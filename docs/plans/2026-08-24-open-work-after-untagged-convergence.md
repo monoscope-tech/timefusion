@@ -1,8 +1,17 @@
 # Open work after the untagged-tier convergence
 
-**Status:** handed off 2026-08-24 ~14:15 UTC. Four items shipped, two blocked on a
-quiet prod, one deliberately not attempted. **Read the HANDOFF section below before
-anything else** — notably which commits are live and the §3 gate trap.
+**Status:** 2026-08-24. **Every item that can be implemented without prod has
+been.** Four sections are closed (§2 fixed, §4 and §5 resolved as needing no
+code, §1b instrumented). The three that remain are not blocked on engineering —
+their success criteria are defined as PROD MEASUREMENTS over a quiet period, and
+prod has been redeploying every ~10-25 minutes all day. **Read the HANDOFF
+section before anything else.**
+
+| What remains | Why it cannot be closed today |
+|---|---|
+| §1 decision (fix (c) or close) | criterion is `immutable_column_disagreement_total` over ≥24h of quiet uptime |
+| §3 step 4 (move reads to the ledger) | criterion is `coverage_ledger_disagreements` reading zero over ≥24h |
+| §6 drain to 0 | blocked by deploy churn; needs a push freeze, not code |
 
 | Item | State |
 |---|---|
@@ -78,7 +87,9 @@ finish, and every process-scoped counter is immature. Both remaining gates —
 4. **Turn on `TIMEFUSION_IMMUTABLE_AUDIT_ENABLED`** for ~24h of quiet uptime and
    read `immutable_column_disagreement_total`. Non-zero means §1 is real and
    fix (c) is justified; zero means the pushdown premise holds and §1 closes.
-5. **Only then consider §5**, whose premise is still unmeasured.
+5. §5 needs nothing — it is closed. If the queue still looks inflated after a
+   quiet period, check whether `ceilings` is populated for those partitions
+   rather than deleting units.
 
 ### Corrections made this session — do not re-derive these
 
