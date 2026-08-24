@@ -3668,6 +3668,20 @@ pub trait CoverageLedger: Send + Sync {
     /// which is the ledger's one unacceptable failure: claiming coverage that is
     /// not there.
     fn replace(&self, cell: &CoverageCell, entries: Vec<CoverageEntry>);
+    /// Apply a whole tier's worth of replacements as ONE durable write.
+    ///
+    /// `replace` persists the entire ledger, so calling it per cell costs
+    /// O(cells^2) serialization — and the recovery pass that writes this ledger
+    /// walks every cell of a tier, hourly, with every file path in every write.
+    /// A batch API is not a convenience here, it is the difference between one
+    /// write and thousands.
+    ///
+    /// An empty entry list retires that cell, same as `replace`.
+    fn replace_many(&self, cells: Vec<(CoverageCell, Vec<CoverageEntry>)>) {
+        for (cell, entries) in cells {
+            self.replace(&cell, entries);
+        }
+    }
     /// Drop a cell entirely — its partition aged out, or its coverage is being
     /// rebuilt from scratch.
     fn retire(&self, cell: &CoverageCell);
@@ -3822,6 +3836,21 @@ impl CoverageLedger for JsonCoverageLedger {
         self.persist();
     }
 
+    /// One write for the whole batch. See the trait's note on why this exists.
+    fn replace_many(&self, cells: Vec<(CoverageCell, Vec<CoverageEntry>)>) {
+        if cells.is_empty() {
+            return;
+        }
+        for (cell, entries) in cells {
+            if entries.is_empty() {
+                self.cells.remove(&cell);
+            } else {
+                self.cells.insert(cell, merge_coverage(entries));
+            }
+        }
+        self.persist();
+    }
+
     fn retire(&self, cell: &CoverageCell) {
         if self.cells.remove(cell).is_some() {
             self.persist();
@@ -3913,6 +3942,27 @@ mod coverage_ledger_tests {
 
         assert_eq!(ledger.coverage(&cell()), vec![entry(0, 10, "g2", Some(9))], "what the replay proved is ALL the cell holds");
         assert_eq!(JsonCoverageLedger::load(dir.path()).coverage(&cell()).len(), 1, "and the replacement is durable");
+    }
+
+    /// `replace` persists the WHOLE ledger, so the recovery pass — which walks
+    /// every cell of a tier, hourly, with every file path in every entry — must
+    /// not call it per cell. That is O(cells^2) serialization on the boot path.
+    #[test]
+    fn a_batch_replacement_is_one_durable_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = JsonCoverageLedger::load(dir.path());
+        let other = ("s".to_owned(), "q".to_owned(), "tier".to_owned(), "2026-08-24".to_owned());
+        ledger.record(&cell(), entry(0, 10, "g1", Some(1)));
+        ledger.record(&other, entry(0, 10, "g1", Some(1)));
+
+        // One cell replaced, one retired by an empty list, in a single call.
+        ledger.replace_many(vec![(cell(), vec![entry(20, 30, "g2", Some(4))]), (other.clone(), Vec::new())]);
+
+        assert_eq!(ledger.coverage(&cell()), vec![entry(20, 30, "g2", Some(4))], "the replacement applied");
+        assert!(ledger.coverage(&other).is_empty(), "an empty list retires the cell, same as replace");
+        let reloaded = JsonCoverageLedger::load(dir.path());
+        assert_eq!(reloaded.coverage(&cell()).len(), 1, "and the batch reached disk");
+        assert!(reloaded.coverage(&other).is_empty(), "including the retirement");
     }
 
     /// Replacing with nothing means the replay found no coverage at all, which
