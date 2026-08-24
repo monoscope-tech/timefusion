@@ -3271,6 +3271,29 @@ mod tests {
         assert_eq!(journal.state(&key), Some(TaskState::Pending), "a declined split must leave the unit runnable, not superseded");
     }
 
+    /// Declining a split must leave the unit RUNNABLE, not merely un-superseded.
+    ///
+    /// This is the failure mode that would be worse than the shred it replaces:
+    /// a unit declined at the floor and then never claimed does no work at all,
+    /// where the shred at least made progress expensively. `split_declined_at_floor`
+    /// rising alongside `pending_base_rollup` is what that would look like in
+    /// prod; this pins it at the source instead of waiting to read it there.
+    #[test]
+    fn a_unit_declined_at_the_floor_is_still_claimable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut unit = task("whale", 0, DAY_MICROS / 2, Operation::BaseRollup);
+        unit.parent_measured_bytes = Some(100 * MAX_DECODED_BYTES);
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        let now = crate::support::now_micros();
+        assert!(!journal.split_time_task(&key, 96 * MAX_DECODED_BYTES, None), "the floor declines the split");
+
+        let claimed = journal.claim_next(Operation::BaseRollup, now, true);
+        assert_eq!(claimed.map(|task| task.key), Some(key), "the declined unit is the one a worker picks up, so the work still happens");
+    }
+
     /// The guard above is only as good as the evidence it reads, and that
     /// evidence has to be the parent's MEASUREMENT — the modelled per-child
     /// number is the very thing that cannot be trusted.
