@@ -1612,11 +1612,8 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
     // Int64 or Float64, and `tdigest`/`hll` states are Binary. That is why
     // `duration_digest` was declared on 2026-08-22 without a migration, and why
     // every derived unit over the 1m tier then failed to plan.
-    let measures = vec![
-        ("m_count".to_string(), "bigint".to_string()),
-        ("m_ratio".to_string(), "double".to_string()),
-        ("m_digest".to_string(), "binary".to_string()),
-    ];
+    let measures =
+        vec![("m_count".to_string(), "bigint".to_string()), ("m_ratio".to_string(), "double".to_string()), ("m_digest".to_string(), "binary".to_string())];
     let widened = db.migrate_add_columns(TABLE, &measures, false).await?;
     assert_eq!(widened.added.len(), 3, "every measure type must be migratable, got {:?}", widened.added);
     assert_eq!(widened.stored_after, widened.stored_before + 3);
