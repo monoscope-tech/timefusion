@@ -3754,6 +3754,31 @@ impl JsonCoverageLedger {
         store_sidecar(&self.data_dir, ROLLUP_COVERAGE, &rows);
     }
 
+    /// The covered ranges this ledger claims for one `(source, tier table)`,
+    /// keyed by project — the shape the ROUTING path needs, as opposed to the
+    /// per-cell shape maintenance needs.
+    ///
+    /// This is the bridge for moving reads off the tags. Routing currently
+    /// answers "is this window covered, and is that coverage current?" from
+    /// `rollup_slice_coverage`, which is rebuilt from Delta tags. The same
+    /// question answered from here is what lets the tags go.
+    ///
+    /// Ranges are returned MERGED, so this is deliberately coarser than the
+    /// per-slice map: two adjacent slices of one generation are one range here
+    /// and two entries there. The covered SET is identical, which is the only
+    /// thing routing asks.
+    pub fn routing_view(&self, source: &str, table_name: &str) -> std::collections::HashMap<String, Vec<CoverageEntry>> {
+        let mut by_project: std::collections::HashMap<String, Vec<CoverageEntry>> = std::collections::HashMap::new();
+        for cell in self.cells.iter() {
+            let (cell_source, project_id, cell_table, _date) = cell.key();
+            if cell_source != source || cell_table != table_name {
+                continue;
+            }
+            by_project.entry(project_id.clone()).or_default().extend(cell.value().iter().cloned());
+        }
+        by_project.into_iter().map(|(project, entries)| (project, merge_coverage(entries))).collect()
+    }
+
     /// Drop cells whose date is older than `keep_from` (a `YYYY-MM-DD` bound),
     /// returning how many went.
     ///

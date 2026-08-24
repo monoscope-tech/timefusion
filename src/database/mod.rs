@@ -11972,6 +11972,34 @@ mod tests {
             recorded.iter().all(|entry| entry.end_micros > entry.start_micros),
             "slice ends are exclusive and must be after their start: {recorded:?}"
         );
+        // THE GATE FOR MOVING READS OFF THE TAGS, checked locally instead of
+        // waiting on prod: whatever the ledger claims for routing must cover
+        // exactly what the tag-derived map claims. `rollup_slice_coverage` is
+        // what routing reads today and is rebuilt from Delta tags; the ledger
+        // has to reproduce that covered set before it can replace it.
+        //
+        // Compared as SETS OF RANGES, not entry-for-entry: the ledger merges
+        // adjacent slices of one generation, so it is deliberately coarser. The
+        // covered instants are the only thing routing asks about.
+        let tag_ranges: std::collections::BTreeSet<(i64, i64)> = db
+            .rollup_slice_coverage
+            .iter()
+            .filter(|entry| entry.key().0 == project)
+            .map(|entry| (entry.key().3, entry.key().4))
+            .collect();
+        assert!(!tag_ranges.is_empty(), "the tag-derived routing map is populated, or this gate proves nothing");
+        let ledger_ranges = db.coverage_ledger.routing_view("otel_logs_and_spans", &cell.2);
+        let ledger_ranges: Vec<(i64, i64)> =
+            ledger_ranges.get(&project).map(|entries| entries.iter().map(|e| (e.start_micros, e.end_micros)).collect()).unwrap_or_default();
+        assert!(!ledger_ranges.is_empty(), "the ledger claims coverage for this project");
+        for (start, end) in &tag_ranges {
+            assert!(
+                ledger_ranges.iter().any(|(lo, hi)| lo <= start && hi >= end),
+                "every range the tags cover is covered by the ledger too: {:?} missing from {ledger_ranges:?}",
+                (start, end)
+            );
+        }
+
         // Coverage without file identity could never REPLACE the tags, only
         // supplement them — selection would still read tags, so files could not
         // become anonymous and the tier could not be compacted, which is the
