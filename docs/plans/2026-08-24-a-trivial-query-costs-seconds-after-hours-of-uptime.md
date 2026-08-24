@@ -4,6 +4,45 @@
 connection turned out to be innocent, and so did the host. What is left is a
 process that gets ~20× slower over hours of uptime.
 
+## 0. Where this stands (read this first)
+
+Everything below §5 is a chronology, including three of my own verdicts that
+later data overturned. The net result, as of 2026-08-24 22:00:
+
+**There are two phenomena, and the stalls are EPISODIC, not a function of age.**
+
+1. **Deploy churn** — a new container replaying WAL while the old one still
+   serves. Explains every stall on a young or mid-life process, replicated four
+   times, and gone once the churn stopped. **My own pushes to the benchmark
+   script were causing it**: `deploy.yml` exempted `docs/**` and `**/*.md` but
+   not `bench/**`. Fixed (`9ab6b00`).
+2. **A connection-setup stall that survives a quiet box** — `connect` 1,450 ms
+   with a warm `SELECT 1` at 77.5 ms, DNS and TCP normal, load 30.6, no deploy.
+   Rare (~1 in 26 samples) and **open**.
+
+**Eliminated, each with the instrument built for it:** host load (44.0 → 178 ms
+versus 32.9 → 4,460 ms — both directions); the maintenance journal mutex (held a
+worker 2,380 ms with *zero* effect on query cost); Delta snapshot refresh (hit
+403 ms/call while `connect` sat at 305 ms); worker starvation (`scheduling_lag_ms`
+0–1 through every stall); swap (100 % full at all times, so it differentiates
+nothing).
+
+**Not monotone with uptime.** 3 min–1.2 h is flat at ~177 ms; a slow episode ran
+1.8–2.24 h peaking at 4,460 ms; the *same process* was fine again at 2.9 h. Do
+not read "age" as the cause — read "episodes, which recur".
+
+**Armed and pending:** `jemalloc.frag_pct` (prediction: climbs into an episode,
+falls out of it — if it stays flat, fragmentation is out too) and per-connection
+`block.pgwire_*_handler_build` timers.
+
+**Do not** ship a scheduled restart (restarts *cause* the churn stalls) or touch
+allocator decay config (mechanism unconfirmed; the last decay change cost ~15 %
+CPU).
+
+> Reading the CSVs: gaps of tens of minutes are **the sampling laptop asleep**,
+> not prod outages. The sampler now runs under `caffeinate -i`, which still does
+> not cover a closed lid.
+
 ## 1. The measurement that started it
 
 Noticed while proving that a 440 GB scan does not starve the box
