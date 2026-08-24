@@ -1593,6 +1593,9 @@ impl Database {
         let ctx = self.bounded_rollup_maintenance_context()?;
         let provider = Self::narrow_provider(log_store, snapshot, selected, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
         const RAW: &str = "__maintenance_slice_raw";
+        // What the PHYSICAL table has, which is not what the spec declares — see
+        // `slice_input_sql`.
+        let present_columns: std::collections::HashSet<String> = provider.schema().fields().iter().map(|field| field.name().clone()).collect();
         ctx.register_table(RAW, provider)?;
         // The schema of whatever is registered as RAW — which is NOT `source_schema`
         // for a derived tier. A derived rollup reads the BASE TIER, and that tier is
@@ -1649,8 +1652,15 @@ impl Database {
                     tombstone: source_schema.tombstone_column.as_deref(),
                 }),
             };
-            let input_sql =
-                crate::rollup::slice_input_sql(input_schema, dedup, RAW, &key.project_id, (key.slice.start_micros, key.slice.end_micros), &shard_predicate);
+            let input_sql = crate::rollup::slice_input_sql(
+                input_schema,
+                dedup,
+                RAW,
+                &key.project_id,
+                (key.slice.start_micros, key.slice.end_micros),
+                &shard_predicate,
+                Some(&present_columns),
+            );
             let frame = ctx.sql(&input_sql).await?;
             ctx.register_table(&input, Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input_sql))))?;
             let aggregate_sql = crate::rollup::build_cohort_sql_range_mode(

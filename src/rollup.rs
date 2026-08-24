@@ -876,22 +876,50 @@ const fn spans_whole_day(start: i64, end: i64) -> bool {
 /// bare `SELECT *`, which is what the derived path used to do: because a tier
 /// holds superseded versions, the aggregate above then SUMs all of them. See
 /// `a_merge_on_read_input_is_deduped_before_the_rollup_aggregate`.
+/// `present` is the column set the registered `raw` provider ACTUALLY has — the
+/// PHYSICAL Delta schema, which is not the synthesized one.
+///
+/// Adding a measure to a rollup spec does not evolve the existing rollup table,
+/// and the writer conforms to the table it already has: a file `dashboard_1m_v3`
+/// wrote on 2026-08-23 22:56 carried `server_duration_digest` and NOT
+/// `duration_digest`, which the spec had declared since 08-22. Selecting the
+/// synthesized field list from that provider is a planning error, and every
+/// derived unit over the tier failed on it — 477 of 658 claims in eight minutes,
+/// a retry loop that froze the 1h tier from 20:17 and starved every other tier.
+///
+/// A column the physical table lacks is projected NULL. Nothing is lost: no file
+/// anywhere holds a value for it, so NULL is what it has always been worth. This
+/// keeps the unit running; evolving the target schema is the separate real fix.
 pub(crate) fn slice_input_sql(
     schema: &crate::schema::TableSchema, dedup: Option<SliceDedup<'_>>, raw: &str, project_id: &str, (start, end): (i64, i64), shard_predicate: &str,
+    present: Option<&std::collections::HashSet<String>>,
 ) -> String {
     let window = format!(
         "WHERE project_id = '{}' AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}){shard_predicate}",
         project_id.replace('\'', "''")
     );
+    // `NULL AS x` for a column the provider lacks, `x` otherwise.
+    let projected = |field: &crate::schema::FieldDef| match present {
+        Some(present) if !present.contains(&field.name) => format!("NULL AS {}", quoted(&field.name)),
+        _ => quoted(&field.name),
+    };
+    let missing = |name: &str| present.is_some_and(|present| !present.contains(name));
     let Some(dedup) = dedup.filter(|dedup| !dedup.keys.is_empty()) else {
+        // `SELECT *` returns only what the provider has, so it cannot stand in
+        // once anything is missing.
+        if schema.fields.iter().any(|field| missing(&field.name)) {
+            let columns = schema.fields.iter().map(&projected).collect::<Vec<_>>().join(", ");
+            return format!("SELECT {columns} FROM {raw} {window}");
+        }
         return format!("SELECT * FROM {raw} {window}");
     };
+    let inner = schema.fields.iter().map(&projected).collect::<Vec<_>>().join(", ");
     let columns = schema.fields.iter().map(|field| quoted(&field.name)).collect::<Vec<_>>().join(", ");
     let keys = dedup.keys.iter().map(|field| quoted(field)).collect::<Vec<_>>().join(", ");
     let order = dedup.tiebreak.map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", quoted(field)));
     let tombstone = dedup.tombstone.map_or_else(String::new, |field| format!(" AND COALESCE({}, false) = false", quoted(field)));
     format!(
-        "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn FROM {raw} \
+        "SELECT {columns} FROM (SELECT {inner}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn FROM {raw} \
          {window}) WHERE __tf_rn = 1{tombstone}"
     )
 }
@@ -2423,7 +2451,7 @@ mod tests {
         let (keys, tiebreak, tombstone) = rollup_tier_dedup(base).expect("a generated tier carries timestamp/id/updated_at");
 
         let dedup = SliceDedup { keys: &keys, tiebreak: Some(tiebreak), tombstone };
-        let sql = slice_input_sql(base, Some(dedup), "__raw", "p", (0, 60_000_000), "");
+        let sql = slice_input_sql(base, Some(dedup), "__raw", "p", (0, 60_000_000), "", None);
         assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY"), "a merge-on-read input must be collapsed to one row per key, got: {sql}");
         assert!(sql.contains("__tf_rn = 1"), "the collapse must keep exactly one version per key, got: {sql}");
         assert!(
@@ -2434,8 +2462,49 @@ mod tests {
         // The shape that actually ran in production: `derived` passed no dedup at
         // all, so the aggregate above summed every version. Kept as an explicit
         // contrast so the regression stays legible.
-        let undeduped = slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "");
+        let undeduped = slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "", None);
         assert!(!undeduped.contains("__tf_rn"), "no dedup means a bare SELECT; this is the shape that over-counted");
+    }
+
+    /// A measure the SPEC declares but the physical table lacks must project
+    /// NULL, not fail the unit.
+    ///
+    /// Adding a measure to a rollup spec does not evolve the existing rollup
+    /// table, and the writer conforms to the table it already has: a file
+    /// `dashboard_1m_v3` wrote at 2026-08-23 22:56 carried
+    /// `server_duration_digest` and NOT `duration_digest`, which the spec had
+    /// declared since 08-22 (`c4d615d`). Selecting the synthesized field list
+    /// from that provider is a planning error, and it froze the 1h tier from
+    /// 20:17 — 477 of 658 claims in eight minutes were the retry loop, starving
+    /// every other tier including a brand-new one that needed to build.
+    ///
+    /// NULL loses nothing: no file anywhere holds a value for that measure.
+    #[test]
+    fn a_measure_the_physical_table_lacks_projects_null_instead_of_failing() {
+        let base = crate::schema::get_schema("otel_logs_and_spans_rollup_dashboard_1m_v3").expect("the 1m tier is a declared rollup target");
+        let (keys, tiebreak, tombstone) = rollup_tier_dedup(base).expect("a generated tier carries timestamp/id/updated_at");
+        let dedup = || SliceDedup { keys: &keys, tiebreak: Some(tiebreak), tombstone };
+        // Exactly prod's shape: everything except the measure added later.
+        let present: std::collections::HashSet<String> =
+            base.fields.iter().map(|field| field.name.clone()).filter(|name| name != "duration_digest").collect();
+        assert!(base.fields.iter().any(|field| field.name == "duration_digest"), "precondition: the spec declares it");
+
+        let sql = slice_input_sql(base, Some(dedup()), "__raw", "p", (0, 60_000_000), "", Some(&present));
+        assert!(sql.contains("NULL AS \"duration_digest\""), "the absent measure must be projected NULL, got: {sql}");
+        assert!(sql.contains("\"server_duration_digest\", ") || sql.contains(", \"server_duration_digest\""), "present columns must still be read, got: {sql}");
+        assert!(!sql.contains("NULL AS \"server_duration_digest\""), "a column the table HAS must not be nulled, got: {sql}");
+        // The outer projection names it, so downstream measure SQL resolves.
+        assert!(sql.matches("\"duration_digest\"").count() >= 2, "the outer select must expose it too, got: {sql}");
+
+        // Same for the undeduped path — `SELECT *` returns only physical columns,
+        // so it cannot stand in once anything is missing.
+        let undeduped = slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "", Some(&present));
+        assert!(undeduped.contains("NULL AS \"duration_digest\""), "the bare-select path must project too, got: {undeduped}");
+
+        // And when nothing is missing, the shape is unchanged.
+        let all: std::collections::HashSet<String> = base.fields.iter().map(|field| field.name.clone()).collect();
+        assert!(!slice_input_sql(base, None, "__raw", "p", (0, 60_000_000), "", Some(&all)).contains("NULL AS"));
+        assert!(!slice_input_sql(base, Some(dedup()), "__raw", "p", (0, 60_000_000), "", Some(&all)).contains("NULL AS"));
     }
 
     #[test]
