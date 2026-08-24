@@ -1262,3 +1262,50 @@ Two residuals, neither alarming:
   removed in `08fcace`: **the journal retains tasks for a spec that no longer
   exists.** Harmless here but it is a real gap — removing a spec should retire its
   queued units, and until it does those claims are pure overhead.
+
+## The level tier is withdrawn, and a fleet-gauge defect is the reason
+
+A goal measurement (latency across 3d/7d/30d with non-routing controls in the
+same round) surfaced two things — one of them about my own instrument.
+
+**My measurement was broken first.** It read `rollup_hits_full` /
+`rollup_hits_hybrid`; the real keys are `..._total`. Every row printed
+`routed=0`, and I nearly reported "routing is broken". The real counters read
+`rollup_hits_full_total=9, rollup_hits_hybrid_total=7` — routing works, at low
+volume. This is the fourth counter-trap of this investigation: **verify the key
+exists before believing a zero.**
+
+**The real finding.** `rollup_min_contiguous_days` and
+`rollup_median_contiguous_days` both fold every (source, tier) with `.min()`.
+`dashboard_level_1m_v1` sat at 2 days, so the FLEET gauge read 2, and
+`coverage_is_short()` compares the median against `COVERAGE_SHORT_DAYS = 14` —
+putting the whole cluster in coverage-short reweighting because of an auxiliary
+tier nobody queries yet. `coverage_is_short`'s own comment warns about this
+shape ("one negligible tenant pins it forever"); it never anticipated a TIER.
+
+That is the third unpriced cost of the level tier, after the doubled maintenance
+queue and the derived half's 489-publishes-3-with-rows. Against zero measured
+benefit — none of the observed misses are `level`-shaped — it is withdrawn
+(`b8e27fb`). `retire_undeclared_tiers` cleans the queued work automatically.
+
+I shipped it arguing that cost is recoverable where an outage is not. This is
+recovering it. The reasoning was sound; the bill was bigger than I priced.
+
+**Top open item: the gauge fold.** A "median" that is then `.min()`-folded across
+tiers is not a median, and any tier being rebuilt reproduces this. It changes
+scheduling weight, so it wants a daylight measurement — not a 06:00 patch from
+whoever just caused the symptom.
+
+**Latency, for the record** (loaded box: `cpu_tokens_used=14/16`, controls 6x
+their best, so treat as ceilings not baselines):
+
+| shape | rep1 | rep2 |
+|---|---|---|
+| CONTROL needle 7d | 1,060 ms | 930 ms |
+| CONTROL topk 7d | 500 ms | 470 ms |
+| groupby 3d | 4,450 ms | 2,010 ms |
+| groupby 7d | 4,610 ms | 4,810 ms |
+| groupby 30d | 49,650 ms | 54,700 ms |
+
+The controls being 6x off their best is the signal: this is a load reading, not a
+regression measurement. Re-run on a quiet process before drawing conclusions.
