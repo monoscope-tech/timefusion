@@ -2665,8 +2665,19 @@ impl Database {
     }
 
     /// Lock the maintenance task journal, recovering from mutex poisoning.
-    fn journal(&self) -> std::sync::MutexGuard<'_, crate::maintenance_coordinator::TaskJournal> {
-        self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    ///
+    /// Both the wait and the hold are timed (`timefusion_stats` component
+    /// `block`): this is a `std::sync::Mutex` taken on every claim, complete
+    /// and checkpoint, and a checkpoint over thousands of pending tasks
+    /// occupies a runtime worker for its whole duration. The read path never
+    /// takes it — no `journal()` call exists under `read/`, `scan.rs` or
+    /// `server/` — so a query can only be hurt by it indirectly, by losing the
+    /// worker. That is exactly what these two numbers measure.
+    fn journal(&self) -> crate::observability::Watched<std::sync::MutexGuard<'_, crate::maintenance_coordinator::TaskJournal>> {
+        let wait = crate::observability::BlockWatch::new("journal_lock_wait");
+        let guard = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(wait);
+        crate::observability::Watched::new("journal_hold", guard)
     }
 
     /// All maintenance targets (unified + custom project tables) as `(name, table)` pairs,

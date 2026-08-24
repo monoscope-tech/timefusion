@@ -459,6 +459,32 @@ pub fn record_tantivy_cache_bytes(bytes: u64) {
     TANTIVY_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When this process started, as seen from inside it.
+///
+/// Every accrual and latency number this process reports is only readable
+/// against its own age — a counter reads 0 because it was never exercised or
+/// because the process is four minutes old, and those imply opposite work
+/// (2026-08-23: a tantivy accrual "fix" was credited twice to what was purely
+/// process age). `docker service ps` answers this from outside, but nothing
+/// pairs it with the numbers themselves; `timefusion_stats` now does.
+static PROCESS_START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Pin the process-start instant. Idempotent; call as early as possible in
+/// every entry point (`main`, `bootstrap`) — the first force wins, so a late
+/// first call would under-report uptime for the whole process lifetime.
+pub fn mark_process_start() {
+    std::sync::LazyLock::force(&PROCESS_START);
+}
+
+pub fn process_uptime_secs() -> u64 {
+    PROCESS_START.elapsed().as_secs()
+}
+
+/// `(last, max)` runtime scheduling lag in ms — see `spawn_runtime_lag_sampler`.
+pub fn runtime_lag_ms() -> (u64, u64) {
+    (RUNTIME_LAG_LAST_MS.load(Relaxed), RUNTIME_LAG_MAX_MS.load(Relaxed))
+}
+
 /// Worst scheduling delay seen by the runtime-lag sampler this process, in ms.
 static RUNTIME_LAG_MAX_MS: AtomicU64 = AtomicU64::new(0);
 /// Most recent sample, so a gauge shows the CURRENT state rather than a
@@ -504,6 +530,84 @@ pub fn spawn_runtime_lag_sampler(cancel: tokio_util::sync::CancellationToken) {
             }
         }
     });
+}
+
+/// Cumulative time a named section blocked a runtime worker: `(count, total_us, max_us)`.
+#[derive(Default)]
+struct BlockStat {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+static BLOCK_STATS: std::sync::LazyLock<dashmap::DashMap<&'static str, BlockStat>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Times a section that occupies a runtime worker without yielding — a
+/// `std::sync::Mutex` hold, a synchronous snapshot refresh.
+///
+/// This is the instrument `scheduling_lag_ms` asks for and cannot supply: lag
+/// says workers woke late while the host was half idle, which means blocked,
+/// not busy — but not *where*. A CPU sampler is the wrong tool for the same
+/// reason (a blocked worker samples as idle), and prod has none anyway since
+/// the 2026-08-11 SIGSEGV crashloop. Wrap the suspects instead and let
+/// `max_ms` name them.
+///
+/// Cost is two `Instant::now()` and one atomic triple per section entry.
+pub struct BlockWatch(&'static str, std::time::Instant);
+
+impl BlockWatch {
+    pub fn new(name: &'static str) -> Self {
+        Self(name, std::time::Instant::now())
+    }
+}
+
+impl Drop for BlockWatch {
+    fn drop(&mut self) {
+        /// Below this a hold is ordinary and a log line would be pure noise;
+        /// the totals still count it.
+        const WARN_MS: u128 = 250;
+        let held = self.1.elapsed();
+        let us = held.as_micros() as u64;
+        let entry = BLOCK_STATS.entry(self.0).or_default();
+        entry.count.fetch_add(1, Relaxed);
+        entry.total_us.fetch_add(us, Relaxed);
+        entry.max_us.fetch_max(us, Relaxed);
+        if held.as_millis() >= WARN_MS {
+            warn!(section = self.0, held_ms = held.as_millis() as u64, "blocking section held a runtime worker — queries scheduled onto this worker waited behind it");
+        }
+    }
+}
+
+/// `(section, count, total_us, max_us)` for every blocking section entered this
+/// process. Unsorted; the caller orders it.
+pub fn block_stats() -> Vec<(&'static str, u64, u64, u64)> {
+    BLOCK_STATS.iter().map(|e| (*e.key(), e.count.load(Relaxed), e.total_us.load(Relaxed), e.max_us.load(Relaxed))).collect()
+}
+
+/// Holds `inner` while a [`BlockWatch`] times it. Derefs to `inner`, so a
+/// `MutexGuard` wrapped in one is used exactly like the guard.
+pub struct Watched<T> {
+    inner: T,
+    _watch: BlockWatch,
+}
+
+impl<T> Watched<T> {
+    pub fn new(name: &'static str, inner: T) -> Self {
+        Self { inner, _watch: BlockWatch::new(name) }
+    }
+}
+
+impl<T> std::ops::Deref for Watched<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for Watched<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
 }
 
 /// Generates the no-attribute "increment by one" recorders. Each no-ops on the

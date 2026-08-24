@@ -1471,7 +1471,31 @@ impl StatsTableProvider {
             ]
         });
 
-        let rows: Vec<Row> = [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, tantivy, bloom_prune, parquet, cache_sizes]
+        // Process age and worker starvation, in the same read as everything
+        // else. Every other counter here is process-scoped, so `uptime_seconds`
+        // is what makes them quotable at all: 0 accrual on a four-minute
+        // process and 0 accrual on a five-hour one are opposite findings.
+        // `scheduling_lag_ms` nonzero while the host has idle cores means
+        // workers are BLOCKED, not busy — read it with the `block` rows below,
+        // which name the section.
+        let (lag_last, lag_max) = crate::observability::runtime_lag_ms();
+        let runtime = rows!["runtime";
+            "uptime_seconds" => crate::observability::process_uptime_secs(),
+            "scheduling_lag_ms" => lag_last,
+            "scheduling_lag_max_ms" => lag_max,
+            "worker_threads" => std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+        ];
+        let mut sections = crate::observability::block_stats();
+        sections.sort_unstable_by_key(|s| s.0);
+        let block: Vec<Row> = sections
+            .into_iter()
+            .flat_map(|(name, count, total_us, max_us)| {
+                [("count", count), ("total_ms", total_us / 1000), ("max_ms", max_us / 1000)].map(|(k, v)| ("block", format!("{name}.{k}"), v.to_string()))
+            })
+            .collect();
+
+        let rows: Vec<Row> =
+            [budget, layer, dml, read_dedup, maintenance, plan_cache, scan, foyer, logical_count, tantivy, bloom_prune, parquet, cache_sizes, runtime, block]
             .into_iter()
             .flatten()
             .collect();
@@ -1565,6 +1589,23 @@ mod stats_table_tests {
             assert_has(&rows, "logical_count", key);
         }
         assert!(rows.contains(&("logical_count".into(), "active_builds".into(), "1".into())));
+    }
+
+    /// Process age and worker starvation must be readable in the same query as
+    /// the counters they qualify — a counter quoted without uptime is not a
+    /// measurement (2026-08-23, twice).
+    #[test]
+    fn exposes_process_uptime_scheduling_lag_and_blocking_sections() {
+        crate::observability::mark_process_start();
+        drop(crate::observability::BlockWatch::new("test_section"));
+
+        let rows = snapshot_rows(&StatsTableProvider::new(None));
+        for key in ["uptime_seconds", "scheduling_lag_ms", "scheduling_lag_max_ms", "worker_threads"] {
+            assert_has(&rows, "runtime", key);
+        }
+        for key in ["test_section.count", "test_section.total_ms", "test_section.max_ms"] {
+            assert_has(&rows, "block", key);
+        }
     }
 
     #[test]

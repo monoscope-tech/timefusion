@@ -56,6 +56,9 @@ const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
 const _: () = assert!(WORKER_STACK_BYTES >= 8 * 2 * 1024 * 1024);
 
 fn main() -> anyhow::Result<()> {
+    // First statement in the process: `timefusion_stats` reports uptime against
+    // this, and every counter it reports is only readable against uptime.
+    timefusion::observability::mark_process_start();
     dotenv().ok();
     // Before the runtime, so every worker thread/listener inherits the raised
     // limit. `bootstrap()` calls it too, for the e2e harness (skips main()).

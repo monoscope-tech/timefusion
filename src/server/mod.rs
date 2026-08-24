@@ -47,6 +47,7 @@ pub fn raise_file_limit() {
 
 /// Initializes storage, recovery, background work, and query providers.
 pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
+    crate::observability::mark_process_start();
     crate::support::init_from_env();
     raise_file_limit();
 
