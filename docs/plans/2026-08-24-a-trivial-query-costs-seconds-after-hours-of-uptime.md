@@ -275,6 +275,11 @@ load explains none of it. Over the first ~15 minutes a TimeFusion process gets
 consistent with the standing note that "idle == 4-min-old container == cold
 cache".
 
+**Extended to n=5 across 117 s → 1,357 s (22.6 min) of one process, sign holds:**
+`connect` r=-0.77, `reuse` r=-0.69, against load r=-0.29 / -0.04. The series is
+409 → 506 → 298 → 299 → 273 ms: it falls off the cold start and then **plateaus
+at ~270–300 ms**. Through 22 minutes of uptime there is no degradation at all.
+
 Three samples is not a result — the sign could flip with the fourth, and this
 run covers 3–16 minutes of uptime while the observation that opened this plan
 was at **five hours**. But it does say something already: the plan's framing —
