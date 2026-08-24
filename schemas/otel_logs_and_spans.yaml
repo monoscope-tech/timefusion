@@ -458,51 +458,25 @@ rollups:
          - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
          - { name: duration_digest, agg: tdigest, column: duration }
 
-  # `level` is a dashboard filter no tier above can express, so every
-  # `level == "ERROR" | summarize …` panel falls back to a raw scan. It is
-  # canonical enough in monoscope's query language to appear in the AI
-  # assistant's prompt examples and in LiveTail's doctests.
+  # NO `level` TIER. Tried and withdrawn on 2026-08-24, after pricing three costs
+  # against zero measured benefit:
   #
-  # A NEW spec, never a fourth dimension on `dashboard_1m_v3`. `generation_id`
-  # hashes the whole spec, so EDITING v3 would change every existing file's
-  # generation and take the tier dark until 30 days rebuilt. Adding is safe by
-  # construction: `route_for` tries every declared rollup and one that cannot
-  # serve a query declines, so "adding a spec can only ever widen what routes",
-  # and the reader takes the first tier actually BUILT — an unbuilt tier is
-  # skipped, never served. That is also what `generation_id`'s own comment means
-  # by bumping the table name.
+  #   * it doubled enqueued rollup work (work scales with the declared spec count);
+  #   * its derived half published 489 rollups of which 3 had rows, because a
+  #     derived tier whose base is unbuilt is still claimable;
+  #   * and — the one that decided it — a young tier PINS THE FLEET. Both
+  #     `rollup_min_contiguous_days` and `rollup_median_contiguous_days` fold
+  #     every (source, tier) with `.min()`, so a tier at 2 days made the fleet
+  #     gauge read 2, and `coverage_is_short()` compares the median against
+  #     `COVERAGE_SHORT_DAYS = 14`. The whole cluster sat in coverage-short mode
+  #     because of an auxiliary tier nobody queries yet.
   #
-  # DELIBERATELY NARROW: `level` alone, not `level` plus v3's three. A tier's
-  # build cost scales with its group count, and duplicating the fat spec would
-  # cost far more for one filter. The candidate sort breaks ties toward the
-  # narrower dimension set, so this is tried first and declines immediately for
-  # anything needing service/kind/status_code, which routes to v3 as it does now.
+  # Against that: ZERO of the misses observed in production are `level`-shaped.
+  # They are endpoint-hash-scoped status-CLASS charts, which `level` does not
+  # touch — see docs/plans/2026-08-22-query-latency-matrix.md.
   #
-  # KNOWN COST, stated because it is the reason to reconsider: enqueued rollup
-  # work scales with the number of declared specs
-  # (`plan_rollup_backfill`, src/database/maintain.rs), so these two tiers
-  # DOUBLE rollup maintenance. Deleting these two entries is the whole revert —
-  # nothing else references them, and no existing tier changes identity.
-  #
-  # Measures are the core panel set. `error_count` is carried because `level`
-  # and `status_code` are different columns, so an errors-by-level chart still
-  # asks for it.
-  - grain: 1m
-    name: dashboard_level_1m_v1
-    dimensions: [level]
-    measures:
-      - { name: request_count, agg: count }
-      - { name: duration_count, agg: count, column: duration }
-      - { name: error_count, agg: count, filter: "status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500" }
-      - { name: duration_sum, agg: sum, column: duration }
-      - { name: duration_min, agg: min, column: duration }
-      - { name: duration_max, agg: max, column: duration }
-      - { name: duration_digest, agg: tdigest, column: duration }
-
-  # NOT re-added until `dashboard_level_1m_v1` has coverage. A derived tier whose
-  # base is unbuilt is still CLAIMABLE, and it publishes empty: measured 20
-  # minutes after this shipped, `dashboard_level_1h_v1` published 489 rollups of
-  # which 3 had rows, while taking ~10x the base tier's claims — and it starved
-  # `dashboard_1h_v2`, the tier every 7d/30d dashboard reads, to ZERO publishes
-  # in the same window. The 1m level tier meanwhile published 51 with rows in 50,
-  # so the narrow-dimension design is sound; only the derived half was premature.
+  # Adding a spec is still safe by construction (`route_for` tries every declared
+  # rollup and one that cannot serve declines). What is NOT safe is adding one
+  # whose ramp-up poisons a fleet-wide gauge. Fix that fold first; then `level`
+  # is cheap, and `status_class` — expressible as declared count MEASURES with no
+  # new dimension — is the one actually worth having.
