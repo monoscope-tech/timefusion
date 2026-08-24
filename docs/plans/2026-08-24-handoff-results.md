@@ -1,0 +1,291 @@
+# Handoff results: what the open items actually measured
+
+2026-08-24, ~10:45-12:00 UTC. Answers to
+`2026-08-24-handoff-open-work.md`, item by item. Every number is stamped with
+the image SHA and container age it was taken on, because the box restarted three
+times during this window (`5635686` -> `0bdeddf` -> `8c37d37`) and every
+`timefusion_stats` counter is process-scoped.
+
+Tools written for this, all under `bench/local/` (gitignored):
+
+- `journal_snapshot.py` — checkpoint + **WAL replay**. The plan's §1 snippet reads
+  `maintenance_tasks.json` alone, and that file was **2h51m stale** the whole
+  session (mtime 08:48, unchanged at 11:38). The `.wal` beside it was current to
+  the second. Any sealed count taken from the checkpoint is a reading of 08:48.
+- `drain_sampler.sh` — the above plus the counters, every 15 min, with the image
+  SHA, so a restart annotates the series instead of truncating it.
+- `routing_probe.py` — reads the routing counters immediately before and after
+  each query on the same connection, so a cell's latency and its hit/miss delta
+  are one event.
+- `small_file_census.py` — object storage, not counters, per (project, date).
+
+---
+
+## 1. Does the sealed backlog drain? **No. It is flat.**
+
+Five samples over 63 minutes, spanning three deploys:
+
+| UTC | image | age | sealed units | sealed cells | complete_base_rollup |
+|---|---|---|---|---|---|
+| 10:50 | `0bdeddf` | 6 min | 931 | 435 | 14,468 |
+| 11:05 | `0bdeddf` | 21 min | 928 | 435 | 14,475 |
+| 11:22 | `0bdeddf` | 37 min | 930 | 435 | 14,488 |
+| 11:38 | `8c37d37` | 4 min | 933 | 435 | 14,498 |
+| 11:53 | `5e7934b` | 4 min | 928 | 435 | 14,541 |
+
+- **Sealed units: 931 -> 928, oscillating +-3.** Not draining, not even slowly.
+- **Sealed cells: 435, unchanged in every single sample.** Not one cell retired.
+- `complete_base_rollup` +73 in 63 min = **~70 completions/hr**, and the sealed
+  count did not move, so essentially all of it is the live frontier — which
+  ingest replenishes. `pending_base_rollup` (journal) went 1,619 -> 1,685 in the
+  same window: the queue GREW.
+
+Two corrections to the plan's premises:
+
+- It says the remaining sealed units are "**every one day-wide**". Measured
+  **inflation 2.13x** (930 units over 435 cells), stable across every sample. The
+  coarsening win did not hold at 1.0.
+- The plan's "best rate observed, ~41/hr of sealed work" is not reproducible here.
+  Over 48 uninterrupted-enough minutes the sealed rate is **~0/hr**.
+
+**So the organisational ask in the plan — "a few hours without a deploy" — is not
+the blocker.** The 37-minute quiet stretch on `0bdeddf` was long enough to see a
+drain if one existed, and there was none. Sealed capacity is being spent
+elsewhere, not lost to restarts. (Four deploys landed during this window anyway,
+which is worth noticing on its own: nobody paused anything.)
+
+One incidental correction to trap 2 — `rollup_min_contiguous_days` read **30 on a
+4-minute-old container** at 11:53, and 0 on an equally young one at 11:38. The
+"resets to 0 and needs ~25 min" rule is not reliable in either direction now, so
+read the gauge rather than reasoning from uptime.
+
+Where it goes, from a claim census of `maintenance_task_started`. **Read the
+window sizes, not the `--since` flags** — `docker service logs --since 6h` returned
+only what the CURRENT container had retained, which was 5 minutes of it. Asking
+for six hours and getting five minutes is a trap worth naming, because 124 starts
+looks like a long-window sample and is not:
+
+```
+window B — 5 min, 1 container (11:38-11:43, four minutes after a deploy)
+  BaseRollup          43   2026-07-19: 9   2026-08-01: 7   2026-08-24: 27
+  Dedup               34   2026-07-24..27: 23              2026-08-24: 11
+  DerivedRollup       12                                   2026-08-24: 12
+  HotPacking          12                                   2026-08-24: 12
+  Repair              13   2026-07-26: 1                   2026-08-23: 12
+  SealedConsolidation 10   2026-08-13: 3  08-14: 1  08-16: 6
+
+window A — 68 min, 2 containers (10:11-11:18, mature process)
+  SealedConsolidation 27   2026-08-13: 1                   2026-08-23: 26
+```
+
+Sealed rollup work IS running — but on two days (07-19, 08-01) out of 435 cells.
+The claim order concentrates, it does not sweep.
+
+The A/B contrast is itself a finding: **a fresh container consolidates old sealed
+days; a mature one spends 26 of 27 claims on the newest sealed day.** That is the
+signature of state that accumulates within a process and is cleared by restart —
+`attempts`, and therefore quarantine.
+
+**Repair is in an immortal-unit loop.** Its 13 claims in window B carry
+`attempts = 9, 10, 10, 12, 40, 41, 41, 42, 42, 43, 43, 44` — twelve of thirteen
+on 2026-08-23 — and in window A Repair timed out **14 times in 30 claims (47%)**.
+`QUARANTINE_ATTEMPTS` is 2, so all of it is running through the
+quarantined-occupancy permit. This is the largest single identified sink and it is
+not any of the plan's seven items.
+
+## 2. Does routing offset the load? **It routes `throughput` and never routes `p95_latency`.**
+
+Thirty wide-window cells, coverage held at 30 for all of them (checked per row,
+per trap 2). `bench/local/routing_probe.log`:
+
+| shape | 7d | 14d | 30d |
+|---|---|---|---|
+| `throughput` | p4 **hit**, p5 **hit**, p6 **hit** | p4 **hit**, p6 **hit** | p4 **hit** |
+| `p95_latency` | 0 hits / 5 misses | 0 hits / 5 misses | 0 hits / 5 misses |
+
+- **Six hybrid hits, all `throughput`.** The routed cells complete: p4 30d
+  throughput 33.4 s, p6 14d 48.1 s — slow, but answered, where the raw path
+  fails outright.
+- **p1 and p2 never routed on `throughput`, at any window.**
+
+### The miss reasons, and a correction to the plan
+
+A first reading said "every miss reason is 0 except `not_built`". **That reading
+was wrong, and wrong by the plan's own trap 1** — it was taken after a restart, so
+it described three fresh misses on a new process, not the fifteen the probe had
+just produced on the old one. Re-run as a same-connection, same-container
+before/after over all fifteen `p95_latency` cells, coverage 30 on every row
+(`bench/local/miss_reasons.log`):
+
+| reason | count | where |
+|---|---|---|
+| `not_built` | 13 | p2 7d/14d/30d, p6 14d (11 on one query) |
+| `stale_coverage` | 6 | p1 7d/14d/30d, p5 14d/30d, p6 30d |
+| `unsupported` | 5 | p4 7d/14d/30d, p5 7d, p6 7d |
+| `filter_not_eligible` | 2 | p1 30d, p2 30d |
+| `tiny_interior` | 1 | p6 30d |
+
+**This contradicts the plan's §2 premise directly.** It states "all routing RULES
+are fixed: `filter_not_eligible` 0 (null guard), `stale_coverage` 0
+(witness/bound fix); remaining misses are `not_built`". Measured, `not_built` is
+under half of them, `stale_coverage` is the sole reason p1 never routes, and
+`unsupported` — which the plan does not mention at all — is the sole reason p4 and
+p5 miss at their narrower windows.
+
+`p95_latency` is also not uniformly unroutable: p4 7d, p4 14d and p6 14d each
+recorded hybrid hits ALONGSIDE a miss, so parts of those plans route and one leg
+does not. The shape is partially reachable, not blocked.
+
+So §2's "done when" is half met. Wide cells that route do complete, and the hit
+counter moves for exactly those. But the dashboard's latency panel is reachable
+only in pieces, and the reason it is not reachable **differs per project** — three
+distinct defects wearing one symptom, which is why "route more shapes" as a single
+work item would have been mis-scoped.
+
+## 3. Why did query latency regress? **Not contention. And the idle arm cannot finish the job.**
+
+The plan's free control fired at 11:33 UTC (`idle_probe.sh`, `tasks_running = 0`
+before and after both probes):
+
+| p1 `87576849` | 2026-08-22 baseline | busy arm | idle arm |
+|---|---|---|---|
+| throughput 1h | 199 ms | 2,430 / 7,320 ms | **8,650 ms** |
+| throughput 3d | 3,297 ms | 8,217 ms | **18,150 ms** |
+
+**Removing the maintenance load made p1 SLOWER, not faster.** Combined with the
+already-recorded fact that p4 got 6x FASTER in the same sweep that made p1 8.7x
+slower, "maintenance contention" is refuted as the cause. The summary should not
+lean on it.
+
+**But the idle arm is confounded, and the confound is the surviving hypothesis.**
+`tasks_running = 0` only happens inside `wait_for_preload`, i.e. in the first 300 s
+of a container — the drain sampler caught the same moment and recorded image
+`8c37d37`, **age 4 minutes**. So the idle arm is also the coldest possible foyer
+cache. It cannot separate "no contention" from "no cache", and cold cache is
+exactly the cache-invalidation hypothesis the plan proposes.
+
+What it does establish: contention is not sufficient, and every post-baseline p1
+reading — busy or idle, 2.4 s to 8.7 s — is 12x to 43x the baseline. The one
+thing common to all of them is that p1's files are being rewritten underneath it.
+
+**That prediction is now untestable as written.** The plan says to re-run p1 "after
+its out-of-policy cells reach zero". Per §5 below, p1's largest cell has not been
+claimed once in seven hours, so it will not reach zero on its own.
+
+## 4. p1 30-day `log_list` OOM — reproduces, untouched
+
+```
+Resources exhausted: unordered merge-on-read dedup exceeded its 2048 MiB per-query budget
+```
+
+Confirmed in the completed matrix (`matrix3.csv`): p1 30d `log_list` OOMs, p6 30d
+OOMs on three shapes, p4 answers the same 30d shape in 4,504 ms. Duplicate
+density, not window width, as the plan says.
+
+**One correction.** The plan says mode B "does not currently reproduce in prod"
+because the scan ceiling refuses the cell first. That is not true of what ran
+here: `2f7754a` (`TIMEFUSION_WIDE_SCAN_REJECT_MB`) exists only on branch
+`tier1-14d-30d-complete`, is not on master, and is an ancestor of **none** of the
+four images deployed during this session (`5635686`, `0bdeddf`, `8c37d37`,
+`5e7934b`) — `grep WIDE_SCAN_REJECT_MB src/` returns nothing on master. No cell in
+the sweep returned `REFUSED`. The OOM is live and unmasked.
+
+Not fixed, per the plan's own instruction. The three obstacles it lists are
+unchanged.
+
+## 5. Compaction: **the fixes work; the cell that matters is never claimed**
+
+The fixes are confirmed live (`680acac`, `8844064`, `e16f157` are all ancestors of
+the deployed image) and confirmed working:
+
+- **The silent branch is quiet.** Four `compaction_unit_selected_nothing` events in
+  40 minutes, against "every 30-60 s" before. All four are correct refusals — three
+  HotPacking cells where only 1-2 of 8-16 under-target files were unsorted
+  candidates, and one SealedConsolidation cell holding exactly one file for that
+  project/date. No fourth silent-refusal variant.
+- **Object storage agrees.** Small files fleet-wide: 1,772 (pre-fix) -> 1,273
+  (v500674) -> **1,170** (v500735). 48 out-of-policy cells.
+
+**The residual is not a refusal, it is a claim.** `87576849 / 2026-08-19` holds
+**238 small files in 1.9 GB — the single largest file-debt cell in the fleet** —
+and has been at exactly 238 across every measurement since yesterday. Searching
+the retained prod logs for its slice (`slice_start=1787097600000000`) returns
+**nothing at all**: not a start, not a timeout, not a funnel event, for any
+operation. That is **73 minutes of retained logs across 3 containers**, in which
+37 SealedConsolidation claims landed on five other dates — not the "6 hours" the
+`--since` flag asked for, per the window note in §1.
+
+This matters because the funnel log cannot see it. `680acac` instrumented "a unit
+was claimed and selected nothing". There is no instrument for "a cell was planned
+and never claimed", and that is the branch this cell is in — the planner reports
+`planned=341` every 60 s, so it is being planned.
+
+Candidate mechanisms, none yet proven, in order of how well they fit:
+
+1. **Quarantine.** `QUARANTINE_ATTEMPTS = 2` and hygiene units time out at 900 s
+   (SealedConsolidation: 8 timeouts in 27 claims, 30%). Two timeouts make a unit
+   claimable only through the narrow quarantined-occupancy permit. A 238-file,
+   17 GB-decoded cell is the most likely thing in the fleet to have timed out
+   twice, and thereafter the largest debt in the fleet becomes the least
+   reachable work in the fleet — benefit ordering inverted by attempt count.
+2. **Frontier misclassification.** `plan_compaction_debt` calls any date before
+   today `SealedConsolidation`, but `is_live_frontier` is true for a full
+   `LIVE_FRONTIER_WINDOW_MICROS` = 24h after the slice ENDS. So yesterday's
+   consolidation unit is class 0 — strict priority over every genuinely sealed
+   cell — until it is 48h old. One 90-minute window had **26 of 27**
+   SealedConsolidation claims on 2026-08-23 for exactly this shape.
+
+The next step is one log line, not a fix: emit the winning rank tuple and the
+count of eligible-but-not-selected units on a claim, so "planned, never claimed"
+stops being invisible. That is the same lesson the lever-2 page already ends on.
+
+## 6. The known-red test is **green**
+
+`config::tests::tantivy_defaults_are_the_deserialized_ones_not_the_derived_ones`
+passes on master with `src/config.rs` unmodified in the working tree. The
+concurrent tantivy work fixed it. Nothing to carry forward.
+
+## 7. The two smaller things
+
+- **`SealedConsolidation` does not survive a restart** — confirmed directly, not
+  inferred. A full journal replay (checkpoint + WAL, 41,580 tasks) contains
+  `base_rollup`, `dedup`, `derived_rollup` and `repair` and **zero** hygiene
+  operations of either kind, while both were running at that moment. The trade
+  the plan describes is real and visible.
+- **Interactive `OPTIMIZE`** — not retried; nothing observed contradicts it.
+
+---
+
+## Code: the coordinator WIP in the tree
+
+Two half-finished changes were sitting uncommitted when this started — tests
+written, implementation missing. Both are now complete and green
+(`cargo nextest run --lib`, 22 targeted tests pass):
+
+- `fold_fleet_gauge` — a tier younger than the coverage horizon abstains from the
+  cross-tier `.min()` instead of pinning it. Prod 2026-08-24: a two-hour-old
+  `dashboard_level_1m_v1` at 2 days held the fleet gauge at 2 while four healthy
+  tiers sat at 30, running the cluster in coverage-short mode for a tier nobody
+  queries.
+- `parent_measured_bytes` — a child that did not get meaningfully cheaper than its
+  parent stops bisecting, because that IS the row-group floor observed.
+
+One trap worth recording, and it is now a test
+(`a_synthetic_stamp_does_not_freeze_a_lineage`): `retry_or_split` forces a
+bisection with a synthetic `MAX_DECODED_BYTES + 1`, which is a "does not fit"
+signal, not a measurement. Stamping it and then comparing the next real
+measurement against it would decline every split in that lineage forever — the
+immortal-unit shape this file already carries three incidents of. The guard is
+therefore two-sided: a child measuring MORE than its parent is evidence the
+parent's number was never a measurement, so it still splits.
+
+A concurrent session was implementing the same guard in the same working tree at
+the same time — `split_declined_at_floor` appeared inside `split_time_task` while
+this was being written. The two implementations were reconciled into one: the
+counter and comment from that session, the two-sided guard and the synthetic-seed
+test from this one. Both halves have since been committed and deployed by that
+session — `8c37d37` (`fold_fleet_gauge`) and `69e6503` ("stop bisecting a slice
+once it stops getting cheaper") — and the 22 targeted tests pass on the tree as it
+stands at `0d8b0ed`.
+
+Nothing in this session was committed or pushed by hand, and nothing was deployed.

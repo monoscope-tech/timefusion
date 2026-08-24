@@ -1309,3 +1309,40 @@ their best, so treat as ceilings not baselines):
 
 The controls being 6x off their best is the signal: this is a load reading, not a
 regression measurement. Re-run on a quiet process before drawing conclusions.
+
+## `duration_digest` now holds values — the migration ran
+
+Authorised and executed 2026-08-24. Scoped to the two tiers whose SPEC declares
+the measure; `otel_metrics_*` reported it "missing" too, but only because it is
+absent from storage — its schema does not declare it, and migrating it would
+have added a column nothing wants.
+
+```
+otel_logs_and_spans_rollup_dashboard_1m_v3   24 -> 25 columns
+otel_logs_and_spans_rollup_dashboard_1h_v2   24 -> 25 columns
+otel_metrics_*                               NOT TOUCHED (spec declares 0)
+```
+
+Re-running reports "nothing to migrate", so it is idempotent as documented.
+
+**Proof it actually works, not merely that the schema is wide.** A parquet file
+the LIVE prod process wrote after the migration:
+
+```
+digest cols: ['server_duration_digest', 'duration_digest']
+rows=1  nulls=0  non_null=1   tdigest state = 17 bytes
+```
+
+Two things that follow:
+
+- The writer picked up the widened schema **without a restart** — the running
+  process re-read the table metadata on its own.
+- `duration_digest` has gone from "declared on 08-22 and silently absent from
+  every file ever written" to holding real tdigest states. The `ceb10b8` NULL
+  projection is now a fallback for historical files rather than the permanent
+  answer.
+
+This closes the loop opened by the 08-22 declaration: YAML declared a measure,
+storage never gained it, every derived unit failed to plan, and the documented
+migration that should have preceded it could not express the type until
+`6054b6e`.
