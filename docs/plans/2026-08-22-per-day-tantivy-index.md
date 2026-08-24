@@ -2237,3 +2237,20 @@ P2 #7 (deploy cadence vs unit length) confounding the measurement, not evidence
 either way. Re-measure on a container with >45 min uptime, and after the
 population is 37% smaller — a shorter spans pass may close the gap by itself
 before any per-table tick gating is worth building.
+
+## Pass condition for the fix, registered before the deploy lands
+
+Shipped as `8698271`, deployed in `3700730`. On a container running that image,
+re-run the two arms and require both:
+
+1. `bench/local/rollup_prefilter_ab.py` — the `kind = 'server'` arm must fall to
+   the control's range (~0.3-1.8 s) and record `prefilter_attempts +0`. A
+   non-zero attempt means the tier is still in `indexed_set()`.
+2. The routed 7d dashboard with `AND kind = 'server'` must fall from 14,484 ms
+   toward the 7,240 ms unfiltered baseline, with `prefilter_attempts +1` rather
+   than `+2` — the remaining one is the raw leg, which this change does not
+   touch and should not.
+
+If (1) passes and (2) does not, the rollup leg was not the cost and the raw
+leg's prefilter is; that is a different fix and this one still stands on the
+build-side saving alone.
