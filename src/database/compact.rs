@@ -1117,6 +1117,60 @@ impl Database {
         })
     }
 
+    /// Counts dedup keys whose versions disagree on a column declared IMMUTABLE,
+    /// or `None` when the schema has nothing auditable.
+    ///
+    /// Immutability is enforced at plan time for UPDATE only (`extract_dml_info`
+    /// refuses to assign an undeclared column). An INSERT is not checked, so a
+    /// client re-emitting a corrected record appends a version that disagrees —
+    /// and read filters on immutable columns are pushed BELOW the merge-on-read
+    /// dedup precisely because they were promised not to.
+    ///
+    /// Two ways a group can disagree, and `COUNT(DISTINCT)` alone catches only
+    /// the first:
+    /// - different non-null values — `COUNT(DISTINCT c) > 1`;
+    /// - null in some versions and set in others — which `COUNT(DISTINCT)`
+    ///   ignores entirely, and which is the SHAPE ENRICHMENT PRODUCES: a field
+    ///   absent on the first emit and filled on the retry. Hence
+    ///   `COUNT(c) > 0 AND COUNT(c) < COUNT(*)`, which must be two-sided: a
+    ///   group where the column is null in EVERY version has `COUNT(c) = 0` and
+    ///   agrees perfectly.
+    ///
+    /// Dedup keys are excluded (they are the grouping), as are the tiebreak and
+    /// tombstone columns, which vary across versions by construction. Composite
+    /// types are excluded because `COUNT(DISTINCT)` over them is neither cheap
+    /// nor meaningful.
+    fn immutable_audit_sql(schema: &crate::schema::TableSchema, scan_name: &str, rows_filter: &str) -> Option<String> {
+        let excluded: std::collections::HashSet<&str> = schema
+            .dedup_keys
+            .iter()
+            .map(String::as_str)
+            .chain(schema.dedup_tiebreak.as_deref())
+            .chain(schema.tombstone_column.as_deref())
+            .collect();
+        let predicates = schema
+            .fields
+            .iter()
+            .filter(|field| !field.mutable && !excluded.contains(field.name.as_str()))
+            .filter(|field| {
+                let ty = field.data_type.to_ascii_lowercase();
+                !["variant", "binary", "list", "struct", "map"].iter().any(|composite| ty.contains(composite))
+            })
+            .map(|field| {
+                let column = crate::rollup::quoted(&field.name);
+                format!("COUNT(DISTINCT {column}) > 1 OR (COUNT({column}) > 0 AND COUNT({column}) < COUNT(*))")
+            })
+            .collect::<Vec<_>>();
+        if predicates.is_empty() || schema.dedup_keys.is_empty() {
+            return None;
+        }
+        let keys = schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
+        Some(format!(
+            "SELECT COUNT(*) FROM (SELECT {keys} FROM {scan_name} WHERE {rows_filter} GROUP BY {keys} HAVING {})",
+            predicates.join(" OR ")
+        ))
+    }
+
     /// Runs `sql` and pulls its first output row's `column(0)` as an `i64` —
     /// the common "run an aggregate probe, get one scalar back" shape used
     /// throughout the dedup rewrite path. `None` if the result is empty or
@@ -1586,6 +1640,32 @@ impl Database {
                                 if shard_before == 0 {
                                     return Ok((0, 0));
                                 }
+                                // The dedup sweep is the ONLY place every version of a key is
+                                // visible at once — the read path collapses them, and the
+                                // `skip_dedup` fast path applies only to partitions already
+                                // certified duplicate-free, so it cannot show a disagreement by
+                                // construction. If this is not measured here it is not measurable.
+                                if self.config.maintenance.timefusion_immutable_audit_enabled
+                                    && let Some(audit_sql) = Self::immutable_audit_sql(schema, scan_name, &rows_filter)
+                                {
+                                    // Diagnostics must never fail the rewrite that carries them.
+                                    match Self::scalar_i64(ctx, &audit_sql).await {
+                                        Ok(Some(disagreeing)) if disagreeing > 0 => {
+                                            crate::observability::maintenance_stats()
+                                                .immutable_column_disagreement_total
+                                                .fetch_add(u64::try_from(disagreeing).unwrap_or_default(), std::sync::atomic::Ordering::Relaxed);
+                                            warn!(
+                                                table = %table_name,
+                                                project_id = %project_id,
+                                                disagreeing,
+                                                event = "immutable_column_disagreement",
+                                                "versions of one key differ on a column declared immutable; read filters on it are pushed below dedup"
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => warn!(%error, "immutable-column audit failed"),
+                                    }
+                                }
                                 let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
                                 let keys = schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
                                 let order = schema
@@ -1766,5 +1846,113 @@ impl Database {
             files.entry(path_partition_value(&uri, "project_id").unwrap_or("default").to_string()).or_default().push(uri);
             files
         }))
+    }
+}
+
+#[cfg(test)]
+mod immutable_audit_tests {
+    use super::*;
+
+    fn logs_schema() -> &'static crate::schema::TableSchema {
+        crate::schema::get_schema("otel_logs_and_spans").expect("the real shipped schema")
+    }
+
+    /// `COUNT(DISTINCT c)` ignores nulls, so on its own it cannot see the shape
+    /// enrichment actually produces: a column absent on the first emit and
+    /// filled on the retry. The null-transition term is what makes the audit
+    /// answer the question it was written for, and it must be TWO-SIDED — a
+    /// group whose column is null in every version agrees perfectly and must not
+    /// be counted.
+    #[test]
+    fn the_audit_catches_a_null_to_value_transition_not_just_differing_values() {
+        let sql = Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns");
+        assert!(sql.contains("COUNT(DISTINCT"), "differing non-null values are caught");
+        assert!(
+            sql.contains("> 0 AND COUNT(") && sql.contains("< COUNT(*)"),
+            "a null-in-some-versions transition is caught, and only when the column is set in at least one: {sql}"
+        );
+    }
+
+    /// The grouping columns cannot disagree with themselves, and the tiebreak
+    /// and tombstone vary across versions BY CONSTRUCTION — auditing them would
+    /// report every duplicated key in the table as a violation, which is the
+    /// most expensive kind of false alarm: one that is always firing.
+    #[test]
+    fn the_audit_skips_columns_that_vary_by_construction() {
+        let schema = logs_schema();
+        let sql = Database::immutable_audit_sql(schema, "scan", "true").expect("logs declare immutable columns");
+        let grouped = schema
+            .dedup_keys
+            .iter()
+            .map(String::as_str)
+            .chain(schema.dedup_tiebreak.as_deref())
+            .chain(schema.tombstone_column.as_deref())
+            .collect::<Vec<_>>();
+        assert!(!grouped.is_empty(), "the schema has dedup keys, or this test proves nothing");
+        for column in grouped {
+            assert!(
+                !sql.contains(&format!("COUNT(DISTINCT {})", crate::rollup::quoted(column))),
+                "{column} varies across versions by construction and must not be audited"
+            );
+        }
+    }
+
+    /// A schema with nothing auditable must yield no query at all, rather than a
+    /// `HAVING` with an empty predicate list that fails at plan time inside the
+    /// dedup rewrite it is riding on.
+    #[test]
+    fn a_schema_with_nothing_to_audit_produces_no_query() {
+        let mut schema = logs_schema().clone();
+        for field in &mut schema.fields {
+            field.mutable = true;
+        }
+        assert!(Database::immutable_audit_sql(&schema, "scan", "true").is_none(), "all-mutable schema has nothing to audit");
+    }
+
+    /// The assertions above check the SQL's SHAPE. This one runs it, because a
+    /// query that mentions the right aggregates and still does not execute — or
+    /// executes and counts the wrong groups — reports a comfortable zero, and a
+    /// zero from this audit is exactly what would be taken as "the hazard is not
+    /// real".
+    #[tokio::test]
+    async fn the_audit_query_actually_counts_disagreeing_keys() {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let mut schema = logs_schema().clone();
+        schema.fields.retain(|field| ["id", "level"].contains(&field.name.as_str()));
+        schema.fields.iter_mut().for_each(|field| field.mutable = false);
+        schema.dedup_keys = vec!["id".to_owned()];
+        schema.dedup_tiebreak = None;
+        schema.tombstone_column = None;
+        assert_eq!(schema.fields.len(), 2, "the trimmed schema has exactly the two columns this test reasons about");
+
+        let arrow = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true), Field::new("level", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            arrow.clone(),
+            vec![
+                //                 differing values   null -> value      agrees      all null
+                Arc::new(StringArray::from(vec!["a", "a", "b", "b", "c", "c", "d", "d"])),
+                Arc::new(StringArray::from(vec![
+                    Some("info"),
+                    Some("error"),
+                    None,
+                    Some("error"),
+                    Some("info"),
+                    Some("info"),
+                    None,
+                    None,
+                ])),
+            ],
+        )
+        .expect("batch");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_batch("scan", batch).expect("register");
+        let sql = Database::immutable_audit_sql(&schema, "scan", "true").expect("two immutable columns");
+        let count = Database::scalar_i64(&ctx, &sql).await.expect("audit runs").expect("one row");
+
+        assert_eq!(count, 2, "`a` differs outright and `b` goes null -> error; `c` agrees and `d` is null throughout ({sql})");
     }
 }

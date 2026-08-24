@@ -937,6 +937,18 @@ atomic_stats! {
     /// pending ALSO rises means units are being declined and then failing to
     /// run, which is worse than the shred, not better.
     split_declined_at_floor,
+    /// Dedup keys whose versions DISAGREE on a column declared immutable.
+    ///
+    /// Immutability is enforced for UPDATE only, so an INSERT can append a
+    /// disagreeing version; read filters on immutable columns are pushed below
+    /// the dedup on the strength of that declaration. Non-zero means the read
+    /// path's premise is false in production and a pushed predicate can match a
+    /// version the winner does not satisfy.
+    ///
+    /// Only counted while `timefusion_immutable_audit_enabled` is on, so ZERO
+    /// here means "not audited" just as loudly as it means "clean" — check the
+    /// flag before concluding anything.
+    immutable_column_disagreement_total,
     /// Base rollup files carrying no parseable slice tags — history written
     /// before tagging existed.
     ///

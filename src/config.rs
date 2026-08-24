@@ -2028,6 +2028,23 @@ pub struct MaintenanceConfig {
     /// the rewrite survive a restart at all.
     #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
+    /// Audit, during the dedup sweep, whether versions of one key disagree on a
+    /// column declared IMMUTABLE — see `FieldDef::mutable`.
+    ///
+    /// The declaration is enforced for UPDATE (`extract_dml_info` refuses to
+    /// assign an undeclared column) but NOT for INSERT: nothing stops a client
+    /// re-emitting a corrected record whose `level` differs from the version
+    /// already stored. Read filters on immutable columns are pushed BELOW the
+    /// merge-on-read dedup on the strength of that declaration, so a
+    /// disagreement makes a pushed predicate match a version the winner does not
+    /// satisfy — silently wrong results, no error and no metric.
+    ///
+    /// Default OFF because it is a second aggregate pass over each dedup shard,
+    /// one `COUNT(DISTINCT)` per audited column, on a memory-tight box. Turn it
+    /// on to find out whether the hazard is real before paying to fix it; the
+    /// answer lands in `immutable_column_disagreement_total`.
+    #[serde_inline_default(false)]
+    pub timefusion_immutable_audit_enabled: bool,
     /// Days back (plus today) the dedup sweep scans.
     // 128: a lower bound put a multi-day floor under the backlog, but a much
     // higher one OOM'd the box — RSS climbed independent of query load, tracking
