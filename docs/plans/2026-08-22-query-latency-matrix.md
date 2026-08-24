@@ -1563,3 +1563,46 @@ the date is hashed — while `08-21` STORED is `ab0d38e1…`, a different family
 entirely. The spec change is visible in the prefix alone, which makes this a
 cheap spot-check for the future: compare a stored generation against its
 neighbours' expected values.
+
+## THE REBUILD WILL NEVER HAPPEN — the planner cannot see orphaned coverage
+
+`partitions_of` (src/database/maintain.rs:679) builds the planner's `covered` set
+from file paths and non-emptiness alone:
+
+```rust
+if partition_file_is_empty(...) { return None; }
+let (project, date) = maintenance_partition_from_action(&file.path(), ...)?;
+Some((project, date))
+```
+
+It never consults the generation tag or the `rollup_generation` column. So a date
+whose files exist but carry a superseded generation **looks covered**, is never
+added to `want`, and is never re-derived.
+
+The full causal chain, now closed:
+
+1. A spec edit changes `generation_id`.
+2. Existing files keep the old generation.
+3. The read path filters `rollup_generation = <current>` → those dates go dark.
+4. The planner sees the date partitions → believes them covered → never re-enqueues.
+5. **They stay dark permanently**, until something unrelated rewrites those partitions.
+
+It is not that the rebuild is slow. There is no rebuild. That is why project
+`00000000…` still shows stale generations on every pre-08-22 date after hours,
+while other projects' publishes made it look like progress.
+
+**And the same blind spot feeds the gauge.** `contiguous_days` is computed from
+this same `covered` set, which is exactly why it reports 30 while reads get ~2.
+The planner and the census share one wrong definition of "covered".
+
+**Fix direction — needs a decision, not a patch.** Making coverage
+generation-aware is correct, and the moment it ships it will enqueue roughly
+33 days x 13 projects of backfill at once. That is the "30-day rebuild" cost of a
+spec change, made explicit and paid deliberately rather than never. Options:
+   * generation-aware `partitions_of` (correct, expensive, immediate);
+   * a one-shot migration that enqueues only the orphaned range (bounded);
+   * accept the loss and let the 35-day horizon age it out — ~11 more days, after
+     which every remaining date is post-08-22 anyway.
+
+The third is free and self-limiting, and worth weighing seriously against the
+first two.
