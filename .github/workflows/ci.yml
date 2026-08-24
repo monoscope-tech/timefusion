@@ -172,6 +172,14 @@ jobs:
       - name: Test
         run: cargo nextest run --profile ci --locked --partition hash:${{ matrix.shard }}/2
 
+      # nextest does not run doctests, so nothing here ever did: two were broken
+      # on master for hours on 2026-08-23 (prod log output in an indented doc
+      # block, which rustdoc parses as Rust). Unpartitioned — doctests are cheap
+      # and splitting them by shard would only halve an already small step.
+      - name: Doctests
+        if: matrix.shard == 1
+        run: cargo test --doc --locked
+
       # libpq 18 sends a protocol-3.2 probe during startup. Exercise the real
       # client and its catalog meta-commands rather than only replaying SQL.
       - name: PostgreSQL 18 client smoke
