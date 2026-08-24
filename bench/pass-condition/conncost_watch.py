@@ -146,10 +146,18 @@ def analyze():
     # break and then correlating across it anyway is the same mistake with a
     # disclaimer attached.
     all_rows = rows
-    runs = [[all_rows[0]]]
-    for prev, row in zip(all_rows, all_rows[1:]):
-        restarted = float(row["runtime.uptime_seconds"] or 0) < float(prev["runtime.uptime_seconds"] or 0)
-        runs.append([row]) if restarted else runs[-1].append(row)
+
+    def up(row):
+        """Uptime, or None when the process could not report it — a row with no
+        uptime has no known process identity, so it can neither extend a run nor
+        be correlated against age. Treat it as a break, not as zero."""
+        v = row.get("runtime.uptime_seconds")
+        return float(v) if v not in (None, "") else None
+
+    runs = [[]]
+    for prev, row in zip([None, *all_rows], all_rows):
+        same_process = up(row) is not None and prev is not None and up(prev) is not None and up(row) >= up(prev)
+        runs[-1].append(row) if same_process else runs.append([row])
     rows = max(runs, key=len)  # `nums` reads this name — late binding is deliberate
 
     ups = nums("runtime.uptime_seconds")
