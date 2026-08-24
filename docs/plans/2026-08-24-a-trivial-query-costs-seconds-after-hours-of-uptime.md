@@ -111,11 +111,21 @@ mid-run means the samples either side are different processes.
 **The quiet window, and who it binds.** Phase 0 and "push to master often" are
 in direct conflict: master deploys, a deploy restarts prod, and a restart voids
 the series. So the instrumentation above was front-loaded into one push
-(`5e7934b`, 2026-08-24) and the window starts with the process that deploy
-brings up. **Any push to master that touches code resets the clock** (`deploy.yml`
-`paths-ignore` already exempts docs-only pushes, for this exact reason) — the
+(`5e7934b`, 2026-08-24). **Any push to master that touches code resets the
+clock** (`deploy.yml` `paths-ignore` already exempts docs-only pushes, for this
+exact reason) — the
 sampler keeps running and `--analyze` will simply report a shorter longest-run.
 Nobody has to coordinate; they only have to know that a deploy is not free here.
+
+**A code push costs *two* restarts, not one, whenever autofmt has something to
+say.** The autofmt workflow runs on every master push and commits its `cargo
+fmt` / `clippy --fix` output as a **new code commit**, which deploys on its own
+~25 min later. `5e7934b` did exactly this (`83423ee`, two cosmetic
+reformattings of the new instrumentation), so the window in practice starts with
+the *autofmt child*, not the commit that was pushed. The rule that generalizes:
+**a quiet window starts after a code push that autofmt leaves alone.** Anyone
+reading a first uptime reset here should check for an autofmt child before
+concluding someone violated the window.
 
 The 2026-08-24 baseline against the *pre*-instrumentation binary, for reference:
 `connect=2147 ms`, `query=1269 ms`, `reuse=749 ms` at host load 27.5 — the
