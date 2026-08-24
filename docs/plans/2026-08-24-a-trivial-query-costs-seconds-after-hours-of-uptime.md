@@ -399,6 +399,37 @@ why 30 quiet minutes at load 44.7 cost nothing. It is a hypothesis, not a
 result: the test is whether spikes disappear now that the sampler no longer
 triggers deploys, and that test runs itself from here.
 
+### The quiet window: 0 slow samples of 15, and hypothesis 3 decoupled too
+
+Since the sampler stopped triggering deploys: **15 samples, none above 800 ms**,
+against 4 of 17 before. That includes a continuous 36-minute run at loads up to
+44.7. The spike-free period is exactly the deploy-free period.
+
+One sample in it retires the remaining suspect. At uptime 524 s,
+`delta_snapshot_refresh.avg_us` read **403,842** — the refresh got roughly five
+times more expensive than its usual ~80 ms — and `connect` was **305 ms**,
+completely unmoved. So the earlier co-movement of refresh cost and query cost was
+not causal; both were downstream of the deploy churn. Hypothesis 3 survives only
+as "some state grows" and no longer as an explanation of query cost.
+
+**What this does not explain, and I am not going to pretend otherwise:** the
+observation that opened this plan was a **5-hour-old** process at 4,748 ms with
+no deploy in progress. Nothing in this window got past 36 minutes of uptime, so
+that regime was never reproduced. The honest state is two separate claims:
+
+1. **Established here** — spikes of 1.4–3.7 s on a *young or mid-life* process
+   are deploy churn: a new container replaying WAL while the old one serves.
+   Instrumented, replicated four times, and gone once the churn stopped. This is
+   also, retroactively, what most of the plan's own §1/§2 samples were: that
+   session ran eight images in a working day.
+2. **Untested** — whether a genuinely long-lived process degrades. It needs prod
+   to stay up for hours, which is now more likely (bench pushes no longer
+   deploy) but is not something this work can force.
+
+The mitigation the plan hypothesized for a "cost tracks uptime" outcome — a
+scheduled restart — would have been actively harmful: **restarts are the thing
+that produced every stall measured here.**
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
