@@ -179,9 +179,13 @@ Phase-0 day has accumulated:
 
 Two things follow immediately, and both narrow the plan:
 
-- **Hypothesis 2 is effectively dead.** Zero wait across 4,017 acquisitions and
-  a 22 ms worst hold. The journal mutex neither blocks queries directly (no
-  caller in the read path) nor indirectly (it does not hold a worker).
+- ~~**Hypothesis 2 is effectively dead.** Zero wait across 4,017 acquisitions and
+  a 22 ms worst hold.~~ **RETRACTED 29 minutes later — see below.** That verdict
+  was read off a 198-second-old process, which is the single trap this repo
+  keeps falling into ([[tf_young_process_reads_as_fixed_2026-08-23]]): a
+  young process reads as healthy. The half that survives is structural and
+  does not depend on age — no `journal()` caller exists in the read path, so
+  nothing queues *on the lock*.
 - **Worker starvation is not exclusive to old processes.** 2.8 s of max lag
   inside the first 198 seconds means whatever blocks workers also blocks them
   when the process is new — so lag alone will not separate age from load either.
@@ -208,6 +212,38 @@ slow state to build".
 of every query on a process three minutes old, and hypothesis 3 predicts it
 grows. It is a wall-time row, so it is not a starvation claim; the point of
 watching it is the slope.
+
+### The same process 29 minutes later (uptime 1,917 s) — everything grew
+
+One process, no restart, nothing redeployed. Cumulative averages understate the
+change, so these are **marginals over the interval** (delta total ÷ delta count):
+
+| | 198 s | 1,917 s | |
+|---|---|---|---|
+| `delta_snapshot_refresh` per call | 53.5 ms | **121.5 ms** | 2.3× |
+| `delta_snapshot_refresh` max | 253 ms | **1,344 ms** | 5.3× |
+| `journal_hold` per call | 1.54 ms | 2.24 ms | 1.5× |
+| `journal_hold` max | 22 ms | **1,580 ms** | 72× |
+| `journal_lock_wait` per call | **0.00 ms** | 0.21 ms | from nothing |
+| `journal_lock_wait` max | **0 ms** | **1,426 ms** | from nothing |
+| `scheduling_lag_max_ms` | 2,764 | 6,579 | 2.4× |
+
+**Hypothesis 2 is back, and hypothesis 1 with it.** A `std::sync::Mutex` held
+1.58 s occupies a runtime worker for 1.58 s, and somebody waited 1.43 s to get
+it — on a process half an hour old, where 29 minutes earlier nobody ever waited
+at all. The read path still never takes this lock, so the damage is indirect
+(the worker, not the lock), which is exactly the surviving half of the
+refutation above and exactly the shape `scheduling_lag_ms` reports.
+
+**Hypothesis 3 is the cleanest signal so far.** `delta_snapshot_refresh` more
+than doubled per call, on the resolve path every query pays, at ~12 calls/min.
+Nothing about a `SELECT 1` should care, and the refresh cost scales with the
+active file list rather than with the query.
+
+Neither is proven — both moved while host load also rose, which is the
+confound Phase 0 exists to break. What *is* established is that all three
+suspects move on the timescale of **minutes**, so this does not need a 24-hour
+vigil to resolve.
 
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
