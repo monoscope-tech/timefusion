@@ -692,6 +692,40 @@ impl Database {
                 // and `tasks_pending` both read as progress on 2026-08-17 while
                 // 14d/30d queries stayed unroutable.
                 let (contiguous, worst_project, median_contiguous) = min_contiguous_days(&covered, &source_partitions, today, &active_projects);
+                // KNOWN DEFECT, 2026-08-24: this median is MIN-FOLDED across tiers
+                // just below, and a median that is then minimised is not a median
+                // of anything — it is "the typical project of the WORST tier".
+                //
+                // That defeats the reason the median exists. `coverage_is_short`'s
+                // own comment says it reads the median rather than the minimum so
+                // that "one negligible tenant pins it forever, holding the fleet in
+                // coverage-short mode". The per-project median fixes that at TENANT
+                // granularity; the cross-tier `.min()` below reintroduces exactly
+                // the same failure at TIER granularity.
+                //
+                // Measured: a new `dashboard_level_1m_v1` ramping at 2 days made the
+                // FLEET gauge read 2 while `dashboard_1m_v3`, `dashboard_1h_v2` and
+                // both otel_metrics tiers sat at 30. Threshold is COVERAGE_SHORT_DAYS
+                // = 14, so the cluster ran in coverage-short mode — which OVERRIDES
+                // the 25,000-task journal ceiling ("the goal outranks the ceiling"
+                // above) — because of an auxiliary tier nobody queries. Withdrawing
+                // that tier took both gauges back to 30, which is what identified the
+                // mechanism. ANY tier being rebuilt reproduces it; removing that tier
+                // cured the symptom, not this.
+                //
+                // NOT fixed here because the right aggregation is a design decision
+                // about what the reweighting is FOR, and each candidate has a real
+                // objection:
+                //   * median-of-medians across the sweep — matches the gauge's name
+                //     and the accumulate-then-publish-once pattern already used for
+                //     `base_tier_ready` below, but masks the case where a MINORITY of
+                //     tiers is genuinely starved and does need the override;
+                //   * exclude "young" tiers — needs a definition of young that will
+                //     not silently exclude a tier that has genuinely REGRESSED;
+                //   * restrict to query-serving tiers — closest to intent, but the
+                //     code has no notion of which tiers those are.
+                // Picking wrong does not crash anything; it quietly mis-weights
+                // maintenance, which is the slowest class of bug to see here.
                 let median_gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
                 let previous_median = median_gauge.load(std::sync::atomic::Ordering::Relaxed);
                 median_gauge
