@@ -486,6 +486,53 @@ That is the strongest disposal of hypothesis 2 available: the event it predicts
 happened, at the magnitude it predicts, and queries did not notice. The 48
 workers absorb it.
 
+### At ~108 minutes the slow regime arrived on its own — and hypothesis 4 is the live lead
+
+The flat stretch ended without a deploy. From uptime 6,494 s onward, five of six
+samples were slow, with **`reuse` slow too** (191–627 ms) — the whole-process
+signature, not the connection-only one:
+
+| uptime | load | connect | reuse | lag_ms | hold_max | refresh avg_us | charged |
+|---|---|---|---|---|---|---|---|
+| 4,449 s | 44.0 | **178 ms** | 45 ms | 0 | 1,064 | 179,821 | — |
+| 6,494 s | 43.0 | **852 ms** | 302 ms | 1 | 2,380 | 120,082 | 25.5 GB |
+| 6,704 s | 38.4 | 1,074 ms | 192 ms | 12 | 2,380 | 118,520 | 13.1 GB |
+| 6,993 s | — | 3,049 ms | 525 ms | 1 | 2,380 | 117,750 | 26.5 GB |
+| 7,399 s | 47.1 | 705 ms | 627 ms | 0 | 2,380 | 115,225 | 17.4 GB |
+| 7,611 s | 49.4 | 1,025 ms | 151 ms | 1 | 2,380 | 113,838 | 15.6 GB |
+
+Load 43.0 costs 852 ms here; load 44.0 cost 178 ms an hour earlier. So it is
+**not load**, and it is not the counters this plan built either — `hold_max` is
+frozen at 2,380, `refresh_avg_us` is *falling*, `pressure_pct` is 0–7, and
+`scheduling_lag_ms` is 0–1 through all of it. **TimeFusion's own runtime is not
+starved while its queries take 600 ms.**
+
+`top` on the host during the slow window says what the in-process counters
+cannot:
+
+    %Cpu(s): 37.7 us, 17.4 sy, 40.2 id, 4.3 wa
+    3740410 timefusion   861.5% CPU   18.9g RES
+    3617008 monoscope    430.8%       3940135 monoscope 407.7%
+    318     kcompactd    100.0%  (kernel memory compaction, pinned)
+    3623661 postgres     100.0%       3667422 postgres  100.0%
+    MiB Swap: 2048.0 total, 0.2 free, 2047.8 used
+
+Three facts together: **TimeFusion is now the top consumer at 861 %** (8.6 of 48
+cores, up from the 554 % §3 recorded), **`kcompactd` is pinned at 100 %**, and
+**swap is 100 % full** — while the box is still 40 % idle. Meanwhile
+`charged_bytes` oscillates between 13 GB and 26 GB every few minutes: TimeFusion
+is allocating and releasing ~13 GB repeatedly, which is precisely what drives
+kernel compaction pressure.
+
+**That makes hypothesis 4 the live lead, not the dead one.** Not "swap thrashing"
+as originally framed, but its neighbour: sustained multi-gigabyte allocation
+churn keeping `kcompactd` saturated, so allocation latency rises box-wide. It
+fits every observation the others failed — cost that ignores load, workers that
+are never starved, a `SELECT 1` that costs 600 ms, and an onset ~2 hours in
+rather than at a fixed age. The counters that would confirm it are jemalloc's
+own (fragmentation, dirty page decay), which this codebase has tangled with
+before.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
