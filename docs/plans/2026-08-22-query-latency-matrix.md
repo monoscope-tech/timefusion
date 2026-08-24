@@ -1413,3 +1413,38 @@ generation and so becomes recoverable into the coverage map.
 The caveat remains the deploy cadence: units are journaled so restarts do not
 lose the rebuild, but the coverage MAP is process-scoped, so routing only pays
 off for processes that live long enough to rebuild it.
+
+### The 08-22 boundary confirmed on a warm process — and my mechanism claim narrowed
+
+First valid routing reading of the session: a 19-minute-old process (the longest
+prod has survived), project `00000000…`:
+
+| window | result |
+|---|---|
+| 2026-08-23 (post spec change) | **hits+1** |
+| 2026-08-21 | hits+0 |
+| 2026-08-18 | hits+0 |
+| 2026-08-14 | hits+0 |
+
+The boundary is exact and matches the generation comparison. Routing works, and
+it works only for dates built since the spec changed.
+
+**But `stale_generation=0`, on both sources — so the counter I shipped does NOT
+catch this path.** It sits inside the `tagged` branch and therefore only sees
+slices that carry slice tags; among those, every generation matches. Pre-08-22
+files evidently predate slice tagging and never reach the check.
+
+So I over-claimed the mechanism. What is actually established:
+
+- **PROVEN:** the read SQL filters `rollup_generation = <current>`, and 08-18
+  rows carry `b3d661e1550311f3` while the current spec computes
+  `ea77658ff500170f`. Those rows cannot be selected regardless of coverage.
+- **PROVEN:** the read-path boundary sits exactly at the 08-22 spec change.
+- **NOT established:** that recovery skips them *via the generation check*. My
+  counter says it does not. Whether they are untagged, or absent from the branch
+  entirely, is open.
+
+Either fact alone explains the miss, so the operational conclusion is unchanged —
+but the instrument is in the wrong place for this failure, and `stale_generation`
+should not be read as "coverage lost to spec edits". It measures the tagged-
+mismatch case only, which is currently zero.
