@@ -3835,4 +3835,3 @@ mod coverage_ledger_tests {
         assert!(JsonCoverageLedger::load(dir.path()).coverage(&old).is_empty(), "retirement is durable, not in-memory only");
     }
 }
-
