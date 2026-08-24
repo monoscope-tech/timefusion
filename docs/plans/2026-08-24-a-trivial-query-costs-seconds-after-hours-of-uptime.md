@@ -342,6 +342,29 @@ spikes landing at ~8–9 minutes of uptime is a hint toward the former (the flus
 interval is 600 s), and it is only a hint — the other two slow samples sat at
 184 s and 722 s.
 
+**First four samples with the flush counters — and load alone is already not
+enough.** No spike landed in the window, but the quiet samples are informative:
+
+| uptime | load | connect | flushes | pressure_pct | refresh avg_us |
+|---|---|---|---|---|---|
+| 280 s | 25.5 | 397 ms | 0 | 9 | 76,765 |
+| 152 s | 23.4 | 356 ms | 0 | 8 | 150,398 |
+| 462 s | 33.2 | 344 ms | 30 | 5 | 86,115 |
+| 770 s | 39.4 | 412 ms | 61 | 5 | 86,074 |
+
+Thirty-one flushes completed between the last two samples — roughly six a
+minute, continuously — with `connect` flat at ~350–410 ms throughout. **Flushes
+are not by themselves a stall**, which weakens "our own flush burst" as the spike
+mechanism before any spike has even been caught with the counter attached.
+
+And `load1` alone is not sufficient either: **load 39.4 here cost 412 ms**, while
+slow samples sat at load 37–49. A monotone load→cost story would have predicted a
+stall at 39.4. So the live lead narrows again — to a *threshold* or a burst that
+`load1` averages away over its minute, not to load as a continuous driver.
+Sampling moved to 180 s to resolve how long a spike actually lasts, which is the
+next thing worth knowing: a stall that spans two adjacent samples is a different
+animal from one that fits inside a single 6-rep probe.
+
 This reorders the hypothesis table: **1 and 2 are eliminated for the spikes**
 (directly, with the instrument built for them), 3 survives only as "state grows"
 without yet explaining cost, and the live lead is contention — which is the
