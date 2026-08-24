@@ -2034,3 +2034,56 @@ Items 1, 2 and 4 all attack the same thing from different sides: a pass that
 cannot finish inside prod's ~15-minute restart window. 1 stops the slow pass
 blocking the fast ones, 4 removes the largest chunk of the slow pass's own cost,
 and 2 stops manufacturing deferred work that arrives in one lump at midnight.
+
+---
+
+# TODO — start here next session
+
+Everything below `0bdeddf` is **unverified**: it shipped minutes before the
+session closed, and prod's ~15-minute restart cadence makes any number taken
+inside one window meaningless. Read
+[[tf_young_process_reads_as_fixed_2026-08-23]] before quoting a rate, and check
+`docker service ps` uptime first.
+
+## P0 — verify what shipped (`0bdeddf`, plus `34508ee` / `6691031` / `c59487f`)
+
+| # | Item | Pass condition | Why it could bite |
+|---|---|---|---|
+| 1 | Concurrency did not cause an OOM | no `exit 137` in `docker service ps` after several cycles | 3 concurrent passes each hold a live-file list + a 64 MB writer arena; this box has been killed at ~125 GB anon |
+| 2 | `skip_today` change works on rollup tiers | `skipped_today=0` on `1m_v3` (was 690); `today` stops accumulating ~1,600 files that wait for midnight | predicate is the synthesized `rollup_generation` column — if a tier ever loses that column the table silently becomes "hot-packed" |
+| 3 | The GC bound does not starve the tail | `tantivy_reconcile_gc_deferred` absent or small | if it fires every pass, 120s is too tight and the deferred projects are never collected |
+| 4 | `older` finally drains | falling faster than the ~100/hr measured at 00:46 (5,305 => ~50h to clear at that rate) | items 1 and 4 should multiply the slots a rollup table actually gets |
+
+## P1 — the question this session never answered
+
+| # | Item | Stake |
+|---|---|---|
+| 5 | **Are rollup tantivy indexes ever READ?** | Rollup tiers are **52% of the indexed file population** (4,906 of 9,456 live files). Every attempt to get a dashboard query to route to a rollup failed (coverage is process-scoped and prod kept restarting), so this is genuinely open. If nothing `text_match`es them, half the coverage obligation is waste and the fix is one line. |
+| 6 | Is the `..f` inheritance in `RollupSpec::synthesize` intended? | Rollup dimensions inherit `tantivy: { indexed: true }` from the spans schema via struct-update syntax, while the `plain()` helper directly above it explicitly sets `tantivy: None`. Looks accidental. Answering #5 answers this. |
+
+**How to answer #5 without guessing:** `EXPLAIN` a dashboard query that actually
+routes (needs a process whose rollup coverage map has rebuilt — ~1h uptime), and
+look for a tantivy prefilter on the rollup `TableScan`. `strip_index_hints` is
+matcher-scoped and does **not** settle it; I checked, and it points the other way.
+
+## P2 — structural
+
+| # | Item | Note |
+|---|---|---|
+| 7 | Deploy cadence vs unit length | Prod restarts every ~15 min; maintenance units average ~21 min. Every fix this session worked *around* this. It is the standing tax on all maintenance work, not a tantivy problem. |
+| 8 | Re-tune the pass bounds now that passes run concurrently | 3 x 320 files x 2048 MB is a very different peak than the sequential case those numbers were sized against. |
+| 9 | `skip_today` on the spans table | Left ON. Correct only if the hot-tail packer really does rewrite those files; worth confirming rather than inheriting the assumption. |
+| 10 | Close this plan as superseded | The per-day index was the original goal. The real defects were serial-loop starvation and a cap sized on the wrong population — building a per-day index would have fixed neither. |
+
+## P3 — hygiene
+
+| # | Item |
+|---|---|
+| 11 | Attribute the `older` inflow spikes — ~800 files in 15 minutes at 23:31. Routine or one-off? Decides whether the new capacity headroom is actually enough. |
+| 12 | **Doctests are not in CI.** `cargo nextest` does not run them, so two were broken on master for hours. Add `cargo test --doc` to `ci/checks.tsv` + `run_body` (they must change together — `make ci-selftest` enforces it). |
+| 13 | Add a `_last_checkpoint` / `numOfAddFiles` bound to any file-count metric. One command would have caught the phantom-backlog error that cost a shipped-and-reverted change. |
+
+## Recommended order
+
+P0 tomorrow on a process with >40 min uptime, then **#5 before any further
+tantivy work** — it could delete half the problem rather than optimise it.
