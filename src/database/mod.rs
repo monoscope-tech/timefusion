@@ -11972,6 +11972,14 @@ mod tests {
             recorded.iter().all(|entry| entry.end_micros > entry.start_micros),
             "slice ends are exclusive and must be after their start: {recorded:?}"
         );
+        // Coverage without file identity could never REPLACE the tags, only
+        // supplement them — selection would still read tags, so files could not
+        // become anonymous and the tier could not be compacted, which is the
+        // reason for moving coverage off files at all.
+        assert!(
+            recorded.iter().all(|entry| !entry.files.is_empty()),
+            "every recorded range names the files that serve it: {recorded:?}"
+        );
 
         // The verifier is the reason this replay survives once reads move onto
         // the ledger, so it has to be right in BOTH directions. Nothing changed

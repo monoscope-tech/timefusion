@@ -3212,6 +3212,7 @@ impl Database {
                                     generation: generation.to_owned(),
                                     source_fingerprint: source_fp,
                                     source_rows: source_rows.and_then(|rows| i64::try_from(rows).ok()),
+                                    files: vec![action.path.clone()],
                                 },
                             ));
                         }

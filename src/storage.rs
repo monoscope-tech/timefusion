@@ -3616,6 +3616,21 @@ pub struct CoverageEntry {
     /// no witness, which every read must treat as unverifiable rather than
     /// fresh.
     pub source_rows: Option<i64>,
+    /// The tier files that SERVE this range.
+    ///
+    /// Without this the ledger can say a range is covered but not what to read
+    /// for it, so file selection would still have to come from the tags and the
+    /// tags could never be dropped — the ledger would be a supplement rather
+    /// than a replacement, and files would stay non-anonymous and therefore
+    /// non-compactable, which is the whole point of moving coverage off them.
+    ///
+    /// It is also what makes an on-demand slice split possible later: a hole
+    /// inside a wide covering file cannot be republished today because the file
+    /// physically holds the hole's rows and re-tagging does not remove them, so
+    /// both copies would be summed. Naming files per range is the prerequisite
+    /// for a reader that can prefer one over the other.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 /// `(source, project_id, tier table, date)` — the partition a coverage entry
@@ -3681,6 +3696,12 @@ pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
                     (Some(a), Some(b)) => Some(a.saturating_add(b)),
                     _ => None,
                 };
+                // Union, not replace: a merged range is served by every file
+                // that served any part of it, and dropping one would make the
+                // ledger describe a range it cannot actually produce.
+                last.files.extend(entry.files);
+                last.files.sort_unstable();
+                last.files.dedup();
             }
             _ => merged.push(entry),
         }
@@ -3792,7 +3813,14 @@ mod coverage_ledger_tests {
     use super::*;
 
     fn entry(start: i64, end: i64, generation: &str, rows: Option<i64>) -> CoverageEntry {
-        CoverageEntry { start_micros: start, end_micros: end, generation: generation.to_owned(), source_fingerprint: 7, source_rows: rows }
+        CoverageEntry {
+            start_micros: start,
+            end_micros: end,
+            generation: generation.to_owned(),
+            source_fingerprint: 7,
+            source_rows: rows,
+            files: vec![format!("{start}-{end}.parquet")],
+        }
     }
 
     fn cell() -> CoverageCell {
@@ -3808,6 +3836,7 @@ mod coverage_ledger_tests {
         assert_eq!(merged.len(), 1, "adjacent slices of one generation are one range");
         assert_eq!((merged[0].start_micros, merged[0].end_micros), (0, 20));
         assert_eq!(merged[0].source_rows, Some(7), "the witness is the sum of what was merged");
+        assert_eq!(merged[0].files.len(), 2, "a merged range is served by every file that served any part of it");
     }
 
     /// Different generations were built from different source content. Merging
