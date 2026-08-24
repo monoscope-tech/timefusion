@@ -16,9 +16,14 @@ later data overturned. The net result, as of 2026-08-24 22:00:
    times, and gone once the churn stopped. **My own pushes to the benchmark
    script were causing it**: `deploy.yml` exempted `docs/**` and `**/*.md` but
    not `bench/**`. Fixed (`9ab6b00`).
-2. **A connection-setup stall that survives a quiet box** — `connect` 1,450 ms
-   with a warm `SELECT 1` at 77.5 ms, DNS and TCP normal, load 30.6, no deploy.
-   Rare (~1 in 26 samples) and **open**.
+2. **A server-side stall in the pgwire startup exchange** — **localized**: the
+   container's own healthcheck, over *loopback*, sees `auth_ms` of 470–1,423 ms
+   while `connect_ms` and `write_ms` are 0 and handler construction maxes at
+   4 ms. Not the network, not the haproxy, not auth logic, not handler build.
+   Frequent (2 of 3 sampling windows), and it explains the external
+   connect-only stalls. Leading hypothesis for the remaining gap: the
+   connection's task is not polled promptly —
+   `scheduling_lag_max_ms` is 2.8–8.2 s in the same processes.
 
 **Eliminated, each with the instrument built for it:** host load (44.0 → 178 ms
 versus 32.9 → 4,460 ms — both directions); the maintenance journal mutex (held a
@@ -699,6 +704,40 @@ address space grows roughly 7× over an hour of uptime. That is the first
 quantity found that genuinely accumulates with age — which is what "state grows
 in-process" was always looking for, though it is address space rather than
 resident memory, so it costs no RSS and is not yet tied to query cost.
+
+### VERDICT on the connection stall: server-side, entirely in the startup exchange
+
+The container's own healthcheck runs the same pgwire startup+auth exchange every
+5 seconds **over loopback**, and reports it split by stage. Sampling the worst of
+its last five probes alongside every external sample:
+
+| my `connect` (internet) | in-container `total` | `connect_ms` | `write_ms` | **`auth_ms`** |
+|---|---|---|---|---|
+| 149 ms | **1,423 ms** | 0 | 0 | **1,423** |
+| 160 ms | **470 ms** | 0 | 0 | **470** |
+| 172 ms | 1 ms | 0 | 0 | 1 |
+
+**The stall is real, server-side, and 100 % of it is `auth_ms`** — the window
+between "startup packet written" and "auth response read". Over loopback, so
+the network, the haproxy and my laptop's path are all excluded by construction.
+`connect_ms = 0` excludes the accept itself. And `block.pgwire_*_handler_build`
+maxes at 2–4 ms, so it is not handler construction; auth is a string compare, so
+it is not the credential check.
+
+Note the first two rows: my external `connect` was **fast** (149–160 ms) while
+the server was stalling. The two are near-independent, which is why 26 external
+samples found this once — I was sampling a frequent server-side event through a
+narrow, badly-timed window. **The healthcheck was a better instrument than the
+one I built, and it was already running.**
+
+What remains inside that window is the connection's task being polled at all,
+plus pgwire's own startup processing (parameter status, ready-for-query). The
+scheduling reading supports the former: `scheduling_lag_max_ms` sat at
+2,764–8,177 ms in these same processes while the instantaneous
+`scheduling_lag_ms` read 0–1 ms — multi-second polling gaps that a 500 ms timer
+sampler almost always misses. That is a *hypothesis*, not a result: the sampler
+now records `inproc_auth_ms` and `scheduling_lag_max_ms` on the same row, and
+their correlation is the next thing to read.
 
 **What to do next, in order:**
 1. Let the process keep ageing with the host columns recording. The question is
