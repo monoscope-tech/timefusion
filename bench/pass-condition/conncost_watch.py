@@ -180,6 +180,22 @@ def analyze():
             line.append(f"{driver.split('.')[-1]}: r={statistics.correlation(x, y):+.2f}")
         print("  " + "   ".join(line))
     print("\n  r near +1 for exactly one driver is the answer; both high means they are still confounded.")
+
+    # The spikes are the phenomenon, and a correlation over 5 samples hides
+    # them: one sample went 270 -> 2,960 -> 252 ms while uptime rose
+    # monotonically. So print the worst sample beside its neighbours — what
+    # moved WITH it is the lead, and what didn't move is eliminated.
+    # Only rows carrying in-process context can implicate anything, so a
+    # pre-instrumentation row is never "the worst" here however slow it was.
+    with_ctx = [r for r in all_rows if up(r) is not None]
+    worst = max(with_ctx, key=lambda r: float(r["connect"] or 0))
+    i = all_rows.index(worst)
+    print(f"\n  worst `connect` sample and its neighbours (row {i} of {len(all_rows)}):")
+    for r in all_rows[max(0, i - 1) : i + 2]:
+        mark = "->" if r is worst else "  "
+        print(f"  {mark} up={r['runtime.uptime_seconds'] or '?':>6}s load={r['load1'] or '?':>6} connect={r['connect']:>8}ms reuse={r['reuse']:>7}ms "
+              f"lag={r['runtime.scheduling_lag_ms'] or '?'}ms refresh_avg_us={r['section.delta_snapshot_refresh.avg_us'] or '?'} "
+              f"hold_max={r['block.journal_hold.max_ms'] or '?'}ms")
     for c, k in STATS:
         v = nums(f"{c}.{k}")
         if v and max(v) != min(v):

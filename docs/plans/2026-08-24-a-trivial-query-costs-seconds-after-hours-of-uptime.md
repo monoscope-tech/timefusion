@@ -293,6 +293,42 @@ Meanwhile the in-process counters keep climbing within every run
 minutes), so "state grows" and "queries get slower" are, so far, *not* the same
 statement.
 
+### The spike caught in-flight — three samples, one process, drivers separated
+
+Correlations over a plateau hide the thing that matters, so `--analyze` now
+prints the worst `connect` sample beside its neighbours. All three below are the
+**same process**, five minutes apart:
+
+| uptime | load | connect | reuse | `scheduling_lag_ms` | `refresh.avg_us` | `journal_hold.max_ms` |
+|---|---|---|---|---|---|---|
+| 170 s | 20.7 | 270 ms | 74 ms | 0 | 107,062 | 6 |
+| **505 s** | **41.3** | **2,960 ms** | **680 ms** | **1** | **175,138** | 615 |
+| 810 s | 33.8 | 252 ms | 70 ms | 0 | 144,271 | 1,186 |
+
+Four things fall out of one table:
+
+- **Age is not the driver.** Uptime rose monotonically while cost spiked 11× and
+  came back. Whatever this is, it is not accumulated state — the process was
+  *older* when it was fast again.
+- **Workers were not starved.** `scheduling_lag_ms` was 0 → 1 → 0 straight
+  through the spike. The "blocked workers while cores idle" story — hypothesis 1,
+  the best fit on paper — is **not** what is happening in this event.
+- **The journal mutex is eliminated for the spike.** `journal_hold.max_ms`
+  climbs monotonically (6 → 615 → 1,186) and is *highest* on the fast sample. It
+  grows with age; it does not track cost.
+- **What does track it: host load, and the Delta snapshot refresh.**
+  `refresh.avg_us` is cumulative, so a jump from 107 ms to 175 ms *average* means
+  the marginal refreshes during that interval were far more expensive. Query cost
+  and snapshot-refresh cost moved together, at peak host load, with no worker
+  starvation — which points at IO/CPU contention with the co-tenant processes
+  (the plan's own §3: monoscope was using ~15.8 of 48 cores) or at object-store
+  latency, not at anything TimeFusion accumulates.
+
+This reorders the hypothesis table: **1 and 2 are eliminated for the spikes**
+(directly, with the instrument built for them), 3 survives only as "state grows"
+without yet explaining cost, and the live lead is contention — which is the
+branch the plan predicted would mean *a restart buys nothing*.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
