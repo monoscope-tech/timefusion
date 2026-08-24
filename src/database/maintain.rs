@@ -312,6 +312,26 @@ impl Database {
                 warn!(retired, event = "maintenance_undeclared_tier_tasks_retired", "queued work for a tier no longer declared");
             }
         }
+        // Why the biggest debt in the fleet is not being worked on.
+        //
+        // `planned=N` alone cannot distinguish "nothing needs doing" from "the
+        // work is queued and never claimed", and prod 2026-08-24 was firmly the
+        // second: 48 out-of-policy cells and `out_of_policy_cells` unchanged
+        // across three object-storage censuses, while the top cell
+        // (`87576849 / 2026-08-19`, 238 small files) appeared in no log line of
+        // any kind for 73 minutes across three containers.
+        //
+        // Both hygiene operations, because they rank in the same pool but plan
+        // from opposite ends of the calendar — a cell that HotPacking treats as
+        // today is the one SealedConsolidation is waiting on tomorrow.
+        {
+            let journal = self.journal();
+            for operation in [Operation::SealedConsolidation, Operation::HotPacking] {
+                if let Some(refusal) = journal.most_indebted_unclaimed(operation, now) {
+                    info!(?operation, refusal, event = "maintenance_hygiene_debt_unclaimed", "the most indebted hygiene cell is not being claimed");
+                }
+            }
+        }
         for (storage_project, source, table_ref) in self.all_tables().await {
             if tiers.contains(&source) {
                 continue;

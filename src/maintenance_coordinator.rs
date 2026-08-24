@@ -1365,6 +1365,106 @@ impl TaskJournal {
         (pending, sealed, unproven, quarantined, not_due)
     }
 
+    /// The full claim order for one task: `(class, damaged, starved, hole,
+    /// width, benefit, recency)`. Smaller wins.
+    ///
+    /// `hole_rank` orders WITHIN a class: a cell whose tier output is missing
+    /// outranks one that already has output and is merely being re-derived.
+    /// Without it, sealed rollup work is strictly newest-first, and recent days
+    /// are re-invalidated continuously by ongoing publication — so the claim
+    /// never walks back far enough to reach an old hole. Prod 2026-08-19 09:00:
+    /// `94c5dc1f`'s 1h tier jumped 2026-07-31 -> 08-14 for a second day running,
+    /// while day-wide derived units for 08-17 were claimed repeatedly.
+    /// Newest-first is right for FRESHNESS and wrong for CONTIGUITY, and 30
+    /// contiguous days is a contiguity goal.
+    ///
+    /// DAMAGE leads its class, ahead of `starved`, because the starvation window
+    /// is a FRESHNESS heuristic and damage is not a freshness question.
+    /// `starved` is only set for work aged 3 to 31 days; every untagged file left
+    /// on prod 2026-08-23 was 32 to 37 days old, so it fell outside the window
+    /// and ranked below the entire ~12,000-unit backfill queue — unreachable in
+    /// practice, whatever `hole_rank` said, because `starved` is compared first.
+    ///
+    /// Damage does not order by width OR recency — every damage unit ties, so the
+    /// per-project cursor in `claim_next` rotates across the damaged CELLS
+    /// instead of draining one to exhaustion. Both width orderings starve.
+    /// `-width` (widest first) buried the narrow repair units: prod 2026-08-23
+    /// had three 5-8 minute units Pending at attempts=0 with deadlines nine hours
+    /// past, behind 800-1400 minute ladders of the same rank. Reversing it
+    /// starved the opposite end — the selection loop matches the winning tuple
+    /// EXACTLY, so ordering by width makes the single narrowest unit win every
+    /// claim, and one whale cell's shredded ladder always contains a narrower
+    /// child than another project's 3-minute hole. Five cells with 3-11 minute
+    /// holes sat untouched for eight hours while that one cell ground down its
+    /// ladder. Tying them puts every damage unit in one rank group, which is what
+    /// `fair_cursors` is for. `benefit` is carried through untouched — it is 0
+    /// for the rollup operations damage repair uses, so it cannot disturb the tie.
+    ///
+    /// A method rather than a closure inside `claim_next` so that a read-only
+    /// caller can ask why a unit is losing. See `most_indebted_unclaimed`.
+    fn rank(&self, task: &MaintenanceTask, now_micros: i64) -> Rank {
+        let (class, starved, width, benefit, order) = scheduling_class(task, now_micros);
+        let hole = self.hole_rank(task);
+        let (width, order) = if hole == 0 { (0, 0) } else { (width, order) };
+        (class, u8::from(hole > 0), starved, hole, width, benefit, order)
+    }
+
+    /// The unit holding the most DEBT that is not being claimed, and why.
+    ///
+    /// `claimability_census` counts why tasks are skipped; `first_refused_sealed`
+    /// names one. Neither can answer the question prod actually poses, for two
+    /// reasons: both sample the first 64 tasks in journal order, and when the
+    /// answer comes back `CLAIMABLE` — eligibility is fine, the refusal is in
+    /// ordering — neither says WHAT outranked it.
+    ///
+    /// That is the branch the worst cell on prod sits in. Measured 2026-08-24:
+    /// `87576849 / 2026-08-19` held 238 small files in 1.9 GB, the single largest
+    /// file-debt cell in the fleet, and read exactly 238 at four object-storage
+    /// censuses spanning a day. Searching 73 minutes of retained logs across
+    /// three containers for its slice returned nothing at all — not a start, not
+    /// a timeout, not a funnel event. `680acac` instrumented "a unit was claimed
+    /// and selected nothing"; nothing instrumented "a cell was planned and never
+    /// claimed", so the fleet's worst debt was invisible rather than explained.
+    ///
+    /// Selects by `input.files` — for hygiene that IS the debt, and it is what
+    /// the planner already counted — so the answer is about the cell that matters
+    /// rather than whichever one the journal happens to hold first.
+    pub fn most_indebted_unclaimed(&self, operation: Operation, now_micros: i64) -> Option<String> {
+        let eligible = || {
+            self.snapshot
+                .tasks
+                .iter()
+                .filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry))
+        };
+        let date_of = |task: &MaintenanceTask| {
+            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
+                .map_or_else(|| "?".to_owned(), |time| time.date_naive().to_string())
+        };
+        let worst = eligible().max_by_key(|task| task.input.map_or(0, |input| input.files))?;
+        let files = worst.input.map_or(0, |input| input.files);
+        // The reasons that live on the task itself, in the order `claim_next`
+        // applies them. Anything else means ordering, which is the case no
+        // existing instrument could name.
+        let reason = if worst.deadline_micros > now_micros {
+            "not_due".to_owned()
+        } else if Self::is_quarantined(worst) {
+            "quarantined".to_owned()
+        } else if !self.dependencies_complete(worst) {
+            "dependencies".to_owned()
+        } else {
+            let winner = eligible()
+                .filter(|task| task.deadline_micros <= now_micros && !Self::is_quarantined(task) && self.dependencies_complete(task))
+                .min_by_key(|task| self.rank(task, now_micros))?;
+            if winner.key == worst.key {
+                // It wins its own claims, so it is not being starved — whatever
+                // is wrong is downstream of selection, not in it.
+                return None;
+            }
+            format!("outranked_by:{:.8}:{}", winner.key.project_id, date_of(winner))
+        };
+        Some(format!("{reason}:{:.8}:{}:files={files}", worst.key.project_id, date_of(worst)))
+    }
+
     /// The first SEALED task of `operation` that `claim_next` would refuse, and
     /// why — as `(project, date, reason)`.
     ///
@@ -2013,33 +2113,9 @@ impl TaskJournal {
         //
         // Bounded and self-terminating: the set comes from files that exist and
         // empties as they are retired.
-        let rank = |journal: &Self, task: &MaintenanceTask| -> (u8, u8, u8, u8, i64, i64, i64) {
-            let (class, starved, width, benefit, order) = scheduling_class(task, now_micros);
-            let hole = journal.hole_rank(task);
-            // Damage does not order by width OR recency — every damage unit
-            // ties, so the per-project cursor below rotates across the damaged
-            // CELLS instead of draining one to exhaustion.
-            //
-            // Both width orderings starve. `-width` (widest first) buried the
-            // narrow repair units: prod 2026-08-23 had three 5-8 minute units
-            // Pending at attempts=0 with deadlines nine hours past, behind
-            // 800-1400 minute ladders of the same rank. Reversing it starved the
-            // opposite end — the selection loop matches the winning tuple
-            // EXACTLY, so ordering by width makes the single narrowest unit win
-            // every claim, and one whale cell's shredded ladder always contains a
-            // narrower child than another project's 3-minute hole. Five cells
-            // with 3-11 minute holes sat untouched for eight hours while that
-            // one cell ground down its ladder.
-            //
-            // Tying them puts every damage unit in one rank group, which is what
-            // `fair_cursors` is for.
-            // `benefit` is carried through untouched — it is 0 for the rollup
-            // operations damage repair uses, so it cannot disturb the tie.
-            let (width, order) = if hole == 0 { (0, 0) } else { (width, order) };
-            (class, u8::from(hole > 0), starved, hole, width, benefit, order)
-        };
-        let best_class = |journal: &Self, sealed_only: bool| -> Option<(u8, u8, u8, u8, i64, i64, i64)> {
-            let mut class: Option<(u8, u8, u8, u8, i64, i64, i64)> = None;
+        let rank = |journal: &Self, task: &MaintenanceTask| -> Rank { journal.rank(task, now_micros) };
+        let best_class = |journal: &Self, sealed_only: bool| -> Option<Rank> {
+            let mut class: Option<Rank> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_live_frontier(task.key.slice, now_micros))) {
                 let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
@@ -2576,6 +2652,9 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// frontier, plus the last two sealed days) ordered newest-first for freshness,
 /// and treats everything behind it as backlog to be drained oldest-first for
 /// contiguity.
+/// The claim-order tuple `claim_next` minimises: see `TaskJournal::rank`.
+type Rank = (u8, u8, u8, u8, i64, i64, i64);
+
 const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 /// ...and an UPPER bound, because an escape valve everything fits through is
 /// not an escape valve.
@@ -3967,6 +4046,60 @@ mod tests {
         // And benefit is hygiene-only — it must not perturb rollup ordering,
         // which damage repair relies on tying.
         assert_eq!(class(&cell("d", 60, 200, Operation::BaseRollup)).3, class(&cell("e", 60, 3, Operation::BaseRollup)).3);
+    }
+
+    /// "Planned and never claimed" must name what beat it.
+    ///
+    /// Prod 2026-08-24: `87576849 / 2026-08-19` held 238 small files — the
+    /// largest file-debt cell in the fleet — read exactly 238 at four
+    /// object-storage censuses spanning a day, and appeared in NO log line of any
+    /// kind across 73 minutes and three containers. `680acac` instrumented "a
+    /// unit was claimed and selected nothing"; this is the other branch, and it
+    /// was invisible rather than explained.
+    ///
+    /// The `outranked_by` arm is the one no existing instrument could reach:
+    /// `claimability_census` counts per-task reasons and `first_refused_sealed`
+    /// returns a bare `CLAIMABLE` — true, and useless, because the refusal is in
+    /// the ORDERING and neither reports the winner.
+    #[test]
+    fn the_most_indebted_hygiene_cell_names_what_outranks_it() {
+        const HOUR: i64 = 3_600_000_000;
+        const DAY: i64 = 24 * HOUR;
+        let now = 400 * DAY;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let cell = |project: &str, hours_ago: i64, files: u32| {
+            let end = now - hours_ago * HOUR;
+            let mut unit = task(project, end - DAY, end, Operation::SealedConsolidation);
+            unit.input = Some(InputFootprint { fp: 1, whole_file_bytes: 1, files });
+            unit
+        };
+        // The prod shape: the biggest debt is OLD, so it is inside the starvation
+        // band; a much smaller cell sealed yesterday is still the live frontier
+        // and takes class 0, which is strict priority.
+        let indebted = cell("bigdebt", 120, 238);
+        journal.upsert(indebted.clone());
+        journal.upsert(cell("frontier", 1, 3));
+
+        let refusal = journal.most_indebted_unclaimed(Operation::SealedConsolidation, now).expect("the debt is not being claimed");
+        assert!(refusal.starts_with("outranked_by:frontier"), "it must name the winner, not merely say CLAIMABLE — got {refusal}");
+        assert!(refusal.contains("files=238"), "and it must carry the debt that makes it worth reporting — got {refusal}");
+
+        // Eligibility reasons still win over the ordering answer, because they
+        // are actionable on the task itself.
+        let mut not_due = indebted.clone();
+        not_due.deadline_micros = now + DAY;
+        journal.upsert(not_due);
+        assert!(
+            journal.most_indebted_unclaimed(Operation::SealedConsolidation, now).is_some_and(|why| why.starts_with("not_due:")),
+            "a future deadline explains it without appealing to ordering"
+        );
+
+        // And silence when there is nothing to explain: the biggest debt winning
+        // its own claims is the healthy state, not a finding.
+        let mut alone = TaskJournal::load(dir.path()).expect("journal");
+        alone.upsert(cell("bigdebt", 120, 238));
+        assert_eq!(alone.most_indebted_unclaimed(Operation::SealedConsolidation, now), None);
     }
 
     #[test]
