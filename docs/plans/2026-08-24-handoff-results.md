@@ -32,9 +32,23 @@ Five samples over 63 minutes, spanning three deploys:
 | 11:22 | `0bdeddf` | 37 min | 930 | 435 | 14,488 |
 | 11:38 | `8c37d37` | 4 min | 933 | 435 | 14,498 |
 | 11:53 | `5e7934b` | 4 min | 928 | 435 | 14,541 |
+| 12:13 | `5e7934b` | 25 min | 924 | 435 | 14,563 |
+| 12:28 | `1e42237` | 1 min | 924 | 435 | 14,572 |
+| 12:44 | `1e42237` | 16 min | **980** | 435 | 14,589 |
 
-- **Sealed units: 931 -> 928, oscillating +-3.** Not draining, not even slowly.
-- **Sealed cells: 435, unchanged in every single sample.** Not one cell retired.
+- **Sealed cells: 435 in every one of eight samples**, across six deploys, 115
+  minutes, and one 38-minute quiet stretch. Not one cell retired, ever. This is
+  the result; everything else is commentary on it.
+- **Sealed units do not trend, they oscillate: 931, 928, 930, 933, 928, 924, 924,
+  980.** The last step is +56 in 16 minutes — and **inflation moved 2.12x -> 2.25x
+  in the same step, with cells fixed at 435**. The queue grew 6% without a single
+  new cell entering it, which is only possible by splitting units that were
+  already there. That is the shred signature, live, and it means the unit count
+  is not a backlog measure at all.
+
+A deploy pause was attempted mid-session and **held for 38 minutes** before the
+sixth deploy (`1e42237`, 12:27). It changed nothing measurable: the two samples
+inside it moved sealed by −4 and cells by 0.
 - `complete_base_rollup` +73 in 63 min = **~70 completions/hr**, and the sealed
   count did not move, so essentially all of it is the live frontier — which
   ingest replenishes. `pending_base_rollup` (journal) went 1,619 -> 1,685 in the
@@ -169,8 +183,31 @@ reading — busy or idle, 2.4 s to 8.7 s — is 12x to 43x the baseline. The one
 thing common to all of them is that p1's files are being rewritten underneath it.
 
 **That prediction is now untestable as written.** The plan says to re-run p1 "after
-its out-of-policy cells reach zero". Per §5 below, p1's largest cell has not been
-claimed once in seven hours, so it will not reach zero on its own.
+its out-of-policy cells reach zero". Per §5 below, p1's largest cell is never
+claimed, so it will not reach zero on its own.
+
+### The warm arm settles half of it
+
+Third arm, added 12:13 UTC on a MATURE container (`5e7934b`, 24 min old,
+`tasks_running = 16` — busy, but with a warm cache). Three consecutive reps of the
+same query on one connection:
+
+| p1 `87576849` | baseline | rep 1 | rep 2 | rep 3 |
+|---|---|---|---|---|
+| throughput 3d | 3,297 ms | 8,706 | 3,746 | **3,293** |
+| throughput 1h | 199 ms | 1,783 | 3,034 | 2,592 |
+
+**The 3d regression is cold cache, and nothing else.** Rep 3 lands at 3,293 ms
+against a 3,297 ms baseline — a 4 ms difference after a reported 2.5x regression.
+Repetition alone recovers it completely, on a box with all 16 maintenance workers
+running. That rules out contention AND rules out any read-path change shipped this
+session as the cause of the wide-window numbers.
+
+**The 1h shape is a separate, unexplained problem.** It does not recover with
+warmth — it gets worse across reps (1,783 -> 3,034 -> 2,592) and stays ~9x the
+199 ms baseline. A narrow window is the cheapest possible query, so whatever this
+is, it is not scan volume and not cache. This is the residual worth chasing, and it
+is a much smaller question than "why did everything regress".
 
 ## 4. p1 30-day `log_list` OOM — reproduces, untouched
 
@@ -204,7 +241,16 @@ the deployed image) and confirmed working:
   candidates, and one SealedConsolidation cell holding exactly one file for that
   project/date. No fourth silent-refusal variant.
 - **Object storage agrees.** Small files fleet-wide: 1,772 (pre-fix) -> 1,273
-  (v500674) -> **1,170** (v500735). 48 out-of-policy cells.
+  (v500674) -> **1,170** (v500735, 11:15) -> **1,148** (v500838, 12:30).
+
+A third census at 12:47 (v500856) read **1,148 again — zero files retired in 17
+minutes** — and `out_of_policy_cells` was 48 in all three.
+
+So object storage tells the same story as the journal, with an independent
+instrument: **−22 files in 75 minutes, then 0 in 17, and the cell count never
+moves.** Files trickle out of the small cells; the large ones do not lose a single
+file. `87576849 / 2026-08-19` has read exactly 238 at four census points spanning
+a day.
 
 **The residual is not a refusal, it is a claim.** `87576849 / 2026-08-19` holds
 **238 small files in 1.9 GB — the single largest file-debt cell in the fleet** —
