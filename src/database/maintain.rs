@@ -856,10 +856,8 @@ impl Database {
             // age out of the 35-day horizon instead of being rebuilt days before
             // they leave it.
             if let Some(cursor_was) = self.journal().repair_orphaned_coverage_once()
-                && let (Ok(from), Ok(before)) = (
-                    chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"),
-                    chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"),
-                )
+                && let (Ok(from), Ok(before)) =
+                    (chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"), chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"))
             {
                 let mut forced = 0usize;
                 for (project, date) in &candidates {
@@ -869,8 +867,11 @@ impl Database {
                     }
                 }
                 warn!(
-                    source, forced, cursor_was,
-                    from = ORPHAN_REPAIR_FROM, before = ORPHAN_REPAIR_BEFORE,
+                    source,
+                    forced,
+                    cursor_was,
+                    from = ORPHAN_REPAIR_FROM,
+                    before = ORPHAN_REPAIR_BEFORE,
                     event = "rollup_orphaned_coverage_repair",
                     "re-enqueueing coverage a spec change orphaned and the planner cannot see"
                 );
