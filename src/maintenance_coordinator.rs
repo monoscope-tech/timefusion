@@ -672,7 +672,15 @@ impl TaskJournal {
     /// that never ran.
     const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v2";
     /// Bump to re-run the orphaned-coverage repair after a FUTURE spec edit.
-    const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v1";
+    ///
+    /// v2: v1 consumed `otel_logs_and_spans`'s cursor without its enqueue taking
+    /// effect — prod logged the repair for `otel_metrics` (forced=197) and never
+    /// for `otel_logs_and_spans`, which is the source holding the orphaned cells.
+    /// The claim persists its cursor BEFORE the caller does the work precisely so
+    /// a crash cannot loop; the cost of that choice is that a pass which claims
+    /// and then does not enqueue burns the one-shot. Bumping is the intended
+    /// recovery, and re-enqueueing is idempotent at the journal.
+    const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v2";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
