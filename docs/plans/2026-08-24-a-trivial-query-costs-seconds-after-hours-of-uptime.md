@@ -260,6 +260,34 @@ inter-deploy life yields 6–10, which is enough to fit uptime against cost
 clean. Each restart then becomes another replicate of the same short experiment
 rather than the thing that ruins it.
 
+### First `--analyze`: within one process, cost goes DOWN with age (n=3)
+
+The longest uninterrupted run available so far is three samples spanning
+184 s → 982 s of one process:
+
+    connect    uptime_seconds: r=-0.94   load1: r=+0.00
+    query      uptime_seconds: r=-0.94   load1: r=+0.03
+    reuse      uptime_seconds: r=-0.93   load1: r=-0.01
+
+`connect` went 1,420 ms → 298 ms → 263 ms as that process aged. **Negative**, and
+load explains none of it. Over the first ~15 minutes a TimeFusion process gets
+*faster*, which is what a cold Foyer/plan cache warming up looks like and is
+consistent with the standing note that "idle == 4-min-old container == cold
+cache".
+
+Three samples is not a result — the sign could flip with the fourth, and this
+run covers 3–16 minutes of uptime while the observation that opened this plan
+was at **five hours**. But it does say something already: the plan's framing —
+"fresh is fast, old is slow" — is not what a single process does over its first
+quarter hour. Whatever costs 1.4 s at 5 h either turns around later, or was
+never about age. Runs long enough to cross an hour are what settle it, and those
+need the deploy traffic to quiet down on its own.
+
+Meanwhile the in-process counters keep climbing within every run
+(`journal_hold.max_ms` 42 → 702, `charged_bytes` 13.7 GB → 47.6 GB in nine
+minutes), so "state grows" and "queries get slower" are, so far, *not* the same
+statement.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
