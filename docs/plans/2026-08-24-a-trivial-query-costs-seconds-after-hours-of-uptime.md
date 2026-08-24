@@ -568,6 +568,24 @@ earlier, so the allocation-pressure lead is *not* confirmed either — one
 instantaneous `top` is not a time series, which is why the sampler now records
 `kcompactd_cpu`, `swap_free_mb` and `iowait_pct` on every row.
 
+### Qualifier, one hour later: the degradation is EPISODIC, not monotone
+
+At 2.5–2.9 h of uptime — the same process, no restart — `connect` is back to
+**280–420 ms** across eight samples, with `kcompactd` at 0 % throughout, swap
+100 % full the whole time (so swap is constant and cannot be a differentiator),
+and `iowait` between 0.2 % and 18.1 % on *fast* samples alike.
+
+So the 1.8–2.24 h slow stretch was an **episode that ended on its own**. Cost is
+not a monotone function of age; a process at 2.9 h is fine. Both of my previous
+headings were too strong in opposite directions, and the shape that fits all of
+it is: **occasional multi-minute episodes where everything gets slow, which
+resolve without intervention** — deploy churn is one reliable trigger for them,
+and there is at least one other trigger that is not a deploy.
+
+That reframes what to look for. Not "which quantity grows with age" but "which
+quantity spikes during an episode and recovers". Anything monotone — uptime,
+`journal_hold`, cache entry counts — is the wrong shape by construction.
+
 **What to do next, in order:**
 1. Let the process keep ageing with the host columns recording. The question is
    now narrow: which in-process quantity is monotone across the 1.2 h → 2.2 h
