@@ -157,7 +157,7 @@ only in pieces, and the reason it is not reachable **differs per project** — t
 distinct defects wearing one symptom, which is why "route more shapes" as a single
 work item would have been mis-scoped.
 
-## 3. Why did query latency regress? **Not contention. And the idle arm cannot finish the job.**
+## 3. Why did query latency regress? **Cold cache, not contention — settled by a third arm.**
 
 The plan's free control fired at 11:33 UTC (`idle_probe.sh`, `tasks_running = 0`
 before and after both probes):
@@ -231,7 +231,7 @@ the sweep returned `REFUSED`. The OOM is live and unmasked.
 Not fixed, per the plan's own instruction. The three obstacles it lists are
 unchanged.
 
-## 5. Compaction: **the fixes work; the cell that matters is never claimed**
+## 5. Compaction: **the fixes work; the cell that matters was never CLAIMED, and now we know why**
 
 The fixes are confirmed live (`680acac`, `8844064`, `e16f157` are all ancestors of
 the deployed image) and confirmed working:
@@ -291,7 +291,7 @@ the newest sealed day, `out_of_policy_cells` should fall below 48 for the first
 time, and the new `maintenance_hygiene_debt_unclaimed` line should stop reporting
 `outranked_by` for the 238-file cell.
 
-Candidate mechanisms, the first still unproven:
+Both candidate mechanisms were run down. Neither is still open:
 
 1. **Quarantine — REAL, INTENTIONAL, and not a defect.** Traced through
    `enqueue`: a unit in `Retry` carrying `WORKER_FAILURE_REASON` makes the 60 s
@@ -314,13 +314,15 @@ Candidate mechanisms, the first still unproven:
    as many words, and the question becomes whether the permit is sized right — not
    whether quarantine should exist.
 
-Remaining candidate, for completeness: `QUARANTINE_ATTEMPTS = 2` and hygiene units time out at 900 s
-   (SealedConsolidation: 8 timeouts in 27 claims, 30%). Two timeouts make a unit
-   claimable only through the narrow quarantined-occupancy permit. A 238-file,
-   17 GB-decoded cell is the most likely thing in the fleet to have timed out
-   twice, and thereafter the largest debt in the fleet becomes the least
-   reachable work in the fleet — benefit ordering inverted by attempt count.
-2. **Frontier misclassification — PROVEN, see above.**
+   The numbers behind it: `QUARANTINE_ATTEMPTS = 2`, and hygiene units time out at
+   900 s (SealedConsolidation: 8 timeouts in 27 claims, 30%). So two timeouts make
+   a unit claimable only through the narrow quarantined-occupancy permit, and a
+   238-file, 17 GB-decoded cell is the most likely thing in the fleet to have timed
+   out twice. That inverts benefit ordering by attempt count — the largest debt
+   becomes the least reachable work — which is a real effect, just not a bug to
+   remove. Whether it is what bites here is now measured, not argued.
+
+2. **Frontier misclassification — PROVEN and FIXED, see above** (`3465ecc`).
 
 **Built, `f7e2717`.** `most_indebted_unclaimed` selects the eligible hygiene unit
 with the most files — for hygiene that IS the debt, and the planner already
