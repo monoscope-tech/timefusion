@@ -267,7 +267,7 @@ was claimed and selected nothing". There is no instrument for "a cell was planne
 and never claimed", and that is the branch this cell is in — the planner reports
 `planned=341` every 60 s, so it is being planned.
 
-**Mechanism 2 is now PROVEN and FIXED ON MASTER** (`3465ecc`), by a unit test with
+**Mechanism 2 is PROVEN and FIXED ON MASTER** (`3465ecc`), by a unit test with
 no prod dependency. `plan_compaction_debt` chooses the
 operation from the calendar (`date == today` mints HotPacking, older mints
 SealedConsolidation) while `is_live_frontier` stays true for a full 24 h after a
@@ -293,7 +293,28 @@ time, and the new `maintenance_hygiene_debt_unclaimed` line should stop reportin
 
 Candidate mechanisms, the first still unproven:
 
-1. **Quarantine (unproven).** `QUARANTINE_ATTEMPTS = 2` and hygiene units time out at 900 s
+1. **Quarantine — REAL, INTENTIONAL, and not a defect.** Traced through
+   `enqueue`: a unit in `Retry` carrying `WORKER_FAILURE_REASON` makes the 60 s
+   re-plan **return early** rather than reset it, and the code says why — that
+   reset "erased both every 60s, which is how day-wide units re-claimed every 5-8
+   minutes against a >=900s floor". So quarantine survives the planner tick BY
+   DESIGN, and undoing it would restore a known duty-cycle bug. `attempts` is
+   never reset on any path.
+
+   This also **explains the A/B log contrast above**, which was left unexplained
+   when it was recorded. Hygiene units are not persisted (§7), so a restart wipes
+   quarantine along with the queue: a FRESH container has no quarantined hygiene
+   units and consolidates old sealed days (08-13/14/16), while a MATURE one has
+   accumulated them and concentrates on whatever is left. That is precisely the
+   68-minute vs 5-minute window difference, from the other side.
+
+   **So there is nothing to fix here without evidence** — and the evidence is now
+   collected automatically: `most_indebted_unclaimed` returns `quarantined:` as a
+   first-class reason. If the 238-file cell is quarantined, the log now says so in
+   as many words, and the question becomes whether the permit is sized right — not
+   whether quarantine should exist.
+
+Remaining candidate, for completeness: `QUARANTINE_ATTEMPTS = 2` and hygiene units time out at 900 s
    (SealedConsolidation: 8 timeouts in 27 claims, 30%). Two timeouts make a unit
    claimable only through the narrow quarantined-occupancy permit. A 238-file,
    17 GB-decoded cell is the most likely thing in the fleet to have timed out
