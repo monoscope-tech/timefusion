@@ -811,6 +811,33 @@ impl TaskJournal {
         Some(cleared)
     }
 
+    /// Drop queued work for a rollup tier that is no longer DECLARED.
+    ///
+    /// Removing a spec from the schema does not remove the tasks already queued
+    /// against it, and those tasks stay claimable forever: prod 2026-08-24 was
+    /// still spending ~80 claims per ten minutes on `dashboard_level_1h_v1`
+    /// after its spec had been deleted, doing nothing each time. Every tier
+    /// rename (`_v2` -> `_v3`) leaves the same residue.
+    ///
+    /// Conservative on purpose, because the cost of a false positive is deleting
+    /// live work:
+    ///
+    ///   * only rollup-target names — a table that is not `{source}_rollup_*`
+    ///     is never a tier and is never considered;
+    ///   * only non-Complete tasks, so history is untouched;
+    ///   * and NOTHING happens when `declared` is empty, which is what an
+    ///     unloaded registry looks like. Without that guard a startup ordering
+    ///     change would silently retire the entire queue.
+    pub fn retire_undeclared_tiers(&mut self, declared: &HashSet<String>) -> usize {
+        if declared.is_empty() {
+            return 0;
+        }
+        self.retain_tasks(|task| {
+            let tier = task.key.physical_table.contains("_rollup_");
+            !(tier && task.state != TaskState::Complete && !declared.contains(&task.key.physical_table))
+        })
+    }
+
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
         if self.snapshot.source_cursors.get(Self::COARSE_BACKFILL_MIGRATION).copied().unwrap_or_default() >= 1 {
             return None;
@@ -4963,6 +4990,45 @@ mod tests {
             .collect();
         assert_eq!(widths.len(), 6, "a genuinely oversized day must keep its slices, got {widths:?}");
         assert!(widths.iter().all(|w| *w < DAY_MICROS));
+    }
+
+    /// Removing a spec must retire its queued work, and must never touch
+    /// anything else.
+    ///
+    /// Prod 2026-08-24 was still spending ~80 claims per ten minutes on
+    /// `dashboard_level_1h_v1` after the spec was deleted, doing nothing each
+    /// time. Every `_v2` -> `_v3` rename leaves the same residue.
+    #[test]
+    fn removing_a_spec_retires_its_queued_work_and_nothing_else() {
+        const DAY: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let tiered = |table: &str, slot: i64, operation| {
+            let mut unit = task("p", slot * DAY, (slot + 1) * DAY, operation);
+            unit.key.physical_table = table.to_owned();
+            unit.key
+        };
+        let gone = tiered("src_rollup_dead_1h_v1", 1, Operation::DerivedRollup);
+        let live = tiered("src_rollup_live_1m_v3", 2, Operation::BaseRollup);
+        let raw = tiered("src", 3, Operation::Dedup);
+        let done = tiered("src_rollup_dead_1h_v1", 4, Operation::DerivedRollup);
+        for key in [&gone, &live, &raw, &done] {
+            journal.enqueue(key.clone(), 0, 1, 0);
+        }
+        journal.complete(&done);
+
+        let declared: HashSet<String> = ["src_rollup_live_1m_v3".to_owned()].into_iter().collect();
+        assert_eq!(journal.retire_undeclared_tiers(&declared), 1, "exactly the undeclared tier's live work");
+        assert_eq!(journal.state(&gone), None, "the undeclared tier's queued unit is gone");
+        assert_eq!(journal.state(&live), Some(TaskState::Pending), "a declared tier is untouched");
+        assert_eq!(journal.state(&raw), Some(TaskState::Pending), "a non-tier table is never considered");
+        assert_eq!(journal.state(&done), Some(TaskState::Complete), "history is untouched");
+
+        // An empty declared set is what an unloaded registry looks like, and it
+        // must retire NOTHING — otherwise a startup ordering change silently
+        // deletes the whole queue.
+        assert_eq!(journal.retire_undeclared_tiers(&HashSet::new()), 0, "an empty registry must never retire anything");
+        assert_eq!(journal.state(&live), Some(TaskState::Pending));
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with

@@ -267,6 +267,17 @@ impl Database {
             .filter_map(|name| get_schema(&name).map(|schema| (name, schema)))
             .flat_map(|(name, schema)| schema.rollups.iter().map(|spec| spec.table_name(&name)).collect::<Vec<_>>())
             .collect();
+        // The same declared-tier set retires work for a tier that no longer
+        // exists — a spec removal or a `_v2` -> `_v3` rename leaves its queued
+        // tasks claimable forever. Free here: `tiers` is already computed.
+        {
+            let mut journal = self.journal();
+            let retired = journal.retire_undeclared_tiers(&tiers);
+            if retired != 0 {
+                let _ = journal.compact();
+                warn!(retired, event = "maintenance_undeclared_tier_tasks_retired", "queued work for a tier no longer declared");
+            }
+        }
         for (storage_project, source, table_ref) in self.all_tables().await {
             if tiers.contains(&source) {
                 continue;
