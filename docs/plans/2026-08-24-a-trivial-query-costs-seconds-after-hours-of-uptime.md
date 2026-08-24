@@ -533,6 +533,52 @@ rather than at a fixed age. The counters that would confirm it are jemalloc's
 own (fragmentation, dirty page decay), which this codebase has tangled with
 before.
 
+### CORRECTION: the plan's original premise is CONFIRMED. Age wins.
+
+At uptime **8,052 s (2.24 h)**, load **32.9**: `connect` = **4,460 ms**,
+`reuse` = **807 ms**. That is the plan's opening measurement reproduced
+(4,748 ms at 5 h) on a process nobody touched, at a load *lower* than samples
+that cost 178 ms.
+
+So the earlier heading in this file — "the age hypothesis is now falsified" —
+was **wrong, and wrong in the way this repo keeps being wrong**: it generalized
+from a range that did not include the phenomenon. Everything up to ~1.2 h was
+genuinely flat; the onset is later. Corrected picture:
+
+| process age | behaviour | evidence |
+|---|---|---|
+| 0–3 min | slow (cold caches) | connect 400–1,400 ms, falling |
+| 3 min – ~1.2 h | **flat, and the best of the day** | connect ~177 ms at loads 24–44, 40+ samples |
+| ~1.8 h – 2.2 h | **degrading badly** | connect 705 → 852 → 1,025 → 3,049 → **4,460 ms** |
+
+And load is now decisively eliminated in *both* directions: **44.0 → 178 ms**
+(1.2 h) versus **32.9 → 4,460 ms** (2.2 h). Higher load, twenty-five times
+faster. What is left standing is the thing the plan named first and I twice
+talked myself out of: **something in-process grows, and past roughly 1.5 hours it
+starts costing every query, including `SELECT 1`.**
+
+The deploy-churn finding survives intact and is still worth having — it explains
+the *young-process* stalls, it was destroying the measurement, and the fix is
+merged. It was simply not the whole thing. The honest sequence is: churn masked
+the real signal, removing the churn made a clean window possible, and the clean
+window then took two hours to show what it was always going to show.
+
+`kcompactd` was at 0 % in this sample after being pinned at 100 % twenty minutes
+earlier, so the allocation-pressure lead is *not* confirmed either — one
+instantaneous `top` is not a time series, which is why the sampler now records
+`kcompactd_cpu`, `swap_free_mb` and `iowait_pct` on every row.
+
+**What to do next, in order:**
+1. Let the process keep ageing with the host columns recording. The question is
+   now narrow: which in-process quantity is monotone across the 1.2 h → 2.2 h
+   transition? `journal_hold` froze, `refresh_avg_us` *fell*, `pressure_pct` is
+   low — none of the current instruments explain it, so the next one has to come
+   from jemalloc's own stats (fragmentation, dirty decay) or from a per-stage
+   breakdown of connection setup.
+2. Do **not** ship a scheduled restart yet. It would help this, and it would
+   reintroduce the churn stalls that dominated the first half of this
+   investigation. Measure which is worse before trading one for the other.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
