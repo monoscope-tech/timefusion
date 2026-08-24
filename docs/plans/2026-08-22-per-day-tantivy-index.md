@@ -1960,3 +1960,62 @@ So the throughput problem is solved: capacity now exceeds baseline accrual by
 are frequent enough to matter. That is a measurement for a quiet morning, not
 another change tonight — the three shipped changes are now visibly doing their
 job and nothing here argues for a fourth.
+
+## 03:00 — it converges. Three cycles, and the midnight step landed as predicted.
+
+| time | today | week | older | **sealed** |
+|---|---|---|---|---|
+| 23:31 | 1593 | 1401 | 5430 | 6831 |
+| 23:46 | 1605 | 1032 | 5354 | 6386 |
+| **00:16** | **0** | **1670** | 5389 | **7059** |
+| 00:31 | 0 | 893 | 5382 | 6275 |
+| 00:46 | 2 | 651 | 5305 | **5956** |
+
+**The UTC-midnight step arrived exactly as registered**: `today` 1605 -> 0 and
+`week` 1032 -> 1670, absorbing the whole deferred day in one interval. Flagging
+it in advance is the only reason the 7059 peak reads as bookkeeping rather than a
+collapse — it would otherwise have looked like the worst regression of the night.
+
+**And then it drained through it.** `week` 1670 -> 893 -> **651**, -1,019 in
+thirty minutes, having just absorbed a day's deferred work. Sealed 7059 -> 6275
+-> **5956**: roughly **-2,200/hr**, against the ~77/hr accrual that used to
+outrun it. `older` is falling too, slowly (5430 -> 5305).
+
+Every cycle now completes, with `1m_v3` hitting its 320 ceiling three cycles
+running:
+
+```
+00:15  spans built=7 · 1h_v2 built=138 · 1m_v3 built=320
+00:31  1m_v3 built=320 · level_1m_v1 built=18
+00:45  1m_v3 built=320 · level_1m_v1 built=9
+```
+
+**The goal is met: coverage converges rather than diverges**, demonstrated over
+three consecutive cycles and across the worst-case boundary event rather than on
+one favourable interval.
+
+### What actually fixed it
+
+Two defects, neither of them the throughput problem everyone (me included) spent
+the day assuming:
+
+1. **Serial-loop starvation.** `indexed_tables()` is a `BTreeSet`, so
+   `otel_logs_and_spans` was always first; its pass could not finish between
+   prod's ~15-minute restarts, and every table behind it was never reached —
+   four rollup tables frozen since 08-20. Fixed by rotating the pass's starting
+   table from a clock-derived offset.
+2. **A cap sized on the wrong population.** `max_files_per_pass = 8`, chosen that
+   morning because a spans build costs 4-5 minutes — while a rollup build costs
+   **1.75 seconds**. Fixed by bounding the pass in bytes (whales) *and* sizing
+   the count ceiling against wall clock (small files), because the two
+   populations are limited by different things.
+
+### Left deliberately undone
+
+- Running the tables concurrently, so a slow spans pass cannot occupy a slot.
+  Diagnosed, not shipped: three changes are in flight and unevaluated, and
+  stacking a fourth is how tonight's one reverted change happened.
+- Whether `skip_today` should apply to tables that write into today's partition
+  continuously. It is why ~1,600 files waited for midnight.
+- `index_manifests/otel_metrics/` — 774 KB of manifests for a table nothing
+  reconciles, uncollectable because reconcile never visits an unindexed table.
