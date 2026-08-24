@@ -3586,3 +3586,253 @@ pub struct StoredSliceCoverage {
     pub intervals: Vec<(i64, i64)>,
 }
 pub const DIRTY_BINS: (&str, &str) = ("dedup_dirty_bins.json", "dirty-bin queue");
+
+pub const ROLLUP_COVERAGE: (&str, &str) = ("rollup_coverage_ledger.json", "rollup coverage ledger");
+
+/// One slice of a rollup tier, and what it was built FROM.
+///
+/// Today the same facts live in Delta metadata tags on each parquet file
+/// (`maintenance_coordinator::TAG_SLICE_START` and friends), which makes the
+/// files self-describing and makes coverage cost a full log replay to read. It
+/// also means an unrelated `OPTIMIZE` that drops custom tags destroys coverage
+/// state, and that two files covering different slices can never be compacted
+/// into one — the tier built to make 30d queries fast is itself thousands of
+/// small files.
+///
+/// See `docs/plans/2026-08-24-open-work-after-untagged-convergence.md` §3.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CoverageEntry {
+    pub start_micros: i64,
+    /// EXCLUSIVE, like `TimeSlice`, and unlike a file statistic's `hi`.
+    pub end_micros: i64,
+    pub generation: String,
+    pub source_fingerprint: u64,
+    /// LOGICAL deduped source rows — the witness that this slice is not stale.
+    ///
+    /// Deliberately not the tag's number. `TAG_SOURCE_ROWS` is compared against
+    /// `num_records`, which is PHYSICAL (tombstones plus merge-on-read
+    /// versions), so ordinary dedup or compaction changes it without changing
+    /// what the rollup aggregated and invalidates a correct slice. `None` means
+    /// no witness, which every read must treat as unverifiable rather than
+    /// fresh.
+    pub source_rows: Option<i64>,
+}
+
+/// `(source, project_id, tier table, date)` — the partition a coverage entry
+/// belongs to, and the unit retirement and repair both work in.
+pub type CoverageCell = (String, String, String, String);
+
+/// Where rollup coverage is recorded and read.
+///
+/// A trait rather than a concrete store because the sidecar JSON here is the
+/// FIRST backend, not the intended one: this state is destined for a real
+/// datastore (Postgres, SlateDB) where a point read does not mean loading every
+/// cell. Keeping callers on this interface makes that a backend swap.
+///
+/// **Ordering is the safety property.** The Delta commit and the ledger write
+/// are not one transaction, and the two failure modes are not symmetric:
+///
+/// - the ledger UNDERSTATES coverage — a wasted rebuild, cheap;
+/// - the ledger CLAIMS coverage that is not there — wrong query results.
+///
+/// So `record` is called only AFTER the commit lands, and a crash in between
+/// leaves an understating ledger. Never the reverse order.
+pub trait CoverageLedger: Send + Sync {
+    fn coverage(&self, cell: &CoverageCell) -> Vec<CoverageEntry>;
+    /// Record a slice that is ALREADY COMMITTED. See the ordering note above.
+    fn record(&self, cell: &CoverageCell, entry: CoverageEntry);
+    /// Drop a cell entirely — its partition aged out, or its coverage is being
+    /// rebuilt from scratch.
+    fn retire(&self, cell: &CoverageCell);
+    fn cells(&self) -> Vec<CoverageCell>;
+}
+
+/// Merge entries of the SAME generation whose slices touch or overlap.
+///
+/// Without this a cell accumulates one entry per incremental build forever, and
+/// the ledger — which is meant to make coverage a cheap read — grows without
+/// bound. Generations are kept apart because a differing generation means the
+/// slices were built from different source content; merging those would invent
+/// a range no single build ever produced.
+pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
+    entries.sort_by(|a, b| (&a.generation, a.start_micros).cmp(&(&b.generation, b.start_micros)));
+    let mut merged: Vec<CoverageEntry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match merged.last_mut() {
+            Some(last) if last.generation == entry.generation && entry.start_micros <= last.end_micros => {
+                last.end_micros = last.end_micros.max(entry.end_micros);
+                // A merged range is only as trustworthy as its weakest part: one
+                // witness-less contributor makes the whole span unverifiable,
+                // which is the conservative direction (a rebuild, not a false
+                // claim of freshness).
+                last.source_rows = match (last.source_rows, entry.source_rows) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    _ => None,
+                };
+            }
+            _ => merged.push(entry),
+        }
+    }
+    merged
+}
+
+/// One `(cell -> entries)` row as it is persisted. Flat on purpose: a tuple key
+/// is not a JSON object key, and a flat row is also what a SQL backend wants.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StoredCoverage {
+    pub source: String,
+    pub project_id: String,
+    pub table_name: String,
+    pub date: String,
+    pub entries: Vec<CoverageEntry>,
+}
+
+/// The first `CoverageLedger` backend: in memory, written through to the same
+/// best-effort JSON sidecar the certification and dirty-bin stores use.
+///
+/// Write-through rather than periodic, for the reason certifications had to
+/// become write-through (2026-08-21): this box restarts constantly, and state
+/// that only reaches disk on a clean shutdown is state that never reaches disk.
+pub struct JsonCoverageLedger {
+    data_dir: std::path::PathBuf,
+    cells: dashmap::DashMap<CoverageCell, Vec<CoverageEntry>>,
+}
+
+impl JsonCoverageLedger {
+    pub fn load(data_dir: impl Into<std::path::PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        let cells = load_sidecar::<StoredCoverage>(&data_dir, ROLLUP_COVERAGE)
+            .into_iter()
+            .map(|row| ((row.source, row.project_id, row.table_name, row.date), row.entries))
+            .collect();
+        Self { data_dir, cells }
+    }
+
+    fn persist(&self) {
+        let rows: Vec<StoredCoverage> = self
+            .cells
+            .iter()
+            .map(|entry| {
+                let ((source, project_id, table_name, date), entries) = (entry.key().clone(), entry.value().clone());
+                StoredCoverage { source, project_id, table_name, date, entries }
+            })
+            .collect();
+        store_sidecar(&self.data_dir, ROLLUP_COVERAGE, &rows);
+    }
+
+    /// Drop cells whose date is older than `keep_from` (a `YYYY-MM-DD` bound),
+    /// returning how many went.
+    ///
+    /// Retirement is not optional: without it the ledger grows for as long as
+    /// the process has ever seen a partition, including partitions that aged out
+    /// of retention months ago. Dates are compared as strings, which is exactly
+    /// right for zero-padded ISO dates and wrong for anything else — the format
+    /// is fixed by the Delta partition value.
+    pub fn retire_before(&self, keep_from: &str) -> usize {
+        let stale: Vec<CoverageCell> = self.cells.iter().filter(|e| e.key().3.as_str() < keep_from).map(|e| e.key().clone()).collect();
+        for cell in &stale {
+            self.cells.remove(cell);
+        }
+        if !stale.is_empty() {
+            self.persist();
+        }
+        stale.len()
+    }
+}
+
+impl CoverageLedger for JsonCoverageLedger {
+    fn coverage(&self, cell: &CoverageCell) -> Vec<CoverageEntry> {
+        self.cells.get(cell).map(|entries| entries.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, cell: &CoverageCell, entry: CoverageEntry) {
+        self.cells.entry(cell.clone()).or_default().push(entry);
+        if let Some(mut entries) = self.cells.get_mut(cell) {
+            let merged = merge_coverage(std::mem::take(&mut *entries));
+            *entries = merged;
+        }
+        self.persist();
+    }
+
+    fn retire(&self, cell: &CoverageCell) {
+        if self.cells.remove(cell).is_some() {
+            self.persist();
+        }
+    }
+
+    fn cells(&self) -> Vec<CoverageCell> {
+        self.cells.iter().map(|entry| entry.key().clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod coverage_ledger_tests {
+    use super::*;
+
+    fn entry(start: i64, end: i64, generation: &str, rows: Option<i64>) -> CoverageEntry {
+        CoverageEntry { start_micros: start, end_micros: end, generation: generation.to_owned(), source_fingerprint: 7, source_rows: rows }
+    }
+
+    fn cell() -> CoverageCell {
+        ("otel_logs_and_spans".to_owned(), "p".to_owned(), "tier".to_owned(), "2026-08-24".to_owned())
+    }
+
+    /// A cell gains an entry per incremental build. Left unmerged the ledger
+    /// grows without bound, which defeats the entire reason it exists — coverage
+    /// as a cheap read instead of a log replay.
+    #[test]
+    fn touching_slices_of_one_generation_merge() {
+        let merged = merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, "g1", Some(4))]);
+        assert_eq!(merged.len(), 1, "adjacent slices of one generation are one range");
+        assert_eq!((merged[0].start_micros, merged[0].end_micros), (0, 20));
+        assert_eq!(merged[0].source_rows, Some(7), "the witness is the sum of what was merged");
+    }
+
+    /// Different generations were built from different source content. Merging
+    /// them would invent a range no build ever produced, and the ledger is the
+    /// authority — an invented range is served as truth.
+    #[test]
+    fn different_generations_never_merge() {
+        let merged = merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, "g2", Some(4))]);
+        assert_eq!(merged.len(), 2, "a generation boundary is a real boundary");
+    }
+
+    /// The witness is what lets a read trust a slice is not stale, so a merged
+    /// range is only as trustworthy as its weakest contributor. Summing `3 +
+    /// unknown` into `3` would manufacture a witness for rows nobody counted —
+    /// and it would fail in the dangerous direction, claiming freshness.
+    #[test]
+    fn a_witnessless_slice_poisons_the_witness_of_the_range_it_merges_into() {
+        let merged = merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, "g1", None)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source_rows, None, "unverifiable beats a manufactured count");
+    }
+
+    /// Write-through, not on shutdown. Certifications had to learn this the hard
+    /// way (2026-08-21): a box that restarts constantly never reaches a clean
+    /// shutdown, so state that only persists then never persists at all.
+    #[test]
+    fn coverage_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = JsonCoverageLedger::load(dir.path());
+        ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
+
+        let reloaded = JsonCoverageLedger::load(dir.path());
+        assert_eq!(reloaded.coverage(&cell()), vec![entry(0, 10, "g1", Some(5))], "a recorded slice is on disk before the process ends");
+    }
+
+    #[test]
+    fn retiring_drops_only_dates_before_the_bound() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = JsonCoverageLedger::load(dir.path());
+        let old = ("s".to_owned(), "p".to_owned(), "tier".to_owned(), "2026-07-01".to_owned());
+        ledger.record(&old, entry(0, 10, "g1", Some(1)));
+        ledger.record(&cell(), entry(0, 10, "g1", Some(1)));
+
+        assert_eq!(ledger.retire_before("2026-08-01"), 1, "only the July cell is past retention");
+        assert!(ledger.coverage(&old).is_empty(), "the retired cell is gone");
+        assert_eq!(ledger.coverage(&cell()).len(), 1, "the in-retention cell is untouched");
+        assert!(JsonCoverageLedger::load(dir.path()).coverage(&old).is_empty(), "retirement is durable, not in-memory only");
+    }
+}
+
