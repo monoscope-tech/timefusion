@@ -808,11 +808,7 @@ impl Database {
                 // takes ~5.5 minutes to rebuild after a restart (measured), so
                 // `usable_cells` reads low on a young process. Compare the two
                 // only once the process has outlived that.
-                let usable_cells = self
-                    .rollup_coverage
-                    .iter()
-                    .filter(|entry| entry.key().1 == source && entry.key().2 == target)
-                    .count();
+                let usable_cells = self.rollup_coverage.iter().filter(|entry| entry.key().1 == source && entry.key().2 == target).count();
                 info!(
                     source,
                     tier = %target,
@@ -861,10 +857,8 @@ impl Database {
             // known quantity of work. Older orphans are left to age out of the
             // 35-day horizon rather than rebuilt days before they leave it.
             if let Some(cursor_was) = self.journal().repair_orphaned_coverage_once(&source)
-                && let (Ok(from), Ok(before)) = (
-                    chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"),
-                    chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"),
-                )
+                && let (Ok(from), Ok(before)) =
+                    (chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"), chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"))
             {
                 let mut forced = 0usize;
                 for (project, date) in &candidates {
@@ -2203,9 +2197,7 @@ impl Database {
                     RollupCoverage {
                         source_fp: partition_fp,
                         source_epoch: Some(
-                            self.rollup_source_epochs
-                                .get(&(key.project_id.clone(), key.source.clone(), date.to_string()))
-                                .map_or(0, |epoch| *epoch.value()),
+                            self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |epoch| *epoch.value()),
                         ),
                         generation: generation.clone(),
                         source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),

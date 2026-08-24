@@ -6805,11 +6805,7 @@ struct LiveTierFile {
 ///    not in the replace set, both would be live after the commit and their rows
 ///    would be summed.
 fn classify_rollup_resume(
-    entry: &StagedIntent,
-    table_name: &str,
-    now_secs: u64,
-    live: &HashMap<&str, LiveTierFile>,
-    current_source_rows: Option<u64>,
+    entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, LiveTierFile>, current_source_rows: Option<u64>,
 ) -> ResumeVerdict {
     let Some(rollup) = entry.rollup.as_ref() else { return ResumeVerdict::Skip };
     if entry.table_name != table_name || entry.adds.is_empty() || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS {
@@ -12230,10 +12226,7 @@ mod tests {
         for add in &staged {
             assert!(after.contains(&add.path), "the staged file {} is live again — committed, not rebuilt", add.path);
         }
-        assert!(
-            crate::observability::maintenance_stats().rollup_resumed.load(std::sync::atomic::Ordering::Relaxed) > before,
-            "and it is counted as a resume"
-        );
+        assert!(crate::observability::maintenance_stats().rollup_resumed.load(std::sync::atomic::Ordering::Relaxed) > before, "and it is counted as a resume");
         // Publication is the half that makes resume worth anything: coverage
         // recovery requires `rollup_slice_complete`, so a commit without it
         // leaves the planner seeing a hole and re-running the whole scan.
@@ -12263,8 +12256,7 @@ mod tests {
         assert!(!db.resume_rollup_unit(&key, moved).await?, "a moved source must not resume");
 
         let table_ref = db.get_or_create_table(&project, &tier).await?;
-        let live: std::collections::HashSet<String> =
-            table_ref.read().await.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect();
+        let live: std::collections::HashSet<String> = table_ref.read().await.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect();
         for add in &staged {
             assert!(!live.contains(&add.path), "the staged file {} must NOT have been committed", add.path);
         }
@@ -14788,12 +14780,7 @@ mod tests {
                 slice,
                 operation: crate::maintenance_coordinator::Operation::BaseRollup,
             },
-            publication: crate::maintenance_coordinator::Publication {
-                source_fingerprint: 7,
-                generation: "g1".into(),
-                rows: 5,
-                source_rows,
-            },
+            publication: crate::maintenance_coordinator::Publication { source_fingerprint: 7, generation: "g1".into(), rows: 5, source_rows },
             source_rows,
             date: "2026-08-24".into(),
         };
