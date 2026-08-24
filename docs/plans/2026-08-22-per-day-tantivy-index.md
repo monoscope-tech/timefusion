@@ -2299,3 +2299,69 @@ failing on the SECOND assertion (`DedupExec fell to full-set`; the primary
 same way on `7f15de5` hours earlier, passed on `fb8dd70` between them, and passes
 locally on the current tree. A regression guard that fails intermittently is
 worth its own look — it protects a path with two logged prod incidents.
+
+## 2026-08-24 — pass condition 2: PASS on the mechanism, on `c8860f5`
+
+Coverage rebuilt to 30 in 614 s of uptime (faster than the ~25 min assumed), so
+the routed arm is real rather than a router that never attempted. Two reps:
+
+| shape | before | rep0 | rep1 | counters now |
+|---|---|---|---|---|
+| no filter | 7,240 ms | 10,715 | 5,447 | `hits_hybrid+1` |
+| `kind = 'server'` | 14,484 ms | 9,266 | 7,732 | `hits_hybrid+1` **`prefilter_attempts+1`** |
+| `status_code = 'ERROR'` | 10,548 ms | 3,792 | 3,715 | `hits_hybrid+1` **`prefilter_attempts+1`** |
+
+**`+1`, not `+2`** — the remaining attempt is the raw leg, which this change
+does not touch and should not. Every shape still routes. That is the whole
+pass condition, and it is load-independent, which the latencies are not: the
+unfiltered control itself ranged 5.4-10.7 s across two reps minutes apart on the
+same process, so treat the latency column as colour and the counter column as
+the result. What can be said is that the filtered shapes no longer sit at ~2x
+the unfiltered one.
+
+---
+
+# Plan closed — superseded (P2 #10)
+
+The per-day index was the original goal and it was never built. Closing it as
+superseded rather than abandoned, because the reasoning that motivated it was
+sound and its two premises were both answered by other means:
+
+**What the plan got right.** Coverage was defined so that compaction manufactured
+work — `uncovered = live files − ∪ covered_files` counts a rewrite as new
+information. That is real, and **Step 0 shipped and is live**:
+`tantivy_carried_forward = 8` on a running process, so a compaction output now
+extends the existing entries instead of being read back and re-indexed.
+
+**What it got wrong.** The remaining divergence was not a format problem. Two
+defects explained it, and a per-day index would have fixed neither:
+
+1. **Serial-loop starvation** — `indexed_tables()` is a `BTreeSet`, so the spans
+   pass always ran first and never finished between prod's ~15-minute restarts.
+   Four rollup tables were frozen since 08-20. Fixed by clock-derived rotation.
+2. **A cap sized on the wrong population** — `max_files_per_pass = 8` was chosen
+   against a 4-5 minute spans build while a rollup build costs 1.75 s. Fixed by
+   bounding a pass in bytes *and* sizing the count ceiling against wall clock.
+
+**And the third, found on 08-24, which deletes most of what remained:** 37% of
+the indexed population existed because rollup dimensions accidentally inherited
+`tantivy: { indexed: true }` through a struct update — and reading those indexes
+made queries ~29x slower. With that gone, `indexed_set()` is a single table
+(`otel_logs_and_spans`), which also means the rotation and `buffer_unordered(3)`
+work from 08-23 is now inert, and the tick-skip concern above may be moot: one
+table cannot starve another.
+
+**What remains open, and where it lives:**
+
+- Whether the spans table alone still diverges. Re-measure `tantivy_uncovered_files`
+  against the NEW population before concluding anything; every historical number
+  in this document is against the old one.
+- The read-side items in "Not addressed here" (`search_us_avg` 0.34 -> 2.1 ms,
+  `reader_hit_pct` 96.9% -> 85.2%) — both hypotheses were "working set > cache"
+  and "IO contention from a permanently-running backfill", and the second is
+  substantially reduced by removing 37% of the build population.
+- Reconcile sweeping manifests of tables no longer indexed (three manual
+  cleanups now).
+- The flaky `text_match_conjunct_does_not_poison_parquet_pushdown` E2E guard.
+
+Successor for anything further: `docs/plans/2026-08-24-handoff-open-work.md`.
