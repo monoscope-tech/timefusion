@@ -25,7 +25,7 @@ Two clean outcomes, per the plan:
 A run is only worth analyzing if it spans a process nobody redeploys —
 `uptime_s` resetting mid-run splits the series, and `--analyze` says so.
 """
-import argparse, csv, os, pathlib, socket, statistics, subprocess, sys, time, urllib.parse
+import argparse, csv, os, pathlib, re, socket, statistics, subprocess, sys, time, urllib.parse
 import psycopg
 
 HERE = pathlib.Path(__file__).parent
@@ -82,6 +82,10 @@ STATS = [
     ("memory", "charged_bytes"),
     # Fragmentation: memory held but not in use. The only candidate left after
     # every other instrument either froze or fell across the cost onset.
+    # Per-connection setup: the one phase a connect-only stall can hide in.
+    ("block", "pgwire_startup_handler_build.max_ms"),
+    ("block", "pgwire_simple_handler_build.max_ms"),
+    ("block", "pgwire_simple_handler_build.avg_us"),
     ("jemalloc", "frag_pct"),
     ("jemalloc", "allocated_mb"),
     ("jemalloc", "resident_mb"),
@@ -93,7 +97,7 @@ STATS = [
     ("maintenance", "tasks_running"),
 ]
 STAGES = ("dns", "tcp", "connect", "query", "reuse")
-FIELDS = ["ts", "load1", "kcompactd_cpu", "swap_free_mb", "iowait_pct", *STAGES, *(f"{c}.{k}" for c, k in STATS)]
+FIELDS = ["ts", "load1", "kcompactd_cpu", "swap_free_mb", "iowait_pct", "inproc_connect_ms", "inproc_write_ms", "inproc_auth_ms", "inproc_total_ms", *STAGES, *(f"{c}.{k}" for c, k in STATS)]
 
 
 def stages():
@@ -122,6 +126,32 @@ def stats():
     return {f"{c}.{k}": got.get((c, k), "") for c, k in STATS}
 
 
+def probe_ms():
+    """Stage split of the worst of the container healthcheck's last 5 probes.
+
+    The healthcheck runs the SAME pgwire startup+auth exchange every 5 s, but
+    from INSIDE the container over loopback. It reads `connect_ms=0 write_ms=0
+    auth_ms=1` while this script, over the internet, reads 100-4,460 ms for the
+    same operation. That pair localizes a stall with no ambiguity: server-side
+    stalls move both, path-side stalls move only ours. Docker keeps only the
+    last five entries, hence the max rather than a single reading.
+    """
+    try:
+        out = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST,
+             'cid=$(docker ps -q -f name=srv-captain--timefusion | head -1); docker inspect --format "{{json .State.Health.Log}}" $cid'],
+            capture_output=True, text=True, timeout=45,
+        ).stdout
+        # Stage split of the WORST of the five, not just its total: `connect_ms`
+        # is the accept path, `auth_ms` is the startup exchange the server
+        # drives. A 1,547ms probe over LOOPBACK is already server-side; this
+        # says which half of the server owns it.
+        pat = r"connect_ms=(\d+) write_ms=(\d+) auth_ms=(\d+) total_ms=(\d+)"
+        return max(re.findall(pat, out), key=lambda m: int(m[3]))
+    except Exception:
+        return ("", "", "", "")
+
+
 def host():
     """`(load1, kcompactd_cpu, swap_free_mb, iowait_pct)`, or blanks if SSH fails.
 
@@ -146,7 +176,7 @@ def host():
 
 def sample():
     load1, kcomp, swap_free, wa = host()
-    row = {"ts": int(time.time()), "load1": load1, "kcompactd_cpu": kcomp, "swap_free_mb": swap_free, "iowait_pct": wa, **stages(), **stats()}
+    row = {"ts": int(time.time()), "load1": load1, "kcompactd_cpu": kcomp, "swap_free_mb": swap_free, "iowait_pct": wa, **dict(zip(("inproc_connect_ms", "inproc_write_ms", "inproc_auth_ms", "inproc_total_ms"), probe_ms())), **stages(), **stats()}
     new = not CSV.exists()
     with CSV.open("a", newline="") as f:
         w = csv.DictWriter(f, FIELDS)
@@ -154,7 +184,7 @@ def sample():
             w.writeheader()
         w.writerow(row)
     print(f"{time.strftime('%H:%M:%S')} uptime={row['runtime.uptime_seconds']}s load={row['load1']} "
-          f"connect={row['connect']}ms reuse={row['reuse']}ms lag={row['runtime.scheduling_lag_ms']}ms kcompactd={kcomp}%", flush=True)
+          f"connect={row['connect']}ms reuse={row['reuse']}ms lag={row['runtime.scheduling_lag_ms']}ms inproc={row['inproc_total_ms']}ms(auth={row['inproc_auth_ms']})", flush=True)
     return row
 
 
