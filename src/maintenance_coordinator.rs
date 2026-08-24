@@ -671,6 +671,8 @@ impl TaskJournal {
     /// that records completion more durably than its effect is worse than one
     /// that never ran.
     const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v2";
+    /// Bump to re-run the orphaned-coverage repair after a FUTURE spec edit.
+    const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -880,6 +882,26 @@ impl TaskJournal {
             let tier = task.key.physical_table.contains("_rollup_");
             !(tier && task.state != TaskState::Complete && !declared.contains(&task.key.physical_table))
         })
+    }
+
+    /// Claim the one-shot orphaned-coverage repair, or `None` if it already ran.
+    ///
+    /// The caller does the work — it needs the tier partitions, which the journal
+    /// does not have. This owns only the once-ness, and it persists the cursor
+    /// IMMEDIATELY rather than after the enqueue: a repair that half-ran and then
+    /// died to a restart would otherwise re-force every cell on the next boot,
+    /// and this box restarts every few minutes. Re-enqueueing is idempotent at
+    /// the journal (`enqueue` upserts by key), so the safe failure is running
+    /// once and under-repairing, never looping.
+    pub fn repair_orphaned_coverage_once(&mut self) -> Option<u64> {
+        let previous = self.snapshot.source_cursors.get(Self::ORPHAN_REPAIR_MIGRATION).copied().unwrap_or_default();
+        if previous >= 1 {
+            return None;
+        }
+        self.snapshot.source_cursors.insert(Self::ORPHAN_REPAIR_MIGRATION.to_owned(), 1);
+        self.dirty_cursors.insert(Self::ORPHAN_REPAIR_MIGRATION.to_owned());
+        let _ = self.checkpoint();
+        Some(previous)
     }
 
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
@@ -5491,6 +5513,21 @@ mod tests {
         // deletes the whole queue.
         assert_eq!(journal.retire_undeclared_tiers(&HashSet::new()), 0, "an empty registry must never retire anything");
         assert_eq!(journal.state(&live), Some(TaskState::Pending));
+    }
+
+    /// The orphan repair must run exactly once, and must persist that BEFORE
+    /// the caller does the work — a half-run repair that died to a restart would
+    /// re-force every cell on the next boot, and prod restarts every few minutes.
+    #[test]
+    fn the_orphan_repair_claims_itself_once_and_survives_a_reload() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        {
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            assert_eq!(journal.repair_orphaned_coverage_once(), Some(0), "first call claims it");
+            assert_eq!(journal.repair_orphaned_coverage_once(), None, "second call in the same process must not");
+        }
+        let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
+        assert_eq!(reloaded.repair_orphaned_coverage_once(), None, "a restart must not re-run the repair");
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with
