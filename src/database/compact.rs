@@ -1141,13 +1141,8 @@ impl Database {
     /// types are excluded because `COUNT(DISTINCT)` over them is neither cheap
     /// nor meaningful.
     fn immutable_audit_sql(schema: &crate::schema::TableSchema, scan_name: &str, rows_filter: &str) -> Option<String> {
-        let excluded: std::collections::HashSet<&str> = schema
-            .dedup_keys
-            .iter()
-            .map(String::as_str)
-            .chain(schema.dedup_tiebreak.as_deref())
-            .chain(schema.tombstone_column.as_deref())
-            .collect();
+        let excluded: std::collections::HashSet<&str> =
+            schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect();
         let predicates = schema
             .fields
             .iter()
@@ -1165,10 +1160,7 @@ impl Database {
             return None;
         }
         let keys = schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
-        Some(format!(
-            "SELECT COUNT(*) FROM (SELECT {keys} FROM {scan_name} WHERE {rows_filter} GROUP BY {keys} HAVING {})",
-            predicates.join(" OR ")
-        ))
+        Some(format!("SELECT COUNT(*) FROM (SELECT {keys} FROM {scan_name} WHERE {rows_filter} GROUP BY {keys} HAVING {})", predicates.join(" OR ")))
     }
 
     /// Runs `sql` and pulls its first output row's `column(0)` as an `i64` —
@@ -1881,13 +1873,8 @@ mod immutable_audit_tests {
     fn the_audit_skips_columns_that_vary_by_construction() {
         let schema = logs_schema();
         let sql = Database::immutable_audit_sql(schema, "scan", "true").expect("logs declare immutable columns");
-        let grouped = schema
-            .dedup_keys
-            .iter()
-            .map(String::as_str)
-            .chain(schema.dedup_tiebreak.as_deref())
-            .chain(schema.tombstone_column.as_deref())
-            .collect::<Vec<_>>();
+        let grouped =
+            schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect::<Vec<_>>();
         assert!(!grouped.is_empty(), "the schema has dedup keys, or this test proves nothing");
         for column in grouped {
             assert!(
@@ -1934,16 +1921,7 @@ mod immutable_audit_tests {
             vec![
                 //                 differing values   null -> value      agrees      all null
                 Arc::new(StringArray::from(vec!["a", "a", "b", "b", "c", "c", "d", "d"])),
-                Arc::new(StringArray::from(vec![
-                    Some("info"),
-                    Some("error"),
-                    None,
-                    Some("error"),
-                    Some("info"),
-                    Some("info"),
-                    None,
-                    None,
-                ])),
+                Arc::new(StringArray::from(vec![Some("info"), Some("error"), None, Some("error"), Some("info"), Some("info"), None, None])),
             ],
         )
         .expect("batch");
