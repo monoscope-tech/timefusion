@@ -260,7 +260,26 @@ arrives and does it again. Each cycle spends a multi-hour rebuild on a
 ten-minute invalidation. It is correct (the escalation exists to prevent a double
 count) but it is a treadmill, and it is where sealed-tier capacity is going.
 
-## Open, and deliberately not guessed at again: four cells that never get a unit
+## RESOLVED — the four cells cleared themselves once deletion stopped
+
+**Read this before the section below, which is preserved as a record of the
+investigation but describes a problem that no longer exists.** By 04:29 the count
+was **7**, all of them `87576849` July days with 800-1400 minute holes, and every
+one of the four "stuck" cells — `dcad860a` 08-13/08-14/08-15 and `87576849`
+08-12 — had gone.
+
+So the answer was the coarsening exemptions after all (`cadb7b0` for the fuse
+pass, `fd99a91` for subsume). They needed one recovery cycle to RE-CREATE the
+repair units that earlier passes had deleted, and I measured in the window before
+that happened — which is why the journal showed no unit at the gap and I read it
+as "never enqueued". The five hypotheses below were refuted correctly; the
+conclusion drawn from them was premature.
+
+The lesson is the same one this whole investigation kept teaching: **a snapshot
+taken between a fix and its next scheduled pass looks exactly like the fix not
+working.** Recovery is hourly, so any judgement inside that hour is a coin flip.
+
+## The investigation, preserved: four cells that appeared to never get a unit
 
 85 → 23. Nineteen of the twenty-three are grinding down normally (total uncovered
 time fell 10,096 → 10,052 minutes in one hour, ~44 min/hour, so the tail is days
