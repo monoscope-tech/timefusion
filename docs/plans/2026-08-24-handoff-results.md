@@ -281,9 +281,24 @@ Candidate mechanisms, none yet proven, in order of how well they fit:
    cell — until it is 48h old. One 90-minute window had **26 of 27**
    SealedConsolidation claims on 2026-08-23 for exactly this shape.
 
-The next step is one log line, not a fix: emit the winning rank tuple and the
-count of eligible-but-not-selected units on a claim, so "planned, never claimed"
-stops being invisible. That is the same lesson the lever-2 page already ends on.
+**Built, `f7e2717`.** `most_indebted_unclaimed` selects the eligible hygiene unit
+with the most files — for hygiene that IS the debt, and the planner already
+counted it — and reports either the per-task reason (`not_due`, `quarantined`,
+`dependencies`) or, when eligibility is fine and the refusal is in the ordering,
+`outranked_by:<project>:<date>`. `plan_compaction_debt` logs it for both hygiene
+operations beside the `planned=N` that could not distinguish "nothing needs doing"
+from "queued and never claimed".
+
+Neither existing instrument could reach this: `claimability_census` and
+`first_refused_sealed` both sample the first 64 tasks in journal order, so a
+specific cell may never be looked at, and `first_refused_sealed` answers a bare
+`CLAIMABLE` without naming the winner. `rank` was lifted out of `claim_next` into
+a method so a read-only caller can ask the question; ordering is unchanged and the
+19 scheduling tests that would have caught a change pass untouched.
+
+**This does not fix the starvation — it makes the next diagnosis one log line
+instead of a guess**, which is the lesson the lever-2 page already ends on. The
+candidate mechanisms above stay candidates until prod prints which one it is.
 
 ## 6. The known-red test is **green**
 
