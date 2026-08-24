@@ -1,10 +1,11 @@
 # Handoff results: what the open items actually measured
 
-2026-08-24, ~10:45-12:00 UTC. Answers to
+2026-08-24, ~10:45-12:50 UTC. Answers to
 `2026-08-24-handoff-open-work.md`, item by item. Every number is stamped with
-the image SHA and container age it was taken on, because the box restarted three
-times during this window (`5635686` -> `0bdeddf` -> `8c37d37`) and every
-`timefusion_stats` counter is process-scoped.
+the image SHA and container age it was taken on, because the box was redeployed
+six times during this window (`5635686` -> `0bdeddf` -> `8c37d37` -> `5e7934b` ->
+`1e42237`, plus one more) and every `timefusion_stats` counter is
+process-scoped.
 
 Tools written for this, all under `bench/local/` (gitignored):
 
@@ -23,7 +24,7 @@ Tools written for this, all under `bench/local/` (gitignored):
 
 ## 1. Does the sealed backlog drain? **No. It is flat.**
 
-Five samples over 63 minutes, spanning three deploys:
+Eight samples over 115 minutes, spanning six deploys:
 
 | UTC | image | age | sealed units | sealed cells | complete_base_rollup |
 |---|---|---|---|---|---|
@@ -49,24 +50,24 @@ Five samples over 63 minutes, spanning three deploys:
 A deploy pause was attempted mid-session and **held for 38 minutes** before the
 sixth deploy (`1e42237`, 12:27). It changed nothing measurable: the two samples
 inside it moved sealed by −4 and cells by 0.
-- `complete_base_rollup` +73 in 63 min = **~70 completions/hr**, and the sealed
-  count did not move, so essentially all of it is the live frontier — which
-  ingest replenishes. `pending_base_rollup` (journal) went 1,619 -> 1,685 in the
-  same window: the queue GREW.
+
+`complete_base_rollup` rose by 121 over the 115 minutes (~63/hr) while the sealed
+count did not move, so essentially all completion is the live frontier — which
+ingest replenishes. `pending_base_rollup` (journal) went 1,619 -> 1,816 across the
+same window: the queue GREW.
 
 Two corrections to the plan's premises:
 
 - It says the remaining sealed units are "**every one day-wide**". Measured
-  **inflation 2.13x** (930 units over 435 cells), stable across every sample. The
-  coarsening win did not hold at 1.0.
+  **inflation 2.12x to 2.25x** over 435 cells, in every sample. The coarsening win
+  did not hold at 1.0.
 - The plan's "best rate observed, ~41/hr of sealed work" is not reproducible here.
-  Over 48 uninterrupted-enough minutes the sealed rate is **~0/hr**.
+  Over 115 minutes the sealed CELL rate is exactly **0/hr**.
 
 **So the organisational ask in the plan — "a few hours without a deploy" — is not
-the blocker.** The 37-minute quiet stretch on `0bdeddf` was long enough to see a
-drain if one existed, and there was none. Sealed capacity is being spent
-elsewhere, not lost to restarts. (Four deploys landed during this window anyway,
-which is worth noticing on its own: nobody paused anything.)
+the blocker.** The 37-minute quiet stretch on `0bdeddf` and the 38-minute pause
+before `1e42237` were each long enough to see a drain if one existed, and there
+was none.
 
 One incidental correction to trap 2 — `rollup_min_contiguous_days` read **30 on a
 4-minute-old container** at 11:53, and 0 on an equally young one at 11:38. The
