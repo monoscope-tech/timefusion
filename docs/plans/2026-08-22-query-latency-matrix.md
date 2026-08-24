@@ -1235,3 +1235,30 @@ now looks more likely. Do not act on either until that one read settles it.
 Deliberately not attempted at this hour. This is the most correctness-sensitive
 path in the rollup system, and moving fast in exactly this area is what produced
 the level-tier regression earlier tonight.
+
+### VERIFIED: `ceb10b8` cleared the retry loop
+
+Same claim rate, ten minutes on the deployed fix:
+
+| | before (8 min) | after (10 min) |
+|---|---|---|
+| task starts | 658 | 654 |
+| coordinator errors | **477 (72%)** | **40 (6%)** |
+| rollup publishes | **103** | **466** |
+
+Publishes up **4.5x** for the same number of claims. Downstream:
+
+- `dashboard_1h_v2` committed at **02:52:47** — its first since 20:17:30, a
+  6.5-hour freeze, and it reports `contiguous_days=30` again.
+- `dashboard_level_1m_v1` reached `contiguous_days=2` and is committing (02:57:49).
+  It had been starved to zero claims and stuck at 1.
+- The claim mix is spread across five tiers instead of 89% on one.
+
+Two residuals, neither alarming:
+- One `contiguous_days=0` sample for `1h_v2` names a DIFFERENT worst project
+  (`5ce1c976…`, 1 of 12) — a tenant with no 1h coverage yet, not a tier
+  regression. Nine of ten samples read 30.
+- `dashboard_level_1h_v1` still takes ~80 claims per 10 min although its spec was
+  removed in `08fcace`: **the journal retains tasks for a spec that no longer
+  exists.** Harmless here but it is a real gap — removing a spec should retire its
+  queued units, and until it does those claims are pure overhead.
