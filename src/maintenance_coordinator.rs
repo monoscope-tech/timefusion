@@ -785,7 +785,9 @@ impl TaskJournal {
     /// 144 whole days and never fit. Prod 2026-08-19, immediately after the
     /// estimate fix deployed:
     ///
-    ///     subsumed=0 fused=0 candidates=266530 blocked=24 over_budget=266506
+    /// ```text
+    /// subsumed=0 fused=0 candidates=266530 blocked=24 over_budget=266506
+    /// ```
     ///
     /// `blocked` had collapsed from 249,786 to 24 — the superseded trap was
     /// gone — and every single candidate was now refused on a number written
@@ -1277,7 +1279,9 @@ impl TaskJournal {
     ///
     /// Measured 2026-08-19 03:00 UTC by #194's census:
     ///
-    ///     cells_missing=264  cells_wanted=0  defer_enqueue=false
+    /// ```text
+    /// cells_missing=264  cells_wanted=0  defer_enqueue=false
+    /// ```
     ///
     /// — the planner saw every hole, every one was vetoed as already-queued, and
     /// `rollup_derived_base_tier_proven` had not fired once. The tasks existed,

@@ -2471,6 +2471,14 @@ fn sort_backfill_uris_newest_first(uris: &mut [String]) {
     uris.sort_by(|a, b| b.cmp(a));
 }
 
+/// Wall-clock the GC phase of one reconcile pass may spend before yielding to
+/// the backfill behind it. Sized so a whole cycle still fits inside prod's
+/// ~15-minute gap between restarts.
+const GC_PHASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Tables reconciled at once. See the call site: bounded low on purpose.
+const TANTIVY_RECONCILE_CONCURRENCY: usize = 3;
+
 type TantivyBackfillWork = (String, String, String); // project, relative parquet, absolute URI
 
 /// Bound a backfill pass by INPUT BYTES, keeping fair-ordering intact.
@@ -3295,10 +3303,32 @@ impl Database {
         // by project uuid at build time) — a fixed "default"+customs list never
         // visits unified tenants.
         let (mut removed, mut blobs) = (0usize, 0usize);
-        for pid in crate::tantivy::list_manifest_projects(svc.object_store.as_ref(), table_name).await? {
-            let Ok(table_ref) = self.resolve_table(&pid, table_name).await else { continue };
-            let live_uris: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
-            let report = svc.gc_after_compaction(table_name, &pid, &live_uris).await?;
+        // Two bounds on the GC phase, which was the reason a spans pass could not
+        // finish between prod's ~15-minute restarts (2026-08-23):
+        //   - every project re-read the WHOLE live-file list, and on a unified
+        //     table all 22 projects resolve to the SAME DeltaTable, so that was
+        //     the same read 22 times. Memoised per resolved table.
+        //   - the loop was unbounded. It now yields at a deadline and says how
+        //     many projects it deferred, rather than starving the backfill that
+        //     follows it.
+        let gc_deadline = std::time::Instant::now() + GC_PHASE_BUDGET;
+        let mut live_cache: HashMap<usize, Arc<Vec<String>>> = HashMap::new();
+        let projects = crate::tantivy::list_manifest_projects(svc.object_store.as_ref(), table_name).await?;
+        let mut gc_deferred = 0usize;
+        for (i, pid) in projects.iter().enumerate() {
+            if std::time::Instant::now() >= gc_deadline {
+                gc_deferred = projects.len() - i;
+                break;
+            }
+            let pid = pid.as_str();
+            let Ok(table_ref) = self.resolve_table(pid, table_name).await else { continue };
+            let live_uris = match live_cache.entry(Arc::as_ptr(&table_ref) as usize) {
+                std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    Arc::clone(e.insert(Arc::new(table_ref.read().await.get_file_uris()?.collect())))
+                }
+            };
+            let report = svc.gc_after_compaction(table_name, pid, &live_uris).await?;
             if report.entries_removed > 0 || report.blob_delete_errors > 0 {
                 info!(
                     "tantivy reconcile gc: table={table_name} project={pid} entries_removed={} blobs_deleted={} delete_errors={}",
@@ -3307,6 +3337,11 @@ impl Database {
             }
             removed += report.entries_removed;
             blobs += report.blobs_deleted;
+        }
+        if gc_deferred > 0 {
+            // No silent caps: a deferred tail must be visible, or a bounded GC
+            // looks identical to a complete one.
+            warn!(table_name, gc_deferred, event = "tantivy_reconcile_gc_deferred");
         }
         let built = self.backfill_table_indexes(&svc, table_name).await?;
         Ok((built, removed, blobs))
@@ -3533,7 +3568,16 @@ impl Database {
             // callback and the two inline-reindex paths. Indexing it per-file
             // spends the pass on work with a half-life of hours while the
             // sealed backlog never moves. Counted, never silent.
-            let skip_today = self.config.tantivy.timefusion_tantivy_backfill_skip_today.then(|| format!("date={}", chrono::Utc::now().date_naive()));
+            // `skip_today` exists so the backfill does not race the hot-tail
+            // packer, which rewrites TODAY's files and would void the index
+            // immediately. Only base tables are hot-packed; a rollup tier is
+            // rebuilt wholesale (`mutable: false`) and writes into today's
+            // partition continuously, so skipping it there just defers work to
+            // the UTC-midnight roll — 2026-08-23 measured `skipped_today=690`
+            // on `1m_v3` against `planned=8`, and ~1,600 files sat until 00:00.
+            let hot_packed = crate::schema::registry().get(table_name).is_some_and(|s| !s.fields.iter().any(|f| f.name == "rollup_generation"));
+            let skip_today = (self.config.tantivy.timefusion_tantivy_backfill_skip_today && hot_packed)
+                .then(|| format!("date={}", chrono::Utc::now().date_naive()));
             let mut skipped_today = 0u64;
             for (pid, mut uris) in by_pid {
                 // Dashboard acceptance is governed by recent windows; a
@@ -4550,8 +4594,16 @@ impl Database {
             // cannot reset it back to the same starving order.
             let tables = svc.config.indexed_tables();
             let offset = rotation_offset(crate::support::now_micros(), tables.len());
-            for table_name in tables.iter().cycle().skip(offset).take(tables.len()) {
-                match db.tantivy_reconcile_table(table_name).await {
+            let ordered: Vec<String> = tables.iter().cycle().skip(offset).take(tables.len()).cloned().collect();
+            // Concurrent, because the passes differ by ~150x in cost: a rollup
+            // table finishes in seconds while `otel_logs_and_spans` takes ~30
+            // minutes, and run in sequence the slow one owned the slot. Bounded
+            // at 3 deliberately — this box has an OOM history and each pass
+            // holds a live-file list plus a tantivy writer arena.
+            futures::stream::iter(ordered.into_iter().map(|table_name| {
+                let db = Arc::clone(&db);
+                async move {
+                match db.tantivy_reconcile_table(&table_name).await {
                     // Logged even when it did nothing: a silent no-op arm made
                     // "ran and found nothing" indistinguishable from "never
                     // ran", and the cron not firing at all was the actual bug.
@@ -4560,7 +4612,11 @@ impl Database {
                     }
                     Err(e) => warn!("tantivy reconcile failed for {}: {}", table_name, e),
                 }
-            }
+                }
+            }))
+            .buffer_unordered(TANTIVY_RECONCILE_CONCURRENCY)
+            .collect::<Vec<()>>()
+            .await;
         });
 
         spawn_db_cron(&db, "Bloom sidecar reconcile", &self.config.maintenance.timefusion_bloom_sidecar_schedule, cancel.clone(), |db| async move {

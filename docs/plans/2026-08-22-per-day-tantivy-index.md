@@ -2019,3 +2019,18 @@ the day assuming:
   continuously. It is why ~1,600 files waited for midnight.
 - `index_manifests/otel_metrics/` — 774 KB of manifests for a table nothing
   reconciles, uncollectable because reconcile never visits an unindexed table.
+
+## Session close — the four remaining items
+
+| # | Item | Change |
+|---|---|---|
+| 1 | Tables run concurrently | `buffer_unordered(3)` over the rotated order. Passes differ ~150x in cost; in sequence the 30-minute spans pass owned the slot. Bounded at 3 for the OOM history — each pass holds a live-file list and a writer arena. |
+| 2 | `skip_today` re-examined | Now applies only to **hot-packed base tables**. It exists to avoid racing the hot-tail packer, which only rewrites base-table files; a rollup tier is rebuilt wholesale (`mutable: false`) and writes into today's partition continuously, so skipping there merely deferred ~1,600 files to the UTC-midnight roll (`skipped_today=690` on `1m_v3` against `planned=8`). Predicate is the synthesized `rollup_generation` column, not a hardcoded name. |
+| 4 | Per-project GC bounded | Two bounds. The live-file list is **memoised per resolved table** — on a unified table all 22 projects resolve to the *same* `DeltaTable`, so this was the identical full read 22 times. And the loop yields at `GC_PHASE_BUDGET` (120s), logging `tantivy_reconcile_gc_deferred` rather than capping silently. |
+| 5 | Orphaned `otel_metrics` manifests | Deleted from prod (10 objects, 774 KB) after backing them up locally. `schemas/otel_metrics.yaml` declares no tantivy field, so the table cannot enter `indexed_set()` and reconcile — the only thing that GCs manifests — could never visit it. |
+| 6 | Broken doctests | `maintenance_coordinator.rs` had prod log output in **indented** doc blocks, which rustdoc parses as Rust. Fenced as ```text; `cargo test --doc` is green. Not caught by CI because nextest does not run doctests. |
+
+Items 1, 2 and 4 all attack the same thing from different sides: a pass that
+cannot finish inside prod's ~15-minute restart window. 1 stops the slow pass
+blocking the fast ones, 4 removes the largest chunk of the slow pass's own cost,
+and 2 stops manufacturing deferred work that arrives in one lump at midnight.
