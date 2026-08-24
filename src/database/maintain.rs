@@ -5,6 +5,40 @@ use tap::Tap;
 
 /// Estimated decoded (in-memory) bytes for a Parquet file of `compressed_size` on
 /// disk — a fixed 12x compression-ratio guess used for budgeting, not measurement.
+/// One tier's contribution to a fleet contiguity gauge, or `None` to abstain.
+///
+/// Every tier folds into one number with `.min()`, and that is the SAFETY
+/// PROPERTY, not a bug. The fleet gauge drives `coverage_is_short`, which
+/// overrides the journal ceiling so a starved tier can enqueue historical
+/// backfill at all. Swap the fold for a median and a single starved tier stops
+/// triggering it — and `dashboard_1h_v2`, the tier every 7d/30d query reads, is
+/// exactly the one that would then wait on a ceiling the live frontier holds
+/// shut forever.
+///
+/// What the fold could NOT distinguish is a tier RAMPING from one STARVED: both
+/// read low, only one is an emergency. Prod 2026-08-24 — a two-hour-old
+/// `dashboard_level_1m_v1` sat at 2 days and pinned the fleet gauge to 2 while
+/// four healthy tiers sat at 30, running the whole cluster in coverage-short
+/// mode for an auxiliary tier nobody queries.
+///
+/// A tier younger than the horizon CANNOT hold that many days, so it abstains.
+/// That keeps the override armed for every real regression, because regression
+/// only happens to tiers old enough to have been complete.
+/// `seeded_by_real` is whether a NON-ramping tier has already contributed in this
+/// sweep, and it is what makes the rule order-independent. A ramping tier still
+/// seeds a gauge nothing real has touched — otherwise a fresh deployment, where
+/// every tier is young, would publish no gauge at all and the reweighting would
+/// run off whatever value the process started with. But a real tier always
+/// OVERWRITES that provisional value rather than minimising into it, so a
+/// ramping tier listed first cannot drag the fleet down either.
+fn fold_fleet_gauge(previous: u64, value: u64, seeded_by_real: bool, ramping: bool) -> Option<u64> {
+    match (ramping, seeded_by_real) {
+        (true, true) => None,
+        (true, false) | (false, false) => Some(value),
+        (false, true) => Some(previous.min(value)),
+    }
+}
+
 fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
 }
@@ -682,10 +716,28 @@ impl Database {
             for (index, spec) in schema.rollups.iter().enumerate() {
                 let target = spec.table_name(&source);
                 let Ok(target_ref) = self.resolve_table(&storage_project, &target).await else { continue };
-                let covered = {
+                let (covered, tier_created_ms) = {
                     let table = target_ref.read().await;
-                    partitions_of(&table)?
+                    (partitions_of(&table)?, table.snapshot().ok().and_then(|state| state.snapshot().metadata().created_time()))
                 };
+                // A tier YOUNGER than the coverage horizon cannot hold that many
+                // days, so a low number from it is ramp-up, not starvation — and
+                // only starvation should move the fleet gauges below.
+                //
+                // Durable on purpose. A high-water mark would be process state,
+                // and this box restarts constantly: after every restart every
+                // tier would look young, the gauges would never signal short, and
+                // a rare false positive would become a permanent false negative.
+                // `created_time` lives in the Delta log and survives.
+                //
+                // KNOWN GAP: a long-lived tier REBUILT from scratch (a `_v3` bump
+                // reusing the same table) still reads old, so it will pin the
+                // gauge while it rebuilds. That may well be correct — a rebuild
+                // does want the backfill capacity — but it is untested, and
+                // saying so is better than letting it look covered.
+                let horizon_ms = horizon.saturating_mul(24 * 60 * 60 * 1_000);
+                let tier_is_ramping = tier_created_ms
+                    .is_some_and(|created| crate::support::now_micros().div_euclid(1_000).saturating_sub(created) < horizon_ms);
                 // The goal metric, computed from the set this planner already
                 // built: how many days back from yesterday are covered with NO
                 // hole, minimised over projects. A 30d panel reads the coarse
@@ -694,50 +746,20 @@ impl Database {
                 // and `tasks_pending` both read as progress on 2026-08-17 while
                 // 14d/30d queries stayed unroutable.
                 let (contiguous, worst_project, median_contiguous) = min_contiguous_days(&covered, &source_partitions, today, &active_projects);
-                // KNOWN DEFECT, 2026-08-24: this median is MIN-FOLDED across tiers
-                // just below, and a median that is then minimised is not a median
-                // of anything — it is "the typical project of the WORST tier".
-                //
-                // That defeats the reason the median exists. `coverage_is_short`'s
-                // own comment says it reads the median rather than the minimum so
-                // that "one negligible tenant pins it forever, holding the fleet in
-                // coverage-short mode". The per-project median fixes that at TENANT
-                // granularity; the cross-tier `.min()` below reintroduces exactly
-                // the same failure at TIER granularity.
-                //
-                // Measured: a new `dashboard_level_1m_v1` ramping at 2 days made the
-                // FLEET gauge read 2 while `dashboard_1m_v3`, `dashboard_1h_v2` and
-                // both otel_metrics tiers sat at 30. Threshold is COVERAGE_SHORT_DAYS
-                // = 14, so the cluster ran in coverage-short mode — which OVERRIDES
-                // the 25,000-task journal ceiling ("the goal outranks the ceiling"
-                // above) — because of an auxiliary tier nobody queries. Withdrawing
-                // that tier took both gauges back to 30, which is what identified the
-                // mechanism. ANY tier being rebuilt reproduces it; removing that tier
-                // cured the symptom, not this.
-                //
-                // NOT fixed here because the right aggregation is a design decision
-                // about what the reweighting is FOR, and each candidate has a real
-                // objection:
-                //   * median-of-medians across the sweep — matches the gauge's name
-                //     and the accumulate-then-publish-once pattern already used for
-                //     `base_tier_ready` below, but masks the case where a MINORITY of
-                //     tiers is genuinely starved and does need the override;
-                //   * exclude "young" tiers — needs a definition of young that will
-                //     not silently exclude a tier that has genuinely REGRESSED;
-                //   * restrict to query-serving tiers — closest to intent, but the
-                //     code has no notion of which tiers those are.
-                // Picking wrong does not crash anything; it quietly mis-weights
-                // maintenance, which is the slowest class of bug to see here.
-                let median_gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
-                let previous_median = median_gauge.load(std::sync::atomic::Ordering::Relaxed);
-                median_gauge
-                    .store(if first_tier_of_sweep { median_contiguous } else { previous_median.min(median_contiguous) }, std::sync::atomic::Ordering::Relaxed);
-                let gauge = &crate::observability::maintenance_stats().rollup_min_contiguous_days;
-                let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
-                // Every tier folds into one number, so take the worst; reset
-                // when this sweep starts over at the first tier of the first source.
-                gauge.store(if first_tier_of_sweep { contiguous } else { previous.min(contiguous) }, std::sync::atomic::Ordering::Relaxed);
-                first_tier_of_sweep = false;
+                // See `fold_fleet_gauge` for why the cross-tier `.min()` stays and why a
+                // ramping tier abstains from it.
+                for (gauge, value) in [
+                    (&crate::observability::maintenance_stats().rollup_median_contiguous_days, median_contiguous),
+                    (&crate::observability::maintenance_stats().rollup_min_contiguous_days, contiguous),
+                ] {
+                    let previous = gauge.load(std::sync::atomic::Ordering::Relaxed);
+                    if let Some(folded) = fold_fleet_gauge(previous, value, !first_tier_of_sweep, tier_is_ramping) {
+                        gauge.store(folded, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                // Only a REAL tier consumes the seed. A ramping tier's value is
+                // provisional and the next real tier overwrites it.
+                first_tier_of_sweep &= tier_is_ramping;
                 // The gauge alone is not actionable: it folds every (project,
                 // tier) into one number, so a zero says the fleet is short
                 // without saying where. Finding that the zero came from ONE
@@ -6737,5 +6759,39 @@ mod date_coverage_recovery_tests {
         // Starting at or before the first row is fine; the read path clamps.
         assert_eq!(Database::contiguous_coverage_end(2 * hour, &mut [(hour, 5 * hour)]), Some(5 * hour));
         assert_eq!(Database::contiguous_coverage_end(hour, &mut []), None);
+    }
+
+    /// A ramping tier must not pin the fleet gauge; a starved one must.
+    ///
+    /// Prod 2026-08-24: a two-hour-old `dashboard_level_1m_v1` at 2 days pinned
+    /// the fleet gauge to 2 while `dashboard_1m_v3`, `dashboard_1h_v2` and both
+    /// otel_metrics tiers sat at 30 — running the whole cluster in
+    /// coverage-short mode, which OVERRIDES the journal ceiling, for an
+    /// auxiliary tier nobody queries.
+    #[test]
+    fn a_ramping_tier_abstains_from_the_fleet_gauge_but_a_starved_one_pins_it() {
+        // The prod shape: a real tier seeds 30, the ramping tier abstains, so
+        // the fleet stays 30 instead of collapsing to 2.
+        let seeded = fold_fleet_gauge(0, 30, false, false).expect("a real tier always counts");
+        assert_eq!(seeded, 30);
+        assert_eq!(fold_fleet_gauge(seeded, 2, true, true), None, "a ramping tier must not drag an established fleet value down");
+
+        // ORDER-INDEPENDENT: the ramping tier listed FIRST seeds provisionally,
+        // and the real tier overwrites rather than minimising into it. Without
+        // this, schema order alone decided whether the fleet read 2 or 30.
+        assert_eq!(fold_fleet_gauge(0, 2, false, true), Some(2), "with nothing real yet, even a ramping tier is better than no gauge");
+        assert_eq!(fold_fleet_gauge(2, 30, false, false), Some(30), "the first real tier REPLACES a provisional value");
+
+        // A fresh deployment is all-ramping, and must still publish something —
+        // abstaining everywhere left the gauge at its start value, which is how
+        // `the_backfill_ceiling_defers_enqueueing_without_stopping_the_pass`
+        // caught this.
+        assert_eq!(fold_fleet_gauge(u64::MAX, 3, false, true), Some(3));
+
+        // And the property that must NOT be lost: a genuinely starved tier still
+        // pins the fleet, because that is what arms the ceiling override for the
+        // tier every 7d/30d query reads.
+        assert_eq!(fold_fleet_gauge(seeded, 5, true, false), Some(5));
+        assert_eq!(fold_fleet_gauge(5, 30, true, false), Some(5), "min, not last-writer");
     }
 }
