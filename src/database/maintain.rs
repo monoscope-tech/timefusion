@@ -785,10 +785,34 @@ impl Database {
                 // without saying where. Finding that the zero came from ONE
                 // project cost a manual sweep of every project across two
                 // sources on 2026-08-17. Name it instead.
+                // `contiguous_days` counts DATE PARTITIONS — see `partitions_of`,
+                // which reads file paths and non-emptiness and nothing else. A
+                // date whose files carry a superseded generation is therefore
+                // counted as covered here while the READ path refuses it, and
+                // the planner never re-derives it for the same reason.
+                //
+                // Prod 2026-08-24 sat at `contiguous_days=30` while exactly two
+                // days were usable, because a spec edit on 08-22 changed
+                // `generation_id` and orphaned everything before it. No gauge
+                // moved. `usable_cells` is the read path's own answer — the size
+                // of the coverage map the router actually consults — so a gap
+                // between the two IS an orphaning event.
+                //
+                // CAVEAT, and it matters: the coverage map is process-scoped and
+                // takes ~5.5 minutes to rebuild after a restart (measured), so
+                // `usable_cells` reads low on a young process. Compare the two
+                // only once the process has outlived that.
+                let usable_cells = self
+                    .rollup_coverage
+                    .iter()
+                    .filter(|entry| entry.key().1 == source && entry.key().2 == target)
+                    .count();
                 info!(
                     source,
                     tier = %target,
                     contiguous_days = contiguous,
+                    partition_cells = covered.len(),
+                    usable_cells,
                     worst_project = worst_project.unwrap_or("none"),
                     active_projects = active_projects.len(),
                     event = "rollup_coverage_contiguity"
@@ -3194,6 +3218,9 @@ impl Database {
     fn record_readable_coverage(&self, source: &str, target: &str, readable: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>>) {
         use crate::storage::CoverageLedger as _;
         let mut disagreements = 0u64;
+        // Accumulated and written ONCE. Per-cell writes would re-serialize the
+        // whole ledger for every cell of every tier, every hour.
+        let mut batch: Vec<(crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>)> = Vec::new();
         let seen: std::collections::HashSet<crate::storage::CoverageCell> = readable.keys().cloned().collect();
         for (cell, entries) in readable {
             let proved = crate::storage::merge_coverage(entries);
@@ -3210,7 +3237,7 @@ impl Database {
                     "the ledger and the Delta tags disagree about this partition's coverage"
                 );
             }
-            self.coverage_ledger.replace(&cell, proved);
+            batch.push((cell, proved));
         }
         // Cells this tier no longer covers at all. Scoped to (source, target)
         // because this replay proves nothing about a tier it did not read.
@@ -3221,9 +3248,9 @@ impl Database {
             .filter(|(cell_source, _, cell_table, _)| cell_source == source && cell_table == target)
             .filter(|cell| !seen.contains(cell))
             .collect();
-        for cell in orphans {
-            self.coverage_ledger.retire(&cell);
-        }
+        // Retired in the same batch — an empty entry list drops the cell.
+        batch.extend(orphans.into_iter().map(|cell| (cell, Vec::new())));
+        self.coverage_ledger.replace_many(batch);
         if disagreements > 0 {
             crate::observability::maintenance_stats().coverage_ledger_disagreements.fetch_add(disagreements, std::sync::atomic::Ordering::Relaxed);
         }
