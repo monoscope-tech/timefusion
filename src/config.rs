@@ -2045,6 +2045,22 @@ pub struct MaintenanceConfig {
     /// answer lands in `immutable_column_disagreement_total`.
     #[serde_inline_default(false)]
     pub timefusion_immutable_audit_enabled: bool,
+    /// Seed rollup ROUTING from the durable coverage ledger at boot, instead of
+    /// waiting for the Delta tag replay to rebuild it.
+    ///
+    /// Routing coverage is currently reconstructed by `recover_rollup_coverage`,
+    /// which replays every tier's log and reads tags off every live file. Until
+    /// that finishes, `rollup_min_contiguous_days` reads 0 and the router does
+    /// not even ATTEMPT to route — so every restart costs a window of
+    /// unrouted, raw-path queries. On a box that restarts every 10-25 minutes
+    /// that window is most of the uptime.
+    ///
+    /// The ledger is durable and holds the same readable coverage, so it can
+    /// answer immediately. Default OFF: flip it only once
+    /// `coverage_ledger_disagreements` has read zero at production scale, since
+    /// a ledger that over-claims serves coverage that is not there.
+    #[serde_inline_default(false)]
+    pub timefusion_coverage_ledger_reads: bool,
     /// Days back (plus today) the dedup sweep scans.
     // 128: a lower bound put a multi-day floor under the backlog, but a much
     // higher one OOM'd the box — RSS climbed independent of query load, tracking

@@ -3137,6 +3137,8 @@ impl Database {
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };
 
+        db.seed_routing_from_ledger();
+
         Ok(db)
     }
 
@@ -11926,12 +11928,44 @@ mod tests {
         Ok(())
     }
 
-    /// A partition still holding an untagged tier file must be QUEUED for rebuild.
+    /// The read-path move, and the whole reason for it: after a restart the
+    /// router has no coverage until `recover_rollup_coverage` replays every
+    /// tier's Delta log, and until then `rollup_min_contiguous_days` reads 0 and
+    /// routing is not even attempted. On a box that restarts every 10-25 minutes
+    /// that window is most of the uptime.
     ///
-    /// `slice_retires` can retire such a file, but only when something publishes that partition,
-    /// and the coordinator publishes for the live frontier and for coverage gaps — neither of which
-    /// describes a sealed day that already has coverage. Recovery already sees these files and
-    /// skipped them silently, which is how 352 of them accumulated across 26 days unnoticed.
+    /// The ledger is durable and already holds the readable coverage, so a fresh
+    /// process can route immediately. Default OFF — flip only once
+    /// `coverage_ledger_disagreements` reads zero at production scale.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_routes_from_the_ledger_before_the_tag_replay_runs() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        let mut cfg = (*create_test_config("ledger-seed")).clone();
+        cfg.maintenance.timefusion_rollup_enabled = true;
+        cfg.maintenance.timefusion_coverage_ledger_reads = true;
+        let cfg = std::sync::Arc::new(cfg);
+        let db = Database::with_config(cfg.clone()).await?;
+        db.cancel_maintenance();
+        let project = format!("seed_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let after_replay = db.rollup_slice_coverage.iter().filter(|entry| entry.key().0 == project).count();
+        assert!(after_replay > 0, "the replay published routing coverage, or this test proves nothing");
+        drop(db);
+
+        // A NEW process over the same data dir, with NO replay run.
+        let restarted = Database::with_config(cfg).await?;
+        restarted.cancel_maintenance();
+        let seeded = restarted.rollup_slice_coverage.iter().filter(|entry| entry.key().0 == project).count();
+
+        assert!(seeded > 0, "routing coverage is available at boot, before any tag replay");
+        assert_eq!(seeded, after_replay, "and it is the coverage the replay would have produced, not a subset");
+        Ok(())
+    }
+
     /// Step 1 of moving coverage off file tags: the replay that reads the tags
     /// also RECORDS what it read. Nothing consumes the ledger yet, which is the
     /// point — it has to be shown to agree with the replay before any read can
@@ -12036,6 +12070,12 @@ mod tests {
         Ok(())
     }
 
+    /// A partition still holding an untagged tier file must be QUEUED for rebuild.
+    ///
+    /// `slice_retires` can retire such a file, but only when something publishes that partition,
+    /// and the coordinator publishes for the live frontier and for coverage gaps — neither of which
+    /// describes a sealed day that already has coverage. Recovery already sees these files and
+    /// skipped them silently, which is how 352 of them accumulated across 26 days unnoticed.
     #[tokio::test]
     async fn recovery_queues_a_rebuild_for_a_partition_holding_untagged_tier_files() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskState};

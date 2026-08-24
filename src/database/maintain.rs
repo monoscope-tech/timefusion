@@ -3133,6 +3133,49 @@ impl Database {
         self.rollup_coverage.len()
     }
 
+    /// Seed routing coverage from the durable ledger, returning how many slices
+    /// it published. Off unless `timefusion_coverage_ledger_reads`.
+    ///
+    /// This is the read-path move, and its value is entirely about RESTARTS.
+    /// `recover_rollup_coverage` rebuilds the same map by replaying every tier's
+    /// Delta log — minutes of work — and until it lands the router does not
+    /// attempt to route at all. The ledger already holds that answer durably, so
+    /// routing can be correct from the first query after boot.
+    ///
+    /// Sound only because the ledger records exactly the slices that passed the
+    /// read path's own filters — see `record_readable_coverage`. It seeds rather
+    /// than replaces: the replay still runs, still verifies, and overwrites
+    /// anything here, so a stale ledger costs one interval of narrower coverage
+    /// and never a wrong answer.
+    pub fn seed_routing_from_ledger(&self) -> usize {
+        if !self.config.maintenance.timefusion_coverage_ledger_reads {
+            return 0;
+        }
+        use crate::storage::CoverageLedger as _;
+        let mut seeded = 0usize;
+        for cell in self.coverage_ledger.cells() {
+            let (source, project_id, table_name, _date) = cell.clone();
+            for entry in self.coverage_ledger.coverage(&cell) {
+                self.rollup_slice_coverage.insert(
+                    (project_id.clone(), source.clone(), table_name.clone(), entry.start_micros, entry.end_micros),
+                    RollupCoverage {
+                        source_fp: entry.source_fingerprint,
+                        source_epoch: 0,
+                        generation: entry.generation.clone(),
+                        rows: 0,
+                        source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                        covered_through: entry.end_micros,
+                    },
+                );
+                seeded += 1;
+            }
+        }
+        if seeded > 0 {
+            info!(seeded, event = "rollup_coverage_seeded_from_ledger", "routing coverage available before the tag replay");
+        }
+        seeded
+    }
+
     /// Write one tier's READABLE coverage into the ledger, verifying it against
     /// what the ledger already held.
     ///
