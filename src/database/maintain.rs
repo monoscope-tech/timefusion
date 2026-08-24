@@ -3124,6 +3124,9 @@ impl Database {
         // base tier has a backlog — the same "cannot tell none from unmeasured"
         // failure the untagged gauge already had.
         let mut unverifiable = 0u64;
+        // Slices whose stored generation no longer matches the current spec:
+        // coverage that exists on disk and cannot be used. See the skip below.
+        let mut stale_generation = 0u64;
         for spec in &schema.rollups {
             let target = spec.table_name(source);
             let (mut untagged_spans, mut tagged_spans): (SpansByPartition, SpansByPartition) = Default::default();
@@ -3220,9 +3223,59 @@ impl Database {
             // Recorded AFTER the replay that read them, never speculatively: the
             // ledger may understate coverage (costing a rebuild) but must never
             // claim coverage that is not there (serving wrong results).
-            for (cell, entry) in ledger_rows {
-                use crate::storage::CoverageLedger;
-                self.coverage_ledger.record(&cell, entry);
+            //
+            // And VERIFIED against what it already held, which is the whole
+            // reason this replay stays once reads move onto the ledger. The
+            // ledger's one new risk is that an authority can drift where
+            // self-describing files cannot; this is the standing alarm.
+            {
+                use crate::storage::CoverageLedger as _;
+                let mut replayed: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>> = HashMap::new();
+                for (cell, entry) in ledger_rows {
+                    replayed.entry(cell).or_default().push(entry);
+                }
+                let replayed_cells: std::collections::HashSet<crate::storage::CoverageCell> = replayed.keys().cloned().collect();
+                let mut disagreements = 0u64;
+                for (cell, entries) in replayed {
+                    let proved = crate::storage::merge_coverage(entries);
+                    let held = self.coverage_ledger.coverage(&cell);
+                    // An empty `held` is the FIRST replay for that cell, not a
+                    // disagreement — every cell would report one on a fresh boot
+                    // and the alarm would be worthless from the day it shipped.
+                    if !held.is_empty() && held != proved {
+                        disagreements += 1;
+                        warn!(
+                            table = %target,
+                            project_id = %cell.1,
+                            date = %cell.3,
+                            held = held.len(),
+                            proved = proved.len(),
+                            event = "coverage_ledger_disagreement",
+                            "the ledger and the Delta tags disagree about this partition's coverage"
+                        );
+                    }
+                    self.coverage_ledger.replace(&cell, proved);
+                }
+                // Cells the ledger holds for THIS tier that the replay no longer
+                // sees at all: their files are gone. Scoped to (source, target)
+                // because this replay proves nothing about any other tier — a
+                // sweep over every cell would retire coverage that is merely not
+                // being looked at right now.
+                let orphans: Vec<_> = self
+                    .coverage_ledger
+                    .cells()
+                    .into_iter()
+                    .filter(|(cell_source, _, cell_table, _)| cell_source == source && *cell_table == target)
+                    .filter(|cell| !self.coverage_ledger.coverage(cell).is_empty() && !replayed_cells.contains(cell))
+                    .collect();
+                for cell in orphans {
+                    self.coverage_ledger.retire(&cell);
+                }
+                if disagreements > 0 {
+                    crate::observability::maintenance_stats()
+                        .coverage_ledger_disagreements
+                        .fetch_add(disagreements, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             // Before any `continue` below, so a partition still holding
             // untagged files is queued whatever the coverage verdict is.
@@ -3286,7 +3339,28 @@ impl Database {
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else { continue };
                     let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else { continue };
-                    if !complete || crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
+                    // A stored generation that no longer matches the CURRENT spec
+                    // is unrecoverable coverage, and it was a bare `continue` —
+                    // the single most consequential silent skip in the rollup
+                    // system.
+                    //
+                    // `generation_id` hashes the whole spec, so ADDING A MEASURE
+                    // invalidates every slice built before it. The read path then
+                    // answers `not_built` for those dates forever, while
+                    // `rollup_coverage_contiguity` still reports 30 days because
+                    // the census counts DATE PARTITIONS, not generation matches.
+                    // A spec change therefore strips read coverage from the whole
+                    // history and no gauge moves. `duration_digest` on 2026-08-22
+                    // is exactly that shape.
+                    //
+                    // Counting it does not fix it — the cure is either a rebuild
+                    // or an identity that tolerates additive change — but it makes
+                    // the cost of a spec edit visible at the moment it is paid.
+                    if !complete {
+                        continue;
+                    }
+                    if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
+                        stale_generation += 1;
                         continue;
                     }
                     if source_rows.is_none() {
@@ -3315,7 +3389,9 @@ impl Database {
             // coverage is recoverable from Delta metadata alone.
         }
         crate::observability::maintenance_stats().rollup_witnessless_slices.store(unverifiable, std::sync::atomic::Ordering::Relaxed);
-        info!(source, recovered, unverifiable, event = "rollup_coverage_recovered");
+        // `stale_generation` is coverage that EXISTS on disk and cannot be used:
+        // read it against `recovered` to price a spec change after the fact.
+        info!(source, recovered, unverifiable, stale_generation, event = "rollup_coverage_recovered");
         Ok(recovered)
     }
 

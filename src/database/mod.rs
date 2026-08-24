@@ -11965,12 +11965,24 @@ mod tests {
 
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
 
-        let recorded = db.coverage_ledger.coverage(&("otel_logs_and_spans".to_owned(), project.clone(), tier, day.to_string()));
+        let cell = ("otel_logs_and_spans".to_owned(), project.clone(), tier, day.to_string());
+        let recorded = db.coverage_ledger.coverage(&cell);
         assert!(!recorded.is_empty(), "the replay recorded the published slice");
         assert!(
             recorded.iter().all(|entry| entry.end_micros > entry.start_micros),
             "slice ends are exclusive and must be after their start: {recorded:?}"
         );
+
+        // The verifier is the reason this replay survives once reads move onto
+        // the ledger, so it has to be right in BOTH directions. Nothing changed
+        // between these two replays, so a second one must record no drift —
+        // otherwise the alarm cries wolf on every hourly pass and gets ignored,
+        // which is worse than not having it.
+        let before = crate::observability::maintenance_stats().coverage_ledger_disagreements.load(std::sync::atomic::Ordering::Relaxed);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let after = crate::observability::maintenance_stats().coverage_ledger_disagreements.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before, "an unchanged tier replayed twice is not a disagreement");
+        assert_eq!(db.coverage_ledger.coverage(&cell), recorded, "and the second replay leaves the same coverage, not a duplicated one");
         Ok(())
     }
 

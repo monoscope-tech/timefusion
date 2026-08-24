@@ -3643,6 +3643,18 @@ pub trait CoverageLedger: Send + Sync {
     fn record(&self, cell: &CoverageCell, entry: CoverageEntry);
     /// Drop a cell entirely — its partition aged out, or its coverage is being
     /// rebuilt from scratch.
+    /// Replace a cell's coverage wholesale with what a replay just proved.
+    ///
+    /// `record` alone is APPEND-ONLY, and coverage is not: a slice rebuilt under
+    /// a new generation supersedes the old entry rather than joining it, and a
+    /// slice whose files were removed leaves nothing behind at all. Re-recording
+    /// every hour without replacing would accumulate superseded entries forever
+    /// and — worse than the size — keep serving ranges whose files are gone,
+    /// which is the ledger's one unacceptable failure: claiming coverage that is
+    /// not there.
+    fn replace(&self, cell: &CoverageCell, entries: Vec<CoverageEntry>);
+    /// Drop a cell entirely — its partition aged out, or its coverage is being
+    /// rebuilt from scratch.
     fn retire(&self, cell: &CoverageCell);
     fn cells(&self) -> Vec<CoverageCell>;
 }
@@ -3755,6 +3767,15 @@ impl CoverageLedger for JsonCoverageLedger {
         self.persist();
     }
 
+    fn replace(&self, cell: &CoverageCell, entries: Vec<CoverageEntry>) {
+        if entries.is_empty() {
+            self.retire(cell);
+            return;
+        }
+        self.cells.insert(cell.clone(), merge_coverage(entries));
+        self.persist();
+    }
+
     fn retire(&self, cell: &CoverageCell) {
         if self.cells.remove(cell).is_some() {
             self.persist();
@@ -3820,6 +3841,36 @@ mod coverage_ledger_tests {
 
         let reloaded = JsonCoverageLedger::load(dir.path());
         assert_eq!(reloaded.coverage(&cell()), vec![entry(0, 10, "g1", Some(5))], "a recorded slice is on disk before the process ends");
+    }
+
+    /// `record` is append-only; coverage is not. A slice rebuilt under a new
+    /// generation SUPERSEDES the old entry, and re-recording every hour without
+    /// replacing would keep the superseded range live forever — serving coverage
+    /// whose files are gone, which is the one failure the ledger must never have.
+    #[test]
+    fn replacing_a_cell_drops_superseded_entries_rather_than_accumulating_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = JsonCoverageLedger::load(dir.path());
+        ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
+        ledger.record(&cell(), entry(20, 30, "g1", Some(5)));
+        assert_eq!(ledger.coverage(&cell()).len(), 2, "two disjoint ranges are two entries");
+
+        ledger.replace(&cell(), vec![entry(0, 10, "g2", Some(9))]);
+
+        assert_eq!(ledger.coverage(&cell()), vec![entry(0, 10, "g2", Some(9))], "what the replay proved is ALL the cell holds");
+        assert_eq!(JsonCoverageLedger::load(dir.path()).coverage(&cell()).len(), 1, "and the replacement is durable");
+    }
+
+    /// Replacing with nothing means the replay found no coverage at all, which
+    /// is a retirement — not a cell holding an empty list, which would read back
+    /// as "known to have no coverage" and is a different claim.
+    #[test]
+    fn replacing_with_nothing_retires_the_cell() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = JsonCoverageLedger::load(dir.path());
+        ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
+        ledger.replace(&cell(), Vec::new());
+        assert!(ledger.cells().is_empty(), "the cell is gone, not empty");
     }
 
     #[test]

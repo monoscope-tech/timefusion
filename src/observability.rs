@@ -949,6 +949,17 @@ atomic_stats! {
     /// here means "not audited" just as loudly as it means "clean" — check the
     /// flag before concluding anything.
     immutable_column_disagreement_total,
+    /// Partitions where the coverage ledger and the Delta tags disagree.
+    ///
+    /// The ledger is destined to be the authority, and an authority can DRIFT
+    /// where self-describing files cannot — that is the one risk the design
+    /// adds. This is the standing alarm against it, and it is why the tag replay
+    /// stays after reads move onto the ledger rather than being deleted with the
+    /// tags it reads.
+    ///
+    /// Must be zero before any read path trusts the ledger. Non-zero afterwards
+    /// means queries may be answered from coverage that is not there.
+    coverage_ledger_disagreements,
     /// Base rollup files carrying no parseable slice tags — history written
     /// before tagging existed.
     ///
