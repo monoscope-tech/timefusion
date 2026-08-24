@@ -49,6 +49,20 @@ async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Resul
         .with_bucket_duration(Duration::from_secs(bucket_secs))
         .with_retention(Duration::from_secs(60 * 60))
         .with_page_row_count_limit(50)
+        // Deterministic file list. The flush spawns the sidecar tantivy index
+        // as a DETACHED task, so whether the index exists by query time is a
+        // race the test can neither observe nor await — and once it does, the
+        // prefilter proves no file can match `no-such-name` and removes EVERY
+        // file from the Delta scan. The leg becomes `EmptyExec`, which declares
+        // no ordering, so `DedupExec` correctly reports `full-set` over zero
+        // rows and the second assertion below fires on a plan that is optimal.
+        //
+        // CI 2026-08-24 (run 32772841710) caught the race mid-test: the plain
+        // SELECT scanned `add_files_seen=2`, `tantivy_index_built` landed 20 ms
+        // later, and the EXPLAIN ANALYZE logged `Predicate statically evaluated
+        // to false; skipping all files`. That is the whole flake — the guard
+        // was measuring which side of a race it landed on, not a regression.
+        .with_tantivy_file_pruning(false)
         .start()
         .await?;
     env.db().cancel_maintenance();
@@ -95,6 +109,10 @@ async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Resul
     // to full-set — the mode whose 2 GiB ceiling killed prod point lookups.
     // With empty legs dropped before the union, the ordered delta leg keeps
     // bounded streaming dedup.
+    // Belt and braces for the race above: if the Delta leg is ever pruned to
+    // nothing again, say so rather than reporting a regression that is not one.
+    // There is no ordered leg to preserve when there is no leg at all.
+    assert!(plan.contains("DataSourceExec"), "no file was scanned at all, so this run proves nothing about leg ordering.\nplan:\n{plan}");
     assert!(dedup_line.contains("bounded["), "DedupExec fell to full-set — an empty leg vetoed the declared ordering.\nplan:\n{plan}");
     Ok(())
 }
