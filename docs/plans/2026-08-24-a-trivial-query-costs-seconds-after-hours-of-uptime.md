@@ -245,6 +245,21 @@ confound Phase 0 exists to break. What *is* established is that all three
 suspects move on the timescale of **minutes**, so this does not need a 24-hour
 vigil to resolve.
 
+**Which is fortunate, because the day-long quiet window is not obtainable.**
+Prod restarted twice in the first 50 minutes of it — not from this work
+(`1e42237` was another worker's deploy), and the plan's own note already said
+prod ran eight images in a working day. A protocol that requires everyone else
+to stop deploying is not a protocol.
+
+**So Phase 0 is re-scoped to the within-process slope, and the sampler now runs
+every 5 minutes instead of 30.** At the 30-minute cadence a process that lives
+~40 minutes yields *one* sample, and `--analyze` needs three in a run — the
+series would have been all breaks and no runs. At 5 minutes an ordinary
+inter-deploy life yields 6–10, which is enough to fit uptime against cost
+*inside* one process, where the load confound still applies but the age axis is
+clean. Each restart then becomes another replicate of the same short experiment
+rather than the thing that ruins it.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise

@@ -180,7 +180,11 @@ def analyze():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--every", type=int, default=1800, help="seconds between samples")
+    # 5 min, not 30: prod is redeployed every ~30-50 min by whoever is working
+    # that day, and a 30-min cadence yields ONE sample per process life while
+    # `--analyze` needs three in a run. The age axis has to be sampled faster
+    # than the thing that resets it.
+    ap.add_argument("--every", type=int, default=300, help="seconds between samples")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--analyze", action="store_true")
     a = ap.parse_args()
