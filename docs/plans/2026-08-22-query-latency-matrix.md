@@ -1512,3 +1512,29 @@ deciding explicitly rather than inheriting.
 
 Also visible: **15 of 106 starts timed out (14%)**, consistent with units
 outliving a process that is replaced every 5-15 minutes.
+
+### Boundary refined (not moved), and the timeouts are not the rollup's
+
+On a 43-minute process — the longest prod has survived today:
+
+| window | result |
+|---|---|
+| 2026-08-23 | hits+1 |
+| **2026-08-22** | **hits+1** |
+| 2026-08-21 | hits+0 |
+| 2026-08-19 | hits+0 |
+
+**This is a finer reading, NOT progress.** 08-22 is the spec-change date itself
+and had never been probed; files written after the change that day carry the
+current generation, so it routing is expected. `08-21` remains the control and
+remains a miss. Claiming the boundary "moved" here would be the false-good-news
+pattern this document keeps catching.
+
+State on that process: `hits_full=0, hits_hybrid=1, misses=70`. Routing works and
+covers about 2 days of a 35-day window, so most queries still miss — which is the
+honest summary of where the goal stands.
+
+**Timeout attribution corrected.** The 14% timeout rate is `SealedConsolidation`
+and `Dedup` — file rewrites — not `BaseRollup`. The rollup rebuild is NOT
+timeout-limited, so the fix for it is ordering and process lifetime, not
+deadlines.
