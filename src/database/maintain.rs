@@ -3133,6 +3133,59 @@ impl Database {
         self.rollup_coverage.len()
     }
 
+    /// Write one tier's READABLE coverage into the ledger, verifying it against
+    /// what the ledger already held.
+    ///
+    /// Called with slices that passed every filter the read path applies, so the
+    /// ledger claims exactly what a query would be served — never more. Writing
+    /// it from the raw tag loop instead was a real defect: slices that are
+    /// incomplete, or whose `generation_id` no longer matches the current spec,
+    /// are refused by the read path, and a ledger recording them would have
+    /// over-claimed the moment reads moved onto it.
+    ///
+    /// The verifier is why the tag replay survives once reads DO move over. The
+    /// one risk this design adds is an authority that can drift where
+    /// self-describing files cannot, and `coverage_ledger_disagreements` is the
+    /// standing alarm against it — it must read zero before any read path trusts
+    /// the ledger.
+    fn record_readable_coverage(&self, source: &str, target: &str, readable: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>>) {
+        use crate::storage::CoverageLedger as _;
+        let mut disagreements = 0u64;
+        let seen: std::collections::HashSet<crate::storage::CoverageCell> = readable.keys().cloned().collect();
+        for (cell, entries) in readable {
+            let proved = crate::storage::merge_coverage(entries);
+            let held = self.coverage_ledger.coverage(&cell);
+            // An empty `held` is the FIRST replay for that cell, not a
+            // disagreement — counting it would make every cell report drift on a
+            // fresh boot, and an alarm that fires on every boot is ignored.
+            if !held.is_empty() && held != proved {
+                disagreements += 1;
+                warn!(
+                    table = %target, project_id = %cell.1, date = %cell.3,
+                    held = held.len(), proved = proved.len(),
+                    event = "coverage_ledger_disagreement",
+                    "the ledger and the Delta tags disagree about this partition's coverage"
+                );
+            }
+            self.coverage_ledger.replace(&cell, proved);
+        }
+        // Cells this tier no longer covers at all. Scoped to (source, target)
+        // because this replay proves nothing about a tier it did not read.
+        let orphans: Vec<_> = self
+            .coverage_ledger
+            .cells()
+            .into_iter()
+            .filter(|(cell_source, _, cell_table, _)| cell_source == source && cell_table == target)
+            .filter(|cell| !seen.contains(cell))
+            .collect();
+        for cell in orphans {
+            self.coverage_ledger.retire(&cell);
+        }
+        if disagreements > 0 {
+            crate::observability::maintenance_stats().coverage_ledger_disagreements.fetch_add(disagreements, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
         if !self.config.maintenance.timefusion_rollup_enabled {
@@ -3156,13 +3209,20 @@ impl Database {
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
-            let (tagged, ledger_rows) = match self.resolve_table("default", &target).await {
+            let (tagged, paths_by_identity) = match self.resolve_table("default", &target).await {
                 Ok(table) => {
                     let table = table.read().await;
                     // `source_rows` is part of the KEY so a partition rebuilt against a
                     // different source count cannot merge with the older evidence.
                     let mut groups: HashMap<TaggedSliceIdentity, u64> = HashMap::new();
-                    let mut ledger_rows: Vec<(crate::storage::CoverageCell, crate::storage::CoverageEntry)> = Vec::new();
+                    // Paths per tagged identity, keyed exactly like `groups` so the
+                    // FILTERED loop below can recover them. The ledger must not be
+                    // written from this raw loop: the filters that follow
+                    // (`rollup_slice_complete`, and the `generation_id` match) are
+                    // what decide whether a slice is READABLE, and a ledger written
+                    // before them claims coverage the read path refuses — the one
+                    // failure this design must never have.
+                    let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
                     for add in table.snapshot()?.log_data().iter() {
                         #[allow(deprecated)]
                         let action = add.add_action();
@@ -3223,81 +3283,28 @@ impl Database {
                         // because a day-wide slice starts at midnight of the day it
                         // covers while a file in `date=D` cannot hold rows outside
                         // `D` — the partition is the stronger statement.
-                        if let Some((partition_project, date)) = file_partition.as_ref() {
-                            ledger_rows.push((
-                                (source.to_owned(), (*partition_project).to_owned(), target.clone(), (*date).to_owned()),
-                                crate::storage::CoverageEntry {
-                                    start_micros: slice_start,
-                                    end_micros: slice_end,
-                                    generation: generation.to_owned(),
-                                    source_fingerprint: source_fp,
-                                    source_rows: source_rows.and_then(|rows| i64::try_from(rows).ok()),
-                                    files: vec![action.path.clone()],
-                                },
-                            ));
+                        if let Some((partition_project, _date)) = file_partition.as_ref() {
+                            // The date comes from the file's PARTITION, not from
+                            // `slice_start`: a file in `date=D` cannot hold rows
+                            // outside `D`, so the partition is the stronger
+                            // statement, and a day-wide slice beginning at midnight
+                            // would otherwise be indistinguishable from one that
+                            // merely starts there.
+                            let entry = paths_by_identity
+                                .entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows))
+                                .or_insert_with(|| ((*partition_project).to_owned(), Vec::new()));
+                            entry.1.push(action.path.clone());
                         }
                     }
-                    (groups, ledger_rows)
+                    (groups, paths_by_identity)
                 }
-                Err(_) => (HashMap::new(), Vec::new()),
+                Err(_) => (HashMap::new(), HashMap::new()),
             };
-            // Recorded AFTER the replay that read them, never speculatively: the
-            // ledger may understate coverage (costing a rebuild) but must never
-            // claim coverage that is not there (serving wrong results).
-            //
-            // And VERIFIED against what it already held, which is the whole
-            // reason this replay stays once reads move onto the ledger. The
-            // ledger's one new risk is that an authority can drift where
-            // self-describing files cannot; this is the standing alarm.
-            {
-                use crate::storage::CoverageLedger as _;
-                let mut replayed: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>> = HashMap::new();
-                for (cell, entry) in ledger_rows {
-                    replayed.entry(cell).or_default().push(entry);
-                }
-                let replayed_cells: std::collections::HashSet<crate::storage::CoverageCell> = replayed.keys().cloned().collect();
-                let mut disagreements = 0u64;
-                for (cell, entries) in replayed {
-                    let proved = crate::storage::merge_coverage(entries);
-                    let held = self.coverage_ledger.coverage(&cell);
-                    // An empty `held` is the FIRST replay for that cell, not a
-                    // disagreement — every cell would report one on a fresh boot
-                    // and the alarm would be worthless from the day it shipped.
-                    if !held.is_empty() && held != proved {
-                        disagreements += 1;
-                        warn!(
-                            table = %target,
-                            project_id = %cell.1,
-                            date = %cell.3,
-                            held = held.len(),
-                            proved = proved.len(),
-                            event = "coverage_ledger_disagreement",
-                            "the ledger and the Delta tags disagree about this partition's coverage"
-                        );
-                    }
-                    self.coverage_ledger.replace(&cell, proved);
-                }
-                // Cells the ledger holds for THIS tier that the replay no longer
-                // sees at all: their files are gone. Scoped to (source, target)
-                // because this replay proves nothing about any other tier — a
-                // sweep over every cell would retire coverage that is merely not
-                // being looked at right now.
-                let orphans: Vec<_> = self
-                    .coverage_ledger
-                    .cells()
-                    .into_iter()
-                    .filter(|(cell_source, _, cell_table, _)| cell_source == source && *cell_table == target)
-                    .filter(|cell| !self.coverage_ledger.coverage(cell).is_empty() && !replayed_cells.contains(cell))
-                    .collect();
-                for cell in orphans {
-                    self.coverage_ledger.retire(&cell);
-                }
-                if disagreements > 0 {
-                    crate::observability::maintenance_stats()
-                        .coverage_ledger_disagreements
-                        .fetch_add(disagreements, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            // Filled by the FILTERED loop below, then verified and written once
+            // per tier. Nothing is recorded for a slice the read path would
+            // refuse, because the ledger is meant to become the authority and an
+            // authority that over-claims serves wrong results.
+            let mut readable: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>> = HashMap::new();
             // Before any `continue` below, so a partition still holding
             // untagged files is queued whatever the coverage verdict is.
             // The gauge, from the WHOLE tier, hourly. Setting it only on publish
@@ -3387,12 +3394,30 @@ impl Database {
                     if source_rows.is_none() {
                         witnessless.push((project_id.clone(), slice));
                     }
+                    // Past every readability filter, so this slice is exactly
+                    // what the read path will serve — and therefore exactly what
+                    // the ledger may claim.
+                    if let Some((partition_project, paths)) =
+                        paths_by_identity.get(&(project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows))
+                    {
+                        readable.entry((source.to_owned(), partition_project.clone(), target.clone(), date.clone())).or_default().push(
+                            crate::storage::CoverageEntry {
+                                start_micros: slice_start,
+                                end_micros: slice_end,
+                                generation: generation.clone(),
+                                source_fingerprint: source_fp,
+                                source_rows: source_rows.and_then(|rows| i64::try_from(rows).ok()),
+                                files: paths.clone(),
+                            },
+                        );
+                    }
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
                         RollupCoverage { source_fp, source_epoch: 0, generation, rows, source_rows, covered_through: slice_end },
                     );
                     recovered += 1;
                 }
+                self.record_readable_coverage(source, &target, readable);
                 self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
                 self.recover_date_coverage(source, &target).await;
                 continue;

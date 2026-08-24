@@ -12000,6 +12000,20 @@ mod tests {
             );
         }
 
+        // AND THE REVERSE, which is the direction that actually matters. The
+        // ledger recording MORE than the tag map would over-claim the moment
+        // reads move onto it — serving coverage the read path deliberately
+        // refuses. That was a real defect: the ledger was originally written
+        // from the raw tag loop, BEFORE `rollup_slice_complete` and the
+        // `generation_id` match decide whether a slice is readable at all.
+        for (lo, hi) in &ledger_ranges {
+            assert!(
+                tag_ranges.iter().any(|(start, end)| start <= lo && end >= hi),
+                "the ledger claims no range the read path refuses: {:?} not in {tag_ranges:?}",
+                (lo, hi)
+            );
+        }
+
         // Coverage without file identity could never REPLACE the tags, only
         // supplement them — selection would still read tags, so files could not
         // become anonymous and the tier could not be compacted, which is the
