@@ -1104,7 +1104,15 @@ atomic_stats! {
     maintenance_tasks_retry,
     maintenance_tasks_complete,
     maintenance_backlog_bytes,
+    /// Oldest age over work the scheduler still INTENDS to do — tasks whose
+    /// slice ended within `STARVATION_HORIZON_MICROS` — so it is bounded by 31
+    /// days and a reading near the bound is a real stall inside the goal window.
+    ///
+    /// `beyond_horizon_tasks` is the deliberately-abandoned remainder. It is not
+    /// optional company: without it, narrowing the age gauge is
+    /// indistinguishable from hiding the debt.
     maintenance_oldest_task_age_secs,
+    maintenance_beyond_horizon_tasks,
     maintenance_eligible_watermark_lag_secs,
     maintenance_processed_bytes,
     maintenance_processed_bytes_per_sec,

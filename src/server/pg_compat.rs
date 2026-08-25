@@ -1049,6 +1049,7 @@ impl StatsTableProvider {
             "tasks_complete" => m.maintenance_tasks_complete,
             "backlog_bytes" => m.maintenance_backlog_bytes,
             "oldest_task_age_seconds" => m.maintenance_oldest_task_age_secs,
+            "beyond_horizon_tasks" => m.maintenance_beyond_horizon_tasks,
             "eligible_watermark_lag_seconds" => m.maintenance_eligible_watermark_lag_secs,
             "processed_bytes_total" => m.maintenance_processed_bytes,
             "processed_bytes_per_second" => m.maintenance_processed_bytes_per_sec,
