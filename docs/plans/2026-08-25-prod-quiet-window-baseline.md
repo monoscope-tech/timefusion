@@ -1046,6 +1046,14 @@ separate "age unlocks the drain" from "this particular cell came up in the
 rotation now". A second spaced point on the same container is running (§8) and is
 what tightens it.
 
+> **UPDATE from census #2 (§8e): the −22 did NOT continue** — 425 again at
+> 10:45Z, uptime 2h44m. So the "age unlocks the drain" reading is **weakened**:
+> the container kept ageing and the next 46-minute window moved nothing. The
+> surviving statement is narrower than what this section first claimed — a single
+> −22 burst occurred on a >2h container after 3h11m of flatness across three
+> containers, and it did not repeat within the next 46 minutes. Read §8e before
+> quoting anything from this section.
+
 ### And still: `out_of_policy_cells = 51` for the TENTH consecutive census
 
 `28f62f01/2026-08-18` fell 28 → 6 and **did not retire** — 6 small files is still
@@ -1265,6 +1273,91 @@ worth noting: the `worst` it names is **stable at `6297304f/2026-08-17`**, which
 *is* a genuine 49-file out-of-policy cell in the census. With `files=0` that is
 arbitrary-iterator luck rather than ranking, but it means the line is currently
 pointing at real debt anyway. Do not read that as the instrument working.
+
+---
+
+## 8e. CENSUS #2 — 10:45Z, uptime **2h43m41s**, the oldest container in days
+
+Stamp taken in the same command: `cbc2auo2h1px…`, image `d3b44f7`,
+`StartedAt 2026-08-25T08:01:21Z`, `Running 3 hours ago`,
+`runtime.uptime_seconds = 9821`. **Same container, still no deploy.**
+
+`as_of=2026-08-25T10:45:02Z delta_version=502755 total_files=3515`
+
+| UTC | uptime | `out_of_policy_cells` | `small_files_in_them` | flagship | `28f62f01/2026-08-18` |
+|---|---|---|---|---|---|
+| 09:12 | 71 min | 51 | 447 | 53 | 28 |
+| 09:59 | 118 min | 51 | **425 (−22)** | 53 | **6 (−22)** |
+| **10:45** | **164 min** | **51** | **425 (0)** | **53** | **6** |
+
+### The −22 did NOT continue. One moving window, then one flat one.
+
+**Do not read this as "the drain stopped."** That is precisely the error this
+repo's history documents and that tasks/02 retracted at 00:53 on 08-25: a −6
+window was called a stop and the next sample fell 107. A flat 46-minute window is
+equally consistent with (a) the drain having bounded out and (b) the rotation gap
+between bursts — the demonstrated per-cell burst pattern has gaps of at least this
+length. **Two windows cannot separate them.** What it does establish:
+
+- `total_files` moved **3556 → 3515 (−41)** and `delta_version` advanced 49, so
+  the table is live and files are being removed *fleet-wide* throughout — they are
+  just not being removed from the 51 out-of-policy cells.
+- **`out_of_policy_cells = 51` for the ELEVENTH consecutive census**, now spanning
+  06:01 → 10:45 (4h44m), four containers and two deploys. Not one cell has ever
+  retired in this series.
+
+### Corrected: the queue is FLAT, not growing and not shrinking
+
+Third reading of the same quantity, and it overturns my second one as well as my
+first. Same process throughout:
+
+| window | length | `tasks_complete` | `tasks_pending` |
+|---|---|---|---|
+| 09:12 → 09:18 | 355 s | +20 | **+70** → I concluded "growing 3.5×" |
+| 09:12 → 09:59 | 2 776 s | +96 | **−67** → I concluded "the queue SHRANK" |
+| 09:59 → 10:45 | 2 748 s | +94 | **+46** |
+| **09:12 → 10:45 (net)** | **5 824 s** | **+190 (117/hr)** | **−21** |
+
+**Over 1h37m the pending queue is flat to within ±70 on a base of ~6 800 — i.e.
+0.3 %.** Both my earlier directional claims were window artifacts. The stable,
+quotable numbers are **~117 completions/hr with pending essentially unchanged**;
+throughput and arrival are in balance on this container. Three samples produced
+three different signs, which is the whole lesson.
+
+**One counter that is genuinely monotone:** `pending_sealed_consolidation`
+**76 → 83 → 94** across the three reads (+18 in 1h33m). The hygiene queue is
+growing steadily while the hygiene backlog on disk does not shrink. That is the
+one directional signal here and it is worth more than the aggregate.
+
+`oldest_task_age_seconds` advanced by **exactly** the elapsed wall clock for a
+third consecutive window (+2 748 / 2 748 s; **85.45 days**). Three windows,
+three exact matches, on a container that has never restarted.
+
+### Corrected: `frag_pct` is NOT flat — it oscillates, inversely with `allocated_mb`
+
+| | 09:24 (83 min) | 09:59 (118 min) | 10:45 (164 min) |
+|---|---|---|---|
+| `frag_pct` | 52.0 | 49.9 | **55.0** |
+| `allocated_mb` | 50 686 | 57 767 | **43 543** |
+| `resident_mb` | 105 670 | 115 229 | 96 828 |
+| `retained_mb` | 1 376 819 | 1 469 693 | **1 657 422** |
+
+**I called this "FLAT" on two points in §7. With three it is not flat — it moves
+52.0 → 49.9 → 55.0**, a 5.1-point range, and it is clearly **anti-correlated with
+`allocated_mb`**: allocation fell 14.2 GB into the last window and frag_pct rose
+5.1 points. That is arithmetic, not pathology — `frag_pct` is
+`(resident − allocated)/resident`, and `allocated` is the volatile term, so the
+metric partly just reports "how much has been freed recently".
+
+**Consequence for §6's prediction, stated carefully:** the prediction was that
+frag_pct climbs into a slow episode. This says the metric moves on its own with
+allocation churn, so **a climb alone will not be evidence of an episode** — any
+future reading has to be paired with `allocated_mb` to mean anything. `retained_mb`
+grew monotonically across all three (+280 GB of address space), which is the
+cleaner churn signal.
+
+My §7 wording ("frag_pct is FLAT, not climbing") is **withdrawn**; two points were
+not enough to characterise a metric that oscillates.
 
 ---
 

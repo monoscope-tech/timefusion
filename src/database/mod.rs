@@ -11756,6 +11756,54 @@ mod tests {
         Ok(())
     }
 
+    /// A planned hygiene unit must carry its file count BEFORE it is ever claimed.
+    ///
+    /// `scheduling_class` ranks hygiene by `task.input.files`, and
+    /// `most_indebted_unclaimed` selects the worst cell on the same field — but
+    /// `record_input` wrote it only at CLAIM time, so every never-claimed cell
+    /// scored zero. That is exactly the population both exist to order: a
+    /// 139-file cell tied a 2-file one and ordering fell through to recency.
+    ///
+    /// Measured on prod 2026-08-25, one container over 5h49m: `small_files_in_them`
+    /// fell 746 -> 447 while `out_of_policy_cells` held at 51 for NINE consecutive
+    /// samples — hygiene rotates across cells instead of finishing any of them.
+    #[tokio::test]
+    async fn planned_hygiene_debt_carries_its_file_count_before_any_claim() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        let db = Database::with_config(create_test_config("hygiene-plan-footprint")).await?;
+        // The bigger debt sealed recently; a smaller cell has waited past
+        // `STARVATION_MICROS` and legitimately wins the claim. That is the
+        // `outranked_by` arm — the one no other instrument can name.
+        let indebted = format!("big_{}", uuid::Uuid::new_v4().simple());
+        let starved = format!("old_{}", uuid::Uuid::new_v4().simple());
+        for (project, days_ago, spans) in [(&indebted, 2_i64, 4_i64), (&starved, 6, 2)] {
+            let day = (Utc::now() - chrono::Duration::days(days_ago)).timestamp_micros();
+            for id in 0..spans {
+                insert_a_span(&db, project, &format!("s{id}"), day + id).await?;
+            }
+        }
+        db.plan_compaction_debt().await?;
+
+        let journal = db.maintenance_tasks.lock().unwrap();
+        let files = |project: &str| {
+            journal
+                .tasks()
+                .find(|task| task.key.project_id == project && task.key.operation == Operation::SealedConsolidation)
+                .expect("a sealed fragmented partition is consolidation debt")
+                .input
+                .map_or(0, |input| input.files)
+        };
+        let (big, small) = (files(&indebted), files(&starved));
+        assert!(big >= 2, "the planner selected the file list to decide the partition was out of policy — the queued unit must carry the count, got {big}");
+        assert!(big > small, "and the bigger cell must read as the bigger debt, got {big} vs {small}");
+        let refusal = journal.most_indebted_unclaimed(Operation::SealedConsolidation, crate::support::now_micros()).expect("the debt is outranked, not claimed");
+        assert!(
+            refusal.contains(&format!("{indebted:.8}")) && refusal.ends_with(&format!("files={big}")),
+            "the instrument must name the genuinely most indebted cell and its debt — got {refusal}"
+        );
+        Ok(())
+    }
+
     /// File hygiene must not pack a rollup TIER.
     ///
     /// A tier file carries the identity tags `recover_rollup_coverage` reads,
