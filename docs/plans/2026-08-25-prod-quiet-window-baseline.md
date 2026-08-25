@@ -848,10 +848,16 @@ jemalloc | frag_pct | 52.0
 
 ## 6. Anomalies
 
-1. **The queue is growing 3.5× faster than it drains.** +20 completions against
-   +70 pending in 355 s. Extrapolated: ~203 completions/hr vs ~710 new
-   pending/hr. Same shape as the 08-24 20:52→21:36 reading (+40 rebuilds, +83
-   pending), but the ratio here is worse.
+1. ~~**The queue is growing 3.5× faster than it drains.**~~ **RETRACTED — see §7.**
+   I measured `+20 complete / +70 pending` over a **355-second** window on a
+   71-minute process and wrote that the queue was growing. Over the **2 776-second**
+   window on the same container it is **+96 complete / −67 pending — the queue is
+   shrinking.** A 6-minute delta is not a throughput measurement, and this is the
+   fifth time in this repo's history that a too-short window produced a confident
+   wrong direction. The usable figure is **~124 completions/hr with pending
+   falling ~87/hr** on a mature container. (The 08-24 `+40 rebuilds / +83 pending`
+   reading was taken over 45.6 min and is not overturned by this; it may simply
+   describe a different load period.)
 
 2. **`oldest_task_age_seconds` grew by exactly the elapsed time again** —
    7 377 178 → 7 377 533, +355 s over 355 s. **85.4 days and counting, on a
@@ -982,4 +988,138 @@ jemalloc | frag_pct | 52.0
 
 ---
 
-## 7. Final stamp
+## 7. THE DISCRIMINATING CENSUS — 09:59Z, container age 1h58m. **The streak is broken; the drain resumed.**
+
+Container stamp taken in the same command, so it qualifies the numbers directly:
+
+```
+2026-08-25T09:59:05Z
+cbc2auo2h1px…  srv-captain--timefusion.1  …:d3b44f7  Running 2 hours ago
+StartedAt 2026-08-25T08:01:21.053034036Z   image d3b44f7
+runtime.uptime_seconds = 7072  (1h57m52s)
+```
+
+**Same container, no deploy, uptime 1h58m — the ≥2h regime that has been
+unobtainable for days.**
+
+| UTC | image | uptime | `out_of_policy_cells` | `small_files_in_them` | flagship `87576849/2026-08-19` |
+|---|---|---|---|---|---|
+| 06:01 | `18bcf8a` | ~5h49m | 51 | 447 | 53 |
+| 07:03 | `44d07e1` | 18 min | 51 | 447 | 53 |
+| 08:05 | `d3b44f7` | 3 min | 51 | 447 | 53 |
+| 09:12 | `d3b44f7` | 71 min | 51 | 447 | 53 |
+| **09:59** | **`d3b44f7`** | **118 min** | **51** | **425 (−22)** | **53** |
+
+`delta_version` 502656 → 502706, `total_files` 3523 → **3556**, `sealed_cells` 1081.
+
+### What moved, and it is a single cell
+
+The −22 is **entirely one cell**: `28f62f01-46a1-400e-8195-da7bc3505b5b /
+2026-08-18` went **28 → 6 small files (−22)**. Every other cell in the visible top
+list is unchanged file-for-file. The flagship `87576849/2026-08-19` sat at 53 for
+the fifth consecutive census.
+
+### Which thesis this supports
+
+**It breaks the flat streak, and it breaks it exactly where the rotation/maturity
+reading predicted and the pure-deploy-churn reading did not.** The series was flat
+at 447 for **3h11m across three containers and two deploys** (06:01, 07:03, 08:05,
+09:12), then moved **−22 within the same container, with no deploy, on the sample
+that crossed ~2 h**.
+
+- **Deploy churn alone is not sufficient.** The 08:05→09:12 window had no deploy
+  either and was flat, so "a deploy happened" is not what distinguishes the moving
+  window from the still one. What distinguishes them is **container age**: the
+  drain appeared only after ~1 h 15 m of maintenance time past the 300 s preload.
+- **Rotation is confirmed, not refuted.** One cell drained 28 → 6 while the
+  flagship and everything else sat still — the per-cell bursty rotation documented
+  in tasks/02's ninth census, seen again.
+- **The two combine into one statement:** hygiene needs a long-lived container to
+  reach any given cell, *and* it rotates rather than finishing cells. A ~1 h deploy
+  cadence therefore lands almost entirely inside the dead zone. That is task 16's
+  thesis with the missing evidence supplied, and it is now an observation on one
+  container rather than an association across containers.
+
+**Stated limits, so this is not over-read:** one moving window after four flat
+ones. It does not prove the drain would have continued at any rate, and it cannot
+separate "age unlocks the drain" from "this particular cell came up in the
+rotation now". A second spaced point on the same container is running (§8) and is
+what tightens it.
+
+### And still: `out_of_policy_cells = 51` for the TENTH consecutive census
+
+`28f62f01/2026-08-18` fell 28 → 6 and **did not retire** — 6 small files is still
+≥ 2, so it stays out of policy. Files leave; cells do not. This is the exact
+practical shape of defect 0 (`benefit` inert because `InputFootprint.files` is
+written only at claim time): hygiene samples cells instead of finishing them.
+**Signal 2 read alone would report "nothing happened" through a window that
+retired 22 files.**
+
+### Counters over 09:12:58 → 09:59:14 — same process, so these ARE rates
+
+| key | 09:12 (71 min) | 09:59 (118 min) | Δ over 2 776 s |
+|---|---|---|---|
+| `tasks_complete` | 38 997 | 39 093 | **+96** (≈ 124/hr) |
+| `tasks_pending` | 6 823 | **6 756** | **−67 — the queue SHRANK** |
+| `pending_base_rollup` | 2 812 | 2 773 | **−39** |
+| `pending_dedup` | 3 708 | 3 693 | **−15** |
+| `pending_sealed_consolidation` | 76 | **83** | +7 |
+| `tasks_retry` | 371 | 376 | +5 |
+| `oldest_task_age_seconds` | 7 377 178 | 7 379 954 | **+2 776 = exactly the elapsed wall clock** |
+| `process_rss_mb` | 44 084.5 | 35 245.8 | −8 839 |
+| `charged_pct` | 52 | 46 | −6 |
+| `journal_hold.count` | 110 814 | 168 738 | +57 924 (≈ 20.9/s) |
+| `journal_hold.total_ms` | 185 088 | 303 747 | +118 659 ms (**4.3 % of one worker**) |
+
+**This retracts anomaly 1 as I first wrote it.** On the 355-second young-process
+window I measured `+20 complete / +70 pending` and wrote "the queue is growing 3.5×
+faster than it drains". Over the 2 776-second mature window it is
+**+96 complete / −67 pending** — the queue is **shrinking**. The 355 s sample was
+too short and too young to carry that claim; a 6-minute delta on a 71-minute
+process is not a throughput measurement. The corrected statement is in anomaly 1.
+
+`oldest_task_age_seconds` still advances at exactly wall-clock rate (**85.4 days**),
+now measured over 2 776 s as well as 355 s. **Nothing old is being worked, on a
+container that has never restarted.** That signature is untouched by the drain
+resuming, and it is the one finding here that no reading softens.
+
+### `jemalloc` second point — `frag_pct` is FLAT, not climbing
+
+| key | 09:24 (83 min) | 09:59 (118 min) | Δ |
+|---|---|---|---|
+| `allocated_mb` | 50 686 | 57 767 | +7 081 (+14 %) |
+| `active_mb` | 55 159 | 62 993 | +7 834 |
+| `resident_mb` | 105 670 | 115 229 | +9 559 |
+| `mapped_mb` | 108 470 | 117 894 | +9 424 |
+| `retained_mb` | 1 376 819 | 1 469 693 | +92 874 |
+| **`frag_pct`** | **52.0** | **49.9** | **−2.1** |
+
+§6 predicted `frag_pct` "climbs into a slow episode and falls out of it — flat
+would rule fragmentation out too". Over 35 minutes in which allocation grew 14 %,
+**frag_pct did not climb; it fell slightly.** Two points, both taken in a stretch
+with no observed slow episode, so this **weakly** supports the flat/ruled-out arm
+and proves nothing about behaviour during an episode. It is the first time the
+metric has been read at all.
+
+---
+
+## 8. Still running at hand-off
+
+Two reads were scheduled and had not returned when this was written:
+
+1. **Ledger burst #3** (`burst2.txt`) — server-side grep `--since 09:20:00Z`,
+   fired ~10:15Z, brackets the expected ~10:06 pass. Tests the discriminator named
+   in §3: do the **same** cells re-disagree, and does `held` advance again
+   (6→7 was seen between the 08:06 and 09:06 passes)? Also gives the third
+   `recovered / unverifiable / stale_generation` triple — a third byte-identical
+   `unverifiable` (2 037 / 2 349) would make "frozen population" much stronger
+   than two.
+2. **Census #2 on the mature container** (`census2.txt`) — ~10:45Z, container age
+   ~2h44m. Two spaced points on one long-lived container is what turns §7's single
+   moving window into a rate.
+
+Both are read-only (logs + a Delta log listing + one `timefusion_stats` select).
+
+---
+
+## 9. Final stamp
