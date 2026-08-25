@@ -1320,6 +1320,12 @@ impl StatsTableProvider {
                     "dedup_bounded_total" => cv(DEDUP_BOUNDED_TOTAL),
                     "dedup_full_set_total" => cv(DEDUP_FULL_SET_TOTAL),
                     "dedup_full_set_pct" => pct(cv(DEDUP_FULL_SET_TOTAL), cv(DEDUP_BOUNDED_TOTAL) + cv(DEDUP_FULL_SET_TOTAL)),
+                    // rows_dropped ≫ compactions is the merge-on-read duplicate
+                    // density the winner collapse exists for; compactions climbing
+                    // with rows_dropped near zero means the winners themselves fill
+                    // the buffer and the window is the problem, not duplication.
+                    "dedup_winner_compactions_total" => cv(DEDUP_WINNER_COMPACTIONS_TOTAL),
+                    "dedup_winner_compaction_rows_dropped" => cv(DEDUP_WINNER_COMPACTION_ROWS_DROPPED),
                     // Read these BEFORE setting TIMEFUSION_WIDE_SCAN_REFUSE_MB — the
                     // threshold has to sit above p99 or it rejects working dashboards.
                     "wide_scan_selected_mb_p50" => q(WIDE_SCAN_SELECTED_MB, 0.50),
@@ -1720,6 +1726,8 @@ mod stats_table_tests {
             ("scan", "provider_build_us_avg"),
             ("scan", "provider_scan_us_avg"),
             ("scan", "mem_plan_us_avg"),
+            ("scan", "dedup_winner_compactions_total"),
+            ("scan", "dedup_winner_compaction_rows_dropped"),
         ] {
             assert_has(&rows, component, key);
         }
