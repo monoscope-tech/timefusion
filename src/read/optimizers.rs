@@ -982,6 +982,27 @@ mod variant_json_accessor_tests {
         assert_eq!(fmt(&batches), fmt(&base), "rows differ\nwith: {plan}");
     }
 
+    /// The shape PROD actually sees, which no SQL case above can produce: TF's
+    /// session omits DataFusion's `ApplyFunctionRewrites`, so a chained
+    /// `variant_to_json(v)->'a'->0->>'b'` stays a NESTED `json_get` tower rather
+    /// than being folded into one multi-key call. This is the only test that
+    /// walks the descent loop — and it pins the path encoding while it is there.
+    #[test]
+    fn the_nested_json_get_tower_prod_emits_folds_into_one_path() {
+        use datafusion::{logical_expr::Cast, prelude::lit};
+        let json_call = |udf: Arc<ScalarUDF>, args: Vec<Expr>| Expr::ScalarFunction(ScalarFunction { func: udf, args });
+        // Exactly what JsonExprPlanner emits, aliases and all; `::` binds tighter
+        // than `->>`, so the last key arrives wrapped in a Cast.
+        let level1 =
+            json_call(datafusion_functions_json::udfs::json_get_udf(), vec![json_call(variant_to_json_udf(), vec![col("v")]), lit("a")]).alias("v -> 'a'");
+        let level2 = json_call(datafusion_functions_json::udfs::json_get_udf(), vec![level1, lit(0i64)]).alias("v -> 'a' -> 0");
+        let cast_key = Expr::Cast(Cast::new(Box::new(lit("b")), datafusion::arrow::datatypes::DataType::Utf8));
+        let tower = json_call(datafusion_functions_json::udfs::json_as_text_udf(), vec![level2, cast_key]);
+
+        let native = super::variant_native_extraction(&tower).expect("the nested tower is the shape this rule exists for");
+        assert!(native.to_string().contains(r"['a'][0]['b']"), "one bracket-quoted path, not dot notation: {native}");
+    }
+
     /// Shapes the peephole must refuse, at the expression level — including the
     /// ones the SQL cases above cannot reach because DataFusion's own JSON
     /// rewriter normalizes them away first.
