@@ -8252,6 +8252,34 @@ fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
     adds.next().is_some_and(|first| live.contains(first) && adds.all(|p| live.contains(p)))
 }
 
+/// Delete the staged parquet of bins leaving a wave uncommitted — MINUS anything
+/// the snapshot references.
+///
+/// `bin_adds_live` answers the same question per bin for the self-landed split;
+/// this filters per ADD because the cost is asymmetric. Deleting a live object is
+/// data loss; leaking a dead one costs pennies until VACUUM/boot reconcile. The
+/// difference matters because a resuming instance commits our staging BIN BY BIN,
+/// so a wave can be part-live, and `probe_commit_landed` is all-or-nothing over
+/// the whole wave's Adds — one resumed bin makes it report `NotLanded` for all of
+/// them (49bf7f9 replaced the resume age gate with an ownership gate, which is
+/// what made another instance's commit reachable at any moment).
+///
+/// Not a lock: the other instance can still commit between the caller's snapshot
+/// read and these deletes. Closing that needs cross-instance coordination; the
+/// re-read shrinks the window from "any time since we staged" to the few
+/// milliseconds between the read and the delete.
+async fn discard_bin_parquet(bins: &[StagedBin], live: &HashSet<String>) {
+    for bin in bins {
+        let orphans: Vec<deltalake::kernel::Action> = bin
+            .adds
+            .iter()
+            .filter(|a| !matches!(a, deltalake::kernel::Action::Add(add) if live.contains(add.path.as_str())))
+            .cloned()
+            .collect();
+        Database::cleanup_orphaned_parquet(&bin.stage_store, &orphans).await;
+    }
+}
+
 /// Per-project outcome of one round's staging. `Result<Option<T>>` overloaded `None`: "converged"
 /// (drop for the tick) vs "bin vanished under a concurrent rewrite" (project still has work —
 /// dropping it would silence its compaction for the rest of the tick).
@@ -15901,6 +15929,31 @@ mod tests {
             vec![("alpha".into(), alpha_rel.into(), alpha_uri), ("beta".into(), beta_rel.into(), beta_uri)],
             "only this wave's live Adds become committed-file index jobs"
         );
+    }
+
+    /// A wave whose commit fails must never delete parquet another instance has
+    /// already made LIVE. `probe_commit_landed` is all-or-nothing over the whole
+    /// wave, and a resuming instance commits our staged intent bin by bin — so a
+    /// part-resumed wave reports `NotLanded` and used to delete the resumed bin's
+    /// files out of the table. The other direction is asserted too: a genuinely
+    /// orphaned bin still gets cleaned up, or "delete nothing" would pass.
+    #[tokio::test]
+    async fn wave_discard_spares_adds_committed_by_another_instance() {
+        use object_store::ObjectStoreExt;
+        let path_of = |bin: &super::StagedBin| match &bin.adds[0] {
+            deltalake::kernel::Action::Add(add) => add.path.to_string(),
+            other => panic!("unexpected action {other:?}"),
+        };
+        // [0] = resumed and committed by instance B; [1] = in no commit at all.
+        let bins = vec![staged_unit("alpha", &["old-a.parquet"], None), staged_unit("beta", &["old-b.parquet"], None)];
+        let stores: Vec<_> = bins.iter().map(|b| b.stage_store.clone()).collect();
+        let paths: Vec<_> = bins.iter().map(|b| object_store::path::Path::from(path_of(b))).collect();
+        for (store, path) in stores.iter().zip(&paths) {
+            store.put(path, object_store::PutPayload::from_static(b"parquet")).await.unwrap();
+        }
+        super::discard_bin_parquet(&bins, &[path_of(&bins[0])].into_iter().collect()).await;
+        assert!(stores[0].head(&paths[0]).await.is_ok(), "live parquet must survive a failed wave commit");
+        assert!(stores[1].head(&paths[1]).await.is_err(), "parquet in no commit is still reclaimed");
     }
 
     fn dedup_unit(date: &str, before: u64, after: u64) -> super::DedupUnit {

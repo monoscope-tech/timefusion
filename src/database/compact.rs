@@ -1252,7 +1252,7 @@ impl Database {
             // One chunk's failure abandons the partition's whole staging batch:
             // clean up the siblings' parquet rather than leaking it (their
             // Adds are in no commit and VACUUM would take days to notice).
-            self.discard_bins(&units).await;
+            self.discard_bins(table_ref, &units, None).await;
             return Err(e);
         }
         Ok((units, all_complete))

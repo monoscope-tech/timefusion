@@ -6360,7 +6360,7 @@ impl Database {
                 // live) targets. Dedup's bins go back on the dirty queue via the
                 // `failed` list — a partition with duplicates still in it must
                 // never be certified clean.
-                self.discard_bins(&bins).await;
+                self.discard_bins(table_ref, &bins, None).await;
                 failed.extend(bins);
                 return WaveResult { landed: carried, failed };
             }
@@ -6385,7 +6385,7 @@ impl Database {
                 Err(e) => {
                     drop(commit_guard);
                     error!("{engine} wave: no snapshot for {table_name}: {e}");
-                    self.discard_bins(&bins).await;
+                    self.discard_bins(table_ref, &bins, None).await;
                     failed.extend(bins);
                     return WaveResult { landed: carried, failed };
                 }
@@ -6408,7 +6408,7 @@ impl Database {
             for bin in &stale {
                 debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit");
             }
-            self.discard_bins(&stale).await;
+            self.discard_bins(table_ref, &stale, Some(&live)).await;
             failed.extend(stale);
             if !self_landed.is_empty() {
                 warn!(
@@ -6441,7 +6441,7 @@ impl Database {
             for bin in &overlapping {
                 debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_overlapping_target");
             }
-            self.discard_bins(&overlapping).await;
+            self.discard_bins(table_ref, &overlapping, Some(&live)).await;
             failed.extend(overlapping);
             if fresh.is_empty() {
                 drop(commit_guard);
@@ -6520,7 +6520,7 @@ impl Database {
                         CommitProbe::NotLanded => {
                             crate::observability::record_optimize_failed();
                             error!("{engine} wave commit failed for '{}': {}", table_name, e);
-                            self.discard_bins(&fresh).await;
+                            self.discard_bins(table_ref, &fresh, None).await;
                             failed.extend(fresh);
                             return WaveResult { landed: carried, failed };
                         }
@@ -6649,10 +6649,39 @@ impl Database {
     /// Cleanup + intent-clear for bins leaving the wave uncommitted. One helper
     /// because the pair IS the crash-safety invariant — a drifted copy that
     /// cleans without clearing (or vice versa) breaks the manifest's meaning.
-    pub(crate) async fn discard_bins(&self, bins: &[StagedBin]) {
-        for bin in bins {
-            Self::cleanup_orphaned_parquet(&bin.stage_store, &bin.adds).await;
-        }
+    ///
+    /// The delete is gated on LIVENESS (`discard_bin_parquet`): a concurrent
+    /// instance can resume our staged intent and commit these very objects, and
+    /// deleting them then is data loss, not reclaimed waste. `live` is the
+    /// caller's set when it already holds one under the commit lock; otherwise we
+    /// re-read the log here, because a stale in-memory snapshot cannot see the
+    /// commit that just landed and deciding a delete on it IS the bug.
+    ///
+    /// Liveness unknown ⇒ delete nothing AND clear nothing: the intent is what
+    /// lets boot-time reconcile reclaim the files later (it spares referenced
+    /// paths), so clearing it here would trade a leak for an unreclaimable one.
+    pub(crate) async fn discard_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, bins: &[StagedBin], live: Option<&HashSet<String>>) {
+        let refreshed;
+        let live = match live {
+            Some(live) => live,
+            None => {
+                let ok = tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                let fresh = if ok {
+                    table_ref.read().await.snapshot().ok().map(|s| s.log_data().iter().map(|f| f.path().into_owned()).collect::<HashSet<_>>())
+                } else {
+                    None
+                };
+                let Some(fresh) = fresh else {
+                    warn!("wave discard: no fresh snapshot — leaving {} bins' staged parquet AND intents for boot reconcile", bins.len());
+                    return;
+                };
+                refreshed = fresh;
+                &refreshed
+            }
+        };
+        discard_bin_parquet(bins, live).await;
         self.clear_bin_intents(bins);
     }
 
