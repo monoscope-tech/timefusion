@@ -2480,8 +2480,9 @@ impl Database {
         };
         let pass = if operation == crate::maintenance_coordinator::Operation::Repair { TailPass::Repair } else { TailPass::Pack };
         let runtime = self.coordinator_runtime_env();
-        let outcome =
-            self.stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit }).await;
+        let outcome = self
+            .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
+            .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
                 let date = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()).unwrap_or_default();
@@ -5265,7 +5266,10 @@ impl Database {
         let planned = self.plan_tail_pass(table_ref, table_name, &today.to_string(), &policy).await?;
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
-        match self.stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None }).await? {
+        match self
+            .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None })
+            .await?
+        {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
             _ => Ok(None),
         }

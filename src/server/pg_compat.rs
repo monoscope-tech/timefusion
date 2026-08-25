@@ -1461,7 +1461,4 @@ mod stats_table_tests {
             assert_has(&rows, "parquet", key);
         }
     }
-
 }
-
-
