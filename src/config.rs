@@ -1974,27 +1974,23 @@ pub struct MaintenanceConfig {
     // suffix-range reads, well within R2/S3 burst limits.
     #[serde_inline_default(16)]
     pub timefusion_warm_concurrency: usize,
-    /// How long the maintenance coordinator waits for the boot cache preload
+    /// How long the maintenance coordinator waits for the boot table REPLAY
     /// before starting anyway.
     ///
-    /// The coordinator used to wait for preload UNCONDITIONALLY, and preload is
-    /// only marked complete when it finishes every table — it is abandoned, and
-    /// the flag left unset, if shutdown arrives first. Measured on prod
-    /// 2026-08-23 over 45 min and two container boots: 26
+    /// The coordinator used to wait for the whole preload, unconditionally, and
+    /// preload is only complete when the PACED body warm has finished every
+    /// table. Prod 2026-08-23, 45 min over two boots: 26
     /// `bootstrap.phase=table_preload` starts and **zero**
-    /// `table_preload_complete`, so every coordinator worker returned at
-    /// `wait_for_preload` and did no maintenance for the whole life of the
-    /// container. `tasks_running` sat at 0 against 22,218 pending / 12,329
-    /// ELIGIBLE units, `rollup_rebuilds_*` at 0, and the rollup tier was never
-    /// built — which is what keeps wide windows missing `not_built`.
+    /// `table_preload_complete`; `tasks_running` sat at 0 against 22,218
+    /// pending / 12,329 ELIGIBLE units. That is what made the wait bounded.
     ///
-    /// A deploy cadence shorter than the warm makes that permanent: the warm
-    /// restarts from scratch each boot and never reaches the end, so
-    /// maintenance never runs again on any container.
-    ///
-    /// Waiting is still right by default — the warm is IO-heavy and competing
-    /// with it at boot slows both. It just must not be unbounded. 0 disables
-    /// the wait entirely.
+    /// The budget then expired on every boot instead (container `62f2385`:
+    /// replay ~4 s, full preload 27 min 21 s), so the coordinator ran beside
+    /// the still-running warm for 22 of 27 minutes anyway — the wait bought
+    /// nothing and cost a fifth of a ~15-minute container's life. The gate is
+    /// now the replay phase, which is what maintenance actually needs; the
+    /// warm is paced to be safe beside other work. 0 disables the wait
+    /// entirely.
     #[serde_inline_default(300)]
     pub timefusion_coordinator_preload_wait_secs: u64,
     /// After a compaction commit, proactively evict the cached full-file bytes
