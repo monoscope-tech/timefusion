@@ -1731,16 +1731,35 @@ pub(crate) async fn match_aggregates(
     // next one is tried, so adding a spec can only ever widen what routes.
     let mut candidates: Vec<&RollupSpec> = schema.rollups.iter().collect();
     candidates.sort_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), spec.dimensions.len()));
-    let mut first_miss = None;
+    let (mut miss, mut grain_miss) = (None, None);
     let mut routes = Vec::new();
     for spec in candidates {
         match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, session).await {
             // The rewrite replaces the node that is IN the tree, never the
             // inlined stand-in — `substitute` finds it by structural equality.
             Ok(route) => routes.push(RoutedRollup { matched: matched.clone(), ..route }),
-            // Report the FIRST spec's reason: it is the one the operator most
-            // likely intended to serve this query, so it is the actionable gap.
-            Err(reason) => first_miss = first_miss.or(Some(reason)),
+            // GRAIN-ONLY disqualifications never win the report. `PartialBucket`
+            // (bucket width not a whole number of grains) and `TinyInterior`
+            // (window shorter than `MIN_INTERIOR_BUCKETS` grains) are the whole
+            // class: each compares the spec's grain against a width the QUERY
+            // chose and reads nothing else about what the spec declares, so
+            // neither names anything an operator could act on. Every other
+            // reason is a declared-schema gap, which is actionable.
+            //
+            // Reporting them masked the real reason at every sub-hour width,
+            // because the coarsest tier is disqualified that way there by
+            // construction — and monoscope's 3-day charts bucket at 30 minutes.
+            // Prod A/B 2026-08-25: the identical non-dimension group-by reported
+            // `unaligned_bucket_width` at '30 minutes' and `unsupported_shape`
+            // at '1 hours'; 6 declines in a 26-shape sweep were mislabelled, so
+            // the standing `unaligned_bucket_width = 14` was 14 unknown reasons.
+            //
+            // Finest spec wins (candidates run coarsest-first), so the reason
+            // comes from the tier with the best chance of serving this width. A
+            // grain reason is still the answer when EVERY spec was disqualified
+            // that way, since then it is true rather than masking.
+            Err(reason @ (MissReason::PartialBucket | MissReason::TinyInterior)) => grain_miss = Some(reason),
+            Err(reason) => miss = Some(reason),
         }
     }
     // EVERY viable spec, not just the best one on paper. Coverage is not known
@@ -1758,7 +1777,7 @@ pub(crate) async fn match_aggregates(
     // So it alone carries the plan text at warn; every other reason is a
     // declared-schema question the counters already answer, and keeping those at
     // debug stops an ordinary unroutable panel from spamming prod's warn stream.
-    let reason = first_miss.unwrap_or(MissReason::UnsupportedShape);
+    let reason = miss.or(grain_miss).unwrap_or(MissReason::UnsupportedShape);
     let shape = matched.display_indent_schema().to_string().lines().take(6).collect::<Vec<_>>().join(" | ");
     match reason {
         MissReason::UnsupportedShape => {
@@ -2167,21 +2186,18 @@ async fn route_with_spec(
         // latency widget (`count(*)` folded in from `HAVING COUNT(*) > 0` beside
         // `percentile_agg(duration)`) was refused outright and scanned 7 days raw.
         //
-        // Withheld from queries that ALSO carry a `percentile_agg`, which is the
-        // latency widget itself. Cells built before the 2026-08-22 spec change have
-        // no `duration_digest` COLUMN in their files, so the reader projects
-        // `NULL AS duration_digest` and the routed chart renders a hole wherever
-        // the rollup interior answers — measured 2026-08-25 on the 7d widget as p95
-        // present for the newest six buckets and NULL for every older one, against a
-        // raw control that has all of them and agrees to within 0.8% on the overlap.
-        // The rewrite is sound; the cells are not, and it must not be what newly
-        // exposes them. Delete this clause once those cells have rebuilt.
-        let carries_digest = aggregate
-            .aggr_expr
-            .iter()
-            .any(|expr| matches!(unaliased(expr), Expr::AggregateFunction(function) if function.func.name().eq_ignore_ascii_case("percentile_agg")));
+        // This was briefly withheld from queries also carrying a `percentile_agg`,
+        // because cells built before the 2026-08-22 spec change hold no
+        // `duration_digest` COLUMN and the reader null-fills it, so a routed
+        // latency chart rendered a hole over the rollup interior. That stopgap is
+        // gone: `TAG_MEASURES` now records what each cell MATERIALIZED and
+        // `Database::rollup_rewrite_for` gates both coverage paths on
+        // `RoutedRollup::measures_available`, so a date or slice that cannot prove
+        // the digest falls to the raw fringe while its siblings keep routing —
+        // pinned by `a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe`
+        // in `src/database/mod.rs`, which covers this widget's exact shape.
         let column = match (column, null_guard) {
-            (None, Some(guard)) if name == "count" && !carries_digest => Some(guard.to_string()),
+            (None, Some(guard)) if name == "count" => Some(guard.to_string()),
             (column, _) => column,
         };
         if null_guard.is_some() && column.as_deref() != null_guard {
@@ -3017,23 +3033,49 @@ mod tests {
         assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
     }
 
-    /// …but NOT when the same query also asks for a percentile. Cells built
-    /// before the 2026-08-22 spec change have no `duration_digest` column in
-    /// their files, so the reader projects NULL and the chart renders a hole
-    /// over the rollup interior (measured on prod 2026-08-25: p95 present for
-    /// the newest six buckets, NULL for every older one). The count rewrite is
-    /// sound and must not be what newly exposes those cells — so monoscope's
-    /// latency widget keeps scanning raw until they have rebuilt.
+    /// …including beside a percentile — monoscope's latency widget itself.
+    ///
+    /// This shape was withheld while cells predating the 2026-08-22 spec change
+    /// still held no `duration_digest` column. That is now the measure gate's
+    /// job, per date and per slice
+    /// (`a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe` in
+    /// `src/database/mod.rs`), so the match level resolves both states and lets
+    /// coverage decide where they may be read from.
     #[tokio::test]
-    async fn a_guarded_count_beside_a_percentile_still_declines() {
+    async fn a_guarded_count_beside_a_percentile_resolves_both_states() {
         let state = session().await;
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS digest \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1 HAVING COUNT(*) > 0"
         );
-        // Not pinned to a reason: which guard fires first depends on the grain the
-        // digest measure selects. The property is that it does not route.
-        assert!(!matches!(route_for(&state, &sql).await, Ok(Some(_))), "a latency widget must not route into cells that project a NULL digest");
+        let (_, generated) = assert_substitutes(&state, &sql, None).await;
+        assert!(generated.contains("duration_digest"), "the percentile must read the digest state: {generated}");
+        assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
+        assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
+    }
+
+    /// A spec disqualified by GRAIN ALONE must not report the miss.
+    ///
+    /// The coarse tier fails every sub-hour bucket that way by construction, and
+    /// monoscope's 3-day charts bucket at 30 minutes — so `unaligned_bucket_width`
+    /// was reported for declines whose real cause was something else entirely.
+    /// Prod A/B 2026-08-25: this same group-by reported `unaligned_bucket_width`
+    /// at '30 minutes' and `unsupported_shape` at '1 hours'.
+    #[tokio::test]
+    async fn a_sub_hour_bucket_reports_the_group_by_not_the_grain() {
+        let state = session().await;
+        // A day-wide window on purpose: the 1h tier must be disqualified by the
+        // BUCKET WIDTH (`PartialBucket`), which is the prod shape, rather than by
+        // a window too narrow to hold two of its grains.
+        let sql = format!(
+            "SELECT time_bucket('30 minutes', timestamp) AS tb, status_message, COUNT(*) FROM {SOURCE} \
+             WHERE project_id = 'project' AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) GROUP BY 1, 2"
+        );
+        assert_eq!(
+            route_for(&state, &sql).await.err(),
+            Some(MissReason::UnknownGroupBy),
+            "the 1h tier's grain complaint must not mask the 1m tier's real reason"
+        );
     }
 
     /// The arm is deliberately narrow. A dimension the spec does not declare, a
