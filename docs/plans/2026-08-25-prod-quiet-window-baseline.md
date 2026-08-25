@@ -1200,6 +1200,74 @@ counter reconciliation is what makes this one safe to quote.
 
 ---
 
+## 8d. Is `6297304f` a project with recent compaction activity? **YES, heavily — on that exact table.**
+
+Logs only, no queries, no code. Window **09:55:37 → 10:08:01Z** (timestamp-verified
+from the returned lines), filtered to `dashboard_1h_v2` AND `6297304f`, 9 lines:
+
+```
+DerivedRollup … slice_start=1787644800000000 slice_end=1787648400000000 estimated_decoded_bytes=…
+DerivedRollup … slice_start=1787644800000000 slice_end=1787648400000000 rows=6…
+DerivedRollup … slice_start=1787612400000000 slice_end=1787616000000000 estimated_decoded_bytes=…
+            … slice_start=1787612400000000 covering_start=1787529600000000 covering_end=1787616000000000
+DerivedRollup … slice_start=1787641200000000 slice_end=1787644800000000 estimated_decoded_bytes=…
+DerivedRollup … slice_start=1787641200000000 slice_end=1787644800000000 rows=5…
+the ledger and the Delta tags disagree … date=2026-08-25          <- the 10:06 line itself
+DerivedRollup … slice_start=1787601600000000 slice_end=1787605200000000 estimated_decoded_bytes=…
+            … slice_start=1787601600000000 covering_start=1787529600000000 covering_end=1787616000000000
+```
+
+Decoded (µs → UTC): `1787641200`→**08-25 07:00**, `1787644800`→**08:00**,
+`1787648400`→**09:00**, `1787612400`→**08-24 23:00**, `1787601600`→**08-24 20:00**,
+`1787616000`→**08-25 00:00**, `1787529600`→**08-24 00:00**.
+
+**Three things this establishes, and one thing it does not.**
+
+1. **This exact (project, table) is under continuous DerivedRollup churn** — four
+   distinct hour slices built in a 12-minute window, spanning 08-24 20:00 through
+   08-25 09:00. The benign explanation ("a rewrite retired tags the ledger still
+   remembers") has an abundant substrate here; this is the busiest cell in the
+   burst by a wide margin.
+2. **A `covering_start`/`covering_end` mechanism is active on it**, and the
+   covering range is **day-wide: 08-24 00:00 → 08-25 00:00**, referenced by two
+   different hour slices. A day-wide covering entry coexisting with the hour
+   entries it covers is the shape that would naturally make the ledger *hold* more
+   entries than a tag set proves. **Named as an observation, not a diagnosis** —
+   the disagreement line was `date=2026-08-25` while the covering range is 08-24,
+   and I am not chasing this into the code per instruction.
+3. Beyond this table, `6297304f` also took `SealedConsolidation` (on
+   `otel_logs_and_spans`, slice 08-18→08-19), `BaseRollup` on
+   `…dashboard_1m_v3`, `Dedup`, and `Repair` on `otel_metrics` in a separate
+   6-minute window. It is one of the most active projects on the box.
+
+**What it does NOT establish — a near-miss worth recording.** I first read the
+paired `DerivedRollup` lines carrying the *same* `slice_start` as **duplicate
+claims on one slice**, which would have been a significant finding. They are not:
+the pattern is consistently one line with `estimated_decoded_bytes` (the claim)
+and one with `rows=` (the completion). Same slice, two lifecycle events. The
+thread IDs differ between them (`58422`/`58425`, `61796`/`61325`), which is what
+made it look like two workers. **No duplicate-claim finding here.**
+
+### Also visible in that fetch: defect 0/1 is still live on `d3b44f7`
+
+Four `most_indebted_unclaimed` lines in a ~6-minute window:
+
+```
+refusal="outranked_by:6297304f:2026-08-18:6297304f:2026-08-17:files=0"
+refusal="outranked_by:87576849:2026-08-18:6297304f:2026-08-17:files=0"
+refusal="outranked_by:00000000:2026-08-17:6297304f:2026-08-17:files=0"
+refusal="outranked_by:28f62f01:2026-08-18:6297304f:2026-08-17:files=0"
+```
+
+**`files=0` on the worst cell in every one**, exactly as recorded on 08-24 — the
+enqueue-time footprint is still not carried, so `benefit` is inert. One nuance
+worth noting: the `worst` it names is **stable at `6297304f/2026-08-17`**, which
+*is* a genuine 49-file out-of-policy cell in the census. With `files=0` that is
+arbitrary-iterator luck rather than ranking, but it means the line is currently
+pointing at real debt anyway. Do not read that as the instrument working.
+
+---
+
 ## 8c. Still running at hand-off
 
 **Census #2 on the mature container** (`census2.txt`) — fires ~10:45Z, container
