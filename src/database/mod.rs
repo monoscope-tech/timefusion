@@ -171,147 +171,241 @@ impl DedupSkipVerdict {
 /// (`server::pg_compat`) so the two can't drift apart into a silent typo. High-water-mark
 /// fields (`decode_polls_inflight`/`_peak`, `decode_peak_batch_bytes`) stay hand-rolled
 /// atomics below — `metrics::Gauge` has no `fetch_max`, so there's no clean equivalent.
-pub mod scan_metric_names {
-    pub const SCANS_TOTAL: &str = "timefusion.scan.scans_total";
-    pub const SCANS_SKIPPED_DELTA: &str = "timefusion.scan.scans_skipped_delta";
-    pub const SCANS_MEM_ONLY: &str = "timefusion.scan.scans_mem_only";
-    pub const SCANS_DELTA_ONLY: &str = "timefusion.scan.scans_delta_only";
-    pub const SCANS_MEM_PLUS_DELTA: &str = "timefusion.scan.scans_mem_plus_delta";
-    pub const DEDUP_ELIGIBLE_SCANS: &str = "timefusion.scan.dedup_eligible_scans";
-    pub const DEDUP_SKIPPED: &str = "timefusion.scan.dedup_skipped";
-    pub const DEDUP_DENIED_UNCERTIFIED: &str = "timefusion.scan.dedup_denied_uncertified";
-    pub const DEDUP_DENIED_BY_LEG: &str = "timefusion.scan.dedup_denied_by_leg";
-    pub const DEDUP_DENIED_NEVER_CERTIFIED: &str = "timefusion.scan.dedup_denied_never_certified";
-    pub const DEDUP_DENIED_FP_MOVED: &str = "timefusion.scan.dedup_denied_fp_moved";
-    pub const DEDUP_DENIED_NO_WINDOW: &str = "timefusion.scan.dedup_denied_no_window";
-    pub const DEDUP_DENIED_UNRESOLVED: &str = "timefusion.scan.dedup_denied_unresolved";
-    pub const DEDUP_DENIED_DISABLED: &str = "timefusion.scan.dedup_denied_disabled";
-    pub const CERT_GRANTED_TOTAL: &str = "timefusion.scan.cert_granted_total";
-    /// Scans that skipped `DedupExec` over SOME (not all) in-window dates.
-    pub const DEDUP_SKIPPED_PER_DATE: &str = "timefusion.scan.dedup_skipped_per_date";
-    /// Scans where the per-FILE skip fired: some files of an UNCERTIFIED date
-    /// were proved clean and isolated, so they bypassed DedupExec.
-    pub const DEDUP_SKIPPED_PER_FILE: &str = "timefusion.scan.dedup_skipped_per_file";
-    // Where the tantivy ROUTING TAX actually goes. Measured 2026-08-22: a routed
-    // equality costs ~300-500ms more than the identical unrouted query while the
-    // whole tantivy fan-out is 33-83ms of it, with zero IO — so ~85% is spent
-    // here, building the scan, and nothing could see it. The single-provider
-    // fast path needs `raw.is_empty() && !bloom_pruned && date_restrict.is_none()`;
-    // these name which conjunct failed, because "drain coverage" and "make the
-    // split cheap" are very different fixes and only the loser tells you which.
-    pub const TANTIVY_SCAN_CALLS: &str = "timefusion.scan.tantivy_scan_calls";
-    pub const TANTIVY_SCAN_US: &str = "timefusion.scan.tantivy_scan_us";
-    pub const TANTIVY_URIS_US: &str = "timefusion.scan.tantivy_uris_us";
-    pub const TANTIVY_FASTPATH: &str = "timefusion.scan.tantivy_fastpath";
-    pub const TANTIVY_SPLIT_RAW: &str = "timefusion.scan.tantivy_split_raw";
-    pub const TANTIVY_SPLIT_BLOOM: &str = "timefusion.scan.tantivy_split_bloom";
-    pub const TANTIVY_SPLIT_DATE: &str = "timefusion.scan.tantivy_split_date";
-    pub const TANTIVY_LIVE_FILES: &str = "timefusion.scan.tantivy_live_files";
-    pub const TANTIVY_RAW_FILES: &str = "timefusion.scan.tantivy_raw_files";
-    // Mirrors of the OTel-only prefilter recorders. `recorders!` adds to an OTel
-    // meter, which `counter_value` (LOCAL_REGISTRY, fed by `metrics::counter!`)
-    // cannot see — so reading them through timefusion_stats returned 0 for
-    // everything and made "the prefilter never ran" look measured. Emit on the
-    // same path as every other row here instead.
-    pub const PREFILTER_ATTEMPTS: &str = "timefusion.scan.prefilter_attempts";
-    pub const PREFILTER_USED: &str = "timefusion.scan.prefilter_used";
-    pub const PREFILTER_SKIPPED: &str = "timefusion.scan.prefilter_skipped";
-    /// Per-reason breakdown of `PREFILTER_SKIPPED`. SIX reasons, not three:
-    /// `decide_prefilter`'s exits (`empty_index`, `low_selectivity`,
-    /// `field_coverage_gap`) plus the search aborts, which increment the same
-    /// total from a different call site. Without the split, "63% of attempts are
-    /// skipped" cannot be attributed to a decision at all — and the fix for a
-    /// declined decision is the opposite of the fix for a missing index.
-    ///
-    /// `counter_value` reads by `&'static str`, so the names are consts and this
-    /// is the one place reason strings and metric names are tied together.
-    pub const PREFILTER_SKIP_REASONS: [(&str, &str); 9] = [
-        ("empty_index", "timefusion.scan.prefilter_skipped.empty_index"),
-        ("low_selectivity", "timefusion.scan.prefilter_skipped.low_selectivity"),
-        ("field_coverage_gap", "timefusion.scan.prefilter_skipped.field_coverage_gap"),
-        ("delta_no_index", "timefusion.scan.prefilter_skipped.no_index"),
-        ("delta_no_usable_index", "timefusion.scan.prefilter_skipped.no_usable_index"),
-        ("delta_cap_exceeded_one_index", "timefusion.scan.prefilter_skipped.cap_exceeded_one_index"),
-        ("delta_cap_exceeded_combined", "timefusion.scan.prefilter_skipped.cap_exceeded_combined"),
-        ("delta_no_hits_returned", "timefusion.scan.prefilter_skipped.no_hits_returned"),
-        ("delta_error", "timefusion.scan.prefilter_skipped.delta_error"),
-    ];
+/// One declaration per scan counter: its metric name AND the `timefusion_stats`
+/// row that exposes it, so a counter cannot be recorded and stay invisible —
+/// which happened three times on 2026-08-25 alone, and `map_or(0, …)` renders an
+/// unexposed counter as a confident zero.
+///
+/// * `rows { C = "metric" as component.row_key; }` — exposed verbatim under that
+///   key. There is no arm without an `as` clause, so omitting one is a compile error.
+/// * `reasons { … when "label"; }` — same, and `PREFILTER_SKIP_REASONS` (the
+///   label `record_prefilter_skip` passes) is generated from the same line, so
+///   the reason list and the readout are one list.
+/// * `derived { C = "metric" via component.row_key; }` — the counter reaches
+///   stats only through a row pg_compat computes by hand (an average, a
+///   percentile). `every_declared_scan_metric_has_a_row` asserts that row exists.
+macro_rules! scan_metrics {
+    (
+        rows { $($(#[$rm:meta])* $rid:ident = $rmetric:literal as $rcomp:ident.$rkey:ident;)+ }
+        reasons { $($(#[$xm:meta])* $xid:ident = $xmetric:literal as $xcomp:ident.$xkey:ident when $reason:literal;)+ }
+        derived { $($(#[$dm:meta])* $did:ident = $dmetric:literal via $dcomp:ident.$dkey:ident;)+ }
+    ) => {
+        $($(#[$rm])* pub const $rid: &str = $rmetric;)+
+        $($(#[$xm])* pub const $xid: &str = $xmetric;)+
+        $($(#[$dm])* pub const $did: &str = $dmetric;)+
 
-    /// Why a slice's coverage was refused, splitting `rollup_miss_stale_coverage`.
-    /// Unverifiable (predates `TAG_SOURCE_ROWS`) and genuinely-moved are the same
-    /// miss with opposite fixes: the first clears on republish, the second cannot.
-    pub const ROLLUP_STALE_NO_WITNESS: &str = "timefusion.scan.rollup_stale_no_witness";
-    pub const ROLLUP_STALE_SHRANK: &str = "timefusion.scan.rollup_stale_shrank";
-    pub const ROLLUP_STALE_GREW: &str = "timefusion.scan.rollup_stale_grew";
-    pub const ROLLUP_STALE_NO_SOURCE_ROWS: &str = "timefusion.scan.rollup_stale_no_source_rows";
+        /// `(component, row key, metric)` — rendered verbatim by `timefusion_stats`.
+        pub const SCAN_ROWS: &[(&str, &str, &str)] =
+            &[$((stringify!($rcomp), stringify!($rkey), $rmetric),)+ $((stringify!($xcomp), stringify!($xkey), $xmetric),)+];
+
+        /// `(component, row key)` of the hand-computed rows the `derived` counters
+        /// reach stats through. Asserted present, never rendered from here.
+        pub const SCAN_DERIVED_ROWS: &[(&str, &str)] = &[$((stringify!($dcomp), stringify!($dkey)),)+];
+
+        /// Skip label -> metric. `counter_value` reads by `&'static str`, so this
+        /// is where the label a call site passes meets the name it increments.
+        pub const PREFILTER_SKIP_REASONS: &[(&str, &str)] = &[$(($reason, $xmetric),)+];
+    };
+}
+
+pub mod scan_metric_names {
+    scan_metrics! {
+    rows {
+        SCANS_TOTAL = "timefusion.scan.scans_total" as scan.total;
+        SCANS_SKIPPED_DELTA = "timefusion.scan.scans_skipped_delta" as scan.skipped_delta;
+        SCANS_MEM_ONLY = "timefusion.scan.scans_mem_only" as scan.mem_only;
+        SCANS_DELTA_ONLY = "timefusion.scan.scans_delta_only" as scan.delta_only;
+        SCANS_MEM_PLUS_DELTA = "timefusion.scan.scans_mem_plus_delta" as scan.mem_plus_delta;
+        DEDUP_ELIGIBLE_SCANS = "timefusion.scan.dedup_eligible_scans" as scan.dedup_eligible;
+        DEDUP_SKIPPED = "timefusion.scan.dedup_skipped" as scan.dedup_skipped;
+        DEDUP_DENIED_UNCERTIFIED = "timefusion.scan.dedup_denied_uncertified" as scan.dedup_denied_uncertified;
+        DEDUP_DENIED_BY_LEG = "timefusion.scan.dedup_denied_by_leg" as scan.dedup_denied_by_leg;
+        DEDUP_DENIED_NEVER_CERTIFIED = "timefusion.scan.dedup_denied_never_certified" as scan.dedup_denied_never_certified;
+        DEDUP_DENIED_FP_MOVED = "timefusion.scan.dedup_denied_fp_moved" as scan.dedup_denied_fp_moved;
+        DEDUP_DENIED_NO_WINDOW = "timefusion.scan.dedup_denied_no_window" as scan.dedup_denied_no_window;
+        DEDUP_DENIED_UNRESOLVED = "timefusion.scan.dedup_denied_unresolved" as scan.dedup_denied_unresolved;
+        DEDUP_DENIED_DISABLED = "timefusion.scan.dedup_denied_disabled" as scan.dedup_denied_disabled;
+        CERT_GRANTED_TOTAL = "timefusion.scan.cert_granted_total" as scan.cert_granted_total;
+        /// Scans that skipped `DedupExec` over SOME (not all) in-window dates.
+        // The per-DATE split fires only AFTER the whole-window verdict
+        // is denied, so it is invisible in `dedup_skipped` and shows up
+        // inside `denied_uncertified` — without this row, enabling
+        // `timefusion_read_dedup_skip_per_date` cannot be observed at all.
+        DEDUP_SKIPPED_PER_DATE = "timefusion.scan.dedup_skipped_per_date" as scan.dedup_skipped_per_date;
+        /// Scans where the per-FILE skip fired: some files of an UNCERTIFIED date
+        /// were proved clean and isolated, so they bypassed DedupExec.
+        DEDUP_SKIPPED_PER_FILE = "timefusion.scan.dedup_skipped_per_file" as scan.dedup_skipped_per_file;
+        // Where the tantivy ROUTING TAX actually goes. Measured 2026-08-22: a routed
+        // equality costs ~300-500ms more than the identical unrouted query while the
+        // whole tantivy fan-out is 33-83ms of it, with zero IO — so ~85% is spent
+        // here, building the scan, and nothing could see it. The single-provider
+        // fast path needs `raw.is_empty() && !bloom_pruned && date_restrict.is_none()`;
+        // these name which conjunct failed, because "drain coverage" and "make the
+        // split cheap" are very different fixes and only the loser tells you which.
+        // The certification-survival split. `never_certified` is what a
+        // persistent/warmed `dedup_clean_fp` could convert; `fp_moved` is
+        // the irreducible floor (the partition genuinely changed), and
+        // `no_window`/`unresolved` are denials this feature never owned.
+        // Read them together with cert_dwell_p50 below — a large
+        // never_certified share only justifies persistence if the
+        // certifications it would persist actually live a while.
+        // The routing tax, where it actually goes. `tantivy_scan_us`
+        // is the routed-only scan construction; compare its delta
+        // against the routed-minus-unrouted wall gap, and read
+        // fastpath vs the three split_* losers to see WHY the cheap
+        // single-provider path was refused.
+        TANTIVY_SCAN_CALLS = "timefusion.scan.tantivy_scan_calls" as scan.tantivy_scan_calls;
+        TANTIVY_SCAN_US = "timefusion.scan.tantivy_scan_us" as scan.tantivy_scan_us_total;
+        TANTIVY_URIS_US = "timefusion.scan.tantivy_uris_us" as scan.tantivy_uris_us_total;
+        TANTIVY_FASTPATH = "timefusion.scan.tantivy_fastpath" as scan.tantivy_fastpath;
+        TANTIVY_SPLIT_RAW = "timefusion.scan.tantivy_split_raw" as scan.tantivy_split_raw;
+        TANTIVY_SPLIT_BLOOM = "timefusion.scan.tantivy_split_bloom" as scan.tantivy_split_bloom;
+        TANTIVY_SPLIT_DATE = "timefusion.scan.tantivy_split_date" as scan.tantivy_split_date;
+        TANTIVY_LIVE_FILES = "timefusion.scan.tantivy_live_files" as scan.tantivy_live_files_total;
+        TANTIVY_RAW_FILES = "timefusion.scan.tantivy_raw_files" as scan.tantivy_raw_files_total;
+        // Mirrors of the OTel-only prefilter recorders. `recorders!` adds to an OTel
+        // meter, which `counter_value` (LOCAL_REGISTRY, fed by `metrics::counter!`)
+        // cannot see — so reading them through timefusion_stats returned 0 for
+        // everything and made "the prefilter never ran" look measured. Emit on the
+        // same path as every other row here instead.
+        // built / commits is the manifest-write amortisation the
+        // batching bought; before it the ratio was 1.
+        // Splits tantivy_scan_us into its three steps, so the next
+        // fix targets the one that owns it rather than guessing.
+        // Whether the prefilter is even REACHING the scan. The
+        // predicate-aware mutable gate (761779d) removed a gate that
+        // was provably dead on otel, and files-per-call did not move
+        // — which it cannot if decide_prefilter is bailing before it,
+        // most plausibly on field_coverage_gap (one in-window index
+        // missing a queried field skips the WHOLE pushdown). These
+        // three separate "never tried" / "tried and used" / "tried
+        // and skipped" so that question stops being a guess.
+        PREFILTER_ATTEMPTS = "timefusion.scan.prefilter_attempts" as scan.prefilter_attempts;
+        PREFILTER_USED = "timefusion.scan.prefilter_used" as scan.prefilter_used;
+        PREFILTER_SKIPPED = "timefusion.scan.prefilter_skipped" as scan.prefilter_skipped;
+        /// Why a slice's coverage was refused, splitting `rollup_miss_stale_coverage`.
+        /// Unverifiable (predates `TAG_SOURCE_ROWS`) and genuinely-moved are the same
+        /// miss with opposite fixes: the first clears on republish, the second cannot.
+        // Splits `rollup_miss_stale_coverage`, which was the SOLE
+        // blocker on every bare dashboard shape measured 2026-08-22.
+        // `no_witness` clears itself once the coordinator republishes
+        // those slices — it is a throughput problem. `moved` does not,
+        // because the partition really is churning. Same miss, opposite
+        // fix, and indistinguishable before this.
+        ROLLUP_STALE_NO_WITNESS = "timefusion.scan.rollup_stale_no_witness" as scan.rollup_stale_no_witness;
+        ROLLUP_STALE_SHRANK = "timefusion.scan.rollup_stale_shrank" as scan.rollup_stale_shrank;
+        // GREW = rows arrived, the tier really is stale. SHRANK = physical
+        // rows were collapsed by dedup/compaction/vacuum, which the logical
+        // set the tier aggregated may not even contain. Both are refused;
+        // this says which is worth building for.
+        ROLLUP_STALE_GREW = "timefusion.scan.rollup_stale_grew" as scan.rollup_stale_grew;
+        ROLLUP_STALE_NO_SOURCE_ROWS = "timefusion.scan.rollup_stale_no_source_rows" as scan.rollup_stale_no_source_rows;
+        /// Indexes built by the reconcile BACKFILL specifically — not by flush,
+        /// compaction or the wave reindex, all of which also publish.
+        TANTIVY_BACKFILL_BUILT = "timefusion.scan.tantivy_backfill_built" as scan.tantivy_backfill_built;
+        /// Output files covered by extending an existing entry across a compaction
+        /// instead of re-indexing them. Read against `TANTIVY_BACKFILL_BUILT`: the
+        /// ratio is how much of the rewrite churn stopped costing a build.
+        // Read against `tantivy_backfill_built`: the ratio is how much
+        // rewrite churn stopped costing a build. A counter that is
+        // incremented but never surfaced cannot be used to judge the
+        // change it exists to judge.
+        TANTIVY_CARRIED_FORWARD = "timefusion.scan.tantivy_carried_forward" as scan.tantivy_carried_forward;
+        // Inside the file-pruned scan: which of its three steps owns the ~430ms.
+        // The provider cache comment above records ~30ms for a pure provider build,
+        // so the cost is expected in selection construction or in scan() over a
+        // multi-thousand-file selection — but that is a guess until measured, and
+        // guesses about this path have been wrong three times.
+        PRUNED_SELECT_US = "timefusion.scan.pruned_select_us" as scan.pruned_select_us_total;
+        PRUNED_BUILD_US = "timefusion.scan.pruned_build_us" as scan.pruned_build_us_total;
+        PRUNED_SCAN_US = "timefusion.scan.pruned_scan_us" as scan.pruned_scan_us_total;
+        PRUNED_CALLS = "timefusion.scan.pruned_calls" as scan.pruned_calls;
+        PRUNED_FILES = "timefusion.scan.pruned_files" as scan.pruned_files_total;
+        /// Batched manifest commits made by the backfill, and entries they carried.
+        /// `entries / commits` is the amortisation actually achieved.
+        TANTIVY_MANIFEST_COMMITS = "timefusion.scan.tantivy_manifest_commits" as scan.tantivy_manifest_commits;
+        TANTIVY_MANIFEST_COMMIT_US = "timefusion.scan.tantivy_manifest_commit_us" as scan.tantivy_manifest_commit_us_total;
+        // Why a dedup pass did NOT end in a certification. `cert_granted_total` has
+        // sat at 0 since 2026-08-20 across three attempted fixes, each of which
+        // guessed at the exit; these name the exits so the next fix is measured.
+        // Sum of the four ~= calls to `record_clean_slice`.
+        // Why certification never happens. `cert_slice_*` are the exits
+        // of `record_clean_slice` (they should sum to its call count);
+        // `cert_refused_*` split `record_certification`'s refusal by the
+        // conjunct that failed. cert_granted_total has been 0 since
+        // 2026-08-20 through three fixes that each guessed the exit —
+        // read these before attempting a fourth.
+        CERT_SLICE_OUTSIDE_DAY = "timefusion.scan.cert_slice_outside_day" as scan.cert_slice_outside_day;
+        CERT_SLICE_DIRTY = "timefusion.scan.cert_slice_dirty" as scan.cert_slice_dirty;
+        CERT_SLICE_PARTIAL = "timefusion.scan.cert_slice_partial" as scan.cert_slice_partial;
+        CERT_SLICE_DAY_COVERED = "timefusion.scan.cert_slice_day_covered" as scan.cert_slice_day_covered;
+        // Why `record_certification` refused, split by the failing conjunct.
+        CERT_REFUSED_DROPPED = "timefusion.scan.cert_refused_dropped" as scan.cert_refused_dropped;
+        CERT_REFUSED_INCOMPLETE = "timefusion.scan.cert_refused_incomplete" as scan.cert_refused_incomplete;
+        CERT_REFUSED_EMPTY = "timefusion.scan.cert_refused_empty" as scan.cert_refused_empty;
+        CERT_REFUSED_FP_MOVED = "timefusion.scan.cert_refused_fp_moved" as scan.cert_refused_fp_moved;
+        CERT_DWELL_TOTAL = "timefusion.scan.cert_dwell_total" as scan.cert_dwell_total;
+        FAST_RESOLVE_HITS = "timefusion.scan.fast_resolve_hits" as scan.fast_resolve_hits;
+        FAST_RESOLVE_MISSES = "timefusion.scan.fast_resolve_misses" as scan.fast_resolve_misses;
+        PROVIDER_CACHE_HITS = "timefusion.scan.provider_cache_hits" as scan.provider_cache_hits;
+        PROVIDER_CACHE_MISSES = "timefusion.scan.provider_cache_misses" as scan.provider_cache_misses;
+        PROVIDER_CACHE_EVICTIONS = "timefusion.scan.provider_cache_evictions" as scan.provider_cache_evictions;
+        PROVIDER_BUILD_ABANDONED = "timefusion.scan.provider_build_abandoned" as scan.provider_build_abandoned;
+        PROVIDER_BUILD_TOTAL = "timefusion.scan.provider_build_total" as scan.provider_build_total;
+        PROVIDER_SCAN_TOTAL = "timefusion.scan.provider_scan_total" as scan.provider_scan_total;
+        BOUNDED_OTEL_SCAN_CANDIDATES = "timefusion.scan.bounded_otel_scan_candidates" as scan.bounded_otel_scan_candidates;
+        BOUNDED_OTEL_SCAN_REJECTIONS = "timefusion.scan.bounded_otel_scan_rejections" as scan.bounded_otel_scan_rejections;
+        WIDE_SCAN_OVERSIZE_TOTAL = "timefusion.scan.wide_scan_oversize_total" as scan.wide_scan_oversize_total;
+        // full-set is the mode that has no LIMIT early termination and
+        // charges the 2 GiB per-query budget. A non-zero pct is the
+        // footer-repair backlog measured from the read side.
+        DEDUP_BOUNDED_TOTAL = "timefusion.scan.dedup_bounded_total" as scan.dedup_bounded_total;
+        DEDUP_FULL_SET_TOTAL = "timefusion.scan.dedup_full_set_total" as scan.dedup_full_set_total;
+        // Unordered keep-greatest collapsing its retained buffer to current
+        // winners, and the rows that collapse bought back. `rows_dropped` far
+        // exceeding `total` is the merge-on-read duplicate density this exists for;
+        // `total` climbing with `rows_dropped` near zero means the scan's winners
+        // genuinely fill the buffer and the window is the problem, not duplication.
+        // rows_dropped ≫ compactions is the merge-on-read duplicate
+        // density the winner collapse exists for; compactions climbing
+        // with rows_dropped near zero means the winners themselves fill
+        // the buffer and the window is the problem, not duplication.
+        DEDUP_WINNER_COMPACTIONS_TOTAL = "timefusion.scan.dedup_winner_compactions_total" as scan.dedup_winner_compactions_total;
+        DEDUP_WINNER_COMPACTION_ROWS_DROPPED = "timefusion.scan.dedup_winner_compaction_rows_dropped" as scan.dedup_winner_compaction_rows_dropped;
+        MEM_PLAN_TOTAL = "timefusion.scan.mem_plan_total" as scan.mem_plan_total;
+        PGWIRE_TOTAL = "timefusion.scan.pgwire_total" as pgwire.queries_total;
+        DECODE_BYTES_TOTAL = "timefusion.scan.decode_bytes_total" as scan_decode.bytes_total;
+        DECODE_PRESSURE_THROTTLED = "timefusion.scan.decode_pressure_throttled" as scan_decode.pressure_throttled_total;
+    }
+    // Per-reason breakdown of `PREFILTER_SKIPPED`. NINE reasons, not three:
+    // `decide_prefilter`'s exits (`empty_index`, `low_selectivity`,
+    // `field_coverage_gap`) plus the search aborts, which increment the same
+    // total from a different call site. Without the split, "63% of attempts are
+    // skipped" cannot be attributed to a decision at all — and the fix for a
+    // declined decision is the opposite of the fix for a missing index.
+    reasons {
+        PREFILTER_SKIP_EMPTY_INDEX = "timefusion.scan.prefilter_skipped.empty_index" as scan.prefilter_skipped_empty_index when "empty_index";
+        PREFILTER_SKIP_LOW_SELECTIVITY = "timefusion.scan.prefilter_skipped.low_selectivity" as scan.prefilter_skipped_low_selectivity when "low_selectivity";
+        PREFILTER_SKIP_FIELD_COVERAGE_GAP = "timefusion.scan.prefilter_skipped.field_coverage_gap" as scan.prefilter_skipped_field_coverage_gap when "field_coverage_gap";
+        PREFILTER_SKIP_NO_INDEX = "timefusion.scan.prefilter_skipped.no_index" as scan.prefilter_skipped_no_index when "delta_no_index";
+        PREFILTER_SKIP_NO_USABLE_INDEX = "timefusion.scan.prefilter_skipped.no_usable_index" as scan.prefilter_skipped_no_usable_index when "delta_no_usable_index";
+        PREFILTER_SKIP_CAP_EXCEEDED_ONE_INDEX = "timefusion.scan.prefilter_skipped.cap_exceeded_one_index" as scan.prefilter_skipped_cap_exceeded_one_index when "delta_cap_exceeded_one_index";
+        PREFILTER_SKIP_CAP_EXCEEDED_COMBINED = "timefusion.scan.prefilter_skipped.cap_exceeded_combined" as scan.prefilter_skipped_cap_exceeded_combined when "delta_cap_exceeded_combined";
+        PREFILTER_SKIP_NO_HITS_RETURNED = "timefusion.scan.prefilter_skipped.no_hits_returned" as scan.prefilter_skipped_no_hits_returned when "delta_no_hits_returned";
+        PREFILTER_SKIP_DELTA_ERROR = "timefusion.scan.prefilter_skipped.delta_error" as scan.prefilter_skipped_delta_error when "delta_error";
+    }
+    derived {
+        CERT_DWELL_SECS_TOTAL = "timefusion.scan.cert_dwell_secs_total" via scan.cert_dwell_secs_avg;
+        PROVIDER_BUILD_US_TOTAL = "timefusion.scan.provider_build_us_total" via scan.provider_build_us_avg;
+        PROVIDER_SCAN_US_TOTAL = "timefusion.scan.provider_scan_us_total" via scan.provider_scan_us_avg;
+        MEM_PLAN_US_TOTAL = "timefusion.scan.mem_plan_us_total" via scan.mem_plan_us_avg;
+        WIDE_SCAN_SELECTED_MB = "timefusion.scan.wide_scan_selected_mb" via scan.wide_scan_selected_mb_p99;
+    }
+    }
 
     pub fn prefilter_skip_metric(reason: &str) -> Option<&'static str> {
         PREFILTER_SKIP_REASONS.iter().find(|(r, _)| *r == reason).map(|(_, m)| *m)
     }
-    /// Indexes built by the reconcile BACKFILL specifically — not by flush,
-    /// compaction or the wave reindex, all of which also publish.
-    pub const TANTIVY_BACKFILL_BUILT: &str = "timefusion.scan.tantivy_backfill_built";
-    /// Output files covered by extending an existing entry across a compaction
-    /// instead of re-indexing them. Read against `TANTIVY_BACKFILL_BUILT`: the
-    /// ratio is how much of the rewrite churn stopped costing a build.
-    pub const TANTIVY_CARRIED_FORWARD: &str = "timefusion.scan.tantivy_carried_forward";
-    // Inside the file-pruned scan: which of its three steps owns the ~430ms.
-    // The provider cache comment above records ~30ms for a pure provider build,
-    // so the cost is expected in selection construction or in scan() over a
-    // multi-thousand-file selection — but that is a guess until measured, and
-    // guesses about this path have been wrong three times.
-    pub const PRUNED_SELECT_US: &str = "timefusion.scan.pruned_select_us";
-    pub const PRUNED_BUILD_US: &str = "timefusion.scan.pruned_build_us";
-    pub const PRUNED_SCAN_US: &str = "timefusion.scan.pruned_scan_us";
-    pub const PRUNED_CALLS: &str = "timefusion.scan.pruned_calls";
-    pub const PRUNED_FILES: &str = "timefusion.scan.pruned_files";
-    /// Batched manifest commits made by the backfill, and entries they carried.
-    /// `entries / commits` is the amortisation actually achieved.
-    pub const TANTIVY_MANIFEST_COMMITS: &str = "timefusion.scan.tantivy_manifest_commits";
-    pub const TANTIVY_MANIFEST_COMMIT_US: &str = "timefusion.scan.tantivy_manifest_commit_us";
-    // Why a dedup pass did NOT end in a certification. `cert_granted_total` has
-    // sat at 0 since 2026-08-20 across three attempted fixes, each of which
-    // guessed at the exit; these name the exits so the next fix is measured.
-    // Sum of the four ~= calls to `record_clean_slice`.
-    pub const CERT_SLICE_OUTSIDE_DAY: &str = "timefusion.scan.cert_slice_outside_day";
-    pub const CERT_SLICE_DIRTY: &str = "timefusion.scan.cert_slice_dirty";
-    pub const CERT_SLICE_PARTIAL: &str = "timefusion.scan.cert_slice_partial";
-    pub const CERT_SLICE_DAY_COVERED: &str = "timefusion.scan.cert_slice_day_covered";
-    // Why `record_certification` refused, split by the failing conjunct.
-    pub const CERT_REFUSED_DROPPED: &str = "timefusion.scan.cert_refused_dropped";
-    pub const CERT_REFUSED_INCOMPLETE: &str = "timefusion.scan.cert_refused_incomplete";
-    pub const CERT_REFUSED_EMPTY: &str = "timefusion.scan.cert_refused_empty";
-    pub const CERT_REFUSED_FP_MOVED: &str = "timefusion.scan.cert_refused_fp_moved";
-    pub const CERT_DWELL_TOTAL: &str = "timefusion.scan.cert_dwell_total";
-    pub const CERT_DWELL_SECS_TOTAL: &str = "timefusion.scan.cert_dwell_secs_total";
-    pub const FAST_RESOLVE_HITS: &str = "timefusion.scan.fast_resolve_hits";
-    pub const FAST_RESOLVE_MISSES: &str = "timefusion.scan.fast_resolve_misses";
-    pub const PROVIDER_CACHE_HITS: &str = "timefusion.scan.provider_cache_hits";
-    pub const PROVIDER_CACHE_MISSES: &str = "timefusion.scan.provider_cache_misses";
-    pub const PROVIDER_CACHE_EVICTIONS: &str = "timefusion.scan.provider_cache_evictions";
-    pub const PROVIDER_BUILD_ABANDONED: &str = "timefusion.scan.provider_build_abandoned";
-    pub const PROVIDER_BUILD_US_TOTAL: &str = "timefusion.scan.provider_build_us_total";
-    pub const PROVIDER_BUILD_TOTAL: &str = "timefusion.scan.provider_build_total";
-    pub const PROVIDER_SCAN_US_TOTAL: &str = "timefusion.scan.provider_scan_us_total";
-    pub const PROVIDER_SCAN_TOTAL: &str = "timefusion.scan.provider_scan_total";
-    pub const BOUNDED_OTEL_SCAN_CANDIDATES: &str = "timefusion.scan.bounded_otel_scan_candidates";
-    pub const BOUNDED_OTEL_SCAN_REJECTIONS: &str = "timefusion.scan.bounded_otel_scan_rejections";
-    pub const WIDE_SCAN_OVERSIZE_TOTAL: &str = "timefusion.scan.wide_scan_oversize_total";
-    pub const DEDUP_BOUNDED_TOTAL: &str = "timefusion.scan.dedup_bounded_total";
-    pub const DEDUP_FULL_SET_TOTAL: &str = "timefusion.scan.dedup_full_set_total";
-    // Unordered keep-greatest collapsing its retained buffer to current
-    // winners, and the rows that collapse bought back. `rows_dropped` far
-    // exceeding `total` is the merge-on-read duplicate density this exists for;
-    // `total` climbing with `rows_dropped` near zero means the scan's winners
-    // genuinely fill the buffer and the window is the problem, not duplication.
-    pub const DEDUP_WINNER_COMPACTIONS_TOTAL: &str = "timefusion.scan.dedup_winner_compactions_total";
-    pub const DEDUP_WINNER_COMPACTION_ROWS_DROPPED: &str = "timefusion.scan.dedup_winner_compaction_rows_dropped";
-    pub const WIDE_SCAN_SELECTED_MB: &str = "timefusion.scan.wide_scan_selected_mb";
-    pub const MEM_PLAN_US_TOTAL: &str = "timefusion.scan.mem_plan_us_total";
-    pub const MEM_PLAN_TOTAL: &str = "timefusion.scan.mem_plan_total";
-    pub const PGWIRE_TOTAL: &str = "timefusion.scan.pgwire_total";
-    pub const DECODE_BYTES_TOTAL: &str = "timefusion.scan.decode_bytes_total";
-    pub const DECODE_PRESSURE_THROTTLED: &str = "timefusion.scan.decode_pressure_throttled";
 }
 
 /// Why a recovered rollup slice cannot be verified, and what — if anything —

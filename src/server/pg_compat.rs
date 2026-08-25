@@ -770,6 +770,11 @@ fn avg(total: u64, samples: u64) -> u64 {
     total.checked_div(samples).unwrap_or(0)
 }
 
+/// `atomic_stats!`-declared counters, rendered exactly as declared.
+fn atomic_rows(rows: Vec<(&'static str, &'static str, u64)>) -> Vec<Row> {
+    rows.into_iter().map(|(component, key, value)| (component, key.to_string(), value.to_string())).collect()
+}
+
 fn or_null<T: ToString>(v: Option<T>) -> String {
     v.map_or_else(|| "null".to_string(), |v| v.to_string())
 }
@@ -941,11 +946,7 @@ impl StatsTableProvider {
         );
 
         let d = crate::observability::dml_stats();
-        let dml = rows![@atomic "dml";
-            "occ_conflicts_total" => d.occ_conflicts,
-            "retry_successes_total" => d.retry_successes,
-            "retry_exhausted_total" => d.retry_exhausted,
-        ];
+        let dml = atomic_rows(d.stats_rows());
 
         // NONZERO = a scan advertised an ordering its data does not honour, i.e.
         // a parquet footer's `sorting_columns` is lying. Drives the hot-tail
@@ -960,147 +961,7 @@ impl StatsTableProvider {
         ];
 
         let m = crate::observability::maintenance_stats();
-        let mut maintenance = rows![@atomic "maintenance";
-            "checkpoints_created" => m.checkpoints_created,
-            "checkpoint_failed" => m.checkpoint_failed,
-            "checkpoint_corrupt" => m.checkpoint_corrupt,
-            "log_files_cleaned" => m.log_files_cleaned,
-            "log_cleanup_failed" => m.log_cleanup_failed,
-            // Max version lag (current - last checkpointed) seen at the last
-            // checkpoint tick. Should stay near checkpoint_interval; a large,
-            // growing value means the checkpoint task is failing or wedged.
-            "checkpoint_lag_versions" => m.checkpoint_lag_versions,
-            // NONZERO = committed parquet was destroyed elsewhere (2026-07-09
-            // commit-path deletion bug). PAGE and investigate.
-            "dangling_removed" => m.dangling_removed,
-            "reconcile_failed" => m.reconcile_failed,
-            "dedup_timed_out_total" => m.dedup_timed_out,
-            "dedup_failed_total" => m.dedup_failed,
-            "light_optimize_timed_out_total" => m.light_optimize_timed_out,
-            "light_optimize_failed_total" => m.light_optimize_failed,
-            "light_optimize_tick_truncated_total" => m.light_optimize_tick_truncated,
-            // planned vs completed is the per-tick coverage check: a persistent
-            // gap means hot projects are going uncompacted (prod 2026-07-29).
-            "light_optimize_projects_planned_total" => m.light_optimize_projects_planned,
-            "light_optimize_projects_completed_total" => m.light_optimize_projects_completed,
-            "light_optimize_bins_committed_total" => m.light_optimize_bins_committed,
-            "light_optimize_waves_committed_total" => m.light_optimize_waves_committed,
-            "repair_bins_in_flight" => m.repair_bins_in_flight,
-            "dedup_bins_committed_total" => m.dedup_bins_committed,
-            "dedup_waves_committed_total" => m.dedup_waves_committed,
-            "light_optimize_wal_yields_total" => m.light_optimize_wal_yields,
-            "light_optimize_flush_debt_yields_total" => m.light_optimize_flush_debt_yields,
-            "light_optimize_memory_brakes_total" => m.light_optimize_memory_brakes,
-            "mor_delta_leg_sorts_total" => m.mor_delta_leg_sorts,
-            "flush_sort_unsorted_fallbacks_total" => m.flush_sort_unsorted_fallbacks,
-            "light_optimize_ticks_degraded_total" => m.light_optimize_ticks_degraded,
-            "rollup_hits_full_total" => m.rollup_hits_full,
-            "rollup_hits_hybrid_total" => m.rollup_hits_hybrid,
-            "rollup_rebuilds_incremental_total" => m.rollup_rebuilds_incremental,
-            "rollup_rebuilds_full_total" => m.rollup_rebuilds_full,
-            "rollup_dirty_partitions" => m.rollup_dirty_partitions,
-            "rollup_skipped_covered_by_wider" => m.rollup_skipped_covered_by_wider,
-            "split_declined_at_floor" => m.split_declined_at_floor,
-            "immutable_column_disagreement_total" => m.immutable_column_disagreement_total,
-            "coverage_ledger_disagreements" => m.coverage_ledger_disagreements,
-            "coverage_ledger_persist_failures" => m.coverage_ledger_persist_failures,
-            "rollup_resumed_total" => m.rollup_resumed,
-            "rollup_resume_declined_total" => m.rollup_resume_declined,
-            "rollup_untagged_inputs" => m.rollup_untagged_inputs,
-            "rollup_tier_untagged_found" => m.rollup_tier_untagged_found,
-            // The republish backlog that gates wide-window routing. Watch it fall;
-            // `rollup_stale_no_witness` per query falls with it.
-            "rollup_witnessless_slices" => m.rollup_witnessless_slices,
-            "rollup_tier_untagged_retired_total" => m.rollup_tier_untagged_retired,
-            "rollup_min_contiguous_days" => m.rollup_min_contiguous_days,
-            "rollup_median_contiguous_days" => m.rollup_median_contiguous_days,
-            "rollup_oldest_invalidation_age_seconds" => m.rollup_oldest_invalidation_age_secs,
-            "rollup_scan_cohorts_total" => m.rollup_scan_cohorts,
-            "rollup_scan_projects_total" => m.rollup_scan_projects,
-            "rollup_scan_estimated_bytes_total" => m.rollup_scan_estimated_bytes,
-            "rollup_cohort_splits_total" => m.rollup_cohort_splits,
-            "rollup_singleton_failures_total" => m.rollup_singleton_failures,
-            "rollup_staged_projects_total" => m.rollup_staged_projects,
-            "rollup_shared_commits_total" => m.rollup_shared_commits,
-            "rollup_commit_actions_total" => m.rollup_commit_actions,
-            "rollup_occ_retries_total" => m.rollup_occ_retries,
-            "rollup_ambiguous_landings_total" => m.rollup_ambiguous_landings,
-            "rollup_scan_duration_ms_total" => m.rollup_scan_duration_ms,
-            "rollup_staging_duration_ms_total" => m.rollup_staging_duration_ms,
-            "rollup_commit_duration_ms_total" => m.rollup_commit_duration_ms,
-            "rollup_end_to_end_duration_ms_total" => m.rollup_end_to_end_duration_ms,
-            "rollup_output_rows_total" => m.rollup_output_rows,
-            "rollup_output_files_total" => m.rollup_output_files,
-            "tantivy_uncovered_files" => m.tantivy_uncovered_files,
-            "pending_dedup" => m.pending_dedup,
-            "pending_base_rollup" => m.pending_base_rollup,
-            "pending_derived_rollup" => m.pending_derived_rollup,
-            "pending_hot_packing" => m.pending_hot_packing,
-            "pending_sealed_consolidation" => m.pending_sealed_consolidation,
-            "pending_repair" => m.pending_repair,
-            "eligible_base_rollup" => m.eligible_base_rollup,
-            "eligible_sealed_total" => m.eligible_sealed_total,
-            "tantivy_oversized_skipped" => m.tantivy_oversized_skipped,
-            "rollup_full_hours_rebuilt_total" => m.rollup_full_hours_rebuilt,
-            "rollup_incremental_hours_rebuilt_total" => m.rollup_incremental_hours_rebuilt,
-            "tasks_pending" => m.maintenance_tasks_pending,
-            "tasks_running" => m.maintenance_tasks_running,
-            "tasks_retry" => m.maintenance_tasks_retry,
-            "tasks_complete" => m.maintenance_tasks_complete,
-            "backlog_bytes" => m.maintenance_backlog_bytes,
-            "oldest_task_age_seconds" => m.maintenance_oldest_task_age_secs,
-            "beyond_horizon_tasks" => m.maintenance_beyond_horizon_tasks,
-            "eligible_watermark_lag_seconds" => m.maintenance_eligible_watermark_lag_secs,
-            "processed_bytes_total" => m.maintenance_processed_bytes,
-            "processed_bytes_per_second" => m.maintenance_processed_bytes_per_sec,
-            "raw_tail_duration_seconds" => m.maintenance_raw_tail_duration_secs,
-            "sealed_compaction_debt_bytes" => m.sealed_compaction_debt_bytes,
-            "cpu_tokens_used" => m.maintenance_cpu_tokens_used,
-            "decoded_bytes_used" => m.maintenance_decoded_bytes_used,
-            "object_read_tokens_used" => m.maintenance_object_read_tokens_used,
-            "object_write_tokens_used" => m.maintenance_object_write_tokens_used,
-            "rollup_misses_total" => m.rollup_misses_total,
-            "rollup_miss_not_built_total" => m.rollup_miss_not_built,
-            "rollup_miss_stale_coverage_total" => m.rollup_miss_stale_coverage,
-            "rollup_miss_tiny_interior_total" => m.rollup_miss_tiny_interior,
-            "rollup_miss_too_many_branches_total" => m.rollup_miss_too_many_branches,
-            "rollup_miss_unsupported_total" => m.rollup_miss_unsupported,
-            "rollup_miss_incomplete_coverage_total" => m.rollup_miss_incomplete_coverage,
-            "rollup_miss_unknown_filter_total" => m.rollup_miss_unknown_filter,
-            "rollup_miss_filter_not_eligible_total" => m.rollup_miss_filter_not_eligible,
-            "rollup_miss_missing_measure_total" => m.rollup_miss_missing_measure,
-            "rollup_miss_unaligned_bucket_total" => m.rollup_miss_unaligned_bucket,
-            "rollup_miss_unknown_group_by_total" => m.rollup_miss_unknown_group_by,
-            "rollup_miss_unwalkable_source_total" => m.rollup_miss_unwalkable_source,
-            "rollup_miss_missing_project_total" => m.rollup_miss_missing_project,
-            "rollup_miss_unbounded_time_total" => m.rollup_miss_unbounded_time,
-            "rollup_miss_non_decomposable_total" => m.rollup_miss_non_decomposable,
-            "rollup_miss_rewrite_schema_mismatch_total" => m.rollup_miss_rewrite_schema_mismatch,
-            "dirty_bin_queue_depth" => m.dirty_bin_queue_depth,
-            "dirty_bin_enqueued_total" => m.dirty_bin_enqueued,
-            "dirty_bin_eligible_total" => m.dirty_bin_eligible,
-            "dirty_bin_processed_total" => m.dirty_bin_processed,
-            "dirty_bin_requeued_total" => m.dirty_bin_requeued,
-            "dirty_bin_batch_probe_clean_total" => m.dirty_bin_batch_probe_clean,
-            "dirty_bin_dropped_rows_total" => m.dirty_bin_dropped_rows,
-            "dirty_bin_rewrite_duration_ms_total" => m.dirty_bin_rewrite_duration_ms,
-            "dedup_bins_deferred_cold_total" => m.dedup_bins_deferred_cold,
-            "dedup_passes_flush_yields_total" => m.dedup_passes_flush_yields,
-            "dedup_bin_stage_timeouts_total" => m.dedup_bin_stage_timeouts,
-            "wave_commits_yielded_to_flush_total" => m.wave_commits_yielded_to_flush,
-            "repair_resumed_total" => m.repair_resumed,
-            "repair_resume_declined_stale_total" => m.repair_resume_declined_stale,
-            "repair_resume_declined_incomplete_total" => m.repair_resume_declined_incomplete,
-            // MUST stay 0 — nonzero = a staged repair whose rows didn't add up.
-            "repair_resume_row_mismatch_total" => m.repair_resume_row_mismatch,
-            // Runs exceeding the long-running warning threshold. Slow progress
-            // is allowed; sustained nonzero with no completion = wedged.
-            "cron_long_running_total" => m.cron_long_running,
-            // Fired frozen while uptime grows = scheduler dead (2026-07-14
-            // outage); skipped growing = a job body is wedged or overlong.
-            "cron_ticks_fired" => m.cron_ticks_fired,
-            "cron_ticks_skipped" => m.cron_ticks_skipped,
-        ];
+        let mut maintenance = atomic_rows(m.stats_rows());
         maintenance.push(("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason()));
         // DERIVED, not hand-listed. `rollup_witnessless_slices` above is one
         // number for a population that sat byte-identical across four hourly
@@ -1132,15 +993,6 @@ impl StatsTableProvider {
             use crate::database::scan_metric_names::*;
             let cv = crate::observability::counter_value;
             let q = |name: &str, p: f64| crate::observability::histogram_quantile(name, p).unwrap_or(0.0) as u64;
-            // `map_or(0, …)` is why the old `no_index_or_cap` row read zero for a
-            // day after the reason was split into four: an unregistered string
-            // is indistinguishable from a counter that never fired. Assert it,
-            // exactly as `record_prefilter_skip` asserts on the emitting side.
-            let skip_reason = |r: &str| {
-                let metric = prefilter_skip_metric(r);
-                debug_assert!(metric.is_some(), "unregistered prefilter skip reason {r:?} — this row would silently read 0");
-                metric.map_or(0, cv)
-            };
             let (total, skipped) = (cv(SCANS_TOTAL), cv(SCANS_SKIPPED_DELTA));
             let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
             let (dedup_elig, dedup_skipped) = (cv(DEDUP_ELIGIBLE_SCANS), cv(DEDUP_SKIPPED));
@@ -1173,181 +1025,36 @@ impl StatsTableProvider {
                     "query_pool_pct" => if pool_size > 0 { pool_used * 100 / pool_size } else { 0 },
                 ],
                 rows!["scan_decode";
-                    "bytes_total" => cv(DECODE_BYTES_TOTAL),
                     "peak_batch_bytes" => dpeak,
                     "polls_inflight" => m.decode.decode_polls_inflight.load(Relaxed),
                     "polls_inflight_peak" => dinflight_peak,
-                    "pressure_throttled_total" => cv(DECODE_PRESSURE_THROTTLED),
                     "worst_case_heap_mb" => mb(dpeak.saturating_mul(dinflight_peak) as f64),
                 ],
                 rows!["scan";
-                    "total" => total,
-                    "skipped_delta" => skipped,
                     "skipped_delta_pct" => pct(skipped, total),
-                    "mem_only" => cv(SCANS_MEM_ONLY),
-                    "delta_only" => cv(SCANS_DELTA_ONLY),
-                    "mem_plus_delta" => cv(SCANS_MEM_PLUS_DELTA),
-                    "dedup_eligible" => dedup_elig,
-                    "dedup_skipped" => dedup_skipped,
                     "dedup_skipped_pct" => pct(dedup_skipped, dedup_elig),
-                    // The per-DATE split fires only AFTER the whole-window verdict
-                    // is denied, so it is invisible in `dedup_skipped` and shows up
-                    // inside `denied_uncertified` — without this row, enabling
-                    // `timefusion_read_dedup_skip_per_date` cannot be observed at all.
-                    "dedup_skipped_per_date" => cv(DEDUP_SKIPPED_PER_DATE),
-                    "dedup_skipped_per_file" => cv(DEDUP_SKIPPED_PER_FILE),
-                    "dedup_denied_uncertified" => cv(DEDUP_DENIED_UNCERTIFIED),
-                    "dedup_denied_by_leg" => cv(DEDUP_DENIED_BY_LEG),
-                    // The certification-survival split. `never_certified` is what a
-                    // persistent/warmed `dedup_clean_fp` could convert; `fp_moved` is
-                    // the irreducible floor (the partition genuinely changed), and
-                    // `no_window`/`unresolved` are denials this feature never owned.
-                    // Read them together with cert_dwell_p50 below — a large
-                    // never_certified share only justifies persistence if the
-                    // certifications it would persist actually live a while.
-                    // The routing tax, where it actually goes. `tantivy_scan_us`
-                    // is the routed-only scan construction; compare its delta
-                    // against the routed-minus-unrouted wall gap, and read
-                    // fastpath vs the three split_* losers to see WHY the cheap
-                    // single-provider path was refused.
-                    "tantivy_scan_calls" => cv(TANTIVY_SCAN_CALLS),
-                    "tantivy_scan_us_total" => cv(TANTIVY_SCAN_US),
-                    "tantivy_uris_us_total" => cv(TANTIVY_URIS_US),
-                    "tantivy_fastpath" => cv(TANTIVY_FASTPATH),
-                    "tantivy_split_raw" => cv(TANTIVY_SPLIT_RAW),
-                    "tantivy_split_bloom" => cv(TANTIVY_SPLIT_BLOOM),
-                    "tantivy_split_date" => cv(TANTIVY_SPLIT_DATE),
-                    "tantivy_live_files_total" => cv(TANTIVY_LIVE_FILES),
-                    "tantivy_raw_files_total" => cv(TANTIVY_RAW_FILES),
-                    "tantivy_backfill_built" => cv(TANTIVY_BACKFILL_BUILT),
-                    // Read against `tantivy_backfill_built`: the ratio is how much
-                    // rewrite churn stopped costing a build. A counter that is
-                    // incremented but never surfaced cannot be used to judge the
-                    // change it exists to judge.
-                    "tantivy_carried_forward" => cv(TANTIVY_CARRIED_FORWARD),
-                    // built / commits is the manifest-write amortisation the
-                    // batching bought; before it the ratio was 1.
-                    // Splits tantivy_scan_us into its three steps, so the next
-                    // fix targets the one that owns it rather than guessing.
-                    // Whether the prefilter is even REACHING the scan. The
-                    // predicate-aware mutable gate (761779d) removed a gate that
-                    // was provably dead on otel, and files-per-call did not move
-                    // — which it cannot if decide_prefilter is bailing before it,
-                    // most plausibly on field_coverage_gap (one in-window index
-                    // missing a queried field skips the WHOLE pushdown). These
-                    // three separate "never tried" / "tried and used" / "tried
-                    // and skipped" so that question stops being a guess.
-                    "prefilter_attempts" => cv(PREFILTER_ATTEMPTS),
-                    "prefilter_used" => cv(PREFILTER_USED),
-                    "prefilter_skipped" => cv(PREFILTER_SKIPPED),
-                    // ...and WHY. These sum to `prefilter_skipped`; the first
-                    // three are decisions (the index answered, the rule declined
-                    // it), the rest are the index failing to answer at all —
-                    // opposite fixes, indistinguishable in the total alone.
-                    "prefilter_skipped_empty_index" => skip_reason("empty_index"),
-                    "prefilter_skipped_low_selectivity" => skip_reason("low_selectivity"),
-                    "prefilter_skipped_field_coverage_gap" => skip_reason("field_coverage_gap"),
-                    // The four the 2026-08-23 split created out of one
-                    // `no_index_or_cap` label. This readout kept asking for the
-                    // OLD string, which nothing writes any more, so the row read
-                    // 0 while the four real counters were never exposed at all —
-                    // 103 of 127 skips unattributable on prod 2026-08-24.
-                    // `every_prefilter_skip_reason_is_exposed` now ties the two
-                    // lists together so they cannot drift apart again.
-                    "prefilter_skipped_no_index" => skip_reason("delta_no_index"),
-                    "prefilter_skipped_no_usable_index" => skip_reason("delta_no_usable_index"),
-                    "prefilter_skipped_cap_exceeded_one_index" => skip_reason("delta_cap_exceeded_one_index"),
-                    "prefilter_skipped_cap_exceeded_combined" => skip_reason("delta_cap_exceeded_combined"),
-                    "prefilter_skipped_no_hits_returned" => skip_reason("delta_no_hits_returned"),
-                    "prefilter_skipped_delta_error" => skip_reason("delta_error"),
-                    // Splits `rollup_miss_stale_coverage`, which was the SOLE
-                    // blocker on every bare dashboard shape measured 2026-08-22.
-                    // `no_witness` clears itself once the coordinator republishes
-                    // those slices — it is a throughput problem. `moved` does not,
-                    // because the partition really is churning. Same miss, opposite
-                    // fix, and indistinguishable before this.
-                    "rollup_stale_no_witness" => cv(ROLLUP_STALE_NO_WITNESS),
                     "rollup_stale_moved" => cv(ROLLUP_STALE_SHRANK) + cv(ROLLUP_STALE_GREW),
-                    // GREW = rows arrived, the tier really is stale. SHRANK = physical
-                    // rows were collapsed by dedup/compaction/vacuum, which the logical
-                    // set the tier aggregated may not even contain. Both are refused;
-                    // this says which is worth building for.
-                    "rollup_stale_grew" => cv(ROLLUP_STALE_GREW),
-                    "rollup_stale_shrank" => cv(ROLLUP_STALE_SHRANK),
-                    "rollup_stale_no_source_rows" => cv(ROLLUP_STALE_NO_SOURCE_ROWS),
-                    "pruned_calls" => cv(PRUNED_CALLS),
-                    "pruned_files_total" => cv(PRUNED_FILES),
-                    "pruned_select_us_total" => cv(PRUNED_SELECT_US),
-                    "pruned_build_us_total" => cv(PRUNED_BUILD_US),
-                    "pruned_scan_us_total" => cv(PRUNED_SCAN_US),
-                    "tantivy_manifest_commits" => cv(TANTIVY_MANIFEST_COMMITS),
-                    "tantivy_manifest_commit_us_total" => cv(TANTIVY_MANIFEST_COMMIT_US),
-                    "dedup_denied_never_certified" => cert_never,
-                    "dedup_denied_fp_moved" => cert_moved,
                     "dedup_denied_never_certified_pct" => pct(cert_never, cert_never + cert_moved),
-                    "dedup_denied_no_window" => cv(DEDUP_DENIED_NO_WINDOW),
-                    "dedup_denied_unresolved" => cv(DEDUP_DENIED_UNRESOLVED),
-                    "dedup_denied_disabled" => cv(DEDUP_DENIED_DISABLED),
-                    "cert_granted_total" => cv(CERT_GRANTED_TOTAL),
-                    // Why certification never happens. `cert_slice_*` are the exits
-                    // of `record_clean_slice` (they should sum to its call count);
-                    // `cert_refused_*` split `record_certification`'s refusal by the
-                    // conjunct that failed. cert_granted_total has been 0 since
-                    // 2026-08-20 through three fixes that each guessed the exit —
-                    // read these before attempting a fourth.
-                    "cert_slice_outside_day" => cv(CERT_SLICE_OUTSIDE_DAY),
-                    "cert_slice_dirty" => cv(CERT_SLICE_DIRTY),
-                    "cert_slice_partial" => cv(CERT_SLICE_PARTIAL),
-                    "cert_slice_day_covered" => cv(CERT_SLICE_DAY_COVERED),
-                    "cert_refused_dropped" => cv(CERT_REFUSED_DROPPED),
-                    "cert_refused_incomplete" => cv(CERT_REFUSED_INCOMPLETE),
-                    "cert_refused_empty" => cv(CERT_REFUSED_EMPTY),
-                    "cert_refused_fp_moved" => cv(CERT_REFUSED_FP_MOVED),
-                    "cert_dwell_total" => cert_dwells,
                     "cert_dwell_secs_avg" => avg(cv(CERT_DWELL_SECS_TOTAL), cert_dwells),
                     "cert_dwell_p50_secs" => m.cert_dwell_percentile_secs(0.50),
                     "cert_dwell_p90_secs" => m.cert_dwell_percentile_secs(0.90),
-                    "fast_resolve_hits" => fr_hits,
-                    "fast_resolve_misses" => fr_misses,
                     "fast_resolve_hit_pct" => pct(fr_hits, fr_hits + fr_misses),
-                    "provider_cache_hits" => pc_hits,
-                    "provider_cache_misses" => pc_misses,
-                    "provider_cache_evictions" => cv(PROVIDER_CACHE_EVICTIONS),
                     "provider_cache_hit_pct" => pct(pc_hits, pc_hits + pc_misses),
-                    "provider_build_abandoned" => cv(PROVIDER_BUILD_ABANDONED),
                     "provider_build_us_avg" => avg(cv(PROVIDER_BUILD_US_TOTAL), provider_builds),
-                    "provider_build_total" => provider_builds,
                     "provider_scan_us_avg" => avg(cv(PROVIDER_SCAN_US_TOTAL), provider_scans),
-                    "provider_scan_total" => provider_scans,
-                    "bounded_otel_scan_candidates" => cv(BOUNDED_OTEL_SCAN_CANDIDATES),
-                    "bounded_otel_scan_rejections" => cv(BOUNDED_OTEL_SCAN_REJECTIONS),
-                    "wide_scan_oversize_total" => cv(WIDE_SCAN_OVERSIZE_TOTAL),
-                    // full-set is the mode that has no LIMIT early termination and
-                    // charges the 2 GiB per-query budget. A non-zero pct is the
-                    // footer-repair backlog measured from the read side.
-                    "dedup_bounded_total" => cv(DEDUP_BOUNDED_TOTAL),
-                    "dedup_full_set_total" => cv(DEDUP_FULL_SET_TOTAL),
                     "dedup_full_set_pct" => pct(cv(DEDUP_FULL_SET_TOTAL), cv(DEDUP_BOUNDED_TOTAL) + cv(DEDUP_FULL_SET_TOTAL)),
-                    // rows_dropped ≫ compactions is the merge-on-read duplicate
-                    // density the winner collapse exists for; compactions climbing
-                    // with rows_dropped near zero means the winners themselves fill
-                    // the buffer and the window is the problem, not duplication.
-                    "dedup_winner_compactions_total" => cv(DEDUP_WINNER_COMPACTIONS_TOTAL),
-                    "dedup_winner_compaction_rows_dropped" => cv(DEDUP_WINNER_COMPACTION_ROWS_DROPPED),
                     // Read these BEFORE setting TIMEFUSION_WIDE_SCAN_REFUSE_MB — the
                     // threshold has to sit above p99 or it rejects working dashboards.
                     "wide_scan_selected_mb_p50" => q(WIDE_SCAN_SELECTED_MB, 0.50),
                     "wide_scan_selected_mb_p90" => q(WIDE_SCAN_SELECTED_MB, 0.90),
                     "wide_scan_selected_mb_p99" => q(WIDE_SCAN_SELECTED_MB, 0.99),
                     "mem_plan_us_avg" => avg(cv(MEM_PLAN_US_TOTAL), mem_plans),
-                    "mem_plan_total" => mem_plans,
                     "lat_p50_us_approx" => m.latency_percentile_us(0.50),
                     "lat_p95_us_approx" => m.latency_percentile_us(0.95),
                     "lat_p99_us_approx" => m.latency_percentile_us(0.99),
                     "lat_p999_us_approx" => m.latency_percentile_us(0.999),
                 ],
                 rows!["pgwire";
-                    "queries_total" => cv(PGWIRE_TOTAL),
                     "lat_p50_us_approx" => m.pgwire_percentile_us(0.50),
                     "lat_p95_us_approx" => m.pgwire_percentile_us(0.95),
                     "lat_p99_us_approx" => m.pgwire_percentile_us(0.99),
@@ -1356,6 +1063,7 @@ impl StatsTableProvider {
             ]
             .into_iter()
             .flatten()
+            .chain(SCAN_ROWS.iter().map(|(component, key, metric)| (*component, (*key).to_string(), cv(metric).to_string())))
             .collect()
         });
 
@@ -1685,22 +1393,20 @@ mod stats_table_tests {
         }
     }
 
-    /// Every registered prefilter skip reason must reach `timefusion_stats`.
+    /// Every counter `scan_metrics!` declares must reach `timefusion_stats`.
     ///
-    /// `every_search_refusal_is_a_registered_prefilter_reason` (database/mod.rs)
-    /// already proves each reason has a METRIC. Nothing proved the metric has a
-    /// ROW, and on 2026-08-23 the `no_index_or_cap` label was split into four
-    /// without the readout following: this section kept asking for the retired
-    /// string, so one row read a constant 0 and the four live counters were
-    /// invisible. Prod 2026-08-24 measured `prefilter_skipped = 127` against
-    /// reason rows summing to 24 — 81% unattributable, while the section's own
-    /// comment claimed the reasons sum to the total.
+    /// `rows`/`reasons` entries are rendered FROM the declaration, so for those
+    /// this only re-proves what the macro already makes structural. What it
+    /// actually pins is `derived`: counters that reach stats through a row
+    /// pg_compat computes by hand (an average, a percentile), the one remaining
+    /// way a declared counter can go unexposed.
     ///
-    /// The `debug_assert` in `skip_reason` covers the dead-string half; this
-    /// covers the missing-row half. Both are needed: a reason can be dropped
-    /// from the readout without any string becoming invalid.
+    /// The bug it retires: the 2026-08-23 prefilter split renamed four reasons
+    /// and the readout kept asking for the retired string, so `map_or(0, …)`
+    /// rendered a confident 0 — 53% of prod skips unattributable on 2026-08-24.
     #[test]
-    fn every_prefilter_skip_reason_is_exposed() {
+    fn every_declared_scan_metric_has_a_row() {
+        use crate::database::scan_metric_names::{SCAN_DERIVED_ROWS, SCAN_ROWS};
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
         let exposed = rows.iter().filter(|(component, key, _)| component == "scan" && key.starts_with("prefilter_skipped_")).count();
         assert_eq!(
@@ -1741,29 +1447,21 @@ mod stats_table_tests {
     fn exposes_dml_retry_outcomes() {
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
 
-        for (component, key) in [
-            ("dml", "occ_conflicts_total"),
-            ("dml", "retry_successes_total"),
-            ("dml", "retry_exhausted_total"),
-            ("maintenance", "dedup_timed_out_total"),
-            ("maintenance", "light_optimize_timed_out_total"),
-            ("maintenance", "cron_long_running_total"),
-            // The rollout signal: hits vs misses is the only way to tell read
-            // routing is firing, and this key list is hand-maintained.
-            ("maintenance", "rollup_hits_full_total"),
-            ("maintenance", "rollup_hits_hybrid_total"),
-            ("maintenance", "rollup_rebuilds_incremental_total"),
-            ("maintenance", "rollup_rebuilds_full_total"),
-            ("maintenance", "rollup_misses_total"),
-            ("parquet", "metadata_cache_hits"),
-            ("parquet", "bytes_read"),
-            ("scan", "provider_build_us_avg"),
-            ("scan", "provider_scan_us_avg"),
-            ("scan", "mem_plan_us_avg"),
-            ("scan", "dedup_winner_compactions_total"),
-            ("scan", "dedup_winner_compaction_rows_dropped"),
-        ] {
+        for (component, key) in SCAN_ROWS.iter().map(|(c, k, _)| (*c, *k)).chain(SCAN_DERIVED_ROWS.iter().copied()) {
             assert_has(&rows, component, key);
         }
     }
+
+    /// `parquet` rows come from deltalake's global snapshot struct, not from a
+    /// declaration this crate owns — the only counters here still exposed by hand.
+    #[test]
+    fn exposes_parquet_io_counters() {
+        let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
+        for key in ["metadata_cache_hits", "bytes_read"] {
+            assert_has(&rows, "parquet", key);
+        }
+    }
+
 }
+
+
