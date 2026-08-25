@@ -963,7 +963,12 @@ mod variant_json_accessor_tests {
     #[test_case::test_case(r#"{"a":"{\"b\":1}"}"#, "->'a'->>'b'", true ; "a string leaf holding JSON is NOT re-parsed")]
     #[test_case::test_case(r#"{"a":1}"#, "->>''", true ; "the empty key is a key, not an empty path")]
     #[test_case::test_case(r#"{"a":{"b":1}}"#, "->'a'", false ; "a terminal arrow keeps its JSON union type")]
-    #[test_case::test_case(r#"{"a":{"b":"c"}}"#, "->>'a'->>'b'", false ; "an intermediate ->> unquotes, so it is not a variant path")]
+    // datafusion-functions-json's own rewriter folds a chained ->> into ONE
+    // multi-key json_as_text before this rule runs, so what arrives is the
+    // ordinary rewritable shape. (That rewriter is a DataFusion default; TF's
+    // session does not register it, so in prod this case stays nested and the
+    // rule declines it — see `an_excluded_shape_is_left_alone`.)
+    #[test_case::test_case(r#"{"a":{"b":"c"}}"#, "->>'a'->>'b'", true ; "chained long arrows, unnested upstream")]
     #[tokio::test]
     async fn both_spellings_agree(doc: &str, accessor: &str, rewritten: bool) {
         let sql = format!("SELECT variant_to_json(json_to_variant(d)){accessor} AS v FROM (VALUES ('{doc}'), (NULL)) t(d)");
@@ -977,22 +982,27 @@ mod variant_json_accessor_tests {
         assert_eq!(fmt(&batches), fmt(&base), "rows differ\nwith: {plan}");
     }
 
-    /// A negative index is a no-match (NULL) in JSON but a hard parse error in
-    /// `VariantPath`, so the peephole must leave it alone rather than turn a
-    /// NULL answer into a failed query.
+    /// Shapes the peephole must refuse, at the expression level — including the
+    /// ones the SQL cases above cannot reach because DataFusion's own JSON
+    /// rewriter normalizes them away first.
     #[test]
-    fn a_negative_index_is_not_rewritten() {
+    fn an_excluded_shape_is_left_alone() {
         use datafusion::prelude::lit;
-        let variant = Expr::ScalarFunction(ScalarFunction { func: variant_to_json_udf(), args: vec![col("v")] });
-        let rewrite = |key: Expr| {
-            super::variant_native_extraction(&Expr::ScalarFunction(ScalarFunction {
-                func: datafusion_functions_json::udfs::json_as_text_udf(),
-                args: vec![variant.clone(), key],
-            }))
-        };
-        assert!(rewrite(lit(1i64)).is_some(), "a non-negative index is rewritten");
-        assert!(rewrite(lit(-1i64)).is_none(), "a negative index must stay on the JSON path");
-        assert!(rewrite(col("k")).is_none(), "a non-literal key has no constant variant path");
+        let json_call = |udf: Arc<ScalarUDF>, args: Vec<Expr>| Expr::ScalarFunction(ScalarFunction { func: udf, args });
+        let as_text = |args: Vec<Expr>| json_call(datafusion_functions_json::udfs::json_as_text_udf(), args);
+        let variant = json_call(variant_to_json_udf(), vec![col("v")]);
+        let rewrite = |e: Expr| super::variant_native_extraction(&e);
+
+        assert!(rewrite(as_text(vec![variant.clone(), lit(1i64)])).is_some(), "a non-negative index is rewritten");
+        // A negative index is a no-match (NULL) in JSON but a hard parse error
+        // in `VariantPath` — a NULL answer must not become a failed query.
+        assert!(rewrite(as_text(vec![variant.clone(), lit(-1i64)])).is_none(), "negative index");
+        assert!(rewrite(as_text(vec![variant.clone(), col("k")])).is_none(), "non-literal key");
+        // An intermediate ->> unquotes a JSON string leaf, so a further lookup
+        // parses that string's contents; a variant path would not.
+        assert!(rewrite(as_text(vec![as_text(vec![variant.clone(), lit("a")]), lit("b")])).is_none(), "nested json_as_text");
+        // json_get_str is NULL unless the leaf IS a string — a different contract.
+        assert!(rewrite(json_call(datafusion_functions_json::udfs::json_get_str_udf(), vec![variant, lit("a")])).is_none(), "json_get_str family");
     }
 }
 
