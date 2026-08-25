@@ -4354,10 +4354,14 @@ mod tests {
         let now = 400 * DAY;
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Shaped exactly like `plan_compaction_debt`: build the unit with the
+        // footprint it selected on, then hand it to `enqueue_planned`. The old
+        // fixture set `input` on a task it `upsert`ed — the one path production
+        // does not take — so it passed while prod read `files=0` on every sample.
         let cell = |project: &str, hours_ago: i64, files: u32| {
             let end = now - hours_ago * HOUR;
             let mut unit = task(project, end - DAY, end, Operation::SealedConsolidation);
-            unit.input = Some(InputFootprint { fp: 1, whole_file_bytes: 1, files });
+            unit.input = Some(InputFootprint::new((0..files).map(|n| format!("{project}/{n}.parquet")), 1));
             unit
         };
         // The biggest debt sealed only a day ago, so it is NOT in the starvation
@@ -4365,29 +4369,69 @@ mod tests {
         // is compared before `benefit`, so the older one legitimately wins and
         // the 238-file cell waits — which is the ordering this instrument exists
         // to make legible.
+        //
+        // The smaller cell is enqueued FIRST, deliberately: with `files` unset
+        // the selection is `max_by_key` over zeroes, which returns whichever the
+        // iterator reached first. Naming the right cell then proves nothing —
+        // prod named a genuinely indebted cell while reporting `files=0`, purely
+        // by journal order. Insertion order must contradict the answer.
         let indebted = cell("bigdebt", 24, 238);
-        journal.upsert(indebted.clone());
-        journal.upsert(cell("starved", 120, 10));
+        journal.enqueue_planned(&cell("starved", 120, 10));
+        journal.enqueue_planned(&indebted);
 
         let refusal = journal.most_indebted_unclaimed(Operation::SealedConsolidation, now).expect("the debt is not being claimed");
         assert!(refusal.starts_with("outranked_by:starved"), "it must name the winner, not merely say CLAIMABLE — got {refusal}");
         assert!(refusal.contains("files=238"), "and it must carry the debt that makes it worth reporting — got {refusal}");
 
         // Eligibility reasons still win over the ordering answer, because they
-        // are actionable on the task itself.
+        // are actionable on the task itself. (A fresh journal, because `enqueue`
+        // only ever pulls a deadline EARLIER.)
+        let mut later = TaskJournal::load(dir.path()).expect("journal");
         let mut not_due = indebted.clone();
         not_due.deadline_micros = now + DAY;
-        journal.upsert(not_due);
+        later.enqueue_planned(&not_due);
         assert!(
-            journal.most_indebted_unclaimed(Operation::SealedConsolidation, now).is_some_and(|why| why.starts_with("not_due:")),
+            later.most_indebted_unclaimed(Operation::SealedConsolidation, now).is_some_and(|why| why.starts_with("not_due:")),
             "a future deadline explains it without appealing to ordering"
         );
 
         // And silence when there is nothing to explain: the biggest debt winning
         // its own claims is the healthy state, not a finding.
         let mut alone = TaskJournal::load(dir.path()).expect("journal");
-        alone.upsert(cell("bigdebt", 24, 238));
+        alone.enqueue_planned(&indebted);
         assert_eq!(alone.most_indebted_unclaimed(Operation::SealedConsolidation, now), None);
+    }
+
+    /// Which footprint wins, and when. Both are honest measurements.
+    ///
+    /// The planner re-derives the live file set every 60 s; the claim-time
+    /// preflight measures what a running unit actually read. `None` must never
+    /// erase either — every other `enqueue` caller passes it, and stripping a
+    /// claim-time footprint breaks the bisect ladder `record_input` documents.
+    #[test]
+    fn a_planned_footprint_heals_a_pending_cell_and_never_erases_a_measured_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut unit = task("p", 0, DAY_MICROS, Operation::SealedConsolidation);
+
+        // The backlog heal: a cell queued before the planner carried a footprint
+        // must not need a first claim to become rankable.
+        journal.enqueue(unit.key.clone(), 0, 1, 0);
+        assert_eq!(journal.input_files(&unit.key), None);
+        unit.input = Some(InputFootprint::new(["a", "b", "c"], 1));
+        journal.enqueue_planned(&unit);
+        assert_eq!(journal.input_files(&unit.key), Some(3), "the next planner tick must supply the count");
+
+        // And a plain re-enqueue leaves it alone rather than zeroing it.
+        journal.enqueue(unit.key.clone(), 0, 1, 0);
+        assert_eq!(journal.input_files(&unit.key), Some(3), "`None` is silence, not evidence of no files");
+
+        // While the unit RUNS, the claim-time measurement is the one that counts:
+        // it is what `abandon_running` bisects on.
+        let claimed = journal.claim_next(Operation::SealedConsolidation, 0, false).expect("claimable");
+        journal.record_input(&claimed.key, InputFootprint::new(["a", "b"], 1));
+        journal.enqueue_planned(&unit);
+        assert_eq!(journal.input_files(&unit.key), Some(2), "a planner tick must not clobber a running unit's own measurement");
     }
 
     #[test]
