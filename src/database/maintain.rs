@@ -2839,8 +2839,19 @@ impl Database {
             let landed = result.failed.is_empty() && !result.landed.is_empty();
             info!(table_name = %key.source, project_id = %key.project_id, landed, event = "resumed_bin_committed_early");
             if landed {
+                // A resumed bin is one BIN, never by construction the whole
+                // cell: `coordinator_compaction_files` hands Repair `take(1)`
+                // and hands packing one budgeted bin-pack. Completing here
+                // unconditionally retired a unit whose partition still carried
+                // debt — the same test the staging arm below and the
+                // already-sorted arm above both make, and for the same reason.
+                let remaining = !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty();
                 let mut journal = self.journal();
-                journal.complete(&key);
+                if remaining {
+                    journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
+                } else {
+                    journal.complete(&key);
+                }
                 journal.checkpoint()?;
                 return Ok(true);
             }
@@ -6825,7 +6836,7 @@ impl Database {
         info!(loaded = kept.len(), dropped, event = "footer_repair_verified_loaded");
     }
 
-    fn staged_intent_path(&self) -> PathBuf {
+    pub(crate) fn staged_intent_path(&self) -> PathBuf {
         self.maintenance_state_path("staged_intent.jsonl")
     }
 
