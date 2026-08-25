@@ -1781,12 +1781,7 @@ impl TaskJournal {
     ///   heals the backlog: cells enqueued before this change gain a count on
     ///   the next planner tick instead of waiting for a first claim.
     fn enqueue_inner(
-        &mut self,
-        key: TaskKey,
-        deadline_micros: i64,
-        estimated_decoded_bytes: u64,
-        created_unix_ms: u64,
-        base_tier_present: bool,
+        &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
         input: Option<InputFootprint>,
     ) {
         // Same rule as `upsert`, and it needs stating twice because this path

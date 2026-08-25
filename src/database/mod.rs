@@ -11796,7 +11796,8 @@ mod tests {
         let (big, small) = (files(&indebted), files(&starved));
         assert!(big >= 2, "the planner selected the file list to decide the partition was out of policy — the queued unit must carry the count, got {big}");
         assert!(big > small, "and the bigger cell must read as the bigger debt, got {big} vs {small}");
-        let refusal = journal.most_indebted_unclaimed(Operation::SealedConsolidation, crate::support::now_micros()).expect("the debt is outranked, not claimed");
+        let refusal =
+            journal.most_indebted_unclaimed(Operation::SealedConsolidation, crate::support::now_micros()).expect("the debt is outranked, not claimed");
         assert!(
             refusal.contains(&format!("{indebted:.8}")) && refusal.ends_with(&format!("files={big}")),
             "the instrument must name the genuinely most indebted cell and its debt — got {refusal}"
