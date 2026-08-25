@@ -2460,6 +2460,16 @@ impl TaskJournal {
         }
     }
 
+    /// Append the pending journal records and fsync them.
+    ///
+    /// Called on every claim, complete and retry — 46 sites, all synchronous,
+    /// all reached from tasks running on the shared runtime. The `fsync` here
+    /// is the blocking syscall that `block.journal_hold.max_ms = 2,380` on prod
+    /// was measuring (2026-08-24), and a held worker stalls every unrelated task
+    /// queued behind it, which is what `SELECT 1` costing seconds looks like
+    /// from the client. The IO therefore runs through
+    /// `without_blocking_the_worker`; the mutex is still held across it, so
+    /// durability ordering is unchanged.
     pub fn checkpoint(&mut self) -> anyhow::Result<()> {
         if let Some(parent) = self.wal_path.parent() {
             fs::create_dir_all(parent)?;
@@ -2494,8 +2504,10 @@ impl TaskJournal {
                 serde_json::to_writer(&mut records, &JournalRecord::Removed(key))?;
                 records.push(b'\n');
             }
-            wal.write_all(&records)?;
-            wal.sync_all()?;
+            crate::support::without_blocking_the_worker(|| {
+                wal.write_all(&records)?;
+                wal.sync_all()
+            })?;
         }
         if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
             self.compact()?;
@@ -2520,10 +2532,16 @@ impl TaskJournal {
             tasks: self.snapshot.tasks.iter().filter(|task| !is_derived_operation(task.key.operation)).cloned().collect(),
             source_cursors: self.snapshot.source_cursors.clone(),
         };
-        let bytes = serde_json::to_vec(&durable)?;
-        crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
-        let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
-        wal.sync_all()?;
+        // Serialize AND write off the worker: the snapshot is every live task
+        // (thousands on prod), so the `to_vec` is as costly as the fsync that
+        // follows it, and both hold the journal mutex.
+        crate::support::without_blocking_the_worker(|| -> anyhow::Result<()> {
+            let bytes = serde_json::to_vec(&durable)?;
+            crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
+            let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
+            wal.sync_all()?;
+            Ok(())
+        })?;
         self.dirty_tasks.clear();
         self.removed_tasks.clear();
         self.dirty_cursors.clear();
