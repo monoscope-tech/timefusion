@@ -651,7 +651,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     // Timeout: the worker burned the whole deadline, then the
                     // lease drop abandons the unit — bisect on repeat, else
                     // deadline-floored backoff. Real code, not a re-imagination.
-                    journal.abandon_running(&key, now);
+                    journal.abandon_running(&key, now, None);
                     none_until = [0; 6];
                     match journal.state(&key) {
                         Some(TaskState::Superseded) => report.splits += 1,

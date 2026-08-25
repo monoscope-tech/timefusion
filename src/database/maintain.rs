@@ -1505,7 +1505,7 @@ impl Database {
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
         let key = task.key.clone();
         self.log_task_started(&task);
-        let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
+        let lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, delay: std::time::Duration| -> Result<()> { self.retry_task(&key, reason, delay) };
         let Some(source_schema) = get_schema(&key.source) else {
             retry("source_schema_missing".to_owned(), std::time::Duration::from_secs(300))?;
@@ -1857,7 +1857,10 @@ impl Database {
                 &shard_predicate,
                 Some(&present_columns),
             );
-            let frame = ctx.sql(&input_sql).await?;
+            // Annotated because the error leaves through `?`, which reaches the
+            // lease carrying nothing — and an unexplained abandonment is
+            // BISECTED. A missing field is deterministic in every child.
+            let frame = ctx.sql(&input_sql).await.map_err(|error| lease.note_failure(error))?;
             ctx.register_table(&input, Arc::new(datafusion::datasource::ViewTable::new(frame.logical_plan().clone(), Some(input_sql))))?;
             let aggregate_sql = crate::rollup::build_cohort_sql_range_mode(
                 spec,
@@ -1868,7 +1871,7 @@ impl Database {
                 (key.slice.start_micros, key.slice.end_micros),
                 derived,
             )?;
-            let shard_aggregate = ctx.sql(&aggregate_sql).await?.collect().await?;
+            let shard_aggregate = ctx.sql(&aggregate_sql).await.map_err(|error| lease.note_failure(error))?.collect().await?;
             if hash_shards == 1 {
                 aggregate = shard_aggregate;
             } else {
