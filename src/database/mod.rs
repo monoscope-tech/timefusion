@@ -4427,10 +4427,10 @@ impl Database {
         // Always on. This was a `#[serde(default)]` bool that prod set to `true`
         // and nothing else ever set at all — see the note in `config.rs`.
         let realtime = true;
-        // Sampled on the same limiter as `rollup_miss_sampled`, so a
-        // multiple-per-second miss rate cannot flood the log.
+        // Sampled on its OWN key, so a multiple-per-second miss rate cannot
+        // flood the log and cannot spend another site's budget either.
         if let Some(project) = &first_uncovered
-            && crate::observability::sample_rollup_miss()
+            && crate::observability::sample_rollup_miss("rollup_uncovered_project")
         {
             warn!(
                 project_id = %project,
@@ -4455,7 +4455,7 @@ impl Database {
             // The most common refusal, and ambiguous from the counter alone: no
             // overlapping coverage vs the buffered horizon cutting it away vs a
             // survivor narrower than one grain — opposite fixes, so log the shape.
-            if crate::observability::sample_rollup_miss() {
+            if crate::observability::sample_rollup_miss("rollup_empty_interior") {
                 warn!(
                     lo = route.lo,
                     hi = route.hi,

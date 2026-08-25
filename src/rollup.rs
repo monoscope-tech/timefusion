@@ -2008,10 +2008,11 @@ pub(crate) async fn match_aggregates(
                 scanned_table(&aggregate.input).filter(|table| crate::schema::get_schema(table).is_some_and(|schema| !schema.rollups.is_empty()))
             {
                 crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
-                // Unconditional warn, not `sample_rollup_miss`: that sampler is
-                // 1-in-512 across ALL misses, and this class runs ~20/hr, so
-                // sampling would print one line per day — the same invisibility
-                // this event exists to end. `node` is bounded by `truncated`.
+                // Unconditional warn, not `sample_rollup_miss`: even budgeted per
+                // reason that sampler is 1-in-64, and this class runs ~20/hr, so
+                // sampling would print one line every three hours — the same
+                // invisibility this event exists to end. `node` is bounded by
+                // `truncated`.
                 //
                 // `inlined_cse` separates two populations that look identical in
                 // the dump: a `__common_expr_N` projection here means

@@ -794,13 +794,30 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
 /// arm, so `missing_project`, `unbounded_time`, `non_decomposable` and
 /// `rewrite_schema_mismatch` were indistinguishable in prod — 29 misses that
 /// could not be diagnosed without a deploy.
-/// True once every `ROLLUP_MISS_SAMPLE` misses, for logging one refused plan
-/// with context. Misses run at several per second on a busy node, so the
-/// counter is what you alert on and this is what you diagnose with.
-pub fn sample_rollup_miss() -> bool {
-    const ROLLUP_MISS_SAMPLE: u64 = 512;
-    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(ROLLUP_MISS_SAMPLE)
+/// True on the first, and then every `ROLLUP_MISS_SAMPLE`th, miss under `key` —
+/// for logging one refused plan with context. Misses run at several per second
+/// on a busy node, so the counter is what you alert on and this is what you
+/// diagnose with.
+///
+/// Budgeted PER KEY. A single shared counter made "does this class ever get
+/// looked at" a function of some other class's rate: prod ran ~1.7 misses/min
+/// across all reasons, so a divisor of 512 is one line per ~5 HOURS and a
+/// measured 4.5h window held exactly ONE sample — of whichever reason happened
+/// to land on the multiple. Keying on the reason bounds the rate within a class
+/// instead of across them, and since the count returned is the one BEFORE the
+/// increment, a key's first occurrence in a process always samples: a rare class
+/// is diagnosable at once rather than after five hours of waiting for its turn.
+///
+/// 64 then sets the steady state. Per key it is what 512 was meant to be and
+/// never was: the largest class measured on prod (~0.5/min) renders once per
+/// ~2h, while the 2.7/s storm the old divisor was sized against — one reason,
+/// 2026-08-17 — still prints only ~2.5 lines/min, the same order as before.
+pub fn sample_rollup_miss(key: &'static str) -> bool {
+    const ROLLUP_MISS_SAMPLE: u64 = 64;
+    static SEEN: std::sync::OnceLock<dashmap::DashMap<&'static str, u64>> = std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(dashmap::DashMap::new).entry(key).or_insert(0);
+    *seen += 1;
+    (*seen - 1).is_multiple_of(ROLLUP_MISS_SAMPLE)
 }
 
 pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
@@ -1553,6 +1570,24 @@ mod tests {
         assert!(out.len() < 1024, "1MB cell must not render in full, got {} bytes", out.len());
         assert!(out.contains('…'), "oversized cell must be marked truncated");
         assert!(out.contains("name=row1"), "small cells render whole");
+    }
+
+    /// One rare miss class must not have its sample budget spent by a common one.
+    ///
+    /// The sampler is the ONLY instrument that renders an offending plan, and a
+    /// single shared counter made "does this class ever get looked at" a function
+    /// of some other class's rate.
+    #[test]
+    fn the_miss_sampler_budgets_each_reason_separately() {
+        let rate = |key| (0..256).filter(|_| sample_rollup_miss(key)).count();
+        let quiet = rate("test.quiet");
+        // A noisy neighbour between the two measurements: with one shared counter
+        // it shifts the second key's phase and its sample count with it.
+        (0..1000).for_each(|_| {
+            sample_rollup_miss("test.noisy");
+        });
+        assert_eq!(rate("test.rare"), quiet, "each reason must get its own budget, whatever the other reasons did");
+        assert!(quiet >= 4, "a divisor that renders <4 plans in 256 misses is the ~5-hours-per-line rate measured on prod");
     }
 }
 
