@@ -1190,6 +1190,17 @@ atomic_stats! {
         rollup_miss_non_decomposable as "rollup_miss_non_decomposable_total",
         rollup_miss_rewrite_schema_mismatch as "rollup_miss_rewrite_schema_mismatch_total",
         rollup_miss_unwalkable_source as "rollup_miss_unwalkable_source_total",
+        /// Derived units retried because their BASE tier does not cover the slice
+        /// they were asked to build. Publishing anyway is the 2026-08-25 bug — the
+        /// witness is the RAW partition, which agrees forever on a sealed day, so a
+        /// cell built over a holey base is short and trusted permanently.
+        ///
+        /// Read it as a RATE, not a level. Rising while `rollup_output_rows_total`
+        /// also rises is the derived tier waiting for its base, which is correct.
+        /// Rising while the base tier publishes nothing means the base is stuck and
+        /// the coarse tier is not being served at all — the read path is exact
+        /// either way (an absent slice falls to the raw fringe), only slower.
+        rollup_derived_base_incomplete as "rollup_derived_base_incomplete_total",
         dirty_bin_queue_depth,
         dirty_bin_enqueued as "dirty_bin_enqueued_total",
         dirty_bin_eligible as "dirty_bin_eligible_total",

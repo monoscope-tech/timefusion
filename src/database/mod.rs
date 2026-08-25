@@ -12592,6 +12592,72 @@ mod tests {
         assert_eq!(*kept.last().expect("bounded"), 88 * day, "the bound must cut from the OLD end, not the new one");
     }
 
+    /// A DERIVED unit must not publish a cell over a HOLEY base tier.
+    ///
+    /// Its witness is the RAW partition (`route.source` is the raw table for
+    /// every tier), but its INPUT is the base tier. On a sealed day the raw
+    /// witness agrees forever, so a derived cell built over a still-holey base
+    /// is published short and then trusted permanently. Prod 2026-08-25,
+    /// project 28f62f01 / 2026-08-20, 1h tier against raw truth: 19:00 exact,
+    /// 20:00 68,881 vs 139,285 (-51%), 21:00 -56%, 22:00 -72%, and the 23:00
+    /// cell claimed its hour while holding ZERO rows. Routed reads returned
+    /// exactly those sums, -68.8% over 20:00-24:00.
+    ///
+    /// Three cases, because the fix has two ways to be wrong: publishing short
+    /// (the bug) and refusing forever (its own outage).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_derived_unit_over_a_holey_base_tier_retries_instead_of_publishing_short() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let db = Database::with_config(create_test_config("derived-holey-base")).await?;
+        db.cancel_maintenance();
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+        let derived_tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a derived tier");
+
+        // `base_hours` is what the BASE tier is built for, out of 20:00-24:00;
+        // the derived unit always asks for `derived` hours from `derived_from`.
+        let (db, derived_tier) = (&db, derived_tier.as_str());
+        let scenario = |base_hours: i64, derived_from: i64, derived_hours: i64| async move {
+            let project = format!("holey_{}", uuid::Uuid::new_v4().simple());
+            for hour in [20, 21, 22, 23] {
+                let at = day_start + hour * 3_600_000_000;
+                db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+            }
+            db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, base_hours, 20).await?;
+            let report = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, derived_hours, derived_from).await?;
+            let claimed: Vec<(i64, i64)> = db
+                .rollup_slice_coverage
+                .iter()
+                .filter(|entry| entry.key().0 == project && entry.key().2 == derived_tier)
+                .map(|entry| (entry.key().3 - day_start, entry.key().4 - day_start))
+                .collect();
+            anyhow::Ok((report.state, report.retry_reason, claimed))
+        };
+
+        const HOUR: i64 = 3_600_000_000;
+        // The bug: base covers 20:00-21:00 only, derived asks for 20:00-24:00.
+        let (state, reason, claimed) = scenario(1, 20, 4).await?;
+        assert!(claimed.is_empty(), "a derived cell must not claim a range its base tier does not cover; claimed {claimed:?}");
+        assert_eq!(state, Some(TaskState::Retry), "the unit must be retried, not completed: {reason:?}");
+        assert_eq!(reason.as_deref(), Some("base_tier_incomplete"));
+
+        // Base tiles the whole ask: publish.
+        let (state, reason, claimed) = scenario(4, 20, 4).await?;
+        assert_eq!(state, Some(TaskState::Complete), "a fully covered base must publish: {reason:?}");
+        assert_eq!(claimed, vec![(20 * HOUR, 24 * HOUR)]);
+
+        // The day's OPENING hours are not a hole. Base units are planned from
+        // row statistics and begin at the first row, so a day-wide derived unit
+        // is uncovered over 00:00-20:00 — and the raw partition holds nothing
+        // there. Refusing this is the way the fix becomes its own outage.
+        let (state, reason, claimed) = scenario(4, 0, 24).await?;
+        assert_eq!(state, Some(TaskState::Complete), "a gap below the partition's first row must not block a publish: {reason:?}");
+        assert_eq!(claimed, vec![(0, 24 * HOUR)]);
+        Ok(())
+    }
+
     /// An INTERIOR gap must be queued — the prod shape that never was.
     ///
     /// Four cells on 2026-08-23 held holes of 3 to 11 minutes and got no unit at
