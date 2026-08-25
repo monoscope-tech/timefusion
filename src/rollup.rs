@@ -630,11 +630,15 @@ pub(crate) const OPEN_END: i64 = i64::MAX;
 ///
 /// Expressed through [`verify_slice_witness`] so there is ONE definition of what
 /// re-proves a slice. This is `SliceWitness::Physical` and nothing else, so the
-/// answer is bit-identical to the hand-rolled comparison it replaces — asserted
-/// in `the_physical_variant_reproduces_slice_coverage_agrees_exactly`.
+/// answer is bit-identical to the hand-rolled comparison it replaces. What proves
+/// that is the PRE-EXISTING case table below
+/// (`slice_coverage_is_trusted_only_when_every_witness_matches_the_partition_now`):
+/// its nine hard-coded verdicts were written against the old body and still hold
+/// against this one. A fresh test comparing the two would be circular — after the
+/// delegation both sides run the same code.
 pub(crate) fn slice_coverage_agrees(witnesses: &[Option<u64>], current: Option<u64>) -> bool {
     let files = current.map(|rows| [SourceFile { min_ts: None, max_ts: None, rows }]);
-    let source = LiveSource { files: files.as_ref().map(<[_]>::as_ref), logical: None };
+    let source = LiveSource { files: files.as_ref().map(|files| &files[..]), logical: None };
     !witnesses.is_empty() && witnesses.iter().all(|witness| verify_slice_witness(witness.map(SliceWitness::Physical), source) == WitnessVerdict::Valid)
 }
 
@@ -4209,19 +4213,6 @@ mod tests {
         witness: Option<SliceWitness>, files: &[SourceFile], logical: Option<(i64, i64, u64)>, expected: WitnessVerdict,
     ) {
         assert_eq!(verify_slice_witness(witness, LiveSource { files: Some(files), logical }), expected);
-    }
-
-    /// `Physical` must be today's rule and nothing else, so a slice stamped
-    /// before any of this cannot change meaning by being re-judged here.
-    #[test_case::test_case(Some(100), Some(100) ; "agrees")]
-    #[test_case::test_case(Some(100), Some(150) ; "grew")]
-    #[test_case::test_case(Some(100), Some(90) ; "shrank")]
-    #[test_case::test_case(None, Some(100) ; "witnessless")]
-    #[test_case::test_case(Some(100), None ; "no live count")]
-    fn the_physical_variant_reproduces_slice_coverage_agrees_exactly(witness: Option<u64>, current: Option<u64>) {
-        let files = current.map(|rows| [SourceFile { min_ts: None, max_ts: None, rows }]);
-        let verdict = verify_slice_witness(witness.map(SliceWitness::Physical), LiveSource { files: files.as_ref().map(<[_]>::as_ref), logical: None });
-        assert_eq!(verdict == WitnessVerdict::Valid, slice_coverage_agrees(&[witness], current));
     }
 
     #[test]

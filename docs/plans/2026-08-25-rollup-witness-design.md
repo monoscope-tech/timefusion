@@ -1,10 +1,23 @@
 # The rollup staleness witness: what it actually refuses, and what to replace it with
 
 Base: `e67a149` (an ancestor of the branch point `1447e6f`, which adds two
-unrelated rollup-routing commits). Nothing in the live path changed. The
-deliverable is the diagnosis, the option comparison, and a proven predicate:
-`rollup::verify_slice_witness`, with a case table asserting the four transitions
+unrelated rollup-routing commits). Default behaviour is unchanged. The deliverable
+is the diagnosis, the option comparison, and a predicate —
+`rollup::verify_slice_witness` — with a case table asserting the four transitions
 the brief names plus the three that carry the corrected diagnosis.
+
+> **VERIFICATION STATUS: the code in this change is UNVERIFIED.** Machine compute
+> was withdrawn part-way through for contention, so `cargo nextest run --lib` and
+> `cargo lint` were never completed against the final tree. `cargo check --lib`
+> passed on an earlier revision of this change; the only edits after that green
+> check were the delegation body, one type fix (`files.as_ref().map(|f| &f[..])`,
+> which is what that check surfaced), and the removal of one test. **Assume the
+> tests have never run.** Nothing here is on a default path, so an outright
+> compile failure is the worst realistic outcome — but it must be built and run
+> before anyone reasons from a green suite.
+>
+> Every FACTUAL claim below is a code reading with a file:line, independent of
+> compute, and stands on its own.
 
 ## 1. Verified mechanism, with corrections
 
@@ -38,7 +51,8 @@ guards is a sub-range of that date. A slice covering 00:00–01:00 is therefore
 voided by a flush into 23:00. Worse, this is monotone: once a day has taken any
 ingest after a slice was built, that slice is stale *forever*, because nothing
 re-enqueues a witness-**moved** slice — `enqueue_witnessless_rebuilds`
-(`maintain.rs:3665`) selects `source_rows.is_none()` only. That is the amplifier
+(`maintain.rs:3238`, fed from `:3596` and `:3644`) selects `source_rows.is_none()`
+only. That is the amplifier
 that turns 511 partition cells into 20 usable ones while the contiguity gauge
 still reads 30/30. **A fix that does not address `grew` fixes 400 of 4503.**
 
@@ -105,21 +119,56 @@ durable — it is the slice end, present in the key and in the tags.
 
 ### B. Carry the witness forward across a benign rewrite
 
-When maintenance rewrites a source partition preserving logical content, it knows
-the rewrite was benign, so it can restamp the witness it is about to invalidate.
+The brief asked whether the rewrite paths hold the information this needs. **They
+hold it already, pre-computed, and the arithmetic is exact.** This is the cheapest
+option on the list by a wide margin and the finding that most changes the picture.
+
+Every source-partition rewrite lands through `Database::commit_wave`
+(`maintain.rs:5834`), and a wave is homogeneous by assertion — *"a wave must not
+mix data-preserving and row-dropping units"*. `StagedBin::data_change`
+(`mod.rs:6979`) is **derived, never stored**, from `dedup.is_some()`, so the
+commit site knows with certainty which kind of rewrite it is committing:
+
+- **`data_change == false` (hot-tail packing / light optimize): the witness needs
+  no update at all.** A bin-pack preserves `num_records`, so the physical sum is
+  unchanged and the witness is still true. Nothing to carry.
+- **`data_change == true` (dedup): the delta is already computed.**
+  `DedupUnit { date, before, after }` with `dropped() = before - after`
+  (`mod.rs:7099`), and `wave_dropped_rows(&result.landed)` (`mod.rs:7119`) already
+  sums it **over the landed bins only** — a unit that failed to commit contributes
+  nothing, which is exactly the correctness property a witness update needs. It is
+  called today at `compact.rs:1029` purely to return a metric.
+
+So the carry-forward is, per landed dedup bin,
+`witness(project_id, bin.dedup.date) -= bin.dedup.dropped()`. No scan, no
+recomputation, no extra object-store round trip. The same shape as the
+independently-derived equality in `resume_verdict` (`mod.rs:6946`), which already
+compares `target_rows` against `staged_rows` from Add statistics and calls a
+repair *"data-preserving by construction"*.
 
 - **grew: not addressed at all.** This is the 400, not the 4103.
-- **dedup: exactly fixed**, and provably so — the rewriter has both counts.
-- **read cost: nil.**
-- **builder: no change to what is stamped**, but a real cost elsewhere: per (d),
-  the authority is the **tier file tags**, and the rewrite happens on the
-  **source** table. Restamping means committing a metadata-only Remove+Add
-  against the *tier* for every affected tier file, plus updating
-  `rollup_slice_coverage`, the journal publication and the coverage ledger. Four
-  writers of one fact, and the tier commit is the one that is easy to forget.
-- **migration: yes** — it repairs slices already stamped, at the next rewrite.
-- Composes well with A: it also repairs the straddles that our own cross-bound
-  packing creates.
+- **dedup: exactly fixed**, arithmetically, at zero marginal cost.
+- **read cost: nil** — the read path is unchanged.
+- **builder: no change to what is stamped.** The real cost is per (d): the
+  recovery authority is the **tier file tags**, and the rewrite happens on the
+  **source** table. A durable carry-forward means updating four holders of one
+  fact — in-memory `rollup_slice_coverage`, the journal publication, the coverage
+  ledger, and the tier files' `TAG_SOURCE_ROWS`. The first three are cheap; the
+  tags need a metadata-only Remove+Add commit against the tier. Skip the tags and
+  the repair is undone by the next restart, which prod does constantly.
+- **soundness precondition, and it holds:** dedup is logically neutral to a
+  rollup only if it drops exactly rows the build never counted. It does: the
+  sweep collapses versions of the same `dedup_keys` keeping the greatest
+  `dedup_tiebreak`, and the builder shards on `source_schema.dedup_keys`
+  (`maintain.rs:1818`) reading the same deduped view — one schema declaration
+  drives both. A row dropped for a tombstone predating the build was already
+  absent from the build's input; a tombstone written after it went through
+  `invalidate_rollup_dml` and removed the slice coverage outright.
+- **migration: yes, and uniquely so** — it repairs witnesses already stamped, at
+  the next rewrite, with no republish. Every other option leaves existing slices
+  on v1 semantics forever.
+- Composes with A: it also repairs the straddles our own cross-bound packing
+  would otherwise create.
 
 ### C. Logical row count — and it already exists
 
@@ -158,7 +207,25 @@ this, and already consulted on the date path.
   the restart window the witness exists for. Making it per-slice-range and
   durable is a strictly larger change than A.
 
-### E. Appendix — max tiebreak stamp (evaluated, rejected)
+### E. Content digest over the logical rows, carried forward (rejected)
+
+A hash of the logical rows in `[lo, hi)` is the ideal invariant — strictly
+stronger than C, since it also catches an UPDATE that preserves the row count.
+It fails on the read side, which is where it has to be paid.
+
+The witness must be re-proved **per query**, and re-proving a digest means
+rehashing every row it covers — a full scan of the window, i.e. exactly the raw
+read the rollup exists to avoid. Carrying it forward across a rewrite (which is
+sound: the digest is invariant under any logical-content-preserving rewrite, so
+it needs no update at all) removes the *write*-side recomputation but not the
+read-side one, and the read side is the binding constraint.
+
+The only way a digest becomes affordable is if something maintains it
+incrementally on ingest — at which point it is D with a hash instead of a
+counter, and inherits D's problems. C dominates it: a count is the same idea with
+an O(1) verification, already implemented and already resident.
+
+### F. Appendix — max tiebreak stamp (evaluated, rejected)
 
 `partition_stats_bounded` already folds `max.{tiebreak}` per partition, and it is
 attractive: packing preserves it, and dedup preserves it too (the row dedup
@@ -179,9 +246,11 @@ In order of value per unit of risk:
    with a partition that is no longer live. Zero correctness surface — it only
    creates work — and it converts "stale forever" into "stale until rebuilt",
    which is what makes every option below actually converge. Do this first.
-2. **B (carry-forward)** for the 400 shrink class. Bounded, provable, no new
-   comparison semantics, no re-darkening. The work is plumbing: four places hold
-   the witness, and the tier tags are the authority.
+2. **B (carry-forward)** for the 400 shrink class, and it is a much smaller job
+   than it sounds: the delta is `wave_dropped_rows`, already computed over the
+   landed bins at `compact.rs:1029`. No new comparison semantics, no re-darkening,
+   and it is the only option that repairs slices already stamped. The work is
+   plumbing — four holders of one fact, and the tier tags are the authority.
 3. **C (logical witness)** as the target shape, stamped under a new tag, with the
    verdict three-valued so `Unverifiable` (index not resident) is measured before
    anyone reasons about how much coverage it wins. Ship it dark: stamp the new
@@ -193,18 +262,37 @@ In order of value per unit of risk:
 
 ## 4. What was built
 
-`src/rollup.rs`: `LiveFile`, `SliceWitness` (`Physical` / `PhysicalBelow` /
+`src/rollup.rs`: `SourceFile`, `SliceWitness` (`Physical` / `PhysicalBelow` /
 `Logical`), `WitnessVerdict` (`Valid` / `Stale` / `Unverifiable`), and
-`verify_slice_witness`. Pure, no IO, not yet called from the live path.
+`verify_slice_witness`. Pure, no IO.
 
-Two properties are asserted, not asserted-ish:
+**What is wired, and what is not.** `slice_coverage_agrees` now delegates to
+`verify_slice_witness` under `SliceWitness::Physical`, which is the same
+comparison it performed inline — so there is one definition of what re-proves a
+slice, and no behaviour change and no flag. `PhysicalBelow` and `Logical` are
+never constructed outside the tests: STAMPING either means a new Delta tag on the
+build path, which this change deliberately does not touch. They carry a narrow
+`#[allow(dead_code)]` with that reason, because a predicate that cannot express a
+candidate cannot be used to evaluate it, and the case table is the evaluation.
 
-- `SliceWitness::Physical` reproduces `slice_coverage_agrees` exactly, over its
-  own case values — so versioning the witness cannot change how an existing slice
-  is judged.
-- The four transitions the brief names, per variant, plus: the `grew` shape and
-  its fix, the straddle poison, and the cost of the straddle poison on a packed
-  day.
+No config flag was added. A flag would only be honest if there were a second
+behaviour to select, and there is not: nothing stamps a v2 witness yet, so a flag
+would gate an unreachable branch. The flag belongs with the builder change.
+
+The delegation's proof is the **pre-existing** nine-case table
+(`slice_coverage_is_trusted_only_when_every_witness_matches_the_partition_now`),
+whose hard-coded verdicts were written against the old body and are re-asserted
+against the new one. A test comparing the two implementations would be circular
+now that both run the same code, so one was written, recognised as circular, and
+removed.
+
+The new case table asserts the four transitions the brief names, per variant,
+plus the three that carry the corrected diagnosis: the `grew` shape and the fact
+that only a bounded or logical witness survives it, the straddle poison that makes
+a bounded witness sound, and what that poison costs on a packed day. Also
+asserted, against the brief: benign bin-pack compaction is `Valid` even under v1.
+
+**These tests have not been run** — see the status note at the top.
 
 The verdict is three-valued because `Stale` and `Unverifiable` demand opposite
 work — a rebuild versus making the evidence exist — and today's read path
