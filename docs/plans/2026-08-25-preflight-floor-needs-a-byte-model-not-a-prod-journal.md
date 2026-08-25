@@ -368,9 +368,16 @@ level 1: width= 43200s observed= 42893MB parent_stamp= 82867MB  split=true
 level 2: width= 21600s observed= 22176MB parent_stamp= 42893MB  split=true
 level 3: width= 10800s observed= 11820MB parent_stamp= 22176MB  split=true
 level 4: width=  5400s observed=  6640MB parent_stamp= 11820MB  split=true
-...
-level 7: width=   660s                    — sheds only ~1/4, DECLINED, runs 4-way sharded
+level 5: width=  2700s observed=  4052MB parent_stamp=  6640MB  split=true
+level 6: width=  1320s observed=  2725MB parent_stamp=  4052MB  split=true
+level 7: width=   660s observed=  2095MB parent_stamp=  2725MB  split=FALSE  declined=1
 ```
+
+Level 7 is the whole point: halving 1320 s → 660 s bought only **23%**
+(2,095 against 2,725 MB) where bisection promises 50%, so `split_sheds_enough`
+declines at 3/4 and the unit RUNS — 660 s wide, 4-way hash-sharded internally,
+523 MB per shard. Under a whole-subtree split this level was never a journal
+level and the question was never asked.
 
 **Bookkeeping, so the counts are comparable.** `units_per_cell` counts every
 unit ever minted, superseded ancestors included. Bisecting one level per

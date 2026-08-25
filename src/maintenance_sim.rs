@@ -1079,7 +1079,10 @@ mod tests {
         let queue = synthetic_whale_queue(start, true, 100);
         let (mut journal, model) = (queue.journal, queue.model);
         let mut report = SimReport::default();
-        for level in 0..6 {
+        // Deep enough to reach the DECLINE, not just the splits above it — the
+        // decline is the behaviour under study, and a trace that stops short of
+        // it leaves §7a's key line derived from counters instead of witnessed.
+        for level in 0..9 {
             let Some(task) = journal
                 .tasks()
                 .filter(|task| task.key.project_id == "whale" && task.state == TaskState::Pending)
