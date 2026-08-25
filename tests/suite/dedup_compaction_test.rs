@@ -2225,7 +2225,7 @@ async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_th
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_coalesce").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    let cfg = (*TestConfigBuilder::new("rollup_coalesce").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     db.cancel_maintenance();
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -2370,7 +2370,7 @@ async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollu
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_null_guard").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    let cfg = (*TestConfigBuilder::new("rollup_null_guard").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     db.cancel_maintenance();
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -2476,7 +2476,7 @@ async fn a_count_star_beside_the_null_guard_refuses_to_route() -> Result<()> {
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_null_guard_count").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    let cfg = (*TestConfigBuilder::new("rollup_null_guard_count").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     db.cancel_maintenance();
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -2547,7 +2547,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_hybrid").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    let cfg = (*TestConfigBuilder::new("rollup_hybrid").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     // This test publishes selected coverage explicitly below. A background
     // coordinator can race that fixture and change the routing counters being

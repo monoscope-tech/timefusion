@@ -62,6 +62,24 @@ type SpansByPartition = HashMap<(String, String), Vec<(i64, i64)>>;
 /// work that would let `slice_retires` reach the untagged files.
 type UntaggedPartitions = HashMap<(String, String), (Vec<(i64, i64)>, Vec<(i64, i64)>)>;
 
+/// Are all of a staged intent's objects actually present, at the size recorded?
+///
+/// The one network check both resume paths make, and the only thing standing
+/// between a process killed mid-PUT and a commit that references a short or
+/// absent object — its recorded stats still add up, so nothing else notices.
+/// Shared because two copies of a safety check drift, and the copy that drifts
+/// is the one nobody is looking at.
+async fn staged_objects_complete(store: &dyn object_store::ObjectStore, adds: &[deltalake::kernel::Add]) -> bool {
+    use object_store::{ObjectStoreExt, path::Path as OsPath};
+    for add in adds {
+        let meta = store.head(&OsPath::from(add.path.as_str())).await;
+        if meta.map_or(true, |meta| i64::try_from(meta.size).unwrap_or(-1) != add.size) {
+            return false;
+        }
+    }
+    true
+}
+
 impl Database {
     /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
     fn retry_task(&self, key: &crate::maintenance_coordinator::TaskKey, reason: String, delay: std::time::Duration) -> Result<()> {
@@ -6231,52 +6249,70 @@ impl Database {
     /// orphan sweep already collects staged parquet that no longer belongs to
     /// anything, and deleting an entry here on a transient read failure would
     /// discard a perfectly good staged output.
+    /// Publish a resumed rollup and retire its intent — the bookkeeping both
+    /// success arms owe, and which the commit alone does not satisfy.
+    fn publish_resumed_rollup(&self, rollup: &crate::database::RollupResume, wave_id: &str) -> Result<()> {
+        let mut journal = self.journal();
+        journal.publish(&rollup.key, rollup.publication.clone());
+        journal.checkpoint()?;
+        drop(journal);
+        self.clear_staged_intent(&[wave_id]);
+        Ok(())
+    }
+
     pub(crate) async fn resume_rollup_unit(&self, key: &crate::maintenance_coordinator::TaskKey, current_source_rows: Option<u64>) -> Result<bool> {
         use deltalake::protocol::{DeltaOperation, SaveMode};
-        use object_store::{ObjectStoreExt, path::Path as OsPath};
         use std::sync::atomic::Ordering::Relaxed;
         let contents = {
             let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            match std::fs::read_to_string(self.staged_intent_path()) {
-                Ok(contents) => contents,
-                Err(_) => return Ok(false),
-            }
+            let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else { return Ok(false) };
+            contents
         };
-        let candidates: Vec<StagedIntent> =
-            parse_staged_intents(&contents).into_iter().filter(|entry| entry.rollup.as_ref().is_some_and(|r| &r.key == key)).collect();
+        // Paired with its evidence, so the commit path below cannot re-ask
+        // whether it is a rollup at all — a branch that could never fire, in the
+        // middle of the one place correctness matters.
+        let candidates: Vec<(StagedIntent, crate::database::RollupResume)> = parse_staged_intents(&contents)
+            .into_iter()
+            .filter_map(|entry| entry.rollup.clone().filter(|rollup| &rollup.key == key).map(|rollup| (entry, rollup)))
+            .collect();
         if candidates.is_empty() {
             return Ok(false);
         }
+        let Some(date_string) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else {
+            return Ok(false);
+        };
         let target_ref = self.get_or_create_table(&key.project_id, &key.physical_table).await?;
         // The WHOLE partition's live files, not just the ones named by an
         // intent: the double-count test asks whether anything else already
         // covers this slice, and a file the intent never heard of is exactly the
-        // dangerous case.
-        let date_string = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()).unwrap_or_default();
-        let (live, target_adds, store) = {
+        // dangerous case. Slice range and Add travel together — the verdict
+        // needs the first, the commit needs the second, and one map serves both.
+        let (partition, store) = {
             let table = target_ref.read().await;
-            let snapshot = table.snapshot()?;
-            let mut live: HashMap<String, crate::database::LiveTierFile> = HashMap::new();
-            let mut target_adds: HashMap<String, deltalake::kernel::Add> = HashMap::new();
-            for file in snapshot.log_data().iter() {
-                #[allow(deprecated)]
-                let add = file.add_action();
-                let in_partition = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default")
-                    .is_some_and(|(project, date)| project == key.project_id && date == date_string);
-                if !in_partition {
-                    continue;
-                }
-                let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref)?.parse::<i64>().ok();
-                let slice = tag(crate::maintenance_coordinator::TAG_SLICE_START).zip(tag(crate::maintenance_coordinator::TAG_SLICE_END));
-                live.insert(add.path.clone(), crate::database::LiveTierFile { rows: file.num_records().and_then(|n| i64::try_from(n).ok()), slice });
-                target_adds.insert(add.path.clone(), add);
-            }
-            (live, target_adds, table.log_store().object_store(None))
+            let partition: HashMap<String, (Option<(i64, i64)>, deltalake::kernel::Add)> = table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .map(|file| {
+                    #[allow(deprecated)]
+                    file.add_action()
+                })
+                .filter(|add| {
+                    Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default")
+                        .is_some_and(|(project, date)| project == key.project_id && date == date_string)
+                })
+                .map(|add| {
+                    let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref)?.parse::<i64>().ok();
+                    let slice = tag(crate::maintenance_coordinator::TAG_SLICE_START).zip(tag(crate::maintenance_coordinator::TAG_SLICE_END));
+                    (add.path.clone(), (slice, add))
+                })
+                .collect();
+            (partition, table.log_store().object_store(None))
         };
-        let live_view: HashMap<&str, crate::database::LiveTierFile> = live.iter().map(|(path, file)| (path.as_str(), *file)).collect();
+        let live_view: HashMap<&str, Option<(i64, i64)>> = partition.iter().map(|(path, (slice, _))| (path.as_str(), *slice)).collect();
         let now_secs = crate::support::now_secs();
         let stats = crate::observability::maintenance_stats();
-        for entry in &candidates {
+        for (entry, rollup) in &candidates {
             let verdict = classify_rollup_resume(entry, &key.physical_table, now_secs, &live_view, current_source_rows);
             match verdict {
                 ResumeVerdict::Skip | ResumeVerdict::RowMismatch { .. } => continue,
@@ -6286,12 +6322,7 @@ impl Database {
                     // replay refuses the slice (`rollup_slice_complete`), the
                     // planner sees a hole and re-enqueues the whole scan — the
                     // exact cost this exists to avoid.
-                    if let Some(rollup) = entry.rollup.as_ref() {
-                        let mut journal = self.journal();
-                        journal.publish(&rollup.key, rollup.publication.clone());
-                        journal.checkpoint()?;
-                    }
-                    self.clear_staged_intent(&[entry.wave_id.as_str()]);
+                    self.publish_resumed_rollup(rollup, &entry.wave_id)?;
                     info!(table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id, event = "rollup_resume_already_landed");
                     return Ok(true);
                 }
@@ -6304,31 +6335,18 @@ impl Database {
                     );
                 }
                 ResumeVerdict::Commit => {
-                    // The one network check, same as the repair path: a process
-                    // killed mid-PUT leaves a short object under a name the
-                    // manifest already knows, and its recorded stats still add up.
-                    let mut complete = true;
-                    for add in &entry.adds {
-                        let meta = store.head(&OsPath::from(add.path.as_str())).await;
-                        if meta.map_or(true, |m| i64::try_from(m.size).unwrap_or(-1) != add.size) {
-                            complete = false;
-                            break;
-                        }
-                    }
-                    if !complete {
+                    if !staged_objects_complete(store.as_ref(), &entry.adds).await {
                         stats.rollup_resume_declined.fetch_add(1, Relaxed);
                         info!(table = %key.physical_table, wave_id = %entry.wave_id, event = "rollup_resume_incomplete");
                         continue;
                     }
-                    let Some(rollup) = entry.rollup.as_ref() else { continue };
-                    let removes: Vec<deltalake::kernel::Action> = entry
+                    let actions: Vec<deltalake::kernel::Action> = entry
                         .target_paths
                         .iter()
-                        .filter_map(|path| target_adds.get(path))
-                        .map(|add| deltalake::kernel::Action::Remove(remove_for_add(add, true)))
+                        .filter_map(|path| partition.get(path))
+                        .map(|(_, add)| deltalake::kernel::Action::Remove(remove_for_add(add, true)))
+                        .chain(entry.adds.iter().cloned().map(deltalake::kernel::Action::Add))
                         .collect();
-                    let actions: Vec<deltalake::kernel::Action> =
-                        removes.into_iter().chain(entry.adds.iter().cloned().map(deltalake::kernel::Action::Add)).collect();
                     let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
                     let guard = commit_lock.lock().await;
                     let mut table = target_ref.read().await.clone();
@@ -6343,10 +6361,7 @@ impl Database {
                     table.state = Some(finalized.snapshot());
                     drop(guard);
                     self.swap_and_refresh_cache(&target_ref, table, None, &[&format!("date={}", rollup.date)]).await;
-                    let mut journal = self.journal();
-                    journal.publish(&rollup.key, rollup.publication.clone());
-                    journal.checkpoint()?;
-                    self.clear_staged_intent(&[entry.wave_id.as_str()]);
+                    self.publish_resumed_rollup(rollup, &entry.wave_id)?;
                     stats.rollup_resumed.fetch_add(1, Relaxed);
                     info!(
                         table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id,
@@ -6440,18 +6455,7 @@ impl Database {
                     );
                 }
                 ResumeVerdict::Commit => {
-                    // The one network check: a process killed mid-PUT leaves a
-                    // short (or absent) object under a name the manifest already
-                    // knows, and its recorded stats would still add up.
-                    let mut complete = true;
-                    for add in &entry.adds {
-                        let meta = store.head(&OsPath::from(add.path.as_str())).await;
-                        if meta.map_or(true, |m| i64::try_from(m.size).unwrap_or(-1) != add.size) {
-                            complete = false;
-                            break;
-                        }
-                    }
-                    if !complete {
+                    if !staged_objects_complete(store.as_ref(), &entry.adds).await {
                         stats.repair_resume_declined_incomplete.fetch_add(1, Relaxed);
                         info!(table_name, project_id, wave_id = %entry.wave_id, event = "staged_intent_resume_incomplete");
                         continue;

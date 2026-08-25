@@ -6777,14 +6777,6 @@ enum ResumeVerdict {
     Commit,
 }
 
-/// One live tier file, as the rollup resume check needs to see it: its row count
-/// and the slice range its tags claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LiveTierFile {
-    rows: Option<i64>,
-    slice: Option<(i64, i64)>,
-}
-
 /// Should a killed rollup unit's staged output be committed on the next boot?
 ///
 /// IO-free, like [`classify_resume`], so every branch is unit-testable; the
@@ -6806,8 +6798,11 @@ struct LiveTierFile {
 ///    slice must be one the staged output replaces. If a file overlaps and is
 ///    not in the replace set, both would be live after the commit and their rows
 ///    would be summed.
+/// `live` maps every path in the target partition to the slice range its tags
+/// claim, `None` for an untagged file — which claims no range and therefore
+/// cannot double-count.
 fn classify_rollup_resume(
-    entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, LiveTierFile>, current_source_rows: Option<u64>,
+    entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<(i64, i64)>>, current_source_rows: Option<u64>,
 ) -> ResumeVerdict {
     let Some(rollup) = entry.rollup.as_ref() else { return ResumeVerdict::Skip };
     if entry.table_name != table_name || entry.adds.is_empty() || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS {
@@ -6818,17 +6813,15 @@ fn classify_rollup_resume(
     if entry.adds.iter().all(|add| live.contains_key(add.path.as_str())) {
         return ResumeVerdict::AlreadyLanded;
     }
-    // A build with no witness can never be verified, by this path or by a read.
-    let (Some(built_from), Some(current)) = (rollup.source_rows, current_source_rows) else {
-        return ResumeVerdict::SourceMoved;
-    };
-    if built_from != current {
+    // Both arms of one rule: a build with no witness can never be verified, and a
+    // witness that no longer matches is a source that moved. Same refusal.
+    if !matches!((rollup.source_rows, current_source_rows), (Some(built_from), Some(current)) if built_from == current) {
         return ResumeVerdict::SourceMoved;
     }
     let replaced: HashSet<&str> = entry.target_paths.iter().map(String::as_str).collect();
     let (start, end) = (rollup.key.slice.start_micros, rollup.key.slice.end_micros);
     let overlaps = |(lo, hi): (i64, i64)| lo < end && hi > start;
-    if live.iter().any(|(path, file)| file.slice.is_some_and(overlaps) && !replaced.contains(path)) {
+    if live.iter().any(|(path, slice)| slice.is_some_and(overlaps) && !replaced.contains(path)) {
         return ResumeVerdict::WouldDoubleCount;
     }
     // Checked LAST so an input that left the snapshot is reported as staleness
@@ -11719,7 +11712,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_debt_skips_rollup_tier_tables() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
-        let mut cfg = (*create_test_config("debt-skips-tiers")).clone();
+        let cfg = (*create_test_config("debt-skips-tiers")).clone();
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("tier_{}", uuid::Uuid::new_v4().simple());
         let day = Utc::now() - chrono::Duration::days(4);
@@ -12076,7 +12069,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_routes_from_the_ledger_before_the_tag_replay_runs() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
-        let mut cfg = (*create_test_config("ledger-seed")).clone();
+        let cfg = (*create_test_config("ledger-seed")).clone();
         let cfg = std::sync::Arc::new(cfg);
         let db = Database::with_config(cfg.clone()).await?;
         db.cancel_maintenance();
@@ -12109,13 +12102,27 @@ mod tests {
     /// byte-for-byte the killed-mid-stage state, and it uses only real
     /// machinery.
     ///
-    /// Returns `(db, key, staged adds, source witness)`.
-    #[allow(clippy::type_complexity)]
-    async fn staged_but_uncommitted_rollup(
-        label: &str,
-    ) -> Result<(Database, crate::maintenance_coordinator::TaskKey, Vec<deltalake::kernel::Add>, Option<u64>, String, String)> {
+    /// The state a killed container leaves behind, as the resume tests need it.
+    struct KilledUnit {
+        db: Database,
+        key: crate::maintenance_coordinator::TaskKey,
+        staged: Vec<deltalake::kernel::Add>,
+        source_rows: Option<u64>,
+        project: String,
+        tier: String,
+    }
+
+    /// Every live path in one tier partition, which is what "did the commit
+    /// land?" means here.
+    async fn live_paths(db: &Database, project: &str, tier: &str) -> std::collections::HashSet<String> {
+        let table_ref = db.get_or_create_table(project, tier).await.expect("table");
+        let table = table_ref.read().await;
+        table.snapshot().expect("snapshot").log_data().iter().map(|file| file.path().to_string()).collect()
+    }
+
+    async fn staged_but_uncommitted_rollup(label: &str) -> Result<KilledUnit> {
         use crate::maintenance_coordinator::Operation;
-        let mut cfg = (*create_test_config(label)).clone();
+        let cfg = (*create_test_config(label)).clone();
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
         let project = format!("resume_{}", uuid::Uuid::new_v4().simple());
@@ -12179,7 +12186,7 @@ mod tests {
                 date: day.to_string(),
             }),
         });
-        Ok((db, key, staged, publication.source_rows, project, tier))
+        Ok(KilledUnit { db, key, staged, source_rows: publication.source_rows, project, tier })
     }
 
     /// A rollup unit killed mid-stage must be COMMITTED on the next claim, not
@@ -12196,22 +12203,13 @@ mod tests {
     /// every rollup resume is refused by construction.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rollup_killed_mid_stage_is_committed_on_the_next_claim() -> Result<()> {
-        let (db, key, staged, source_rows, project, tier) = staged_but_uncommitted_rollup("rollup-resume").await?;
-        let live = |db: &Database, tier: &str, project: &str| {
-            let (tier, project) = (tier.to_owned(), project.to_owned());
-            let db = db.clone();
-            async move {
-                let table_ref = db.get_or_create_table(&project, &tier).await.expect("table");
-                let table = table_ref.read().await;
-                table.snapshot().expect("snapshot").log_data().iter().map(|file| file.path().to_string()).collect::<std::collections::HashSet<_>>()
-            }
-        };
-        assert!(live(&db, &tier, &project).await.is_empty(), "the reconstructed state has nothing live");
+        let KilledUnit { db, key, staged, source_rows, project, tier } = staged_but_uncommitted_rollup("rollup-resume").await?;
+        assert!(live_paths(&db, &project, &tier).await.is_empty(), "the reconstructed state has nothing live");
 
         let before = crate::observability::maintenance_stats().rollup_resumed.load(std::sync::atomic::Ordering::Relaxed);
         assert!(db.resume_rollup_unit(&key, source_rows).await?, "the staged output describes reality and must be committed");
 
-        let after = live(&db, &tier, &project).await;
+        let after = live_paths(&db, &project, &tier).await;
         for add in &staged {
             assert!(after.contains(&add.path), "the staged file {} is live again — committed, not rebuilt", add.path);
         }
@@ -12235,7 +12233,7 @@ mod tests {
     /// both end up live and a dashboard SUMs them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rollup_whose_source_moved_is_discarded_not_committed() -> Result<()> {
-        let (db, key, staged, source_rows, project, tier) = staged_but_uncommitted_rollup("rollup-resume-stale").await?;
+        let KilledUnit { db, key, staged, source_rows, project, tier } = staged_but_uncommitted_rollup("rollup-resume-stale").await?;
         let before = crate::observability::maintenance_stats().rollup_resume_declined.load(std::sync::atomic::Ordering::Relaxed);
 
         // One more source row: the witness the build recorded no longer
@@ -12244,8 +12242,7 @@ mod tests {
         let moved = source_rows.map(|rows| rows + 1);
         assert!(!db.resume_rollup_unit(&key, moved).await?, "a moved source must not resume");
 
-        let table_ref = db.get_or_create_table(&project, &tier).await?;
-        let live: std::collections::HashSet<String> = table_ref.read().await.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect();
+        let live = live_paths(&db, &project, &tier).await;
         for add in &staged {
             assert!(!live.contains(&add.path), "the staged file {} must NOT have been committed", add.path);
         }
@@ -12269,7 +12266,7 @@ mod tests {
     async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
         use crate::storage::CoverageLedger as _;
-        let mut cfg = (*create_test_config("ledger-populate")).clone();
+        let cfg = (*create_test_config("ledger-populate")).clone();
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
         let project = format!("ledger_{}", uuid::Uuid::new_v4().simple());
@@ -14755,7 +14752,7 @@ mod tests {
     /// resumed commit can be WRONG rather than merely wasteful.
     #[test]
     fn a_rollup_resumes_only_when_the_source_held_still_and_nothing_else_covers_the_slice() {
-        use super::{LiveTierFile, ResumeVerdict::*};
+        use super::ResumeVerdict::*;
         let slice = crate::maintenance_coordinator::TimeSlice::new(1_000, 2_000).expect("slice");
         let rollup = |source_rows: Option<u64>| super::RollupResume {
             key: crate::maintenance_coordinator::TaskKey {
@@ -14773,9 +14770,8 @@ mod tests {
             rollup: Some(rollup(source_rows)),
             ..resume_intent(targets, vec![resume_add("out1", 5)])
         };
-        let file = |rows: i64, slice: Option<(i64, i64)>| LiveTierFile { rows: Some(rows), slice };
-        let live = |files: &[(&'static str, LiveTierFile)]| files.iter().copied().collect::<HashMap<&str, LiveTierFile>>();
-        let inside = live(&[("in1", file(9, Some((1_000, 2_000))))]);
+        let live = |files: &[(&'static str, Option<(i64, i64)>)]| files.iter().copied().collect::<HashMap<&str, Option<(i64, i64)>>>();
+        let inside = live(&[("in1", Some((1_000, 2_000)))]);
         let ok = intent(&["in1"], Some(100));
 
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &inside, Some(100)), Commit);
@@ -14795,17 +14791,17 @@ mod tests {
         // staged output does NOT replace would stay live beside it, and a
         // dashboard would SUM both. An untagged file (`slice: None`) claims no
         // range and cannot double-count.
-        let overlapping = live(&[("in1", file(9, Some((1_000, 2_000)))), ("other", file(9, Some((1_500, 2_500))))]);
+        let overlapping = live(&[("in1", Some((1_000, 2_000))), ("other", Some((1_500, 2_500)))]);
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &overlapping, Some(100)), WouldDoubleCount);
-        let adjacent = live(&[("in1", file(9, Some((1_000, 2_000)))), ("later", file(9, Some((2_000, 3_000))))]);
+        let adjacent = live(&[("in1", Some((1_000, 2_000))), ("later", Some((2_000, 3_000)))]);
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &adjacent, Some(100)), Commit, "slice ends are exclusive; touching is not overlapping");
-        let untagged = live(&[("in1", file(9, Some((1_000, 2_000)))), ("legacy", file(9, None))]);
+        let untagged = live(&[("in1", Some((1_000, 2_000))), ("legacy", None)]);
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &untagged, Some(100)), Commit);
         // An input that left the snapshot entirely.
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &live(&[]), Some(100)), Stale);
         // Our own output is live ⇒ the commit landed and only the journal
         // publication was lost. The caller publishes; it must never re-commit.
-        let landed = live(&[("out1", file(5, Some((1_000, 2_000))))]);
+        let landed = live(&[("out1", Some((1_000, 2_000)))]);
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &landed, Some(100)), AlreadyLanded);
         // A still-running instance on a shared volume may be mid-staging.
         let young = super::StagedIntent { recorded_at: 100_000 - 10, ..ok.clone() };
