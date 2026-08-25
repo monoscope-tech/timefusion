@@ -96,17 +96,26 @@ impl ExprPlanner for VariantAwareExprPlanner {
             return Ok(PlannerResult::Planned(datafusion::functions_nested::expr_fn::array_has_any(expr.left, expr.right)));
         }
 
-        let is_long_arrow = match &expr.op {
-            BinaryOperator::Arrow => false,
-            BinaryOperator::LongArrow => true,
+        // `#>`/`#>>` address the same leaves as `->`/`->>`, but take the whole
+        // path as one text[] literal instead of a chain. Postgres callers reach
+        // for them whenever the path is built programmatically, so a store that
+        // supports only the arrow forms silently forces every such query into a
+        // per-store branch on the client.
+        let (is_long_arrow, path_is_array) = match &expr.op {
+            BinaryOperator::Arrow => (false, false),
+            BinaryOperator::LongArrow => (true, false),
+            BinaryOperator::HashArrow => (false, true),
+            BinaryOperator::HashLongArrow => (true, true),
             _ => return Ok(PlannerResult::Original(expr)),
         };
 
-        let (base_expr, mut path_parts) = collect_arrow_chain(&expr.left);
-        let Some(component) = extract_path_component(&expr.right) else {
+        let (base_expr, mut path_parts) =
+            if path_is_array { (unalias(&expr.left), vec![]) } else { collect_arrow_chain(&expr.left) };
+        let Some(components) = (if path_is_array { extract_path_array(&expr.right) } else { extract_path_component(&expr.right).map(|c| vec![c]) })
+        else {
             return Ok(PlannerResult::Original(expr));
         };
-        path_parts.push(component);
+        path_parts.extend(components);
 
         if !is_variant_column(&base_expr, schema) {
             return Ok(PlannerResult::Original(expr)); // Let JSON planner handle
@@ -124,10 +133,53 @@ impl ExprPlanner for VariantAwareExprPlanner {
             variant_leaf
         };
 
-        let op_str = if is_long_arrow { "->>" } else { "->" };
+        let op_str = match (path_is_array, is_long_arrow) {
+            (false, false) => "->",
+            (false, true) => "->>",
+            (true, false) => "#>",
+            (true, true) => "#>>",
+        };
         let alias_name = format!("{base_repr} {op_str} {}", path_repr(&path_parts));
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(result, None::<&str>, alias_name))))
     }
+}
+
+fn unalias(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Alias(alias) => unalias(&alias.expr),
+        expr => expr.clone(),
+    }
+}
+
+/// Path operand of `#>`/`#>>`. Postgres spells it `text[]`, which reaches the
+/// planner either as the unparsed literal `{a,b,c}` or as an already-built list.
+/// Quoted elements (`{"a b",c}`) are unquoted, matching Postgres array-literal
+/// parsing; an empty path is rejected so `#>> '{}'` falls through unchanged
+/// rather than silently addressing the whole document.
+fn extract_path_array(expr: &Expr) -> Option<Vec<PathComponent>> {
+    let expr = match expr {
+        Expr::Cast(cast) => cast.expr.as_ref(),
+        expr => expr,
+    };
+    let parts: Vec<PathComponent> = match expr {
+        Expr::Literal(v, _) => {
+            let raw = extract_utf8_string(v)?;
+            let inner = raw.strip_prefix('{')?.strip_suffix('}')?;
+            if inner.is_empty() {
+                return None;
+            }
+            inner
+                .split(',')
+                .map(|part| {
+                    let part = part.trim();
+                    PathComponent::Field(part.strip_prefix('"').and_then(|p| p.strip_suffix('"')).unwrap_or(part).to_string())
+                })
+                .collect()
+        }
+        Expr::ScalarFunction(func) if func.func.name() == "make_array" => func.args.iter().filter_map(extract_path_component).collect(),
+        _ => return None,
+    };
+    (!parts.is_empty()).then_some(parts)
 }
 
 fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
