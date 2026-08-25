@@ -2028,57 +2028,6 @@ pub struct MaintenanceConfig {
     /// the rewrite survive a restart at all.
     #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
-    /// The same idea for ROLLUP units, on its own switch because it is a
-    /// different risk class.
-    ///
-    /// The problem is the same and worse: a rollup unit averages ~21 minutes and
-    /// a prod container lives ~10-25, so the journal survives every restart and
-    /// the work never does — `oldest_task_age` in the tens of DAYS is that, not
-    /// a stuck queue. What differs is the safety argument. A repair preserves
-    /// rows, so `classify_resume` can compare input and output counts; a rollup
-    /// AGGREGATES, so that comparison is meaningless and the check is replaced
-    /// by two others (see `classify_rollup_resume`) — a source-row witness and a
-    /// no-double-count test against the tier's live files.
-    ///
-    /// Defaults OFF. Committing a STALE rollup double-counts, because the
-    /// replace-set removes files contained in the slice: if the inputs moved,
-    /// the resumed output and the newer files can both end up live and a
-    /// dashboard sums them. Turn on deliberately, one deploy on its own.
-    #[serde(default)]
-    pub timefusion_rollup_resume_enabled: bool,
-    /// Audit, during the dedup sweep, whether versions of one key disagree on a
-    /// column declared IMMUTABLE — see `FieldDef::mutable`.
-    ///
-    /// The declaration is enforced for UPDATE (`extract_dml_info` refuses to
-    /// assign an undeclared column) but NOT for INSERT: nothing stops a client
-    /// re-emitting a corrected record whose `level` differs from the version
-    /// already stored. Read filters on immutable columns are pushed BELOW the
-    /// merge-on-read dedup on the strength of that declaration, so a
-    /// disagreement makes a pushed predicate match a version the winner does not
-    /// satisfy — silently wrong results, no error and no metric.
-    ///
-    /// Default OFF because it is a second aggregate pass over each dedup shard,
-    /// one `COUNT(DISTINCT)` per audited column, on a memory-tight box. Turn it
-    /// on to find out whether the hazard is real before paying to fix it; the
-    /// answer lands in `immutable_column_disagreement_total`.
-    #[serde_inline_default(false)]
-    pub timefusion_immutable_audit_enabled: bool,
-    /// Seed rollup ROUTING from the durable coverage ledger at boot, instead of
-    /// waiting for the Delta tag replay to rebuild it.
-    ///
-    /// Routing coverage is currently reconstructed by `recover_rollup_coverage`,
-    /// which replays every tier's log and reads tags off every live file. Until
-    /// that finishes, `rollup_min_contiguous_days` reads 0 and the router does
-    /// not even ATTEMPT to route — so every restart costs a window of
-    /// unrouted, raw-path queries. On a box that restarts every 10-25 minutes
-    /// that window is most of the uptime.
-    ///
-    /// The ledger is durable and holds the same readable coverage, so it can
-    /// answer immediately. Default OFF: flip it only once
-    /// `coverage_ledger_disagreements` has read zero at production scale, since
-    /// a ledger that over-claims serves coverage that is not there.
-    #[serde_inline_default(false)]
-    pub timefusion_coverage_ledger_reads: bool,
     /// Days back (plus today) the dedup sweep scans.
     // 128: a lower bound put a multi-day floor under the backlog, but a much
     // higher one OOM'd the box — RSS climbed independent of query load, tracking

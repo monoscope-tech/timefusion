@@ -978,9 +978,9 @@ atomic_stats! {
     /// path's premise is false in production and a pushed predicate can match a
     /// version the winner does not satisfy.
     ///
-    /// Only counted while `timefusion_immutable_audit_enabled` is on, so ZERO
-    /// here means "not audited" just as loudly as it means "clean" — check the
-    /// flag before concluding anything.
+    /// The audit runs unconditionally, so zero here means CLEAN rather than
+    /// "not measured" — the one reading a flag-gated version of this counter
+    /// could never give.
     immutable_column_disagreement_total,
     /// Partitions where the coverage ledger and the Delta tags disagree.
     ///

@@ -3781,10 +3781,10 @@ impl JsonCoverageLedger {
     /// the disk copy diverge, and only the memory copy knows. Losing one is safe
     /// while the Delta tags remain the authority — the ledger merely understates
     /// coverage and costs a rebuild — so this does NOT fail the recovery pass.
-    /// It has to be VISIBLE, though: `coverage_ledger_persist_failures` joins
-    /// `coverage_ledger_disagreements` as a precondition on
-    /// `timefusion_coverage_ledger_reads`, because a ledger that silently stopped
-    /// persisting reads exactly like a ledger with nothing to say.
+    /// It has to be VISIBLE, though, because a ledger that silently stopped
+    /// persisting reads exactly like a ledger with nothing to say:
+    /// `coverage_ledger_persist_failures` beside `coverage_ledger_disagreements`
+    /// is what says which one it is. Both must read zero before the tags can go.
     fn persist(&self) {
         let rows: Vec<StoredCoverage> = self
             .cells
