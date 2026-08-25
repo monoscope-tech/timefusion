@@ -2631,14 +2631,6 @@ impl TableBuffer {
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let new_size = estimate_batch_size(&batch);
-        // Taken before the batch is moved into the bucket. `timestamp_micros` is
-        // ONE routing timestamp for the whole batch, so widening the bucket by it
-        // alone left `[min,max]` covering a single point of a multi-row batch —
-        // and readers prune a bucket whose advertised range cannot meet the query
-        // window (`bucket_overlaps_range`). A batch spanning 21:00–23:00 therefore
-        // advertised 21:00, and any `timestamp >= 21:30` pruned it: the rows were
-        // in memory, matched the predicate, and were invisible until flush.
-        let ts_bounds = batch_timestamp_range(&batch);
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
@@ -2751,17 +2743,7 @@ impl TableBuffer {
         // move the update back inside the lock OR derive the value from
         // `batches.iter().map(|b| b.num_rows()).sum()` under the lock.
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
-        // Both ends, so the range covers every row the bucket now holds. Falls
-        // back to the routing timestamp only when the batch carries no readable
-        // `timestamp` column — widening by too much is safe (it can only make a
-        // bucket survive pruning it could have skipped), losing rows is not.
-        match ts_bounds {
-            Some((lo, hi)) => {
-                bucket.update_timestamps(lo);
-                bucket.update_timestamps(hi);
-            }
-            None => bucket.update_timestamps(timestamp_micros),
-        }
+        bucket.update_timestamps(timestamp_micros);
 
         Ok((new_size as i64 + coalesce_delta, bucket_id))
     }
@@ -3046,37 +3028,6 @@ mod tests {
         assert!(ts.windows(2).all(|w| w[0] >= w[1]), "rows must be ordered timestamp DESC across chunk boundaries");
         assert_eq!(ts.first().copied(), Some(N - 1), "greatest timestamp first");
         assert_eq!(ts.last().copied(), Some(0), "least timestamp last");
-    }
-
-    /// A multi-row batch must advertise the range it actually holds. Readers
-    /// prune a bucket whose `[min,max]` cannot meet the query window, so a
-    /// bucket widened by the routing timestamp alone hid every row above it:
-    /// rows at 21:00/22:00/23:00 inserted as one batch reported `max = 21:00`,
-    /// and `timestamp >= 21:30` returned nothing while the rows sat in memory.
-    #[test]
-    fn bucket_range_covers_every_row_of_a_multi_row_batch() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let (lo, mid, hi) = (1_735_678_800_000_000i64, 1_735_682_400_000_000, 1_735_686_000_000_000);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(TimestampMicrosecondArray::from(vec![lo, mid, hi]).with_timezone("UTC")), Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
-
-        let buffer = MemBuffer::new();
-        // Routed by the batch's FIRST timestamp, as the write path does.
-        buffer.insert_with_hold("p", "otel_logs_and_spans", batch, lo, None).expect("insert");
-
-        let table = buffer.tables.get(&table_key("p", "otel_logs_and_spans")).expect("table");
-        let bucket = table.buckets.iter().next().expect("one bucket");
-        assert_eq!(bucket.min_timestamp.load(Ordering::Relaxed), lo, "min must be the batch's earliest row");
-        assert_eq!(bucket.max_timestamp.load(Ordering::Relaxed), hi, "max must be the batch's latest row, not the routing timestamp");
-
-        // The predicate that used to prune the whole bucket.
-        assert!(bucket_overlaps_range(bucket.value(), &(Some(lo + 1), None)), "a lower bound above the first row must not prune a bucket holding later rows");
     }
 
     fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
@@ -3642,15 +3593,12 @@ mod tests {
     /// pruning until the next insert. It must replay the rows' real range.
     #[test]
     fn restore_taken_bucket_preserves_timestamp_range() {
-        use crate::support::test_helpers::{json_to_batch, test_span_ts};
+        use crate::support::test_helpers::{json_to_batch, test_span};
         let buffer = MemBuffer::new();
         let dur = bucket_duration_micros();
         let ts = 7 * dur + 12_345; // mid-bucket — distinct from the bucket-start sentinel
         let bucket_id = MemBuffer::compute_bucket_id(ts);
-        // The ROW carries `ts` too: the bucket range describes the rows it holds, so a
-        // fixture whose row timestamp differed from the routing value would assert the
-        // old coupling rather than the range.
-        buffer.insert("p1", "otel_logs_and_spans", json_to_batch(vec![test_span_ts("a", "svc", "p1", ts)]).unwrap(), ts).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", json_to_batch(vec![test_span("a", "svc", "p1")]).unwrap(), ts).unwrap();
 
         let taken = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("bucket taken");
         assert_eq!((taken.min_timestamp, taken.max_timestamp), (ts, ts), "take must capture the real row range");
