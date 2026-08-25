@@ -38,9 +38,12 @@ worker 2,380 ms with *zero* effect on query cost); Delta snapshot refresh (hit
 0–1 through every stall); swap (100 % full at all times, so it differentiates
 nothing).
 
-**Not monotone with uptime.** 3 min–1.2 h is flat at ~177 ms; a slow episode ran
-1.8–2.24 h peaking at 4,460 ms; the *same process* was fine again at 2.9 h. Do
-not read "age" as the cause — read "episodes, which recur".
+**The title premise is FALSE.** A 7.15-hour process — longer-lived than the 5 h
+one that opened this plan — measured `connect` **107 ms** and warm `SELECT 1`
+**23.5 ms**, the fastest samples of the whole investigation, with 221 GB
+retained and 606,953 journal fsyncs behind it. Cost is *episodic*: flat at
+~177 ms for hours, with occasional multi-minute slow stretches that recover on
+their own. Do not read "age" as the cause.
 
 **Armed and pending:** `jemalloc.frag_pct` (prediction: climbs into an episode,
 falls out of it — if it stays flat, fragmentation is out too) and per-connection
@@ -826,6 +829,30 @@ than no probe.
 **Verification, prod:** baseline **114 lag warns in 20 minutes (5.7/min)** on
 the pre-fix image. Post-deploy measurement of the identical window is recorded
 below.
+
+### The premise, settled at 7.15 hours — the age the plan was written about
+
+A process finally survived long enough (nobody deployed for seven hours), and it
+is the fastest sample in the entire investigation:
+
+| | plan's §1 (5 h uptime) | this process (**7.15 h**) |
+|---|---|---|
+| `connect` | 4,748 ms | **107 ms** |
+| warm `SELECT 1` | 2,969 ms | **23.5 ms** |
+| in-container `auth_ms` | — | 8 ms |
+| host load | 39 | 30 |
+
+**"A trivial query costs seconds after hours of uptime" is false.** The title
+premise is refuted at a *longer* uptime than the one that produced it, and the
+§1 numbers were a process being crushed by a concurrent deploy, as this
+investigation found by accident when it caught itself doing the same thing.
+
+And the state that "grows with uptime" grew exactly as predicted while cost did
+not follow it: `retained_mb` **221,291** (221 GB of decommitted address space),
+`frag_pct` 19.2 %, `journal_hold.count` **606,953**. That last one is the
+justification for the fix on its own terms — **606 thousand blocking fsyncs in
+7 hours (~24/second), totalling 1,708,649 ms of frozen-worker time, or 28
+minutes of a worker doing nothing but waiting on the disk.**
 
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
