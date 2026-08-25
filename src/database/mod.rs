@@ -12085,7 +12085,6 @@ mod tests {
         use crate::maintenance_coordinator::Operation;
         let mut cfg = (*create_test_config("ledger-seed")).clone();
         cfg.maintenance.timefusion_rollup_enabled = true;
-        cfg.maintenance.timefusion_coverage_ledger_reads = true;
         let cfg = std::sync::Arc::new(cfg);
         let db = Database::with_config(cfg.clone()).await?;
         db.cancel_maintenance();
@@ -12126,7 +12125,6 @@ mod tests {
         use crate::maintenance_coordinator::Operation;
         let mut cfg = (*create_test_config(label)).clone();
         cfg.maintenance.timefusion_rollup_enabled = true;
-        cfg.maintenance.timefusion_rollup_resume_enabled = true;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
         let project = format!("resume_{}", uuid::Uuid::new_v4().simple());

@@ -2099,23 +2099,21 @@ impl Database {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
             return Ok(true);
         }
-        if self.config.maintenance.timefusion_rollup_resume_enabled {
-            self.record_staged_intent(&StagedIntent {
-                wave_id: resume_wave.clone(),
-                table_name: key.physical_table.clone(),
-                project_id: key.project_id.clone(),
-                recorded_at: crate::support::now_secs(),
-                paths: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.path.clone()) } else { None }).collect(),
-                target_paths: target_paths.clone(),
-                adds: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.clone()) } else { None }).collect(),
-                rollup: Some(crate::database::RollupResume {
-                    key: key.clone(),
-                    publication: publication.clone(),
-                    source_rows: publication.source_rows,
-                    date: date_string.clone(),
-                }),
-            });
-        }
+        self.record_staged_intent(&StagedIntent {
+            wave_id: resume_wave.clone(),
+            table_name: key.physical_table.clone(),
+            project_id: key.project_id.clone(),
+            recorded_at: crate::support::now_secs(),
+            paths: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.path.clone()) } else { None }).collect(),
+            target_paths: target_paths.clone(),
+            adds: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.clone()) } else { None }).collect(),
+            rollup: Some(crate::database::RollupResume {
+                key: key.clone(),
+                publication: publication.clone(),
+                source_rows: publication.source_rows,
+                date: date_string.clone(),
+            }),
+        });
         if !actions.is_empty() {
             let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
             let guard = commit_lock.lock().await;
@@ -3244,7 +3242,7 @@ impl Database {
     }
 
     /// Seed routing coverage from the durable ledger, returning how many slices
-    /// it published. Off unless `timefusion_coverage_ledger_reads`.
+    /// it published.
     ///
     /// This is the read-path move, and its value is entirely about RESTARTS.
     /// `recover_rollup_coverage` rebuilds the same map by replaying every tier's
@@ -3258,9 +3256,6 @@ impl Database {
     /// anything here, so a stale ledger costs one interval of narrower coverage
     /// and never a wrong answer.
     pub fn seed_routing_from_ledger(&self) -> usize {
-        if !self.config.maintenance.timefusion_coverage_ledger_reads {
-            return 0;
-        }
         use crate::storage::CoverageLedger as _;
         let mut seeded = 0usize;
         for cell in self.coverage_ledger.cells() {
@@ -6243,9 +6238,6 @@ impl Database {
         use deltalake::protocol::{DeltaOperation, SaveMode};
         use object_store::{ObjectStoreExt, path::Path as OsPath};
         use std::sync::atomic::Ordering::Relaxed;
-        if !self.config.maintenance.timefusion_rollup_resume_enabled {
-            return Ok(false);
-        }
         let contents = {
             let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match std::fs::read_to_string(self.staged_intent_path()) {

@@ -1637,9 +1637,13 @@ impl Database {
                                 // `skip_dedup` fast path applies only to partitions already
                                 // certified duplicate-free, so it cannot show a disagreement by
                                 // construction. If this is not measured here it is not measurable.
-                                if self.config.maintenance.timefusion_immutable_audit_enabled
-                                    && let Some(audit_sql) = Self::immutable_audit_sql(schema, scan_name, &rows_filter)
-                                {
+                                //
+                                // Unconditional: it is one extra aggregate over a
+                                // shard this rewrite is about to read in full
+                                // anyway, and what it detects is silently wrong
+                                // query results. A correctness audit that is off
+                                // is not an audit.
+                                if let Some(audit_sql) = Self::immutable_audit_sql(schema, scan_name, &rows_filter) {
                                     // Diagnostics must never fail the rewrite that carries them.
                                     match Self::scalar_i64(ctx, &audit_sql).await {
                                         Ok(Some(disagreeing)) if disagreeing > 0 => {

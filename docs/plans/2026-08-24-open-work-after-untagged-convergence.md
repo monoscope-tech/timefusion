@@ -10,14 +10,14 @@ section before anything else.**
 | What remains | Why it cannot be closed today |
 |---|---|
 | §1 decision (fix (c) or close) | criterion is `immutable_column_disagreement_total` over ≥24h of quiet uptime |
-| §3 step 4 ENABLEMENT | code is DONE and shipped default-OFF; flipping `TIMEFUSION_COVERAGE_LEDGER_READS` wants `coverage_ledger_disagreements` at zero at production scale first |
+| §3 step 4 VERIFICATION | code is DONE and ON — the flag was deleted (see "No default-off flags" below). `coverage_ledger_disagreements` and `coverage_ledger_persist_failures` are now standing alarms rather than a gate to flip |
 | §6 drain to 0 | blocked by deploy churn; needs a push freeze, not code |
 
 | Item | State |
 |---|---|
-| §1 immutability gap | **§1b instrumented** (`8b8ad30`), default OFF; decision still pending real data |
+| §1 immutability gap | **§1b instrumented** (`8b8ad30`) and now UNCONDITIONAL; decision still pending real data, but zero in `immutable_column_disagreement_total` finally means clean rather than unmeasured |
 | §2 preflight floor | **DONE** (`69e6503`) — committed, lint clean, 895/895 lib tests |
-| §3 ledger | **steps 1-4 DONE** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`, `21f3951`, `4bbd0fe`, `941771a`) — built, populated with only READABLE slices, verified both directions locally, entries name their files, and reads route from it at boot behind `TIMEFUSION_COVERAGE_LEDGER_READS` (default OFF). Remaining: flip the flag once `coverage_ledger_disagreements` reads zero at production scale |
+| §3 ledger | **steps 1-4 DONE** (`3ec8003`, `f6b50e5`, `b9572cf`, `98e72d5`, `21f3951`, `4bbd0fe`, `941771a`) — built, populated with only READABLE slices, verified both directions locally, entries name their files, and reads route from it at boot, unconditionally. Remaining: watch `coverage_ledger_disagreements` at production scale |
 | §4 escalation treadmill | **investigated, no code — two corrections** (`98e72d5`). (b) batching is ALREADY implicit: `enqueue` is keyed, so N escalations to one covering slice collapse to one task. (a) the on-demand split written in this doc is UNSOUND — the covering file physically holds the hole's rows, so re-tagging it narrower double-counts. Escalation stays correct until the ledger can name files per range |
 | §5 fragment debris | **RESOLVED - no migration, and it must not be written.** `clear_stale_estimates` already exists, and the partition ceiling rescues footprint-less debris by FUSING it (proven by test). Deleting those units would have discarded real queued work |
 | §6 whale cells | **BLOCKED, not self-completing — earlier assessment was wrong.** See "Why the drain stopped" below |
@@ -84,9 +84,10 @@ finish, and every process-scoped counter is immature. Both remaining gates —
    the Delta log, never from a counter.
 3. **Push the three local commits**, then let two hourly passes run, then read
    `coverage_ledger_disagreements` — remembering the trap above.
-4. **Turn on `TIMEFUSION_IMMUTABLE_AUDIT_ENABLED`** for ~24h of quiet uptime and
-   read `immutable_column_disagreement_total`. Non-zero means §1 is real and
-   fix (c) is justified; zero means the pushdown premise holds and §1 closes.
+4. **Read `immutable_column_disagreement_total`** after ~24h of quiet uptime.
+   The audit runs unconditionally now, so zero means CLEAN rather than "not
+   measured". Non-zero means §1 is real and fix (c) is justified; zero means the
+   pushdown premise holds and §1 closes.
 5. §5 needs nothing — it is closed. If the queue still looks inflated after a
    quiet period, check whether `ceilings` is populated for those partitions
    rather than deleting units.
@@ -176,8 +177,8 @@ correction below).
   JSON is the fallback, not the plan. The one thing that must not happen is a
   caller reaching past `CoverageLedger` to `JsonCoverageLedger`.
 
-**Task 16 — implemented, tested, shipped DEFAULT OFF behind
-`TIMEFUSION_ROLLUP_RESUME_ENABLED`.** Two things differ from section A's sketch:
+**Task 16 — implemented, tested, and ON.** Two things differ from section A's
+sketch:
 
 - **The `source_fingerprint` recomputation is not what shipped**, because it is
   both more expensive (it hashes the SELECTED file list, so recomputing means
@@ -195,6 +196,31 @@ correction below).
 It hooks in at the top of `run_coordinator_rollup_once` — after the source
 metadata is read, before the aggregate — and short-circuits the bisection, which
 would otherwise shred a unit whose answer is already written.
+
+### No default-off flags (2026-08-25)
+
+The three switches this plan's work introduced —
+`TIMEFUSION_ROLLUP_RESUME_ENABLED`, `TIMEFUSION_COVERAGE_LEDGER_READS` and
+`TIMEFUSION_IMMUTABLE_AUDIT_ENABLED` — have all been **deleted**, and their
+behaviour is unconditional. The standing rule: if it is valuable it ships on, and
+if it is not valuable it is removed. There is no third state.
+
+A default-off flag is not a safety mechanism, it is a deferred decision that
+reads like one, and this system has already paid for that mistake twice over:
+
+- **An off audit produces zero, which is indistinguishable from clean.** That is
+  precisely the "cannot tell none from unmeasured" failure recorded four separate
+  times in this repo's own history. `immutable_column_disagreement_total` was
+  about to be the fifth.
+- **The ledger flag deferred the decision to prod**, where nothing gets a quiet
+  window to decide in — which is the very problem task 16 exists to fix. The
+  safety argument that mattered is the both-directions equivalence test
+  (`4bbd0fe`), and that runs on every commit; the flag added nothing to it.
+
+The refusal logic stays exactly as conservative as it was — `SourceMoved`,
+`WouldDoubleCount` and `Stale` all decline, and the counters still say which.
+What changed is that the code either earns its place in the running system or
+leaves the tree.
 
 Still open on 16, and **not producible from a workstation**: `oldest_task_age`
 falling on prod across a normal deploy cadence. Read `rollup_resumed_total`
