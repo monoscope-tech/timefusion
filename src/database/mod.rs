@@ -9853,6 +9853,30 @@ mod decide_prefilter_tests {
         assert!(matches!(field_gap, PrefilterDecision::Skipped("field_coverage_gap")));
     }
 
+    /// A 0% selectivity floor is the whole prefilter's off switch, and the e2e
+    /// harness (`with_tantivy_prefilter(false)`) relies on it to keep a Delta
+    /// leg's file list independent of a detached index build. It must skip for
+    /// EVERY hit set — the empty one included, which would otherwise push an
+    /// `id IN ()` that statically prunes every file.
+    #[test]
+    fn zero_selectivity_floor_skips_every_hit_set() {
+        for ids in [&[][..], &["a"][..]] {
+            let d = decide_prefilter(
+                ids.iter().map(|s| s.to_string()).collect(),
+                100,
+                0, // min_selectivity_pct
+                false,
+                HashSet::new(),
+                HashSet::from(["zero_hit.parquet".to_string()]),
+                HashMap::new(),
+                false,
+                true,
+                true,
+            );
+            assert!(matches!(d, PrefilterDecision::Skipped("low_selectivity")), "0% floor must skip for {} hits", ids.len());
+        }
+    }
+
     /// A non-mutable (non-merge-on-read) table gets file exclusion + row selection.
     #[test]
     fn non_mutable_table_gets_file_exclusion_and_row_selection() {
