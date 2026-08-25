@@ -6377,7 +6377,6 @@ impl Database {
 
     async fn resumable_staged_bin(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, files: &[String]) -> Option<StagedBin> {
         use deltalake::kernel::Action;
-        use object_store::{ObjectStoreExt, path::Path as OsPath};
         use std::sync::atomic::Ordering::Relaxed;
         if !self.config.maintenance.timefusion_repair_resume_enabled {
             return None;

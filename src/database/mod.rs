@@ -6798,6 +6798,7 @@ enum ResumeVerdict {
 ///    slice must be one the staged output replaces. If a file overlaps and is
 ///    not in the replace set, both would be live after the commit and their rows
 ///    would be summed.
+///
 /// `live` maps every path in the target partition to the slice range its tags
 /// claim, `None` for an untagged file — which claims no range and therefore
 /// cannot double-count.
