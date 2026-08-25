@@ -1003,6 +1003,9 @@ impl StatsTableProvider {
             "split_declined_at_floor" => m.split_declined_at_floor,
             "immutable_column_disagreement_total" => m.immutable_column_disagreement_total,
             "coverage_ledger_disagreements" => m.coverage_ledger_disagreements,
+            "coverage_ledger_persist_failures" => m.coverage_ledger_persist_failures,
+            "rollup_resumed_total" => m.rollup_resumed,
+            "rollup_resume_declined_total" => m.rollup_resume_declined,
             "rollup_untagged_inputs" => m.rollup_untagged_inputs,
             "rollup_tier_untagged_found" => m.rollup_tier_untagged_found,
             // The republish backlog that gates wide-window routing. Watch it fall;

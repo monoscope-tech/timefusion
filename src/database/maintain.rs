@@ -39,6 +39,12 @@ fn fold_fleet_gauge(previous: u64, value: u64, seeded_by_real: bool, ramping: bo
     }
 }
 
+/// The window the one-shot orphan repair rebuilds. `BEFORE` is the date the
+/// `duration_digest` spec edit landed and changed `generation_id`; `FROM` bounds
+/// the work, leaving older orphans to age out of the 35-day horizon.
+const ORPHAN_REPAIR_FROM: &str = "2026-08-01";
+const ORPHAN_REPAIR_BEFORE: &str = "2026-08-22";
+
 fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
 }
@@ -55,6 +61,24 @@ type SpansByPartition = HashMap<(String, String), Vec<(i64, i64)>>;
 /// the slice ranges of its tagged ones. `uncovered_gaps` turns the pair into the
 /// work that would let `slice_retires` reach the untagged files.
 type UntaggedPartitions = HashMap<(String, String), (Vec<(i64, i64)>, Vec<(i64, i64)>)>;
+
+/// Are all of a staged intent's objects actually present, at the size recorded?
+///
+/// The one network check both resume paths make, and the only thing standing
+/// between a process killed mid-PUT and a commit that references a short or
+/// absent object — its recorded stats still add up, so nothing else notices.
+/// Shared because two copies of a safety check drift, and the copy that drifts
+/// is the one nobody is looking at.
+async fn staged_objects_complete(store: &dyn object_store::ObjectStore, adds: &[deltalake::kernel::Add]) -> bool {
+    use object_store::{ObjectStoreExt, path::Path as OsPath};
+    for add in adds {
+        let meta = store.head(&OsPath::from(add.path.as_str())).await;
+        if meta.map_or(true, |meta| i64::try_from(meta.size).unwrap_or(-1) != add.size) {
+            return false;
+        }
+    }
+    true
+}
 
 impl Database {
     /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
@@ -581,7 +605,7 @@ impl Database {
         const BACKFILL_PENDING_CEILING: usize = 25_000;
 
         let horizon = i64::from(self.config.maintenance.timefusion_rollup_backfill_days);
-        if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
+        if horizon == 0 {
             return Ok(0);
         }
         // Defers the ENQUEUE, not the pass. The ceiling exists because a deep
@@ -802,11 +826,7 @@ impl Database {
                 // takes ~5.5 minutes to rebuild after a restart (measured), so
                 // `usable_cells` reads low on a young process. Compare the two
                 // only once the process has outlived that.
-                let usable_cells = self
-                    .rollup_coverage
-                    .iter()
-                    .filter(|entry| entry.key().1 == source && entry.key().2 == target)
-                    .count();
+                let usable_cells = self.rollup_coverage.iter().filter(|entry| entry.key().1 == source && entry.key().2 == target).count();
                 info!(
                     source,
                     tier = %target,
@@ -831,7 +851,50 @@ impl Database {
                     .filter(|(index, _)| schema.rollups[*index].derive_from.is_none())
                     .flat_map(|(_, covered)| covered.iter().map(|(project, date)| (source.clone(), project.clone(), date.to_string()))),
             );
-            let missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
+            let mut missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
+            // ONE-SHOT REPAIR for coverage the planner is structurally blind to.
+            //
+            // `partitions_of` decides "covered" from a non-empty file existing at
+            // the path — it never reads the generation. So when a spec edit
+            // changes `generation_id`, every slice built before it keeps the old
+            // value, the READ path refuses those dates, and the planner counts
+            // them covered and never re-derives them. They stay dark forever.
+            //
+            // Measured 2026-08-24 on `dashboard_1m_v3`: 37 usable of 461 cells in
+            // the 35-day window — 92% of the tier unreadable — while
+            // `contiguous_days` reported 30 and no gauge moved. The spec edit was
+            // `duration_digest` on 08-22.
+            //
+            // Forces every tier of every in-window day BEFORE that edit back into
+            // `missing_tiers` so the ordinary enqueue path below rebuilds them.
+            // Going through that path rather than a parallel one is deliberate:
+            // it already decides Dedup-vs-not, orders derived after base, and
+            // respects the already-queued veto.
+            //
+            // Bounded to `[ORPHAN_REPAIR_FROM, ORPHAN_REPAIR_BEFORE)` so it is a
+            // known quantity of work. Older orphans are left to age out of the
+            // 35-day horizon rather than rebuilt days before they leave it.
+            if let Some(cursor_was) = self.journal().repair_orphaned_coverage_once(&source)
+                && let (Ok(from), Ok(before)) =
+                    (chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_FROM, "%Y-%m-%d"), chrono::NaiveDate::parse_from_str(ORPHAN_REPAIR_BEFORE, "%Y-%m-%d"))
+            {
+                let mut forced = 0usize;
+                for (project, date) in &candidates {
+                    if *date >= from && *date < before {
+                        missing_tiers.insert((project.clone(), *date), (0..schema.rollups.len()).collect());
+                        forced += 1;
+                    }
+                }
+                warn!(
+                    source,
+                    forced,
+                    cursor_was,
+                    from = ORPHAN_REPAIR_FROM,
+                    before = ORPHAN_REPAIR_BEFORE,
+                    event = "rollup_orphaned_coverage_repair",
+                    "re-enqueueing coverage a spec change orphaned and the planner cannot see"
+                );
+            }
             // Publish the holes so `claim_next` can rank them ahead of days that
             // already have tier output. Same coverage read, same 60s cadence.
             for ((project, date), missing) in &missing_tiers {
@@ -1670,6 +1733,17 @@ impl Database {
                 "base files carry no slice tags; selected on timestamp statistics instead"
             );
         }
+        // Everything above this line is metadata; everything below is the scan
+        // and aggregate that make a unit ~21 minutes. If a previous process got
+        // as far as staging this unit's output, committing it here is the whole
+        // saving — including skipping the bisection below, which would otherwise
+        // shred a unit whose answer is already written.
+        if self.resume_rollup_unit(&key, source_rows.and_then(|rows| u64::try_from(rows).ok())).await? {
+            let mut journal = self.journal();
+            journal.complete(&key);
+            journal.checkpoint()?;
+            return Ok(true);
+        }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
             let mut journal = self.journal();
             if journal.split_time_task(&key, estimated_bytes, Some(input_footprint)) {
@@ -2010,6 +2084,21 @@ impl Database {
             return Ok(true);
         }
         let target_paths = replaced.iter().map(|add| add.path.clone()).collect::<Vec<_>>();
+        // The staged parquet is already in object storage; only the commit is
+        // left. Recording the intent HERE — after the tags are stamped and the
+        // replace-set is decided, before anything commits — is what lets the
+        // next boot finish this unit instead of paying its ~21-minute scan
+        // again. Everything the resume needs travels with the entry: the journal
+        // key and publication (a commit without the publication is invisible to
+        // coverage and would simply be rebuilt), and the source row witness that
+        // decides whether the output still describes reality.
+        let resume_wave = uuid::Uuid::new_v4().to_string();
+        let publication = crate::maintenance_coordinator::Publication {
+            source_fingerprint: source_fp,
+            generation: generation.clone(),
+            rows,
+            source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
+        };
         let mut actions = replaced.iter().map(|add| Action::Remove(remove_for_add(add, true))).collect::<Vec<_>>();
         actions.extend(adds.iter().cloned());
 
@@ -2028,6 +2117,21 @@ impl Database {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
             return Ok(true);
         }
+        self.record_staged_intent(&StagedIntent {
+            wave_id: resume_wave.clone(),
+            table_name: key.physical_table.clone(),
+            project_id: key.project_id.clone(),
+            recorded_at: crate::support::now_secs(),
+            paths: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.path.clone()) } else { None }).collect(),
+            target_paths: target_paths.clone(),
+            adds: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.clone()) } else { None }).collect(),
+            rollup: Some(crate::database::RollupResume {
+                key: key.clone(),
+                publication: publication.clone(),
+                source_rows: publication.source_rows,
+                date: date_string.clone(),
+            }),
+        });
         if !actions.is_empty() {
             let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
             let guard = commit_lock.lock().await;
@@ -2037,6 +2141,10 @@ impl Database {
             if !target_paths.iter().all(|path| live.contains(path)) {
                 drop(guard);
                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                // The staged objects are gone, so the intent can no longer
+                // describe anything resumable — leaving it would have the next
+                // boot try to commit Adds whose parquet was deleted.
+                self.clear_staged_intent(&[resume_wave.as_str()]);
                 retry("slice_occ_stale".to_owned(), std::time::Duration::from_secs(1))?;
                 return Ok(true);
             }
@@ -2068,9 +2176,8 @@ impl Database {
                 (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), key.slice.start_micros, key.slice.end_micros),
                 RollupCoverage {
                     source_fp,
-                    source_epoch: 0,
+                    source_epoch: None,
                     generation: generation.clone(),
-                    rows,
                     source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                     covered_through: key.slice.end_micros,
                 },
@@ -2105,27 +2212,23 @@ impl Database {
                     (key.project_id.clone(), key.source.clone(), key.physical_table.clone(), date.to_string()),
                     RollupCoverage {
                         source_fp: partition_fp,
-                        source_epoch: self
-                            .rollup_source_epochs
-                            .get(&(key.project_id.clone(), key.source.clone(), date.to_string()))
-                            .map_or(0, |epoch| *epoch.value()),
+                        source_epoch: Some(
+                            self.rollup_source_epochs.get(&(key.project_id.clone(), key.source.clone(), date.to_string())).map_or(0, |epoch| *epoch.value()),
+                        ),
                         generation: generation.clone(),
-                        rows,
                         source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                         covered_through: key.slice.end_micros,
                     },
                 );
             }
-            journal.publish(
-                &key,
-                crate::maintenance_coordinator::Publication {
-                    source_fingerprint: source_fp,
-                    generation: generation.clone(),
-                    rows,
-                    source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
-                },
-            );
+            journal.publish(&key, publication.clone());
             journal.checkpoint()?;
+            // Committed AND published, so the entry no longer describes work a
+            // restart could finish. Cleared after the checkpoint rather than
+            // before it: an intent that outlives its unit is retried and finds
+            // its Adds already live (`AlreadyLanded`), while one cleared early
+            // and then lost to a crash is the ~21 minutes this exists to save.
+            self.clear_staged_intent(&[resume_wave.as_str()]);
             // Per-unit outcome, because the counters are process-wide totals and
             // cannot answer "why has THIS project's coverage not moved". Prod
             // 2026-08-17: the whale started day-sized BaseRollup units for
@@ -2664,7 +2767,7 @@ impl Database {
     /// Walks the batches' dates, so it is gated on the master switch as well as
     /// the schema: with rollups off this runs on every inbound write for nothing.
     pub(crate) fn invalidate_rollup_batches(&self, project_id: &str, source: &str, batches: &[RecordBatch]) -> std::io::Result<()> {
-        if !self.config.maintenance.timefusion_rollup_enabled || get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
+        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return Ok(());
         }
         let mut dates: HashMap<String, u32> = HashMap::new();
@@ -3085,9 +3188,8 @@ impl Database {
                 (project.clone(), source.to_string(), target.to_string(), date.clone()),
                 RollupCoverage {
                     source_fp: partition.fingerprint,
-                    source_epoch: self.rollup_source_epochs.get(&(project, source.to_string(), date)).map_or(0, |epoch| *epoch.value()),
+                    source_epoch: Some(self.rollup_source_epochs.get(&(project, source.to_string(), date)).map_or(0, |epoch| *epoch.value())),
                     generation: newest.generation.clone(),
-                    rows: slices.iter().map(|(_, coverage)| coverage.rows).sum(),
                     source_rows: Some(current_rows),
                     covered_through,
                 },
@@ -3158,7 +3260,7 @@ impl Database {
     }
 
     /// Seed routing coverage from the durable ledger, returning how many slices
-    /// it published. Off unless `timefusion_coverage_ledger_reads`.
+    /// it published.
     ///
     /// This is the read-path move, and its value is entirely about RESTARTS.
     /// `recover_rollup_coverage` rebuilds the same map by replaying every tier's
@@ -3172,9 +3274,6 @@ impl Database {
     /// anything here, so a stale ledger costs one interval of narrower coverage
     /// and never a wrong answer.
     pub fn seed_routing_from_ledger(&self) -> usize {
-        if !self.config.maintenance.timefusion_coverage_ledger_reads {
-            return 0;
-        }
         use crate::storage::CoverageLedger as _;
         let mut seeded = 0usize;
         for cell in self.coverage_ledger.cells() {
@@ -3184,9 +3283,8 @@ impl Database {
                     (project_id.clone(), source.clone(), table_name.clone(), entry.start_micros, entry.end_micros),
                     RollupCoverage {
                         source_fp: entry.source_fingerprint,
-                        source_epoch: 0,
+                        source_epoch: None,
                         generation: entry.generation.clone(),
-                        rows: 0,
                         source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
                         covered_through: entry.end_micros,
                     },
@@ -3256,11 +3354,41 @@ impl Database {
         }
     }
 
+    /// Drop ledger cells whose date fell out of the rollup horizon, returning how
+    /// many went.
+    ///
+    /// Without a caller the ledger grows for as long as the process has ever seen
+    /// a partition — including partitions that aged out months ago, whose file
+    /// lists it would go on carrying in every write. The tier replay's own orphan
+    /// sweep does not cover this: it only retires cells of a tier it just read,
+    /// so a tier that stops being replayed at all leaves its history behind
+    /// forever.
+    ///
+    /// Bounded by `timefusion_rollup_backfill_days`, which is the horizon the
+    /// planner itself enumerates and is pinned to the dedup certification window
+    /// — one constant, so a future horizon change moves both rather than leaving
+    /// the ledger retiring coverage the planner still wants. `0` disables the
+    /// backfill entirely and must therefore retire NOTHING, not everything.
+    ///
+    /// Dates come from `crate::support::now_micros()` — the virtual clock — so
+    /// e2e time travel drives this the same way it drives every other horizon.
+    fn retire_aged_out_coverage(&self) -> usize {
+        let horizon = self.config.maintenance.timefusion_rollup_backfill_days;
+        if horizon == 0 {
+            return 0;
+        }
+        let Some(now) = chrono::DateTime::from_timestamp_micros(crate::support::now_micros()) else { return 0 };
+        let keep_from = (now.date_naive() - chrono::Duration::days(i64::from(horizon))).to_string();
+        let retired = self.coverage_ledger.retire_before(&keep_from);
+        if retired > 0 {
+            info!(retired, keep_from, event = "rollup_coverage_ledger_retired", "coverage cells past the rollup horizon dropped from the ledger");
+        }
+        retired
+    }
+
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
-        if !self.config.maintenance.timefusion_rollup_enabled {
-            return Ok(0);
-        }
+        self.retire_aged_out_coverage();
         let mut recovered = 0;
         // Summed over every declared tier, then stored ONCE. Storing per tier made
         // the last spec's count the whole reading, which is zero whenever only the
@@ -3284,7 +3412,12 @@ impl Database {
                     let table = table.read().await;
                     // `source_rows` is part of the KEY so a partition rebuilt against a
                     // different source count cannot merge with the older evidence.
-                    let mut groups: HashMap<TaggedSliceIdentity, u64> = HashMap::new();
+                    // A SET, not a count: the per-identity `num_records` sum this
+                    // used to carry fed exactly one `debug!` line and a placeholder
+                    // zero on the ledger-seeded path, so it was a field that read
+                    // as measured on one route and unset on another while meaning
+                    // nothing on either.
+                    let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
                     // Paths per tagged identity, keyed exactly like `groups` so the
                     // FILTERED loop below can recover them. The ledger must not be
                     // written from this raw loop: the filters that follow
@@ -3339,15 +3472,13 @@ impl Database {
                         ) else {
                             continue;
                         };
-                        let rows = action.get_stats().ok().flatten().map_or(0, |stats| u64::try_from(stats.num_records.max(0)).unwrap_or(0));
                         // Absent on generations written before the tag; `-1` is the
                         // sentinel a build writes when the source reported no count.
                         // Both become `None`, which the read path refuses to verify.
                         let source_rows = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS)
                             .and_then(|value| value.parse::<i64>().ok())
                             .and_then(|rows| u64::try_from(rows).ok());
-                        let entry = groups.entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows)).or_default();
-                        *entry = entry.saturating_add(rows);
+                        groups.insert((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows));
                         // Same facts, recorded explicitly. The date comes from the
                         // file's own partition rather than from `slice_start`,
                         // because a day-wide slice starts at midnight of the day it
@@ -3368,7 +3499,7 @@ impl Database {
                     }
                     (groups, paths_by_identity)
                 }
-                Err(_) => (HashMap::new(), HashMap::new()),
+                Err(_) => (std::collections::HashSet::new(), HashMap::new()),
             };
             // Filled by the FILTERED loop below, then verified and written once
             // per tier. Nothing is recorded for a slice the read path would
@@ -3413,7 +3544,7 @@ impl Database {
             // pass saw zero and prod read `rollup_witnessless_slices = 0` over a
             // 23,337-slice backlog. Same "cannot tell none from unmeasured" failure
             // the untagged gauge above already had, reintroduced one field over.
-            unverifiable += tagged.keys().filter(|(.., source_rows)| source_rows.is_none()).count() as u64;
+            unverifiable += tagged.iter().filter(|(.., source_rows)| source_rows.is_none()).count() as u64;
             let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {
                 if publication.source_rows.is_none() {
@@ -3423,9 +3554,8 @@ impl Database {
                     (key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros),
                     RollupCoverage {
                         source_fp: publication.source_fingerprint,
-                        source_epoch: 0,
+                        source_epoch: None,
                         generation: publication.generation.clone(),
-                        rows: publication.rows,
                         source_rows: publication.source_rows,
                         covered_through: key.slice.end_micros,
                     },
@@ -3433,7 +3563,7 @@ impl Database {
                 recovered += 1;
             }
             if !tagged.is_empty() {
-                for ((project_id, slice_start, slice_end, generation, source_fp, source_rows), rows) in tagged {
+                for (project_id, slice_start, slice_end, generation, source_fp, source_rows) in tagged {
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else { continue };
                     let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
                     let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else { continue };
@@ -3483,7 +3613,7 @@ impl Database {
                     }
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
-                        RollupCoverage { source_fp, source_epoch: 0, generation, rows, source_rows, covered_through: slice_end },
+                        RollupCoverage { source_fp, source_epoch: None, generation, source_rows, covered_through: slice_end },
                     );
                     recovered += 1;
                 }
@@ -3937,7 +4067,7 @@ impl Database {
         let dates: Vec<chrono::NaiveDate> = (0..=lookback).rev().map(|d| today - chrono::Duration::days(d)).collect();
 
         let pre_version = table_ref.read().await.version().unwrap_or(0);
-        let needs_rollup_retry = self.config.maintenance.timefusion_rollup_enabled && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
+        let needs_rollup_retry = get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
         if !needs_rollup_retry && self.last_dedup_versions.read().await.get(dedup_key).copied() == Some(pre_version) {
             debug!("dedup sweep: table={} version={} unchanged — skipping", table_name, pre_version);
             return Ok(());
@@ -5604,6 +5734,7 @@ impl Database {
             // without re-reading footers. See `resumable_staged_bin`.
             target_paths: files.clone(),
             adds: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.clone()) } else { None }).collect(),
+            rollup: None,
         });
         // Data-preserving compaction: BOTH sides carry data_change=false so the
         // fork's snapshot-isolation downgrade applies and concurrent ingest
@@ -6105,9 +6236,147 @@ impl Database {
     /// commit lost an OCC race. `commit_wave` lands it with the same lock, flush priority, liveness
     /// re-check and OCC ladder. `None` is always safe: the caller stages normally, and the
     /// declined entry's parquet falls to boot-time reconcile / VACUUM.
+    /// Commit a rollup unit whose output was staged before a restart, instead of
+    /// re-running its scan. `Ok(true)` means this unit is DONE and the caller
+    /// must not build anything.
+    ///
+    /// Called after the source metadata is read (so the witness is in hand) and
+    /// before the aggregate — which is the ~21 minutes at stake. A prod container
+    /// lives ~10-25 minutes, so without this a unit of that size essentially
+    /// never completes: the journal survives every restart and the work does not.
+    ///
+    /// Every refusal path leaves the intent alone rather than deleting it: the
+    /// orphan sweep already collects staged parquet that no longer belongs to
+    /// anything, and deleting an entry here on a transient read failure would
+    /// discard a perfectly good staged output.
+    /// Publish a resumed rollup and retire its intent — the bookkeeping both
+    /// success arms owe, and which the commit alone does not satisfy.
+    fn publish_resumed_rollup(&self, rollup: &crate::database::RollupResume, wave_id: &str) -> Result<()> {
+        let mut journal = self.journal();
+        journal.publish(&rollup.key, rollup.publication.clone());
+        journal.checkpoint()?;
+        drop(journal);
+        self.clear_staged_intent(&[wave_id]);
+        Ok(())
+    }
+
+    pub(crate) async fn resume_rollup_unit(&self, key: &crate::maintenance_coordinator::TaskKey, current_source_rows: Option<u64>) -> Result<bool> {
+        use deltalake::protocol::{DeltaOperation, SaveMode};
+        use std::sync::atomic::Ordering::Relaxed;
+        let contents = {
+            let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else { return Ok(false) };
+            contents
+        };
+        // Paired with its evidence, so the commit path below cannot re-ask
+        // whether it is a rollup at all — a branch that could never fire, in the
+        // middle of the one place correctness matters.
+        let candidates: Vec<(StagedIntent, crate::database::RollupResume)> = parse_staged_intents(&contents)
+            .into_iter()
+            .filter_map(|entry| entry.rollup.clone().filter(|rollup| &rollup.key == key).map(|rollup| (entry, rollup)))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let Some(date_string) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else {
+            return Ok(false);
+        };
+        let target_ref = self.get_or_create_table(&key.project_id, &key.physical_table).await?;
+        // The WHOLE partition's live files, not just the ones named by an
+        // intent: the double-count test asks whether anything else already
+        // covers this slice, and a file the intent never heard of is exactly the
+        // dangerous case. Slice range and Add travel together — the verdict
+        // needs the first, the commit needs the second, and one map serves both.
+        let (partition, store) = {
+            let table = target_ref.read().await;
+            let partition: HashMap<String, (Option<(i64, i64)>, deltalake::kernel::Add)> = table
+                .snapshot()?
+                .log_data()
+                .iter()
+                .map(|file| {
+                    #[allow(deprecated)]
+                    file.add_action()
+                })
+                .filter(|add| {
+                    Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default")
+                        .is_some_and(|(project, date)| project == key.project_id && date == date_string)
+                })
+                .map(|add| {
+                    let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref)?.parse::<i64>().ok();
+                    let slice = tag(crate::maintenance_coordinator::TAG_SLICE_START).zip(tag(crate::maintenance_coordinator::TAG_SLICE_END));
+                    (add.path.clone(), (slice, add))
+                })
+                .collect();
+            (partition, table.log_store().object_store(None))
+        };
+        let live_view: HashMap<&str, Option<(i64, i64)>> = partition.iter().map(|(path, (slice, _))| (path.as_str(), *slice)).collect();
+        let now_secs = crate::support::now_secs();
+        let stats = crate::observability::maintenance_stats();
+        for (entry, rollup) in &candidates {
+            let verdict = classify_rollup_resume(entry, &key.physical_table, now_secs, &live_view, current_source_rows);
+            match verdict {
+                ResumeVerdict::Skip | ResumeVerdict::RowMismatch { .. } => continue,
+                ResumeVerdict::AlreadyLanded => {
+                    // The Delta commit landed and only the bookkeeping was lost.
+                    // PUBLISH anyway: without a journal publication the coverage
+                    // replay refuses the slice (`rollup_slice_complete`), the
+                    // planner sees a hole and re-enqueues the whole scan — the
+                    // exact cost this exists to avoid.
+                    self.publish_resumed_rollup(rollup, &entry.wave_id)?;
+                    info!(table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id, event = "rollup_resume_already_landed");
+                    return Ok(true);
+                }
+                ResumeVerdict::Stale | ResumeVerdict::SourceMoved | ResumeVerdict::WouldDoubleCount => {
+                    stats.rollup_resume_declined.fetch_add(1, Relaxed);
+                    info!(
+                        table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id,
+                        verdict = ?verdict, event = "rollup_resume_declined",
+                        "a staged rollup output no longer describes reality — rebuilding it instead"
+                    );
+                }
+                ResumeVerdict::Commit => {
+                    if !staged_objects_complete(store.as_ref(), &entry.adds).await {
+                        stats.rollup_resume_declined.fetch_add(1, Relaxed);
+                        info!(table = %key.physical_table, wave_id = %entry.wave_id, event = "rollup_resume_incomplete");
+                        continue;
+                    }
+                    let actions: Vec<deltalake::kernel::Action> = entry
+                        .target_paths
+                        .iter()
+                        .filter_map(|path| partition.get(path))
+                        .map(|(_, add)| deltalake::kernel::Action::Remove(remove_for_add(add, true)))
+                        .chain(entry.adds.iter().cloned().map(deltalake::kernel::Action::Add))
+                        .collect();
+                    let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
+                    let guard = commit_lock.lock().await;
+                    let mut table = target_ref.read().await.clone();
+                    let target_schema = get_schema(&key.physical_table).ok_or_else(|| anyhow::anyhow!("rollup target schema missing"))?;
+                    let op = DeltaOperation::Write { mode: SaveMode::Overwrite, partition_by: Some(target_schema.partitions.clone()), predicate: None };
+                    let finalized = deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(
+                        self.config.maintenance.timefusion_incremental_snapshot,
+                    ))
+                    .with_actions(actions)
+                    .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
+                    .await?;
+                    table.state = Some(finalized.snapshot());
+                    drop(guard);
+                    self.swap_and_refresh_cache(&target_ref, table, None, &[&format!("date={}", rollup.date)]).await;
+                    self.publish_resumed_rollup(rollup, &entry.wave_id)?;
+                    stats.rollup_resumed.fetch_add(1, Relaxed);
+                    info!(
+                        table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id,
+                        rows = rollup.publication.rows, event = "rollup_resumed",
+                        "committed a rollup staged before a restart instead of rebuilding it"
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn resumable_staged_bin(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, files: &[String]) -> Option<StagedBin> {
         use deltalake::kernel::Action;
-        use object_store::{ObjectStoreExt, path::Path as OsPath};
         use std::sync::atomic::Ordering::Relaxed;
         if !self.config.maintenance.timefusion_repair_resume_enabled {
             return None;
@@ -6156,7 +6425,10 @@ impl Database {
         let stats = crate::observability::maintenance_stats();
         for entry in &candidates {
             match classify_resume(entry, table_name, now_secs, &live_view) {
-                ResumeVerdict::Skip => continue,
+                // A repair intent never carries the rollup evidence, so these
+                // two verdicts are unreachable here by construction — see
+                // `classify_rollup_resume`, which is the only producer.
+                ResumeVerdict::Skip | ResumeVerdict::SourceMoved | ResumeVerdict::WouldDoubleCount => continue,
                 ResumeVerdict::AlreadyLanded => {
                     // The commit landed and only the bookkeeping was lost. Never
                     // re-commit: that would Remove the files it just Added.
@@ -6182,18 +6454,7 @@ impl Database {
                     );
                 }
                 ResumeVerdict::Commit => {
-                    // The one network check: a process killed mid-PUT leaves a
-                    // short (or absent) object under a name the manifest already
-                    // knows, and its recorded stats would still add up.
-                    let mut complete = true;
-                    for add in &entry.adds {
-                        let meta = store.head(&OsPath::from(add.path.as_str())).await;
-                        if meta.map_or(true, |m| i64::try_from(m.size).unwrap_or(-1) != add.size) {
-                            complete = false;
-                            break;
-                        }
-                    }
-                    if !complete {
+                    if !staged_objects_complete(store.as_ref(), &entry.adds).await {
                         stats.repair_resume_declined_incomplete.fetch_add(1, Relaxed);
                         info!(table_name, project_id, wave_id = %entry.wave_id, event = "staged_intent_resume_incomplete");
                         continue;
