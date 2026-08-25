@@ -21,8 +21,9 @@ by arithmetic:
 |---|---|---|
 | 2026-08-25 14:51:49 | 7,397,505 | 2026-06-01T00:00:04Z (4 s publish skew) |
 | 2026-08-25 14:56:53 | 7,397,813 | **2026-06-01T00:00:00Z** (0 s) |
+| 2026-08-25 15:10:14 | 7,398,614 | **2026-06-01T00:00:00Z** (0 s) |
 
-Two points five minutes apart, both landing on an exact UTC midnight. A record's
+Three points over 19 minutes, all landing on an exact UTC midnight. A record's
 birthday lands at an arbitrary time of day; only one production path can stamp a
 task with a midnight:
 
