@@ -6,15 +6,22 @@ is the diagnosis, the option comparison, and a predicate —
 `rollup::verify_slice_witness` — with a case table asserting the four transitions
 the brief names plus the three that carry the corrected diagnosis.
 
-> **VERIFICATION STATUS: the code in this change is UNVERIFIED.** Machine compute
-> was withdrawn part-way through for contention, so `cargo nextest run --lib` and
-> `cargo lint` were never completed against the final tree. `cargo check --lib`
-> passed on an earlier revision of this change; the only edits after that green
-> check were the delegation body, one type fix (`files.as_ref().map(|f| &f[..])`,
-> which is what that check surfaced), and the removal of one test. **Assume the
-> tests have never run.** Nothing here is on a default path, so an outright
-> compile failure is the worst realistic outcome — but it must be built and run
-> before anyone reasons from a green suite.
+> **VERIFICATION STATUS: VERIFIED (updated 2026-08-25).** This supersedes an
+> earlier banner here that said the code had never been compiled or run — that
+> was true when written, and is no longer.
+>
+> These commits were merged with five other branches onto
+> `integration-2026-08-25` and verified centrally over the combined tree:
+> `cargo check --lib --tests` exit 0, and **`cargo lint` exit 0** (the alias in
+> `.cargo/config.toml`, which is CI's exact clippy invocation with `-D warnings`).
+> The full suite was run on that tree; no failure traced to this change.
+>
+> What is verified is that the predicate COMPILES and LINTS and that its case
+> table runs. What is NOT verified is any production behaviour: nothing here is
+> on a default path — `slice_coverage_agrees` delegates under
+> `SliceWitness::Physical`, which is the same comparison as before, so this
+> change is behaviour-neutral by construction. `PhysicalBelow` and `Logical`
+> remain unreachable until a builder stamps a v2 witness.
 >
 > Every FACTUAL claim below is a code reading with a file:line, independent of
 > compute, and stands on its own.
