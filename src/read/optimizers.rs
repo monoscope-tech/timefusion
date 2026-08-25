@@ -813,6 +813,189 @@ fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<ScalarUDF>) -> Expr {
     }
 }
 
+/// Peephole: `json_as_text(variant_to_json(v), 'k')` → the Variant-native
+/// extraction `json_to_pg_text(variant_to_json(variant_get(v, "['k']")))`.
+///
+/// `variant_to_json` serializes the WHOLE Variant to a JSON string per row and
+/// `json_as_text` then re-parses that string to read one field. Measured on
+/// prod `otel_metrics`: the extraction is 87-91% of the query (6h: 5.37s of
+/// 5.93s wall on 11.85 MB scanned). Reading the leaf natively and serializing
+/// only that is 4.2x on the same rows (24h: 26.4s → 6.26s), and at 3 days it
+/// is the difference between ~19s and ~79s, i.e. over the 60s ceiling.
+///
+/// **Why an analyzer rule and not `VariantAwareExprPlanner`.** The planner sees
+/// one binary op at a time, bottom-up, and here the left operand is
+/// `variant_to_json(v)` — a Utf8 expression that datafusion-functions-json is
+/// right to claim. Teaching the planner to unwrap it would compose correctly
+/// *only* when the chain ends in `->>`: a TERMINAL `->` must keep returning the
+/// JSON union it returns today (rewriting it to `variant_get` would change the
+/// column's type and its pg wire OID), and at `plan_binary_op` time you cannot
+/// tell a terminal `->` from one a later `->>` will consume. That is decidable
+/// only with the whole expression tree in hand. It also catches the shape when
+/// a client spells the functions out instead of using the operators.
+///
+/// Rewritten: an outer `json_as_text` over any chain of `json_get` calls whose
+/// keys are all literals and whose base is `variant_to_json`. Deliberately NOT
+/// rewritten:
+/// - a terminal `json_get` (`->`): return type would go JSON-union → Variant.
+/// - an intermediate `json_as_text`: it unquotes a JSON *string* leaf, so a
+///   further lookup parses that string's contents; `variant_get` would not.
+/// - `json_get_str`/`_int`/`_float`/`_bool`/`_json`: different NULL semantics.
+/// - a non-literal key: the path must be a constant to become a variant path.
+/// - a negative array index: JSON reads it as no-match (NULL), while
+///   `VariantPath` fails to parse it — a NULL answer must not become an error.
+#[derive(Debug, Default)]
+pub struct VariantJsonAccessorPeephole;
+
+impl AnalyzerRule for VariantJsonAccessorPeephole {
+    fn name(&self) -> &str {
+        "variant_json_accessor_peephole"
+    }
+
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        plan.transform_up(|plan| {
+            plan.map_expressions(|expr| {
+                expr.transform_down(|e| {
+                    Ok(match variant_native_extraction(&e) {
+                        // Alias to the original expression's schema name: this rule must not
+                        // rename a projection output (that is the wire column name, and any
+                        // outer reference resolves through it). Types are unchanged (Utf8 in,
+                        // Utf8 out, no `tf.pg_type` tag on either), so no schema recompute.
+                        Some(native) => Transformed::yes(native.alias(e.schema_name().to_string())),
+                        None => Transformed::no(e),
+                    })
+                })
+            })
+        })
+        .map(|t| t.data)
+    }
+}
+
+/// The Variant-native equivalent of a `json_as_text` over `variant_to_json`,
+/// or None when the shape is not one of the provably equivalent cases.
+fn variant_native_extraction(expr: &Expr) -> Option<Expr> {
+    use crate::read::functions::{PathComponent, build_variant_path, extract_path_component, json_to_pg_text_udf, variant_get_udf};
+
+    fn peel(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Alias(alias) => peel(&alias.expr),
+            other => other,
+        }
+    }
+    // The JSON planner alias-wraps every node it plans, so peel at each step.
+    fn call<'a>(expr: &'a Expr, name: &str) -> Option<&'a ScalarFunction> {
+        match peel(expr) {
+            Expr::ScalarFunction(sf) if sf.func.name() == name => Some(sf),
+            _ => None,
+        }
+    }
+
+    let (mut node, mut path) = {
+        let sf = call(expr, "json_as_text")?;
+        let (json, keys) = sf.args.split_first()?;
+        (json, keys.iter().map(extract_path_component).collect::<Option<Vec<_>>>()?)
+    };
+    // Walk down the `->` chain, prepending each hop's keys. A json_get over a
+    // json_get takes only the object/array arm of the inner union, which is
+    // exactly a nested variant path: a non-container intermediate is NULL both ways.
+    let variant = loop {
+        if let Some(sf) = call(node, "variant_to_json") {
+            let [variant] = sf.args.as_slice() else { return None };
+            break variant;
+        }
+        let sf = call(node, "json_get")?;
+        let (inner, keys) = sf.args.split_first()?;
+        let mut head = keys.iter().map(extract_path_component).collect::<Option<Vec<_>>>()?;
+        head.extend(path);
+        (node, path) = (inner, head);
+    };
+    if path.iter().any(|p| matches!(p, PathComponent::Index(i) if *i < 0)) {
+        return None;
+    }
+
+    let scalar = |func: Arc<ScalarUDF>, args: Vec<Expr>| Expr::ScalarFunction(ScalarFunction { func, args });
+    let leaf = scalar(variant_get_udf(), vec![variant.clone(), Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path))), None)]);
+    // `variant_get` cannot stringify numeric/boolean leaves, so reuse the exact
+    // composition `VariantAwareExprPlanner` already emits for `->>`.
+    Some(scalar(json_to_pg_text_udf(), vec![scalar(variant_to_json_udf(), vec![leaf])]))
+}
+
+#[cfg(test)]
+mod variant_json_accessor_tests {
+    //! Equivalence, not assertion: every case runs the SAME SQL twice — once
+    //! through a session that has the peephole and once through one that does
+    //! not — and demands identical rows AND an identical schema. A case is
+    //! also told whether it is supposed to be rewritten, so an accidentally
+    //! narrowed (or widened) match fails here rather than in prod.
+    use datafusion::prelude::SessionContext;
+
+    use super::*;
+
+    async fn run(sql: &str, with_rule: bool) -> (String, Vec<datafusion::arrow::record_batch::RecordBatch>) {
+        let mut ctx = SessionContext::new();
+        crate::read::functions::register_custom_functions(&mut ctx).expect("custom functions");
+        datafusion_functions_json::register_all(&mut ctx).expect("json functions");
+        if with_rule {
+            ctx.add_analyzer_rule(Arc::new(VariantJsonAccessorPeephole));
+        }
+        let plan = ctx.sql(sql).await.expect("plan").into_optimized_plan().expect("optimize");
+        let batches = SessionContext::from(ctx.state()).execute_logical_plan(plan.clone()).await.unwrap().collect().await.expect("execute");
+        (plan.display_indent().to_string(), batches)
+    }
+
+    /// `doc` is the JSON the Variant holds; `accessor` is appended to
+    /// `variant_to_json(json_to_variant(d))`. Every case also carries a NULL
+    /// input row, and runs over a column (not a folded scalar) so the array
+    /// kernels are the ones compared.
+    #[test_case::test_case(r#"{"a":"x"}"#, "->>'a'", true ; "string leaf")]
+    #[test_case::test_case(r#"{"a":42}"#, "->>'a'", true ; "numeric leaf keeps its text form")]
+    #[test_case::test_case(r#"{"a":1.5}"#, "->>'a'", true ; "float leaf")]
+    #[test_case::test_case(r#"{"a":true}"#, "->>'a'", true ; "boolean leaf")]
+    #[test_case::test_case(r#"{"a":null}"#, "->>'a'", true ; "an explicit JSON null is SQL NULL")]
+    #[test_case::test_case(r#"{"b":1}"#, "->>'a'", true ; "missing key")]
+    #[test_case::test_case(r#"{"a":{"b":1,"c":[2]}}"#, "->>'a'", true ; "object leaf is returned as JSON text")]
+    #[test_case::test_case(r#"{"a":[1,"two"]}"#, "->>'a'", true ; "array leaf is returned as JSON text")]
+    #[test_case::test_case(r#"{"a":{"b":"c"}}"#, "->'a'->>'b'", true ; "chained through a json_get")]
+    #[test_case::test_case(r#"{"a":{"b":{"c":"d"}}}"#, "->'a'->'b'->>'c'", true ; "chained twice")]
+    #[test_case::test_case(r#"{"http.method":"GET"}"#, "->>'http.method'", true ; "a dotted OTel key is ONE key")]
+    #[test_case::test_case(r#"{"a":["x","y"]}"#, "->'a'->>1", true ; "array index")]
+    #[test_case::test_case(r#"{"a":"x"}"#, "->'a'->>'b'", true ; "descending into a string leaf is NULL both ways")]
+    #[test_case::test_case(r#"{"a":"{\"b\":1}"}"#, "->'a'->>'b'", true ; "a string leaf holding JSON is NOT re-parsed")]
+    #[test_case::test_case(r#"{"a":1}"#, "->>''", true ; "the empty key is a key, not an empty path")]
+    #[test_case::test_case(r#"{"a":{"b":1}}"#, "->'a'", false ; "a terminal arrow keeps its JSON union type")]
+    #[test_case::test_case(r#"{"a":{"b":"c"}}"#, "->>'a'->>'b'", false ; "an intermediate ->> unquotes, so it is not a variant path")]
+    #[tokio::test]
+    async fn both_spellings_agree(doc: &str, accessor: &str, rewritten: bool) {
+        let sql = format!("SELECT variant_to_json(json_to_variant(d)){accessor} AS v FROM (VALUES ('{doc}'), (NULL)) t(d)");
+        let (plan, batches) = run(&sql, true).await;
+        let (base_plan, base) = run(&sql, false).await;
+
+        assert_eq!(plan.contains("variant_get"), rewritten, "peephole fired unexpectedly\nwith: {plan}\nwithout: {base_plan}");
+        assert!(!base_plan.contains("variant_get"), "control plan must keep the serialized form: {base_plan}");
+        assert_eq!(batches.iter().map(|b| b.schema()).collect::<Vec<_>>(), base.iter().map(|b| b.schema()).collect::<Vec<_>>(), "wire schema changed");
+        let fmt = |b: &[datafusion::arrow::record_batch::RecordBatch]| datafusion::arrow::util::pretty::pretty_format_batches(b).unwrap().to_string();
+        assert_eq!(fmt(&batches), fmt(&base), "rows differ\nwith: {plan}");
+    }
+
+    /// A negative index is a no-match (NULL) in JSON but a hard parse error in
+    /// `VariantPath`, so the peephole must leave it alone rather than turn a
+    /// NULL answer into a failed query.
+    #[test]
+    fn a_negative_index_is_not_rewritten() {
+        use datafusion::prelude::lit;
+        let variant = Expr::ScalarFunction(ScalarFunction { func: variant_to_json_udf(), args: vec![col("v")] });
+        let rewrite = |key: Expr| {
+            super::variant_native_extraction(&Expr::ScalarFunction(ScalarFunction {
+                func: datafusion_functions_json::udfs::json_as_text_udf(),
+                args: vec![variant.clone(), key],
+            }))
+        };
+        assert!(rewrite(lit(1i64)).is_some(), "a non-negative index is rewritten");
+        assert!(rewrite(lit(-1i64)).is_none(), "a negative index must stay on the JSON path");
+        assert!(rewrite(col("k")).is_none(), "a non-literal key has no constant variant path");
+    }
+}
+
 #[cfg(test)]
 mod peel_tests {
     //! Unit tests for `wrap_root_projection` peel logic. These exercise the

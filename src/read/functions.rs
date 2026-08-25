@@ -78,7 +78,7 @@ impl TypePlanner for PostgresTypePlanner {
 pub struct VariantAwareExprPlanner;
 
 #[derive(Debug, Clone, PartialEq)]
-enum PathComponent {
+pub(super) enum PathComponent {
     Field(String),
     Index(i64),
 }
@@ -192,7 +192,7 @@ fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
     }
 }
 
-fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
+pub(super) fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
     // `::` binds tighter than `->>`, so monoscope's `attributes->>'route'::text`
     // parses as `attributes ->> CAST('route' AS text)` — the cast lands on the
     // PATH, not the extracted value. Matching only a bare literal made this
@@ -252,15 +252,21 @@ fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
     }
 }
 
-/// Build variant_get path string from components:
-/// `["user", "name"]` → `user.name`, `["items", Index(0)]` → `items[0]`.
-fn build_variant_path(parts: &[PathComponent]) -> String {
+/// Build a `variant_get` path string from components:
+/// `["user", "name"]` → `['user']['name']`, `["items", Index(0)]` → `['items'][0]`.
+///
+/// Field names are ALWAYS bracket-quoted, never emitted as bare dot notation.
+/// `VariantPath` reads `a.b` as a two-element nested path, but Postgres `->>`
+/// takes the whole literal as ONE key — so the everyday OTel shape
+/// `attributes ->> 'http.request.method'` resolved to NULL instead of the
+/// value. The bracket form is the only encoding that can say "one field named
+/// exactly this". Inside the brackets `\` and `]` are backslash-escaped, which
+/// is what `parquet_variant`'s bracket parser unescapes.
+pub(super) fn build_variant_path(parts: &[PathComponent]) -> String {
     parts
         .iter()
-        .enumerate()
-        .map(|(i, part)| match part {
-            PathComponent::Field(name) if i > 0 => format!(".{name}"),
-            PathComponent::Field(name) => name.clone(),
+        .map(|part| match part {
+            PathComponent::Field(name) => format!("['{}']", name.replace('\\', "\\\\").replace(']', "\\]")),
             PathComponent::Index(idx) => format!("[{idx}]"),
         })
         .collect()
@@ -2001,6 +2007,34 @@ mod tests {
             Some(PathComponent::Field("route".to_string())),
             "a cast around a path literal cannot change which field is addressed"
         );
+    }
+
+    /// A field name is ONE key, whatever characters it holds. Dot notation
+    /// cannot say that — `http.method` would address a nested path — so the
+    /// encoder brackets and escapes, and `VariantPath` must read back exactly
+    /// the name that went in.
+    #[test_case::test_case("plain")]
+    #[test_case::test_case("http.request.method" ; "dots are part of the OTel key")]
+    #[test_case::test_case("a[0]" ; "brackets")]
+    #[test_case::test_case("back\\slash")]
+    #[test_case::test_case("quo'te")]
+    #[test_case::test_case("dq\"uote")]
+    #[test_case::test_case("123" ; "digits stay a field, not an index")]
+    #[test_case::test_case("")]
+    fn a_field_name_round_trips_through_the_variant_path_encoding(name: &str) {
+        use parquet_variant::{VariantPath, VariantPathElement};
+        let encoded = build_variant_path(&[PathComponent::Field(name.to_string())]);
+        assert_eq!(
+            VariantPath::try_from(encoded.as_str()).unwrap_or_else(|e| panic!("{name:?} encoded as {encoded:?}: {e}")).as_ref(),
+            [VariantPathElement::field(name)],
+        );
+    }
+
+    #[test]
+    fn an_index_and_a_field_compose_into_one_path() {
+        let path = build_variant_path(&[PathComponent::Field("items".into()), PathComponent::Index(2), PathComponent::Field("name".into())]);
+        assert_eq!(path, "['items'][2]['name']");
+        assert_eq!(parquet_variant::VariantPath::try_from(path.as_str()).unwrap().len(), 3);
     }
 
     #[test]
