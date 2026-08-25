@@ -826,27 +826,26 @@ tokio's time driver can be driven by the idle `block_on` thread, so timers keep
 firing while the worker is held. A probe that cannot see the defect is worse
 than no probe.
 
-**Verification, prod — a partial win, and not cleanly attributable.**
+**Verification, prod — confirmed at matched load.**
 
-| | pre-fix (`18bcf8a`) | post-fix (`f7378af`) |
-|---|---|---|
-| lag warns / 20 min | **114** (5.7/min) | **45** (2.25/min) |
-| host load | ~30 | 23.45 |
-| `journal_hold.avg_us` | 2,815 | **1,610** |
+| | pre-fix (`18bcf8a`) | post-fix, 1st read | post-fix, **load-matched** (`44d07e1`) |
+|---|---|---|---|
+| lag warns / 20 min | **114** (5.7/min) | 45 (2.25/min) | **35 (1.75/min)** |
+| host load (15-min avg) | ~30 | 23.45 | **30.47** |
+| `journal_hold.avg_us` | 2,815 | **1,610** | |
+
+The first post-fix read was taken at load 23.45 and was therefore confounded —
+a 22 % lighter box could explain a lower rate on its own. The scheduled window
+landed at a **15-minute load average of 30.47, matching the baseline**, with the
+1-minute average at 38.84 — i.e. *equal or busier* — and measured **1.75/min
+against the baseline's 5.7/min**. Same load, **3.3× fewer stalls**, and below
+the pre-fix variance band (3.3–5.7/min). The reduction is attributable.
 
 The first 10 minutes after the deploy were discarded before measuring — a fresh
 process throws a lag burst during WAL replay (`inproc auth_ms` read 1,252 ms at
 41 s of uptime), and counting that would have read *worse* than reality.
 
-**What this does and does not establish.** The rate fell 60 %, but 2.25/min sits
-inside the pre-fix *variance* — an earlier pre-fix window measured 3.3/min — and
-post-fix load was 22 % lower. So the improvement is real in direction and
-unproven in size. What is certain by construction, not by this measurement, is
-that the blocking mechanism is gone: `block_in_place` demonstrably frees the
-worker's queue (the unit test fails without it at 405 ms), and prod was doing
-606,953 of these fsyncs in 7 hours.
-
-**And warns did not go to zero, so other blockers remain.** 2.25/min means
+**And warns did not go to zero, so other blockers remain.** 1.75/min means
 workers are still being held by something this fix does not cover — sync
 object-store metadata reads, zstd paths outside `write_atomic_with`, or
 CPU-bound work that never yields. `BlockWatch` is the instrument for finding
