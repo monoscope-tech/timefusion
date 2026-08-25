@@ -1371,3 +1371,55 @@ single −22 window into a rate. Read-only (Delta log listing + one
 ---
 
 ## 9. Final stamp
+
+---
+
+## §11 — CORRECTION 2026-08-25 17:xx: `out_of_policy_cells` was UNREACHABLE
+
+**Every reading of `out_of_policy_cells` above is against a definition no amount
+of compaction could ever satisfy.** The number 51, flat across 13 censuses, five
+containers and three deploys, was an artifact — and the pre-registered prediction
+that it would fall after the benefit-ordering fix could never have been met.
+
+Two different predicates were being compared:
+
+| | predicate |
+|---|---|
+| **Planner** (`src/database/maintain.rs:435`) | out of policy only if the **two smallest** files sum to ≤ target: `small.len() >= 2 && small[0].size + small[1].size <= small_target` |
+| **Census** (`bench/local/small_file_census.py`) | any **≥ 2 files** under target |
+
+`grep -rn "out_of_policy" src/` returns **only comments**. There is no in-process
+gauge of that name; the metric lived solely in a local script and never consulted
+the system's own rule.
+
+**Why it could never clear.** The packer breaks its bin at
+`bytes + add.size > target` (`src/database/mod.rs:7317`), so **every file it
+emits is under target by construction**. A 1.5 GB cell converges to
+`ceil(1.5 GB / 256 MiB) = 6` files and correctly stops. `28f62f01/2026-08-18`
+went 28 → 6 and hit *exactly* that terminal state: the planner retired its task,
+the packer agreed (`selected.len() < 2` → empty), and the census counted all six
+forever.
+
+**Corrected census** (predicate now matches the planner; new `floor` column =
+`ceil(bytes / TARGET)`, where compaction can actually stop), `delta_version=503033`:
+
+```
+sealed_cells=1081 out_of_policy_cells=14 small_files_in_them=292
+
+project        date          files  small     GB  floor
+87576849…a1a8  2026-08-19       53     53    2.1      8
+6297304f…f54e  2026-08-20       50     50    0.4      2
+6297304f…f54e  2026-08-17       49     49    0.9      4
+6297304f…f54e  2026-08-18       46     46    0.5      3
+6297304f…f54e  2026-08-21       32     32    0.2      1
+87576849…a1a8  2026-08-22       28     28    1.2      5
+6297304f…f54e  2026-08-14       15     15    0.5      2
+```
+
+**51 → 14 cells, 425 → 292 small files.** `files − floor` is the only quantity
+that is both real debt and reachable; use it, not the raw small-file count.
+
+**Caveat that changes how the table reads:** the census's GB is COMPRESSED. The
+planner's `estimated_decoded_bytes` for the "0.5 GB" cell is **4.28 GB (~8.5x)**.
+A cheap-looking cell is not a cheap unit, and that multiplier is why these units
+do not fit in the 900 s rewrite timeout.

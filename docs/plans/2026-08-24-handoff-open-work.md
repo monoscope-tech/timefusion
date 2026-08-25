@@ -4,6 +4,25 @@
 cold. Each item states what is known, what is NOT known, the exact commands, and
 the trap that will mislead you if you skip them.
 
+> **SUPERSEDED AGAIN, 2026-08-25.** Before using anything on this page or in the
+> block below it, read `2026-08-25-prod-quiet-window-baseline.md` (esp. §11) and
+> `2026-08-25-prod-followup-lag-and-ledger.md`. Four more premises fell:
+>
+> - **`out_of_policy_cells` was UNREACHABLE by construction** — the census counted
+>   any ≥2 files under target while the planner requires the two smallest to SUM
+>   under target, and the packer emits only sub-target files. Every "51, flat,
+>   nothing retires" reading anywhere in this directory is that artifact.
+>   Corrected: **14 cells, 292 small files.**
+> - **The queue drains but nothing COMMITS.** 109 units time out at 900 s in a
+>   90-minute window, ~98,100 worker-seconds against 86,400 of capacity, and they
+>   do not bisect on abandonment — the retry runs the same slice with the same
+>   `input_fp`. That, not ordering, is why hygiene never converges.
+> - **The 85-day `oldest_task_age` is a `SealedConsolidation` for 2026-05-31**,
+>   not a rollup task, and the gauge reports DATA age — so its wall-clock-exact
+>   advance is calendar arithmetic, not evidence of starvation.
+> - **The 30d `log_list` failure is a scan-guard refusal, not an OOM**, so no
+>   dedup-bounding work can fix it.
+>
 > **ANSWERED — see `2026-08-24-handoff-results.md`.** Every item below was run and
 > has a verdict. Read that page first; four of the premises stated here were
 > measured to be wrong, so acting on this page alone will send you the wrong way:
