@@ -309,6 +309,46 @@ Neither should ship on this evidence alone: the floor's real per-tenant shape is
 the one thing §4 says a prod journal would calibrate, and it decides which of
 the three rows above production actually lives in.
 
+## 7. Decision, 2026-08-25: bisect ONE level per measurement
+
+**Taken:** `byte_bounded_units` no longer recurses. One call halves the slice
+once — two children, priced by time share, each stamped with what the parent
+MEASURED — and the next level is minted only after its own preflight has
+measured it for real. The guard is therefore consulted at every level of the
+ladder, which is the whole of the defect: it was a between-call test on a
+within-call recursion.
+
+This is §6's first candidate direction, and it is the change §5 forbids
+"without a decision". This is the decision. `SPLIT_MUST_SHED_NUMERATOR/
+DENOMINATOR` stay at 3/4 — one decided change, not two — and `MIN_SLICE_MICROS`
+is untouched. The hash-shard branch (a slice already at the floor) is unchanged,
+so `split_time_task` still declines to mint hash-shard units and lets the runner
+shard internally.
+
+**Rejected: tighten `SPLIT_MUST_SHED_*` to 2/3.** §6's own sweep refutes it. The
+100x row reads identically at 1/2, 2/3, 3/4, 4/5 and guard-off — no constant can
+repair a predicate that is never consulted, so the required outcome
+(`split_declined_at_floor > 0` on the whale) is unreachable by any threshold.
+2/3 helps only the 20x row, which is a shape the incident was not.
+
+**Rejected: leave it and rely on the runner's internal hash sharding.** Memory
+is bounded either way; the queue is not. 1,440 journal units at the floor is the
+cost the incident was about.
+
+**Failure mode this risks — the decline side.** A declined leaf runs with
+`observed / MAX_DECODED_BYTES` internal hash shards, and every shard re-reads
+the row-group floor: work amplification, bounded in memory, not starvation. And
+a lineage now needs ~8 sequential claim→measure→split rounds where it needed 1,
+so a whale converges to runnable width more slowly. The *volume* of preflights
+is roughly unchanged (~255 against ~257 — every minted unit was preflighted
+anyway); it is depth that grows. The opposite failure mode — over-splitting into
+a shred — strictly decreases, because no level is ever minted unmeasured.
+
+### 7a. Results after the fix, same fixture, same six criteria
+
+_(Filled in below from the post-fix run; the fixture is byte-for-byte the one
+§6 used.)_
+
 ## Done when
 
 §3c criteria 1-4 pass in CI as a `#[test]` over the synthetic fixture (not a

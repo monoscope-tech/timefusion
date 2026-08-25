@@ -313,16 +313,20 @@ pub struct MaintenanceTask {
     /// preflight can tell whether halving the width actually bought anything.
     ///
     /// `byte_bounded_units` prices children by TIME SHARE, which is a model, not
-    /// a measurement — so the recursion always terminates on paper however
-    /// expensive the slice really is. The true cost has a floor (a slice reads
-    /// at least one row group of every file it overlaps; prod 2026-08-22
-    /// measured 302 MB for a FIVE-MINUTE slice), and it surfaces only when the
-    /// preflight re-measures at claim time, finds itself over budget and splits
-    /// again — all the way to `MIN_SLICE_MICROS`. One (project, tier, day) held
-    /// 3,455 units that way.
+    /// a measurement — so a split always "fits" on paper however expensive the
+    /// slice really is. The true cost has a floor (a slice reads at least one
+    /// row group of every file it overlaps; prod 2026-08-22 measured 302 MB for
+    /// a FIVE-MINUTE slice), and it surfaces only when the preflight re-measures
+    /// at claim time, finds itself over budget and splits again — all the way to
+    /// `MIN_SLICE_MICROS`. One (project, tier, day) held 3,455 units that way.
     ///
     /// Comparing against this turns the model into a feedback loop: measure, and
-    /// if the child did not get meaningfully cheaper than its parent, stop.
+    /// if the child did not get meaningfully cheaper than its parent, stop. The
+    /// loop only closes because a split descends ONE level per call — when it
+    /// descended a whole subtree, every descendant carried the same stamp and
+    /// the ladder reached the floor in two measured levels, so this field was
+    /// never once consulted at a width where the floor dominates (sim,
+    /// 2026-08-25).
     /// `default` so older journals deserialize as `None` and bisect exactly as
     /// they did before.
     #[serde(default)]
@@ -470,9 +474,17 @@ fn split_sheds_enough(parent_measured_bytes: Option<u64>, observed_bytes: u64) -
     observed_bytes > parent || observed_bytes.saturating_mul(SPLIT_MUST_SHED_DENOMINATOR) < parent.saturating_mul(SPLIT_MUST_SHED_NUMERATOR)
 }
 
-/// Split a unit until each estimated reservation fits.  A one-minute whale is
-/// divided by a stable hash of the complete dedup key; callers must apply
+/// Split a unit that does not fit, **one level per call**.  A one-minute whale
+/// is divided by a stable hash of the complete dedup key; callers must apply
 /// `hash(key) % hash_shards == hash_shard` before deduplication.
+///
+/// One level, not a subtree, because every level below the first is priced by
+/// TIME SHARE and time share is a model. Descending many levels inside one call
+/// stamped every descendant with the same measurement, so a lineage reached
+/// `MIN_SLICE_MICROS` in two journal levels and `split_sheds_enough` — a
+/// between-call test — was never asked about any level in between. Halving once
+/// and re-measuring makes the guard see every level, which is the only way it
+/// can observe the floor at the width where the floor starts to dominate.
 pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u64) -> Vec<MaintenanceTask> {
     if observed_or_estimated_bytes <= MAX_DECODED_BYTES {
         let mut task = task.clone();
@@ -487,11 +499,11 @@ pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u
                 / u128::try_from(task.key.slice.width()).unwrap_or(1)) as u64;
             let mut left = task.clone();
             left.key.slice.end_micros = midpoint;
+            left.estimated_decoded_bytes = left_bytes;
             let mut right = task.clone();
             right.key.slice.start_micros = midpoint;
-            let mut units = byte_bounded_units(&left, left_bytes);
-            units.extend(byte_bounded_units(&right, observed_or_estimated_bytes.saturating_sub(left_bytes)));
-            return units;
+            right.estimated_decoded_bytes = observed_or_estimated_bytes.saturating_sub(left_bytes);
+            return vec![left, right];
         }
     }
 
@@ -2369,8 +2381,8 @@ impl TaskJournal {
     pub fn abandon_running(&mut self, key: &TaskKey, now_micros: i64) {
         let attempts = self.task_indices.get(key).and_then(|index| self.snapshot.tasks.get(*index)).map_or(1, |task| task.attempts);
         // `MAX_DECODED_BYTES + 1` is the smallest input that makes
-        // `byte_bounded_units` bisect: it asks for one split, not a full
-        // recursive shred down to the minimum slice.
+        // `byte_bounded_units` bisect, and a bisect is one halving: this asks
+        // for one split, never a shred down to the minimum slice.
         if attempts >= 2 && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1), None) {
             return;
         }
@@ -2447,9 +2459,9 @@ impl TaskJournal {
         // some width the cost stops falling and only the model keeps shrinking.
         //
         // `byte_bounded_units` cannot see that — it prices children by time
-        // share (`:444`) — so the recursion always terminates on paper and the
-        // truth arrives one preflight later, over budget, splitting again. That
-        // cycle is what minted 3,455 units for one (project, tier, day).
+        // share — so a split always "fits" on paper and the truth arrives one
+        // preflight later, over budget, splitting again. That cycle is what
+        // minted 3,455 units for one (project, tier, day).
         //
         // The parent's measurement is the evidence: if this unit came back
         // costing most of what its parent cost, the floor has been reached and
@@ -3389,13 +3401,18 @@ mod tests {
         }
     }
 
+    /// One call halves ONCE. Descending further would price the extra levels by
+    /// time share and stamp them all with this one measurement, which is what
+    /// made `split_sheds_enough` unreachable; the next level is minted only
+    /// after its own preflight has measured it.
     #[test]
-    fn recursively_splits_whales_and_hash_shards_one_minute() {
+    fn halves_a_whale_once_and_hash_shards_one_minute() {
         let input = task("whale", 0, NORMAL_SLICE_MICROS, Operation::Dedup);
         let units = byte_bounded_units(&input, 10 * MAX_DECODED_BYTES);
-        assert!(units.len() >= 10);
-        assert!(units.iter().all(|unit| unit.estimated_decoded_bytes <= MAX_DECODED_BYTES));
-        assert!(units.iter().all(|unit| unit.key.slice.width() >= MIN_SLICE_MICROS));
+        assert_eq!(units.len(), 2, "one level per measurement, not a subtree");
+        assert_eq!(units.iter().map(|unit| unit.estimated_decoded_bytes).sum::<u64>(), 10 * MAX_DECODED_BYTES, "the halves must price the whole parent");
+        assert!(units.iter().all(|unit| unit.key.slice.width() == NORMAL_SLICE_MICROS / 2 && unit.hash_shards <= 1));
+        assert_eq!(units[0].key.slice.end_micros, units[1].key.slice.start_micros, "and they must tile the parent");
 
         let minute = task("whale", 0, MIN_SLICE_MICROS, Operation::Dedup);
         let shards = byte_bounded_units(&minute, MAX_DECODED_BYTES * 3);
