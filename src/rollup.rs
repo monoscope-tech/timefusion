@@ -44,6 +44,19 @@ pub enum MissReason {
     /// Hybrid routing would create too many disjoint raw/rollup predicates.
     TooManyBranches,
     RewriteSchemaMismatch,
+    /// An aggregate over a rollup-BEARING table whose plan the matcher could not
+    /// walk from the aggregate down to the scan — a node between them that
+    /// `source_and_filters` refuses, in practice DataFusion's CSE lifting a
+    /// group expression into a `__common_expr_N` projection.
+    ///
+    /// Its population is deliberately narrow: only plans whose underlying table
+    /// actually declares rollups are counted, so a join or a `pg_catalog`
+    /// aggregate stays silent. Before this existed the whole class was invisible
+    /// — `match_aggregates` returned `Ok(Vec::new())` and the caller's `Ok(None)`
+    /// arm recorded nothing, so "no miss counter moved" read as "it routed" when
+    /// it could equally mean "the matcher was never reached". Prod 2026-08-25:
+    /// monoscope's log-explorer count chart declined here, 7 days raw, silently.
+    UnwalkableSource,
 }
 
 impl MissReason {
@@ -1405,6 +1418,79 @@ fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mu
     }
 }
 
+/// Undo DataFusion's common-subexpression extraction, for MATCHING only.
+///
+/// `GROUP BY COALESCE(status_code, 'null')` plans as a `CASE` that names its
+/// operand twice, so CSE lifts the operand into `Projection: … AS
+/// __common_expr_1` and the aggregate groups by `CASE WHEN __common_expr_1 …`.
+/// Every dimension matcher below reads bare columns, so the group expression
+/// stopped resembling a dimension and `source_and_filters` refused the aliased
+/// projection outright — the query fell through with no reason recorded at all.
+/// That is not an edge case: it is the shape monoscope emits for EVERY chart
+/// (`COALESCE(<dimension>::text, 'null')`), and on prod 2026-08-25 it cost 39.2s
+/// against 4.25s for the identical query written with a bare column.
+///
+/// Substituting each `__common_expr_N` back into the aggregate's own expressions
+/// restores the pre-CSE shape. Deliberately narrow, because walking through a
+/// projection that RENAMES would make the matcher read a dimension off the wrong
+/// column: only CSE's own generated aliases are inlined, any other alias
+/// declines, and the rebuilt aggregate must still carry field-for-field the same
+/// names and types — it stands in for the original only where they agree.
+fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregate) -> Option<datafusion::logical_expr::Aggregate> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
+
+    const CSE_PREFIX: &str = "__common_expr_";
+
+    let LogicalPlan::Projection(projection) = aggregate.input.as_ref() else { return None };
+    let mut definitions = std::collections::HashMap::new();
+    for expr in &projection.expr {
+        match expr {
+            Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX) => {
+                definitions.insert(alias.name.clone(), alias.expr.as_ref().clone());
+            }
+            Expr::Column(_) => {}
+            // A rename, a computed projection — anything else is exactly what
+            // `source_and_filters` refuses to walk, and for the same reason.
+            _ => return None,
+        }
+    }
+    if definitions.is_empty() {
+        return None;
+    }
+    let inline = |expr: &Expr| {
+        expr.clone()
+            .transform_up(|node| {
+                Ok(match &node {
+                    Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
+                    _ => Transformed::no(node),
+                })
+            })
+            .map(|transformed| transformed.data)
+            .ok()
+            // CSE may define one alias in terms of another; a single bottom-up
+            // pass would leave the inner one dangling over a scan that has no
+            // such column. Decline rather than route a half-substituted shape.
+            .filter(|inlined| !inlined.column_refs().iter().any(|column| column.name.starts_with(CSE_PREFIX)))
+    };
+    let group_expr = aggregate.group_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
+    let aggr_expr = aggregate.aggr_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
+    Aggregate::try_new(projection.input.clone(), group_expr, aggr_expr)
+        .ok()
+        .filter(|rebuilt| rebuilt.schema.has_equivalent_names_and_types(&aggregate.schema).is_ok())
+}
+
+/// The table `plan` ultimately scans, ignoring every node `source_and_filters`
+/// refuses to walk. Used ONLY to decide whether an unwalkable plan was ever a
+/// rollup candidate, never to route: a plan with two scans yields the first,
+/// which is why it may not feed anything that answers rows.
+fn scanned_table(plan: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
+    match plan {
+        datafusion::logical_expr::LogicalPlan::TableScan(scan) => Some(scan.table_name.table().to_string()),
+        plan => plan.inputs().into_iter().find_map(scanned_table),
+    }
+}
+
 /// Does this predicate constrain ONLY `project_id`/`timestamp`?
 ///
 /// Those are the two the probe injects to satisfy the scan admission guard, and
@@ -1533,9 +1619,22 @@ pub(crate) async fn match_aggregates(
         return Ok(Vec::new());
     }
     let Some(matched) = outermost_aggregate(plan) else { return Ok(Vec::new()) };
-    let LogicalPlan::Aggregate(aggregate) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
+    let LogicalPlan::Aggregate(original) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
+    // Match against the pre-CSE shape where there is one. `matched` stays the
+    // node actually in the tree, because that is what the rewrite substitutes
+    // for; the inlined copy only ever answers "does this resemble a dimension".
+    let inlined = inline_common_exprs(original);
+    let aggregate = inlined.as_ref().unwrap_or(original);
     let mut predicates = Vec::new();
-    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(Vec::new()) };
+    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else {
+        // Count this ONLY when a rollup-bearing table sits underneath; an
+        // aggregate over a join or `pg_catalog` was never a candidate and must
+        // not inflate the reason breakdown. See `MissReason::UnwalkableSource`.
+        if scanned_table(&aggregate.input).is_some_and(|table| crate::schema::get_schema(&table).is_some_and(|schema| !schema.rollups.is_empty())) {
+            crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
+        }
+        return Ok(Vec::new());
+    };
     let Some(schema) = crate::schema::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
     // Try every declared rollup, coarsest grain first: a coarser grain reads
@@ -1969,6 +2068,19 @@ async fn route_with_spec(
         // over THAT column. `SELECT count(*), p95(duration) … WHERE duration IS NOT
         // NULL` is real monoscope traffic (the top-K tables) and its `count(*)`
         // counts only rows with a duration, where `request_count` counts them all.
+        //
+        // `count(*)` is the one aggregate that can be REWRITTEN to satisfy the
+        // guard instead of being refused by it: under `col IS NOT NULL`,
+        // `count(*) ≡ count(col)`. The guard was set aside above rather than
+        // pushed, so neither leg re-applies it — and `{agg: count, column: col}`
+        // skips exactly the rows the predicate excluded, while the raw leg emits
+        // `COUNT(col)` for the same measure. Before this, monoscope's log-explorer
+        // latency widget (`count(*)` folded in from `HAVING COUNT(*) > 0` beside
+        // `percentile_agg(duration)`) was refused outright and scanned 7 days raw.
+        let column = match (column, null_guard) {
+            (None, Some(guard)) if name == "count" => Some(guard.to_string()),
+            (column, _) => column,
+        };
         if null_guard.is_some() && column.as_deref() != null_guard {
             return Err(MissReason::FilterNotEligible);
         }

@@ -812,6 +812,7 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
         R::UnboundedTime => &stats.rollup_miss_unbounded_time,
         R::NonDecomposableAggregate => &stats.rollup_miss_non_decomposable,
         R::RewriteSchemaMismatch => &stats.rollup_miss_rewrite_schema_mismatch,
+        R::UnwalkableSource => &stats.rollup_miss_unwalkable_source,
     }
     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = METRICS.get() {
@@ -1137,6 +1138,7 @@ atomic_stats! {
     rollup_miss_unbounded_time,
     rollup_miss_non_decomposable,
     rollup_miss_rewrite_schema_mismatch,
+    rollup_miss_unwalkable_source,
     dirty_bin_queue_depth,
     dirty_bin_enqueued,
     dirty_bin_eligible,
