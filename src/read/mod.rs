@@ -1886,11 +1886,7 @@ mod tests {
     #[test_case::test_case(&[(&["a"], &[10], &[Some(5)]), (&["a"], &[10], &[Some(5)])] ; "an equal stamp does not unseat the incumbent")]
     fn a_winner_compaction_changes_no_answer(spec: &[BatchSpec<'_>]) {
         let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
-        assert_eq!(
-            run_unbounded(&batches, true),
-            run_unbounded(&batches, false),
-            "compacting the retained buffer to current winners changed the answer"
-        );
+        assert_eq!(run_unbounded(&batches, true), run_unbounded(&batches, false), "compacting the retained buffer to current winners changed the answer");
     }
 
     /// And the reason to do it — reproduced as the shape prod actually has, not
