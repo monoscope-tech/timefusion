@@ -1574,6 +1574,28 @@ impl Database {
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
+        // Read STRICTLY BEFORE the snapshot below, and evaluated after it — see
+        // the derived base-coverage gate. Coverage is inserted only AFTER the
+        // base unit's Delta commit and only ever grows, so a range collected
+        // here is guaranteed to be present in a snapshot taken later. Collected
+        // the other way round it is not: base hour-units and a derived unit for
+        // the same day run concurrently (rewrite concurrency is 2, and
+        // `dependencies_complete` requires only the DAY ready), so a base commit
+        // landing between the snapshot and this read would show as coverage the
+        // snapshot does not contain — and the unit would publish short while
+        // claiming the whole slice, which is the exact bug the gate exists for.
+        let base_covered: Vec<(i64, i64)> = if derived {
+            self.rollup_slice_coverage
+                .iter()
+                .filter(|entry| {
+                    let (project, source, table, start, end) = entry.key();
+                    *project == key.project_id && *source == key.source && *table == from && key.slice.overlaps(*start, *end)
+                })
+                .map(|entry| (entry.key().3, entry.key().4))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes) = {
             let table = from_table.read().await;
             let witness_guard = match &witness_table {
@@ -1602,7 +1624,10 @@ impl Database {
             // compares, plus the earliest row the partition actually holds —
             // which is what decides whether this slice may claim the day's
             // opening hours (see the publish site).
-            let partition_identity = partition_stats.map(|stats| (stats.fingerprint, stats.min_ts));
+            // `max_ts` rides along for the derived base-coverage gate below: it
+            // and `min_ts` bound the range in which a missing base slice is a
+            // real hole rather than a stretch the source never held.
+            let partition_identity = partition_stats.map(|stats| (stats.fingerprint, stats.min_ts, stats.max_ts));
             let partition_paths = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string);
             let mut selected = Vec::new();
             let mut estimated = 0u64;
@@ -1740,6 +1765,61 @@ impl Database {
                 event = "maintenance_rollup_untagged_input",
                 "base files carry no slice tags; selected on timestamp statistics instead"
             );
+        }
+        // A DERIVED unit's witness describes the RAW partition, but its INPUT is
+        // the base tier — witness table != input table, which is the one
+        // invariant that makes the base tier safe. On a SEALED day the raw
+        // witness agrees forever, so a derived cell built over a still-holey
+        // base is published short and then trusted permanently. Prod 2026-08-25,
+        // project 28f62f01 / 2026-08-20, 1h tier against raw truth: 19:00 exact,
+        // 20:00 68,881 vs 139,285 (-51%), 21:00 -56%, 22:00 -72%, and the 23:00
+        // cell claimed its hour while holding ZERO rows. Routed reads on a
+        // mature process returned exactly those sums, -68.8% over 20:00-24:00.
+        //
+        // The base tier cannot fail this way because its holes are ABSENCES:
+        // `rollup::complement` hands an uncovered range to the raw fringe and
+        // the answer stays exact. So bound the derived unit the same way — it
+        // may only publish a range its base tier actually covers, and otherwise
+        // RETRY, which leaves the range absent and the read path exact.
+        //
+        // `rollup_slice_coverage` is the same union the read path routes on, and
+        // it records EMPTY publications too (the insert at the publish site is
+        // unconditional, and its `Publication` is recovered from the journal at
+        // boot), so a genuinely empty base slice counts as covered and cannot
+        // deadlock this.
+        //
+        // Gaps OUTSIDE the source partition's own span are not holes: base units
+        // are planned from row statistics, so their slices begin at the first
+        // row rather than at 00:00 — the same fact the `partition_min_ts` gate at
+        // the publish site rests on. Without this trim every day-opening derived
+        // unit would retry forever, which is its own outage. The span comes from
+        // add-action statistics, which over-report (tombstones, superseded
+        // merge-on-read versions), so the trim can only RETAIN a gap — the
+        // direction that retries instead of publishing short.
+        //
+        // Placed before `resume_rollup_unit` and `split_time_task` deliberately:
+        // staged output from a previous process was built over whatever the base
+        // held THEN, and children of a split inherit the same incomplete base.
+        if derived
+            && let Some((hole_start, hole_end)) = crate::rollup::uncovered(key.slice.start_micros, key.slice.end_micros, base_covered)
+                .into_iter()
+                .find(|(start, end)| partition_identity.is_none_or(|(_, min_ts, max_ts)| *end > min_ts && *start <= max_ts))
+        {
+            crate::observability::maintenance_stats().rollup_derived_base_incomplete.fetch_add(1, Relaxed);
+            warn!(
+                table = %key.physical_table, project_id = %key.project_id, base = %from,
+                slice_start = key.slice.start_micros, slice_end = key.slice.end_micros, hole_start, hole_end,
+                event = "maintenance_rollup_base_tier_incomplete",
+                "the base tier does not cover this derived slice; retrying rather than publishing a short cell"
+            );
+            // Neither a capacity nor a schema failure, so `retry_or_split` leaves
+            // the slice whole (splitting would only mint children over the same
+            // incomplete base) and it is never quarantined. The backoff caps at
+            // ~32 min: this is a metadata-only pass, but a base that never
+            // completes must not re-claim a worker every second.
+            let attempts = self.journal().attempts(&key);
+            retry("base_tier_incomplete".to_owned(), std::time::Duration::from_secs(60u64 << attempts.min(5)))?;
+            return Ok(true);
         }
         // Everything above this line is metadata; everything below is the scan
         // and aggregate that make a unit ~21 minutes. If a previous process got
@@ -2222,7 +2302,7 @@ impl Database {
             // returns exactly what a raw scan would — nothing. `min_ts` comes
             // from the same `partition_stats_bounded` call as the fingerprint, so
             // it describes the snapshot this build actually read.
-            if let Some((partition_fp, partition_min_ts)) = partition_identity
+            if let Some((partition_fp, partition_min_ts, _)) = partition_identity
                 && partition_min_ts >= key.slice.start_micros
             {
                 self.rollup_coverage.insert(

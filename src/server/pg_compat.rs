@@ -1000,6 +1000,7 @@ impl StatsTableProvider {
             "rollup_rebuilds_full_total" => m.rollup_rebuilds_full,
             "rollup_dirty_partitions" => m.rollup_dirty_partitions,
             "rollup_skipped_covered_by_wider" => m.rollup_skipped_covered_by_wider,
+            "rollup_derived_base_incomplete" => m.rollup_derived_base_incomplete,
             "split_declined_at_floor" => m.split_declined_at_floor,
             "immutable_column_disagreement_total" => m.immutable_column_disagreement_total,
             "coverage_ledger_disagreements" => m.coverage_ledger_disagreements,

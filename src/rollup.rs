@@ -626,6 +626,18 @@ pub(crate) fn complement(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> Vec<(i64, i
     gaps
 }
 
+/// [`complement`] for a coverage set that is neither sorted nor disjoint.
+///
+/// Slice coverage arrives from a `DashMap` in hash order and its ranges overlap
+/// freely — `split_time_task` cuts a day into children and `coarsen_sealed_slices`
+/// fuses them back, so the same hours are published at several widths at once.
+/// Sorting by start is all `complement` needs; its `cursor.max(end)` already
+/// absorbs overlap.
+pub(crate) fn uncovered(lo: i64, hi: i64, mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.sort_unstable();
+    complement(lo, hi, &ranges)
+}
+
 pub(crate) fn hybrid_branch_count(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> usize {
     ranges.len().saturating_add(complement(lo, hi, ranges).len())
 }
@@ -2269,6 +2281,25 @@ mod tests {
     use std::sync::Arc;
 
     const SOURCE: &str = "otel_logs_and_spans";
+
+    /// The derived-rollup base gate feeds `uncovered` a `DashMap` iteration —
+    /// unsorted, and overlapping because one range is published at several
+    /// widths at once. A "sorted and disjoint" contract silently reports holes
+    /// that are not there, which for that gate means retrying forever.
+    #[test]
+    fn uncovered_tolerates_unsorted_overlapping_coverage() {
+        for (covered, want) in [
+            (vec![], vec![(0, 100)]),
+            (vec![(0, 100)], vec![]),
+            // Reversed and overlapping: still tiles [0,100).
+            (vec![(50, 100), (0, 60)], vec![]),
+            // The 1h-tier shape: hour 20 built, 21-23 absent.
+            (vec![(0, 25)], vec![(25, 100)]),
+            (vec![(25, 50), (75, 100)], vec![(0, 25), (50, 75)]),
+        ] {
+            assert_eq!(uncovered(0, 100, covered.clone()), want, "coverage {covered:?}");
+        }
+    }
 
     /// `MissReason::label` feeds the `rollup_misses` counter, so these strings
     /// are a prod dashboard contract, not an implementation detail. Pinned
