@@ -3597,7 +3597,11 @@ impl Database {
                 let reason = if witnessed.contains(&key) {
                     UnverifiableReason::MixedWitness
                 } else {
-                    witness_reasons.get(&key).copied().unwrap_or(UnverifiableReason::TagAbsent)
+                    // Never `TagAbsent` as a default: a lost classification would
+                    // then hide inside the largest legitimate bucket. This arm is
+                    // unreachable (the same iteration that added the identity
+                    // recorded its reason), and says so out loud if it ever is.
+                    witness_reasons.get(&key).copied().unwrap_or(UnverifiableReason::Unattributed)
                 };
                 reason.bump(&mut reasons);
                 spec_unverifiable += 1;

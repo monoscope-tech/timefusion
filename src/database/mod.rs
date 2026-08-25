@@ -392,6 +392,15 @@ pub mod rollup_unverifiable {
             /// too, since Delta tags are `HashMap<String, Option<String>>`).
             /// History written before the tag existed.
             TagAbsent => "witness_tag_absent",
+            /// MUST STAY 0. The catch-all, and it is unreachable by
+            /// construction: a witness-less identity is recorded with its reason
+            /// in the same loop iteration that puts it in the tagged set, so the
+            /// tally can always find it. Nonzero means the two passes disagree
+            /// about the population and the split can no longer be trusted to
+            /// sum — which is worth a row precisely because the alternative,
+            /// defaulting into a real bucket, would hide it inside the largest
+            /// legitimate count.
+            Unattributed => "unattributed",
         }
     }
 
