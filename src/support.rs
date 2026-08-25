@@ -211,8 +211,9 @@ pub mod test_helpers {
             let id = format!("{}-{}", self.test_name, &uuid::Uuid::new_v4().to_string()[..8]);
             let mut cfg = minio_base_config(&id, &format!("/tmp/timefusion-{id}"));
             cfg.buffer.timefusion_flush_immediately = self.buffer_mode == BufferMode::FlushImmediately;
-            cfg.maintenance.timefusion_rollup_enabled = self.rollups;
-            cfg.maintenance.timefusion_rollup_read_enabled = self.rollups;
+            // Rollups are unconditional now, so `with_rollups()` no longer gates
+            // anything — it stays as a declaration of intent at the call sites.
+            let _ = self.rollups;
             Arc::new(cfg)
         }
     }

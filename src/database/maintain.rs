@@ -587,7 +587,7 @@ impl Database {
         const BACKFILL_PENDING_CEILING: usize = 25_000;
 
         let horizon = i64::from(self.config.maintenance.timefusion_rollup_backfill_days);
-        if horizon == 0 || !self.config.maintenance.timefusion_rollup_enabled {
+        if horizon == 0 {
             return Ok(0);
         }
         // Defers the ENQUEUE, not the pass. The ceiling exists because a deep
@@ -2749,7 +2749,7 @@ impl Database {
     /// Walks the batches' dates, so it is gated on the master switch as well as
     /// the schema: with rollups off this runs on every inbound write for nothing.
     pub(crate) fn invalidate_rollup_batches(&self, project_id: &str, source: &str, batches: &[RecordBatch]) -> std::io::Result<()> {
-        if !self.config.maintenance.timefusion_rollup_enabled || get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
+        if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return Ok(());
         }
         let mut dates: HashMap<String, u32> = HashMap::new();
@@ -3370,9 +3370,6 @@ impl Database {
 
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
-        if !self.config.maintenance.timefusion_rollup_enabled {
-            return Ok(0);
-        }
         self.retire_aged_out_coverage();
         let mut recovered = 0;
         // Summed over every declared tier, then stored ONCE. Storing per tier made
@@ -4052,7 +4049,7 @@ impl Database {
         let dates: Vec<chrono::NaiveDate> = (0..=lookback).rev().map(|d| today - chrono::Duration::days(d)).collect();
 
         let pre_version = table_ref.read().await.version().unwrap_or(0);
-        let needs_rollup_retry = self.config.maintenance.timefusion_rollup_enabled && get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
+        let needs_rollup_retry = get_schema(table_name).is_some_and(|schema| !schema.rollups.is_empty());
         if !needs_rollup_retry && self.last_dedup_versions.read().await.get(dedup_key).copied() == Some(pre_version) {
             debug!("dedup sweep: table={} version={} unchanged — skipping", table_name, pre_version);
             return Ok(());

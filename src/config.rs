@@ -2054,15 +2054,13 @@ pub struct MaintenanceConfig {
     /// sealed bins are the normal maintenance path.
     #[serde(default)]
     pub timefusion_dedup_sweep_fallback: bool,
-    /// Master kill switch for rollup builds and reads.
-    #[serde(default)]
-    pub timefusion_rollup_enabled: bool,
-    /// Read-side rollup routing gate. Builds can run while this stays off.
-    #[serde(default)]
-    pub timefusion_rollup_read_enabled: bool,
-    /// Allow raw fringes and a live raw tail around certified rollup windows.
-    #[serde(default)]
-    pub timefusion_rollup_realtime_tail: bool,
+    // Rollup builds, read routing and the realtime tail were three separate
+    // `#[serde(default)]` bools — i.e. OFF unless the environment said otherwise,
+    // which meant a fresh deployment ran with rollups silently disabled and every
+    // wide query on the raw path. Prod set all three to `true` and had done for
+    // months, so the flags encoded no decision anyone was still making; they only
+    // created a way for the feature to be off by accident. Deleted rather than
+    // defaulted-on, so there is no longer a switch to get wrong.
     /// Optional comma-separated read canary projects.
     #[serde(default)]
     pub timefusion_rollup_read_projects: Option<String>,
@@ -2084,7 +2082,10 @@ pub struct MaintenanceConfig {
     /// Set 0 to disable.
     // Must match `timefusion_dedup_lookback_days` — certification and rollup coverage need
     // the same horizon, or a day is certified but never rolled up (or vice versa).
-    #[serde_inline_default(35)]
+    // 31, matching what prod runs. Still configurable — a shorter horizon is a
+    // legitimate choice for a small deployment — but the default is the value
+    // that has actually been exercised.
+    #[serde_inline_default(31)]
     pub timefusion_rollup_backfill_days: u16,
     #[serde_inline_default("0 */10 * * * *".to_string())]
     pub timefusion_rollup_backfill_schedule: String,
@@ -2314,19 +2315,20 @@ impl MaintenanceConfig {
         projects.is_none_or(|projects| projects.trim().is_empty() || projects.split(',').map(str::trim).any(|project| project == project_id))
     }
 
-    /// Builds run for EVERY project once rollups are on.
+    /// Reads honour the canary allow-list; BUILDS run for every project,
+    /// unconditionally, and there is no longer a switch for either.
     ///
-    /// There was a per-project canary allow-list here. It was deleted because a
-    /// hidden list of project UUIDs is a debugging trap: "why has this project
-    /// no rollup" has an answer that lives in an env var nobody remembers
-    /// setting, and any project created after the list was written silently
-    /// never gets built.
-    pub fn rollup_build_enabled(&self) -> bool {
-        self.timefusion_rollup_enabled
-    }
-
+    /// `rollup_build_enabled()` used to live here returning the global flag.
+    /// With that flag gone the function could only ever return `true`, and a
+    /// predicate that is always true is worse than no predicate — it reads at
+    /// the call site like a decision is being made.
+    ///
+    /// The build side deliberately has no allow-list: a hidden list of project
+    /// UUIDs is a debugging trap, because "why has this project no rollup" then
+    /// has an answer living in an env var nobody remembers setting, and any
+    /// project created after the list was written silently never gets built.
     pub fn rollup_read_enabled_for(&self, project_id: &str) -> bool {
-        self.timefusion_rollup_enabled && self.timefusion_rollup_read_enabled && Self::selected(project_id, self.timefusion_rollup_read_projects.as_deref())
+        Self::selected(project_id, self.timefusion_rollup_read_projects.as_deref())
     }
 
     /// Flush escalation-sort pool in bytes. Floored so a misconfigured 0 can't
@@ -2545,21 +2547,25 @@ mod tests {
         assert_eq!(cfg.timefusion_tantivy_reconcile_schedule, "0 */15 * * * *");
     }
 
-    /// Builds follow the global switch and NOTHING else. The read side keeps
-    /// its canary list; the build side deliberately has none, so a project
-    /// missing a rollup is never explained by a forgotten env var.
+    /// Rollups are ON with no configuration at all, and the read canary is the
+    /// only thing left that can narrow them.
+    ///
+    /// Three `#[serde(default)]` bools used to gate builds, reads and the
+    /// realtime tail — OFF unless the environment said otherwise, so a fresh
+    /// deployment ran with rollups silently disabled and every wide query on the
+    /// raw path. Prod had set all three to `true` for months, so they encoded no
+    /// live decision; they only offered a way to be off by accident.
     #[test]
-    fn rollup_builds_follow_the_global_switch_for_every_project() {
-        let mut config = AppConfig::default().maintenance;
-        assert!(!config.rollup_build_enabled());
-        assert!(!config.rollup_read_enabled_for("project-a"));
+    fn rollups_need_no_configuration_and_only_the_read_canary_narrows_them() {
+        let mut config: MaintenanceConfig = serde_json::from_str("{}").expect("every field has a default");
+        // A DESERIALIZED default config — what prod actually runs — routes reads
+        // for any project without anything being set.
+        assert!(config.rollup_read_enabled_for("project-a"), "an unconfigured deployment must still route");
+        assert!(config.rollup_read_enabled_for("a-project-created-tomorrow"));
+        assert_eq!(config.timefusion_rollup_backfill_days, 31, "the shipped default is the value prod exercises");
 
-        config.timefusion_rollup_enabled = true;
-        config.timefusion_rollup_read_enabled = true;
+        // The canary still narrows the READ side when it is set, and only then.
         config.timefusion_rollup_read_projects = Some("project-b".into());
-        for project in ["project-a", "project-b", "project-c", "a-project-created-tomorrow"] {
-            assert!(config.rollup_build_enabled(), "builds must cover every project: {project}");
-        }
         assert!(!config.rollup_read_enabled_for("project-a"));
         assert!(config.rollup_read_enabled_for("project-b"));
     }

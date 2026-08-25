@@ -3778,7 +3778,7 @@ impl Database {
         // Both switches are project-independent, so they are checked BEFORE the
         // matcher: `match_aggregate` plans one statement per filtered measure,
         // and with the feature off that cost must not be paid at all.
-        if self.bypass_rollup || !self.config.maintenance.timefusion_rollup_enabled || !self.config.maintenance.timefusion_rollup_read_enabled {
+        if self.bypass_rollup {
             return Ok(None);
         }
         let routes = crate::rollup::match_aggregates(logical_plan, session).await?;
@@ -3792,7 +3792,7 @@ impl Database {
             Some(project) => self.config.maintenance.rollup_read_enabled_for(project),
             None => {
                 let maintenance = &self.config.maintenance;
-                maintenance.timefusion_rollup_enabled && maintenance.timefusion_rollup_read_enabled && maintenance.timefusion_rollup_read_projects.is_none()
+                maintenance.timefusion_rollup_read_projects.is_none()
             }
         };
         if !enabled {
@@ -4052,7 +4052,9 @@ impl Database {
         // A buffered row is missing from EVERY rollup partition, whichever dates
         // are certified, so this caps the whole set rather than trimming a tail.
         let horizon = buffered.unwrap_or(route.hi);
-        let realtime = self.config.maintenance.timefusion_rollup_realtime_tail;
+        // Always on. This was a `#[serde(default)]` bool that prod set to `true`
+        // and nothing else ever set at all — see the note in `config.rs`.
+        let realtime = true;
         // Sampled on the same limiter as `rollup_miss_sampled`, so a
         // multiple-per-second miss rate cannot flood the log.
         if let Some(project) = &first_uncovered
