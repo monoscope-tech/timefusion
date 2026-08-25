@@ -114,6 +114,20 @@ pub fn is_capacity_failure(message: &str) -> bool {
     // abandon_running's split nor its backoff floor ever fired.
     message.contains("Resources exhausted") || message.contains("Not enough memory to continue external sort") || message.contains("resource_admission")
 }
+
+/// Whether a failure is a DETERMINISTIC PLAN error — the SQL could not be built
+/// at all, so every retry, and every CHILD of a bisection, fails identically.
+///
+/// The opposite verdict to [`is_capacity_failure`]: shrinking the slice cannot
+/// make a missing column appear, it only multiplies the number of units failing
+/// on it. Prod 2026-08-24: base files written before a rollup spec change lacked
+/// `duration_digest`, and bisecting the units that named it turned one bad spec
+/// into 477 of 658 claims failing in eight minutes — the 1h tier froze and every
+/// other operation starved behind the storm. Same string-matching contract as
+/// its sibling, pinned by `schema_failures_are_recognised_from_prod_text`.
+pub fn is_schema_failure(message: &str) -> bool {
+    message.contains("Schema error") || message.contains("SchemaError") || message.contains("No field named")
+}
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
@@ -135,6 +149,18 @@ pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
 /// churn race inside the rollup tier. Row counts survive compaction.
 pub const TAG_SOURCE_ROWS: &str = "timefusion.source_rows";
 pub const TAG_GENERATION: &str = "timefusion.generation";
+/// Which declared measures this slice's files actually MATERIALIZED, comma
+/// separated — not what the spec declares.
+///
+/// The generation does not imply it. `duration_digest` was declared 2026-08-22
+/// and first written 2026-08-24 10:30 UTC, so slices carrying the current
+/// generation hold no digest at all, and Delta null-fills the column on scan.
+/// Every merge then SKIPS those nulls — `tdigest_merge` and SQL `SUM` alike —
+/// so the answer is a plausible number computed from the covered fraction
+/// rather than a visible NULL: prod measured a p95 over 08-22..08-25 built from
+/// 3,438 of 14,830 rows. The read path refuses a cell that cannot prove the
+/// measure a query needs; see `RoutedRollup::measures_available`.
+pub const TAG_MEASURES: &str = "timefusion.measures";
 const JOURNAL_VERSION: u32 = 1;
 const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 static THROUGHPUT_SAMPLE: std::sync::OnceLock<Mutex<(i64, u64)>> = std::sync::OnceLock::new();
@@ -166,15 +192,19 @@ impl Operation {
 /// The operation mix a maintenance worker rotates through. One definition for
 /// the server loop (`run_coordinator_maintenance_once`) and the journal-replay
 /// simulator (`maintenance_sim`) — the sim exists to evaluate changes to this
-/// mix, so the two must never be able to drift apart.
+/// mix, so the two must never be able to drift apart. The SIGNAL that selects
+/// the cycle is shared too: both sides decide through
+/// `database::coverage_is_short_for` over `database::median_contiguous_days`.
 ///
 /// BALANCED interleaves dependent publication with dedup: dedup/base receive
 /// three slots each; derived and file work each receive one. `claim_next`
 /// still applies deadline, recent-slice, dependency, and project fairness.
 ///
 /// COVERAGE_SHORT gives the rollup chain the slots while
-/// `rollup_min_contiguous_days` is below goal: `dependencies_complete` makes
-/// BaseRollup depend on NOTHING, so of the balanced cycle six slots in ten go
+/// `rollup_median_contiguous_days` is below goal (the MEDIAN, not the goal
+/// gauge — one negligible tenant must not pin the fleet):
+/// `dependencies_complete` makes BaseRollup depend on NOTHING, so of the
+/// balanced cycle six slots in ten go
 /// to work that cannot advance the metric governing 14d/30d latency (measured
 /// 2026-08-18). Every operation keeps at least one slot — file debt left at
 /// zero is how file counts ran to 2-3k and degraded every query (2026-08-01).
@@ -626,11 +656,23 @@ pub struct TaskLease {
     journal: Arc<Mutex<TaskJournal>>,
     key: TaskKey,
     started_micros: i64,
+    /// Why the unit is about to fail, when the failing path knows. Errors leave
+    /// a run function through `?`, which reaches [`Drop`] carrying nothing at
+    /// all, so without this `abandon_running` must treat a deterministic plan
+    /// error exactly like a timeout — and bisect it. Mutex, not `RefCell`, so
+    /// the lease stays `Send` across the run functions' awaits.
+    failure: Mutex<Option<String>>,
 }
 
 impl TaskLease {
     pub fn new(journal: Arc<Mutex<TaskJournal>>, key: TaskKey) -> Self {
-        Self { journal, key, started_micros: crate::support::now_micros() }
+        Self { journal, key, started_micros: crate::support::now_micros(), failure: Mutex::new(None) }
+    }
+
+    /// Annotate the error on its way out: `lease.note_failure(error)?`.
+    pub fn note_failure<E: std::fmt::Display>(&self, error: E) -> E {
+        *self.failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
+        error
     }
 }
 
@@ -671,7 +713,8 @@ impl Drop for TaskLease {
             event = "maintenance_task_finished"
         );
         if outcome == Some(TaskState::Running) {
-            journal.abandon_running(&self.key, crate::support::now_micros());
+            let failure = self.failure.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            journal.abandon_running(&self.key, crate::support::now_micros(), failure.as_deref());
             if let Err(error) = journal.checkpoint() {
                 tracing::error!(error = %error, task = ?self.key, "failed to checkpoint maintenance task lease recovery");
             }
@@ -1846,7 +1889,12 @@ impl TaskJournal {
             // quarantine permit; the reset below erased both every 60s, which is
             // how day-wide units re-claimed every 5-8 minutes against a >=900s
             // floor. The debt it re-notices is already queued — nothing is lost.
-            if self.snapshot.tasks[index].state == TaskState::Retry && self.snapshot.tasks[index].retry_reason.as_deref() == Some(Self::WORKER_FAILURE_REASON) {
+            // `schema_error` for the same reason, and more sharply: a re-mint
+            // would clear the park and hand the unit straight back to a worker
+            // whose plan cannot build, every 60 seconds.
+            if self.snapshot.tasks[index].state == TaskState::Retry
+                && matches!(self.snapshot.tasks[index].retry_reason.as_deref(), Some(Self::WORKER_FAILURE_REASON | Self::SCHEMA_FAILURE_REASON))
+            {
                 return;
             }
             let task = &mut self.snapshot.tasks[index];
@@ -2047,6 +2095,26 @@ impl TaskJournal {
     /// back — a deadline it could not meet, or an error inside the unit.
     pub const WORKER_FAILURE_REASON: &'static str = "worker_error";
 
+    /// The `retry_reason` a unit parked on a DETERMINISTIC plan error carries —
+    /// a state token, never the error text, because three places match it
+    /// exactly: [`Self::is_quarantined`], the planner re-mint guard in
+    /// `enqueue`, and the claim gate that reads the first. The text is logged
+    /// once at the park site instead.
+    pub const SCHEMA_FAILURE_REASON: &'static str = "schema_error";
+    /// How long a schema-parked unit waits. Deliberately as long as the file's
+    /// other never-going-to-change-soon retries (`invalid_slice_timestamp`): the
+    /// thing that fixes it is a rebuild or a deploy, not another attempt.
+    const SCHEMA_PARK_MICROS: i64 = 3_600 * 1_000_000;
+
+    /// Park a unit whose SQL cannot be planned. Never bisected: the children
+    /// would name the same missing column and fail identically, which is the
+    /// 2026-08-24 retry storm.
+    fn park_schema_failure(&mut self, key: &TaskKey, now_micros: i64, error: &str) {
+        crate::observability::maintenance_stats().maintenance_schema_parked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(?key, %error, event = "maintenance_task_schema_parked", "parked a maintenance unit on a deterministic plan error instead of bisecting it");
+        self.retry(key, Self::SCHEMA_FAILURE_REASON.to_owned(), now_micros.saturating_add(Self::SCHEMA_PARK_MICROS));
+    }
+
     /// Has this unit PROVEN it cannot fit its deadline?
     ///
     /// Attempts alone is not that proof, and using it as the proxy quarantined
@@ -2065,8 +2133,11 @@ impl TaskJournal {
     ///
     /// So require the worker's own verdict: only a unit `abandon_running` gave
     /// back is evidence about cost. Anything else retries normally.
+    /// A schema-parked unit qualifies immediately: one deterministic plan error
+    /// is already proof, and rationing its claims is the point of the tag.
     pub fn is_quarantined(task: &MaintenanceTask) -> bool {
-        task.attempts >= Self::QUARANTINE_ATTEMPTS && task.retry_reason.as_deref() == Some(Self::WORKER_FAILURE_REASON)
+        task.retry_reason.as_deref() == Some(Self::SCHEMA_FAILURE_REASON)
+            || (task.attempts >= Self::QUARANTINE_ATTEMPTS && task.retry_reason.as_deref() == Some(Self::WORKER_FAILURE_REASON))
     }
 
     /// Claim one unit. `allow_quarantined` admits units that have already timed
@@ -2378,7 +2449,16 @@ impl TaskJournal {
     /// Byte-based splitting does not cover this. It fires on decoded bytes,
     /// while what overran was WALL TIME — a day-sized slice with modest bytes
     /// still pays an object-store round trip per file.
-    pub fn abandon_running(&mut self, key: &TaskKey, now_micros: i64) {
+    ///
+    /// `failure` is the worker's own account of what went wrong, when it had
+    /// one — a timeout drops the future and carries nothing, and that unnamed
+    /// case is exactly the one bisection exists for. Positive evidence of a
+    /// DETERMINISTIC plan error is the one thing that suppresses it.
+    pub fn abandon_running(&mut self, key: &TaskKey, now_micros: i64, failure: Option<&str>) {
+        if let Some(error) = failure.filter(|failure| is_schema_failure(failure)) {
+            self.park_schema_failure(key, now_micros, error);
+            return;
+        }
         let attempts = self.task_indices.get(key).and_then(|index| self.snapshot.tasks.get(*index)).map_or(1, |task| task.attempts);
         // `MAX_DECODED_BYTES + 1` is the smallest input that makes
         // `byte_bounded_units` bisect, and a bisect is one halving: this asks
@@ -2428,6 +2508,12 @@ impl TaskJournal {
     /// 50-80s of object-store work per pass, and each guarding a partition that
     /// stayed uncertified — which keeps `DedupExec` in every query plan over it.
     pub fn retry_or_split(&mut self, key: &TaskKey, reason: String, when_micros: i64, attempts: u32) {
+        // A reason that names a missing field is the opposite verdict: the
+        // input does not FIT nothing — it cannot be PLANNED, at any width.
+        if is_schema_failure(&reason) {
+            self.park_schema_failure(key, crate::support::now_micros(), &reason);
+            return;
+        }
         if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1), None) {
             return;
         }
@@ -3175,6 +3261,58 @@ impl Drop for AdmissionPermit {
 mod tests {
     use super::*;
 
+    /// Verbatim prod text, 2026-08-24: base files written before a rollup spec
+    /// change lacked `duration_digest`, and the DataFusion `SchemaError` that
+    /// raised arrives type-erased, so the strings are the contract.
+    #[test]
+    fn schema_failures_are_recognised_from_prod_text() {
+        assert!(is_schema_failure("Schema error: No field named duration_digest. Valid fields are __maintenance_slice_input_0.project_id, ..."));
+        assert!(is_schema_failure("Error during planning: SchemaError(FieldNotFound { field: Column { name: \"duration_digest\" } })"));
+        for benign in ["dedup: Object at location ... not found", "compaction: transaction failed: version 2667 already exists", "resource_admission"] {
+            assert!(!is_schema_failure(benign), "must not park a unit that would succeed on a retry: {benign}");
+        }
+    }
+
+    /// A missing column cannot be halved away: every CHILD of a bisection names
+    /// it too and fails identically, so splitting turns one bad spec into a
+    /// retry storm. Prod 2026-08-24: 477 of 658 claims failed in eight minutes,
+    /// the 1h rollup tier stopped ingesting entirely, and every other operation
+    /// starved behind the churn. Both entry points must park instead — and the
+    /// park has to survive the 60s planner re-mint, or it is a hot loop with a
+    /// fresh face.
+    #[test_case::test_case(true ; "the worker hands back a plan error")]
+    #[test_case::test_case(false ; "a fast-fail retry reason carries one")]
+    fn a_deterministic_plan_error_parks_instead_of_shredding_the_slice(via_abandon: bool) {
+        const ERROR: &str = "Schema error: No field named duration_digest.";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Day-wide: splittable, so nothing but the guard stops the bisection.
+        let mut unit = task("p", 0, DAY_MICROS, Operation::BaseRollup);
+        unit.attempts = 2;
+        unit.state = TaskState::Running;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        let now = 1_000_000_000;
+        if via_abandon {
+            journal.abandon_running(&key, now, Some(ERROR));
+        } else {
+            journal.retry_or_split(&key, format!("resolve_input: {ERROR}"), now, 2);
+        }
+
+        assert_eq!(journal.tasks().count(), 1, "a deterministic failure must not be bisected into children that fail identically");
+        let parked = journal.tasks().find(|candidate| candidate.key == key).expect("requeued").clone();
+        assert_eq!(parked.state, TaskState::Retry);
+        assert_eq!(parked.retry_reason.as_deref(), Some(TaskJournal::SCHEMA_FAILURE_REASON), "the operator must see a park, not a backoff");
+        assert!(TaskJournal::is_quarantined(&parked), "a parked unit is rationed to the quarantine permit, not the whole pool");
+        assert!(parked.deadline_micros >= now + 3_600_000_000, "a park waits for a deploy or a rebuild, not for the next tick");
+
+        journal.enqueue(key.clone(), now + 60_000_000, 1_000, 0);
+        let after = journal.tasks().find(|candidate| candidate.key == key).expect("still queued");
+        assert_eq!(after.deadline_micros, parked.deadline_micros, "the planner tick must not hand an unplannable unit straight back");
+        assert_eq!(after.retry_reason.as_deref(), Some(TaskJournal::SCHEMA_FAILURE_REASON));
+    }
+
     /// A unit that cannot be split — repair is the standing case, since its cost
     /// is the file it rewrites and time-bisection cannot shrink a file set — must
     /// not come straight back. Burning a 900s deadline and returning 256s later
@@ -3198,7 +3336,7 @@ mod tests {
         journal.upsert(unit);
 
         let now = 1_000_000_000;
-        journal.abandon_running(&key, now);
+        journal.abandon_running(&key, now, None);
 
         let deadline_micros = i64::try_from(operation_deadline_secs(Operation::Repair) * 1_000_000).expect("fits");
         let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
@@ -3225,7 +3363,7 @@ mod tests {
         let key = unit.key.clone();
         journal.upsert(unit);
 
-        journal.abandon_running(&key, 0);
+        journal.abandon_running(&key, 0, None);
         let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
         assert_eq!(not_before, 2 * 1_000_000, "one failure retries on plain exponential backoff, not the deadline floor");
     }
@@ -3300,7 +3438,7 @@ mod tests {
         let key = unit.key.clone();
         journal.upsert(unit);
 
-        journal.abandon_running(&key, 0);
+        journal.abandon_running(&key, 0, None);
         assert_eq!(journal.state(&key), Some(TaskState::Superseded), "two failures split a day-wide unit");
         let children: Vec<_> = journal.tasks().filter(|child| child.key != key).map(|child| child.key.clone()).collect();
         assert_eq!(children.len(), 2, "bisection leaves two live children");
@@ -3338,7 +3476,7 @@ mod tests {
         journal.upsert(unit);
 
         let now = 1_000_000_000;
-        journal.abandon_running(&key, now);
+        journal.abandon_running(&key, now, None);
         let floored = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
 
         journal.enqueue(key.clone(), now + 60_000_000, 1_000, 0);
@@ -3361,7 +3499,7 @@ mod tests {
         journal.upsert(unit);
 
         let now = 0;
-        journal.abandon_running(&key, now);
+        journal.abandon_running(&key, now, None);
         let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
         let exponential = 256 * 1_000_000i64;
         let floor = i64::try_from(operation_deadline_secs(Operation::Dedup) * 1_000_000).expect("fits");
@@ -6044,7 +6182,7 @@ mod tests {
         // retry, the second says the slice itself does not fit.
         for _ in 0..2 {
             assert!(journal.mark_running(&key));
-            journal.abandon_running(&key, 0);
+            journal.abandon_running(&key, 0, None);
         }
 
         let widths: Vec<i64> = journal.tasks().filter(|t| t.state != TaskState::Superseded).map(|t| t.key.slice.width()).collect();

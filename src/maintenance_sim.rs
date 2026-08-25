@@ -322,16 +322,18 @@ struct Stream {
     project_id: String,
 }
 
-/// Contiguity model mirroring `min_contiguous_days`: a day counts once its
-/// base tier AND its derived tier each cover a full day's width; contiguity
-/// counts back from yesterday; the gauge is the MIN over active (source,
-/// project) pairs — including pairs with NO completed coverage, which count 0.
+/// Contiguity model mirroring `min_contiguous_days`: a day counts for a tier
+/// once that tier covers its full width, and contiguity counts back from
+/// yesterday. Two statistics come off it, exactly as in production: the MIN
+/// over active (source, project) pairs is the reported goal metric, and the
+/// MEDIAN is what `coverage_is_short` steers by.
 struct Coverage {
     /// (source, project) -> day_start -> [base_width, derived_width] micros.
     days: HashMap<(String, String), BTreeMap<i64, [i64; 2]>>,
-    /// The active set: every stream found in the journal. The real gauge reads
-    /// recent source partitions, which is the same set by construction here.
-    pairs: Vec<(String, String)>,
+    /// The active set: every stream found in the journal, with whether it has a
+    /// derived tier at all. The real gauge reads recent source partitions, which
+    /// is the same set by construction here.
+    pairs: Vec<(String, String, bool)>,
 }
 
 impl Coverage {
@@ -351,24 +353,53 @@ impl Coverage {
         }
     }
 
-    fn min_contiguous_days(&self, now_micros: i64) -> u64 {
+    /// Contiguous covered days back from yesterday, per project of ONE
+    /// (source, tier) — the population production's backfill sweep folds over.
+    /// Per sweep rather than per pair-AND because the fleet gauge is a MEDIAN
+    /// within the sweep and a MIN across sweeps (`fold_fleet_gauge`), and a
+    /// median does not survive being AND-ed first.
+    fn contiguous_days(&self, now_micros: i64, source: &str, tier: usize) -> Vec<u64> {
         let yesterday = (now_micros.div_euclid(DAY_MICROS) - 1) * DAY_MICROS;
-        let mut min = u64::MAX;
-        for (source, project) in &self.pairs {
-            let mut contiguous = 0u64;
-            let mut day = yesterday;
-            while self
-                .days
-                .get(&(source.clone(), project.clone()))
-                .and_then(|days| days.get(&day))
-                .is_some_and(|widths| widths[0] >= DAY_MICROS && widths[1] >= DAY_MICROS)
-            {
-                contiguous += 1;
-                day -= DAY_MICROS;
-            }
-            min = min.min(contiguous);
-        }
-        if min == u64::MAX { 0 } else { min }
+        self.pairs
+            .iter()
+            .filter(|(pair_source, _, has_derived)| pair_source == source && (tier == 0 || *has_derived))
+            .map(|(_, project, _)| {
+                let days = self.days.get(&(source.to_owned(), project.clone()));
+                (0i64..).take_while(|back| days.and_then(|d| d.get(&(yesterday - back * DAY_MICROS))).is_some_and(|widths| widths[tier] >= DAY_MICROS)).count()
+                    as u64
+            })
+            .collect()
+    }
+
+    /// One entry per (source, tier) sweep, skipping sweeps with no projects —
+    /// a tier no stream declares does not exist to fold, exactly as production
+    /// never sweeps it.
+    fn per_sweep(&self, now_micros: i64) -> Vec<Vec<u64>> {
+        let sources = self.pairs.iter().map(|(source, ..)| source.as_str()).collect::<std::collections::BTreeSet<_>>();
+        sources.into_iter().flat_map(|source| (0..2).map(move |tier| self.contiguous_days(now_micros, source, tier))).filter(|days| !days.is_empty()).collect()
+    }
+
+    /// The goal metric: days every pair can answer, every tier. Reported, never
+    /// steered by — see `coverage_is_short`.
+    fn min_contiguous_days(&self, now_micros: i64) -> u64 {
+        self.per_sweep(now_micros).into_iter().filter_map(|days| days.into_iter().min()).min().unwrap_or(0)
+    }
+
+    /// The control signal, computed the way production computes it: the MEDIAN
+    /// over each (source, tier) sweep's projects, folded by MIN, compared through
+    /// the one shared predicate (`database::coverage_is_short_for`). Steering by
+    /// the MIN here — which is what the sim used to do — puts the sim in
+    /// coverage-short mode on states where the server is not, silently
+    /// invalidating exactly the cycle-policy answers the sim exists to give.
+    ///
+    /// RESIDUAL GAP: production lets a tier younger than the backfill horizon
+    /// ABSTAIN from the fleet fold (`fold_fleet_gauge`'s `ramping`). The sim has
+    /// no tier creation time, so no simulated tier ever abstains; on a freshly
+    /// created tier production reads its median as provisional where the sim
+    /// takes it at face value.
+    fn coverage_is_short(&self, now_micros: i64) -> bool {
+        let fleet = self.per_sweep(now_micros).into_iter().map(|mut days| crate::database::median_contiguous_days(&mut days)).min().unwrap_or(0);
+        crate::database::coverage_is_short_for(fleet)
     }
 }
 
@@ -512,7 +543,8 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         streams.truncate(target);
     }
 
-    let mut coverage = Coverage { days: HashMap::new(), pairs: streams.iter().map(|s| (s.source.clone(), s.project_id.clone())).collect() };
+    let mut coverage =
+        Coverage { days: HashMap::new(), pairs: streams.iter().map(|s| (s.source.clone(), s.project_id.clone(), s.derived_rollup_table.is_some())).collect() };
     // Seed coverage from already-complete rollup tasks so a fetched journal
     // starts with the coverage prod actually has.
     for task in journal.tasks() {
@@ -555,7 +587,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     let mut none_until = [0i64; 6];
     // Evaluated before any claim, so the initial cycle matches the journal's
     // seeded coverage.
-    let mut coverage_short = coverage.min_contiguous_days(now) < crate::database::COVERAGE_SHORT_DAYS;
+    let mut coverage_short = coverage.coverage_is_short(now);
 
     while now < end {
         let next_worker_free = workers.iter().map(|w| w.busy_until).min().unwrap_or(end);
@@ -635,7 +667,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     if matches!(key.operation, Operation::BaseRollup | Operation::DerivedRollup) {
                         coverage.record(&key);
                         let contiguous = coverage.min_contiguous_days(now);
-                        coverage_short = contiguous < crate::database::COVERAGE_SHORT_DAYS;
+                        coverage_short = coverage.coverage_is_short(now);
                         // Capture milestones at the crossing event, not just at
                         // report ticks — a tick can land just short of a day
                         // boundary and read one day less.
@@ -651,7 +683,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     // Timeout: the worker burned the whole deadline, then the
                     // lease drop abandons the unit — bisect on repeat, else
                     // deadline-floored backoff. Real code, not a re-imagination.
-                    journal.abandon_running(&key, now);
+                    journal.abandon_running(&key, now, None);
                     none_until = [0; 6];
                     match journal.state(&key) {
                         Some(TaskState::Superseded) => report.splits += 1,
@@ -983,6 +1015,53 @@ mod tests {
         let report_10x = run(journal_with_streams(13), &cfg_10x, start).unwrap();
         assert!(report_10x.pending_end > 10 * pending_13.max(1), "10x must diverge: pending {} vs {} at 13 projects", report_10x.pending_end, pending_13);
         assert!(report_10x.frontier_lag_secs_max > report_13.frontier_lag_secs_max + 600, "10x lag must clearly exceed the 13-project lag");
+    }
+
+    /// The sim and the server must make the SAME coverage-short decision from
+    /// the same coverage state — the cycle it selects is most of what the sim is
+    /// asked about. Each case is the per-project count of contiguous covered
+    /// days; the rows where MIN and MEDIAN disagree are the whole point (the sim
+    /// used to gate on the MIN, so a single laggard put it in coverage-short
+    /// mode on states the server calls healthy).
+    #[test_case::test_case(&[30, 30, 30], &[30, 30, 30], false; "fleet covered")]
+    #[test_case::test_case(&[2, 3, 4], &[2, 3, 4], true; "fleet short")]
+    #[test_case::test_case(&[0, 20, 25], &[0, 20, 25], false; "one laggard cannot pin the fleet")]
+    #[test_case::test_case(&[13, 15], &[13, 15], false; "even count takes the upper median")]
+    #[test_case::test_case(&[0, 13], &[0, 13], true; "even count upper median still short")]
+    #[test_case::test_case(&[30, 30, 30], &[2, 2, 2], true; "a lagging derived tier is short on its own")]
+    fn sim_and_server_agree_on_coverage_short(base: &[u64], derived: &[u64], expected: bool) {
+        use std::collections::HashSet;
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let now = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let source_table = "otel_logs_and_spans".to_owned();
+        let projects = (0..base.len()).map(|i| format!("p{i}")).collect::<Vec<_>>();
+        // Every project's SOURCE holds all 30 days back; each tier covers its
+        // own count of them, at full width.
+        let (mut covered, mut source) = ([HashSet::new(), HashSet::new()], HashSet::new());
+        let mut coverage = Coverage { days: HashMap::new(), pairs: Vec::new() };
+        for (index, project) in projects.iter().enumerate() {
+            coverage.pairs.push((source_table.clone(), project.clone(), true));
+            for back in 1..=30u64 {
+                let date = today - chrono::Duration::days(back as i64);
+                source.insert((project.clone(), date));
+                for (tier, days) in [base, derived].into_iter().enumerate() {
+                    if back <= days[index] {
+                        covered[tier].insert((project.clone(), date));
+                        coverage.days.entry((source_table.clone(), project.clone())).or_default().entry(now - back as i64 * DAY_MICROS).or_default()[tier] =
+                            DAY_MICROS;
+                    }
+                }
+            }
+        }
+        // Production sweeps each (source, tier), takes the MEDIAN over that
+        // sweep's projects, and folds the sweeps by MIN — `fold_fleet_gauge`
+        // with no ramping tier.
+        let active = projects.iter().map(String::as_str).collect::<HashSet<_>>();
+        let fleet = covered.iter().map(|covered| crate::database::min_contiguous_days(covered, &source, today, &active).2).min().unwrap();
+        let server = crate::database::coverage_is_short_for(fleet);
+        assert_eq!(server, expected, "server decision at fleet median {fleet}");
+        assert_eq!(coverage.coverage_is_short(now), server, "sim must decide as the server does (fleet median {fleet})");
     }
 
     #[test]

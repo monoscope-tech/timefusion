@@ -2462,13 +2462,25 @@ async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollu
     Ok(())
 }
 
-/// `count(*)` alongside the guarded percentile must NOT route: raw counts only the
-/// rows with a duration, while `request_count` counted every row. This is real
-/// monoscope traffic (the top-K endpoint tables put both in one query), so the
-/// disqualifier is load-bearing rather than defensive.
+/// `count(*)` under a null guard ROUTES, and answers from `duration_count`.
+///
+/// This test previously asserted the opposite. The reasoning it encoded — that
+/// such a query "counts a different row set than the tier's `request_count`" — is
+/// correct about `request_count` and was the right conservative call while that
+/// was the only count measure the matcher would reach. But under `col IS NOT
+/// NULL`, consumed as a guard rather than pushed, `count(*)` is *exactly*
+/// `count(col)`, and `duration_count` declares precisely that. So the query is
+/// answerable rather than merely refusable, and the equality below — routed
+/// against raw, bucket for bucket — is what proves it.
+///
+/// The case the original doc comment describes, `count(*)` **alongside** a
+/// percentile, is a different query and is still refused; see
+/// `a_guarded_count_beside_a_percentile_still_declines` in `src/rollup.rs`. That
+/// refusal is about pre-08-22 cells having no `duration_digest` column, not about
+/// the count.
 #[serial]
 #[tokio::test]
-async fn a_count_star_beside_the_null_guard_refuses_to_route() -> Result<()> {
+async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<()> {
     struct ClockGuard;
     impl Drop for ClockGuard {
         fn drop(&mut self) {
@@ -2516,12 +2528,16 @@ async fn a_count_star_beside_the_null_guard_refuses_to_route() -> Result<()> {
     };
     let before = hits();
     let routed = ctx.sql(&query).await?.collect().await?;
-    assert_eq!(hits(), before, "count(*) under a null guard counts a different row set than the tier's request_count; it must NOT route");
+    assert!(hits() > before, "count(*) under a null guard is exactly count(duration), which duration_count declares; it must route");
 
     let total = |batches: &[datafusion::arrow::array::RecordBatch]| {
         batches.iter().filter(|b| b.num_rows() > 0).flat_map(|b| (0..b.num_rows()).map(|r| b.column(1).as_primitive::<Int64Type>().value(r))).sum::<i64>()
     };
-    assert_eq!(total(&routed), total(&db.query_delta_only(&query).await?), "the refused query must still answer correctly from raw");
+    assert_eq!(
+        total(&routed),
+        total(&db.query_delta_only(&query).await?),
+        "the ROUTED answer must equal raw — this is what proves duration_count is the right measure"
+    );
     Ok(())
 }
 

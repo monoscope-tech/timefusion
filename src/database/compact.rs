@@ -1392,8 +1392,13 @@ impl Database {
             let provider = Self::narrow_provider(chunk_log_store, Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL))
                 .await
                 .map_err(|e| anyhow::anyhow!("dedup rewrite provider: {e}"))?;
+            // Sort parallelism descends on retry: the merge exec is unspillable
+            // and per-partition, so a bin that exhausted the pool at the cap must
+            // not be replanned at the same width (prod 2026-08-25, 56 looping
+            // units). Coordinator-driven units carry the ladder rung; the cron
+            // path has no attempt count and keeps the configured width.
             let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
-                self.config.memory.timefusion_query_partitions,
+                limits.map_or(self.config.memory.timefusion_query_partitions, |l| l.sort_partitions),
                 self.maintenance_runtime_env(),
             ));
             ctx.register_table(scan_name, provider)?;
