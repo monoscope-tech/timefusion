@@ -2821,6 +2821,23 @@ mod tests {
         assert_substitutes(&state, &sql, None).await;
     }
 
+    /// monoscope's log-explorer count chart verbatim — `extract(epoch …)` over
+    /// the bucket, the `::text` coalesce over the dimension, `count(*)::float`.
+    /// Structurally the same as the test above, kept separate because every
+    /// previous rollup regression here was found by benching the REAL generated
+    /// SQL and missed by a simplified stand-in.
+    #[tokio::test]
+    async fn the_log_explorer_count_chart_routes_verbatim() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer, COALESCE(status_code::text, 'null'), count(*)::float AS count_ \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY time_bucket('1 hours', timestamp), COALESCE(status_code::text, 'null')"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        assert!(generated_sql(&route).contains("COALESCE(status_code, 'null')"), "the real chart shape must route");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
     /// A group expression the matcher cannot serve must DECLINE, not vanish.
     /// `coalesce(status_code, level)` needs `level`, which no spec declares, so
     /// this stays a miss — but before `UnwalkableSource` it left `match_aggregates`
