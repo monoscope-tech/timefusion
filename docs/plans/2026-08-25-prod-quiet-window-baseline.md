@@ -1423,3 +1423,52 @@ that is both real debt and reachable; use it, not the raw small-file count.
 planner's `estimated_decoded_bytes` for the "0.5 GB" cell is **4.28 GB (~8.5x)**.
 A cheap-looking cell is not a cheap unit, and that multiplier is why these units
 do not fit in the 900 s rewrite timeout.
+
+---
+
+## §12 — FIRST READING ON `a90f881` (container 2 min). Two questions answered outright.
+
+Rates are NOT readable at 2 minutes. These three are, because they are censuses
+computed from DURABLE state at the boot replay, not process-scoped accruals.
+
+### The frozen ~4,386-slice population is 100% `witness_tag_absent`
+
+```
+rollup_unverifiable_total                  4386
+rollup_unverifiable_witness_tag_absent     4386   <- ALL of them
+rollup_unverifiable_fate_journal_incomplete 4386
+rollup_unverifiable_mixed_witness             0
+rollup_unverifiable_witness_negative          0
+rollup_unverifiable_unattributed              0   <- catch-all empty, as designed
+rollup_unverifiable_identity_tag_incomplete   0
+```
+
+The total matches the four-pass frozen figure exactly (2,037 + 2,349 = 4,386),
+so the split is over the same population and nothing shifted.
+
+**Every one of them simply has no `TAG_SOURCE_ROWS` tag** — not a corrupt tag,
+not a negative count, not a disagreement between files. They predate the witness
+tag, and their fate is uniformly `journal_incomplete`. A population that had no
+instrument this morning is fully attributed on its first reading, and the
+catch-all built to catch a missed reason is empty, which is the evidence the
+enumeration was complete.
+
+### `oldest_task_age_seconds`: 85.6 days → **10.85 days**, with the remainder SIZED
+
+```
+oldest_task_age_seconds   937786   (10.85 d, within the 31-day horizon)
+beyond_horizon_tasks        1534
+```
+
+The gauge now measures work the scheduler intends to do, and the deliberately
+abandoned set is **1,534 tasks** — counted, not hidden. That pairing was the
+design condition: narrowing the gauge without sizing the remainder would have
+been indistinguishable from concealing the debt.
+
+### The permit fix is firing
+
+`compaction_permits_unavailable = 9` after two minutes — units are DECLINING to
+claim rather than claiming and blocking. Direction is correct; magnitude means
+nothing yet. **Re-read at ≥2 h against `maintenance_coordinator_unit_timed_out`,
+which it is meant to replace.** The falsifier stands: if this stayed at 0 while
+timeouts continued, the permit would not be taken where the fix assumes.
