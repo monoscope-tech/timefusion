@@ -1726,6 +1726,8 @@ mod stats_table_tests {
             ("scan", "provider_build_us_avg"),
             ("scan", "provider_scan_us_avg"),
             ("scan", "mem_plan_us_avg"),
+            ("scan", "dedup_winner_compactions_total"),
+            ("scan", "dedup_winner_compaction_rows_dropped"),
         ] {
             assert_has(&rows, component, key);
         }
