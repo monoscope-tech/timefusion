@@ -13370,9 +13370,32 @@ mod tests {
             Ok(())
         }
 
-        async fn run_repair(&self) -> Result<UnitRunReport> {
-            self.db.run_unit_once("otel_logs_and_spans", &self.project, self.day, crate::maintenance_coordinator::Operation::Repair, 24, 0).await
+        async fn run_unit(&self) -> Result<UnitRunReport> {
+            run_consolidation(&self.db, &self.project, self.day).await
         }
+    }
+
+    async fn run_consolidation(db: &Database, project: &str, day: chrono::NaiveDate) -> Result<UnitRunReport> {
+        db.run_unit_once("otel_logs_and_spans", project, day, crate::maintenance_coordinator::Operation::SealedConsolidation, 24, 0).await
+    }
+
+    /// One metadata-only Delta commit. The fixture below rewinds and re-tags the
+    /// log three times; none of it touches object storage.
+    async fn commit_actions(table_ref: &Arc<RwLock<DeltaTable>>, actions: Vec<deltalake::kernel::Action>) -> Result<()> {
+        let mut table = table_ref.read().await.clone();
+        let schema = get_schema("otel_logs_and_spans").expect("source schema");
+        let op = deltalake::protocol::DeltaOperation::Write {
+            mode: deltalake::protocol::SaveMode::Append,
+            partition_by: Some(schema.partitions.clone()),
+            predicate: None,
+        };
+        let finalized = deltalake::kernel::transaction::CommitBuilder::default()
+            .with_actions(actions)
+            .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
+            .await?;
+        table.state = Some(finalized.snapshot());
+        *table_ref.write().await = table;
+        Ok(())
     }
 
     async fn staged_but_uncommitted_bin(label: &str) -> Result<KilledBin> {
@@ -13381,53 +13404,70 @@ mod tests {
         let project = format!("repair_{}", uuid::Uuid::new_v4().simple());
         let day = (Utc::now() - chrono::Duration::days(4)).date_naive();
         let noon = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        // TWO flushes, so Repair's `take(1)` provably leaves the cell owing work
-        // — which is what makes the resumed unit's completion semantics visible.
-        for (id, offset) in [("a", 0), ("b", 60_000_000)] {
+        // THREE flushes. Two become the bin; the third is tagged an
+        // already-sorted run below and is therefore skipped by the selection
+        // while staying LIVE — which is what leaves the cell owing work after
+        // the bin commits, and so what makes the resumed unit's completion
+        // semantics observable at all.
+        //
+        // NOT Repair, deliberately: `repair_bin_already_sorted` reads the
+        // parquet footer, and an ingest-flushed file already carries sorting
+        // columns, so a Repair unit clears the file as a false suspect and
+        // never stages anything. (An earlier version of this fixture used
+        // Repair and only "passed" when object-store reads failed under load —
+        // a rewrite that never happened read as a rewrite.)
+        for (id, offset) in [("a", 0), ("b", 60_000_000), ("c", 120_000_000)] {
             insert_a_span(&db, &project, id, noon + offset).await?;
         }
         let table_ref = db.get_or_create_table(&project, "otel_logs_and_spans").await?;
-        let before = live_adds(&table_ref).await;
-        assert_eq!(before.len(), 2, "two flushes, two files, or the cell cannot owe work after one repair bin");
+        let ingested = live_adds(&table_ref).await;
+        assert_eq!(ingested.len(), 3, "three flushes, three files");
 
-        // The process that "died": it produced a committed replacement for
-        // exactly one input, and this is also the assertion that the
-        // already-sorted short-circuit did NOT fire.
-        let first = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::Repair, 24, 0).await?;
+        // Tag one file as a sorted run. Packing skips sorted runs while any
+        // unsorted candidate remains, so this one is excluded from the bin and
+        // survives it. Two commits, so a Remove and an Add of the same path can
+        // never race each other's ordering within one version.
+        let mut held = ingested[0].clone();
+        commit_actions(&table_ref, vec![deltalake::kernel::Action::Remove(super::remove_for_add(&held, false))]).await?;
+        let mut tags = held.tags.clone().unwrap_or_default();
+        tags.insert(super::SORTED_RUN_TAG.to_owned(), Some("true".to_owned()));
+        held.tags = Some(tags);
+        commit_actions(&table_ref, vec![deltalake::kernel::Action::Add(held.clone())]).await?;
+
+        let before = live_adds(&table_ref).await;
+        assert_eq!(before.len(), 3, "re-tagging is metadata only and must not lose a file");
+
+        // The process that "died": it packed the two untagged files into one
+        // committed output. This also asserts the unit did real work — a
+        // short-circuit that retires nothing produces the same retry_reason.
+        let first = run_consolidation(&db, &project, day).await?;
         assert_eq!(
             first.retry_reason.as_deref(),
             Some("compaction_debt_remaining"),
-            "a Repair unit rewrites ONE file, so the two-file cell must requeue rather than complete — the semantics the resume arm has to match"
+            "the held sorted run is still live and under target, so the cell owes work — the semantics the resume arm has to match: {first}"
         );
         let after = live_adds(&table_ref).await;
         let paths = |adds: &[deltalake::kernel::Add]| adds.iter().map(|add| add.path.clone()).collect::<HashSet<_>>();
         let (was, settled) = (paths(&before), paths(&after));
         let staged: Vec<_> = after.iter().filter(|add| !was.contains(&add.path)).cloned().collect();
         let targets: Vec<_> = before.iter().filter(|add| !settled.contains(&add.path)).cloned().collect();
-        assert_eq!((staged.is_empty(), targets.len()), (false, 1), "one input rewritten into a fresh output, or there is nothing to resume: {first}");
+        assert_eq!(
+            (staged.is_empty(), targets.len()),
+            (false, 2),
+            "the two untagged files must have been packed into a fresh output, or there is nothing to resume: {first}"
+        );
 
-        // Rewind: drop the output from the log, put its input back. The output's
-        // parquet stays in the object store — that IS the staged bin.
-        {
-            let mut table = table_ref.read().await.clone();
-            let actions: Vec<deltalake::kernel::Action> = staged
+        // Rewind: drop the output from the log, put its inputs back. The
+        // output's parquet stays in the object store — that IS the staged bin.
+        commit_actions(
+            &table_ref,
+            staged
                 .iter()
                 .map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, true)))
                 .chain(targets.iter().cloned().map(deltalake::kernel::Action::Add))
-                .collect();
-            let schema = get_schema("otel_logs_and_spans").expect("source schema");
-            let op = deltalake::protocol::DeltaOperation::Write {
-                mode: deltalake::protocol::SaveMode::Append,
-                partition_by: Some(schema.partitions.clone()),
-                predicate: None,
-            };
-            let finalized = deltalake::kernel::transaction::CommitBuilder::default()
-                .with_actions(actions)
-                .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
-                .await?;
-            table.state = Some(finalized.snapshot());
-            *table_ref.write().await = table;
-        }
+                .collect(),
+        )
+        .await?;
         Ok(KilledBin { db, project, day, table_ref, staged, targets, settled })
     }
 
@@ -13448,26 +13488,10 @@ mod tests {
     /// wall-clock `STAGED_INTENT_MIN_AGE_SECS` gate that skipped, and a test
     /// using only artificially aged intents would have passed while prod
     /// no-opped — exactly the trap that hid this.
-    /// IGNORED 2026-08-25: the FIXTURE cannot establish its precondition
-    /// reliably. Its seeded Repair unit returns `compaction_debt_remaining`
-    /// having rewritten nothing (`staged.is_empty()`), so there is no staged bin
-    /// to resume and the assertion at the top of `staged_but_uncommitted_bin`
-    /// fires before the subject is ever exercised. The same fixture DID produce
-    /// a rewrite in an earlier run on `e67a149`, so it is seed/selection
-    /// dependent — most likely `repair_bin_already_sorted` short-circuiting on
-    /// the seeded files.
-    ///
-    /// The SUBJECT is unverified, not refuted: nothing here says the resume arm
-    /// is wrong. The completion-semantics fix these cases were written to guard
-    /// (a resumed bin is one BIN, so it must requeue with
-    /// `compaction_debt_remaining` rather than complete the cell) is in the tree
-    /// and is independently supported by the sibling arms it now mirrors.
-    /// Un-ignore once the fixture reliably stages a bin.
     #[test_case::test_case(true, true, true; "a previous instance, aged past the legacy gate")]
     #[test_case::test_case(true, false, true; "a previous instance, seconds old — THE prod timing")]
     #[test_case::test_case(false, false, false; "our own young intent may still be in flight here")]
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "fixture cannot stage a bin reliably; see doc comment"]
     async fn coordinator_commits_a_resumable_staged_bin_instead_of_restaging(foreign: bool, aged: bool, resumes: bool) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let killed = staged_but_uncommitted_bin(&format!("repair-resume-{foreign}-{aged}")).await?;
@@ -13475,7 +13499,7 @@ mod tests {
 
         let stats = crate::observability::maintenance_stats();
         let (resumed, skipped) = (stats.repair_resumed.load(Relaxed), stats.repair_resume_skipped.load(Relaxed));
-        let report = killed.run_repair().await?;
+        let report = killed.run_unit().await?;
         let live = live_paths(&killed.db, &killed.project, "otel_logs_and_spans").await;
 
         if !resumes {
@@ -13502,14 +13526,6 @@ mod tests {
     /// A resume whose staged parquet is gone must fall through to normal staging,
     /// not fail the unit. This is the common way an intent outlives what it
     /// describes: the boot-time reconcile deletes exactly these objects.
-    ///
-    /// IGNORED, and honestly: its *precondition* fails, not its subject. The
-    /// shared fixture's first `run_unit_once` retires no file here — the report
-    /// still reads `compaction_debt_remaining`, so the unit ran and decided
-    /// there was nothing to rewrite — while the same fixture rewrites a file for
-    /// all three rows of the case table above. Un-ignore once that is explained;
-    /// the assertions below are the ones this case is meant to make.
-    #[ignore = "fixture precondition: the first repair run retires no file under this test, unexplained"]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_resume_whose_staged_parquet_is_gone_stages_normally() -> Result<()> {
         use object_store::ObjectStoreExt;
@@ -13523,7 +13539,7 @@ mod tests {
 
         let stats = crate::observability::maintenance_stats();
         let (resumed, incomplete) = (stats.repair_resumed.load(Relaxed), stats.repair_resume_declined_incomplete.load(Relaxed));
-        let report = killed.run_repair().await?;
+        let report = killed.run_unit().await?;
 
         assert_eq!(stats.repair_resumed.load(Relaxed), resumed, "there is nothing to commit — the objects are gone");
         assert!(stats.repair_resume_declined_incomplete.load(Relaxed) > incomplete, "and the decline is counted");
