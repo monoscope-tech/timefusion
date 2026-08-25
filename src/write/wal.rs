@@ -1329,7 +1329,18 @@ fn write_json_atomic<T: Serialize>(target: &std::path::Path, value: &T, durable:
 /// drained-flag consumption); pure hint files (post-flush cursor snapshot) skip
 /// the syncs. The temp file is removed on failure so a partial write can't
 /// accumulate.
+///
+/// Every caller reaches this from a task on the shared runtime — sidecars,
+/// the rollup journal, the maintenance snapshot, WAL metadata — and `durable`
+/// costs two fsyncs. A held worker stalls the unrelated tasks queued behind it,
+/// which prod reports as a 500 ms timer waking seconds late several times a
+/// minute (2026-08-24), so the whole body runs through
+/// `without_blocking_the_worker`.
 pub(crate) fn write_atomic_with(target: &std::path::Path, durable: bool, write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> std::io::Result<()> {
+    crate::support::without_blocking_the_worker(move || write_atomic_blocking(target, durable, write))
+}
+
+fn write_atomic_blocking(target: &std::path::Path, durable: bool, write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut tmp = target.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);

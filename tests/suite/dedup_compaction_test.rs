@@ -299,7 +299,6 @@ async fn rollup_backfill_leaves_already_queued_days_alone() -> Result<()> {
 #[tokio::test]
 async fn today_is_rolled_up_to_the_buffer_boundary_and_still_matches_the_raw_answer() -> Result<()> {
     let mut cfg = (*TestConfigBuilder::new("rollup_today").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_realtime_tail = true;
     cfg.maintenance.timefusion_rollup_backfill_days = 2;
     let cfg = Arc::new(cfg);
     // A REAL buffered layer: without one `min_buffered_micros` is always None,
@@ -2226,8 +2225,7 @@ async fn a_coalesced_dimension_folds_null_and_the_literal_identically_through_th
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_coalesce").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let cfg = (*TestConfigBuilder::new("rollup_coalesce").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     db.cancel_maintenance();
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -2372,8 +2370,7 @@ async fn an_all_null_duration_bucket_is_eliminated_identically_through_the_rollu
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_null_guard").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let cfg = (*TestConfigBuilder::new("rollup_null_guard").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     db.cancel_maintenance();
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -2479,8 +2476,7 @@ async fn a_count_star_beside_the_null_guard_refuses_to_route() -> Result<()> {
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_null_guard_count").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let cfg = (*TestConfigBuilder::new("rollup_null_guard_count").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     db.cancel_maintenance();
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -2551,8 +2547,7 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
         }
     }
     let _clock_guard = ClockGuard;
-    let mut cfg = (*TestConfigBuilder::new("rollup_hybrid").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_realtime_tail = true;
+    let cfg = (*TestConfigBuilder::new("rollup_hybrid").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     // This test publishes selected coverage explicitly below. A background
     // coordinator can race that fixture and change the routing counters being
@@ -2915,7 +2910,6 @@ async fn a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_
 #[tokio::test]
 async fn backfill_covers_sealed_days_and_legacy_coverage_falls_back_after_restart() -> Result<()> {
     let mut cfg = (*TestConfigBuilder::new("rollup_backfill").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_realtime_tail = true;
     cfg.maintenance.timefusion_rollup_backfill_days = 7;
     let cfg = Arc::new(cfg);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
@@ -3018,7 +3012,6 @@ async fn a_committed_rollup_records_date_level_coverage() -> Result<()> {
     // that proves these units really commit. Reusing its shape matters: a bare
     // config drains ZERO units and the assertion then passes vacuously.
     let mut cfg = (*TestConfigBuilder::new("rollup_cov_producer").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-    cfg.maintenance.timefusion_rollup_realtime_tail = true;
     cfg.maintenance.timefusion_rollup_backfill_days = 7;
     let cfg = Arc::new(cfg);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
@@ -3110,7 +3103,6 @@ async fn a_rewriting_sweep_is_confirmed_by_the_next_pass_with_no_other_commit() 
     cfg.maintenance.timefusion_read_dedup_skip_swept = true;
     // Rollups bypass the version guard entirely (`needs_rollup_retry`), which
     // would hide the regression this test exists for.
-    cfg.maintenance.timefusion_rollup_enabled = false;
     let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 

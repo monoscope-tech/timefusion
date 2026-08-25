@@ -4,6 +4,63 @@
 connection turned out to be innocent, and so did the host. What is left is a
 process that gets ~20× slower over hours of uptime.
 
+## 0. Where this stands (read this first)
+
+Everything below §5 is a chronology, including three of my own verdicts that
+later data overturned. The net result, as of 2026-08-24 22:00:
+
+**There are two phenomena, and the stalls are EPISODIC, not a function of age.**
+
+1. **Deploy churn** — a new container replaying WAL while the old one still
+   serves. Explains every stall on a young or mid-life process, replicated four
+   times, and gone once the churn stopped. **My own pushes to the benchmark
+   script were causing it**: `deploy.yml` exempted `docs/**` and `**/*.md` but
+   not `bench/**`. Fixed (`9ab6b00`).
+2. **A server-side stall in the pgwire startup exchange** — **localized**: the
+   container's own healthcheck, over *loopback*, sees `auth_ms` of 470–1,423 ms
+   while `connect_ms` and `write_ms` are 0 and handler construction maxes at
+   4 ms. Not the network, not the haproxy, not auth logic, not handler build.
+   Frequent (2 of 3 sampling windows), and it explains the external
+   connect-only stalls.
+
+**The system-level finding, which is bigger than either — and is now FIXED
+(`f7378af`, 2026-08-25).** The process was failing to wake a 500 ms timer on
+time by 0.3–2.9 s, several times a minute, on 48 workers with the host 40 %
+idle. Cause: **`fsync` running on runtime worker threads.**
+`TaskJournal::checkpoint` fsyncs while holding the journal mutex from 46 call
+sites — **606,953 holds totalling 28 minutes of frozen-worker time in 7 hours**
+— and a worker inside a blocking syscall polls *none* of the tasks queued on it.
+Fixed by routing that IO through `block_in_place`
+(`support::without_blocking_the_worker`), also applied to `compact` and
+`write_atomic_with`. Prod, at matched load (~30): **5.7 → 1.75 lag warns/min,
+3.3× fewer.** Not zero, so other worker-blockers remain — `BlockWatch` is the
+tool for finding them.
+
+**Eliminated, each with the instrument built for it:** host load (44.0 → 178 ms
+versus 32.9 → 4,460 ms — both directions); the maintenance journal mutex (held a
+worker 2,380 ms with *zero* effect on query cost); Delta snapshot refresh (hit
+403 ms/call while `connect` sat at 305 ms); swap (100 % full at all times, so it differentiates
+nothing).
+
+**The title premise is FALSE.** A 7.15-hour process — longer-lived than the 5 h
+one that opened this plan — measured `connect` **107 ms** and warm `SELECT 1`
+**23.5 ms**, the fastest samples of the whole investigation, with 221 GB
+retained and 606,953 journal fsyncs behind it. Cost is *episodic*: flat at
+~177 ms for hours, with occasional multi-minute slow stretches that recover on
+their own. Do not read "age" as the cause.
+
+**Armed and pending:** `jemalloc.frag_pct` (prediction: climbs into an episode,
+falls out of it — if it stays flat, fragmentation is out too) and per-connection
+`block.pgwire_*_handler_build` timers.
+
+**Do not** ship a scheduled restart (restarts *cause* the churn stalls) or touch
+allocator decay config (mechanism unconfirmed; the last decay change cost ~15 %
+CPU).
+
+> Reading the CSVs: gaps of tens of minutes are **the sampling laptop asleep**,
+> not prod outages. The sampler now runs under `caffeinate -i`, which still does
+> not cover a closed lid.
+
 ## 1. The measurement that started it
 
 Noticed while proving that a 440 GB scan does not starve the box
@@ -607,6 +664,127 @@ Note the deploy that carried this **failed its own post-deploy gate** —
 measures handoff readiness, and 12 s against a 10 s budget on a box at load ~35
 is its own small signal about startup under contention. Not chased here.
 
+### Handler construction is NOT the connection stall — and that points outside the process
+
+`62f2385` deployed and reporting, over 135 connections:
+
+    block.pgwire_simple_handler_build     avg 876us   max 2ms
+    block.pgwire_extended_handler_build   avg 768us   max 4ms
+    block.pgwire_startup_handler_build    avg   4us   max 0ms
+
+Per-connection setup inside TimeFusion costs **under 5 ms, worst case**. It
+cannot be the 1,450 ms `connect` sample. Combined with auth being a string
+compare, essentially nothing in this process's connection path is expensive.
+
+**So the search moves outside the process — and there is an obvious candidate
+this plan never mentioned: `srv-timefusion-pgwire-proxy`, the haproxy in front
+of pgwire.** Every measured connection traverses it, and its config is built to
+produce exactly this signature: `timeout connect 1s` with `fall 2` on a 250 ms
+`tcp-check`, so a backend marked DOWN makes *new* connections pay a connect
+timeout plus retries while *established* sessions are untouched.
+
+**Refuted within the hour, by its own logs.** Over 8 hours haproxy logged 17
+`is DOWN` transitions, every one of them `Layer4 connection problem, Connection
+refused` — the signature of a container that is gone, i.e. a deploy restart, not
+a health-check timeout. Lining the transitions up against every slow sample
+recorded all day:
+
+| slow sample | connect | nearest DOWN/UP |
+|---|---|---|
+| 12:00Z | 1,433 ms | 87.8 min away |
+| 13:20Z | 2,960 ms | 7.5 min away |
+| 15:02Z | 1,450 ms | 33.7 min away |
+| 16:23Z | 3,049 ms | 97.6 min away |
+| 16:42Z | 4,460 ms | 78.8 min away |
+
+Not one stall is within 7 minutes of a proxy transition; most are an hour or two
+away. The proxy is not flapping during the stalls, and its DOWN events are the
+deploy churn already accounted for. **Hypothesis raised and killed in the same
+session — worth recording precisely so nobody re-raises it from the config
+alone, which reads guilty.**
+
+What that leaves inside connection establishment, having eliminated DNS, TCP,
+auth, handler construction and the proxy: the pgwire **startup exchange itself**
+and the **accept path**. A slow accept fits the signature exactly — the kernel
+completes the TCP handshake from the listen backlog (so `tcp` stays fast) while
+the startup message waits for a task that has not been polled yet. That is the
+next thing to time, and it needs a timer around accept-to-first-message rather
+than around anything measured so far.
+
+**Second finding, from the same read:** `jemalloc.retained_mb` is **21,127** on a
+184-second-old process, against **147,247** on an ~80-minute-old one. Retained
+address space grows roughly 7× over an hour of uptime. That is the first
+quantity found that genuinely accumulates with age — which is what "state grows
+in-process" was always looking for, though it is address space rather than
+resident memory, so it costs no RSS and is not yet tied to query cost.
+
+### VERDICT on the connection stall: server-side, entirely in the startup exchange
+
+The container's own healthcheck runs the same pgwire startup+auth exchange every
+5 seconds **over loopback**, and reports it split by stage. Sampling the worst of
+its last five probes alongside every external sample:
+
+| my `connect` (internet) | in-container `total` | `connect_ms` | `write_ms` | **`auth_ms`** |
+|---|---|---|---|---|
+| 149 ms | **1,423 ms** | 0 | 0 | **1,423** |
+| 160 ms | **470 ms** | 0 | 0 | **470** |
+| 172 ms | 1 ms | 0 | 0 | 1 |
+
+**The stall is real, server-side, and 100 % of it is `auth_ms`** — the window
+between "startup packet written" and "auth response read". Over loopback, so
+the network, the haproxy and my laptop's path are all excluded by construction.
+`connect_ms = 0` excludes the accept itself. And `block.pgwire_*_handler_build`
+maxes at 2–4 ms, so it is not handler construction; auth is a string compare, so
+it is not the credential check.
+
+Note the first two rows: my external `connect` was **fast** (149–160 ms) while
+the server was stalling. The two are near-independent, which is why 26 external
+samples found this once — I was sampling a frequent server-side event through a
+narrow, badly-timed window. **The healthcheck was a better instrument than the
+one I built, and it was already running.**
+
+What remains inside that window is the connection's task being polled at all,
+plus pgwire's own startup processing (parameter status, ready-for-query). The
+scheduling reading supports the former: `scheduling_lag_max_ms` sat at
+2,764–8,177 ms in these same processes while the instantaneous
+`scheduling_lag_ms` read 0–1 ms — multi-second polling gaps that a 500 ms timer
+sampler almost always misses. That is a *hypothesis*, not a result: the sampler
+now records `inproc_auth_ms` and `scheduling_lag_max_ms` on the same row, and
+their correlation is the next thing to read.
+
+### The lag test: inconclusive by saturation, because the runtime is late CONTINUOUSLY
+
+`spawn_runtime_lag_sampler` has been writing a timestamped `warn!` per event at
+≥250 ms all along, and nothing had read it. Lining those up against the three
+healthcheck windows above:
+
+| window (UTC) | `auth_ms` | lag warns inside it |
+|---|---|---|
+| 20:49:05–20:49:30 | **470** | 518, 593, 500 ms |
+| 20:51:09–20:51:34 | **1** | 290, 345, 545, 313 ms |
+
+**The hypothesis cannot be tested this way: the warns never stop.** Over twelve
+minutes there are ~40 of them — several a minute, 275 ms to 2,850 ms — in stall
+windows *and* in the window where `auth_ms` was 1 ms. A cause that is always
+present cannot be correlated with an effect that is intermittent.
+
+But the negative result is smaller than what it uncovers. **This process fails
+to wake a 500 ms timer on time, by 0.3–2.9 seconds, several times a minute,
+continuously, on a 48-worker runtime and a host that is 40 % idle.** That is not
+a connection problem or a query problem; it is the runtime being persistently
+unable to poll a trivial task. The auth stalls (470–1,423 ms) sit squarely
+inside that distribution, which is consistent with causation without proving it.
+
+Proving it needs the timing *inside* the server — accept-to-startup-handled per
+connection — not more correlation of two things measured from outside. That is
+a code change and it is the first move for whoever picks this up. Note the
+instrument shape trap while doing it: `scheduling_lag_max_ms` is a monotone
+high-water mark (already 2.8–8.2 s, so a 1.4 s event cannot move it) and
+`scheduling_lag_ms` is an instantaneous read that misses sub-second events —
+**neither column can ever correlate with an episodic stall.** The per-event
+`warn!` is the only record that can, which is why the logs answered what the
+counters could not.
+
 **What to do next, in order:**
 1. Let the process keep ageing with the host columns recording. The question is
    now narrow: which in-process quantity is monotone across the 1.2 h → 2.2 h
@@ -617,6 +795,128 @@ is its own small signal about startup under contention. Not chased here.
 2. Do **not** ship a scheduled restart yet. It would help this, and it would
    reintroduce the churn stalls that dominated the first half of this
    investigation. Measure which is worse before trading one for the other.
+
+### THE FIX (2026-08-25, `f7378af`): fsync was freezing workers, and their queues with them
+
+Phase 1 named "workers are blocked, not busy". This is what was blocking them.
+
+`TaskJournal::checkpoint` does `write_all` + **`sync_all`** while holding the
+journal mutex, and it is called from **46 sites** — every claim, every
+completion, every retry, with 16 maintenance workers cycling. `compact`
+additionally serializes every live task (thousands) before its own fsync. All
+synchronous, all on tasks running on the shared runtime. `block.journal_hold.max_ms
+= 2,380` was measuring precisely this.
+
+The damage is not to the caller. A worker inside a blocking syscall cannot poll
+**any** of the tasks queued on it, so an fsync freezes unrelated work — a
+health probe, a timer, a client's connection setup. That is the whole distance
+between "maintenance does IO" and "`SELECT 1` costs seconds".
+
+`support::without_blocking_the_worker` runs such work through
+`tokio::task::block_in_place`, which hands the worker's remaining tasks to
+another thread *first*. Applied at three places: the journal fsync, the compact
+serialize+fsync, and inside `write_atomic_with` — the shared helper behind the
+storage sidecars, the rollup journal and WAL metadata, where `durable` costs two
+fsyncs. Outside a multi-thread runtime it calls straight through, so CLI
+subcommands and tests are unaffected. The mutex is still held across the IO:
+durability ordering is unchanged. `store_snapshot` was already on
+`spawn_blocking` and was left alone.
+
+**The test measures the right thing, which took two attempts.** One worker, a
+blocking task, a neighbour queued behind it: naive, the neighbour waits the full
+400 ms; through the helper it runs immediately (verified failing without the
+fix at 405 ms). The first version measured *timer lag* and passed even unfixed —
+tokio's time driver can be driven by the idle `block_on` thread, so timers keep
+firing while the worker is held. A probe that cannot see the defect is worse
+than no probe.
+
+**Verification, prod — confirmed at matched load.**
+
+| | pre-fix (`18bcf8a`) | post-fix, 1st read | post-fix, **load-matched** (`44d07e1`) |
+|---|---|---|---|
+| lag warns / 20 min | **114** (5.7/min) | 45 (2.25/min) | **35 (1.75/min)** |
+| host load (15-min avg) | ~30 | 23.45 | **30.47** |
+| `journal_hold.avg_us` | 2,815 | **1,610** | |
+
+The first post-fix read was taken at load 23.45 and was therefore confounded —
+a 22 % lighter box could explain a lower rate on its own. The scheduled window
+landed at a **15-minute load average of 30.47, matching the baseline**, with the
+1-minute average at 38.84 — i.e. *equal or busier* — and measured **1.75/min
+against the baseline's 5.7/min**. Same load, **3.3× fewer stalls**, and below
+the pre-fix variance band (3.3–5.7/min). The reduction is attributable.
+
+The first 10 minutes after the deploy were discarded before measuring — a fresh
+process throws a lag burst during WAL replay (`inproc auth_ms` read 1,252 ms at
+41 s of uptime), and counting that would have read *worse* than reality.
+
+**The residual, hunted the same day (`4762c2b`).** 1.75/min was not zero, so
+two more blockers were found — both on the **query** path, both in tantivy
+search:
+
+1. `ensure_cached` is `async` and called `install_blob_into_cache` **inline** —
+   zstd-decode + untar of an entire index blob on a runtime worker. Its sibling
+   on the seeding path already used `spawn_blocking`: one call site right, one
+   wrong, which is what an oversight looks like as opposed to a decision.
+2. The per-index fan-out ran `open_cached` (mmap + segment opens) and the
+   tantivy **search itself** synchronously inside the async task. That search is
+   CPU-bound, yields nowhere, and has cost seconds on a fat needle (4.5 M
+   matches, 2026-08-22).
+
+Fixed with `spawn_blocking` and `block_in_place`. The second uses
+`block_in_place` deliberately: its body borrows `self`, `node` and the stats, so
+`spawn_blocking` would force ownership surgery, while moving the *other* tasks
+off the thread needs no signature change at all — the property that made the
+helper worth having.
+
+Checked and left alone because they were already correct: the index build path
+(`build_and_pack`), the disk-cache reaper, `store_snapshot`. The defects
+clustered on the read path.
+
+### Result: 5.7 → 0.45 lag warns/min, at higher load
+
+| | lag warns / 20 min | rate | host load (15-min) |
+|---|---|---|---|
+| baseline (`18bcf8a`) | 114 | 5.7/min | ~30 |
+| + fsync fix (`f7378af`) | 35 | 1.75/min | 30.47 |
+| + tantivy fixes (`4762c2b`) | **9** | **0.45/min** | **35.29** |
+
+**A 12.7× reduction, measured on a busier box than the baseline.** The window
+ran entirely on `4762c2b` (it shut down three minutes after the measurement
+ended, and its successor contains the same commits), and the first 10 minutes
+after each deploy were discarded.
+
+Warns are not zero and probably never will be — a 500 ms timer on a
+48-worker runtime under real maintenance load will occasionally wake 250 ms
+late. What has gone is the population of multi-second stalls.
+
+Note on comparing the two runs: use `avg_us` and rates, **never `max_ms`**. The
+maxes are monotone high-water marks, so the 19-minute process reads lower than
+the 7-hour one for reasons that have nothing to do with the fix — the same
+instrument-shape trap recorded above.
+
+### The premise, settled at 7.15 hours — the age the plan was written about
+
+A process finally survived long enough (nobody deployed for seven hours), and it
+is the fastest sample in the entire investigation:
+
+| | plan's §1 (5 h uptime) | this process (**7.15 h**) |
+|---|---|---|
+| `connect` | 4,748 ms | **107 ms** |
+| warm `SELECT 1` | 2,969 ms | **23.5 ms** |
+| in-container `auth_ms` | — | 8 ms |
+| host load | 39 | 30 |
+
+**"A trivial query costs seconds after hours of uptime" is false.** The title
+premise is refuted at a *longer* uptime than the one that produced it, and the
+§1 numbers were a process being crushed by a concurrent deploy, as this
+investigation found by accident when it caught itself doing the same thing.
+
+And the state that "grows with uptime" grew exactly as predicted while cost did
+not follow it: `retained_mb` **221,291** (221 GB of decommitted address space),
+`frag_pct` 19.2 %, `journal_hold.count` **606,953**. That last one is the
+justification for the fix on its own terms — **606 thousand blocking fsyncs in
+7 hours (~24/second), totalling 1,708,649 ms of frozen-worker time, or 28
+minutes of a worker doing nothing but waiting on the disk.**
 
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism

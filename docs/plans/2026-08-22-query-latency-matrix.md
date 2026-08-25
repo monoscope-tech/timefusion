@@ -1636,3 +1636,39 @@ not a free one, and changes my earlier recommendation from "probably wait" to
 "worth deciding deliberately". The bounded one-shot migration over the orphaned
 range now looks the most attractive: it is ~424 cells of work, once, against 11
 days of near-total tier darkness.
+
+## The orphan repair shipped and fired
+
+Deployed `18bcf8a`. Verification, in the order it became available:
+
+| signal | before | after |
+|---|---|---|
+| `tasks_pending` | 5,918 | **6,742** (+824) |
+| `pending_base_rollup` | 2,123 | 2,785 |
+| `pending_dedup` | ~2,700 | 3,679 |
+| claims on orphaned dates | none | **08-16, 08-18, 08-19** |
+| `otel_metrics` repair line | — | `forced=197` |
+
+Orphaned dates are being claimed for the first time. The generation flip on
+08-18 has not happened yet and should not be expected to: the units were queued
+minutes ago, each takes minutes, and the starved set drains oldest-first so
+08-18 is late in that order.
+
+**Two defects were caught in this change before or just after it shipped, both
+of the same family the whole investigation has been about — a mechanism that
+reports success while doing nothing:**
+
+1. **The cursor was global** while the call sits inside a per-source loop. If
+   `otel_metrics` were processed first it would consume the one-shot and
+   `otel_logs_and_spans` — the only source with orphaned cells — would never
+   run, logging nothing. Caught by re-reading the diff before deploy. Fixed by
+   keying per source (`2278e49`).
+2. **v1 burned `otel_logs_and_spans`' one-shot without enqueueing.** Prod logged
+   the repair for `otel_metrics` only. This is the accepted cost of persisting
+   the cursor BEFORE the work — a crash mid-repair must not re-force every cell
+   on the next boot when the box restarts every few minutes. Recovery is to bump
+   the constant, which is exactly what per-source keying made possible; under a
+   global cursor `otel_metrics` claiming it would have blocked the fix forever.
+
+If this needs re-running again, bump `ORPHAN_REPAIR_MIGRATION`. Re-enqueueing is
+idempotent at the journal, so a redundant run costs nothing.

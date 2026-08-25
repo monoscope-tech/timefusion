@@ -705,6 +705,16 @@ impl TaskJournal {
     /// that records completion more durably than its effect is worse than one
     /// that never ran.
     const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v2";
+    /// Bump to re-run the orphaned-coverage repair after a FUTURE spec edit.
+    ///
+    /// v2: v1 consumed `otel_logs_and_spans`'s cursor without its enqueue taking
+    /// effect — prod logged the repair for `otel_metrics` (forced=197) and never
+    /// for `otel_logs_and_spans`, which is the source holding the orphaned cells.
+    /// The claim persists its cursor BEFORE the caller does the work precisely so
+    /// a crash cannot loop; the cost of that choice is that a pass which claims
+    /// and then does not enqueue burns the one-shot. Bumping is the intended
+    /// recovery, and re-enqueueing is idempotent at the journal.
+    const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v2";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -914,6 +924,32 @@ impl TaskJournal {
             let tier = task.key.physical_table.contains("_rollup_");
             !(tier && task.state != TaskState::Complete && !declared.contains(&task.key.physical_table))
         })
+    }
+
+    /// Claim the one-shot orphaned-coverage repair, or `None` if it already ran.
+    ///
+    /// The caller does the work — it needs the tier partitions, which the journal
+    /// does not have. This owns only the once-ness, and it persists the cursor
+    /// IMMEDIATELY rather than after the enqueue: a repair that half-ran and then
+    /// died to a restart would otherwise re-force every cell on the next boot,
+    /// and this box restarts every few minutes. Re-enqueueing is idempotent at
+    /// the journal (`enqueue` upserts by key), so the safe failure is running
+    /// once and under-repairing, never looping.
+    /// PER SOURCE. The caller runs inside a loop over sources, so a single global
+    /// cursor would be consumed by whichever source happens to be processed
+    /// first — and if that is `otel_metrics`, the repair fires for a source that
+    /// does not need it and NEVER runs for `otel_logs_and_spans`, which is the
+    /// one whose spec changed. A silent no-op that looks like success.
+    pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> Option<u64> {
+        let key = format!("{}:{source}", Self::ORPHAN_REPAIR_MIGRATION);
+        let previous = self.snapshot.source_cursors.get(&key).copied().unwrap_or_default();
+        if previous >= 1 {
+            return None;
+        }
+        self.snapshot.source_cursors.insert(key.clone(), 1);
+        self.dirty_cursors.insert(key);
+        let _ = self.checkpoint();
+        Some(previous)
     }
 
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
@@ -1464,15 +1500,10 @@ impl TaskJournal {
     /// the planner already counted — so the answer is about the cell that matters
     /// rather than whichever one the journal happens to hold first.
     pub fn most_indebted_unclaimed(&self, operation: Operation, now_micros: i64) -> Option<String> {
-        let eligible = || {
-            self.snapshot
-                .tasks
-                .iter()
-                .filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry))
-        };
+        let eligible =
+            || self.snapshot.tasks.iter().filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry));
         let date_of = |task: &MaintenanceTask| {
-            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
-                .map_or_else(|| "?".to_owned(), |time| time.date_naive().to_string())
+            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map_or_else(|| "?".to_owned(), |time| time.date_naive().to_string())
         };
         let worst = eligible().max_by_key(|task| task.input.map_or(0, |input| input.files))?;
         let files = worst.input.map_or(0, |input| input.files);
@@ -2473,6 +2504,16 @@ impl TaskJournal {
         }
     }
 
+    /// Append the pending journal records and fsync them.
+    ///
+    /// Called on every claim, complete and retry — 46 sites, all synchronous,
+    /// all reached from tasks running on the shared runtime. The `fsync` here
+    /// is the blocking syscall that `block.journal_hold.max_ms = 2,380` on prod
+    /// was measuring (2026-08-24), and a held worker stalls every unrelated task
+    /// queued behind it, which is what `SELECT 1` costing seconds looks like
+    /// from the client. The IO therefore runs through
+    /// `without_blocking_the_worker`; the mutex is still held across it, so
+    /// durability ordering is unchanged.
     pub fn checkpoint(&mut self) -> anyhow::Result<()> {
         if let Some(parent) = self.wal_path.parent() {
             fs::create_dir_all(parent)?;
@@ -2507,8 +2548,10 @@ impl TaskJournal {
                 serde_json::to_writer(&mut records, &JournalRecord::Removed(key))?;
                 records.push(b'\n');
             }
-            wal.write_all(&records)?;
-            wal.sync_all()?;
+            crate::support::without_blocking_the_worker(|| {
+                wal.write_all(&records)?;
+                wal.sync_all()
+            })?;
         }
         if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
             self.compact()?;
@@ -2533,10 +2576,16 @@ impl TaskJournal {
             tasks: self.snapshot.tasks.iter().filter(|task| !is_derived_operation(task.key.operation)).cloned().collect(),
             source_cursors: self.snapshot.source_cursors.clone(),
         };
-        let bytes = serde_json::to_vec(&durable)?;
-        crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
-        let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
-        wal.sync_all()?;
+        // Serialize AND write off the worker: the snapshot is every live task
+        // (thousands on prod), so the `to_vec` is as costly as the fsync that
+        // follows it, and both hold the journal mutex.
+        crate::support::without_blocking_the_worker(|| -> anyhow::Result<()> {
+            let bytes = serde_json::to_vec(&durable)?;
+            crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
+            let wal = OpenOptions::new().create(true).write(true).truncate(true).open(&self.wal_path)?;
+            wal.sync_all()?;
+            Ok(())
+        })?;
         self.dirty_tasks.clear();
         self.removed_tasks.clear();
         self.dirty_cursors.clear();
@@ -4223,11 +4272,7 @@ mod tests {
         let yesterday = cell("small", 399 * DAY, 3, Operation::SealedConsolidation);
         let five_days_old = cell("bigdebt", 395 * DAY, 238, Operation::SealedConsolidation);
 
-        assert_eq!(
-            super::scheduling_class(&yesterday, now).0,
-            1,
-            "the planner mints SealedConsolidation only for a date it already treats as sealed"
-        );
+        assert_eq!(super::scheduling_class(&yesterday, now).0, 1, "the planner mints SealedConsolidation only for a date it already treats as sealed");
         assert!(
             super::scheduling_class(&five_days_old, now) < super::scheduling_class(&yesterday, now),
             "238 files of debt must outrank 3 — which class 0 was silently preventing"
@@ -4235,11 +4280,7 @@ mod tests {
 
         // The blast radius. Today's packing IS frontier work and must stay class
         // 0, or this trades one starvation for another.
-        assert_eq!(
-            super::scheduling_class(&cell("today", 400 * DAY, 9, Operation::HotPacking), now).0,
-            0,
-            "today's packing is genuinely live-frontier work"
-        );
+        assert_eq!(super::scheduling_class(&cell("today", 400 * DAY, 9, Operation::HotPacking), now).0, 0, "today's packing is genuinely live-frontier work");
     }
 
     /// "Planned and never claimed" must name what beat it.
@@ -5563,6 +5604,26 @@ mod tests {
         // deletes the whole queue.
         assert_eq!(journal.retire_undeclared_tiers(&HashSet::new()), 0, "an empty registry must never retire anything");
         assert_eq!(journal.state(&live), Some(TaskState::Pending));
+    }
+
+    /// The orphan repair must run exactly once, and must persist that BEFORE
+    /// the caller does the work — a half-run repair that died to a restart would
+    /// re-force every cell on the next boot, and prod restarts every few minutes.
+    #[test]
+    fn the_orphan_repair_claims_itself_once_and_survives_a_reload() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        {
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "first call claims it");
+            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "second call in the same process must not");
+            // PER SOURCE: the caller loops over sources, so one global cursor
+            // would let whichever source is processed first consume the repair —
+            // and if that is otel_metrics, the source that actually needs it
+            // never runs. A silent no-op that looks like success.
+            assert_eq!(journal.repair_orphaned_coverage_once("otel_metrics"), Some(0), "a different source claims independently");
+        }
+        let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
+        assert_eq!(reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with

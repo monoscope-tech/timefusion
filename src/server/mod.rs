@@ -299,8 +299,24 @@ impl LoggingHandlerFactory {
     }
 }
 
+/// pgwire calls these factory methods **per connection**, so their cost is
+/// per-connection setup — the phase between "socket open" and "ready for
+/// query".
+///
+/// That phase is the one the 2026-08-24 investigation could not attribute: a
+/// sample with `connect` at 1,450 ms and a warm `SELECT 1` at 77.5 ms, on a
+/// calm box. The original plan discharged the connection path because a warm
+/// query paid the cost too — but every sample it had was taken during a deploy,
+/// where everything is slow. With that churn removed, connection-establishment
+/// stalls are what remain, and nothing inside the process could say which part.
+///
+/// They are sync and allocate a `DfSessionService` each time, so they occupy a
+/// worker for their duration — `BlockWatch` (the `block` component), not
+/// `TimedSection`. Auth itself is a string compare (`ConfigAuthSource`), which
+/// is why it is not separately timed.
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        let _t = crate::observability::BlockWatch::new("pgwire_simple_handler_build");
         Arc::new(
             LoggingSimpleQueryHandler::builder()
                 .session_context(self.session_context.clone())
@@ -313,6 +329,7 @@ impl PgWireServerHandlers for LoggingHandlerFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        let _t = crate::observability::BlockWatch::new("pgwire_extended_handler_build");
         Arc::new(
             LoggingExtendedQueryHandler::builder()
                 .session_context(self.session_context.clone())
@@ -324,6 +341,7 @@ impl PgWireServerHandlers for LoggingHandlerFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
+        let _t = crate::observability::BlockWatch::new("pgwire_startup_handler_build");
         Arc::new(CleartextPasswordAuthStartupHandler::new(ConfigAuthSource::new(self.auth_config.clone()), TimeFusionServerParameterProvider::default()))
     }
 
