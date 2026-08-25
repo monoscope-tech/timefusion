@@ -136,6 +136,18 @@ mod tests {
         assert!(protected < BLOCK / 4, "the neighbour should run while the blocking work happens elsewhere, but waited {protected:?}");
     }
 
+    /// `block_in_place` panics when called off a runtime worker, and a
+    /// `spawn_blocking` thread still reports a runtime handle — so the flavor
+    /// check alone would not save us if tokio rejected that combination. It
+    /// does not, and `write_atomic_with` is reachable from both kinds of
+    /// thread, so this pins the behaviour the helper depends on.
+    #[test]
+    fn safe_to_call_from_a_blocking_thread_which_also_sees_a_runtime_handle() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let out = runtime.block_on(async { tokio::task::spawn_blocking(|| without_blocking_the_worker(|| 42)).await });
+        assert_eq!(out.unwrap(), 42);
+    }
+
     #[test]
     fn set_and_advance() {
         let t0 = 4_000_000_000_000_000_i64;
