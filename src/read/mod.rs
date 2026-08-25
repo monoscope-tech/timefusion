@@ -1812,6 +1812,9 @@ mod tests {
         assert!(d.seen.is_empty(), "seen only holds overflow-flushed keys");
     }
 
+    /// One `vbatch` as a case-table row: ids, timestamps, tiebreak stamps.
+    type BatchSpec<'a> = (&'a [&'a str], &'a [i64], &'a [Option<i64>]);
+
     /// An UNBOUNDED keep-greatest state (`bound: None`) — the merge-on-read
     /// shape that buffers to end-of-stream and owns the 2 GiB ceiling.
     fn unbounded_dedup() -> Dedup {
@@ -1875,7 +1878,7 @@ mod tests {
     #[test_case::test_case(&[(&["c"], &[30], &[Some(4)]), (&["c"], &[30], &[None])] ; "and in the other arrival order")]
     #[test_case::test_case(&[(&["a", "a", "a"], &[10, 10, 10], &[Some(1), Some(3), Some(2)]), (&["a"], &[10], &[Some(9)]), (&["b"], &[20], &[Some(1)])] ; "many versions in one batch, then a later winner")]
     #[test_case::test_case(&[(&["a"], &[10], &[Some(1)]), (&["b"], &[20], &[Some(1)]), (&["a"], &[10], &[Some(2)]), (&["b"], &[20], &[Some(2)])] ; "two keys updated alternately")]
-    fn a_winner_compaction_changes_no_answer(spec: &[(&[&str], &[i64], &[Option<i64>])]) {
+    fn a_winner_compaction_changes_no_answer(spec: &[BatchSpec<'_>]) {
         let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
         assert_eq!(
             run_unbounded(&batches, true),
