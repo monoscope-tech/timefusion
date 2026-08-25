@@ -135,6 +135,18 @@ pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
 /// churn race inside the rollup tier. Row counts survive compaction.
 pub const TAG_SOURCE_ROWS: &str = "timefusion.source_rows";
 pub const TAG_GENERATION: &str = "timefusion.generation";
+/// Which declared measures this slice's files actually MATERIALIZED, comma
+/// separated — not what the spec declares.
+///
+/// The generation does not imply it. `duration_digest` was declared 2026-08-22
+/// and first written 2026-08-24 10:30 UTC, so slices carrying the current
+/// generation hold no digest at all, and Delta null-fills the column on scan.
+/// Every merge then SKIPS those nulls — `tdigest_merge` and SQL `SUM` alike —
+/// so the answer is a plausible number computed from the covered fraction
+/// rather than a visible NULL: prod measured a p95 over 08-22..08-25 built from
+/// 3,438 of 14,830 rows. The read path refuses a cell that cannot prove the
+/// measure a query needs; see `RoutedRollup::measures_available`.
+pub const TAG_MEASURES: &str = "timefusion.measures";
 const JOURNAL_VERSION: u32 = 1;
 const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 static THROUGHPUT_SAMPLE: std::sync::OnceLock<Mutex<(i64, u64)>> = std::sync::OnceLock::new();
@@ -1781,12 +1793,7 @@ impl TaskJournal {
     ///   heals the backlog: cells enqueued before this change gain a count on
     ///   the next planner tick instead of waiting for a first claim.
     fn enqueue_inner(
-        &mut self,
-        key: TaskKey,
-        deadline_micros: i64,
-        estimated_decoded_bytes: u64,
-        created_unix_ms: u64,
-        base_tier_present: bool,
+        &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
         input: Option<InputFootprint>,
     ) {
         // Same rule as `upsert`, and it needs stating twice because this path

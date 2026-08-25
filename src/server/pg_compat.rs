@@ -1071,6 +1071,7 @@ impl StatsTableProvider {
             "rollup_miss_unaligned_bucket_total" => m.rollup_miss_unaligned_bucket,
             "rollup_miss_unknown_group_by_total" => m.rollup_miss_unknown_group_by,
             "rollup_miss_unwalkable_source_total" => m.rollup_miss_unwalkable_source,
+            "rollup_miss_measure_not_stored_total" => m.rollup_miss_measure_not_stored,
             "rollup_miss_missing_project_total" => m.rollup_miss_missing_project,
             "rollup_miss_unbounded_time_total" => m.rollup_miss_unbounded_time,
             "rollup_miss_non_decomposable_total" => m.rollup_miss_non_decomposable,

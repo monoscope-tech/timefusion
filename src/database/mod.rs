@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     path::PathBuf,
     sync::Arc,
@@ -515,6 +515,10 @@ struct RollupCoverage {
     /// bound, and two of them computing it a minute apart would disagree and
     /// invalidate perfectly good coverage on every query.
     covered_through: i64,
+    /// The measure columns this cell's files actually MATERIALIZED, from
+    /// `TAG_MEASURES`. `None` is a legacy cell that carries no such evidence —
+    /// see `RoutedRollup::measures_available` for what each answer permits.
+    measures: Option<HashSet<String>>,
 }
 
 #[derive(Debug)]
@@ -3909,6 +3913,11 @@ impl Database {
         // every later date too, so one stale day made a 7-day query scan 8.4M
         // raw rows while six days sat fully built.
         let mut miss = None;
+        // Recorded on the way OUT rather than at either gate, and only when the
+        // query still routed. A total decline propagates `miss` and `dml.rs`
+        // counts it there, so incrementing at the gate as well would report two
+        // misses for one query — the shape of counter that has lied here before.
+        let mut measure_declined = false;
         // One project's covered ranges. The rewrite may only read a range EVERY
         // project has covered, so these are intersected below — a project missing
         // a day drags that day into the raw leg instead of being silently omitted
@@ -3946,6 +3955,16 @@ impl Database {
                 let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
                 if coverage.source_fp != source_fp || coverage.source_epoch != Some(source_epoch) {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
+                    continue;
+                }
+                // Freshness proves the cell was built from the CURRENT source;
+                // it says nothing about which measures its files hold. A cell
+                // missing one serves NULLs that every merge skips, so it is
+                // dropped to the raw fringe rather than answered from a fraction
+                // of the window — see `RoutedRollup::measures_available`.
+                if !route.measures_available(coverage.measures.as_ref()) {
+                    miss = miss.or(Some(crate::rollup::MissReason::MeasureNotStored));
+                    measure_declined = true;
                     continue;
                 }
                 debug!(project_id = %project, source = %route.source, target = %route.target, date, "rollup coverage selected");
@@ -4024,6 +4043,15 @@ impl Database {
                     }
                 }
                 for (key, coverage) in fresh {
+                    // Per slice, like the witness above and for the same reason:
+                    // a slice built before the measure existed sends only ITS
+                    // range to the raw fringe, while siblings that do carry the
+                    // measure keep routing.
+                    if !route.measures_available(coverage.measures.as_ref()) {
+                        miss = miss.or(Some(crate::rollup::MissReason::MeasureNotStored));
+                        measure_declined = true;
+                        continue;
+                    }
                     covered.push((key.3, key.4));
                     generations.push((project.clone(), date.clone(), coverage.generation.clone()));
                     slice_ticket.push((key, coverage.source_fp, coverage.generation.clone()));
@@ -4117,6 +4145,9 @@ impl Database {
         slice_ticket.retain(|((_, _, _, start, end), ..)| interiors.iter().any(|(covered_start, covered_end)| *start < *covered_end && *end > *covered_start));
         if generations.is_empty() {
             return Err(miss.unwrap_or(crate::rollup::MissReason::NotBuilt));
+        }
+        if measure_declined {
+            crate::observability::record_rollup_miss(crate::rollup::MissReason::MeasureNotStored);
         }
         let mode = if interiors == [(route.lo, route.hi)] { "full" } else { "hybrid" };
         Ok(Some(RollupRewrite {
@@ -6071,6 +6102,8 @@ pub(crate) struct DedupExecutionLimits {
     max_decoded_bytes: u64,
     max_concurrent_shards: usize,
     probe_hash_shards: usize,
+    /// Sort parallelism for this attempt — see [`dedup_sort_partitions`].
+    sort_partitions: usize,
 }
 
 #[derive(Clone)]
@@ -7449,6 +7482,42 @@ const REPAIR_QUARANTINE_AFTER: u32 = 3;
 /// through 16, 4, 1. Exhaustion at the floor is believed.
 const REPAIR_SORT_PARTITION_LADDER: [usize; 3] = [REPAIR_SORT_PARTITIONS, 4, 1];
 
+/// Sort parallelism ladder a dedup rewrite is retried at, same doctrine as
+/// [`REPAIR_SORT_PARTITION_LADDER`] but starting from the cap dedup already runs
+/// under ([`MAINTENANCE_MAX_PARTITIONS`], 2) rather than repair's 16.
+///
+/// Dedup already bounds its DECODED bytes by sharding, but nothing bounded its
+/// sort parallelism — and the merge operator is unspillable and per-partition,
+/// so sharding cannot help it. Prod 2026-08-25: 56 units looping on
+/// "Not enough memory to continue external sort", the two merge streams of a
+/// 2-partition sort holding 475 MB + 454 MB while the pool refused a further
+/// 582 MB. At one partition there is no merge exec at all and the sort spills
+/// within its fair share, so exhaustion at 2 says nothing about 1.
+const DEDUP_SORT_PARTITION_LADDER: [usize; 2] = [MAINTENANCE_MAX_PARTITIONS, 1];
+
+/// Sort parallelism for a dedup rewrite, by the claiming task's `attempts`.
+///
+/// `attempts` is POST-CLAIM: `claim_next` calls `mark_running` (which does
+/// `attempts += 1`) and only then clones the task it returns
+/// (`maintenance_coordinator.rs:2035` and `:2180`). So a unit running for the
+/// FIRST time arrives here with `attempts == 1`, not 0 — hence the
+/// `saturating_sub(1)`. Indexing the ladder directly would put every first-ever
+/// dedup on the single-partition floor and halve the whole fleet's sort
+/// parallelism to fix 56 units.
+///
+/// Level comes from that persisted count rather than an in-process map like
+/// repair's `repair_degradation`. Prod replaces the process every 15-28 minutes,
+/// so a map is lost with it and the units already looping at attempts 8-15 would
+/// keep retrying at the width that just failed — the bug this ladder ends.
+///
+/// Narrowing on ANY retry (not just an exhaustion) is deliberate: the failure
+/// reason is not plumbed to this call site, and a narrower sort costs only
+/// parallelism.
+fn dedup_sort_partitions(attempts: u32) -> usize {
+    let level = (attempts.saturating_sub(1)) as usize;
+    DEDUP_SORT_PARTITION_LADDER[level.min(DEDUP_SORT_PARTITION_LADDER.len() - 1)]
+}
+
 /// What a failed repair staging costs the candidate: the parallelism to retry
 /// at next (`None` = nothing cheaper left) and the strike step to charge.
 ///
@@ -7698,6 +7767,33 @@ mod decode_tests {
         for level in 0..super::REPAIR_SORT_PARTITION_LADDER.len() {
             assert_eq!(super::repair_failure_action(false, level), (None, 1), "transient failures never escalate or park early");
         }
+    }
+
+    /// Regression: the dedup rewrite retried at the SAME parallelism forever.
+    ///
+    /// Prod 2026-08-25 had 56 units (17 on one project) looping on
+    /// "Not enough memory to continue external sort" at attempts up to 15, with
+    /// two unspillable `ExternalSorterMerge` streams holding 475 MB + 454 MB of
+    /// a 5.0 GB pool. Repair had `REPAIR_SORT_PARTITION_LADDER`; dedup had
+    /// nothing, so every retry rebuilt the identical plan and failed identically.
+    #[test]
+    fn a_retried_dedup_rewrite_narrows_to_a_single_partition() {
+        // First try runs at the cap dedup has always used — no regression for
+        // the units that succeed, which is nearly all of them.
+        // `attempts` is POST-CLAIM, so a first-ever run arrives as 1, not 0.
+        // Getting this boundary wrong would put EVERY dedup on the floor and
+        // halve the fleet's sort parallelism to fix 56 units — the regression
+        // this case exists to pin down.
+        assert_eq!(super::dedup_sort_partitions(1), super::MAINTENANCE_MAX_PARTITIONS, "a first-ever run keeps today's width");
+        assert_eq!(super::dedup_sort_partitions(0), super::MAINTENANCE_MAX_PARTITIONS, "a hypothetical pre-claim 0 must not narrow either");
+        // Any RETRY drops to the floor, where there is no merge exec to be
+        // unspillable. This is the assertion that fails without the fix.
+        for attempts in 2..9u32 {
+            assert_eq!(super::dedup_sort_partitions(attempts), 1, "attempt {attempts} must narrow: the merge exec cannot spill");
+        }
+        let ladder = super::DEDUP_SORT_PARTITION_LADDER;
+        assert_eq!(*ladder.last().unwrap(), 1, "the floor must have no merge exec");
+        assert!(ladder.windows(2).all(|w| w[0] > w[1]), "strictly descending: {ladder:?}");
     }
 
     /// The ladder must end at 1: a single-partition sort is the only setting
@@ -11796,7 +11892,8 @@ mod tests {
         let (big, small) = (files(&indebted), files(&starved));
         assert!(big >= 2, "the planner selected the file list to decide the partition was out of policy — the queued unit must carry the count, got {big}");
         assert!(big > small, "and the bigger cell must read as the bigger debt, got {big} vs {small}");
-        let refusal = journal.most_indebted_unclaimed(Operation::SealedConsolidation, crate::support::now_micros()).expect("the debt is outranked, not claimed");
+        let refusal =
+            journal.most_indebted_unclaimed(Operation::SealedConsolidation, crate::support::now_micros()).expect("the debt is outranked, not claimed");
         assert!(
             refusal.contains(&format!("{indebted:.8}")) && refusal.ends_with(&format!("files={big}")),
             "the instrument must name the genuinely most indebted cell and its debt — got {refusal}"
@@ -11970,6 +12067,126 @@ mod tests {
         assert!(
             !crate::rollup::slice_coverage_agrees(&witnesses, grown.and_then(|rows| u64::try_from(rows).ok())),
             "a slice built before the write must not be served afterwards"
+        );
+        Ok(())
+    }
+
+    /// A date whose cells cannot PROVE they hold a measure must fall to the raw
+    /// fringe while its siblings keep routing.
+    ///
+    /// The failure this guards is silent and biased, not visible: Delta null-fills
+    /// a column the files lack, and every merge skips those nulls rather than
+    /// poisoning the result, so a 7-day percentile chart answered from 1.5 days of
+    /// digests returns a plausible number. Prod 2026-08-25 measured a p95 over
+    /// 08-22..08-25 computed from 3,438 of 14,830 rows, all post-cutover.
+    ///
+    /// Generation cannot detect it — `duration_digest` was declared 08-22 and not
+    /// written until 08-24, so the affected cells carry the CURRENT generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        const DIGEST: &str = "duration_digest";
+        let mut cfg = (*create_test_config("measure-not-stored")).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        // An `Arc` because `create_session_context` consumes one.
+        let db = std::sync::Arc::new(Database::with_config(std::sync::Arc::new(cfg)).await?);
+        db.cancel_maintenance();
+        let project = format!("meas_{}", uuid::Uuid::new_v4().simple());
+        let days: Vec<chrono::NaiveDate> = (3..=4).rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
+        for (index, day) in days.iter().enumerate() {
+            // Several hours apart so each day's coverage is wide enough for the
+            // hybrid cost floor, which declines a sliver of interior outright.
+            for hour in [1, 7, 13, 19] {
+                let at = day.and_hms_opt(hour, 0, 0).expect("hour").and_utc().timestamp_micros();
+                let row = serde_json::json!({
+                    "timestamp": at, "id": format!("d{index}h{hour}"), "name": "op", "project_id": project, "hashes": [],
+                    "summary": ["digest fixture"], "date": day.to_string(), "duration": 100 + hour, "kind": "server", "status_code": "OK",
+                });
+                db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![row])?], true, None).await?;
+            }
+            db.run_unit_once("otel_logs_and_spans", &project, *day, Operation::BaseRollup, 24, 0).await?;
+        }
+
+        // The build must record what it materialized, or stripping it below
+        // proves nothing about the read path.
+        let published: Vec<Option<HashSet<String>>> =
+            db.rollup_slice_coverage.iter().filter(|entry| entry.key().0 == project).map(|entry| entry.value().measures.clone()).collect();
+        assert!(!published.is_empty(), "both builds must publish slice coverage");
+        assert!(
+            published.iter().all(|measures| measures.as_ref().is_some_and(|names| names.contains(DIGEST))),
+            "a fresh build materializes the declared digest and must say so: {published:?}"
+        );
+
+        let (lo, hi) = (
+            days[0].and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros(),
+            days[1].and_hms_opt(23, 59, 59).expect("end").and_utc().timestamp_micros(),
+        );
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS p \
+             FROM otel_logs_and_spans WHERE project_id = '{project}' \
+             AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1"
+        );
+        let mut ctx = std::sync::Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let state = ctx.state();
+        let route = async |db: &Database| {
+            let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
+            db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))
+        };
+
+        // The control. Without it a test that only asserts the refusal passes
+        // just as well when nothing routes at all.
+        let before = route(&db).await?.expect("both days are built and must route");
+        let dates: HashSet<String> = before.ticket.dates.iter().map(|((.., date), ..)| date.clone()).collect();
+        let slice_days: HashSet<String> = before
+            .ticket
+            .slices
+            .iter()
+            .filter_map(|((.., start, _), ..)| chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()))
+            .collect();
+        assert!(
+            days.iter().all(|day| dates.contains(&day.to_string()) || slice_days.contains(&day.to_string())),
+            "both days must route before the strip: dates {dates:?} slices {slice_days:?}"
+        );
+
+        // The older day's cells lose their proof — exactly the prod shape, where
+        // the column was declared before any file carried it.
+        let strip = |measures: &mut Option<HashSet<String>>| {
+            *measures = Some(measures.clone().unwrap_or_default().into_iter().filter(|name| name != DIGEST).collect());
+        };
+        let stripped = days[0].to_string();
+        for mut entry in db.rollup_slice_coverage.iter_mut() {
+            if entry.key().0 == project && chrono::DateTime::from_timestamp_micros(entry.key().3).is_some_and(|time| time.date_naive().to_string() == stripped)
+            {
+                strip(&mut entry.value_mut().measures);
+            }
+        }
+        for mut entry in db.rollup_coverage.iter_mut() {
+            if entry.key().0 == project && entry.key().3 == stripped {
+                strip(&mut entry.value_mut().measures);
+            }
+        }
+
+        let misses = || crate::observability::maintenance_stats().rollup_miss_measure_not_stored.load(std::sync::atomic::Ordering::Relaxed);
+        let declines_before = misses();
+        let after = route(&db).await?.expect("the sibling day still routes");
+        assert_eq!(after.mode, "hybrid", "one day on the tier and one raw is a hybrid rewrite, got {}", after.mode);
+        assert!(misses() > declines_before, "the decline must be counted, or the refusal is invisible in prod");
+        for ((.., date), ..) in &after.ticket.dates {
+            assert_ne!(date, &stripped, "a date that cannot prove the digest must not be read from the tier");
+        }
+        for ((.., start, _), ..) in &after.ticket.slices {
+            let day = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string());
+            assert_ne!(day.as_deref(), Some(stripped.as_str()), "a slice that cannot prove the digest must not be read from the tier");
+        }
+        assert!(
+            after.ticket.dates.iter().any(|((.., date), ..)| date == &days[1].to_string())
+                || after
+                    .ticket
+                    .slices
+                    .iter()
+                    .any(|((.., start, _), ..)| { chrono::DateTime::from_timestamp_micros(*start).is_some_and(|time| time.date_naive() == days[1]) }),
+            "the sibling day proves the digest and must keep routing"
         );
         Ok(())
     }

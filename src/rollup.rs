@@ -57,6 +57,12 @@ pub enum MissReason {
     /// it could equally mean "the matcher was never reached". Prod 2026-08-25:
     /// monoscope's log-explorer count chart declined here, 7 days raw, silently.
     UnwalkableSource,
+    /// The cell is fresh, but its FILES do not carry a measure the query needs,
+    /// so Delta null-fills the column and the merge — `tdigest_merge` or SQL
+    /// `SUM` alike — skips those nulls and answers from the covered fraction.
+    /// Distinct from `StaleCoverage`: nothing moved under the build, the build
+    /// never wrote the column.
+    MeasureNotStored,
 }
 
 impl MissReason {
@@ -881,6 +887,32 @@ const fn spans_whole_day(start: i64, end: i64) -> bool {
     start.rem_euclid(crate::maintenance_coordinator::DAY_MICROS) == 0 && end.saturating_sub(start) == crate::maintenance_coordinator::DAY_MICROS
 }
 
+/// The declared measures a build actually MATERIALIZES, for `TAG_MEASURES`.
+///
+/// Two independent ways a declared measure ends up as an all-NULL column, one
+/// per tier, and a measure counts only if it survives both:
+///
+/// - its INPUT is missing. A derived tier reads the base tier's own state
+///   column (`measure.name`); a base build reads the raw `measure.column`. When
+///   `slice_input_sql` projects `NULL AS …` for it, the aggregate above folds
+///   nulls and writes an empty state.
+/// - its TARGET column is missing. The writer conforms to the tier table as it
+///   already exists, so `cast_record_batch` drops any measure the physical
+///   schema has not been evolved to hold — which is how `duration_digest` was
+///   declared on 2026-08-22 and first written on 08-24.
+pub(crate) fn materialized_measures(
+    spec: &RollupSpec, derived: bool, present: &std::collections::HashSet<String>, target: &arrow::datatypes::Schema,
+) -> Vec<String> {
+    spec.measures
+        .iter()
+        .filter(|measure| {
+            let input = if derived { Some(measure.name.as_str()) } else { measure.column.as_deref() };
+            input.is_none_or(|column| present.contains(column)) && target.column_with_name(&measure.name).is_some()
+        })
+        .map(|measure| measure.name.clone())
+        .collect()
+}
+
 /// The SELECT a rollup slice reads its input through, collapsing duplicates
 /// when `dedup` says how.
 ///
@@ -937,7 +969,50 @@ pub(crate) fn slice_input_sql(
     )
 }
 
+/// Measures a cell WITHOUT `TAG_MEASURES` is known not to hold, and is
+/// therefore refused for.
+///
+/// A BRIDGE with an expiry. It exists only because cells written before the tag
+/// carry no evidence, and the two wholesale answers are both wrong: trusting
+/// legacy cells preserves the bug this list is here to stop, while refusing them
+/// all sends every count chart back to a raw scan and gives up a verified 7.7x.
+/// Delete the branch — and this constant — once every cell carries the tag, and
+/// ADD AN ENTRY whenever a measure is declared on a spec before the cells that
+/// predate it are rebuilt.
+///
+/// It is not a statement about tdigests. Both audits (2026-08-20, 08-24) found
+/// 14 of 15 declared measures sound on both tiers, `server_duration_digest`
+/// among them, so state encoding is fine — `duration_digest` was declared on
+/// 2026-08-22 (c4d615d) and not materialized until ~08-24 10:30 UTC, and every
+/// date 08-14..08-23 reads `count(duration_digest) = 0` across all 12 projects.
+///
+/// Nor can the generation stand in for it: 08-22/08-23 cells carry the CURRENT
+/// generation and still hold no digest.
+///
+/// Nor is "scalar measures are safe" a rule. `Merge::Count` and `Merge::Sum`
+/// fold with SQL `SUM`, which skips NULLs exactly as `tdigest_merge` does — a
+/// missing scalar undercounts just as silently as a missing sketch.
+const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 1] = ["duration_digest"];
+
 impl RoutedRollup {
+    /// Every tier column this rewrite reads a state out of, the `HAVING` guard
+    /// included — the guard is projected into each leg beside the measures, so
+    /// a cell missing it would drop groups rather than merely null a column.
+    pub(crate) fn needed_measure_columns(&self) -> impl Iterator<Item = &str> {
+        self.measures.iter().chain(self.guard.iter()).flat_map(|measure| measure.measures.iter().map(String::as_str))
+    }
+
+    /// Whether a cell whose materialized measures are `have` may serve this
+    /// query. `None` is a legacy cell — it carries no `TAG_MEASURES` and so
+    /// proves nothing either way, which is what
+    /// `MEASURES_ABSENT_FROM_LEGACY_CELLS` exists to decide.
+    pub(crate) fn measures_available(&self, have: Option<&std::collections::HashSet<String>>) -> bool {
+        match have {
+            Some(have) => self.needed_measure_columns().all(|column| have.contains(column)),
+            None => self.needed_measure_columns().all(|column| !MEASURES_ABSENT_FROM_LEGACY_CELLS.contains(&column)),
+        }
+    }
+
     /// A half-open range predicate. Only `>=`/`<` are ever emitted: an inclusive
     /// bound on either side of a shared boundary double counts a whole bucket.
     /// `OPEN_END` marks the trailing range of a window the query left unbounded,
@@ -2221,6 +2296,7 @@ mod tests {
                 "too_many_branches",
                 "rewrite_schema_mismatch",
                 "unwalkable_source",
+                "measure_not_stored",
             ]
         );
     }
@@ -2796,6 +2872,32 @@ mod tests {
         assert!(generated.contains("duration_digest"), "the unfiltered digest must answer it: {generated}");
         assert!(!generated.contains("server_duration_digest"), "the server-filtered digest must NOT answer an unfiltered percentile: {generated}");
         assert_substitutes(&state, &sql, None).await;
+
+        // A cell may hold the current generation and still not hold this column
+        // — declared 2026-08-22, first written 08-24 — so the tag is the only
+        // proof, and a cell that cannot show it is refused rather than answered
+        // from the fraction of the window that does carry a digest.
+        assert!(!route.measures_available(None), "a legacy cell proves no digest and must not serve a percentile");
+        assert!(
+            !route.measures_available(Some(&["request_count".to_owned()].into_iter().collect())),
+            "a cell that materialized other measures still cannot serve the digest"
+        );
+        assert!(
+            route.measures_available(Some(&route.needed_measure_columns().map(str::to_owned).collect())),
+            "a cell that materialized every needed column must serve it"
+        );
+    }
+
+    /// The other half of the same rule: a legacy cell is not refused wholesale.
+    /// `duration_digest` is the ONE measure the 2026-08-20/08-24 audits found
+    /// missing, so a count chart keeps routing off untagged cells — refusing
+    /// them all would send every such chart back to a raw scan.
+    #[tokio::test]
+    async fn a_legacy_cell_still_serves_a_count_chart() {
+        let state = session().await;
+        let sql = format!("SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        assert!(route.measures_available(None), "a count chart must keep routing off a cell written before TAG_MEASURES");
     }
 
     /// THE shape monoscope's grouped charts emit for a dimension:

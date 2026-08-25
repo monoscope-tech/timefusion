@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use serde::Serialize;
 
 use crate::maintenance_coordinator::{
-    Invalidation, InputFootprint, MAX_DECODED_BYTES, MIN_SLICE_MICROS, MaintenanceTask, Operation, TaskJournal, TaskKey, TaskState, operation_cycle,
+    InputFootprint, Invalidation, MAX_DECODED_BYTES, MIN_SLICE_MICROS, MaintenanceTask, Operation, TaskJournal, TaskKey, TaskState, operation_cycle,
     operation_deadline_secs,
 };
 
@@ -417,9 +417,8 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
         SplitGuard::Shipped => {}
         SplitGuard::Off => defeat_guard(journal, task),
         SplitGuard::Ratio(numerator, denominator) => {
-            let sheds = task
-                .parent_measured_bytes
-                .is_none_or(|parent| observed > parent || observed.saturating_mul(denominator) < parent.saturating_mul(numerator));
+            let sheds =
+                task.parent_measured_bytes.is_none_or(|parent| observed > parent || observed.saturating_mul(denominator) < parent.saturating_mul(numerator));
             if !sheds {
                 report.split_declined_at_floor += 1;
                 return Some(observed);
@@ -1062,14 +1061,8 @@ mod tests {
     fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64) -> (SimReport, String, String) {
         let start = 100 * DAY_MICROS;
         let queue = synthetic_whale_queue(start, floored, whale_x_max);
-        let cfg = SimConfig {
-            mint_frontier: false,
-            workers: 16,
-            horizon_micros: 6 * HOUR,
-            byte_model: Some(queue.model),
-            split_guard: guard,
-            ..Default::default()
-        };
+        let cfg =
+            SimConfig { mint_frontier: false, workers: 16, horizon_micros: 6 * HOUR, byte_model: Some(queue.model), split_guard: guard, ..Default::default() };
         let report = run(queue.journal, &cfg, start).unwrap();
         (report, queue.whale_cell, queue.stamped_cell)
     }

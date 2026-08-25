@@ -3648,6 +3648,12 @@ pub struct CoverageEntry {
     /// for a reader that can prefer one over the other.
     #[serde(default)]
     pub files: Vec<String>,
+    /// The measure columns these files actually MATERIALIZED, from
+    /// `TAG_MEASURES`. `None` on an entry written before the tag existed, which
+    /// the read path treats as unproven rather than as "no measures" — the
+    /// distinction `#[serde(default)]` preserves for ledgers already on disk.
+    #[serde(default)]
+    pub measures: Option<Vec<String>>,
 }
 
 /// `(source, project_id, tier table, date)` — the partition a coverage entry
@@ -3916,6 +3922,7 @@ mod coverage_ledger_tests {
             source_fingerprint: 7,
             source_rows: rows,
             files: vec![format!("{start}-{end}.parquet")],
+            measures: None,
         }
     }
 

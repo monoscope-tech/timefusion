@@ -464,19 +464,26 @@ rollups:
   #   * it doubled enqueued rollup work (work scales with the declared spec count);
   #   * its derived half published 489 rollups of which 3 had rows, because a
   #     derived tier whose base is unbuilt is still claimable;
-  #   * and — the one that decided it — a young tier PINS THE FLEET. Both
-  #     `rollup_min_contiguous_days` and `rollup_median_contiguous_days` fold
-  #     every (source, tier) with `.min()`, so a tier at 2 days made the fleet
-  #     gauge read 2, and `coverage_is_short()` compares the median against
-  #     `COVERAGE_SHORT_DAYS = 14`. The whole cluster sat in coverage-short mode
-  #     because of an auxiliary tier nobody queries yet.
+  #   * and — the one that decided it, SINCE FIXED — a young tier pinned the
+  #     fleet. Both `rollup_min_contiguous_days` and `rollup_median_contiguous_days`
+  #     folded every (source, tier) with `.min()`, so a tier at 2 days made the
+  #     fleet gauge read 2 and `coverage_is_short()` (median vs
+  #     `COVERAGE_SHORT_DAYS = 14`) held the whole cluster in coverage-short mode
+  #     for an auxiliary tier nobody queries. `fold_fleet_gauge` in
+  #     `database/maintain.rs` now has a tier younger than the horizon ABSTAIN,
+  #     while the cross-tier `.min()` stays — it is what arms the backfill-ceiling
+  #     override, so a genuinely starved `dashboard_1h_v2` must still trigger it.
   #
-  # Against that: ZERO of the misses observed in production are `level`-shaped.
-  # They are endpoint-hash-scoped status-CLASS charts, which `level` does not
-  # touch — see docs/plans/2026-08-22-query-latency-matrix.md.
+  # Read that third bullet as closed, NOT as re-authorisation: the first two are
+  # untouched and remain grounds on their own. And ZERO of the misses observed in
+  # production are `level`-shaped — they are endpoint-hash-scoped status-CLASS
+  # charts, which `level` does not touch (docs/plans/2026-08-22-query-latency-matrix.md).
   #
   # Adding a spec is still safe by construction (`route_for` tries every declared
-  # rollup and one that cannot serve declines). What is NOT safe is adding one
-  # whose ramp-up poisons a fleet-wide gauge. Fix that fold first; then `level`
-  # is cheap, and `status_class` — expressible as declared count MEASURES with no
-  # new dimension — is the one actually worth having.
+  # rollup and one that cannot serve declines). `status_class` — expressible as
+  # declared count MEASURES with no new dimension — remains the one actually worth
+  # having. Note a measure addition is not free either: it lands NULL in every
+  # already-written cell, which is what `MissReason::MeasureNotStored` now refuses.
+  #
+  # The one case the fold fix does NOT cover, and it is untested: a long-lived tier
+  # REBUILT from scratch under the same table name reads old, so it still pins.

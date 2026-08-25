@@ -1297,7 +1297,12 @@ impl Database {
             return Ok(true);
         };
         let probe_hash_shards = usize::try_from(estimated_bytes.div_ceil(MAX_DECODED_BYTES).clamp(1, DEDUP_BUCKET_COUNT)).unwrap_or(1);
-        let limits = DedupExecutionLimits { max_decoded_bytes: MAX_DECODED_BYTES, max_concurrent_shards: 1, probe_hash_shards };
+        let limits = DedupExecutionLimits {
+            max_decoded_bytes: MAX_DECODED_BYTES,
+            max_concurrent_shards: 1,
+            probe_hash_shards,
+            sort_partitions: dedup_sort_partitions(task.attempts),
+        };
         // Certification is a property of the whole PARTITION — the read path keys
         // `dedup_clean_fp` on (project, table, date) and refuses the skip if ANY
         // in-window partition lacks an entry. This path is what grants it:
@@ -1918,6 +1923,10 @@ impl Database {
         for batch in batches {
             writer.write(deltalake::kernel::schema::cast_record_batch(&batch?, arrow_schema.clone(), true, true)?).await?;
         }
+        // What these files can be READ for, which is not what the spec declares
+        // — see `materialized_measures`. Computed against the writer's schema
+        // because that is the one `cast_record_batch` above conformed to.
+        let materialized = crate::rollup::materialized_measures(spec, derived, &present_columns, &arrow_schema);
         let mut adds = writer.flush().await?.into_iter().map(Action::Add).collect::<Vec<_>>();
         let stage_ms = stage_started.elapsed().as_millis() as u64;
         let commit_started = std::time::Instant::now();
@@ -1936,6 +1945,7 @@ impl Database {
                 // this slice and must refuse it, so write the sentinel rather
                 // than omitting the tag when the source reports no count.
                 (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
+                (crate::maintenance_coordinator::TAG_MEASURES, materialized.join(",")),
             ] {
                 tags.insert(name.to_owned(), Some(value));
             }
@@ -2183,6 +2193,7 @@ impl Database {
                     generation: generation.clone(),
                     source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                     covered_through: key.slice.end_micros,
+                    measures: Some(materialized.iter().cloned().collect()),
                 },
             );
             // DATE-level coverage, the second routing route. It had no producer
@@ -2221,6 +2232,7 @@ impl Database {
                         generation: generation.clone(),
                         source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                         covered_through: key.slice.end_micros,
+                        measures: Some(materialized.iter().cloned().collect()),
                     },
                 );
             }
@@ -3187,6 +3199,14 @@ impl Database {
             let mut spans: Vec<(i64, i64)> = slices.iter().map(|(start, coverage)| (*start, coverage.covered_through)).collect();
             let Some(covered_through) = Self::contiguous_coverage_end(partition.min_ts, &mut spans) else { continue };
             let newest = slices.iter().map(|(_, coverage)| coverage).max_by_key(|coverage| coverage.covered_through).expect("non-empty");
+            // The date can be read for a measure only if EVERY slice covering it
+            // materialized that measure, and one slice with no evidence leaves
+            // the whole date unproven — the date route does not consult the
+            // slices again, so it cannot be more optimistic than the weakest one.
+            let measures = slices.iter().try_fold(None::<HashSet<String>>, |folded, (_, coverage)| {
+                let slice = coverage.measures.as_ref()?;
+                Some(Some(folded.map_or_else(|| slice.clone(), |folded| &folded & slice)))
+            });
             self.rollup_coverage.insert(
                 (project.clone(), source.to_string(), target.to_string(), date.clone()),
                 RollupCoverage {
@@ -3195,6 +3215,7 @@ impl Database {
                     generation: newest.generation.clone(),
                     source_rows: Some(current_rows),
                     covered_through,
+                    measures: measures.flatten(),
                 },
             );
             recovered += 1;
@@ -3290,6 +3311,7 @@ impl Database {
                         generation: entry.generation.clone(),
                         source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
                         covered_through: entry.end_micros,
+                        measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
                     },
                 );
                 seeded += 1;
@@ -3410,7 +3432,7 @@ impl Database {
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
-            let (tagged, paths_by_identity) = match self.resolve_table("default", &target).await {
+            let (tagged, paths_by_identity, measures_by_identity) = match self.resolve_table("default", &target).await {
                 Ok(table) => {
                     let table = table.read().await;
                     // `source_rows` is part of the KEY so a partition rebuilt against a
@@ -3429,6 +3451,11 @@ impl Database {
                     // before them claims coverage the read path refuses — the one
                     // failure this design must never have.
                     let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
+                    // Not part of the identity: two files of one slice that
+                    // disagree about their measures are still the same slice,
+                    // and folding measures into the key would instead make them
+                    // two entries racing for one coverage slot.
+                    let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
                     for add in table.snapshot()?.log_data().iter() {
                         #[allow(deprecated)]
                         let action = add.add_action();
@@ -3481,7 +3508,20 @@ impl Database {
                         let source_rows = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS)
                             .and_then(|value| value.parse::<i64>().ok())
                             .and_then(|rows| u64::try_from(rows).ok());
-                        groups.insert((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows));
+                        // Absent means "no evidence", NOT "no measures" — the two
+                        // permit different queries, so an empty tag value must
+                        // still parse as `Some(∅)`. Several files can serve one
+                        // slice identity, and the slice can only be read for a
+                        // measure they ALL carry, hence the intersection.
+                        let measures = tag(crate::maintenance_coordinator::TAG_MEASURES)
+                            .map(|value| value.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<BTreeSet<String>>());
+                        let identity = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows);
+                        let merged = match measures_by_identity.remove(&identity) {
+                            Some(seen) => seen.zip(measures).map(|(left, right)| &left & &right),
+                            None => measures,
+                        };
+                        measures_by_identity.insert(identity.clone(), merged);
+                        groups.insert(identity);
                         // Same facts, recorded explicitly. The date comes from the
                         // file's own partition rather than from `slice_start`,
                         // because a day-wide slice starts at midnight of the day it
@@ -3500,9 +3540,9 @@ impl Database {
                             entry.1.push(action.path.clone());
                         }
                     }
-                    (groups, paths_by_identity)
+                    (groups, paths_by_identity, measures_by_identity)
                 }
-                Err(_) => (std::collections::HashSet::new(), HashMap::new()),
+                Err(_) => (std::collections::HashSet::new(), HashMap::new(), HashMap::new()),
             };
             // Filled by the FILTERED loop below, then verified and written once
             // per tier. Nothing is recorded for a slice the read path would
@@ -3561,6 +3601,10 @@ impl Database {
                         generation: publication.generation.clone(),
                         source_rows: publication.source_rows,
                         covered_through: key.slice.end_micros,
+                        // The journal records no measure evidence, so this route
+                        // can only say "unproven". Harmless for a slice that also
+                        // has tags: the tagged loop below overwrites this entry.
+                        measures: None,
                     },
                 );
                 recovered += 1;
@@ -3597,6 +3641,8 @@ impl Database {
                     if source_rows.is_none() {
                         witnessless.push((project_id.clone(), slice));
                     }
+                    let measures =
+                        measures_by_identity.get(&(project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows)).cloned().flatten();
                     // Past every readability filter, so this slice is exactly
                     // what the read path will serve — and therefore exactly what
                     // the ledger may claim.
@@ -3611,12 +3657,20 @@ impl Database {
                                 source_fingerprint: source_fp,
                                 source_rows: source_rows.and_then(|rows| i64::try_from(rows).ok()),
                                 files: paths.clone(),
+                                measures: measures.as_ref().map(|names| names.iter().cloned().collect()),
                             },
                         );
                     }
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
-                        RollupCoverage { source_fp, source_epoch: None, generation, source_rows, covered_through: slice_end },
+                        RollupCoverage {
+                            source_fp,
+                            source_epoch: None,
+                            generation,
+                            source_rows,
+                            covered_through: slice_end,
+                            measures: measures.map(|names| names.into_iter().collect()),
+                        },
                     );
                     recovered += 1;
                 }
