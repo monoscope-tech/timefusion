@@ -2481,7 +2481,7 @@ impl Database {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
             return Ok(true);
         }
-        self.record_staged_intent(&StagedIntent {
+        self.record_staged_intent(StagedIntent {
             wave_id: resume_wave.clone(),
             table_name: key.physical_table.clone(),
             project_id: key.project_id.clone(),
@@ -2495,6 +2495,7 @@ impl Database {
                 source_rows: publication.source_rows,
                 date: date_string.clone(),
             }),
+            instance: None,
         });
         if !actions.is_empty() {
             let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
@@ -2831,9 +2832,8 @@ impl Database {
         // A repair bin is one 40+ minute whole-file rewrite against a process
         // replaced every 15-28 minutes, so that discarded a complete, sorted,
         // row-exact replacement on almost every pass.
-        let date_marker = chrono::DateTime::from_timestamp_micros(key.slice.start_micros)
-            .map(|time| format!("date={}/", time.date_naive()))
-            .unwrap_or_default();
+        let date_marker =
+            chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| format!("date={}/", time.date_naive())).unwrap_or_default();
         if let Some(bin) = self.resumable_staged_bin(&table_ref, &key.source, &key.project_id, &files).await {
             let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![bin], 0).await;
             let landed = result.failed.is_empty() && !result.landed.is_empty();
@@ -6243,7 +6243,7 @@ impl Database {
         // Record the intent BEFORE the bin can be handed to a wave commit, so a
         // crash anywhere in the staging→commit window leaves a trail to clean up.
         let wave_id = uuid::Uuid::new_v4().to_string();
-        self.record_staged_intent(&StagedIntent {
+        self.record_staged_intent(StagedIntent {
             wave_id: wave_id.clone(),
             table_name: table_name.to_string(),
             project_id: project_id.to_string(),
@@ -6255,6 +6255,7 @@ impl Database {
             target_paths: files.clone(),
             adds: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.clone()) } else { None }).collect(),
             rollup: None,
+            instance: None,
         });
         // Data-preserving compaction: BOTH sides carry data_change=false so the
         // fork's snapshot-isolation downgrade applies and concurrent ingest
@@ -6801,8 +6802,12 @@ impl Database {
 
     /// Append one bin's staged paths. Best-effort: a manifest write failure
     /// must never fail the compaction, only widen the VACUUM backstop's job.
-    pub(crate) fn record_staged_intent(&self, entry: &StagedIntent) {
+    pub(crate) fn record_staged_intent(&self, entry: StagedIntent) {
         use std::io::Write;
+        // Stamped HERE, never by callers: a site that forgot would write an
+        // entry indistinguishable from a pre-upgrade one and lose its resume to
+        // the legacy age gate forever (see `resume_guarded`).
+        let entry = StagedIntent { instance: Some(crate::observability::instance_id().to_owned()), ..entry };
         let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.staged_intent_path();
         let write = crate::support::without_blocking_the_worker(|| -> std::io::Result<()> {
@@ -6810,7 +6815,7 @@ impl Database {
                 std::fs::create_dir_all(dir)?;
             }
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-            writeln!(file, "{}", serde_json::to_string(entry)?)
+            writeln!(file, "{}", serde_json::to_string(&entry)?)
         });
         if let Err(e) = write {
             warn!("staged-intent manifest append failed ({:?}): {} — orphan cleanup falls back to VACUUM", path, e);

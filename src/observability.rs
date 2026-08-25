@@ -480,6 +480,17 @@ pub fn process_uptime_secs() -> u64 {
     PROCESS_START.elapsed().as_secs()
 }
 
+/// WHICH instance this is — minted on first use, never reused, and stamped on
+/// everything a restart may have to disown (see `resume_guarded`).
+///
+/// The PID cannot serve: prod runs as PID 1 inside a container, so every
+/// restart would claim to be the same process — the one answer that turns
+/// "somebody else staged this" into "we are still staging it".
+pub fn instance_id() -> &'static str {
+    static INSTANCE_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+    &INSTANCE_ID
+}
+
 /// `(last, max)` runtime scheduling lag in ms — see `spawn_runtime_lag_sampler`.
 pub fn runtime_lag_ms() -> (u64, u64) {
     (RUNTIME_LAG_LAST_MS.load(Relaxed), RUNTIME_LAG_MAX_MS.load(Relaxed))

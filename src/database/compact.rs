@@ -1730,7 +1730,7 @@ impl Database {
             // a crash anywhere in the staging->commit window leaves a trail to
             // clean up (same guarantee as hot bins).
             let wave_id = uuid::Uuid::new_v4().to_string();
-            self.record_staged_intent(&StagedIntent {
+            self.record_staged_intent(StagedIntent {
                 wave_id: wave_id.clone(),
                 table_name: table_name.to_string(),
                 project_id: project_id.to_string(),
@@ -1742,6 +1742,7 @@ impl Database {
                 target_paths: Vec::new(),
                 adds: Vec::new(),
                 rollup: None,
+                instance: None,
             });
             debug!(table_name, project_id, chunk = label, files = targets.len(), before, after, event = "dedup_chunk_staged");
             return Ok(BinOutcome::Staged(StagedBin {

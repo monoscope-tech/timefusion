@@ -7021,6 +7021,13 @@ pub(crate) struct StagedIntent {
     /// been indistinguishable from a real rollup with zero rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rollup: Option<RollupResume>,
+    /// WHICH instance staged this (`crate::observability::instance_id`). A
+    /// different id means some other process staged it and this one is certainly
+    /// not mid-staging it — the question the wall-clock age gate could only
+    /// guess at. `None` = written before this field existed, so the guess is all
+    /// there is. See [`resume_guarded`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
 }
 
 /// What a killed rollup unit needs in order to be COMMITTED on the next boot
@@ -7075,6 +7082,36 @@ fn parse_staged_intents(contents: &str) -> Vec<StagedIntent> {
 /// younger than `STAGED_INTENT_MIN_AGE_SECS` may belong to a live instance sharing the volume and are
 /// left for its own wave commit, the next boot, or VACUUM.
 const STAGED_INTENT_MIN_AGE_SECS: u64 = 30 * 60;
+
+/// Must this entry be left alone for now, i.e. might we ourselves still be
+/// staging it?
+///
+/// The age gate was never about age: it stood in for "is another instance still
+/// working this?", and as a proxy it FORFEITED the resume rather than delaying
+/// it — `requeue_running` re-claims a unit within minutes of a restart while its
+/// intent is still young, so prod read `repair_resumed_total` and
+/// `rollup_resumed_total` flat 0 with every decline counter also 0. Identity
+/// answers the question exactly:
+///
+/// - a DIFFERENT id is another process's staging. Every record site appends the
+///   entry only after the last parquet flush returns, so a manifest entry never
+///   describes half-written output, and the Commit arm re-verifies the objects
+///   (`staged_objects_complete`) anyway. Eligible immediately.
+/// - OUR id may be a unit still in flight in this very process, so it keeps the
+///   wall-clock gate — which also lets a unit requeued by its own deadline
+///   resume eventually instead of never.
+/// - NO id predates this field. There is nothing to compare, so it keeps the
+///   gate; treating it as eligible would reintroduce the hazard on the first
+///   boot after an upgrade.
+///
+/// Deliberately NOT used by `staged_orphan_deletions`: identity proves "not
+/// ours", never "its owner is dead", and committing another instance's finished
+/// staging merely risks losing a Delta OCC race, while DELETING its parquet
+/// before its own commit destroys the work.
+fn resume_guarded(entry: &StagedIntent, now_secs: u64) -> bool {
+    entry.instance.as_deref().is_none_or(|id| id == crate::observability::instance_id())
+        && now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS
+}
 
 fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs: u64, referenced: &HashSet<String>) -> Vec<String> {
     entries
@@ -7148,7 +7185,7 @@ fn classify_rollup_resume(
     entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<(i64, i64)>>, current_source_rows: Option<u64>,
 ) -> ResumeVerdict {
     let Some(rollup) = entry.rollup.as_ref() else { return ResumeVerdict::Skip };
-    if entry.table_name != table_name || entry.adds.is_empty() || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS {
+    if entry.table_name != table_name || entry.adds.is_empty() || resume_guarded(entry, now_secs) {
         return ResumeVerdict::Skip;
     }
     // Same argument as `classify_resume`: staged parquet is uuid-named by the
@@ -7179,14 +7216,10 @@ fn classify_rollup_resume(
 /// (`None` = the Add carries no stats, which makes row preservation
 /// unverifiable and is therefore never committable).
 fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<i64>>) -> ResumeVerdict {
-    // Same age gate, same reason, as `staged_orphan_deletions`: on an
-    // overlapping rolling deploy a still-running instance may be mid-staging,
-    // and committing its half-written output is exactly the hazard.
-    if entry.table_name != table_name
-        || entry.target_paths.is_empty()
-        || entry.adds.is_empty()
-        || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS
-    {
+    // The one hazard this owes: on an overlapping rolling deploy the staging
+    // instance may still be alive and about to commit its own output. Ownership,
+    // not age, is what answers that — see `resume_guarded`.
+    if entry.table_name != table_name || entry.target_paths.is_empty() || entry.adds.is_empty() || resume_guarded(entry, now_secs) {
         return ResumeVerdict::Skip;
     }
     // Staged parquet is uuid-named by the writer, so nobody else can produce
@@ -13175,7 +13208,7 @@ mod tests {
 
         // The intent the killed process would have left, aged past the
         // rolling-deploy window so it is unambiguously a crash leftover.
-        db.record_staged_intent(&super::StagedIntent {
+        db.record_staged_intent(super::StagedIntent {
             wave_id: uuid::Uuid::new_v4().to_string(),
             table_name: tier.clone(),
             project_id: project.clone(),
@@ -13189,6 +13222,7 @@ mod tests {
                 source_rows: publication.source_rows,
                 date: day.to_string(),
             }),
+            instance: None,
         });
         Ok(KilledUnit { db, key, staged, source_rows: publication.source_rows, project, tier })
     }
@@ -16020,8 +16054,9 @@ mod tests {
         let entries = super::parse_staged_intents(contents);
         assert_eq!(entries.len(), 1, "only the intact line survives: {entries:?}");
         assert_eq!(entries[0].paths, vec!["p1", "p2"]);
-        // Pre-resume lines carry neither resume field and stay cleanup-only.
-        assert!(entries[0].target_paths.is_empty() && entries[0].adds.is_empty());
+        // Pre-resume lines carry neither resume field and stay cleanup-only, and
+        // no instance id — which is what keeps them on the wall-clock gate.
+        assert!(entries[0].target_paths.is_empty() && entries[0].adds.is_empty() && entries[0].instance.is_none());
         assert!(super::parse_staged_intents("").is_empty());
         assert!(super::parse_staged_intents("garbage").is_empty());
     }
@@ -16040,6 +16075,7 @@ mod tests {
             target_paths: Vec::new(),
             adds: Vec::new(),
             rollup: None,
+            instance: None,
         };
         let old = super::STAGED_INTENT_MIN_AGE_SECS + 1;
         let entries = vec![
@@ -16073,6 +16109,7 @@ mod tests {
             target_paths: targets.iter().map(|s| s.to_string()).collect(),
             adds,
             rollup: None,
+            instance: None,
         }
     }
 
@@ -16091,7 +16128,7 @@ mod tests {
         assert_eq!(super::classify_resume(&ok, "logs", 100_000, &live), Commit);
         // Another table's entry is not this reconcile's to judge.
         assert_eq!(super::classify_resume(&ok, "metrics", 100_000, &live), Skip);
-        // Young: a still-running instance on a shared volume may be mid-staging.
+        // Young and OURS: this process may still be staging it.
         let young = super::StagedIntent { recorded_at: 100_000 - 10, ..ok.clone() };
         assert_eq!(super::classify_resume(&young, "logs", 100_000, &live), Skip);
         // Pre-resume (and dedup) entries carry neither field: cleanup-only.
@@ -16114,6 +16151,33 @@ mod tests {
         // re-commit (re-committing would remove files the landed commit added).
         let landed = resume_intent(&["in1"], vec![resume_add("out1", 100)]);
         assert_eq!(super::classify_resume(&landed, "logs", 100_000, &resume_live(&[("out1", Some(100))])), AlreadyLanded);
+    }
+
+    /// Resume is gated on OWNERSHIP, not on age.
+    ///
+    /// `requeue_running` re-claims a killed unit within minutes of a restart,
+    /// so the 30-minute wall-clock gate never DELAYED a resume — it forfeited
+    /// it, and prod read `repair_resumed_total` = `rollup_resumed_total` = 0
+    /// with every decline counter also 0. A previous instance's intent is
+    /// eligible the moment it is seen; our own — possibly still in flight — and
+    /// a pre-upgrade entry that cannot say whose it is keep the gate.
+    #[test]
+    fn a_previous_instances_staged_intent_resumes_without_waiting_out_the_age_gate() {
+        use super::ResumeVerdict::*;
+        let ok = resume_intent(&["in1", "in2"], vec![resume_add("out1", 100)]);
+        let owned_by =
+            |instance: Option<&str>, age: u64| super::StagedIntent { instance: instance.map(str::to_string), recorded_at: 100_000 - age, ..ok.clone() };
+        let live = resume_live(&[("in1", Some(30)), ("in2", Some(70))]);
+        let verdict = |entry: &super::StagedIntent| super::classify_resume(entry, "logs", 100_000, &live);
+        assert_eq!(verdict(&owned_by(Some("a-dead-instance"), 10)), Commit);
+        assert_eq!(verdict(&owned_by(Some(crate::observability::instance_id()), 10)), Skip);
+        assert_eq!(verdict(&owned_by(None, 10)), Skip, "no id: nothing to compare, so the wall-clock proxy stands");
+        assert_eq!(verdict(&owned_by(None, super::STAGED_INTENT_MIN_AGE_SECS + 1)), Commit);
+        assert_eq!(
+            verdict(&owned_by(Some(crate::observability::instance_id()), super::STAGED_INTENT_MIN_AGE_SECS + 1)),
+            Commit,
+            "our own unit requeued by its own deadline resumes eventually, not never"
+        );
     }
 
     /// The rollup half of resume, decided WITHOUT IO.
@@ -16175,9 +16239,16 @@ mod tests {
         // publication was lost. The caller publishes; it must never re-commit.
         let landed = live(&[("out1", Some((1_000, 2_000)))]);
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &landed, Some(100)), AlreadyLanded);
-        // A still-running instance on a shared volume may be mid-staging.
-        let young = super::StagedIntent { recorded_at: 100_000 - 10, ..ok.clone() };
-        assert_eq!(super::classify_rollup_resume(&young, "logs", 100_000, &inside, Some(100)), Skip);
+        // Ownership, not age — the same ladder `classify_resume` obeys: another
+        // instance's staging is eligible at once, ours may still be in flight,
+        // and a pre-upgrade entry keeps the wall-clock proxy.
+        let owned_by =
+            |instance: Option<&str>, age: u64| super::StagedIntent { instance: instance.map(str::to_string), recorded_at: 100_000 - age, ..ok.clone() };
+        let verdict = |entry: &super::StagedIntent| super::classify_rollup_resume(entry, "logs", 100_000, &inside, Some(100));
+        assert_eq!(verdict(&owned_by(Some("a-dead-instance"), 10)), Commit);
+        assert_eq!(verdict(&owned_by(Some(crate::observability::instance_id()), 10)), Skip);
+        assert_eq!(verdict(&owned_by(None, 10)), Skip);
+        assert_eq!(verdict(&owned_by(None, super::STAGED_INTENT_MIN_AGE_SECS + 1)), Commit);
     }
 
     /// The Add stats column list must be the narrow prune set, not the whole schema, and must never
