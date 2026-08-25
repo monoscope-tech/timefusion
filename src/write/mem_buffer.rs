@@ -363,6 +363,21 @@ pub struct TimeBucket {
     memory_bytes: AtomicUsize,
     min_timestamp: AtomicI64,
     max_timestamp: AtomicI64,
+    /// Span of the row `timestamp` values this bucket actually holds, used
+    /// ONLY to decide whether a query window can skip the bucket
+    /// (`bucket_overlaps_range`).
+    ///
+    /// Deliberately separate from `min_timestamp`/`max_timestamp`, which are
+    /// widened by the batch's single ROUTING timestamp and carry two other
+    /// meanings: the span `get_bucket_ranges` masks Delta over (merge-on-read),
+    /// and the flushed watermark. Widening those to the true row span masks
+    /// Delta rows that share a timestamp with buffered ones — it dropped 15 of
+    /// 20 rows across a dirty restart in `cold_start_under_five_seconds`.
+    /// Read pruning is the only consumer that wants the row span, so it gets
+    /// its own pair. Sentinels (`MAX`/`MIN`) mean "unknown" and fall back to
+    /// the routing span, which is what pre-existing/restored buckets report.
+    row_min_ts: AtomicI64,
+    row_max_ts: AtomicI64,
     /// Wall-clock micros (via `crate::support`) when this bucket was created.
     /// Drives the flush-dwell staleness signal — how long the bucket has
     /// waited to flush — independent of its rows' event-time range, so
@@ -1019,8 +1034,16 @@ pub fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
 fn bucket_overlaps_range(bucket: &TimeBucket, (min_filter, max_filter): &(Option<i64>, Option<i64>)) -> bool {
     // `&&` short-circuits, so an unbounded side never pays its atomic load.
     // The sentinels (empty bucket) mean "unknown range" — never prune.
-    let starts_after = |max: i64| matches!(bucket.min_timestamp.load(Ordering::Relaxed), m if m != i64::MAX && m > max);
-    let ends_before = |min: i64| matches!(bucket.max_timestamp.load(Ordering::Relaxed), m if m != i64::MIN && m < min);
+    let lo = match bucket.row_min_ts.load(Ordering::Relaxed) {
+        i64::MAX => bucket.min_timestamp.load(Ordering::Relaxed),
+        v => v,
+    };
+    let hi = match bucket.row_max_ts.load(Ordering::Relaxed) {
+        i64::MIN => bucket.max_timestamp.load(Ordering::Relaxed),
+        v => v,
+    };
+    let starts_after = |max: i64| lo != i64::MAX && lo > max;
+    let ends_before = |min: i64| hi != i64::MIN && hi < min;
     !max_filter.is_some_and(starts_after) && !min_filter.is_some_and(ends_before)
 }
 
@@ -1848,6 +1871,11 @@ impl MemBuffer {
         // Delta commit failure) can replay it instead of guessing bucket-start.
         let min_timestamp = bucket.min_timestamp.swap(i64::MAX, Ordering::Relaxed);
         let max_timestamp = bucket.max_timestamp.swap(i64::MIN, Ordering::Relaxed);
+        // Reset with them: a reused bucket that kept a drained tenant's row span would
+        // survive pruning it should skip (wasteful, not wrong) and, worse, report a span
+        // for rows it no longer holds.
+        bucket.row_min_ts.store(i64::MAX, Ordering::Relaxed);
+        bucket.row_max_ts.store(i64::MIN, Ordering::Relaxed);
         // Park the GC-floor pin in `taking_pins` BEFORE clearing it from the
         // bucket, so a concurrent GC sweep between this take and the flush
         // path's `register_inflight_pin` still sees the floor (see
@@ -2631,6 +2659,8 @@ impl TableBuffer {
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let new_size = estimate_batch_size(&batch);
+        // Taken before the batch is moved into the bucket; see `row_min_ts`.
+        let ts_bounds = batch_timestamp_range(&batch);
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
@@ -2744,6 +2774,13 @@ impl TableBuffer {
         // `batches.iter().map(|b| b.num_rows()).sum()` under the lock.
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
+        // Read pruning needs the span the rows actually occupy: routing widens by one
+        // point, so a batch spanning 21:00-23:00 advertised 21:00 and `>= 21:30` skipped
+        // the bucket entirely while the rows sat in memory.
+        if let Some((lo, hi)) = ts_bounds {
+            bucket.row_min_ts.fetch_min(lo, Ordering::Relaxed);
+            bucket.row_max_ts.fetch_max(hi, Ordering::Relaxed);
+        }
 
         Ok((new_size as i64 + coalesce_delta, bucket_id))
     }
@@ -2757,6 +2794,8 @@ impl TimeBucket {
             memory_bytes: AtomicUsize::new(0),
             min_timestamp: AtomicI64::new(i64::MAX),
             max_timestamp: AtomicI64::new(i64::MIN),
+            row_min_ts: AtomicI64::new(i64::MAX),
+            row_max_ts: AtomicI64::new(i64::MIN),
             created_micros: crate::support::now_micros(),
             wal_shard_state: Mutex::new(WalShardState::default()),
             flush_pinned_prefix: AtomicUsize::new(0),
@@ -3028,6 +3067,45 @@ mod tests {
         assert!(ts.windows(2).all(|w| w[0] >= w[1]), "rows must be ordered timestamp DESC across chunk boundaries");
         assert_eq!(ts.first().copied(), Some(N - 1), "greatest timestamp first");
         assert_eq!(ts.last().copied(), Some(0), "least timestamp last");
+    }
+
+    /// Read pruning must consult the span the rows actually occupy. Routing widens
+    /// `min/max_timestamp` by ONE point, so a batch spanning 21:00-23:00 advertised
+    /// 21:00 and any `timestamp >= 21:30` skipped the bucket while its rows sat in
+    /// memory, invisible until flush.
+    ///
+    /// The row span is deliberately a SEPARATE pair: widening `min/max_timestamp`
+    /// itself also moves the span `get_bucket_ranges` masks Delta over, which dropped
+    /// 15 of 20 rows across a dirty restart (`cold_start_under_five_seconds`). This
+    /// asserts both halves — the row span tracks the rows, the routing span does not
+    /// move — so a future simplification that merges them fails here.
+    #[test]
+    fn row_span_tracks_rows_while_routing_span_stays_put() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let (lo, mid, hi) = (1_735_678_800_000_000i64, 1_735_682_400_000_000, 1_735_686_000_000_000);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![lo, mid, hi]).with_timezone("UTC")), Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let buffer = MemBuffer::new();
+        buffer.insert_with_hold("p", "otel_logs_and_spans", batch, lo, None).expect("insert");
+        let table = buffer.tables.get(&table_key("p", "otel_logs_and_spans")).expect("table");
+        let bucket = table.buckets.iter().next().expect("one bucket");
+
+        assert_eq!(bucket.row_max_ts.load(Ordering::Relaxed), hi, "row span must reach the batch's latest row");
+        assert_eq!(bucket.row_min_ts.load(Ordering::Relaxed), lo, "row span must start at the batch's earliest row");
+        assert_eq!(bucket.max_timestamp.load(Ordering::Relaxed), lo, "the routing span must stay on the routing timestamp");
+
+        assert!(
+            bucket_overlaps_range(bucket.value(), &(Some(lo + 1), None)),
+            "a lower bound above the first row must not prune a bucket still holding later rows"
+        );
+        assert!(!bucket_overlaps_range(bucket.value(), &(Some(hi + 1), None)), "a bound above every row must still prune");
     }
 
     fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
