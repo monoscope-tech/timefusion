@@ -1,6 +1,8 @@
 # The preflight floor needs a byte model in `sim`, not a prod journal
 
-**Owner:** unassigned. **Status:** decision recorded, implementation not started.
+**Owner:** unassigned. **Status:** §7 decided and implemented; all six criteria
+pass (§7a). §6 records the pre-fix measurement and is kept for the diagnosis —
+**its threshold table (§6 "Criterion 5") is superseded by §7b.**
 **Last reviewed:** 2026-08-25. **Closes:** `tasks/09`'s framing.
 
 ## Verdict
@@ -346,8 +348,65 @@ a shred — strictly decreases, because no level is ever minted unmeasured.
 
 ### 7a. Results after the fix, same fixture, same six criteria
 
-_(Filled in below from the post-fix run; the fixture is byte-for-byte the one
-§6 used.)_
+`synth:whale`, 6 virtual hours, 16 workers. **The fixture is byte-for-byte the
+one §6 used** — nothing was tuned to make this pass.
+
+| # | Claim | Result |
+|---|---|---|
+| 1 | Bug reproduces | **PASS** — floored + guard off: 2,879 whale units, **1,440 at `MIN_SLICE_MICROS`** |
+| 2 | Floorless control is clean | **PASS** — 255 units, **zero** at the floor, guard on or off |
+| 3 | Fix works | **PASS** — floored + shipped guard: **255** units (was 1,697 pre-fix / 2,879 now), **0** at the floor, **128 runs hash-sharded above it**, narrowest sharded run **660 s**, max run 523 MB ≤ 512 MiB |
+| 4 | Fix does not stall | **PASS** — `split_declined_at_floor` 24 → 128 and flat, `max_cell_pending` 4 → **0**, `pending_end = 0` |
+| 5 | Threshold calibrated | **Swept; 3/4 is now correct and the §6 table is void** — see below |
+| 6 | Lineage guard holds | **PASS** — the `MAX_DECODED_BYTES + 1` stamped lineage still splits at scale (63 units) |
+
+The whale ladder, one measured level at a time (`whale_lineage_trace`):
+
+```
+level 0: width= 86400s observed= 82867MB parent_stamp=    none  split=true
+level 1: width= 43200s observed= 42893MB parent_stamp= 82867MB  split=true
+level 2: width= 21600s observed= 22176MB parent_stamp= 42893MB  split=true
+level 3: width= 10800s observed= 11820MB parent_stamp= 22176MB  split=true
+level 4: width=  5400s observed=  6640MB parent_stamp= 11820MB  split=true
+...
+level 7: width=   660s                    — sheds only ~1/4, DECLINED, runs 4-way sharded
+```
+
+**Bookkeeping, so the counts are comparable.** `units_per_cell` counts every
+unit ever minted, superseded ancestors included. Bisecting one level per
+measurement makes the ~127 intermediate parents journal rows that a
+whole-subtree split never created, so *both* arms inflate against §6: guard-off
+reads 2,879 rather than 1,697 (identical 1,440 pending leaves at the floor), and
+the floorless control reads 255 rather than 129. `a_floorless_whale_never_reaches_the_floor`'s
+bound moved 200 → 300 for that reason alone; its discriminating assertion —
+nothing at `MIN_SLICE_MICROS` — is unchanged and still exact.
+
+### 7b. Criterion 5 re-swept — and the threshold's meaning inverted
+
+Once the guard is consulted at *every* level, a **tighter** ratio declines
+**earlier**, which is the opposite of what §6's table implied. `Off` is the
+pre-fix baseline. Read: `units / at MIN_SLICE / declined / completed`.
+
+| floor | 1/2 | 2/3 | **3/4 (shipped)** | 4/5 | off |
+|---|---|---|---|---|---|
+| 100x | 3 / 0 / 6 / 218 | 127 / 0 / 64 / 324 | **255 / 0 / 128 / 388** | 511 / 0 / 256 / 516 | 2879 / 1440 / 0 / 1700 |
+| 20x | 3 / 0 / 6 / 218 | 127 / 0 / 64 / 324 | **255 / 0 / 0 / 388** | 255 / 0 / 0 / 388 | 255 / 0 / 0 / 388 |
+| 5x | 3 / 0 / 6 / 218 | 31 / 0 / 0 / 276 | **31 / 0 / 0 / 276** | 31 / 0 / 0 / 276 | 31 / 0 / 0 / 276 |
+
+Every run drained to `pending_end = 0`; no threshold stalls the queue.
+
+1. **3/4 fires exactly where the floor dominates and nowhere else.** At 100x it
+   declines 128 splits; at 20x and 5x it declines nothing and is
+   indistinguishable from `Off`, because bisection genuinely still works there.
+   That is the behaviour a guard should have.
+2. **1/2 is actively harmful and the sweep is what shows it.** It declines on
+   *every* shape, including 5x where the model is accurate, collapsing the whale
+   to 3 units that each run ~80-way internally — **completed work falls 388 →
+   218 at 100x and 276 → 218 at 5x.** §6 recommended moving toward 1/2 on the
+   old table; that recommendation is withdrawn.
+3. **`SPLIT_MUST_SHED_* stays 3/4.`** It is no longer "the first value that does
+   nothing" — under a measured ladder it is the value that separates a real
+   floor from an ordinary bisection.
 
 ## Done when
 

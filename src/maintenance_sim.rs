@@ -1121,44 +1121,55 @@ mod tests {
     fn a_floorless_whale_never_reaches_the_floor() {
         for guard in [SplitGuard::Off, SplitGuard::Shipped] {
             let (report, whale, _) = synth_run(false, guard);
-            // 129 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves
-            // and bisection only makes powers of two. The discriminating
-            // property is that NOTHING reaches MIN_SLICE_MICROS.
-            assert!(cell_units(&report, &whale) < 200, "{guard:?}: {} units", cell_units(&report, &whale));
+            // 255 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves,
+            // bisection only makes powers of two, and since bisection descends
+            // ONE level per measurement the 127 intermediate parents are
+            // journal rows too (it was 129 when one call minted the whole
+            // subtree). The discriminating property is unchanged and is the
+            // only one asserted below: NOTHING reaches MIN_SLICE_MICROS.
+            assert!(cell_units(&report, &whale) < 300, "{guard:?}: {} units", cell_units(&report, &whale));
             assert_eq!(report.units_at_min_slice, 0, "{guard:?}: nothing may reach the floor");
         }
     }
 
-    /// §3c.3/4 — **the fix does not hold on this queue, and this test pins
-    /// that.**
+    /// §3c.3/4 — the fix, and the regression guard for the defect it closed.
     ///
-    /// `69e6503` compares a unit's measurement against `parent_measured_bytes`,
-    /// but `byte_bounded_units` descends MANY levels inside ONE call, stamping
-    /// every descendant with the same number. The whale's ladder is therefore
-    /// only two journal levels deep — day (82,867 MB, no stamp, splits
-    /// unconditionally into 5-minute children) then 5 minutes (1,751 MB against
-    /// a stamp of 82,867 MB, so it sheds 98% and splits again, into one-minute
-    /// children). The third level is AT `MIN_SLICE_MICROS`, where the preflight
-    /// never asks (`database/maintain.rs:1276` requires `width > MIN_SLICE`).
+    /// `69e6503` compared a unit's measurement against `parent_measured_bytes`,
+    /// but `byte_bounded_units` used to descend MANY levels inside ONE call,
+    /// stamping every descendant with the same number. The whale's ladder was
+    /// then only two journal levels deep — day, then five minutes — and the
+    /// third level was already AT `MIN_SLICE_MICROS`, where the preflight never
+    /// asks (`database/maintain.rs:1276` requires `width > MIN_SLICE`). A
+    /// BETWEEN-call test on a WITHIN-call recursion never fires.
     ///
-    /// The guard is a BETWEEN-call test on a WITHIN-call recursion, so it never
-    /// gets to fire: `split_declined_at_floor` stays 0 and the run is
-    /// byte-for-byte identical to the pre-fix one. It does not stall either —
-    /// nothing is declined, so nothing fails to run — but "does not stall" is
-    /// all §3c.4 can claim here.
+    /// Bisecting one level per measurement makes every level a journal level,
+    /// so the guard is consulted at each: the whale ladder now declines at
+    /// 660 s having shed only ~2/3 of its parent, and the declined units RUN,
+    /// hash-sharded internally above the floor.
+    ///
+    /// **`split_declined_at_floor > 0` is the regression assertion** — it is
+    /// exactly 0 for every threshold if the recursion ever descends a subtree
+    /// again.
     #[test]
-    fn the_shipped_guard_never_engages_on_a_two_level_shred() {
+    fn the_floor_guard_declines_above_the_floor_and_the_shred_stops() {
         let (fixed, whale, _) = synth_run(true, SplitGuard::Shipped);
         let (unfixed, _, _) = synth_run(true, SplitGuard::Off);
-        assert_eq!(fixed.split_declined_at_floor, 0, "the guard never fires: the ladder is two levels, not three");
-        assert_eq!(cell_units(&fixed, &whale), cell_units(&unfixed, &whale), "so the fix changes nothing on this queue");
-        assert!(fixed.units_at_min_slice >= 1_000, "the shred survives the fix: {}", fixed.units_at_min_slice);
-        // The one thing that does hold: no execution exceeds the budget,
-        // because the runner hash-shards internally at any width. Every such
-        // run is AT the floor, never above it — which is what §3c.3 wanted and
-        // did not get.
+        assert!(fixed.split_declined_at_floor > 0, "the guard must be CONSULTED, which is the whole defect");
+        assert_eq!(fixed.units_at_min_slice, 0, "and nothing may reach the floor: {}", fixed.units_at_min_slice);
+        assert!(
+            cell_units(&fixed, &whale) * 4 < cell_units(&unfixed, &whale),
+            "the shred must collapse: {} against {}",
+            cell_units(&fixed, &whale),
+            cell_units(&unfixed, &whale)
+        );
+        // Declining is only safe because the runner hash-shards internally, so
+        // memory stays bounded — and now those runs happen ABOVE the floor
+        // instead of at it, which is what §3c.3 asked for.
         assert!(fixed.max_run_bytes <= MAX_DECODED_BYTES, "{} bytes decoded in one run", fixed.max_run_bytes);
-        assert_eq!(fixed.sharded_runs_above_min_slice, 0, "no unit is hash-sharded ABOVE the floor");
+        assert!(fixed.sharded_runs_above_min_slice > 0, "a declined unit must run hash-sharded ABOVE the floor");
+        assert!(fixed.narrowest_sharded_run_micros > MIN_SLICE_MICROS, "narrowest sharded run {}", fixed.narrowest_sharded_run_micros);
+        // §3c.4's good half: declines rise while the queue still drains.
+        assert_eq!(fixed.pending_end, 0, "declining must not stall the queue");
     }
 
     /// §3c.6 — a lineage carrying `retry_or_split`'s synthetic

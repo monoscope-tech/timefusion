@@ -5559,21 +5559,35 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         let now = 10 * DAY_MICROS;
-        let parent = task("p", DAY_MICROS, 2 * DAY_MICROS, Operation::BaseRollup).key;
-        journal.enqueue(parent.clone(), 0, 0, 0);
         // The 391 GB prod's 1,440 units claimed between them, against a
         // partition holding 35 files that decode to well under the budget.
         let footprint = InputFootprint::new((0..35).map(|n| format!("part-{n}.parquet")), MAX_DECODED_BYTES / 2);
+        // A split stamps its children with what the PARENT read — that is what
+        // lets fusion price them as one scan later. Exercised on a different
+        // day so the halves it leaves cannot subsume the shred below, which
+        // would collapse it by covering rather than by fusion.
+        let parent = task("p", 3 * DAY_MICROS, 4 * DAY_MICROS, Operation::BaseRollup).key;
+        journal.enqueue(parent.clone(), 0, 0, 0);
         assert!(journal.split_time_task(&parent, 391 * 1024 * 1024 * 1024, Some(footprint)));
+        assert!(journal.tasks().filter(|t| t.state == TaskState::Pending).all(|t| t.input == Some(footprint)), "children inherit what they read");
 
+        // The shred as prod held it, and as only REPEATED preflights can now
+        // produce it: 1,440 contiguous one-minute units over the same file
+        // set, nothing wider on the table.
+        for minute in 0..1_440 {
+            let start = DAY_MICROS + minute * MIN_SLICE_MICROS;
+            let key = task("p", start, start + MIN_SLICE_MICROS, Operation::BaseRollup).key;
+            journal.enqueue(key.clone(), 0, 282 * 1024 * 1024, 0);
+            let index = journal.task_indices[&key];
+            journal.snapshot.tasks[index].input = Some(footprint);
+        }
         let shredded = |journal: &TaskJournal| {
             journal
                 .tasks()
                 .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
                 .count()
         };
-        assert!(shredded(&journal) > 1_000, "precondition: the bisect ladder reaches the floor");
-        assert!(journal.tasks().filter(|t| t.state == TaskState::Pending).all(|t| t.input == Some(footprint)), "children inherit what they read");
+        assert!(shredded(&journal) > 1_000, "precondition: the day is shredded to the floor");
 
         // The cascade lands them at a width they can actually finish. One pass
         // is enough because every child names the same file set.
