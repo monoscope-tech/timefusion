@@ -1710,6 +1710,51 @@ impl TaskJournal {
     /// exists — see the field on [`MaintenanceTask`]. Only `plan_rollup_backfill`
     /// can prove it, because only it reads actual tier coverage.
     pub fn enqueue_with_base_tier(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool) {
+        self.enqueue_inner(key, deadline_micros, estimated_decoded_bytes, created_unix_ms, base_tier_present, None);
+    }
+
+    /// Queue a unit the planner has already MEASURED, carrying its footprint.
+    ///
+    /// `scheduling_class` ranks file hygiene by `input.files` and
+    /// `most_indebted_unclaimed` picks the worst cell on the same field, but the
+    /// only writer was `record_input` — at CLAIM time. So every never-claimed
+    /// cell scored zero, which is precisely the population both exist to order:
+    /// a 139-file cell tied a 2-file one and ordering fell through to recency.
+    /// Prod 2026-08-25, one container over 5h49m: `small_files_in_them` 746 ->
+    /// 447 with `out_of_policy_cells` at 51 for nine consecutive samples —
+    /// hygiene rotated across cells instead of finishing any of them.
+    ///
+    /// Deliberately NOT `upsert`: that replaces the whole task, resetting
+    /// `state`/`attempts` and bypassing the Superseded/live-descendant veto
+    /// below, which exists because resurrecting a parent beside its children
+    /// starved them for days.
+    pub fn enqueue_planned(&mut self, task: &MaintenanceTask) {
+        self.enqueue_inner(task.key.clone(), task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms, task.base_tier_present, task.input);
+    }
+
+    /// Precedence between the two footprints, since both are honest:
+    ///
+    /// * `None` NEVER erases. Most callers cannot measure anything, and stripping
+    ///   a claim-time footprint would break the bisect ladder `record_input`
+    ///   documents — children of a fused or split unit would carry none.
+    /// * The claim-time measurement wins while the unit is `Running` (the guard
+    ///   below already refuses to touch a running task) and while it sits in the
+    ///   quarantine early-return: those are the windows `abandon_running` reads
+    ///   it in, and it is a real measurement of what the unit actually read.
+    /// * Between claims the PLANNER wins. It re-derives the live file set every
+    ///   60 s, so it is the fresher observation, and nothing is lost — every
+    ///   claim records its own footprint unconditionally. This is also what
+    ///   heals the backlog: cells enqueued before this change gain a count on
+    ///   the next planner tick instead of waiting for a first claim.
+    fn enqueue_inner(
+        &mut self,
+        key: TaskKey,
+        deadline_micros: i64,
+        estimated_decoded_bytes: u64,
+        created_unix_ms: u64,
+        base_tier_present: bool,
+        input: Option<InputFootprint>,
+    ) {
         // Same rule as `upsert`, and it needs stating twice because this path
         // does not go through it: a key removed earlier in this write window and
         // enqueued again is CREATED, not removed. `coarsen_to_width` does
@@ -1750,6 +1795,7 @@ impl TaskJournal {
                 task.retry_reason = None;
                 task.publication = None;
                 task.base_tier_present |= base_tier_present;
+                task.input = input.or(task.input);
                 self.dirty_tasks.insert(key);
                 return;
             }
@@ -1773,7 +1819,11 @@ impl TaskJournal {
                     // Latching, never clearing: the planner proves presence, and
                     // a later enqueue that cannot prove it (the frontier's) is
                     // silence, not evidence of absence.
-                    || (base_tier_present && !task.base_tier_present);
+                    || (base_tier_present && !task.base_tier_present)
+                    // The re-plan that HEALS the backlog: a cell queued before
+                    // the planner carried a footprint, or one whose debt grew,
+                    // must not have to be claimed once to become rankable.
+                    || (input.is_some() && input != task.input);
                 if changed {
                     task.state = TaskState::Pending;
                     task.deadline_micros = new_deadline;
@@ -1781,6 +1831,7 @@ impl TaskJournal {
                     task.retry_reason = None;
                     task.publication = None;
                     task.base_tier_present |= base_tier_present;
+                    task.input = input.or(task.input);
                     self.dirty_tasks.insert(key);
                 }
             }
@@ -1801,7 +1852,7 @@ impl TaskJournal {
             retry_reason: None,
             publication: None,
             base_tier_present,
-            input: None,
+            input,
             parent_measured_bytes: None,
         });
     }
