@@ -492,9 +492,12 @@ pub mod rollup_unverifiable {
         let reasons = UnverifiableReason::ALL.iter().map(|reason| reason.as_str()).zip(BY_REASON.iter());
         let fates = UnverifiableFate::ALL.iter().map(|fate| fate.as_str()).zip(BY_FATE.iter());
         let total = BY_REASON.iter().map(|gauge| gauge.load(Relaxed)).sum::<u64>();
-        [("rollup_unverifiable_total".to_owned(), total), ("rollup_unverifiable_identity_tag_incomplete_total".to_owned(), IDENTITY_TAG_INCOMPLETE.load(Relaxed))]
-            .into_iter()
-            .chain(reasons.chain(fates).map(|(label, gauge)| (format!("rollup_unverifiable_{label}"), gauge.load(Relaxed))))
+        [
+            ("rollup_unverifiable_total".to_owned(), total),
+            ("rollup_unverifiable_identity_tag_incomplete_total".to_owned(), IDENTITY_TAG_INCOMPLETE.load(Relaxed)),
+        ]
+        .into_iter()
+        .chain(reasons.chain(fates).map(|(label, gauge)| (format!("rollup_unverifiable_{label}"), gauge.load(Relaxed))))
     }
 }
 

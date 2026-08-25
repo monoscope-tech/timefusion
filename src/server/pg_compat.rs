@@ -1728,8 +1728,11 @@ mod stats_table_tests {
             .map(|suffix| format!("rollup_unverifiable_{suffix}"))
             .collect();
         let rows = snapshot_rows(&StatsTableProvider::new(None));
-        let exposed: std::collections::BTreeSet<String> =
-            rows.iter().filter(|(component, key, _)| component == "maintenance" && key.starts_with("rollup_unverifiable_")).map(|(_, key, _)| key.clone()).collect();
+        let exposed: std::collections::BTreeSet<String> = rows
+            .iter()
+            .filter(|(component, key, _)| component == "maintenance" && key.starts_with("rollup_unverifiable_"))
+            .map(|(_, key, _)| key.clone())
+            .collect();
         assert_eq!(exposed, expected, "the exposed rows and the bucket lists must be the same set — an unexposed bucket cannot be attributed");
     }
 
