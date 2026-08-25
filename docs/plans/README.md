@@ -45,6 +45,26 @@ at trades one kind of stale for a worse one.
 - [Query latency matrix](2026-08-22-query-latency-matrix.md) — filter-shape
   matrix; `src/database/mod.rs` cites it.
 
+## Decisions taken 2026-08-25
+
+Five items that were open as decisions, not as code. Each states its verdict in
+the first paragraph and each names the premise it found false — three of the five
+were deferred or blocked on a reason that did not survive being checked.
+
+- [Union tags stay deferred](2026-08-25-union-tags-stay-deferred.md) — tag-aware
+  rollup-tier compaction. Deferred, with a four-condition revisit trigger; the
+  ledger is not the reason and should stop being cited as one.
+- [The preflight floor needs a byte model in `sim`](2026-08-25-preflight-floor-needs-a-byte-model-not-a-prod-journal.md)
+  — `sim` does not model byte-driven splits, so the prod journal was never the
+  blocker. Specifies the model and the synthetic fixture.
+- [Partial certification](2026-08-25-partial-certification-design.md) — design
+  only; the §3a rule is already wired, and missing add-action timestamp stats are
+  an unnamed second blocker. Supersedes the "diagnosed, fix not built" page below.
+- [Dedup strategy triage](2026-08-25-dedup-strategy-triage.md) — ranked order for
+  the dedup backlog; measure duplication before choosing a policy.
+- [Ingest-profile leftovers, closed](2026-08-25-ingest-profile-leftovers-closed.md)
+  — both phases were fixed by `a3a4b25`; no profile was needed.
+
 ## Reference pages kept for live code
 
 These are complete, but live code cites them as the rationale for a current
