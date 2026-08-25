@@ -2079,8 +2079,22 @@ async fn route_with_spec(
         // `COUNT(col)` for the same measure. Before this, monoscope's log-explorer
         // latency widget (`count(*)` folded in from `HAVING COUNT(*) > 0` beside
         // `percentile_agg(duration)`) was refused outright and scanned 7 days raw.
+        //
+        // Withheld from queries that ALSO carry a `percentile_agg`, which is the
+        // latency widget itself. Cells built before the 2026-08-22 spec change have
+        // no `duration_digest` COLUMN in their files, so the reader projects
+        // `NULL AS duration_digest` and the routed chart renders a hole wherever
+        // the rollup interior answers — measured 2026-08-25 on the 7d widget as p95
+        // present for the newest six buckets and NULL for every older one, against a
+        // raw control that has all of them and agrees to within 0.8% on the overlap.
+        // The rewrite is sound; the cells are not, and it must not be what newly
+        // exposes them. Delete this clause once those cells have rebuilt.
+        let carries_digest = aggregate
+            .aggr_expr
+            .iter()
+            .any(|expr| matches!(unaliased(expr), Expr::AggregateFunction(function) if function.func.name().eq_ignore_ascii_case("percentile_agg")));
         let column = match (column, null_guard) {
-            (None, Some(guard)) if name == "count" => Some(guard.to_string()),
+            (None, Some(guard)) if name == "count" && !carries_digest => Some(guard.to_string()),
             (column, _) => column,
         };
         if null_guard.is_some() && column.as_deref() != null_guard {
@@ -2853,23 +2867,40 @@ mod tests {
         assert!(route_for(&state, &sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
     }
 
-    /// monoscope's log-explorer latency widget, verbatim down to the `HAVING
-    /// COUNT(*) > 0` — whose `count(*)` DataFusion folds into the aggregate
-    /// beside the digest. Under `duration IS NOT NULL` that count is exactly
-    /// `count(duration)`, so it resolves to `duration_count` instead of refusing
-    /// the whole query. Prod 2026-08-25: 35.7s raw against 3.34s routed.
+    /// Under `col IS NOT NULL` — consumed above rather than pushed, so neither
+    /// leg re-applies it — `count(*)` is exactly `count(col)`, which
+    /// `duration_count` declares. Before this the whole query was refused
+    /// `filter_not_eligible` and scanned raw.
     #[tokio::test]
-    async fn a_percentile_widget_counting_under_a_null_guard_routes() {
+    async fn a_guarded_count_resolves_to_the_guard_column() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
+        assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
+    }
+
+    /// …but NOT when the same query also asks for a percentile. Cells built
+    /// before the 2026-08-22 spec change have no `duration_digest` column in
+    /// their files, so the reader projects NULL and the chart renders a hole
+    /// over the rollup interior (measured on prod 2026-08-25: p95 present for
+    /// the newest six buckets, NULL for every older one). The count rewrite is
+    /// sound and must not be what newly exposes those cells — so monoscope's
+    /// latency widget keeps scanning raw until they have rebuilt.
+    #[tokio::test]
+    async fn a_guarded_count_beside_a_percentile_still_declines() {
         let state = session().await;
         let sql = format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS digest \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1 HAVING COUNT(*) > 0"
         );
-        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
-        let generated = generated_sql(&route);
-        assert!(generated.contains("duration_digest"), "the digest measure must answer the percentile: {generated}");
-        assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
-        assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
+        // Not pinned to a reason: which guard fires first depends on the grain the
+        // digest measure selects. The property is that it does not route.
+        assert!(!matches!(route_for(&state, &sql).await, Ok(Some(_))), "a latency widget must not route into cells that project a NULL digest");
     }
 
     /// The arm is deliberately narrow. A dimension the spec does not declare, a
