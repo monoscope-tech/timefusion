@@ -190,10 +190,11 @@ Revisit when **all four** hold. Each is checkable; none is a judgement call.
 >
 > Not "absent from the window" — the line is present on both sources and the
 > field reads zero, so the ratio is 0%, not ~92%. **What is still missing for
-> trigger 1 as written:** both passes are the SAME container at 71 and 77 min
-> uptime, and the trigger asks for ≥2h uptime on TWO separate containers. Take
-> the confirming read on the next long-lived container rather than treating this
-> as closed.
+> trigger 1 as written, and it fails on BOTH axes:** all four lines come from the
+> SAME container (started 08:01:21Z), and the two passes fired at **5 min and
+> 65 min uptime** — so neither "≥2h uptime" nor "two separate containers" is met.
+> Take the confirming read on the next long-lived container rather than treating
+> this as closed.
 >
 > **A new residual surfaced in the same read, and it is NOT the generation
 > problem:** `unverifiable` is byte-identical across both passes — 2,037 and
