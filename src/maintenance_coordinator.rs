@@ -862,8 +862,19 @@ impl TaskJournal {
         let mut replacements: HashMap<TaskKey, (i64, u64, u64)> = HashMap::new();
         let mut migrated = 0usize;
         for task in &mut self.snapshot.tasks {
+            // A SPLIT CHILD is not a legacy fragment. This migration exists for
+            // the old 10-minute derived units; collapsing a child back to its
+            // hour erases the bisection ladder and re-enqueues the parent key,
+            // which `enqueue_inner` then resurrects to Pending — the loop that
+            // turned one schema break into 4,632 superseded derived records on
+            // 2026-08-22/23 (not one survived at width 1.0h; the migrated
+            // population peaked at the 1-minute floor). `parent_measured_bytes`
+            // is set only by `split_time_task`, so it is the exact discriminator.
+            // Recombining children stays `coarsen_to_width`'s job — it prices the
+            // fusion, which this pass cannot.
             if !(task.key.operation == Operation::DerivedRollup
                 && task.key.slice.width() != DERIVED_SLICE_MICROS
+                && task.parent_measured_bytes.is_none()
                 && !matches!(task.state, TaskState::Complete | TaskState::Superseded))
             {
                 continue;
