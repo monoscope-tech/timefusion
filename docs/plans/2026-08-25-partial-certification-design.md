@@ -258,6 +258,31 @@ remains the *last* step, not the gate.
   projects live in the durable sidecar, and `cert_granted_total = 0` is
   process-scoped. Three separate fixes have already been aimed at a healthy
   mechanism on the strength of that zero.
+
+  > **MEASURED 2026-08-25, image `d3b44f7`, container age 2 h — and it is worse
+  > than "not measured", but read the trap before acting.** On a process with
+  > **3,161** `dedup_eligible` scans: `cert_granted_total = 0`,
+  > `dedup_denied_uncertified = 3,160`,
+  > `dedup_denied_never_certified_pct = **100.0**`, and every `cert_refused_*`
+  > zero except `dropped = 4`.
+  >
+  > The **grant** counter being 0 is still the process-scoped artifact above and
+  > proves nothing on its own. What is NEW is the **denial** side: 3,160 of 3,161
+  > eligible scans were denied for `never_certified`, on a container old enough
+  > that the durable sidecar's 97 grants were loadable. So the read path is not
+  > finding usable certifications for essentially any scan it attempts, and
+  > `DedupExec` is in effectively every plan.
+  >
+  > This does NOT license re-diagnosing the mechanism as broken — that is the
+  > exact mistake three prior fixes made. It says the *contiguity/eligibility*
+  > gap this document exists to close is live and expensive right now, which
+  > raises the item's priority without changing its design.
+  >
+  > Cheap discriminator before anyone writes code: compare
+  > `dedup_denied_never_certified_pct` against the durable sidecar's grant list
+  > for the SAME projects. If projects with grants are still denied
+  > `never_certified`, the lookup is at fault; if the denied projects are simply
+  > not in the grant list, the producer's coverage is, which is §2's question.
 - **Do not** carry a certification across a rewrite (see 2's precondition 1).
 - **Do not** widen this to the per-date path. The per-date skip
   (`database/mod.rs:8710`) rests on a *different* argument — `date` derives from

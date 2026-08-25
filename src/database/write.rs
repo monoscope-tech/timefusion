@@ -381,7 +381,14 @@ impl Database {
                 .with_storage_options(storage_options.clone())
                 .with_allow_http(true))
         };
-        let restored = match crate::storage::load_snapshot(&Self::delta_snapshot_dir(&self.config), storage_uri) {
+        // `spawn_blocking`, mirroring `persist_snapshot`'s store side: this
+        // zstd-decodes and deserializes a whole `DeltaTableState` (22k+ files
+        // on the fat prod tables), which is SECONDS of CPU — long work wants
+        // its own thread, not a borrowed worker. Boot preload runs many of
+        // these concurrently on the same runtime the coordinator is on.
+        let (snapshot_dir, url_owned) = (Self::delta_snapshot_dir(&self.config), storage_uri.to_string());
+        let loaded = tokio::task::spawn_blocking(move || crate::storage::load_snapshot(&snapshot_dir, &url_owned)).await.unwrap_or(None);
+        let restored = match loaded {
             Some(state) => {
                 let restored_version = state.version();
                 let mut table = builder()?.build()?;
