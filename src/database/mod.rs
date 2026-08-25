@@ -299,6 +299,13 @@ pub mod scan_metric_names {
     pub const WIDE_SCAN_OVERSIZE_TOTAL: &str = "timefusion.scan.wide_scan_oversize_total";
     pub const DEDUP_BOUNDED_TOTAL: &str = "timefusion.scan.dedup_bounded_total";
     pub const DEDUP_FULL_SET_TOTAL: &str = "timefusion.scan.dedup_full_set_total";
+    // Unordered keep-greatest collapsing its retained buffer to current
+    // winners, and the rows that collapse bought back. `rows_dropped` far
+    // exceeding `total` is the merge-on-read duplicate density this exists for;
+    // `total` climbing with `rows_dropped` near zero means the scan's winners
+    // genuinely fill the buffer and the window is the problem, not duplication.
+    pub const DEDUP_WINNER_COMPACTIONS_TOTAL: &str = "timefusion.scan.dedup_winner_compactions_total";
+    pub const DEDUP_WINNER_COMPACTION_ROWS_DROPPED: &str = "timefusion.scan.dedup_winner_compaction_rows_dropped";
     pub const WIDE_SCAN_SELECTED_MB: &str = "timefusion.scan.wide_scan_selected_mb";
     pub const MEM_PLAN_US_TOTAL: &str = "timefusion.scan.mem_plan_us_total";
     pub const MEM_PLAN_TOTAL: &str = "timefusion.scan.mem_plan_total";
@@ -2262,13 +2269,13 @@ pub struct Database {
     /// One-shot guard so a second `preload_tables` call can't double the
     /// boot-time S3 warm burst.
     preload_started: Arc<std::sync::atomic::AtomicBool>,
-    /// Barrier set after startup discovery + footer warming. Maintenance waits
-    /// on it so it's never the first cold-loader of a table foreground needs.
-    preload_complete: Arc<std::sync::atomic::AtomicBool>,
-    preload_complete_notify: Arc<tokio::sync::Notify>,
-    /// Tables warmed so far, and how many there are. Read only when the
-    /// coordinator's wait EXPIRES — see there for why the ratio is the whole
-    /// question.
+    /// Barrier set once every registry table's Delta log has been REPLAYED —
+    /// not when the paced body warm behind it finishes. Maintenance waits on it
+    /// so it's never the first cold-loader of a table foreground needs.
+    preload_replay_complete: Arc<std::sync::atomic::AtomicBool>,
+    preload_replay_notify: Arc<tokio::sync::Notify>,
+    /// Tables replayed so far, and how many there are. The ratio is also read
+    /// when the coordinator's wait EXPIRES — see there.
     preload_tables_done: Arc<std::sync::atomic::AtomicU64>,
     preload_tables_total: Arc<std::sync::atomic::AtomicU64>,
     /// Runtime for CPU/IO-heavy startup and coordinator work; foreground
@@ -3073,8 +3080,8 @@ impl Database {
             maintenance_shutdown: Arc::new(maintenance_shutdown),
             _maintenance_cancel_guard: Some(maintenance_cancel_guard),
             preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preload_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            preload_complete_notify: Arc::new(tokio::sync::Notify::new()),
+            preload_replay_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            preload_replay_notify: Arc::new(tokio::sync::Notify::new()),
             preload_tables_done: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preload_tables_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             maintenance_executor: Arc::new(std::sync::OnceLock::new()),
@@ -5787,7 +5794,13 @@ impl Database {
                 let db = Arc::clone(&db);
                 async move {
                     let t = std::time::Instant::now();
-                    match db.resolve_table("default", &table_name).await {
+                    let resolved = db.resolve_table("default", &table_name).await;
+                    // Count the table as replayed BEFORE the warm, and count it
+                    // even when the replay failed: a single unresolvable table
+                    // must not hold the maintenance gate shut for the whole
+                    // budget, which is the failure this gate keeps producing.
+                    db.mark_table_replayed();
+                    match resolved {
                         Ok(table_ref) => {
                             // Warm via the already-resolved handle — warm_cache_for_table
                             // would redundantly resolve_table a second time.
@@ -5810,7 +5823,6 @@ impl Database {
                         }
                         Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }
-                    db.preload_tables_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             });
             // Abandon warming on shutdown so in-flight S3 calls can't slow
@@ -5820,8 +5832,9 @@ impl Database {
                 _ = preload_all => true,
             };
             if completed {
-                db.preload_complete.store(true, std::sync::atomic::Ordering::Release);
-                db.preload_complete_notify.notify_waiters();
+                // Idempotent, and the only thing that releases the gate when
+                // the registry is empty.
+                db.mark_replay_complete();
                 info!(event = "table_preload_complete");
             }
         };
@@ -5834,41 +5847,63 @@ impl Database {
         }
     }
 
-    /// Wait until preload has published all discoverable table handles. The
-    /// atomic closes the `Notify` check/subscribe race and also makes late
-    /// subscribers return immediately.
-    /// Wait for the boot preload, but never forever — see
-    /// `timefusion_coordinator_preload_wait_secs` for the prod measurement that
-    /// made this bounded. `false` means "give up on this worker" and is
-    /// returned ONLY for cancellation; a preload that is merely slow returns
-    /// `true` so maintenance proceeds.
+    /// One table's Delta log replay is done — the warm behind it may still be
+    /// running. Counted in BOTH outcomes, because an unresolvable table must
+    /// not hold the gate.
+    fn mark_table_replayed(&self) {
+        let done = self.preload_tables_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if done >= self.preload_tables_total.load(std::sync::atomic::Ordering::Relaxed) {
+            self.mark_replay_complete();
+        }
+    }
+
+    fn mark_replay_complete(&self) {
+        if !self.preload_replay_complete.swap(true, std::sync::atomic::Ordering::Release) {
+            self.preload_replay_notify.notify_waiters();
+            info!(event = "table_preload_replay_complete");
+        }
+    }
+
+    /// Wait until every registry table's Delta log has been replayed, so
+    /// maintenance is never the first cold loader of a table the foreground
+    /// needs. The atomic closes the `Notify` check/subscribe race and also
+    /// makes late subscribers return immediately.
+    ///
+    /// It does NOT wait for the paced body warm behind the replay. Prod
+    /// container `62f2385`: replay ~4 s, full preload 27 min 21 s (13.8
+    /// files/s over 22,642 files) against a 300 s budget — so the wait always
+    /// expired, and the coordinator then ran beside the still-running warm for
+    /// 22 of those 27 minutes. It never prevented the overlap it exists to
+    /// prevent; it only delayed maintenance by a fifth of a ~15-minute
+    /// container's life. The body warm is deliberately paced to be safe beside
+    /// other work (see `preload_tables`), which is why it needs no gate.
+    ///
+    /// Still bounded — see `timefusion_coordinator_preload_wait_secs`. `false`
+    /// means "give up on this worker" and is returned ONLY for cancellation; a
+    /// replay that is merely slow returns `true` so maintenance proceeds.
     async fn wait_for_preload(&self, cancel: &CancellationToken) -> bool {
         let budget = self.config.maintenance.timefusion_coordinator_preload_wait_secs;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(budget);
         loop {
-            if self.preload_complete.load(std::sync::atomic::Ordering::Acquire) {
+            if self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire) {
                 return true;
             }
             if budget == 0 || tokio::time::Instant::now() >= deadline {
-                // HOW FAR IT GOT, not just that it expired. Prod logs this line
-                // on every boot, which says the 300s is always paid in full and
-                // maintenance then competes with a still-running warm anyway —
-                // so the wait does not achieve the thing it exists for. What it
-                // could not say is whether 300s was nearly enough (raise it) or
-                // nowhere near (lower it, and stop paying a fifth of every
-                // container's life for nothing). Without this ratio that is a
-                // guess, and the container lives ~10-25 minutes.
+                // HOW FAR IT GOT, not just that it expired. Now that the gate
+                // is the replay and not the warm, this line firing at all means
+                // the replay itself overran the budget — a real alarm rather
+                // than the every-boot noise it used to be.
                 warn!(
                     event = "maintenance_coordinator_preload_wait_expired",
                     waited_secs = budget,
                     tables_done = self.preload_tables_done.load(std::sync::atomic::Ordering::Relaxed),
                     tables_total = self.preload_tables_total.load(std::sync::atomic::Ordering::Relaxed),
-                    "starting maintenance before the cache preload finished; it would otherwise never start on this container"
+                    "starting maintenance before the table replay finished; it would otherwise never start on this container"
                 );
                 return true;
             }
-            let notified = self.preload_complete_notify.notified();
-            if self.preload_complete.load(std::sync::atomic::Ordering::Acquire) {
+            let notified = self.preload_replay_notify.notified();
+            if self.preload_replay_complete.load(std::sync::atomic::Ordering::Acquire) {
                 return true;
             }
             tokio::select! {
@@ -12715,10 +12750,10 @@ mod tests {
 
     /// Maintenance must not be hostage to the boot cache preload.
     ///
-    /// `preload_complete` is set ONLY when the warm finishes every table; it is
-    /// abandoned and left unset if shutdown arrives first. The coordinator, the
-    /// tantivy reconcile and the coverage recovery all gate on it, so a warm
-    /// that never finishes silently disables all three for the life of the
+    /// The gate is set ONLY when every table has been replayed; it is abandoned
+    /// and left unset if shutdown arrives first. The coordinator, the tantivy
+    /// reconcile and the coverage recovery all gate on it, so a preload that
+    /// never finishes would silently disable all three for the life of the
     /// container.
     ///
     /// Prod 2026-08-23, 45 min across two boots: 26
@@ -12735,7 +12770,7 @@ mod tests {
         let mut cfg = (*create_test_config("preload-wait")).clone();
         cfg.maintenance.timefusion_coordinator_preload_wait_secs = 300;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
-        // Deliberately never set `preload_complete` — the prod state.
+        // Deliberately never mark the replay complete — the prod state.
         let cancel = CancellationToken::new();
         let started = tokio::time::Instant::now();
         assert!(db.wait_for_preload(&cancel).await, "a slow preload must release maintenance, not disable it");
@@ -12748,6 +12783,45 @@ mod tests {
         cancel.cancel();
         let db2 = Database::with_config(create_test_config("preload-cancel")).await?;
         assert!(!db2.wait_for_preload(&cancel).await, "a cancelled worker must still stop");
+        Ok(())
+    }
+
+    /// The gate is the REPLAY phase, not the paced body warm.
+    ///
+    /// Prod container `62f2385`, from its own boot: preload start 20:38:09,
+    /// `table_preload_complete` 21:05:32 — 27 min 21 s, 5.5x the 300 s budget,
+    /// of which the per-table `bootstrap.phase=table_preload` lines account for
+    /// 0.6-4.0 s each (~4 s of Delta log replay in total). The other 27 minutes
+    /// is the paced body warm: 22,642 files / 1,641 s = 13.8 files/s, the
+    /// configured pace. The coordinator gave up at 300 s and ran ALONGSIDE that
+    /// warm for the remaining 22 minutes anyway — so the wait never prevented
+    /// the overlap it exists to prevent, it only cost a fifth of a ~15-minute
+    /// container's life.
+    ///
+    /// What the wait legitimately protects is the unpaced phase: resolving each
+    /// table's Delta log so maintenance is not the first cold loader of a table
+    /// the foreground needs. That is what the flag now means.
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_waits_for_the_replay_phase_not_the_body_warm() -> Result<()> {
+        let mut cfg = (*create_test_config("preload-replay")).clone();
+        cfg.maintenance.timefusion_coordinator_preload_wait_secs = 300;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let cancel = CancellationToken::new();
+        db.preload_tables_total.store(2, std::sync::atomic::Ordering::Relaxed);
+
+        // A partially-replayed registry is still a wait: one table resolved
+        // says nothing about the other.
+        db.mark_table_replayed();
+        let started = tokio::time::Instant::now();
+        assert!(db.wait_for_preload(&cancel).await);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(300), "one of two tables replayed must not release the gate");
+
+        // Both replayed releases immediately — with the paced body warm still
+        // running, which is exactly the state this change stops paying for.
+        db.mark_table_replayed();
+        let started = tokio::time::Instant::now();
+        assert!(db.wait_for_preload(&cancel).await);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "the replayed registry must release the gate without waiting on the warm");
         Ok(())
     }
 

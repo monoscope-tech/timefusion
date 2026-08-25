@@ -1103,22 +1103,177 @@ metric has been read at all.
 
 ---
 
-## 8. Still running at hand-off
+## 8. LEDGER BURST #3 (10:06Z, uptime 2h05m) — **the lag reading is CONFIRMED on three passes**
 
-Two reads were scheduled and had not returned when this was written:
+Counter re-read at 10:13:23Z, uptime **7 922 s (2h12m)**:
+`coverage_ledger_disagreements = 107`, `persist_failures = 0`,
+`immutable_column_disagreement_total = 0`.
 
-1. **Ledger burst #3** (`burst2.txt`) — server-side grep `--since 09:20:00Z`,
-   fired ~10:15Z, brackets the expected ~10:06 pass. Tests the discriminator named
-   in §3: do the **same** cells re-disagree, and does `held` advance again
-   (6→7 was seen between the 08:06 and 09:06 passes)? Also gives the third
-   `recovered / unverifiable / stale_generation` triple — a third byte-identical
-   `unverifiable` (2 037 / 2 349) would make "frozen population" much stronger
-   than two.
-2. **Census #2 on the mature container** (`census2.txt`) — ~10:45Z, container age
-   ~2h44m. Two spaced points on one long-lived container is what turns §7's single
-   moving window into a rate.
+**Exact reconciliation, three for three:** 29 (08:06) + 40 (09:06) + **38 (10:06)**
+= **107**, the counter value. Every disagreement the counter has ever recorded on
+this container is accounted for by a logged line. Nothing is un-logged, and the
+cadence is confirmed **hourly** (08:06:23, 09:06:34, 10:06).
 
-Both are read-only (logs + a Delta log listing + one `timefusion_stats` select).
+### `held` advances every pass — this is a lag, not drift
+
+The discriminator I named in §3 was: do the same cells re-disagree, and does
+`held` advance? Same nine projects, same table, three passes:
+
+| pass | `otel_metrics_rollup_metrics_1m_v2` (9 projects) | `…dashboard_1m_v3` |
+|---|---|---|
+| 08:06 | `held=7 proved=7` | 6× `held=6 proved=7` |
+| 09:06 | `held=7 proved=8` | 8× `held=7 proved=8` |
+| **10:06** | **`held=8 proved=9`** | **8× `held=8 proved=9`** |
+
+**`held` walks 7 → 7 → 8 while `proved` walks 7 → 8 → 9.** The ledger keeps
+catching up and the tags keep moving one ahead — one new entry per hour on the
+live frontier, which is exactly the rollup cadence. Drift would pin `held` while
+`proved` ran away; instead the gap stays constant at one and both advance.
+
+**Verdict: `coverage_ledger_disagreements` is benign frontier write-ordering lag,
+established on three hourly passes with a monotone `held`.** It is not the
+`98e72d5` serde artifact, and it is not ledger corruption. `persist_failures`
+remains 0 across all three.
+
+### Two new shapes in this burst, neither fatal, both worth naming
+
+1. **First disagreement on a date other than today:**
+   `…dashboard_1h_v2 project_id=87576849… date=2026-08-24 held=6 proved=6`.
+   Across 107 disagreements this is the **only** non-`2026-08-25` cell, and it is
+   yesterday — the day that sealed at midnight, i.e. still the most recently
+   written partition. Equal counts, so it is a content difference, not a missing
+   entry. Consistent with the same lag draining out of the previous day. **Still
+   zero disagreements on any of the 1 080 genuinely sealed cells.**
+2. **First `proved < held`:** `…dashboard_1h_v2 project_id=6297304f… date=2026-08-25
+   held=3 proved=1`. The ledger holds **more** than the tags prove — the opposite
+   direction from every other line, and **not** a lag signature. One occurrence in
+   107. Two readings, not resolved: a compaction/rewrite retired tags the ledger
+   still remembers (benign, and the next pass should show `held` falling to 1), or
+   a genuine over-claim by the ledger. **This is the one line that would matter if
+   it recurs**, because an over-claiming ledger can serve a read from files that
+   are gone. Cheapest check: the 11:06 pass — does that cell's `held` fall to
+   match `proved`?
+
+---
+
+## 8b. `unverifiable` is FROZEN — third byte-identical reading
+
+Third pass triple (log window verified, `--since 09:30:00Z`, lines at ~10:06):
+
+```
+source="otel_metrics"          recovered=4857  unverifiable=2037  stale_generation=0
+source="otel_logs_and_spans"   recovered=20570 unverifiable=2349  stale_generation=0
+```
+
+Full series, three passes on one container, 08:06 → 10:06:
+
+| source | metric | 08:06 | 09:06 | 10:06 | trend |
+|---|---|---|---|---|---|
+| `otel_metrics` | `recovered` | 4 719 | 4 787 | **4 857** | +68, **+70** |
+| `otel_metrics` | `unverifiable` | 2 037 | 2 037 | **2 037** | **frozen** |
+| `otel_metrics` | `stale_generation` | 0 | 0 | **0** | **flat zero** |
+| `otel_logs_and_spans` | `recovered` | 20 345 | 20 455 | **20 570** | +110, **+115** |
+| `otel_logs_and_spans` | `unverifiable` | 2 349 | 2 349 | **2 349** | **frozen** |
+| `otel_logs_and_spans` | `stale_generation` | 0 | 0 | **0** | **flat zero** |
+
+Two conclusions, at different strengths:
+
+1. **`stale_generation = 0` on three passes, both sources.** The generation-orphan
+   population is empty on this build. Still one container, still under 2h at the
+   first two passes — the third is at 2h05m, so **one** of the trigger's two axes
+   is now met; "two separate containers" is not.
+2. **`unverifiable` is byte-identical three times — 2 037 and 2 349 — while
+   `recovered` grew by 138 and 225 respectively.** Recovery is demonstrably doing
+   work each pass and this population never changes by even one slice. A frozen
+   **~4 386-slice** set that coverage recovery cannot verify. Three identical
+   readings while a sibling counter moves is much stronger than two: it is not a
+   sampling artifact and it is not "nothing ran". **This is the successor problem
+   to the generation orphans** — same blast radius, different cause, and it has no
+   instrument beyond this log line.
+
+**Trap discipline applied:** the count of 38 comes from a fetch whose burst is
+fully contained in the window (all 38 at `T10:06`, i.e. not clipped at either
+edge), and it is independently corroborated by the counter arithmetic
+(29+40+38 = 107 exactly). Earlier in this session a single server-side-grepped
+fetch silently truncated and would have supported a wrong occurrence count; the
+counter reconciliation is what makes this one safe to quote.
+
+---
+
+## 8d. Is `6297304f` a project with recent compaction activity? **YES, heavily — on that exact table.**
+
+Logs only, no queries, no code. Window **09:55:37 → 10:08:01Z** (timestamp-verified
+from the returned lines), filtered to `dashboard_1h_v2` AND `6297304f`, 9 lines:
+
+```
+DerivedRollup … slice_start=1787644800000000 slice_end=1787648400000000 estimated_decoded_bytes=…
+DerivedRollup … slice_start=1787644800000000 slice_end=1787648400000000 rows=6…
+DerivedRollup … slice_start=1787612400000000 slice_end=1787616000000000 estimated_decoded_bytes=…
+            … slice_start=1787612400000000 covering_start=1787529600000000 covering_end=1787616000000000
+DerivedRollup … slice_start=1787641200000000 slice_end=1787644800000000 estimated_decoded_bytes=…
+DerivedRollup … slice_start=1787641200000000 slice_end=1787644800000000 rows=5…
+the ledger and the Delta tags disagree … date=2026-08-25          <- the 10:06 line itself
+DerivedRollup … slice_start=1787601600000000 slice_end=1787605200000000 estimated_decoded_bytes=…
+            … slice_start=1787601600000000 covering_start=1787529600000000 covering_end=1787616000000000
+```
+
+Decoded (µs → UTC): `1787641200`→**08-25 07:00**, `1787644800`→**08:00**,
+`1787648400`→**09:00**, `1787612400`→**08-24 23:00**, `1787601600`→**08-24 20:00**,
+`1787616000`→**08-25 00:00**, `1787529600`→**08-24 00:00**.
+
+**Three things this establishes, and one thing it does not.**
+
+1. **This exact (project, table) is under continuous DerivedRollup churn** — four
+   distinct hour slices built in a 12-minute window, spanning 08-24 20:00 through
+   08-25 09:00. The benign explanation ("a rewrite retired tags the ledger still
+   remembers") has an abundant substrate here; this is the busiest cell in the
+   burst by a wide margin.
+2. **A `covering_start`/`covering_end` mechanism is active on it**, and the
+   covering range is **day-wide: 08-24 00:00 → 08-25 00:00**, referenced by two
+   different hour slices. A day-wide covering entry coexisting with the hour
+   entries it covers is the shape that would naturally make the ledger *hold* more
+   entries than a tag set proves. **Named as an observation, not a diagnosis** —
+   the disagreement line was `date=2026-08-25` while the covering range is 08-24,
+   and I am not chasing this into the code per instruction.
+3. Beyond this table, `6297304f` also took `SealedConsolidation` (on
+   `otel_logs_and_spans`, slice 08-18→08-19), `BaseRollup` on
+   `…dashboard_1m_v3`, `Dedup`, and `Repair` on `otel_metrics` in a separate
+   6-minute window. It is one of the most active projects on the box.
+
+**What it does NOT establish — a near-miss worth recording.** I first read the
+paired `DerivedRollup` lines carrying the *same* `slice_start` as **duplicate
+claims on one slice**, which would have been a significant finding. They are not:
+the pattern is consistently one line with `estimated_decoded_bytes` (the claim)
+and one with `rows=` (the completion). Same slice, two lifecycle events. The
+thread IDs differ between them (`58422`/`58425`, `61796`/`61325`), which is what
+made it look like two workers. **No duplicate-claim finding here.**
+
+### Also visible in that fetch: defect 0/1 is still live on `d3b44f7`
+
+Four `most_indebted_unclaimed` lines in a ~6-minute window:
+
+```
+refusal="outranked_by:6297304f:2026-08-18:6297304f:2026-08-17:files=0"
+refusal="outranked_by:87576849:2026-08-18:6297304f:2026-08-17:files=0"
+refusal="outranked_by:00000000:2026-08-17:6297304f:2026-08-17:files=0"
+refusal="outranked_by:28f62f01:2026-08-18:6297304f:2026-08-17:files=0"
+```
+
+**`files=0` on the worst cell in every one**, exactly as recorded on 08-24 — the
+enqueue-time footprint is still not carried, so `benefit` is inert. One nuance
+worth noting: the `worst` it names is **stable at `6297304f/2026-08-17`**, which
+*is* a genuine 49-file out-of-policy cell in the census. With `files=0` that is
+arbitrary-iterator luck rather than ranking, but it means the line is currently
+pointing at real debt anyway. Do not read that as the instrument working.
+
+---
+
+## 8c. Still running at hand-off
+
+**Census #2 on the mature container** (`census2.txt`) — fires ~10:45Z, container
+age ~2h44m. Two spaced points on one long-lived container is what turns §7's
+single −22 window into a rate. Read-only (Delta log listing + one
+`timefusion_stats` select).
 
 ---
 
