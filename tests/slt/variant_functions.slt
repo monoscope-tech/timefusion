@@ -215,9 +215,23 @@ SELECT variant_to_json(json_to_variant('[1, "two", true, null]')->0);
 1
 
 query T
-SELECT json_to_variant('[1, "two", true, null]')->1->>'';
+SELECT json_to_variant('[1, "two", true, null]')->>1;
 ----
 two
+
+# A key is a key: `->> ''` looks up the field named "" and finds nothing on a
+# string element (Postgres answers NULL here too). This used to return `two`,
+# because the bare-dot path encoding turned an empty field name into an empty
+# path — the same encoding that made `->> 'http.method'` miss.
+query T
+SELECT json_to_variant('[1, "two", true, null]')->1->>'';
+----
+NULL
+
+query T
+SELECT json_to_variant('{"http.request.method": "GET"}')->>'http.request.method';
+----
+GET
 
 # Test complex nested structure
 query T
@@ -247,6 +261,43 @@ query B
 SELECT json_to_variant('{"message": "Success"}')->>'message' ~* 'error';
 ----
 false
+
+# === Serialized-then-reparsed accessors (the shape monoscope emits) ===
+# `variant_to_json(v)->'a'->>'b'` is JSON text extraction, not Variant
+# extraction; VariantJsonAccessorPeephole rewrites it to read the leaf
+# natively. Same answers, ~4x less time.
+
+query T
+SELECT variant_to_json(json_to_variant('{"user": {"name": "Alice", "id": 123}}'))->'user'->>'name';
+----
+Alice
+
+query T
+SELECT variant_to_json(json_to_variant('{"a": {"b": 42}}'))->'a'->>'b';
+----
+42
+
+query T
+SELECT variant_to_json(json_to_variant('{"http.request.method": "GET"}'))->>'http.request.method';
+----
+GET
+
+query T
+SELECT variant_to_json(json_to_variant('{"a": {"b": null}}'))->'a'->>'b';
+----
+NULL
+
+query T
+SELECT variant_to_json(json_to_variant('{"a": {"b": {"c": 1}}}'))->>'a';
+----
+{"b":{"c":1}}
+
+# In a predicate, which is where monoscope actually puts it. The rewrite has to
+# be position-independent — an expression is an expression.
+query B
+SELECT variant_to_json(json_to_variant('{"system": {"device": "disk0"}}'))->'system'->>'device' = 'disk0';
+----
+true
 
 # === Arrow operators on JSON strings (via datafusion-functions-json) ===
 
