@@ -109,10 +109,8 @@ impl ExprPlanner for VariantAwareExprPlanner {
             _ => return Ok(PlannerResult::Original(expr)),
         };
 
-        let (base_expr, mut path_parts) =
-            if path_is_array { (unalias(&expr.left), vec![]) } else { collect_arrow_chain(&expr.left) };
-        let Some(components) = (if path_is_array { extract_path_array(&expr.right) } else { extract_path_component(&expr.right).map(|c| vec![c]) })
-        else {
+        let (base_expr, mut path_parts) = if path_is_array { (unalias(&expr.left), vec![]) } else { collect_arrow_chain(&expr.left) };
+        let Some(components) = (if path_is_array { extract_path_array(&expr.right) } else { extract_path_component(&expr.right).map(|c| vec![c]) }) else {
             return Ok(PlannerResult::Original(expr));
         };
         path_parts.extend(components);
