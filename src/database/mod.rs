@@ -908,7 +908,10 @@ fn build_optimize_session_state_tuned(
 const CONTIGUITY_HORIZON_DAYS: u64 = 30;
 
 /// `(worst, worst_project, median)` contiguous answered days across projects.
-fn min_contiguous_days<'a>(
+///
+/// `pub(crate)` for the sim's drift test, which pins that the sim's own
+/// contiguity model makes the same coverage-short decision as this one.
+pub(crate) fn min_contiguous_days<'a>(
     covered: &HashSet<(String, chrono::NaiveDate)>, source: &HashSet<(String, chrono::NaiveDate)>, today: chrono::NaiveDate, active_projects: &HashSet<&'a str>,
 ) -> (u64, Option<&'a str>, u64) {
     // A day the SOURCE never held counts as answered: a rollup can't exist for
@@ -920,7 +923,7 @@ fn min_contiguous_days<'a>(
     };
     // Capped at the horizon (30 is the goal itself); otherwise a quiet tenant —
     // for whom every pre-first-row day is "answered" — scores the age of the epoch.
-    let mut per_project = active_projects
+    let per_project = active_projects
         .iter()
         .map(|project| {
             let days = (1u64..=CONTIGUITY_HORIZON_DAYS)
@@ -931,13 +934,8 @@ fn min_contiguous_days<'a>(
         .collect::<Vec<_>>();
     // Name tie-break keeps the reported laggard stable across sweeps.
     let (worst_days, worst) = per_project.iter().copied().min_by_key(|(days, project)| (*days, *project)).unwrap_or((0, None));
-    // The minimum is the honest goal ("can EVERY tenant answer a 30d panel")
-    // but a terrible control signal — one outlier pins it forever, holding the
-    // fleet in coverage-short mode and starving the dedup that would end it.
-    // The median is what `coverage_is_short` steers by.
-    per_project.sort_unstable_by_key(|(days, _)| *days);
-    let median = per_project.get(per_project.len() / 2).map_or(0, |(days, _)| *days);
-    (worst_days, worst, median)
+    let mut days = per_project.iter().map(|(days, _)| *days).collect::<Vec<_>>();
+    (worst_days, worst, median_contiguous_days(&mut days))
 }
 
 /// Does this file prove its partition holds no rows?
@@ -1632,18 +1630,39 @@ impl PartitionStats {
 ///
 /// A 14d panel is the most common wide dashboard window and the cheapest useful
 /// target; 30d follows once 14 holds. Set at the goal rather than at 1 so the
-/// weighting does not flap the moment the first day lands. Pub for the journal
-/// simulator (`maintenance_sim`), which drives the same switch from its own
-/// contiguity model.
+/// weighting does not flap the moment the first day lands. Read only through
+/// `coverage_is_short_for`, which the journal
+/// simulator (`maintenance_sim`) calls with the median of its own contiguity
+/// model.
 pub const COVERAGE_SHORT_DAYS: u64 = 14;
+
+/// The statistic the coverage-short switch steers by: the median of the
+/// per-project contiguous-day counts (upper median on an even count, 0 when
+/// empty). Sorts in place.
+///
+/// The minimum is the honest goal ("can EVERY tenant answer a 30d panel") but a
+/// terrible control signal — one outlier pins it forever, holding the fleet in
+/// coverage-short mode and starving the dedup certification that would end it.
+///
+/// Shared with `maintenance_sim` so the sim cannot steer off a different
+/// statistic than the server does; see `coverage_is_short_for`.
+pub(crate) fn median_contiguous_days(per_project: &mut [u64]) -> u64 {
+    per_project.sort_unstable();
+    per_project.get(per_project.len() / 2).copied().unwrap_or(0)
+}
+
+/// THE coverage-short predicate. `coverage_is_short` feeds it the fleet gauge;
+/// `maintenance_sim` feeds it the median of its own contiguity model, so the
+/// simulated and served cycle selections cannot disagree on the threshold or on
+/// the statistic.
+pub(crate) fn coverage_is_short_for(median_days: u64) -> bool {
+    median_days < COVERAGE_SHORT_DAYS
+}
 
 /// Is contiguous rollup coverage short enough to be worth reweighting for?
 /// Reads the gauge the backfill sweep already publishes — one atomic load.
 fn coverage_is_short() -> bool {
-    // The MEDIAN, not the minimum: the minimum is the goal metric but one
-    // negligible tenant pins it forever, holding the fleet in coverage-short
-    // mode and starving the dedup certification that would end it.
-    crate::observability::maintenance_stats().rollup_median_contiguous_days.load(std::sync::atomic::Ordering::Relaxed) < COVERAGE_SHORT_DAYS
+    coverage_is_short_for(crate::observability::maintenance_stats().rollup_median_contiguous_days.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The overlap of two coalesced range sets. Both inputs must already be sorted

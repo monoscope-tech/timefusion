@@ -192,15 +192,19 @@ impl Operation {
 /// The operation mix a maintenance worker rotates through. One definition for
 /// the server loop (`run_coordinator_maintenance_once`) and the journal-replay
 /// simulator (`maintenance_sim`) — the sim exists to evaluate changes to this
-/// mix, so the two must never be able to drift apart.
+/// mix, so the two must never be able to drift apart. The SIGNAL that selects
+/// the cycle is shared too: both sides decide through
+/// `database::coverage_is_short_for` over `database::median_contiguous_days`.
 ///
 /// BALANCED interleaves dependent publication with dedup: dedup/base receive
 /// three slots each; derived and file work each receive one. `claim_next`
 /// still applies deadline, recent-slice, dependency, and project fairness.
 ///
 /// COVERAGE_SHORT gives the rollup chain the slots while
-/// `rollup_min_contiguous_days` is below goal: `dependencies_complete` makes
-/// BaseRollup depend on NOTHING, so of the balanced cycle six slots in ten go
+/// `rollup_median_contiguous_days` is below goal (the MEDIAN, not the goal
+/// gauge — one negligible tenant must not pin the fleet):
+/// `dependencies_complete` makes BaseRollup depend on NOTHING, so of the
+/// balanced cycle six slots in ten go
 /// to work that cannot advance the metric governing 14d/30d latency (measured
 /// 2026-08-18). Every operation keeps at least one slot — file debt left at
 /// zero is how file counts ran to 2-3k and degraded every query (2026-08-01).
