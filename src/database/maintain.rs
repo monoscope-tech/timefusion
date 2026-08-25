@@ -6877,9 +6877,13 @@ impl Database {
     pub(crate) async fn resume_rollup_unit(&self, key: &crate::maintenance_coordinator::TaskKey, current_source_rows: Option<u64>) -> Result<bool> {
         use deltalake::protocol::{DeltaOperation, SaveMode};
         use std::sync::atomic::Ordering::Relaxed;
+        let stats = crate::observability::maintenance_stats();
         let contents = {
             let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else { return Ok(false) };
+            let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else {
+                stats.rollup_resume_no_intent.fetch_add(1, Relaxed);
+                return Ok(false);
+            };
             contents
         };
         // Paired with its evidence, so the commit path below cannot re-ask
@@ -6890,6 +6894,7 @@ impl Database {
             .filter_map(|entry| entry.rollup.clone().filter(|rollup| &rollup.key == key).map(|rollup| (entry, rollup)))
             .collect();
         if candidates.is_empty() {
+            stats.rollup_resume_no_intent.fetch_add(1, Relaxed);
             return Ok(false);
         }
         let Some(date_string) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else {
@@ -6925,11 +6930,15 @@ impl Database {
         };
         let live_view: HashMap<&str, Option<(i64, i64)>> = partition.iter().map(|(path, (slice, _))| (path.as_str(), *slice)).collect();
         let now_secs = crate::support::now_secs();
-        let stats = crate::observability::maintenance_stats();
         for (entry, rollup) in &candidates {
             let verdict = classify_rollup_resume(entry, &key.physical_table, now_secs, &live_view, current_source_rows);
             match verdict {
-                ResumeVerdict::Skip | ResumeVerdict::RowMismatch { .. } => continue,
+                // `classify_rollup_resume` cannot return RowMismatch — a rollup
+                // aggregates — so this arm is the ownership guard and nothing else.
+                ResumeVerdict::Skip | ResumeVerdict::RowMismatch { .. } => {
+                    stats.rollup_resume_skipped.fetch_add(1, Relaxed);
+                    continue;
+                }
                 ResumeVerdict::AlreadyLanded => {
                     // The Delta commit landed and only the bookkeeping was lost.
                     // PUBLISH anyway: without a journal publication the coverage
@@ -6937,6 +6946,7 @@ impl Database {
                     // planner sees a hole and re-enqueues the whole scan — the
                     // exact cost this exists to avoid.
                     self.publish_resumed_rollup(rollup, &entry.wave_id)?;
+                    stats.rollup_resume_already_landed.fetch_add(1, Relaxed);
                     info!(table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id, event = "rollup_resume_already_landed");
                     return Ok(true);
                 }
@@ -7042,10 +7052,14 @@ impl Database {
                 // A repair intent never carries the rollup evidence, so these
                 // two verdicts are unreachable here by construction — see
                 // `classify_rollup_resume`, which is the only producer.
-                ResumeVerdict::Skip | ResumeVerdict::SourceMoved | ResumeVerdict::WouldDoubleCount => continue,
+                ResumeVerdict::Skip | ResumeVerdict::SourceMoved | ResumeVerdict::WouldDoubleCount => {
+                    stats.repair_resume_skipped.fetch_add(1, Relaxed);
+                    continue;
+                }
                 ResumeVerdict::AlreadyLanded => {
                     // The commit landed and only the bookkeeping was lost. Never
                     // re-commit: that would Remove the files it just Added.
+                    stats.repair_resume_already_landed.fetch_add(1, Relaxed);
                     info!(table_name, project_id, wave_id = %entry.wave_id, event = "staged_intent_already_landed");
                     self.clear_staged_intent(&[entry.wave_id.as_str()]);
                 }

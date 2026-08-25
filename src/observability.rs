@@ -1276,6 +1276,23 @@ atomic_stats! {
         /// short. Every one of these is a correct refusal; a rising count means the
         /// staging window and the churn window overlap, not that resume is broken.
         rollup_resume_declined as "rollup_resume_declined_total",
+        /// Claims that found NO staged intent for the unit at all (no manifest, or
+        /// no entry naming this task). THE denominator: without it a zero
+        /// `rollup_resumed` cannot be told apart from "resume was never even
+        /// offered a candidate", which is what a code trace had to establish by
+        /// hand on 2026-08-25.
+        rollup_resume_no_intent as "rollup_resume_no_intent_total",
+        /// Candidates held back by the ownership guard (see `resume_guarded`) or
+        /// belonging to another table. Nonzero with `rollup_resumed` at 0 means the
+        /// guard, not the evidence, is what forfeits the work.
+        rollup_resume_skipped as "rollup_resume_skipped_total",
+        /// Staged rollup output whose Delta commit had already landed — only the
+        /// journal publication was lost, and resume supplies it. Counted apart from
+        /// `rollup_resumed` because it rescues bookkeeping, not the ~21-min scan.
+        rollup_resume_already_landed as "rollup_resume_already_landed_total",
+        /// Repair equivalents of the two above; same reading.
+        repair_resume_skipped as "repair_resume_skipped_total",
+        repair_resume_already_landed as "repair_resume_already_landed_total",
         /// Resume declined: an input file was rewritten underneath the staged
         /// output, so committing it would resurrect removed rows.
         repair_resume_declined_stale as "repair_resume_declined_stale_total",
