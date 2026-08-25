@@ -12432,33 +12432,46 @@ mod tests {
             days[0].and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros(),
             days[1].and_hms_opt(23, 59, 59).expect("end").and_utc().timestamp_micros(),
         );
-        let sql = format!(
-            "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS p \
-             FROM otel_logs_and_spans WHERE project_id = '{project}' \
-             AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) GROUP BY 1"
-        );
+        // Both shapes: the bare percentile, and monoscope's latency widget — a
+        // `HAVING COUNT(*) > 0` folded in beside it under `duration IS NOT NULL`,
+        // which resolves the count to `duration_count` and so needs TWO measures
+        // proven. That shape used to be refused outright at the match level
+        // (`carries_digest`); this gate is what replaced it.
+        let shapes = [
+            "percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS p".to_string(),
+            "percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS p, COUNT(*) AS c".to_string(),
+        ];
+        let sql = |select: &str, widget: bool| {
+            format!(
+                "SELECT time_bucket('1 hours', timestamp) AS tb, {select} FROM otel_logs_and_spans WHERE project_id = '{project}' \
+                 AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}){} GROUP BY 1",
+                if widget { " AND duration IS NOT NULL" } else { "" }
+            )
+        };
         let mut ctx = std::sync::Arc::clone(&db).create_session_context();
         db.setup_session_context(&mut ctx)?;
         let state = ctx.state();
-        let route = async |db: &Database| {
+        let route = async |db: &Database, sql: String| {
             let plan = state.optimize(&state.create_logical_plan(&sql).await.expect("parse")).expect("optimize");
             db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("declined: {}", reason.label()))
         };
 
         // The control. Without it a test that only asserts the refusal passes
         // just as well when nothing routes at all.
-        let before = route(&db).await?.expect("both days are built and must route");
-        let dates: HashSet<String> = before.ticket.dates.iter().map(|((.., date), ..)| date.clone()).collect();
-        let slice_days: HashSet<String> = before
-            .ticket
-            .slices
-            .iter()
-            .filter_map(|((.., start, _), ..)| chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()))
-            .collect();
-        assert!(
-            days.iter().all(|day| dates.contains(&day.to_string()) || slice_days.contains(&day.to_string())),
-            "both days must route before the strip: dates {dates:?} slices {slice_days:?}"
-        );
+        for (index, select) in shapes.iter().enumerate() {
+            let before = route(&db, sql(select, index == 1)).await?.expect("both days are built and must route");
+            let dates: HashSet<String> = before.ticket.dates.iter().map(|((.., date), ..)| date.clone()).collect();
+            let slice_days: HashSet<String> = before
+                .ticket
+                .slices
+                .iter()
+                .filter_map(|((.., start, _), ..)| chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()))
+                .collect();
+            assert!(
+                days.iter().all(|day| dates.contains(&day.to_string()) || slice_days.contains(&day.to_string())),
+                "both days must route before the strip: dates {dates:?} slices {slice_days:?}"
+            );
+        }
 
         // The older day's cells lose their proof — exactly the prod shape, where
         // the column was declared before any file carried it.
@@ -12479,26 +12492,28 @@ mod tests {
         }
 
         let misses = || crate::observability::maintenance_stats().rollup_miss_measure_not_stored.load(std::sync::atomic::Ordering::Relaxed);
-        let declines_before = misses();
-        let after = route(&db).await?.expect("the sibling day still routes");
-        assert_eq!(after.mode, "hybrid", "one day on the tier and one raw is a hybrid rewrite, got {}", after.mode);
-        assert!(misses() > declines_before, "the decline must be counted, or the refusal is invisible in prod");
-        for ((.., date), ..) in &after.ticket.dates {
-            assert_ne!(date, &stripped, "a date that cannot prove the digest must not be read from the tier");
+        for (index, select) in shapes.iter().enumerate() {
+            let declines_before = misses();
+            let after = route(&db, sql(select, index == 1)).await?.expect("the sibling day still routes");
+            assert_eq!(after.mode, "hybrid", "one day on the tier and one raw is a hybrid rewrite, got {}", after.mode);
+            assert!(misses() > declines_before, "the decline must be counted, or the refusal is invisible in prod");
+            for ((.., date), ..) in &after.ticket.dates {
+                assert_ne!(date, &stripped, "a date that cannot prove the digest must not be read from the tier");
+            }
+            for ((.., start, _), ..) in &after.ticket.slices {
+                let day = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string());
+                assert_ne!(day.as_deref(), Some(stripped.as_str()), "a slice that cannot prove the digest must not be read from the tier");
+            }
+            assert!(
+                after.ticket.dates.iter().any(|((.., date), ..)| date == &days[1].to_string())
+                    || after
+                        .ticket
+                        .slices
+                        .iter()
+                        .any(|((.., start, _), ..)| { chrono::DateTime::from_timestamp_micros(*start).is_some_and(|time| time.date_naive() == days[1]) }),
+                "the sibling day proves the digest and must keep routing"
+            );
         }
-        for ((.., start, _), ..) in &after.ticket.slices {
-            let day = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string());
-            assert_ne!(day.as_deref(), Some(stripped.as_str()), "a slice that cannot prove the digest must not be read from the tier");
-        }
-        assert!(
-            after.ticket.dates.iter().any(|((.., date), ..)| date == &days[1].to_string())
-                || after
-                    .ticket
-                    .slices
-                    .iter()
-                    .any(|((.., start, _), ..)| { chrono::DateTime::from_timestamp_micros(*start).is_some_and(|time| time.date_naive() == days[1]) }),
-            "the sibling day proves the digest and must keep routing"
-        );
         Ok(())
     }
 
