@@ -554,7 +554,10 @@ impl Database {
         if count != 0 {
             let mut journal = self.journal();
             for task in planned {
-                journal.enqueue(task.key, task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms);
+                // `enqueue_planned`, not `enqueue`: the footprint this scan just
+                // measured is the whole benefit term of `scheduling_class`, and
+                // discarding it here is what made hygiene ordering inert.
+                journal.enqueue_planned(&task);
             }
             journal.checkpoint()?;
         }
