@@ -6155,7 +6155,7 @@ impl Database {
         use std::io::Write;
         let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let file_path = self.repair_verified_path();
-        let write = (|| -> std::io::Result<()> {
+        let write = crate::support::without_blocking_the_worker(|| -> std::io::Result<()> {
             if let Some(dir) = file_path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
@@ -6164,7 +6164,7 @@ impl Database {
                 writeln!(file, "{path}")?;
             }
             Ok(())
-        })();
+        });
         if let Err(e) = write {
             warn!("verified-sorted append failed ({:?}): {} — repair will re-probe these footers after a restart", file_path, e);
         }
@@ -6200,13 +6200,13 @@ impl Database {
         use std::io::Write;
         let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.staged_intent_path();
-        let write = (|| -> std::io::Result<()> {
+        let write = crate::support::without_blocking_the_worker(|| -> std::io::Result<()> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
             writeln!(file, "{}", serde_json::to_string(entry)?)
-        })();
+        });
         if let Err(e) = write {
             warn!("staged-intent manifest append failed ({:?}): {} — orphan cleanup falls back to VACUUM", path, e);
         }
@@ -6218,13 +6218,19 @@ impl Database {
     fn clear_staged_intent(&self, wave_ids: &[&str]) {
         let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.staged_intent_path();
-        let Ok(contents) = std::fs::read_to_string(&path) else { return };
-        let kept: Vec<String> = parse_staged_intents(&contents)
-            .into_iter()
-            .filter(|e| !wave_ids.contains(&e.wave_id.as_str()))
-            .filter_map(|e| serde_json::to_string(&e).ok())
-            .collect();
-        let write = if kept.is_empty() { std::fs::write(&path, b"") } else { std::fs::write(&path, kept.join("\n") + "\n") };
+        // Read the whole manifest, re-encode every surviving entry, rewrite it —
+        // once per committed wave, from an async maintenance task.
+        let Some(write) = crate::support::without_blocking_the_worker(|| {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let kept: Vec<String> = parse_staged_intents(&contents)
+                .into_iter()
+                .filter(|e| !wave_ids.contains(&e.wave_id.as_str()))
+                .filter_map(|e| serde_json::to_string(&e).ok())
+                .collect();
+            Some(if kept.is_empty() { std::fs::write(&path, b"") } else { std::fs::write(&path, kept.join("\n") + "\n") })
+        }) else {
+            return;
+        };
         if let Err(e) = write {
             warn!("staged-intent manifest compaction failed ({:?}): {}", path, e);
         }

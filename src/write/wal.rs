@@ -445,22 +445,26 @@ impl WalManager {
     /// drops when this returns, so callers' `persist_topic` file I/O runs
     /// outside the critical section — keep it after the call, not before.
     /// `on_pre` fires with the pre-append tail under the lock — same
-    /// hold-registration contract as [`Self::append_batch`].
+    /// hold-registration contract as [`Self::append_batch`]. Runs through
+    /// `without_blocking_the_worker` for the reason [`Self::append_batch`]
+    /// does: under `sync_each` this fsyncs before returning.
     fn locked_append(&self, walrus_key: &str, entry: &WalEntry, on_pre: impl FnOnce(Option<WalPosition>)) -> Result<(), WalError> {
-        let entry_bytes = serialize_wal_entry(entry)?;
-        let guard = self.append_lock(walrus_key);
-        on_pre(self.wal.current_position(walrus_key).ok());
-        self.wal.append_for_topic(walrus_key, &entry_bytes)?;
-        // Sync OUTSIDE the stripe lock: the entry's bytes are already in the
-        // mmap and `Writer::sync` flushes the whole active block, so
-        // sync-before-ack holds — while an ms-scale msync under the stripe
-        // would stall every same-stripe append (the lock's contract is
-        // "fast, in-memory only").
-        drop(guard);
-        if self.ack_fsync {
-            self.wal.sync_topic(walrus_key).map_err(WalError::Io)?;
-        }
-        Ok(())
+        crate::support::without_blocking_the_worker(|| {
+            let entry_bytes = serialize_wal_entry(entry)?;
+            let guard = self.append_lock(walrus_key);
+            on_pre(self.wal.current_position(walrus_key).ok());
+            self.wal.append_for_topic(walrus_key, &entry_bytes)?;
+            // Sync OUTSIDE the stripe lock: the entry's bytes are already in the
+            // mmap and `Writer::sync` flushes the whole active block, so
+            // sync-before-ack holds — while an ms-scale msync under the stripe
+            // would stall every same-stripe append (the lock's contract is
+            // "fast, in-memory only").
+            drop(guard);
+            if self.ack_fsync {
+                self.wal.sync_topic(walrus_key).map_err(WalError::Io)?;
+            }
+            Ok(())
+        })
     }
 
     /// Returns the shard the entry was appended to.
@@ -486,26 +490,31 @@ impl WalManager {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-        // Imperative on purpose: a `map(..).collect::<Result<Vec<_>,_>>()` over
-        // the splits would hold every batch's split output alive alongside the
-        // serialized entries, doubling the transient footprint of a big append.
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(batches.len());
-        for batch in batches {
-            for data in split_to_wal_payloads(batch, WAL_SPLIT_TARGET, MAX_BATCH_SIZE)? {
-                payloads.push(serialize_wal_entry(&WalEntry::new(project_id, table_name, WalOperation::Insert, data))?);
+        // Serialize AND append off the worker's own queue: prod runs
+        // `wal_fsync_mode = sync_each` (the default), so walrus fsyncs inside
+        // `batch_append_for_topic` — an ~1ms blocking syscall on the ingest
+        // path, at ingest frequency. Same defect as the 2026-08-25 journal
+        // fsync, on the write path. The IPC serialize is inside the wrap
+        // because it borrows `batches` and is the other half of the hold.
+        let pre_pos = crate::support::without_blocking_the_worker(|| -> Result<_, WalError> {
+            // Imperative on purpose: a `map(..).collect::<Result<Vec<_>,_>>()` over
+            // the splits would hold every batch's split output alive alongside the
+            // serialized entries, doubling the transient footprint of a big append.
+            let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(batches.len());
+            for batch in batches {
+                for data in split_to_wal_payloads(batch, WAL_SPLIT_TARGET, MAX_BATCH_SIZE)? {
+                    payloads.push(serialize_wal_entry(&WalEntry::new(project_id, table_name, WalOperation::Insert, data))?);
+                }
             }
-        }
-
-        let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-        let pre_pos = {
+            let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
             // Guard scoped tightly: dropped before persist_topic so the shard
             // lock never covers persist_topic's synchronous file I/O.
             let _guard = self.append_lock(&walrus_key);
             let pre_pos = self.wal.current_position(&walrus_key).ok();
             on_pre_append(shard, pre_pos);
             self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
-            pre_pos
-        };
+            Ok(pre_pos)
+        })?;
         self.persist_topic(&topic);
         debug!(%topic, shard, batches = batches.len(), "WAL batch append INSERT");
         Ok((shard, pre_pos))
