@@ -52,17 +52,22 @@ async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Resul
         // Deterministic file list. The flush spawns the sidecar tantivy index
         // as a DETACHED task, so whether the index exists by query time is a
         // race the test can neither observe nor await — and once it does, the
-        // prefilter proves no file can match `no-such-name` and removes EVERY
-        // file from the Delta scan. The leg becomes `EmptyExec`, which declares
-        // no ordering, so `DedupExec` correctly reports `full-set` over zero
-        // rows and the second assertion below fires on a plan that is optimal.
+        // prefilter finds no hit for `no-such-name` and pushes an empty
+        // `id IN ()`, which delta-rs evaluates statically to false and drops
+        // EVERY file. The leg becomes `EmptyExec`, which declares no ordering,
+        // so `DedupExec` correctly reports `full-set` over zero rows and the
+        // assertions below fire on a plan that is optimal.
         //
         // CI 2026-08-24 (run 32772841710) caught the race mid-test: the plain
         // SELECT scanned `add_files_seen=2`, `tantivy_index_built` landed 20 ms
         // later, and the EXPLAIN ANALYZE logged `Predicate statically evaluated
         // to false; skipping all files`. That is the whole flake — the guard
         // was measuring which side of a race it landed on, not a regression.
-        .with_tantivy_file_pruning(false)
+        //
+        // Nothing under guard here is the prefilter's: the bug is delta-rs'
+        // `process_filters` composing the parquet predicate, which runs on the
+        // original filters (text_match conjunct included) either way.
+        .with_tantivy_prefilter(false)
         .start()
         .await?;
     env.db().cancel_maintenance();

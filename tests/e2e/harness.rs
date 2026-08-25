@@ -45,7 +45,7 @@ pub struct E2eEnvBuilder {
     use_deletion_vectors: bool,
     warm_full_files: bool,
     dml_merge_key_prune: bool,
-    tantivy_file_pruning: bool,
+    tantivy_prefilter: bool,
     dml_coalesce_secs: u64,
     page_row_count_limit: Option<usize>,
     sort_skip_bytes: Option<usize>,
@@ -80,7 +80,7 @@ impl Default for E2eEnvBuilder {
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
             dml_merge_key_prune: true,
-            tantivy_file_pruning: true,
+            tantivy_prefilter: true,
             // 0 = synchronous DML (prod-default off). Prod runs 60s; set >0 to
             // exercise the coalescer defer/drain path in tests.
             dml_coalesce_secs: 0,
@@ -194,12 +194,13 @@ impl E2eEnvBuilder {
         self.dml_merge_key_prune = on;
         self
     }
-    /// File-level tantivy scan pruning. Off makes the Delta leg's file list
+    /// The tantivy scan prefilter (id IN-list, zero-hit file exclusion and
+    /// row selection all at once). Off makes the Delta leg's file list
     /// independent of whether the sidecar index has finished building — which
     /// a flush spawns as a DETACHED task, so it is otherwise a race the test
     /// cannot observe or await.
-    pub fn with_tantivy_file_pruning(mut self, on: bool) -> Self {
-        self.tantivy_file_pruning = on;
+    pub fn with_tantivy_prefilter(mut self, on: bool) -> Self {
+        self.tantivy_prefilter = on;
         self
     }
     /// Defer `UPDATE ... FROM` Delta legs through the coalescer (prod runs 60s);
@@ -258,7 +259,7 @@ impl E2eEnvBuilder {
             use_deletion_vectors: self.use_deletion_vectors,
             warm_full_files: self.warm_full_files,
             dml_merge_key_prune: self.dml_merge_key_prune,
-            tantivy_file_pruning: self.tantivy_file_pruning,
+            tantivy_prefilter: self.tantivy_prefilter,
             dml_coalesce_secs: self.dml_coalesce_secs,
             sort_skip_bytes: self.sort_skip_bytes,
             light_optimize_target_size: self.light_optimize_target_size,
@@ -374,7 +375,7 @@ impl E2eEnv {
             use_deletion_vectors: self.builder.use_deletion_vectors,
             warm_full_files: self.builder.warm_full_files,
             dml_merge_key_prune: self.builder.dml_merge_key_prune,
-            tantivy_file_pruning: self.builder.tantivy_file_pruning,
+            tantivy_prefilter: self.builder.tantivy_prefilter,
             dml_coalesce_secs: self.builder.dml_coalesce_secs,
             sort_skip_bytes: self.builder.sort_skip_bytes,
             light_optimize_target_size: self.builder.light_optimize_target_size,
@@ -494,7 +495,7 @@ struct BuildCfgArgs<'a> {
     use_deletion_vectors: bool,
     warm_full_files: bool,
     dml_merge_key_prune: bool,
-    tantivy_file_pruning: bool,
+    tantivy_prefilter: bool,
     dml_coalesce_secs: u64,
     page_row_count_limit: Option<usize>,
     sort_skip_bytes: Option<usize>,
@@ -534,7 +535,14 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
-    cfg.tantivy.timefusion_tantivy_file_pruning = args.tantivy_file_pruning;
+    // A 0% selectivity floor is the off switch for the WHOLE prefilter: any hit
+    // set covers >= 0% of the indexed rows, so `decide_prefilter` always returns
+    // `low_selectivity` and the Delta scan keeps the original predicate. Turning
+    // off `timefusion_tantivy_file_pruning` alone is NOT enough — a zero-hit
+    // index still yields an empty `id IN ()`, which prunes every file anyway.
+    if !args.tantivy_prefilter {
+        cfg.tantivy.timefusion_tantivy_prefilter_min_selectivity_pct = 0;
+    }
     cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
     if let Some(b) = args.sort_skip_bytes {
         cfg.maintenance.timefusion_sort_skip_bytes = b;
