@@ -176,6 +176,37 @@ not, on current evidence, and that reason should stop being cited.
 
 Revisit when **all four** hold. Each is checkable; none is a judgement call.
 
+> **MEASURED the same day, 2026-08-25 — trigger 1 is all but satisfied, and the
+> 92% is FALSIFIED on the live build.** Read from `rollup_coverage_recovered` on
+> image `d3b44f7`, two hourly passes (08:06:2xZ and 09:06:3xZ) on one container
+> started 08:01:21Z:
+>
+> | source | 08:06 | 09:06 | Δ |
+> |---|---|---|---|
+> | `otel_metrics` — `recovered` | 4,719 | 4,787 | +68 |
+> | `otel_metrics` — `stale_generation` | **0** | **0** | 0 |
+> | `otel_logs_and_spans` — `recovered` | 20,345 | 20,455 | +110 |
+> | `otel_logs_and_spans` — `stale_generation` | **0** | **0** | 0 |
+>
+> Not "absent from the window" — the line is present on both sources and the
+> field reads zero, so the ratio is 0%, not ~92%. **What is still missing for
+> trigger 1 as written:** both passes are the SAME container at 71 and 77 min
+> uptime, and the trigger asks for ≥2h uptime on TWO separate containers. Take
+> the confirming read on the next long-lived container rather than treating this
+> as closed.
+>
+> **A new residual surfaced in the same read, and it is NOT the generation
+> problem:** `unverifiable` is byte-identical across both passes — 2,037 and
+> 2,349, ~4,386 slices — while `recovered` grew by 68 and 110. That is a FROZEN
+> population recovery cannot verify. The generation-orphan reason for deferring
+> this work is gone; this one takes its place and is unowned.
+>
+> Trap that bit during this measurement: a server-side-grepped fetch with
+> `--since 2026-08-25T08:00:00Z` returned only the 08:06 pair and exited 0, which
+> would have supported "the line fired once". The four occurrences were assembled
+> from three fetches with independently verified windows. **Never quote an
+> occurrence count from a single `docker service logs` fetch.**
+
 1. **The tier is readable.** `stale_generation / recovered` from
    `rollup_coverage_recovered` is below ~10% on a container with ≥2h uptime,
    measured on two separate containers. If it is still high, fix the orphaning
