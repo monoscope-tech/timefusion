@@ -849,12 +849,45 @@ The first 10 minutes after the deploy were discarded before measuring — a fres
 process throws a lag burst during WAL replay (`inproc auth_ms` read 1,252 ms at
 41 s of uptime), and counting that would have read *worse* than reality.
 
-**And warns did not go to zero, so other blockers remain.** 1.75/min means
-workers are still being held by something this fix does not cover — sync
-object-store metadata reads, zstd paths outside `write_atomic_with`, or
-CPU-bound work that never yields. `BlockWatch` is the instrument for finding
-them: wrap a suspect, read `block.<name>.max_ms`. That is the next session's
-work, not a reason to discount this one.
+**The residual, hunted the same day (`4762c2b`).** 1.75/min was not zero, so
+two more blockers were found — both on the **query** path, both in tantivy
+search:
+
+1. `ensure_cached` is `async` and called `install_blob_into_cache` **inline** —
+   zstd-decode + untar of an entire index blob on a runtime worker. Its sibling
+   on the seeding path already used `spawn_blocking`: one call site right, one
+   wrong, which is what an oversight looks like as opposed to a decision.
+2. The per-index fan-out ran `open_cached` (mmap + segment opens) and the
+   tantivy **search itself** synchronously inside the async task. That search is
+   CPU-bound, yields nowhere, and has cost seconds on a fat needle (4.5 M
+   matches, 2026-08-22).
+
+Fixed with `spawn_blocking` and `block_in_place`. The second uses
+`block_in_place` deliberately: its body borrows `self`, `node` and the stats, so
+`spawn_blocking` would force ownership surgery, while moving the *other* tasks
+off the thread needs no signature change at all — the property that made the
+helper worth having.
+
+Checked and left alone because they were already correct: the index build path
+(`build_and_pack`), the disk-cache reaper, `store_snapshot`. The defects
+clustered on the read path.
+
+### Result: 5.7 → 0.45 lag warns/min, at higher load
+
+| | lag warns / 20 min | rate | host load (15-min) |
+|---|---|---|---|
+| baseline (`18bcf8a`) | 114 | 5.7/min | ~30 |
+| + fsync fix (`f7378af`) | 35 | 1.75/min | 30.47 |
+| + tantivy fixes (`4762c2b`) | **9** | **0.45/min** | **35.29** |
+
+**A 12.7× reduction, measured on a busier box than the baseline.** The window
+ran entirely on `4762c2b` (it shut down three minutes after the measurement
+ended, and its successor contains the same commits), and the first 10 minutes
+after each deploy were discarded.
+
+Warns are not zero and probably never will be — a 500 ms timer on a
+48-worker runtime under real maintenance load will occasionally wake 250 ms
+late. What has gone is the population of multi-second stalls.
 
 Note on comparing the two runs: use `avg_us` and rates, **never `max_ms`**. The
 maxes are monotone high-water marks, so the 19-minute process reads lower than
