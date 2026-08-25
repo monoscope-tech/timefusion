@@ -314,6 +314,181 @@ pub mod scan_metric_names {
     pub const DECODE_PRESSURE_THROTTLED: &str = "timefusion.scan.decode_pressure_throttled";
 }
 
+/// Why a recovered rollup slice cannot be verified, and what — if anything —
+/// ever clears it.
+///
+/// `recover_rollup_coverage` counted the population with ONE number
+/// (`rollup_witnessless_slices`) and one log field. Prod 2026-08-25 read it
+/// byte-identical across four hourly passes INCLUDING a restart (2,037
+/// `otel_metrics` / 2,349 `otel_logs_and_spans`, ~4,386 slices) while
+/// `recovered` grew every pass: durable state, frozen, with nothing saying why.
+/// That population blocks the union-tag work, so it needs a split, not a total.
+///
+/// TWO dimensions over the SAME slices, each summing to the aggregate:
+/// * `UnverifiableReason` — why the row witness is missing. Every route to
+///   `source_rows == None` in the tag replay, and nothing else.
+/// * `UnverifiableFate` — what the recovery pass then did with it. This is the
+///   half that can explain FROZEN: only `QueuedForRepublish` reaches
+///   `enqueue_witnessless_rebuilds`, and the two skips before it are silent.
+///
+/// The gauge names are DERIVED from these lists (`gauge_rows`), so `pg_compat`
+/// hand-maintains no third list — the bug class that cost 53% of prefilter skips
+/// their attribution on 2026-08-24, three times in one day.
+pub mod rollup_unverifiable {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    use itertools::Itertools;
+
+    /// Declares a bucket enum together with its gauge array, so a variant cannot
+    /// be added without a gauge and a row appearing for it.
+    macro_rules! buckets {
+        ($(#[$m:meta])* $name:ident => $gauges:ident { $($(#[$vm:meta])* $variant:ident => $label:literal),+ $(,)? }) => {
+            $(#[$m])*
+            #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+            pub enum $name { $($(#[$vm])* $variant,)+ }
+
+            impl $name {
+                /// Declaration order is PRECEDENCE order where one slice could
+                /// match several — the lowest variant wins, so attribution does
+                /// not depend on the order the Delta log lists a slice's files —
+                /// and it is the row order in `timefusion_stats`.
+                pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
+
+                pub const fn as_str(self) -> &'static str {
+                    match self { $(Self::$variant => $label,)+ }
+                }
+
+                /// Count one slice into a per-pass tally.
+                pub fn bump(self, tally: &mut Tally) {
+                    tally.resize(Self::ALL.len(), 0);
+                    tally[self as usize] += 1;
+                }
+
+                /// `label=count,…` for the recovery log line.
+                pub fn render(tally: &Tally) -> String {
+                    Self::ALL.iter().enumerate().map(|(index, bucket)| format!("{}={}", bucket.as_str(), tally.get(index).copied().unwrap_or_default())).join(",")
+                }
+            }
+
+            static $gauges: [AtomicU64; $name::ALL.len()] = [const { AtomicU64::new(0) }; $name::ALL.len()];
+        };
+    }
+
+    buckets! {
+        /// Every route to `source_rows == None` in the tag replay. Exhaustive by
+        /// construction: `classify_witness` is the ONLY producer of `source_rows`,
+        /// and its error arms are exactly these.
+        UnverifiableReason => BY_REASON {
+            /// The same (project, slice, generation, fingerprint) ALSO appears
+            /// with a witness — a rewrite stripped the tag off some files only.
+            /// Outranks the parse reasons: the fix is a repair, not a republish.
+            MixedWitness => "mixed_witness",
+            /// `TAG_SOURCE_ROWS` present but not an `i64`.
+            TagUnparsable => "witness_tag_unparsable",
+            /// Parses, but negative — `-1` is the sentinel a build writes when
+            /// the source reported no count, and any negative fails `u64`.
+            TagNegative => "witness_negative",
+            /// No `TAG_SOURCE_ROWS` at all (present-with-null-value lands here
+            /// too, since Delta tags are `HashMap<String, Option<String>>`).
+            /// History written before the tag existed.
+            TagAbsent => "witness_tag_absent",
+        }
+    }
+
+    buckets! {
+        /// What the recovery pass did with the slice, in code order. Only the
+        /// last arm is ever queued for republish; the others `continue` before
+        /// the witness-less list is built and were entirely silent.
+        UnverifiableFate => BY_FATE {
+            /// `TimeSlice::new` or the date derivation refused the tags.
+            InvalidSlice => "fate_invalid_slice",
+            /// The journal does not call the slice complete, so recovery skips
+            /// it BEFORE the witness-less list — and enqueueing a rebuild is
+            /// itself what flips a task off Complete. Nothing else re-queues it.
+            JournalIncomplete => "fate_journal_incomplete",
+            /// Stored generation no longer matches the current spec. Distinct
+            /// from the pass-wide `stale_generation` field, which counts the
+            /// WHOLE tagged set; this is its witness-less subset.
+            StaleGeneration => "fate_stale_generation",
+            /// Passed every filter and was handed to the republish queue (which
+            /// keeps the newest `BOUND` and logs the rest as `deferred`).
+            QueuedForRepublish => "fate_queued_for_republish",
+        }
+    }
+
+    /// The witness a slice's `TAG_SOURCE_ROWS` carries, or why it has none.
+    ///
+    /// The single producer of `source_rows`, so the count and its attribution
+    /// cannot disagree — deriving them separately is how a split ends up not
+    /// summing to its total.
+    ///
+    /// ```
+    /// use timefusion::database::rollup_unverifiable::{classify_witness, UnverifiableReason::*};
+    /// assert_eq!(classify_witness(Some("42")), Ok(42));
+    /// assert_eq!(classify_witness(None), Err(TagAbsent));
+    /// assert_eq!(classify_witness(Some("")), Err(TagUnparsable));
+    /// assert_eq!(classify_witness(Some("12.5")), Err(TagUnparsable));
+    /// assert_eq!(classify_witness(Some("-1")), Err(TagNegative));
+    /// ```
+    pub fn classify_witness(raw: Option<&str>) -> Result<u64, UnverifiableReason> {
+        match raw.map(str::parse::<i64>) {
+            None => Err(UnverifiableReason::TagAbsent),
+            Some(Err(_)) => Err(UnverifiableReason::TagUnparsable),
+            Some(Ok(rows)) => u64::try_from(rows).map_err(|_| UnverifiableReason::TagNegative),
+        }
+    }
+
+    /// Files carrying this source's tag whose IDENTITY tags are incomplete
+    /// (missing/unparsable project, generation, fingerprint or slice bounds).
+    ///
+    /// Not part of the unverifiable population — such a file is dropped from the
+    /// tagged set entirely and counted nowhere else, so it is exactly the
+    /// invisible bucket this whole exercise exists to prevent. Monotonic across
+    /// passes (every hourly pass re-reads the same log), so read its RATE: a
+    /// constant slope over a quiet fleet is a standing population, not churn.
+    pub static IDENTITY_TAG_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
+
+    /// A per-pass tally, indexed by variant. `Vec` rather than an array so the
+    /// two dimensions share one type.
+    pub type Tally = Vec<u64>;
+
+    /// Publish one source's tallies, replacing that source's previous numbers.
+    ///
+    /// Per SOURCE, because `recover_rollup_coverage` runs once per source and a
+    /// plain `store` would make the exported number last-source-wins — which is
+    /// what the legacy `rollup_witnessless_slices` gauge still is, deliberately
+    /// left alone so its series stays comparable. These rows are FLEET totals.
+    pub fn publish(source: &str, reasons: &Tally, fates: &Tally) {
+        use std::sync::{LazyLock, Mutex};
+        type PerSource = std::collections::HashMap<String, (Tally, Tally)>;
+        static BY_SOURCE: LazyLock<Mutex<PerSource>> = LazyLock::new(Default::default);
+
+        let Ok(mut by_source) = BY_SOURCE.lock() else { return };
+        by_source.insert(source.to_owned(), (reasons.clone(), fates.clone()));
+        let sum = |pick: fn(&(Tally, Tally)) -> &Tally, gauges: &[AtomicU64]| {
+            for (index, gauge) in gauges.iter().enumerate() {
+                gauge.store(by_source.values().map(|tallies| pick(tallies).get(index).copied().unwrap_or_default()).sum(), Relaxed);
+            }
+        };
+        sum(|(reasons, _)| reasons, &BY_REASON);
+        sum(|(_, fates)| fates, &BY_FATE);
+    }
+
+    /// Every gauge this module exposes, as `timefusion_stats` rows. The ONE
+    /// source of truth for the key list: `pg_compat` iterates it rather than
+    /// naming keys, so a new bucket cannot be recorded without becoming readable.
+    ///
+    /// `total` is the fleet aggregate and equals the sum of either dimension.
+    pub fn gauge_rows() -> impl Iterator<Item = (String, u64)> {
+        let reasons = UnverifiableReason::ALL.iter().map(|reason| reason.as_str()).zip(BY_REASON.iter());
+        let fates = UnverifiableFate::ALL.iter().map(|fate| fate.as_str()).zip(BY_FATE.iter());
+        let total = BY_REASON.iter().map(|gauge| gauge.load(Relaxed)).sum::<u64>();
+        [("rollup_unverifiable_total".to_owned(), total), ("rollup_unverifiable_identity_tag_incomplete_total".to_owned(), IDENTITY_TAG_INCOMPLETE.load(Relaxed))]
+            .into_iter()
+            .chain(reasons.chain(fates).map(|(label, gauge)| (format!("rollup_unverifiable_{label}"), gauge.load(Relaxed))))
+    }
+}
+
 /// High-water-mark decode gauges surfaced via `timefusion_stats`. Separate from the
 /// `metrics`-backed counters above because `metrics::Gauge` has no `fetch_max` —
 /// `decode_begin`/`decode_end` need the atomic read-modify-write these give directly.

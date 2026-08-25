@@ -53,6 +53,13 @@ fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
 
+/// The same identity WITHOUT `source_rows`: what a slice is, independent of what
+/// its files claim about the source. Two files sharing this key and disagreeing
+/// about the witness are a partial strip, not history predating the tag.
+type SliceKey = (String, i64, i64, String, u64);
+
+use crate::database::rollup_unverifiable::{Tally, UnverifiableFate, UnverifiableReason};
+
 /// Time ranges keyed by `(project, date)` — the untagged files' statistics
 /// spans, and separately the tagged files' slice ranges.
 type SpansByPartition = HashMap<(String, String), Vec<(i64, i64)>>;
@@ -3398,6 +3405,13 @@ impl Database {
         // base tier has a backlog — the same "cannot tell none from unmeasured"
         // failure the untagged gauge already had.
         let mut unverifiable = 0u64;
+        // The same population, split two ways — see `rollup_unverifiable`. Summed
+        // over every tier exactly like `unverifiable`, so all three agree, and
+        // published per SOURCE so the exported rows are fleet totals rather than
+        // the last source to run (which the legacy gauge below still is).
+        let (mut reasons, mut fates) = (Tally::new(), Tally::new());
+        // One sampled slice per (tier, reason): identity, not just a count.
+        let mut examples: std::collections::HashSet<(String, UnverifiableReason)> = std::collections::HashSet::new();
         // Slices whose stored generation no longer matches the current spec:
         // coverage that exists on disk and cannot be used. See the skip below.
         let mut stale_generation = 0u64;
@@ -3410,7 +3424,7 @@ impl Database {
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
-            let (tagged, paths_by_identity) = match self.resolve_table("default", &target).await {
+            let (tagged, paths_by_identity, witness_reasons, witnessed) = match self.resolve_table("default", &target).await {
                 Ok(table) => {
                     let table = table.read().await;
                     // `source_rows` is part of the KEY so a partition rebuilt against a
@@ -3429,6 +3443,13 @@ impl Database {
                     // before them claims coverage the read path refuses — the one
                     // failure this design must never have.
                     let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
+                    // Why each witness-less identity has no witness, and which
+                    // identities DO carry one — keyed WITHOUT `source_rows`, so a
+                    // slice whose files disagree (a rewrite that stripped the tag
+                    // off some of them) is distinguishable from one that never had
+                    // it. Different repair entirely, indistinguishable in a count.
+                    let mut witness_reasons: HashMap<SliceKey, UnverifiableReason> = HashMap::new();
+                    let mut witnessed: std::collections::HashSet<SliceKey> = std::collections::HashSet::new();
                     for add in table.snapshot()?.log_data().iter() {
                         #[allow(deprecated)]
                         let action = add.add_action();
@@ -3473,14 +3494,31 @@ impl Database {
                             tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
                             tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
                         ) else {
+                            // Tagged for THIS source, yet not identifiable: the file
+                            // is dropped from the tagged set and counted nowhere
+                            // else, so without this it is an invisible population.
+                            crate::database::rollup_unverifiable::IDENTITY_TAG_INCOMPLETE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             continue;
                         };
                         // Absent on generations written before the tag; `-1` is the
                         // sentinel a build writes when the source reported no count.
-                        // Both become `None`, which the read path refuses to verify.
-                        let source_rows = tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS)
-                            .and_then(|value| value.parse::<i64>().ok())
-                            .and_then(|rows| u64::try_from(rows).ok());
+                        // Both become `None`, which the read path refuses to verify —
+                        // and `classify_witness` says WHICH, from the one place that
+                        // decides, so the split cannot fail to sum to the total.
+                        let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
+                        let source_rows = witness.ok();
+                        let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
+                        match witness {
+                            Ok(_) => {
+                                witnessed.insert(slice_key);
+                            }
+                            // Lowest variant wins, so a slice seen under two
+                            // reasons attributes deterministically whatever order
+                            // the log lists its files in.
+                            Err(reason) => {
+                                witness_reasons.entry(slice_key).and_modify(|held| *held = (*held).min(reason)).or_insert(reason);
+                            }
+                        }
                         groups.insert((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows));
                         // Same facts, recorded explicitly. The date comes from the
                         // file's own partition rather than from `slice_start`,
@@ -3500,9 +3538,9 @@ impl Database {
                             entry.1.push(action.path.clone());
                         }
                     }
-                    (groups, paths_by_identity)
+                    (groups, paths_by_identity, witness_reasons, witnessed)
                 }
-                Err(_) => (std::collections::HashSet::new(), HashMap::new()),
+                Err(_) => Default::default(),
             };
             // Filled by the FILTERED loop below, then verified and written once
             // per tier. Nothing is recorded for a slice the read path would
@@ -3547,7 +3585,44 @@ impl Database {
             // pass saw zero and prod read `rollup_witnessless_slices = 0` over a
             // 23,337-slice backlog. Same "cannot tell none from unmeasured" failure
             // the untagged gauge above already had, reintroduced one field over.
-            unverifiable += tagged.iter().filter(|(.., source_rows)| source_rows.is_none()).count() as u64;
+            // Same population as before — the filter is unchanged — but attributed.
+            // A slice whose siblings carry a witness is `MixedWitness` whatever its
+            // own tag said, because a partial strip is repaired, not republished.
+            let mut spec_unverifiable = 0u64;
+            for identity @ (project_id, slice_start, slice_end, generation, source_fp, source_rows) in &tagged {
+                if source_rows.is_some() {
+                    continue;
+                }
+                let key = (project_id.clone(), *slice_start, *slice_end, generation.clone(), *source_fp);
+                let reason = if witnessed.contains(&key) {
+                    UnverifiableReason::MixedWitness
+                } else {
+                    witness_reasons.get(&key).copied().unwrap_or(UnverifiableReason::TagAbsent)
+                };
+                reason.bump(&mut reasons);
+                spec_unverifiable += 1;
+                // ONE offending slice per (tier, reason) is what makes this
+                // actionable: the next person opens that partition instead of
+                // reading a count. Bounded by the number of reasons, not by the
+                // ~4,386-slice population.
+                if examples.insert((target.clone(), reason)) {
+                    warn!(
+                        source,
+                        target,
+                        project_id = %project_id,
+                        slice_start,
+                        slice_end,
+                        generation = %generation,
+                        source_fp,
+                        reason = reason.as_str(),
+                        date = ?chrono::DateTime::from_timestamp_micros(*slice_start).map(|time| time.date_naive().to_string()),
+                        files = paths_by_identity.get(identity).map(|(_, paths)| paths.len()).unwrap_or_default(),
+                        event = "rollup_unverifiable_example",
+                        "a sampled slice that can never be verified"
+                    );
+                }
+            }
+            unverifiable += spec_unverifiable;
             let published = self.journal().published_rollups(source, &target);
             for (key, publication) in &published {
                 if publication.source_rows.is_none() {
@@ -3567,9 +3642,25 @@ impl Database {
             }
             if !tagged.is_empty() {
                 for (project_id, slice_start, slice_end, generation, source_fp, source_rows) in tagged {
-                    let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else { continue };
+                    // The SECOND dimension over the unverifiable population: what
+                    // this pass then did with the slice. Only the last arm reaches
+                    // the republish queue, and every earlier exit was a silent
+                    // `continue` — which is how a frozen population goes four
+                    // hourly passes without anything saying it is stuck.
+                    let mut fate = |bucket: UnverifiableFate| {
+                        if source_rows.is_none() {
+                            bucket.bump(&mut fates);
+                        }
+                    };
+                    let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(slice_start, slice_end) else {
+                        fate(UnverifiableFate::InvalidSlice);
+                        continue;
+                    };
                     let complete = self.journal().rollup_slice_complete(source, &project_id, &target, slice);
-                    let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else { continue };
+                    let Some(date) = chrono::DateTime::from_timestamp_micros(slice_start).map(|time| time.date_naive().to_string()) else {
+                        fate(UnverifiableFate::InvalidSlice);
+                        continue;
+                    };
                     // A stored generation that no longer matches the CURRENT spec
                     // is unrecoverable coverage, and it was a bare `continue` —
                     // the single most consequential silent skip in the rollup
@@ -3588,13 +3679,16 @@ impl Database {
                     // or an identity that tolerates additive change — but it makes
                     // the cost of a spec edit visible at the moment it is paid.
                     if !complete {
+                        fate(UnverifiableFate::JournalIncomplete);
                         continue;
                     }
                     if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
+                        fate(UnverifiableFate::StaleGeneration);
                         stale_generation += 1;
                         continue;
                     }
                     if source_rows.is_none() {
+                        fate(UnverifiableFate::QueuedForRepublish);
                         witnessless.push((project_id.clone(), slice));
                     }
                     // Past every readability filter, so this slice is exactly
@@ -3638,9 +3732,26 @@ impl Database {
             // coverage is recoverable from Delta metadata alone.
         }
         crate::observability::maintenance_stats().rollup_witnessless_slices.store(unverifiable, std::sync::atomic::Ordering::Relaxed);
+        // Each dimension attributes the WHOLE population, so a split that stops
+        // summing to the aggregate is a lost bucket — the exact defect this
+        // instrument exists to prevent, caught here rather than on prod.
+        debug_assert_eq!(reasons.iter().sum::<u64>(), unverifiable, "every unverifiable slice must carry a reason");
+        debug_assert_eq!(fates.iter().sum::<u64>(), unverifiable, "every unverifiable slice must carry a fate");
+        crate::database::rollup_unverifiable::publish(source, &reasons, &fates);
         // `stale_generation` is coverage that EXISTS on disk and cannot be used:
         // read it against `recovered` to price a spec change after the fact.
-        info!(source, recovered, unverifiable, stale_generation, event = "rollup_coverage_recovered");
+        info!(
+            source,
+            recovered,
+            unverifiable,
+            stale_generation,
+            // Both splits on the SAME line as the aggregate: one log fetch answers
+            // "how many" and "why" together, and they are checkable against each
+            // other without joining two events.
+            by_reason = %UnverifiableReason::render(&reasons),
+            by_fate = %UnverifiableFate::render(&fates),
+            event = "rollup_coverage_recovered"
+        );
         Ok(recovered)
     }
 

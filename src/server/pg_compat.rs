@@ -1101,6 +1101,13 @@ impl StatsTableProvider {
             "cron_ticks_skipped" => m.cron_ticks_skipped,
         ];
         maintenance.push(("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason()));
+        // DERIVED, not hand-listed. `rollup_witnessless_slices` above is one
+        // number for a population that sat byte-identical across four hourly
+        // passes and a restart; these say why, in two dimensions that each sum to
+        // it. Iterating the bucket lists is the point: a reason added without a
+        // row is the bug class that cost 53% of prefilter skips their attribution
+        // on 2026-08-24, and it cannot happen here.
+        maintenance.extend(crate::database::rollup_unverifiable::gauge_rows().map(|(key, value)| ("maintenance", key, value.to_string())));
 
         let plan_cache = crate::read::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();
@@ -1701,6 +1708,29 @@ mod stats_table_tests {
             "{} skip reasons are registered but {exposed} rows are exposed — a reason that has no row cannot be attributed",
             crate::database::scan_metric_names::PREFILTER_SKIP_REASONS.len()
         );
+    }
+
+    /// Every unverifiable-slice bucket must reach `timefusion_stats`, and no row
+    /// may exist that no bucket produces.
+    ///
+    /// Set equality, not a count: a bucket renamed without the readout following
+    /// leaves a row that reads a confident 0 forever, which is exactly how
+    /// `no_index_or_cap` hid 81% of prefilter skips. The rows are derived from
+    /// `ALL`, so this passes by construction today — it is here to fail the day
+    /// someone re-introduces a hand-maintained key list.
+    #[test]
+    fn every_unverifiable_bucket_is_exposed() {
+        use crate::database::rollup_unverifiable::{UnverifiableFate, UnverifiableReason};
+        let expected: std::collections::BTreeSet<String> = ["total".to_owned(), "identity_tag_incomplete_total".to_owned()]
+            .into_iter()
+            .chain(UnverifiableReason::ALL.iter().map(|reason| reason.as_str().to_owned()))
+            .chain(UnverifiableFate::ALL.iter().map(|fate| fate.as_str().to_owned()))
+            .map(|suffix| format!("rollup_unverifiable_{suffix}"))
+            .collect();
+        let rows = snapshot_rows(&StatsTableProvider::new(None));
+        let exposed: std::collections::BTreeSet<String> =
+            rows.iter().filter(|(component, key, _)| component == "maintenance" && key.starts_with("rollup_unverifiable_")).map(|(_, key, _)| key.clone()).collect();
+        assert_eq!(exposed, expected, "the exposed rows and the bucket lists must be the same set — an unexposed bucket cannot be attributed");
     }
 
     #[test]
