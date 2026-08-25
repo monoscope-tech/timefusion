@@ -827,22 +827,39 @@ pub fn record_commit_timeout(op: &'static str) {
 }
 
 /// Declares a process-global atomic-counter struct together with its all-zero
-/// static, so a new counter can't drift from its initializer.
+/// static AND its `timefusion_stats` rows, so a new counter can drift from
+/// neither its initializer nor the readout. On 2026-08-25 two counters were
+/// incremented with no arm in `pg_compat`, so no `SELECT` would ever have shown
+/// them; there is deliberately no "declared but not exposed" arm here.
+/// The row key defaults to the field name — `field as "key"` pins the
+/// historical key where it differs (usually a `_total` suffix).
 macro_rules! atomic_stats {
-    ($(#[$sm:meta])* $name:ident => $global:ident { $($(#[$fm:meta])* $field:ident),+ $(,)? }) => {
+    ($(#[$sm:meta])* $name:ident => $global:ident as $component:literal { $($(#[$fm:meta])* $field:ident $(as $key:literal)?),+ $(,)? }) => {
         $(#[$sm])*
         pub struct $name {
             $($(#[$fm])* pub $field: AtomicU64,)+
         }
         static $global: $name = $name { $($field: AtomicU64::new(0),)+ };
+        impl $name {
+            /// `(component, key, value)` for every counter, for `timefusion_stats`.
+            pub fn stats_rows(&self) -> Vec<(&'static str, &'static str, u64)> {
+                vec![$((
+                    $component,
+                    atomic_stats!(@key $field $(, $key)?),
+                    self.$field.load(std::sync::atomic::Ordering::Relaxed),
+                ),)+]
+            }
+        }
     };
+    (@key $field:ident) => { stringify!($field) };
+    (@key $field:ident, $key:literal) => { $key };
 }
 
 atomic_stats! {
-    DmlStats => DML_STATS {
-        occ_conflicts,
-        retry_successes,
-        retry_exhausted,
+    DmlStats => DML_STATS as "dml" {
+        occ_conflicts as "occ_conflicts_total",
+        retry_successes as "retry_successes_total",
+        retry_exhausted as "retry_exhausted_total",
         /// Delta merges executed by coalescer drains — readable in-process (the
         /// OTel counter isn't); tests assert on deltas of this to pin folding.
         coalesce_merges,
@@ -863,355 +880,369 @@ atomic_stats! {
     /// tasks. `checkpoint_lag_versions` is the last observed max lag (a gauge), the
     /// rest are monotonic.
     #[derive(Default)]
-    MaintenanceStats => MAINTENANCE_STATS {
-    checkpoints_created,
-    checkpoint_failed,
-    /// Checkpoints that wrote OK but failed post-write footer verification
-    /// (the referenced object isn't a readable Parquet). Log cleanup is
-    /// withheld so the JSON log stays recoverable. PAGE if > 0.
-    checkpoint_corrupt,
-    log_files_cleaned,
-    log_cleanup_failed,
-    checkpoint_lag_versions,
-    dangling_removed,
-    reconcile_failed,
-    dedup_timed_out,
-    dedup_failed,
-    /// Adds a rewrite planner had to drop because the in-memory snapshot listed
-    /// the same file twice. Nonzero means reads over that table double-count
-    /// rows — the file list diverged from the log, which no amount of dedup or
-    /// compaction repairs on its own. PAGE if > 0.
-    snapshot_duplicate_adds,
-    light_optimize_timed_out,
-    light_optimize_failed,
-    /// Ticks that hit the wall-clock budget with hot projects still pending.
-    light_optimize_tick_truncated,
-    /// Wave-engine per-tick accounting. `planned` counts projects the tick's
-    /// single metadata walk found work for; `completed` counts bins that landed.
-    /// ALERT when completed lags planned for N consecutive ticks — that's the
-    /// "8 of 11 hot projects never reached" shape (prod 2026-07-29).
-    light_optimize_projects_planned,
-    light_optimize_projects_completed,
-    light_optimize_bins_committed,
-    light_optimize_waves_committed,
-    /// GAUGE: repair bins sorting right now. A repair pass runs for up to
-    /// `timefusion_footer_repair_budget_secs` and logs nothing between its
-    /// per-bin events, so this is the only cheap way to tell "repair is
-    /// grinding" from "repair is wedged" without SSH.
-    repair_bins_in_flight,
-    /// Dedup-engine waves (data_change: true) — counted separately so the
-    /// light_optimize_* counters mean pure compaction only.
-    dedup_bins_committed,
-    dedup_waves_committed,
-    /// Waves not STARTED because the WAL was over its emergency-flush threshold
-    /// (durability outranks compaction) or memory was near the cgroup limit.
-    /// Chronic nonzero = compaction is being starved, not protected.
-    light_optimize_wal_yields,
-    /// Ticks/waves stopped because at least one MemBuffer bucket exceeded its
-    /// retention target without landing. Unlike the byte-based WAL brake this
-    /// catches small but old persistence debt.
-    light_optimize_flush_debt_yields,
-    light_optimize_memory_brakes,
-    /// Scans on a `version_append` table where the Delta leg did NOT already
-    /// satisfy keep-greatest's ordering, so a `SortExec` was injected over it.
-    ///
-    /// Zero is the healthy state and the PRECONDITION for turning
-    /// `version_append` on for a busy table: the sort is per-partition and
-    /// spillable, but prod's `otel_logs_and_spans` scans read 48 file groups
-    /// (2026-08-01), and 48 concurrent sorts over a measured 145MB peak batch is
-    /// the 2026-07-20 wide-scan OOM shape. Nonzero here means the partition
-    /// carries files without an honest sorted footer — today that is the DML
-    /// rewrite path (`dml_writer_properties` passes `declare_sorted=false`),
-    /// which merge-on-read removes by construction.
-    mor_delta_leg_sorts,
-    /// Escalated flush sorts that FAILED and wrote their group unsorted. One
-    /// unsorted file disables the reader's footer ordering for every scan
-    /// touching its partition (query-time SortExec, unordered MOR dedup), so
-    /// any nonzero here is a read-path incident in the making (2026-08-03).
-    flush_sort_unsorted_fallbacks,
-    /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
-    /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
-    /// outrunning flush often enough that compaction is running at the floor.
-    light_optimize_ticks_degraded,
-    /// Repair ticks skipped because ANOTHER table's repair pass already held the
-    /// process-wide permit. The light pool is shared across tables while the
-    /// wave engine's concurrency cap is per-table, so before this guard two
-    /// repair sorts could co-exist and starve each other (prod 2026-08-11 11:30,
-    /// `otel_metrics` vs `otel_logs_and_spans`, a 981 MB bin lost with 2.1 MB
-    /// left of 15.4 GB). Chronic nonzero = repair is contended, not broken; a
-    /// permanently-zero repair backlog on one table while this climbs means the
-    /// other table is monopolising the permit.
-    repair_ticks_yielded,
-    /// Dashboard aggregates served from a rollup, split by how much of the
-    /// window the rollup owned. The OTel counters carry the same numbers but
-    /// cannot be read back in-process, and these two are the only signal that
-    /// says whether read routing is actually firing — `rollup_hits_hybrid`
-    /// specifically is the one that proves the raw-fringe union works, since a
-    /// full-window hit needs no union at all.
-    rollup_hits_full,
-    rollup_hits_hybrid,
-    /// Partitions rebuilt from only the hours that changed, vs from scratch.
-    /// The ratio is the whole point of the dirty-hour tracking: a fall to zero
-    /// means something is widening the dirty set to the whole day and every
-    /// enrichment is paying for 24 hours of re-aggregation again.
-    rollup_rebuilds_incremental,
-    rollup_rebuilds_full,
-    rollup_dirty_partitions,
-    /// Derived slices completed WITHOUT publishing because a strictly wider live
-    /// file already covered them. Expected to be rare; if it is not, a late row
-    /// inside an already-published day may be going stale in the coarse tier.
-    rollup_skipped_covered_by_wider,
-    /// Splits refused because the unit measured nearly what its parent measured:
-    /// bisection has hit the row-group floor and halving the width again buys
-    /// nothing but journal units.
-    ///
-    /// This is the instrument for the 2026-08-22 shred — 3,455 units for a
-    /// single (project, tier, day). Read it against `pending_base_rollup`: this
-    /// rising while pending stops growing is the fix working. This rising while
-    /// pending ALSO rises means units are being declined and then failing to
-    /// run, which is worse than the shred, not better.
-    split_declined_at_floor,
-    /// Dedup keys whose versions DISAGREE on a column declared immutable.
-    ///
-    /// Immutability is enforced for UPDATE only, so an INSERT can append a
-    /// disagreeing version; read filters on immutable columns are pushed below
-    /// the dedup on the strength of that declaration. Non-zero means the read
-    /// path's premise is false in production and a pushed predicate can match a
-    /// version the winner does not satisfy.
-    ///
-    /// The audit runs unconditionally, so zero here means CLEAN rather than
-    /// "not measured" — the one reading a flag-gated version of this counter
-    /// could never give.
-    immutable_column_disagreement_total,
-    /// Partitions where the coverage ledger and the Delta tags disagree.
-    ///
-    /// The ledger is destined to be the authority, and an authority can DRIFT
-    /// where self-describing files cannot — that is the one risk the design
-    /// adds. This is the standing alarm against it, and it is why the tag replay
-    /// stays after reads move onto the ledger rather than being deleted with the
-    /// tags it reads.
-    ///
-    /// Must be zero before any read path trusts the ledger. Non-zero afterwards
-    /// means queries may be answered from coverage that is not there.
-    coverage_ledger_disagreements,
-    /// Ledger writes that did not reach disk.
-    ///
-    /// `store_sidecar` warns and continues, which is right for a hint and wrong
-    /// for an authority: the in-memory ledger goes on serving what it holds while
-    /// the durable copy falls behind, and nothing else would say so. Understating
-    /// coverage is the safe direction — it costs a rebuild, not a wrong answer —
-    /// so this is not fatal while the Delta tags remain. It must read ZERO
-    /// alongside `coverage_ledger_disagreements` before the tags can go.
-    coverage_ledger_persist_failures,
-    /// Base rollup files carrying no parseable slice tags — history written
-    /// before tagging existed.
-    ///
-    /// Until #169 such a file was DROPPED, so it was invisible to the coarse
-    /// tier forever while the unit published rows=0 and completed,
-    /// indistinguishable from a genuinely empty slice. That is what this counter
-    /// was added to expose, and it did: 15 hits in 20 minutes against 16 of 16
-    /// derived publications at rows=0.
-    ///
-    /// It now counts files SELECTED by the fallback — pruned on their own
-    /// timestamp statistics instead of discarded — so it measures how much of the
-    /// base tier predates tagging, not how much is unreachable. Expect it to
-    /// shrink as those partitions are rewritten; a rise means older history is
-    /// being reached, which is the point.
-    rollup_untagged_inputs,
-    /// Untagged files found LIVE IN A TIER at publish time (gauge, overwritten
-    /// per unit), and the running total this publish path has retired.
-    ///
-    /// A tier file with no identity tags used to be immortal — the replace-set
-    /// skipped it, so every rebuild stacked another version of every `id` beside
-    /// it. That ran for a MONTH unnoticed (352 files, 26 days, 7.17 versions per
-    /// id) purely because nothing counted it; it was found by hand while chasing
-    /// an inflated dashboard. After `slice_retires` the steady state is genuinely
-    /// zero, so `found` is alarmable at > 0: nonzero means some path is writing
-    /// or stripping tier tags again and should be named before it costs another
-    /// archaeology session.
-    ///
-    /// `retired` is how a repair is watched draining — the only proof a rebuild
-    /// REMOVED the old file rather than publishing a correct one beside it,
-    /// which is exactly what the first repair attempt did.
-    rollup_tier_untagged_found,
-    rollup_tier_untagged_retired,
-    /// Recovered slices carrying NO row witness — published before
-    /// `TAG_SOURCE_ROWS` existed. Every read refuses them `stale_coverage` and no
-    /// rule can ever rescue them, so this is the size of the backlog that has to
-    /// republish before wide dashboards route. Set from the whole recovery pass,
-    /// hourly, so it reads 0 only when there genuinely are none.
-    rollup_witnessless_slices,
-    /// Contiguous sealed days of rollup coverage, counting back from yesterday,
-    /// minimised over every (project, declared tier).
-    ///
-    /// This is the number that governs long-window query latency, and no
-    /// existing metric tracked it. `MIN(date)` reads as progress while the
-    /// middle stays holey — it advanced 08-01 -> 07-30 on 2026-08-17 while the
-    /// coarse tier held only 3 days — and a 30d panel needs 30 CONTIGUOUS days
-    /// in the tier it reads, so one hole anywhere in the window sends it to a
-    /// raw scan. Minimised, not averaged: a single uncovered project is a
-    /// customer whose dashboard is slow.
-    rollup_min_contiguous_days,
-    rollup_median_contiguous_days,
-    rollup_oldest_invalidation_age_secs,
-    rollup_scan_cohorts,
-    rollup_scan_projects,
-    rollup_scan_estimated_bytes,
-    rollup_cohort_splits,
-    rollup_singleton_failures,
-    rollup_staged_projects,
-    rollup_shared_commits,
-    rollup_commit_actions,
-    rollup_occ_retries,
-    rollup_ambiguous_landings,
-    rollup_scan_duration_ms,
-    rollup_staging_duration_ms,
-    rollup_commit_duration_ms,
-    rollup_end_to_end_duration_ms,
-    rollup_output_rows,
-    rollup_output_files,
-    /// Live parquet files the Tantivy manifest does NOT cover, as of the last
-    /// reconcile pass, plus the ones skipped for exceeding
-    /// TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB. Gauges, not counters: each pass
-    /// overwrites them.
-    ///
-    /// Without these there is no way to tell whether a reindex is converging or
-    /// how far it has left to run, which is precisely why the reindex was being
-    /// driven by hand from sibling containers — three of which were OOM-killed
-    /// on 2026-08-16. `uncovered` trending to 0 IS the definition of done.
-    tantivy_uncovered_files,
-    tantivy_oversized_skipped,
-    /// Pending (non-Complete) tasks split by operation, and the subset that is
-    /// ELIGIBLE right now (deadline passed). Gauges, republished each checkpoint.
-    ///
-    /// `tasks_pending` alone cannot answer the only question that matters when
-    /// coverage stalls: is the rollup work absent, present-but-not-eligible, or
-    /// present-and-eligible but out-competed? Prod 2026-08-17 sat at ~128k
-    /// pending with rollup coverage frozen for hours, and there was no way to
-    /// tell which of those three it was without guessing.
-    pending_dedup,
-    pending_base_rollup,
-    pending_derived_rollup,
-    pending_hot_packing,
-    pending_sealed_consolidation,
-    pending_repair,
-    eligible_base_rollup,
-    eligible_sealed_total,
-    rollup_full_hours_rebuilt,
-    rollup_incremental_hours_rebuilt,
-    maintenance_tasks_pending,
-    maintenance_tasks_running,
-    maintenance_tasks_retry,
-    maintenance_tasks_complete,
-    maintenance_backlog_bytes,
-    maintenance_oldest_task_age_secs,
-    maintenance_eligible_watermark_lag_secs,
-    maintenance_processed_bytes,
-    maintenance_processed_bytes_per_sec,
-    maintenance_raw_tail_duration_secs,
-    sealed_compaction_debt_bytes,
-    maintenance_cpu_tokens_used,
-    maintenance_decoded_bytes_used,
-    maintenance_object_read_tokens_used,
-    maintenance_object_write_tokens_used,
-    /// Aggregates that fell through to a raw scan, plus the breakdown by reason.
-    ///
-    /// The OTel counter carries the same labels but cannot be read back
-    /// in-process, and the reason is the ONLY thing that distinguishes "the
-    /// build never ran" from "it ran and the source moved under it" from "the
-    /// shape is unsupported" — which is the entire diagnosis of a rollout that
-    /// is building rollups but not serving them. Without it the answer is
-    /// guesswork over a 19k-line log.
-    rollup_misses_total,
-    rollup_miss_not_built,
-    rollup_miss_stale_coverage,
-    rollup_miss_tiny_interior,
-    rollup_miss_too_many_branches,
-    rollup_miss_unsupported,
-    rollup_miss_incomplete_coverage,
-    rollup_miss_unknown_filter,
-    rollup_miss_filter_not_eligible,
-    rollup_miss_missing_measure,
-    rollup_miss_unaligned_bucket,
-    rollup_miss_unknown_group_by,
-    rollup_miss_missing_project,
-    rollup_miss_unbounded_time,
-    rollup_miss_non_decomposable,
-    rollup_miss_rewrite_schema_mismatch,
-    rollup_miss_unwalkable_source,
-    dirty_bin_queue_depth,
-    dirty_bin_enqueued,
-    dirty_bin_eligible,
-    dirty_bin_processed,
-    dirty_bin_requeued,
-    /// Queued bins consumed by the whole-date BATCH probe without per-bin
-    /// staging (every flushed bin is enqueued, so in prod ~97% of queued bins
-    /// carry no duplicates at all). Also counted in `dirty_bin_processed`.
-    dirty_bin_batch_probe_clean,
-    dirty_bin_dropped_rows,
-    dirty_bin_rewrite_duration_ms,
-    /// Cold-owned dirty bins (date old enough that the nightly consolidate owns
-    /// the partition) DEPRIORITIZED to the tail of a drain pass and left on the
-    /// queue. They are NOT dropped: consolidate bin-packs but does not collapse
-    /// duplicates, so the dirty-bin drain stays their only physical dedup.
-    /// NOTE `cold_optimize_after_days` defaults to 1 and the drain already skips
-    /// today, so in the default configuration EVERY drainable bin is cold-owned
-    /// — this then reads as "queued bins this pass had no batch slot for".
-    /// Chronic growth = a backlog the batch size can't keep up with.
-    dedup_bins_deferred_cold,
-    /// Drain passes skipped (or cut short between chunks) because the flush path
-    /// was behind. Dedup is an optimization — read-side DedupExec keeps results
-    /// correct — so it yields to persistence (2026-07-30: a boot drain over a
-    /// 10-day backlog pinned the commit path and starved flush for a whole
-    /// container life). Chronic nonzero = flush is unhealthy, not dedup.
-    dedup_passes_flush_yields,
-    /// Per-bin STAGING attempts killed at the deadline and requeued. The
-    /// deadline exists so one hung object-store read can't wedge the drain
-    /// for hours behind the 1-permit maintenance semaphore (prod 2026-08-05:
-    /// 6.5h stall, skips=77). Repeated hits are the same bin retrying —
-    /// an oversized bin that can't finish inside the deadline, not noise.
-    dedup_bin_stage_timeouts,
-    /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
-    /// on a per-table commit lock a flush was already waiting for — the flush
-    /// starvation of prod 2026-07-30, where durability waited >600s behind
-    /// legally-slow maintenance commits. The wave's bins are requeued and
-    /// re-staged later, so this is deferred work, not lost work. Chronic nonzero
-    /// = flush is saturating the commit path and compaction is being crowded out.
-    wave_commits_yielded_to_flush,
-    /// Boot-time resume of a staged-but-uncommitted footer-repair bin: the
-    /// rewrite survived the restart that killed its process, so the next pass
-    /// doesn't redo the (40+ minute) work. See `resume_staged_intents`.
-    repair_resumed,
-    /// Rollup units COMMITTED at claim time from output a previous process
-    /// staged, instead of re-running their ~21-minute scan. Read against
-    /// `rollup_resume_declined`: the ratio is what says whether resume is
-    /// rescuing work or whether the source keeps moving underneath it.
-    rollup_resumed,
-    /// Staged rollup outputs refused — the source moved, an input left the
-    /// snapshot, another live file already covers the slice, or the parquet is
-    /// short. Every one of these is a correct refusal; a rising count means the
-    /// staging window and the churn window overlap, not that resume is broken.
-    rollup_resume_declined,
-    /// Resume declined: an input file was rewritten underneath the staged
-    /// output, so committing it would resurrect removed rows.
-    repair_resume_declined_stale,
-    /// Resume declined: a staged output object is missing or the wrong size —
-    /// the process died mid-PUT.
-    repair_resume_declined_incomplete,
-    /// Resume declined because output rows != input rows. A repair is
-    /// row-preserving by construction, so this must be ZERO forever; nonzero
-    /// means a truncated staging that would have DROPPED rows, or a broken
-    /// assumption. PAGE if > 0.
-    repair_resume_row_mismatch,
-    /// Cron ticks skipped because the previous run of the same job was still
-    /// in flight. A steadily growing value = a wedged/overlong job body.
-    cron_ticks_skipped,
-    /// Cron fires actually dispatched (all jobs). Frozen while uptime grows =
-    /// the scheduler is dead (2026-07-14 outage signature).
-    cron_ticks_fired,
-    /// Cron runs that exceeded the long-running warning threshold. Slow but
-    /// progressing work is allowed to finish; this is for observability.
-    cron_long_running,
+    MaintenanceStats => MAINTENANCE_STATS as "maintenance" {
+        checkpoints_created,
+        checkpoint_failed,
+        /// Checkpoints that wrote OK but failed post-write footer verification
+        /// (the referenced object isn't a readable Parquet). Log cleanup is
+        /// withheld so the JSON log stays recoverable. PAGE if > 0.
+        checkpoint_corrupt,
+        log_files_cleaned,
+        log_cleanup_failed,
+        // Max version lag (current - last checkpointed) seen at the last
+        // checkpoint tick. Should stay near checkpoint_interval; a large,
+        // growing value means the checkpoint task is failing or wedged.
+        checkpoint_lag_versions,
+        // NONZERO = committed parquet was destroyed elsewhere (2026-07-09
+        // commit-path deletion bug). PAGE and investigate.
+        dangling_removed,
+        reconcile_failed,
+        dedup_timed_out as "dedup_timed_out_total",
+        dedup_failed as "dedup_failed_total",
+        /// Adds a rewrite planner had to drop because the in-memory snapshot listed
+        /// the same file twice. Nonzero means reads over that table double-count
+        /// rows — the file list diverged from the log, which no amount of dedup or
+        /// compaction repairs on its own. PAGE if > 0.
+        snapshot_duplicate_adds,
+        light_optimize_timed_out as "light_optimize_timed_out_total",
+        light_optimize_failed as "light_optimize_failed_total",
+        /// Ticks that hit the wall-clock budget with hot projects still pending.
+        light_optimize_tick_truncated as "light_optimize_tick_truncated_total",
+        /// Wave-engine per-tick accounting. `planned` counts projects the tick's
+        /// single metadata walk found work for; `completed` counts bins that landed.
+        /// ALERT when completed lags planned for N consecutive ticks — that's the
+        /// "8 of 11 hot projects never reached" shape (prod 2026-07-29).
+        // planned vs completed is the per-tick coverage check: a persistent
+        // gap means hot projects are going uncompacted (prod 2026-07-29).
+        light_optimize_projects_planned as "light_optimize_projects_planned_total",
+        light_optimize_projects_completed as "light_optimize_projects_completed_total",
+        light_optimize_bins_committed as "light_optimize_bins_committed_total",
+        light_optimize_waves_committed as "light_optimize_waves_committed_total",
+        /// GAUGE: repair bins sorting right now. A repair pass runs for up to
+        /// `timefusion_footer_repair_budget_secs` and logs nothing between its
+        /// per-bin events, so this is the only cheap way to tell "repair is
+        /// grinding" from "repair is wedged" without SSH.
+        repair_bins_in_flight,
+        /// Dedup-engine waves (data_change: true) — counted separately so the
+        /// light_optimize_* counters mean pure compaction only.
+        dedup_bins_committed as "dedup_bins_committed_total",
+        dedup_waves_committed as "dedup_waves_committed_total",
+        /// Waves not STARTED because the WAL was over its emergency-flush threshold
+        /// (durability outranks compaction) or memory was near the cgroup limit.
+        /// Chronic nonzero = compaction is being starved, not protected.
+        light_optimize_wal_yields as "light_optimize_wal_yields_total",
+        /// Ticks/waves stopped because at least one MemBuffer bucket exceeded its
+        /// retention target without landing. Unlike the byte-based WAL brake this
+        /// catches small but old persistence debt.
+        light_optimize_flush_debt_yields as "light_optimize_flush_debt_yields_total",
+        light_optimize_memory_brakes as "light_optimize_memory_brakes_total",
+        /// Scans on a `version_append` table where the Delta leg did NOT already
+        /// satisfy keep-greatest's ordering, so a `SortExec` was injected over it.
+        ///
+        /// Zero is the healthy state and the PRECONDITION for turning
+        /// `version_append` on for a busy table: the sort is per-partition and
+        /// spillable, but prod's `otel_logs_and_spans` scans read 48 file groups
+        /// (2026-08-01), and 48 concurrent sorts over a measured 145MB peak batch is
+        /// the 2026-07-20 wide-scan OOM shape. Nonzero here means the partition
+        /// carries files without an honest sorted footer — today that is the DML
+        /// rewrite path (`dml_writer_properties` passes `declare_sorted=false`),
+        /// which merge-on-read removes by construction.
+        mor_delta_leg_sorts as "mor_delta_leg_sorts_total",
+        /// Escalated flush sorts that FAILED and wrote their group unsorted. One
+        /// unsorted file disables the reader's footer ordering for every scan
+        /// touching its partition (query-time SortExec, unordered MOR dedup), so
+        /// any nonzero here is a read-path incident in the making (2026-08-03).
+        flush_sort_unsorted_fallbacks as "flush_sort_unsorted_fallbacks_total",
+        /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
+        /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
+        /// outrunning flush often enough that compaction is running at the floor.
+        light_optimize_ticks_degraded as "light_optimize_ticks_degraded_total",
+        /// Repair ticks skipped because ANOTHER table's repair pass already held the
+        /// process-wide permit. The light pool is shared across tables while the
+        /// wave engine's concurrency cap is per-table, so before this guard two
+        /// repair sorts could co-exist and starve each other (prod 2026-08-11 11:30,
+        /// `otel_metrics` vs `otel_logs_and_spans`, a 981 MB bin lost with 2.1 MB
+        /// left of 15.4 GB). Chronic nonzero = repair is contended, not broken; a
+        /// permanently-zero repair backlog on one table while this climbs means the
+        /// other table is monopolising the permit.
+        repair_ticks_yielded,
+        /// Dashboard aggregates served from a rollup, split by how much of the
+        /// window the rollup owned. The OTel counters carry the same numbers but
+        /// cannot be read back in-process, and these two are the only signal that
+        /// says whether read routing is actually firing — `rollup_hits_hybrid`
+        /// specifically is the one that proves the raw-fringe union works, since a
+        /// full-window hit needs no union at all.
+        rollup_hits_full as "rollup_hits_full_total",
+        rollup_hits_hybrid as "rollup_hits_hybrid_total",
+        /// Partitions rebuilt from only the hours that changed, vs from scratch.
+        /// The ratio is the whole point of the dirty-hour tracking: a fall to zero
+        /// means something is widening the dirty set to the whole day and every
+        /// enrichment is paying for 24 hours of re-aggregation again.
+        rollup_rebuilds_incremental as "rollup_rebuilds_incremental_total",
+        rollup_rebuilds_full as "rollup_rebuilds_full_total",
+        rollup_dirty_partitions,
+        /// Derived slices completed WITHOUT publishing because a strictly wider live
+        /// file already covered them. Expected to be rare; if it is not, a late row
+        /// inside an already-published day may be going stale in the coarse tier.
+        rollup_skipped_covered_by_wider,
+        /// Splits refused because the unit measured nearly what its parent measured:
+        /// bisection has hit the row-group floor and halving the width again buys
+        /// nothing but journal units.
+        ///
+        /// This is the instrument for the 2026-08-22 shred — 3,455 units for a
+        /// single (project, tier, day). Read it against `pending_base_rollup`: this
+        /// rising while pending stops growing is the fix working. This rising while
+        /// pending ALSO rises means units are being declined and then failing to
+        /// run, which is worse than the shred, not better.
+        split_declined_at_floor,
+        /// Dedup keys whose versions DISAGREE on a column declared immutable.
+        ///
+        /// Immutability is enforced for UPDATE only, so an INSERT can append a
+        /// disagreeing version; read filters on immutable columns are pushed below
+        /// the dedup on the strength of that declaration. Non-zero means the read
+        /// path's premise is false in production and a pushed predicate can match a
+        /// version the winner does not satisfy.
+        ///
+        /// The audit runs unconditionally, so zero here means CLEAN rather than
+        /// "not measured" — the one reading a flag-gated version of this counter
+        /// could never give.
+        immutable_column_disagreement_total,
+        /// Partitions where the coverage ledger and the Delta tags disagree.
+        ///
+        /// The ledger is destined to be the authority, and an authority can DRIFT
+        /// where self-describing files cannot — that is the one risk the design
+        /// adds. This is the standing alarm against it, and it is why the tag replay
+        /// stays after reads move onto the ledger rather than being deleted with the
+        /// tags it reads.
+        ///
+        /// Must be zero before any read path trusts the ledger. Non-zero afterwards
+        /// means queries may be answered from coverage that is not there.
+        coverage_ledger_disagreements,
+        /// Ledger writes that did not reach disk.
+        ///
+        /// `store_sidecar` warns and continues, which is right for a hint and wrong
+        /// for an authority: the in-memory ledger goes on serving what it holds while
+        /// the durable copy falls behind, and nothing else would say so. Understating
+        /// coverage is the safe direction — it costs a rebuild, not a wrong answer —
+        /// so this is not fatal while the Delta tags remain. It must read ZERO
+        /// alongside `coverage_ledger_disagreements` before the tags can go.
+        coverage_ledger_persist_failures,
+        /// Base rollup files carrying no parseable slice tags — history written
+        /// before tagging existed.
+        ///
+        /// Until #169 such a file was DROPPED, so it was invisible to the coarse
+        /// tier forever while the unit published rows=0 and completed,
+        /// indistinguishable from a genuinely empty slice. That is what this counter
+        /// was added to expose, and it did: 15 hits in 20 minutes against 16 of 16
+        /// derived publications at rows=0.
+        ///
+        /// It now counts files SELECTED by the fallback — pruned on their own
+        /// timestamp statistics instead of discarded — so it measures how much of the
+        /// base tier predates tagging, not how much is unreachable. Expect it to
+        /// shrink as those partitions are rewritten; a rise means older history is
+        /// being reached, which is the point.
+        rollup_untagged_inputs,
+        /// Untagged files found LIVE IN A TIER at publish time (gauge, overwritten
+        /// per unit), and the running total this publish path has retired.
+        ///
+        /// A tier file with no identity tags used to be immortal — the replace-set
+        /// skipped it, so every rebuild stacked another version of every `id` beside
+        /// it. That ran for a MONTH unnoticed (352 files, 26 days, 7.17 versions per
+        /// id) purely because nothing counted it; it was found by hand while chasing
+        /// an inflated dashboard. After `slice_retires` the steady state is genuinely
+        /// zero, so `found` is alarmable at > 0: nonzero means some path is writing
+        /// or stripping tier tags again and should be named before it costs another
+        /// archaeology session.
+        ///
+        /// `retired` is how a repair is watched draining — the only proof a rebuild
+        /// REMOVED the old file rather than publishing a correct one beside it,
+        /// which is exactly what the first repair attempt did.
+        rollup_tier_untagged_found,
+        rollup_tier_untagged_retired as "rollup_tier_untagged_retired_total",
+        /// Recovered slices carrying NO row witness — published before
+        /// `TAG_SOURCE_ROWS` existed. Every read refuses them `stale_coverage` and no
+        /// rule can ever rescue them, so this is the size of the backlog that has to
+        /// republish before wide dashboards route. Set from the whole recovery pass,
+        /// hourly, so it reads 0 only when there genuinely are none.
+        // The republish backlog that gates wide-window routing. Watch it fall;
+        // `rollup_stale_no_witness` per query falls with it.
+        rollup_witnessless_slices,
+        /// Contiguous sealed days of rollup coverage, counting back from yesterday,
+        /// minimised over every (project, declared tier).
+        ///
+        /// This is the number that governs long-window query latency, and no
+        /// existing metric tracked it. `MIN(date)` reads as progress while the
+        /// middle stays holey — it advanced 08-01 -> 07-30 on 2026-08-17 while the
+        /// coarse tier held only 3 days — and a 30d panel needs 30 CONTIGUOUS days
+        /// in the tier it reads, so one hole anywhere in the window sends it to a
+        /// raw scan. Minimised, not averaged: a single uncovered project is a
+        /// customer whose dashboard is slow.
+        rollup_min_contiguous_days,
+        rollup_median_contiguous_days,
+        rollup_oldest_invalidation_age_secs as "rollup_oldest_invalidation_age_seconds",
+        rollup_scan_cohorts as "rollup_scan_cohorts_total",
+        rollup_scan_projects as "rollup_scan_projects_total",
+        rollup_scan_estimated_bytes as "rollup_scan_estimated_bytes_total",
+        rollup_cohort_splits as "rollup_cohort_splits_total",
+        rollup_singleton_failures as "rollup_singleton_failures_total",
+        rollup_staged_projects as "rollup_staged_projects_total",
+        rollup_shared_commits as "rollup_shared_commits_total",
+        rollup_commit_actions as "rollup_commit_actions_total",
+        rollup_occ_retries as "rollup_occ_retries_total",
+        rollup_ambiguous_landings as "rollup_ambiguous_landings_total",
+        rollup_scan_duration_ms as "rollup_scan_duration_ms_total",
+        rollup_staging_duration_ms as "rollup_staging_duration_ms_total",
+        rollup_commit_duration_ms as "rollup_commit_duration_ms_total",
+        rollup_end_to_end_duration_ms as "rollup_end_to_end_duration_ms_total",
+        rollup_output_rows as "rollup_output_rows_total",
+        rollup_output_files as "rollup_output_files_total",
+        /// Live parquet files the Tantivy manifest does NOT cover, as of the last
+        /// reconcile pass, plus the ones skipped for exceeding
+        /// TIMEFUSION_TANTIVY_BACKFILL_MAX_FILE_MB. Gauges, not counters: each pass
+        /// overwrites them.
+        ///
+        /// Without these there is no way to tell whether a reindex is converging or
+        /// how far it has left to run, which is precisely why the reindex was being
+        /// driven by hand from sibling containers — three of which were OOM-killed
+        /// on 2026-08-16. `uncovered` trending to 0 IS the definition of done.
+        tantivy_uncovered_files,
+        tantivy_oversized_skipped,
+        /// Pending (non-Complete) tasks split by operation, and the subset that is
+        /// ELIGIBLE right now (deadline passed). Gauges, republished each checkpoint.
+        ///
+        /// `tasks_pending` alone cannot answer the only question that matters when
+        /// coverage stalls: is the rollup work absent, present-but-not-eligible, or
+        /// present-and-eligible but out-competed? Prod 2026-08-17 sat at ~128k
+        /// pending with rollup coverage frozen for hours, and there was no way to
+        /// tell which of those three it was without guessing.
+        pending_dedup,
+        pending_base_rollup,
+        pending_derived_rollup,
+        pending_hot_packing,
+        pending_sealed_consolidation,
+        pending_repair,
+        eligible_base_rollup,
+        eligible_sealed_total,
+        rollup_full_hours_rebuilt as "rollup_full_hours_rebuilt_total",
+        rollup_incremental_hours_rebuilt as "rollup_incremental_hours_rebuilt_total",
+        maintenance_tasks_pending as "tasks_pending",
+        maintenance_tasks_running as "tasks_running",
+        maintenance_tasks_retry as "tasks_retry",
+        maintenance_tasks_complete as "tasks_complete",
+        maintenance_backlog_bytes as "backlog_bytes",
+        maintenance_oldest_task_age_secs as "oldest_task_age_seconds",
+        maintenance_eligible_watermark_lag_secs as "eligible_watermark_lag_seconds",
+        maintenance_processed_bytes as "processed_bytes_total",
+        maintenance_processed_bytes_per_sec as "processed_bytes_per_second",
+        maintenance_raw_tail_duration_secs as "raw_tail_duration_seconds",
+        sealed_compaction_debt_bytes,
+        maintenance_cpu_tokens_used as "cpu_tokens_used",
+        maintenance_decoded_bytes_used as "decoded_bytes_used",
+        maintenance_object_read_tokens_used as "object_read_tokens_used",
+        maintenance_object_write_tokens_used as "object_write_tokens_used",
+        /// Aggregates that fell through to a raw scan, plus the breakdown by reason.
+        ///
+        /// The OTel counter carries the same labels but cannot be read back
+        /// in-process, and the reason is the ONLY thing that distinguishes "the
+        /// build never ran" from "it ran and the source moved under it" from "the
+        /// shape is unsupported" — which is the entire diagnosis of a rollout that
+        /// is building rollups but not serving them. Without it the answer is
+        /// guesswork over a 19k-line log.
+        rollup_misses_total,
+        rollup_miss_not_built as "rollup_miss_not_built_total",
+        rollup_miss_stale_coverage as "rollup_miss_stale_coverage_total",
+        rollup_miss_tiny_interior as "rollup_miss_tiny_interior_total",
+        rollup_miss_too_many_branches as "rollup_miss_too_many_branches_total",
+        rollup_miss_unsupported as "rollup_miss_unsupported_total",
+        rollup_miss_incomplete_coverage as "rollup_miss_incomplete_coverage_total",
+        rollup_miss_unknown_filter as "rollup_miss_unknown_filter_total",
+        rollup_miss_filter_not_eligible as "rollup_miss_filter_not_eligible_total",
+        rollup_miss_missing_measure as "rollup_miss_missing_measure_total",
+        rollup_miss_unaligned_bucket as "rollup_miss_unaligned_bucket_total",
+        rollup_miss_unknown_group_by as "rollup_miss_unknown_group_by_total",
+        rollup_miss_missing_project as "rollup_miss_missing_project_total",
+        rollup_miss_unbounded_time as "rollup_miss_unbounded_time_total",
+        rollup_miss_non_decomposable as "rollup_miss_non_decomposable_total",
+        rollup_miss_rewrite_schema_mismatch as "rollup_miss_rewrite_schema_mismatch_total",
+        rollup_miss_unwalkable_source as "rollup_miss_unwalkable_source_total",
+        dirty_bin_queue_depth,
+        dirty_bin_enqueued as "dirty_bin_enqueued_total",
+        dirty_bin_eligible as "dirty_bin_eligible_total",
+        dirty_bin_processed as "dirty_bin_processed_total",
+        dirty_bin_requeued as "dirty_bin_requeued_total",
+        /// Queued bins consumed by the whole-date BATCH probe without per-bin
+        /// staging (every flushed bin is enqueued, so in prod ~97% of queued bins
+        /// carry no duplicates at all). Also counted in `dirty_bin_processed`.
+        dirty_bin_batch_probe_clean as "dirty_bin_batch_probe_clean_total",
+        dirty_bin_dropped_rows as "dirty_bin_dropped_rows_total",
+        dirty_bin_rewrite_duration_ms as "dirty_bin_rewrite_duration_ms_total",
+        /// Cold-owned dirty bins (date old enough that the nightly consolidate owns
+        /// the partition) DEPRIORITIZED to the tail of a drain pass and left on the
+        /// queue. They are NOT dropped: consolidate bin-packs but does not collapse
+        /// duplicates, so the dirty-bin drain stays their only physical dedup.
+        /// NOTE `cold_optimize_after_days` defaults to 1 and the drain already skips
+        /// today, so in the default configuration EVERY drainable bin is cold-owned
+        /// — this then reads as "queued bins this pass had no batch slot for".
+        /// Chronic growth = a backlog the batch size can't keep up with.
+        dedup_bins_deferred_cold as "dedup_bins_deferred_cold_total",
+        /// Drain passes skipped (or cut short between chunks) because the flush path
+        /// was behind. Dedup is an optimization — read-side DedupExec keeps results
+        /// correct — so it yields to persistence (2026-07-30: a boot drain over a
+        /// 10-day backlog pinned the commit path and starved flush for a whole
+        /// container life). Chronic nonzero = flush is unhealthy, not dedup.
+        dedup_passes_flush_yields as "dedup_passes_flush_yields_total",
+        /// Per-bin STAGING attempts killed at the deadline and requeued. The
+        /// deadline exists so one hung object-store read can't wedge the drain
+        /// for hours behind the 1-permit maintenance semaphore (prod 2026-08-05:
+        /// 6.5h stall, skips=77). Repeated hits are the same bin retrying —
+        /// an oversized bin that can't finish inside the deadline, not noise.
+        dedup_bin_stage_timeouts as "dedup_bin_stage_timeouts_total",
+        /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
+        /// on a per-table commit lock a flush was already waiting for — the flush
+        /// starvation of prod 2026-07-30, where durability waited >600s behind
+        /// legally-slow maintenance commits. The wave's bins are requeued and
+        /// re-staged later, so this is deferred work, not lost work. Chronic nonzero
+        /// = flush is saturating the commit path and compaction is being crowded out.
+        wave_commits_yielded_to_flush as "wave_commits_yielded_to_flush_total",
+        /// Boot-time resume of a staged-but-uncommitted footer-repair bin: the
+        /// rewrite survived the restart that killed its process, so the next pass
+        /// doesn't redo the (40+ minute) work. See `resume_staged_intents`.
+        repair_resumed as "repair_resumed_total",
+        /// Rollup units COMMITTED at claim time from output a previous process
+        /// staged, instead of re-running their ~21-minute scan. Read against
+        /// `rollup_resume_declined`: the ratio is what says whether resume is
+        /// rescuing work or whether the source keeps moving underneath it.
+        rollup_resumed as "rollup_resumed_total",
+        /// Staged rollup outputs refused — the source moved, an input left the
+        /// snapshot, another live file already covers the slice, or the parquet is
+        /// short. Every one of these is a correct refusal; a rising count means the
+        /// staging window and the churn window overlap, not that resume is broken.
+        rollup_resume_declined as "rollup_resume_declined_total",
+        /// Resume declined: an input file was rewritten underneath the staged
+        /// output, so committing it would resurrect removed rows.
+        repair_resume_declined_stale as "repair_resume_declined_stale_total",
+        /// Resume declined: a staged output object is missing or the wrong size —
+        /// the process died mid-PUT.
+        repair_resume_declined_incomplete as "repair_resume_declined_incomplete_total",
+        /// Resume declined because output rows != input rows. A repair is
+        /// row-preserving by construction, so this must be ZERO forever; nonzero
+        /// means a truncated staging that would have DROPPED rows, or a broken
+        /// assumption. PAGE if > 0.
+        // MUST stay 0 — nonzero = a staged repair whose rows didn't add up.
+        repair_resume_row_mismatch as "repair_resume_row_mismatch_total",
+        /// Cron ticks skipped because the previous run of the same job was still
+        /// in flight. A steadily growing value = a wedged/overlong job body.
+        cron_ticks_skipped,
+        /// Cron fires actually dispatched (all jobs). Frozen while uptime grows =
+        /// the scheduler is dead (2026-07-14 outage signature).
+        // Fired frozen while uptime grows = scheduler dead (2026-07-14
+        // outage); skipped growing = a job body is wedged or overlong.
+        cron_ticks_fired,
+        /// Cron runs that exceeded the long-running warning threshold. Slow but
+        /// progressing work is allowed to finish; this is for observability.
+        // Runs exceeding the long-running warning threshold. Slow progress
+        // is allowed; sustained nonzero with no completion = wedged.
+        cron_long_running as "cron_long_running_total",
     }
 }
 
