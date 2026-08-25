@@ -2820,14 +2820,40 @@ impl Database {
             return Ok(true);
         };
         let pass = if operation == crate::maintenance_coordinator::Operation::Repair { TailPass::Repair } else { TailPass::Pack };
+        // A staged-but-uncommitted rewrite from a previous process is COMMITTED
+        // here rather than redone. `stage_hot_bin` records an intent for every
+        // bin it stages, but when the coordinator took ownership of slice
+        // maintenance the only consumer of those intents went with it: every
+        // caller of `resumable_staged_bin` sits under
+        // `!COORDINATOR_OWNS_SLICE_MAINTENANCE`, which is `true`. So prod kept
+        // writing intents that nothing could ever redeem, and the only remaining
+        // reader was the boot-time reconcile — which DELETES the staged parquet.
+        // A repair bin is one 40+ minute whole-file rewrite against a process
+        // replaced every 15-28 minutes, so that discarded a complete, sorted,
+        // row-exact replacement on almost every pass.
+        let date_marker = chrono::DateTime::from_timestamp_micros(key.slice.start_micros)
+            .map(|time| format!("date={}/", time.date_naive()))
+            .unwrap_or_default();
+        if let Some(bin) = self.resumable_staged_bin(&table_ref, &key.source, &key.project_id, &files).await {
+            let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![bin], 0).await;
+            let landed = result.failed.is_empty() && !result.landed.is_empty();
+            info!(table_name = %key.source, project_id = %key.project_id, landed, event = "resumed_bin_committed_early");
+            if landed {
+                let mut journal = self.journal();
+                journal.complete(&key);
+                journal.checkpoint()?;
+                return Ok(true);
+            }
+            // The resume lost its race (inputs no longer live). Fall through and
+            // stage normally rather than failing the unit.
+        }
         let runtime = self.coordinator_runtime_env();
         let outcome = self
             .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
             .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
-                let date = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()).unwrap_or_default();
-                let result = self.commit_wave(&table_ref, &key.source, &[format!("date={date}/")], false, vec![unit], 0).await;
+                let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![unit], 0).await;
                 result.failed.is_empty() && !result.landed.is_empty()
             }
             Ok(BinOutcome::Converged) => true,
