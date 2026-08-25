@@ -1406,7 +1406,6 @@ mod stats_table_tests {
     /// rendered a confident 0 — 53% of prod skips unattributable on 2026-08-24.
     #[test]
     fn every_declared_scan_metric_has_a_row() {
-        use crate::database::scan_metric_names::{SCAN_DERIVED_ROWS, SCAN_ROWS};
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
         let exposed = rows.iter().filter(|(component, key, _)| component == "scan" && key.starts_with("prefilter_skipped_")).count();
         assert_eq!(
@@ -1445,6 +1444,7 @@ mod stats_table_tests {
 
     #[test]
     fn exposes_dml_retry_outcomes() {
+        use crate::database::scan_metric_names::{SCAN_DERIVED_ROWS, SCAN_ROWS};
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
 
         for (component, key) in SCAN_ROWS.iter().map(|(c, k, _)| (*c, *k)).chain(SCAN_DERIVED_ROWS.iter().copied()) {

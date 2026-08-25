@@ -813,6 +813,7 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
         R::NonDecomposableAggregate => &stats.rollup_miss_non_decomposable,
         R::RewriteSchemaMismatch => &stats.rollup_miss_rewrite_schema_mismatch,
         R::UnwalkableSource => &stats.rollup_miss_unwalkable_source,
+        R::MeasureNotStored => &stats.rollup_miss_measure_not_stored,
     }
     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = METRICS.get() {
