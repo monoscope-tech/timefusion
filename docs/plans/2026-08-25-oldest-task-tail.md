@@ -90,8 +90,8 @@ So a 2026-05-31 cell is ranked in the same group as yesterday's, and ordered
 newest-first inside it. It is reachable only when the 3–31 day band is empty of
 eligible `SealedConsolidation` work *and* its benefit bucket beats every fresher
 out-of-band cell. `pending_sealed_consolidation` was 76 → 83 → 94 → 99 over the
-day and `out_of_policy_cells` has been 51 for twelve censuses: the band is never
-empty. Measure zero.
+day and `out_of_policy_cells` has been 51 for thirteen consecutive censuses
+(`tasks/01-NEXT-2026-08-25.md` item 4): the band is never empty. Measure zero.
 
 **Correction to the brief's second premise.** "`benefit` is 0 for every operation
 except SealedConsolidation/HotPacking/Repair, so benefit ordering does not touch
@@ -147,7 +147,8 @@ a 45-day bound prod spent escalation on 2026-07-17/19/20 — outside any window 
 is what queries read, and 2026-05-31 is not in it. Deprioritising it is right.
 
 What is *not* right is that the abandonment is undeclared and that the gauge
-meant to expose queue health has been pinned red by it for months. A
+meant to expose queue health is pinned red by it — 83 days on 2026-08-23, 85.6
+on 08-25, and by construction for as long as this stamp is the queue minimum. A
 permanently-red gauge is worse than no gauge: it trains readers to skip the one
 number that would show a real scheduling stall inside the goal window.
 
@@ -202,8 +203,24 @@ again, and it deletes durable state. It should be the next step.
   the age gauge AND counted in `beyond_horizon_tasks`, while an in-band task
   drives the age.
 - **On prod, after the next deploy, on a ≥1 h container:**
-  `oldest_task_age_seconds ≤ 2,678,400` (31 d) **and**
-  `beyond_horizon_tasks > 0`. Both, together — the second is what proves the
-  first is a definition change and not a silent hide.
+  `oldest_task_age_seconds ≤ 2,764,800` — the horizon (31 d) **plus one day-wide
+  slice**, because within-horizon tasks are still aged from `created_unix_ms`
+  and an invalidation-minted task's stamp is `observed_at`, which can precede its
+  slice end by up to the slice width — **and** `beyond_horizon_tasks > 0`. Both,
+  together: the second is what proves the first is a definition change and not a
+  silent hide.
+  (Unifying the gauge onto `now − slice.end` would remove that mixed clock
+  entirely. It is a semantics change on a number people quote, so it belongs
+  with the follow-up below, not here.)
 - **Not in scope, deliberately:** the 2026-05-31 partition stays fragmented. That
   is the decision, not an oversight.
+
+## 5. Two smaller things noticed, not changed
+
+- A `Running` beyond-horizon task now counts as abandoned. Harmless for a count
+  — it is one tick of skew on a gauge that answers "how much have we given up
+  on" — but it means `beyond_horizon_tasks` is not exactly "never scheduled".
+- `maintenance_sim.rs:938` stamps `created_unix_ms: 0`. If the sim ever calls
+  `publish_statistics`, the age gauge reads the whole Unix epoch there.
+  Pre-existing and harmless today (it does not call it); noted so the next person
+  to wire stats into the sim does not chase it.
