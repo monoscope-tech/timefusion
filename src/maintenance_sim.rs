@@ -1178,6 +1178,18 @@ mod tests {
         assert!(cell_units(&report, &stamped) > 1, "the stamped lineage must not freeze: {} units", cell_units(&report, &stamped));
     }
 
+    /// §3b's debris, witnessed: 600 footprint-less one-minute units each
+    /// claiming 4,466,185,462 bytes over a 0.36 GB partition. Nothing can fuse
+    /// them on their own prices — only the partition ceiling can, which is why
+    /// a run with a byte model drives `coarsen_sealed_slices_capped`. This is
+    /// the interaction (fusion against the floor guard, at once) that no unit
+    /// test covers.
+    #[test]
+    fn the_footprintless_debris_fuses_under_the_partition_ceiling() {
+        let (report, _, _) = synth_run(true, SplitGuard::Shipped);
+        assert!(report.coarsen_fused > 0, "the ceiling must rescue the debris: fused {} of {} candidates", report.coarsen_fused, report.coarsen_candidates);
+    }
+
     /// §3c.5 — the threshold sweep, over three floor shapes. Printed rather
     /// than asserted: the constant can only be argued from the table.
     #[test]
