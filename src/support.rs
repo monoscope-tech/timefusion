@@ -148,6 +148,17 @@ mod tests {
         assert_eq!(out.unwrap(), 42);
     }
 
+    /// Wrapped helpers now nest — `store_sidecar` wraps a serialize whose
+    /// write tail is `write_atomic_with`, itself wrapped. `block_in_place`
+    /// inside `block_in_place` has to be legal for that to be a fix rather
+    /// than a panic on the maintenance path.
+    #[test]
+    fn nested_helper_calls_are_allowed() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let out = runtime.block_on(async { tokio::spawn(async { without_blocking_the_worker(|| without_blocking_the_worker(|| 42)) }).await });
+        assert_eq!(out.unwrap(), 42);
+    }
+
     #[test]
     fn set_and_advance() {
         let t0 = 4_000_000_000_000_000_i64;
