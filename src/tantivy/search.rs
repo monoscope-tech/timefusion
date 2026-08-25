@@ -242,32 +242,44 @@ impl TantivySearchService {
         let mut tasks = futures::stream::iter(work.into_iter().map(|(file_uuid, blob_path, rows, entry_covered, ordinals_valid)| async move {
             let prepare_started = Instant::now();
             let dir = self.ensure_cached(table, project_id, &file_uuid, &blob_path).await?;
-            let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
-            SearchStats::timed(&self.stats.prepares, &self.stats.prepare_us, prepare_started);
-            let started = Instant::now();
-            let out = match build_node_query(&index, node)? {
-                PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
-                PredsQuery::Query(q) => {
-                    let searcher = reader.searcher();
-                    // Count-first: a raw per-index match count over `max_hits`
-                    // already forces the abort verdict (the prefilter can no
-                    // longer prove completeness), so establish it with the
-                    // cheap Count collector instead of materializing hits —
-                    // a 4.5M-match needle cost 4-6s of plan time per query
-                    // doing doc-store reads it then threw away (prod
-                    // 2026-08-22). The limit on the materializing search is a
-                    // backstop; `search()` passes usize::MAX, hence saturating.
-                    let count = searcher.search(&*q, &tantivy::collector::Count).map_err(|e| anyhow!("count: {e}"))?;
-                    if count > max_hits {
-                        None
-                    } else {
-                        let hits = query_with_searcher(&searcher, &*q, Some(max_hits.saturating_add(1)))?;
-                        SearchStats::add(&self.stats.hits_materialized, hits.len() as u64);
-                        Some((Some(hits), rows, entry_covered, ordinals_valid))
+            // Everything from here to the end of the search is synchronous
+            // tantivy work — mmap-ing segments, then a CPU-bound search that
+            // yields nowhere and has cost seconds on a fat needle (4.5M
+            // matches, 2026-08-22). Inline it holds a runtime worker, and a
+            // held worker stalls every unrelated task queued on it. This is
+            // the same defect as the 2026-08-25 journal fsync, on the query
+            // path. `block_in_place` rather than `spawn_blocking` because the
+            // body borrows `self`, `node` and the stats — moving the OTHER
+            // tasks off this thread needs no ownership changes at all.
+            let out = crate::support::without_blocking_the_worker(|| {
+                let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
+                SearchStats::timed(&self.stats.prepares, &self.stats.prepare_us, prepare_started);
+                let started = Instant::now();
+                let out = match build_node_query(&index, node)? {
+                    PredsQuery::MissingField => Some((None, rows, entry_covered, ordinals_valid)),
+                    PredsQuery::Query(q) => {
+                        let searcher = reader.searcher();
+                        // Count-first: a raw per-index match count over `max_hits`
+                        // already forces the abort verdict (the prefilter can no
+                        // longer prove completeness), so establish it with the
+                        // cheap Count collector instead of materializing hits —
+                        // a 4.5M-match needle cost 4-6s of plan time per query
+                        // doing doc-store reads it then threw away (prod
+                        // 2026-08-22). The limit on the materializing search is a
+                        // backstop; `search()` passes usize::MAX, hence saturating.
+                        let count = searcher.search(&*q, &tantivy::collector::Count).map_err(|e| anyhow!("count: {e}"))?;
+                        if count > max_hits {
+                            None
+                        } else {
+                            let hits = query_with_searcher(&searcher, &*q, Some(max_hits.saturating_add(1)))?;
+                            SearchStats::add(&self.stats.hits_materialized, hits.len() as u64);
+                            Some((Some(hits), rows, entry_covered, ordinals_valid))
+                        }
                     }
-                }
-            };
-            SearchStats::timed(&self.stats.searches, &self.stats.search_us, started);
+                };
+                SearchStats::timed(&self.stats.searches, &self.stats.search_us, started);
+                Ok::<_, anyhow::Error>(out)
+            })?;
             Ok::<_, anyhow::Error>(out)
         }))
         .buffer_unordered(self.config.search_concurrency());
@@ -471,7 +483,13 @@ impl TantivySearchService {
         }
         let started = Instant::now();
         let blob = super::download(self.object_store.as_ref(), &ObjPath::from(blob_path)).await?;
-        install_blob_into_cache(&dir, &blob)?;
+        // `spawn_blocking`, matching the seeding path below: this zstd-decodes
+        // and untars a whole index blob, which is CPU-and-IO bound and yields
+        // nowhere. Called inline it held a runtime worker on the QUERY path,
+        // and a held worker stalls every unrelated task queued on it — the
+        // 2026-08-25 fsync fix, same defect in a different place.
+        let (target, bytes) = (dir.clone(), blob.clone());
+        tokio::task::spawn_blocking(move || install_blob_into_cache(&target, &bytes)).await??;
         SearchStats::timed(&self.stats.blob_fetches, &self.stats.blob_fetch_us, started);
         Ok(dir)
     }

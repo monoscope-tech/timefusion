@@ -595,6 +595,39 @@ macro_rules! section_timer {
 section_timer!(BlockWatch, "block", warn_ms = 250, "blocking section held a runtime worker — queries scheduled onto this worker waited behind it");
 section_timer!(TimedSection, "section");
 
+/// jemalloc's own arena accounting, in bytes: `(allocated, active, resident, mapped, retained)`.
+///
+/// `resident - allocated` is fragmentation — memory the kernel has given this
+/// process that no live allocation is using. It is the one quantity left that
+/// could explain the 2026-08-24 finding: query cost flat for an hour, then
+/// climbing past ~1.5 h of uptime, while `journal_hold` froze,
+/// `delta_snapshot_refresh` FELL, buffer pressure stayed at 0–7 % and
+/// `scheduling_lag_ms` never left 0–1. None of those grow; fragmentation does,
+/// and this process churns 13–26 GB every few minutes.
+///
+/// `None` off Linux or without `--features profiling`, where jemalloc is not
+/// the allocator (prod builds with it — see the Dockerfile). Same posture as
+/// the tantivy rows: absent, never faked zeros.
+#[cfg(all(feature = "profiling", target_os = "linux"))]
+pub fn jemalloc_bytes() -> Option<(u64, u64, u64, u64, u64)> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // jemalloc's stats are cached; advancing the epoch is what refreshes them.
+    // Without this every sample returns the values from process start.
+    epoch::advance().ok()?;
+    Some((
+        stats::allocated::read().ok()? as u64,
+        stats::active::read().ok()? as u64,
+        stats::resident::read().ok()? as u64,
+        stats::mapped::read().ok()? as u64,
+        stats::retained::read().ok()? as u64,
+    ))
+}
+
+#[cfg(not(all(feature = "profiling", target_os = "linux")))]
+pub fn jemalloc_bytes() -> Option<(u64, u64, u64, u64, u64)> {
+    None
+}
+
 /// `((component, section), count, total_us, max_us)` for every timed section
 /// entered this process. Unsorted; the caller orders it.
 pub fn section_stats() -> Vec<((&'static str, &'static str), u64, u64, u64)> {
@@ -945,9 +978,9 @@ atomic_stats! {
     /// path's premise is false in production and a pushed predicate can match a
     /// version the winner does not satisfy.
     ///
-    /// Only counted while `timefusion_immutable_audit_enabled` is on, so ZERO
-    /// here means "not audited" just as loudly as it means "clean" — check the
-    /// flag before concluding anything.
+    /// The audit runs unconditionally, so zero here means CLEAN rather than
+    /// "not measured" — the one reading a flag-gated version of this counter
+    /// could never give.
     immutable_column_disagreement_total,
     /// Partitions where the coverage ledger and the Delta tags disagree.
     ///
@@ -960,6 +993,15 @@ atomic_stats! {
     /// Must be zero before any read path trusts the ledger. Non-zero afterwards
     /// means queries may be answered from coverage that is not there.
     coverage_ledger_disagreements,
+    /// Ledger writes that did not reach disk.
+    ///
+    /// `store_sidecar` warns and continues, which is right for a hint and wrong
+    /// for an authority: the in-memory ledger goes on serving what it holds while
+    /// the durable copy falls behind, and nothing else would say so. Understating
+    /// coverage is the safe direction — it costs a rebuild, not a wrong answer —
+    /// so this is not fatal while the Delta tags remain. It must read ZERO
+    /// alongside `coverage_ledger_disagreements` before the tags can go.
+    coverage_ledger_persist_failures,
     /// Base rollup files carrying no parseable slice tags — history written
     /// before tagging existed.
     ///
@@ -1138,6 +1180,16 @@ atomic_stats! {
     /// rewrite survived the restart that killed its process, so the next pass
     /// doesn't redo the (40+ minute) work. See `resume_staged_intents`.
     repair_resumed,
+    /// Rollup units COMMITTED at claim time from output a previous process
+    /// staged, instead of re-running their ~21-minute scan. Read against
+    /// `rollup_resume_declined`: the ratio is what says whether resume is
+    /// rescuing work or whether the source keeps moving underneath it.
+    rollup_resumed,
+    /// Staged rollup outputs refused — the source moved, an input left the
+    /// snapshot, another live file already covers the slice, or the parquet is
+    /// short. Every one of these is a correct refusal; a rising count means the
+    /// staging window and the churn window overlap, not that resume is broken.
+    rollup_resume_declined,
     /// Resume declined: an input file was rewritten underneath the staged
     /// output, so committing it would resurrect removed rows.
     repair_resume_declined_stale,

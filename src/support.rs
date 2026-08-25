@@ -62,9 +62,91 @@ pub fn unfreeze() {
     FROZEN_NOW.store(WALL_SENTINEL, Ordering::Release);
 }
 
+/// Run `f` without freezing the runtime worker it lands on.
+///
+/// A blocking syscall inside an `async` task does not just make that task slow —
+/// it holds the worker thread, so every OTHER task queued on that worker waits
+/// too, including ones with nothing to do with the caller. On 2026-08-24 prod
+/// showed the shape of this directly: a 500 ms timer waking **0.3–2.9 s late,
+/// several times a minute**, on 48 workers with the host 40 % idle
+/// (`docs/plans/2026-08-24-a-trivial-query-costs-seconds-after-hours-of-uptime.md`).
+/// Workers were not busy; they were *blocked*.
+///
+/// `block_in_place` tells tokio to hand this worker's remaining tasks to
+/// another thread before running `f`, so the blocking work costs one thread
+/// rather than one thread *and* its queue. It requires the multi-thread
+/// runtime and panics elsewhere, so a current-thread runtime (and any
+/// non-async caller — CLI subcommands, tests) runs `f` directly, which is
+/// correct: there is no shared worker queue to protect.
+///
+/// Use for genuinely blocking work — `fsync`, a large synchronous serialize —
+/// not as a general escape from `async`.
+pub fn without_blocking_the_worker<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// The prod defect in miniature: one worker, a task blocking it, and a
+    /// timer that has to wake on time anyway.
+    ///
+    /// Run directly, the blocking call owns the only worker and the 50 ms timer
+    /// cannot fire until it finishes — which is the 0.3–2.9 s scheduling lag
+    /// prod reports several times a minute. Through
+    /// `without_blocking_the_worker`, tokio moves the timer to another thread
+    /// and it wakes on schedule.
+    #[test]
+    fn a_blocking_call_must_not_hold_the_worker_its_neighbours_are_queued_on() {
+        const BLOCK: Duration = Duration::from_millis(400);
+
+        // How long a neighbour task waits to be polled at all — worker
+        // starvation measured directly. A timer would be a weaker probe here:
+        // tokio's time driver can be driven by the idle `block_on` thread, so
+        // timers still fire while the worker is held.
+        //
+        // Both tasks are SPAWNED (`block_on` runs on the calling thread, not
+        // the worker), and the blocker is spawned first so it owns the worker
+        // before the neighbour is queued behind it. `wrap` is the only
+        // difference between the two runs.
+        let neighbour_wait = |wrap: bool| {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+            runtime.block_on(async move {
+                let blocker = tokio::spawn(async move {
+                    let block = || std::thread::sleep(BLOCK);
+                    if wrap { without_blocking_the_worker(block) } else { block() }
+                });
+                tokio::task::yield_now().await;
+                let queued_at = std::time::Instant::now();
+                let neighbour = tokio::spawn(async move { queued_at.elapsed() });
+                let (_, waited) = tokio::join!(blocker, neighbour);
+                waited.unwrap()
+            })
+        };
+
+        let blocked = neighbour_wait(false);
+        let protected = neighbour_wait(true);
+        assert!(blocked >= BLOCK / 2, "expected the naive call to hold the worker for ~{BLOCK:?}, neighbour waited only {blocked:?}");
+        assert!(protected < BLOCK / 4, "the neighbour should run while the blocking work happens elsewhere, but waited {protected:?}");
+    }
+
+    /// `block_in_place` panics when called off a runtime worker, and a
+    /// `spawn_blocking` thread still reports a runtime handle — so the flavor
+    /// check alone would not save us if tokio rejected that combination. It
+    /// does not, and `write_atomic_with` is reachable from both kinds of
+    /// thread, so this pins the behaviour the helper depends on.
+    #[test]
+    fn safe_to_call_from_a_blocking_thread_which_also_sees_a_runtime_handle() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let out = runtime.block_on(async { tokio::task::spawn_blocking(|| without_blocking_the_worker(|| 42)).await });
+        assert_eq!(out.unwrap(), 42);
+    }
 
     #[test]
     fn set_and_advance() {
@@ -129,8 +211,9 @@ pub mod test_helpers {
             let id = format!("{}-{}", self.test_name, &uuid::Uuid::new_v4().to_string()[..8]);
             let mut cfg = minio_base_config(&id, &format!("/tmp/timefusion-{id}"));
             cfg.buffer.timefusion_flush_immediately = self.buffer_mode == BufferMode::FlushImmediately;
-            cfg.maintenance.timefusion_rollup_enabled = self.rollups;
-            cfg.maintenance.timefusion_rollup_read_enabled = self.rollups;
+            // Rollups are unconditional now, so `with_rollups()` no longer gates
+            // anything — it stays as a declaration of intent at the call sites.
+            let _ = self.rollups;
             Arc::new(cfg)
         }
     }
