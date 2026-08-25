@@ -826,9 +826,37 @@ tokio's time driver can be driven by the idle `block_on` thread, so timers keep
 firing while the worker is held. A probe that cannot see the defect is worse
 than no probe.
 
-**Verification, prod:** baseline **114 lag warns in 20 minutes (5.7/min)** on
-the pre-fix image. Post-deploy measurement of the identical window is recorded
-below.
+**Verification, prod — a partial win, and not cleanly attributable.**
+
+| | pre-fix (`18bcf8a`) | post-fix (`f7378af`) |
+|---|---|---|
+| lag warns / 20 min | **114** (5.7/min) | **45** (2.25/min) |
+| host load | ~30 | 23.45 |
+| `journal_hold.avg_us` | 2,815 | **1,610** |
+
+The first 10 minutes after the deploy were discarded before measuring — a fresh
+process throws a lag burst during WAL replay (`inproc auth_ms` read 1,252 ms at
+41 s of uptime), and counting that would have read *worse* than reality.
+
+**What this does and does not establish.** The rate fell 60 %, but 2.25/min sits
+inside the pre-fix *variance* — an earlier pre-fix window measured 3.3/min — and
+post-fix load was 22 % lower. So the improvement is real in direction and
+unproven in size. What is certain by construction, not by this measurement, is
+that the blocking mechanism is gone: `block_in_place` demonstrably frees the
+worker's queue (the unit test fails without it at 405 ms), and prod was doing
+606,953 of these fsyncs in 7 hours.
+
+**And warns did not go to zero, so other blockers remain.** 2.25/min means
+workers are still being held by something this fix does not cover — sync
+object-store metadata reads, zstd paths outside `write_atomic_with`, or
+CPU-bound work that never yields. `BlockWatch` is the instrument for finding
+them: wrap a suspect, read `block.<name>.max_ms`. That is the next session's
+work, not a reason to discount this one.
+
+Note on comparing the two runs: use `avg_us` and rates, **never `max_ms`**. The
+maxes are monotone high-water marks, so the 19-minute process reads lower than
+the 7-hour one for reasons that have nothing to do with the fix — the same
+instrument-shape trap recorded above.
 
 ### The premise, settled at 7.15 hours — the age the plan was written about
 
