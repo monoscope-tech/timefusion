@@ -166,6 +166,29 @@ number that would show a real scheduling stall inside the goal window.
    (3) would be exactly this repo's favourite failure — a metric change that
    reads as good news.
 
+### The band has two edges, and both strand work — same constant pair
+
+A sibling measured the young edge on the same prod image: **27 of 27**
+consecutive `maintenance_hygiene_debt_unclaimed` samples show winners dated
+2026-08-17..08-20 while the fleet's largest hygiene debt — 199 files, dated
+2026-08-24 — loses every time. That is `STARVATION_MICROS = 3 days`: a cell must
+age three days before its file count is allowed to matter, because `starved`
+(index 2) is compared before `benefit` (index 5).
+
+It is the same mechanism as this document's, seen from the other end. `starved`
+is one bit derived from a *pair* of constants, and both non-escalated states —
+too young (< 3 d) and too old (> 31 d) — collapse into the same value `1` and
+are then ordered newest-first. The young end recovers on its own: a cell that
+waits three days enters the band. **The old end never recovers**, because time
+only moves one way. That asymmetry is the whole difference, and it is why the
+young edge is a latency question and the old edge is an abandonment question.
+
+The decision below is therefore explicitly about the OLD edge only. The young
+edge (should a 199-file cell wait three days behind smaller older ones?) is a
+real question with a real measurement behind it, it is a benefit-vs-freshness
+trade-off inside the goal window, and it should be decided on its own evidence —
+not folded into this one because the two share a `u8`.
+
 ### Rejected: (b) make the tail reachable
 
 Rejected on cost/benefit and on precedent. The only shape that works is the
@@ -179,6 +202,15 @@ to compact data no dashboard window reads. It also cannot be validated anywhere
 but prod: `timefusion sim` does not model per-unit bytes on this path, and the
 change is a throughput claim. Not worth a half-day prod experiment and an OOM
 risk for a 2026-05-31 partition.
+
+**And reachability would probably buy nothing anyway, because the binding
+constraint is throughput, not ordering.** Measured on the same image: 109 units
+timed out at the 900 s deadline in a 90-minute window — ~98,100 worker-seconds
+against ~86,400 of capacity, committing nothing. A pool that is already
+over-subscribed by work that never commits does not have a free slot to give the
+tail; giving it a reserved share would take that share from work inside the goal
+window and would not obviously finish either. Ordering changes are how you spend
+capacity you have. This queue does not have any.
 
 ### Rejected here, kept as the better follow-up: stop *minting* beyond-horizon work
 
@@ -214,6 +246,20 @@ again, and it deletes durable state. It should be the next step.
   with the follow-up below, not here.)
 - **Not in scope, deliberately:** the 2026-05-31 partition stays fragmented. That
   is the decision, not an oversight.
+
+### Status of the code in `e0dbc58`
+
+**UNVERIFIED.** The change is committed (`src/maintenance_coordinator.rs`,
+`src/observability.rs`, `src/server/pg_compat.rs`, plus one test,
+`the_age_gauge_skips_abandoned_work_and_counts_it_instead`) but neither
+`cargo check` nor the test ever completed: the machine was at load ~140 on 10
+cores with several concurrent cold `datafusion` builds, and the run was killed
+rather than waited out. **Do not merge it on this document's word.** The
+decision above stands on its own and is the deliverable; the patch needs
+`cargo lint` plus that test and its three neighbours
+(`pending_work_is_reported_per_operation_and_by_eligibility`,
+`damage_outranks_work_inside_the_starvation_window`, and the horizon test at
+`coordinator.rs:4470`) run with the selected-test count checked.
 
 ## 5. Two smaller things noticed, not changed
 
