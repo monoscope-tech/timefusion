@@ -44,6 +44,19 @@ pub enum MissReason {
     /// Hybrid routing would create too many disjoint raw/rollup predicates.
     TooManyBranches,
     RewriteSchemaMismatch,
+    /// An aggregate over a rollup-BEARING table whose plan the matcher could not
+    /// walk from the aggregate down to the scan — a node between them that
+    /// `source_and_filters` refuses, in practice DataFusion's CSE lifting a
+    /// group expression into a `__common_expr_N` projection.
+    ///
+    /// Its population is deliberately narrow: only plans whose underlying table
+    /// actually declares rollups are counted, so a join or a `pg_catalog`
+    /// aggregate stays silent. Before this existed the whole class was invisible
+    /// — `match_aggregates` returned `Ok(Vec::new())` and the caller's `Ok(None)`
+    /// arm recorded nothing, so "no miss counter moved" read as "it routed" when
+    /// it could equally mean "the matcher was never reached". Prod 2026-08-25:
+    /// monoscope's log-explorer count chart declined here, 7 days raw, silently.
+    UnwalkableSource,
 }
 
 impl MissReason {
@@ -1405,6 +1418,79 @@ fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mu
     }
 }
 
+/// Undo DataFusion's common-subexpression extraction, for MATCHING only.
+///
+/// `GROUP BY COALESCE(status_code, 'null')` plans as a `CASE` that names its
+/// operand twice, so CSE lifts the operand into `Projection: … AS
+/// __common_expr_1` and the aggregate groups by `CASE WHEN __common_expr_1 …`.
+/// Every dimension matcher below reads bare columns, so the group expression
+/// stopped resembling a dimension and `source_and_filters` refused the aliased
+/// projection outright — the query fell through with no reason recorded at all.
+/// That is not an edge case: it is the shape monoscope emits for EVERY chart
+/// (`COALESCE(<dimension>::text, 'null')`), and on prod 2026-08-25 it cost 39.2s
+/// against 4.25s for the identical query written with a bare column.
+///
+/// Substituting each `__common_expr_N` back into the aggregate's own expressions
+/// restores the pre-CSE shape. Deliberately narrow, because walking through a
+/// projection that RENAMES would make the matcher read a dimension off the wrong
+/// column: only CSE's own generated aliases are inlined, any other alias
+/// declines, and the rebuilt aggregate must still carry field-for-field the same
+/// names and types — it stands in for the original only where they agree.
+fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregate) -> Option<datafusion::logical_expr::Aggregate> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
+
+    const CSE_PREFIX: &str = "__common_expr_";
+
+    let LogicalPlan::Projection(projection) = aggregate.input.as_ref() else { return None };
+    let mut definitions = std::collections::HashMap::new();
+    for expr in &projection.expr {
+        match expr {
+            Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX) => {
+                definitions.insert(alias.name.clone(), alias.expr.as_ref().clone());
+            }
+            Expr::Column(_) => {}
+            // A rename, a computed projection — anything else is exactly what
+            // `source_and_filters` refuses to walk, and for the same reason.
+            _ => return None,
+        }
+    }
+    if definitions.is_empty() {
+        return None;
+    }
+    let inline = |expr: &Expr| {
+        expr.clone()
+            .transform_up(|node| {
+                Ok(match &node {
+                    Expr::Column(column) => definitions.get(&column.name).map_or(Transformed::no(node), |definition| Transformed::yes(definition.clone())),
+                    _ => Transformed::no(node),
+                })
+            })
+            .map(|transformed| transformed.data)
+            .ok()
+            // CSE may define one alias in terms of another; a single bottom-up
+            // pass would leave the inner one dangling over a scan that has no
+            // such column. Decline rather than route a half-substituted shape.
+            .filter(|inlined| !inlined.column_refs().iter().any(|column| column.name.starts_with(CSE_PREFIX)))
+    };
+    let group_expr = aggregate.group_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
+    let aggr_expr = aggregate.aggr_expr.iter().map(inline).collect::<Option<Vec<_>>>()?;
+    Aggregate::try_new(projection.input.clone(), group_expr, aggr_expr)
+        .ok()
+        .filter(|rebuilt| rebuilt.schema.has_equivalent_names_and_types(&aggregate.schema).is_ok())
+}
+
+/// The table `plan` ultimately scans, ignoring every node `source_and_filters`
+/// refuses to walk. Used ONLY to decide whether an unwalkable plan was ever a
+/// rollup candidate, never to route: a plan with two scans yields the first,
+/// which is why it may not feed anything that answers rows.
+fn scanned_table(plan: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
+    match plan {
+        datafusion::logical_expr::LogicalPlan::TableScan(scan) => Some(scan.table_name.table().to_string()),
+        plan => plan.inputs().into_iter().find_map(scanned_table),
+    }
+}
+
 /// Does this predicate constrain ONLY `project_id`/`timestamp`?
 ///
 /// Those are the two the probe injects to satisfy the scan admission guard, and
@@ -1533,9 +1619,22 @@ pub(crate) async fn match_aggregates(
         return Ok(Vec::new());
     }
     let Some(matched) = outermost_aggregate(plan) else { return Ok(Vec::new()) };
-    let LogicalPlan::Aggregate(aggregate) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
+    let LogicalPlan::Aggregate(original) = matched else { unreachable!("outermost_aggregate returns an Aggregate") };
+    // Match against the pre-CSE shape where there is one. `matched` stays the
+    // node actually in the tree, because that is what the rewrite substitutes
+    // for; the inlined copy only ever answers "does this resemble a dimension".
+    let inlined = inline_common_exprs(original);
+    let aggregate = inlined.as_ref().unwrap_or(original);
     let mut predicates = Vec::new();
-    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else { return Ok(Vec::new()) };
+    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else {
+        // Count this ONLY when a rollup-bearing table sits underneath; an
+        // aggregate over a join or `pg_catalog` was never a candidate and must
+        // not inflate the reason breakdown. See `MissReason::UnwalkableSource`.
+        if scanned_table(&aggregate.input).is_some_and(|table| crate::schema::get_schema(&table).is_some_and(|schema| !schema.rollups.is_empty())) {
+            crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
+        }
+        return Ok(Vec::new());
+    };
     let Some(schema) = crate::schema::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
     // Try every declared rollup, coarsest grain first: a coarser grain reads
@@ -1549,7 +1648,9 @@ pub(crate) async fn match_aggregates(
     let mut routes = Vec::new();
     for spec in candidates {
         match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, session).await {
-            Ok(route) => routes.push(route),
+            // The rewrite replaces the node that is IN the tree, never the
+            // inlined stand-in — `substitute` finds it by structural equality.
+            Ok(route) => routes.push(RoutedRollup { matched: matched.clone(), ..route }),
             // Report the FIRST spec's reason: it is the one the operator most
             // likely intended to serve this query, so it is the actionable gap.
             Err(reason) => first_miss = first_miss.or(Some(reason)),
@@ -1969,6 +2070,19 @@ async fn route_with_spec(
         // over THAT column. `SELECT count(*), p95(duration) … WHERE duration IS NOT
         // NULL` is real monoscope traffic (the top-K tables) and its `count(*)`
         // counts only rows with a duration, where `request_count` counts them all.
+        //
+        // `count(*)` is the one aggregate that can be REWRITTEN to satisfy the
+        // guard instead of being refused by it: under `col IS NOT NULL`,
+        // `count(*) ≡ count(col)`. The guard was set aside above rather than
+        // pushed, so neither leg re-applies it — and `{agg: count, column: col}`
+        // skips exactly the rows the predicate excluded, while the raw leg emits
+        // `COUNT(col)` for the same measure. Before this, monoscope's log-explorer
+        // latency widget (`count(*)` folded in from `HAVING COUNT(*) > 0` beside
+        // `percentile_agg(duration)`) was refused outright and scanned 7 days raw.
+        let column = match (column, null_guard) {
+            (None, Some(guard)) if name == "count" => Some(guard.to_string()),
+            (column, _) => column,
+        };
         if null_guard.is_some() && column.as_deref() != null_guard {
             return Err(MissReason::FilterNotEligible);
         }
@@ -2092,6 +2206,7 @@ mod tests {
                 "tiny_interior",
                 "too_many_branches",
                 "rewrite_schema_mismatch",
+                "unwalkable_source",
             ]
         );
     }
@@ -2685,6 +2800,76 @@ mod tests {
         let generated = generated_sql(&route);
         assert!(generated.contains("COALESCE(resource___service___name, 'null')"), "the coalesce must reach the rewrite verbatim: {generated}");
         assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The same chart with the `::text` cast monoscope actually emits. The cast
+    /// is the whole difference: `COALESCE(col, 'null')` repeats a bare column,
+    /// which CSE leaves alone, while `COALESCE(col::text, 'null')` repeats a
+    /// COMPUTATION and gets lifted into `__common_expr_1` — so the test above
+    /// passed for a year while every real panel declined. Prod 2026-08-25:
+    /// 39.2s here against 4.25s for the bare-column spelling, 7 days, one project.
+    #[tokio::test]
+    async fn a_grouped_chart_casting_its_dimension_routes_despite_cse() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(status_code::text, 'null') AS sc, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("COALESCE(status_code, 'null')"), "the coalesce must survive CSE into the rewrite: {generated}");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// monoscope's log-explorer count chart verbatim — `extract(epoch …)` over
+    /// the bucket, the `::text` coalesce over the dimension, `count(*)::float`.
+    /// Structurally the same as the test above, kept separate because every
+    /// previous rollup regression here was found by benching the REAL generated
+    /// SQL and missed by a simplified stand-in.
+    #[tokio::test]
+    async fn the_log_explorer_count_chart_routes_verbatim() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer, COALESCE(status_code::text, 'null'), count(*)::float AS count_ \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY time_bucket('1 hours', timestamp), COALESCE(status_code::text, 'null')"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        assert!(generated_sql(&route).contains("COALESCE(status_code, 'null')"), "the real chart shape must route");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// A group expression the matcher cannot serve must DECLINE, not vanish.
+    /// `coalesce(status_code, level)` needs `level`, which no spec declares, so
+    /// this stays a miss — but before `UnwalkableSource` it left `match_aggregates`
+    /// through `Ok(Vec::new())` and no counter moved at all, which reads exactly
+    /// like a route. The distinction under test is `Err(_)` versus `Ok(None)`.
+    #[tokio::test]
+    async fn an_unservable_group_expression_is_counted_rather_than_silent() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(coalesce(status_code, level)::text, 'null') AS sc, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
+        );
+        assert!(route_for(&state, &sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
+    }
+
+    /// monoscope's log-explorer latency widget, verbatim down to the `HAVING
+    /// COUNT(*) > 0` — whose `count(*)` DataFusion folds into the aggregate
+    /// beside the digest. Under `duration IS NOT NULL` that count is exactly
+    /// `count(duration)`, so it resolves to `duration_count` instead of refusing
+    /// the whole query. Prod 2026-08-25: 35.7s raw against 3.34s routed.
+    #[tokio::test]
+    async fn a_percentile_widget_counting_under_a_null_guard_routes() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS digest \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1 HAVING COUNT(*) > 0"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("duration_digest"), "the digest measure must answer the percentile: {generated}");
+        assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
+        assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
     }
 
     /// The arm is deliberately narrow. A dimension the spec does not declare, a

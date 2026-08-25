@@ -764,11 +764,17 @@ impl Winners {
         }
     }
 
-    fn shift_batches(&mut self, count: u32) {
+    /// Visit every live winner. Used both to shift indices after an emit and to
+    /// re-point them after the buffer is compacted.
+    fn cands_mut(&mut self, mut f: impl FnMut(&mut Cand)) {
         match self {
-            Self::Small(entries) => entries.iter_mut().for_each(|(_, cand)| cand.batch -= count),
-            Self::Large(entries) => entries.values_mut().for_each(|cand| cand.batch -= count),
+            Self::Small(entries) => entries.iter_mut().for_each(|(_, cand)| f(cand)),
+            Self::Large(entries) => entries.values_mut().for_each(f),
         }
+    }
+
+    fn shift_batches(&mut self, count: u32) {
+        self.cands_mut(|cand| cand.batch -= count);
     }
 
     fn min_batch(&self, default: usize) -> usize {
@@ -852,6 +858,11 @@ struct Greatest {
     /// Pool accounting for `batches` (`bytes` mirrors its size). The winner
     /// map is second-order (one small entry per key) and stays untracked.
     reservation: MemoryReservation,
+    /// Re-arm point for `compact_to_winners`: twice what the winners cost after
+    /// the last compaction. Without it a scan whose winners genuinely fill the
+    /// buffer would re-filter every retained batch on every push and make no
+    /// progress — the compaction has to buy more than it costs.
+    compact_floor: usize,
 }
 
 impl Greatest {
@@ -863,7 +874,86 @@ impl Greatest {
                 RowConverter::new(vec![sf]).map_err(arrow_err)
             })
             .transpose()?;
-        Ok(Self { idx, conv, best: Winners::new(), batches: Vec::new(), masks: Vec::new(), bytes: 0, reservation })
+        Ok(Self { idx, conv, best: Winners::new(), batches: Vec::new(), masks: Vec::new(), bytes: 0, reservation, compact_floor: 0 })
+    }
+
+    /// Collapse the retained buffer to the rows that are CURRENT winners.
+    ///
+    /// **Sound only while the whole scan is one open run** — i.e. unbounded
+    /// keep-greatest, where `close_run` has not fired and every `masks` entry is
+    /// still false. Under that condition a retained row is either the live
+    /// winner for its key, or a version some strictly greater tiebreak already
+    /// beat; a beaten version can never be emitted, so dropping it changes no
+    /// answer. Bounded mode must NOT call this: its masks carry closed-run
+    /// winners that have not been emitted yet, and this would discard them.
+    ///
+    /// This is what bounds unordered dedup by DISTINCT KEYS instead of by rows.
+    /// `push` already releases the PREFIX of batches ahead of the earliest live
+    /// candidate (`min_batch` + `emit_prefix`), which is why a few keys updated
+    /// together cost nothing. What it cannot release is a batch holding one
+    /// live winner among many dead rows, or any batch after an early-pinned
+    /// key: one long-lived candidate in batch 0 pins the prefix at 0 and every
+    /// batch behind it is retained whole. With millions of distinct keys that
+    /// is the normal case, so the retained buffer grows with VERSIONS while the
+    /// answer grows with keys — the 2 GiB ceiling in `check_unbounded_growth`
+    /// is reached by the duplicates, not by the answer. That is p1's 30d
+    /// `log_list` failing while p4 answers the identical shape, and it is why
+    /// the variable is duplicate density rather than window width
+    /// (2026-08-24).
+    fn compact_to_winners(&mut self) -> DFResult<()> {
+        if self.batches.is_empty() {
+            return Ok(());
+        }
+        let mut keep: Vec<Vec<bool>> = self.batches.iter().map(|b| vec![false; b.num_rows()]).collect();
+        self.best.cands_mut(|cand| keep[cand.batch as usize][cand.row as usize] = true);
+
+        let old = std::mem::take(&mut self.batches);
+        let dropped: usize = old.iter().map(RecordBatch::num_rows).sum::<usize>() - keep.iter().flatten().filter(|k| **k).count();
+        // Old (batch, row) → new (batch, row), for every row of every old batch.
+        // Dropped rows are never looked up: only live winners are re-pointed.
+        let mut moved: Vec<Vec<(u32, u32)>> = Vec::with_capacity(old.len());
+        let mut kept_bytes = 0usize;
+        for (batch, mask) in old.into_iter().zip(&keep) {
+            let mut rows = vec![(u32::MAX, u32::MAX); mask.len()];
+            if !mask.iter().any(|k| *k) {
+                moved.push(rows);
+                continue;
+            }
+            let bi = self.batches.len() as u32;
+            let mut next = 0u32;
+            for (row, keep_row) in mask.iter().enumerate() {
+                if *keep_row {
+                    rows[row] = (bi, next);
+                    next += 1;
+                }
+            }
+            // `compact_batch` after the filter, not just the filter: Arrow's
+            // filter over a view array produces new views over the ORIGINAL
+            // buffers, so without this the parquet column-chunk blocks stay
+            // alive and the compaction frees nothing (the same hazard the
+            // buffering path above already pays for).
+            let compacted = crate::write::mem_buffer::compact_batch(filter_record_batch(&batch, &BooleanArray::from(mask.clone())).map_err(arrow_err)?);
+            kept_bytes += compacted.get_array_memory_size();
+            self.batches.push(compacted);
+            moved.push(rows);
+        }
+        self.best.cands_mut(|cand| {
+            let (batch, row) = moved[cand.batch as usize][cand.row as usize];
+            cand.batch = batch;
+            cand.row = row;
+        });
+        self.masks = self.batches.iter().map(|b| vec![false; b.num_rows()]).collect();
+        // The pool must see the drop, or the reservation outlives the memory it
+        // stands for and the next query inherits a buffer that is not there.
+        match kept_bytes.cmp(&self.bytes) {
+            std::cmp::Ordering::Less => self.reservation.shrink(self.bytes - kept_bytes),
+            std::cmp::Ordering::Greater => self.reservation.try_grow(kept_bytes - self.bytes)?,
+            std::cmp::Ordering::Equal => {}
+        }
+        self.bytes = kept_bytes;
+        metrics::counter!(crate::database::scan_metric_names::DEDUP_WINNER_COMPACTIONS_TOTAL).increment(1);
+        metrics::counter!(crate::database::scan_metric_names::DEDUP_WINNER_COMPACTION_ROWS_DROPPED).increment(dropped as u64);
+        Ok(())
     }
 
     fn tiebreak_rows<'a>(&self, column: &'a ArrayRef) -> DFResult<TiebreakRows<'a>> {
@@ -975,6 +1065,11 @@ impl Dedup {
         if self.bound.is_some() && g.bytes > RUN_BUFFER_MAX_BYTES {
             g.close_run(&mut self.seen, true);
             out.extend(g.emit_prefix(g.batches.len(), proj)?);
+        } else if self.bound.is_none() && g.bytes > g.compact_floor.max(RUN_BUFFER_MAX_BYTES) {
+            // Unbounded cannot emit early — a later batch may still beat any
+            // key — but it CAN stop holding rows that are already beaten.
+            g.compact_to_winners()?;
+            g.compact_floor = g.bytes.saturating_mul(2);
         }
         let tbs = g.tiebreak_rows(batch.column(g.idx))?;
         let bvals = match self.bound.as_ref() {
@@ -1715,6 +1810,141 @@ mod tests {
         assert_eq!(g.best.len(), 2, "only the open run's keys are held");
         assert_eq!(g.batches.len(), 1, "only the open run's batches are held");
         assert!(d.seen.is_empty(), "seen only holds overflow-flushed keys");
+    }
+
+    /// One `vbatch` as a case-table row: ids, timestamps, tiebreak stamps.
+    type BatchSpec<'a> = (&'a [&'a str], &'a [i64], &'a [Option<i64>]);
+
+    /// An UNBOUNDED keep-greatest state (`bound: None`) — the merge-on-read
+    /// shape that buffers to end-of-stream and owns the 2 GiB ceiling.
+    fn unbounded_dedup() -> Dedup {
+        let in_schema = vbatch(&["a"], &[0], &[Some(0)]).schema();
+        Dedup {
+            key_idxs: vec![1, 0],
+            conv: RowConverter::new(vec![SortField::new(DataType::Int64), SortField::new(DataType::Utf8)]).unwrap(),
+            output_projection: None,
+            seen: SeenSet::default(),
+            bound: None,
+            direct_string_key: None,
+            greatest: Some(
+                Greatest::new(2, in_schema.field(2).data_type(), MemoryConsumer::new("test").register(&Arc::new(TaskContext::default()).memory_pool().clone()))
+                    .unwrap(),
+            ),
+        }
+    }
+
+    fn rows_of(batches: &[RecordBatch]) -> Vec<(String, i64, Option<i64>)> {
+        let mut out: Vec<_> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                let ts = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let tb = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..b.num_rows()).map(|i| (ids.value(i).to_string(), ts.value(i), tb.is_valid(i).then(|| tb.value(i)))).collect::<Vec<_>>()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Push `batches`, optionally collapsing the retained buffer after each one,
+    /// and return the deduped answer. `compact_every` forces the path that
+    /// `RUN_BUFFER_MAX_BYTES` would otherwise only reach at 64 MB.
+    fn run_unbounded(batches: &[RecordBatch], compact_every: bool) -> Vec<(String, i64, Option<i64>)> {
+        let mut d = unbounded_dedup();
+        let mut out = Vec::new();
+        for b in batches {
+            out.extend(d.push(b).unwrap());
+            if compact_every {
+                d.greatest.as_mut().unwrap().compact_to_winners().unwrap();
+            }
+        }
+        out.extend(d.finish().unwrap());
+        rows_of(&out)
+    }
+
+    /// THE correctness assertion for winner-row compaction: collapsing the
+    /// retained buffer must not change a single answer, and in particular a key
+    /// whose newest version arrives in a LATER batch must still be replaceable
+    /// after its earlier version survived a compaction.
+    ///
+    /// Each case is an arrival order over the same logical rows. `b`'s newest
+    /// version arrives first, `a`'s arrives last, and `c` carries the NULL stamp
+    /// (a legacy row written before the version column existed) that must lose
+    /// to any stamped version regardless of where the compaction falls.
+    #[test_case::test_case(&[(&["a", "b"], &[10, 20], &[Some(1), Some(9)]), (&["b", "a"], &[20, 10], &[Some(2), Some(7)])] ; "update arrives in a later batch")]
+    #[test_case::test_case(&[(&["a"], &[10], &[Some(7)]), (&["a"], &[10], &[Some(1)])] ; "the winner arrives FIRST and later versions lose")]
+    #[test_case::test_case(&[(&["c"], &[30], &[None]), (&["c"], &[30], &[Some(4)])] ; "a NULL stamp loses across a compaction")]
+    #[test_case::test_case(&[(&["c"], &[30], &[Some(4)]), (&["c"], &[30], &[None])] ; "and in the other arrival order")]
+    #[test_case::test_case(&[(&["a", "a", "a"], &[10, 10, 10], &[Some(1), Some(3), Some(2)]), (&["a"], &[10], &[Some(9)]), (&["b"], &[20], &[Some(1)])] ; "many versions in one batch, then a later winner")]
+    #[test_case::test_case(&[(&["a"], &[10], &[Some(1)]), (&["b"], &[20], &[Some(1)]), (&["a"], &[10], &[Some(2)]), (&["b"], &[20], &[Some(2)])] ; "two keys updated alternately")]
+    // A TIE across the compaction. `beats` is strict, so the equal challenger is
+    // never applied and the incumbent's row is the only one retained. The two
+    // versions are indistinguishable in every observable column, so what this
+    // pins is that a tie at the boundary loses no key and emits no duplicate —
+    // not which of the two identical rows survived.
+    #[test_case::test_case(&[(&["a"], &[10], &[Some(5)]), (&["a"], &[10], &[Some(5)])] ; "an equal stamp does not unseat the incumbent")]
+    fn a_winner_compaction_changes_no_answer(spec: &[BatchSpec<'_>]) {
+        let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
+        assert_eq!(
+            run_unbounded(&batches, true),
+            run_unbounded(&batches, false),
+            "compacting the retained buffer to current winners changed the answer"
+        );
+    }
+
+    /// And the reason to do it — reproduced as the shape prod actually has, not
+    /// as a few keys updated together.
+    ///
+    /// `p` is a key whose winner lands in batch 0 and is never beaten. That
+    /// PINS the prefix at 0, so `push`'s own `min_batch`/`emit_prefix` release
+    /// can never fire, and every later batch is retained whole including its
+    /// dead versions. With millions of distinct keys over a 30-day window some
+    /// key always plays `p`'s part, which is why the release that works in the
+    /// unit tests above does nothing on the query that fails.
+    #[test]
+    fn a_winner_compaction_retains_one_row_per_key_not_per_version() {
+        let mut d = unbounded_dedup();
+        d.push(&vbatch(&["p"], &[1], &[Some(1)])).unwrap();
+        // 40 further keys, each arriving as three versions inside one batch.
+        for i in 0..40i64 {
+            let id = format!("k{i}");
+            d.push(&vbatch(&[&id, &id, &id], &[10 + i, 10 + i, 10 + i], &[Some(1), Some(3), Some(2)])).unwrap();
+        }
+        let g = d.greatest.as_mut().unwrap();
+        let before: usize = g.batches.iter().map(RecordBatch::num_rows).sum();
+        let bytes_before = g.bytes;
+        assert_eq!(before, 121, "a pinned early candidate keeps every version buffered");
+
+        g.compact_to_winners().unwrap();
+        let after: usize = g.batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(after, 41, "one row per live key survives, got {after}");
+        assert!(g.bytes < bytes_before, "the pool reservation must fall with the rows ({bytes_before} -> {})", g.bytes);
+
+        // The surviving row per key is the WINNER (tb=3), not the first-arrived
+        // (tb=1) — this is the assertion a bad remap fails.
+        let out = rows_of(&d.finish().unwrap());
+        assert_eq!(out.len(), 41);
+        assert!(out.iter().all(|(id, _, tb)| id == "p" || *tb == Some(3)), "a compaction re-pointed a candidate at the wrong row: {out:?}");
+    }
+
+    /// A compaction that leaves a batch with no winners must drop the batch and
+    /// re-point every surviving candidate. Dropping a batch shifts every later
+    /// batch's index, so this is where an off-by-one shows up as a wrong row
+    /// rather than as a panic. `p` pins the prefix so `push` does not release
+    /// the emptied batch on its own.
+    #[test]
+    fn a_compaction_that_empties_a_batch_repoints_the_survivors() {
+        let mut d = unbounded_dedup();
+        d.push(&vbatch(&["p"], &[1], &[Some(1)])).unwrap();
+        d.push(&vbatch(&["a"], &[10], &[Some(1)])).unwrap();
+        // Beats `a`, so the middle batch loses its only winner and must go.
+        d.push(&vbatch(&["a"], &[10], &[Some(5)])).unwrap();
+        let g = d.greatest.as_mut().unwrap();
+        assert_eq!(g.batches.len(), 3);
+        g.compact_to_winners().unwrap();
+        assert_eq!(g.batches.len(), 2, "the batch whose only winner was beaten is dropped");
+        assert_eq!(rows_of(&d.finish().unwrap()), vec![("a".into(), 10, Some(5)), ("p".into(), 1, Some(1))]);
     }
 }
 

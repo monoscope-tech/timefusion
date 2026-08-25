@@ -613,18 +613,52 @@ pub struct TaskJournal {
 pub struct TaskLease {
     journal: Arc<Mutex<TaskJournal>>,
     key: TaskKey,
+    started_micros: i64,
 }
 
 impl TaskLease {
     pub fn new(journal: Arc<Mutex<TaskJournal>>, key: TaskKey) -> Self {
-        Self { journal, key }
+        Self { journal, key, started_micros: crate::support::now_micros() }
     }
 }
 
 impl Drop for TaskLease {
     fn drop(&mut self) {
         let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if journal.state(&self.key) == Some(TaskState::Running) {
+        // The ONLY place a unit's end is observable on every path. Prod
+        // 2026-08-24, one container's whole 62-minute life: 244
+        // `maintenance_task_started` and ZERO completion lines of any kind —
+        // because none existed. `TaskJournal::complete` and `publish` set the
+        // state and log nothing, so a log-only reading could not tell
+        // "succeeded" from "did nothing" from "died", and the first reading of
+        // it looked like a total stall when it was an absent instrument. That
+        // is the same shape as `retry()` logging nothing, which stalled two
+        // earlier diagnoses.
+        //
+        // Emitted from the lease rather than from `complete()` for two reasons:
+        // the lease is RAII so no exit path can skip it (the run functions
+        // return early in a dozen places), and `complete()` knows neither how
+        // long the unit ran nor that it was the one running it.
+        //
+        // The state read here IS the outcome, because this runs after the run
+        // function has recorded it: `Complete` succeeded, `Retry` is going
+        // round again, `Running` means it died without recording anything and
+        // is about to be abandoned below.
+        let outcome = journal.state(&self.key);
+        let ran_micros = crate::support::now_micros().saturating_sub(self.started_micros);
+        tracing::info!(
+            operation = ?self.key.operation, table = %self.key.physical_table, project_id = %self.key.project_id,
+            slice_start = self.key.slice.start_micros, slice_end = self.key.slice.end_micros,
+            outcome = ?outcome, ran_secs = ran_micros / 1_000_000,
+            // What the unit knows it READ. Not the same as what it changed —
+            // a consolidation that merged 200 files and one that merged none
+            // are still indistinguishable here, and closing that needs the
+            // publish site, not this one. Said plainly so the next reader does
+            // not mistake "completed" for "did something".
+            input_files = journal.input_files(&self.key),
+            event = "maintenance_task_finished"
+        );
+        if outcome == Some(TaskState::Running) {
             journal.abandon_running(&self.key, crate::support::now_micros());
             if let Err(error) = journal.checkpoint() {
                 tracing::error!(error = %error, task = ?self.key, "failed to checkpoint maintenance task lease recovery");
@@ -2428,6 +2462,16 @@ impl TaskJournal {
         self.task_indices.get(key).map(|index| self.snapshot.tasks[*index].state)
     }
 
+    /// Files this unit's footprint says it reads, if it has one yet.
+    ///
+    /// `None` is the common case for a unit that has never been claimed —
+    /// `record_input` writes the footprint at claim time — so a `None` here is
+    /// information, not a gap: it says the scheduler was ordering this unit
+    /// without knowing its debt.
+    pub fn input_files(&self, key: &TaskKey) -> Option<u32> {
+        self.task_indices.get(key).and_then(|index| self.snapshot.tasks[*index].input).map(|input| input.files)
+    }
+
     pub fn rollup_slice_complete(&self, source: &str, project_id: &str, target: &str, slice: TimeSlice) -> bool {
         self.snapshot.tasks.iter().any(|task| {
             task.key.source == source
@@ -3863,6 +3907,34 @@ mod tests {
         drop(journal_guard);
         let loaded = TaskJournal::load(dir.path()).expect("load checkpoint");
         assert_eq!(loaded.state(&key), Some(TaskState::Retry));
+    }
+
+    /// A completed unit must NOT be requeued by its lease, and the lease must
+    /// read the outcome the run function recorded.
+    ///
+    /// This is the invariant behind `maintenance_task_finished`: the event is
+    /// emitted from `Drop`, so it reports whatever `state` says at that moment.
+    /// If the lease could not distinguish Complete from Running, the new event
+    /// would report every successful unit as a death — which is worse than the
+    /// silence it replaces, because it looks like data.
+    #[test]
+    fn a_completed_lease_reports_complete_and_is_not_requeued() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let input = task("p", 0, MIN_SLICE_MICROS, Operation::SealedConsolidation);
+        let key = input.key.clone();
+        journal.upsert(input);
+        assert!(journal.mark_running(&key));
+        assert!(journal.complete(&key));
+        let journal = Arc::new(Mutex::new(journal));
+        drop(TaskLease::new(Arc::clone(&journal), key.clone()));
+
+        let guard = journal.lock().expect("lock");
+        assert_eq!(guard.state(&key), Some(TaskState::Complete), "a completed unit must survive its own lease drop");
+        // And the debt field the event carries is absent on a unit that was
+        // never preflighted — which is the state every unclaimed hygiene cell
+        // is in, and the reason `benefit` ordering cannot see their debt.
+        assert_eq!(guard.input_files(&key), None);
     }
 
     #[test]

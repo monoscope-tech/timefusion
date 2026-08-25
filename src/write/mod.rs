@@ -272,12 +272,18 @@ fn deferred_tantivy_path(config: &AppConfig) -> std::path::PathBuf {
     config.core.timefusion_data_dir.join("tantivy-recovery-pending.json")
 }
 
+/// Called under `deferred_tantivy_files`'s `std::sync::Mutex` once per file
+/// deferred and once per file completed, from async indexing tasks — so the
+/// write runs off the worker's queue for the same reason the journal fsync
+/// does.
 fn persist_deferred_tantivy_files(path: &std::path::Path, files: &[DeferredTantivyFile]) {
-    let Ok(bytes) = serde_json::to_vec(files) else { return };
-    let tmp = path.with_extension("tmp");
-    if std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("."))).is_ok() && std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(tmp, path);
-    }
+    crate::support::without_blocking_the_worker(|| {
+        let Ok(bytes) = serde_json::to_vec(files) else { return };
+        let tmp = path.with_extension("tmp");
+        if std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("."))).is_ok() && std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(tmp, path);
+        }
+    });
 }
 
 #[derive(Debug, Default)]

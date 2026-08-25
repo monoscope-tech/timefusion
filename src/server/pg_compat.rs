@@ -1070,6 +1070,7 @@ impl StatsTableProvider {
             "rollup_miss_missing_measure_total" => m.rollup_miss_missing_measure,
             "rollup_miss_unaligned_bucket_total" => m.rollup_miss_unaligned_bucket,
             "rollup_miss_unknown_group_by_total" => m.rollup_miss_unknown_group_by,
+            "rollup_miss_unwalkable_source_total" => m.rollup_miss_unwalkable_source,
             "rollup_miss_missing_project_total" => m.rollup_miss_missing_project,
             "rollup_miss_unbounded_time_total" => m.rollup_miss_unbounded_time,
             "rollup_miss_non_decomposable_total" => m.rollup_miss_non_decomposable,
@@ -1123,7 +1124,15 @@ impl StatsTableProvider {
             use crate::database::scan_metric_names::*;
             let cv = crate::observability::counter_value;
             let q = |name: &str, p: f64| crate::observability::histogram_quantile(name, p).unwrap_or(0.0) as u64;
-            let skip_reason = |r: &str| prefilter_skip_metric(r).map_or(0, cv);
+            // `map_or(0, …)` is why the old `no_index_or_cap` row read zero for a
+            // day after the reason was split into four: an unregistered string
+            // is indistinguishable from a counter that never fired. Assert it,
+            // exactly as `record_prefilter_skip` asserts on the emitting side.
+            let skip_reason = |r: &str| {
+                let metric = prefilter_skip_metric(r);
+                debug_assert!(metric.is_some(), "unregistered prefilter skip reason {r:?} — this row would silently read 0");
+                metric.map_or(0, cv)
+            };
             let (total, skipped) = (cv(SCANS_TOTAL), cv(SCANS_SKIPPED_DELTA));
             let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
             let (dedup_elig, dedup_skipped) = (cv(DEDUP_ELIGIBLE_SCANS), cv(DEDUP_SKIPPED));
@@ -1230,7 +1239,17 @@ impl StatsTableProvider {
                     "prefilter_skipped_empty_index" => skip_reason("empty_index"),
                     "prefilter_skipped_low_selectivity" => skip_reason("low_selectivity"),
                     "prefilter_skipped_field_coverage_gap" => skip_reason("field_coverage_gap"),
-                    "prefilter_skipped_no_index_or_cap" => skip_reason("delta_no_index_or_cap_exceeded"),
+                    // The four the 2026-08-23 split created out of one
+                    // `no_index_or_cap` label. This readout kept asking for the
+                    // OLD string, which nothing writes any more, so the row read
+                    // 0 while the four real counters were never exposed at all —
+                    // 103 of 127 skips unattributable on prod 2026-08-24.
+                    // `every_prefilter_skip_reason_is_exposed` now ties the two
+                    // lists together so they cannot drift apart again.
+                    "prefilter_skipped_no_index" => skip_reason("delta_no_index"),
+                    "prefilter_skipped_no_usable_index" => skip_reason("delta_no_usable_index"),
+                    "prefilter_skipped_cap_exceeded_one_index" => skip_reason("delta_cap_exceeded_one_index"),
+                    "prefilter_skipped_cap_exceeded_combined" => skip_reason("delta_cap_exceeded_combined"),
                     "prefilter_skipped_no_hits_returned" => skip_reason("delta_no_hits_returned"),
                     "prefilter_skipped_delta_error" => skip_reason("delta_error"),
                     // Splits `rollup_miss_stale_coverage`, which was the SOLE
@@ -1301,6 +1320,12 @@ impl StatsTableProvider {
                     "dedup_bounded_total" => cv(DEDUP_BOUNDED_TOTAL),
                     "dedup_full_set_total" => cv(DEDUP_FULL_SET_TOTAL),
                     "dedup_full_set_pct" => pct(cv(DEDUP_FULL_SET_TOTAL), cv(DEDUP_BOUNDED_TOTAL) + cv(DEDUP_FULL_SET_TOTAL)),
+                    // rows_dropped ≫ compactions is the merge-on-read duplicate
+                    // density the winner collapse exists for; compactions climbing
+                    // with rows_dropped near zero means the winners themselves fill
+                    // the buffer and the window is the problem, not duplication.
+                    "dedup_winner_compactions_total" => cv(DEDUP_WINNER_COMPACTIONS_TOTAL),
+                    "dedup_winner_compaction_rows_dropped" => cv(DEDUP_WINNER_COMPACTION_ROWS_DROPPED),
                     // Read these BEFORE setting TIMEFUSION_WIDE_SCAN_REFUSE_MB — the
                     // threshold has to sit above p99 or it rejects working dashboards.
                     "wide_scan_selected_mb_p50" => q(WIDE_SCAN_SELECTED_MB, 0.50),
@@ -1652,6 +1677,32 @@ mod stats_table_tests {
         }
     }
 
+    /// Every registered prefilter skip reason must reach `timefusion_stats`.
+    ///
+    /// `every_search_refusal_is_a_registered_prefilter_reason` (database/mod.rs)
+    /// already proves each reason has a METRIC. Nothing proved the metric has a
+    /// ROW, and on 2026-08-23 the `no_index_or_cap` label was split into four
+    /// without the readout following: this section kept asking for the retired
+    /// string, so one row read a constant 0 and the four live counters were
+    /// invisible. Prod 2026-08-24 measured `prefilter_skipped = 127` against
+    /// reason rows summing to 24 — 81% unattributable, while the section's own
+    /// comment claimed the reasons sum to the total.
+    ///
+    /// The `debug_assert` in `skip_reason` covers the dead-string half; this
+    /// covers the missing-row half. Both are needed: a reason can be dropped
+    /// from the readout without any string becoming invalid.
+    #[test]
+    fn every_prefilter_skip_reason_is_exposed() {
+        let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
+        let exposed = rows.iter().filter(|(component, key, _)| component == "scan" && key.starts_with("prefilter_skipped_")).count();
+        assert_eq!(
+            exposed,
+            crate::database::scan_metric_names::PREFILTER_SKIP_REASONS.len(),
+            "{} skip reasons are registered but {exposed} rows are exposed — a reason that has no row cannot be attributed",
+            crate::database::scan_metric_names::PREFILTER_SKIP_REASONS.len()
+        );
+    }
+
     #[test]
     fn exposes_dml_retry_outcomes() {
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
@@ -1675,6 +1726,8 @@ mod stats_table_tests {
             ("scan", "provider_build_us_avg"),
             ("scan", "provider_scan_us_avg"),
             ("scan", "mem_plan_us_avg"),
+            ("scan", "dedup_winner_compactions_total"),
+            ("scan", "dedup_winner_compaction_rows_dropped"),
         ] {
             assert_has(&rows, component, key);
         }
