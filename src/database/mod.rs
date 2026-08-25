@@ -6361,10 +6361,16 @@ pub(crate) struct DedupRangeOptions {
     limits: Option<DedupExecutionLimits>,
 }
 
-#[derive(Clone)]
 struct HotStageOptions {
     pass: TailPass,
     runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    /// A `light_rewrite_sem` permit the CALLER already holds. `None` means
+    /// `stage_hot_bin` blocks for one itself, which is right for the wave
+    /// engine (it spends a tick budget, not a journal claim) and wrong for a
+    /// coordinator unit, whose deadline is already running — see
+    /// `docs/plans/2026-08-25-the-900s-is-a-queue-not-a-rewrite.md`. Ownership
+    /// is moved in so "the caller holds it" cannot be asserted falsely.
+    light_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 struct CompactionDebtFile {
@@ -16256,6 +16262,53 @@ mod tests {
         let ctx1 = Arc::new(db.clone()).create_session_context();
         let ctx2 = Arc::new(db.clone()).create_session_context();
         assert!(Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()), "contexts must share one RuntimeEnv/memory pool");
+        Ok(())
+    }
+
+    /// A packing unit must not CLAIM a slot it has no permit to start.
+    ///
+    /// `light_rewrite_sem` was acquired ~46 lines inside `stage_hot_bin`, long after
+    /// `claim_next` stamped the unit `Running` and started its 900 s deadline. Prod
+    /// 2026-08-25, one 90-minute window: all 46 staged bins reported `permit_wait_ms`
+    /// between 349,962 and 750,561 against `staging_ms` of 254 to 15,303 — the deadline
+    /// was spent in a queue, not on a rewrite — and 38 `SealedConsolidation` plus 53
+    /// `Dedup` units hit their deadline having committed nothing, 50,100 of 86,400
+    /// available worker-seconds. Byte-splitting cannot reach that: splitting a unit
+    /// stuck in a line yields two units in the same line.
+    ///
+    /// So the permit is taken BEFORE the claim, and a turn that cannot get one leaves
+    /// the task untouched for whoever can.
+    /// See `docs/plans/2026-08-25-the-900s-is-a-queue-not-a-rewrite.md`.
+    #[tokio::test]
+    async fn a_packing_unit_never_claims_a_slot_it_cannot_start() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TaskState, TimeSlice};
+        let db = Database::with_config(create_test_config("light-permit-preclaim")).await?;
+        let project = format!("permit_{}", uuid::Uuid::new_v4().simple());
+        let day_start = midnight_micros((Utc::now() - chrono::Duration::days(3)).date_naive());
+        let key = TaskKey {
+            physical_table: "otel_logs_and_spans".to_owned(),
+            source: "otel_logs_and_spans".to_owned(),
+            project_id: project.clone(),
+            slice: TimeSlice::new(day_start, day_start + crate::maintenance_coordinator::DAY_MICROS)?,
+            operation: Operation::SealedConsolidation,
+        };
+        db.maintenance_tasks.lock().unwrap().enqueue(key.clone(), 0, 1024, 0);
+
+        // Every light-rewrite permit taken, exactly as prod's steady state.
+        let held = Arc::clone(&db.light_rewrite_sem).acquire_many_owned(db.light_rewrite_sem.available_permits() as u32).await?;
+
+        let claimed = db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?;
+        let (state, attempts) = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            (journal.state(&key), journal.tasks().find(|task| task.key == key).map(|task| task.attempts))
+        };
+        assert!(!claimed, "a turn with no permit must report no work done, so the cycle moves this worker on");
+        assert_eq!(state, Some(TaskState::Pending), "the unit must stay claimable rather than burn a deadline waiting for a permit");
+        assert_eq!(attempts, Some(0), "queueing is not an attempt — inflating it feeds the unit to abandon_running's bisect and its >=900s floor");
+
+        // And with a permit free, the same turn does claim it.
+        drop(held);
+        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "the refusal must be the permit, not the queue being empty");
         Ok(())
     }
 

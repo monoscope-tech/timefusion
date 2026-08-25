@@ -2384,8 +2384,36 @@ impl Database {
         Ok(selected)
     }
 
-    async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
-        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources, TaskLease, TaskState};
+    pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
+        // The rewrite permit BEFORE the claim, never inside `stage_hot_bin`.
+        //
+        // `light_rewrite_sem` prices ~2 permits on the prod box and is ~100%
+        // saturated; blocking on it after `claim_next` has stamped the unit
+        // Running spends the unit's whole deadline in a queue. Prod 2026-08-25,
+        // 90 minutes: 46/46 staged bins waited 350-750s for 0.25-15s of work,
+        // and 38 SealedConsolidation units plus 53 Dedup units hit their
+        // deadline having committed nothing — 50,100 of 86,400 worker-seconds.
+        //
+        // Refusing to claim is work-conserving in exactly the way the debt-slot
+        // and derived-reserve caps twenty lines above already are: the cycle
+        // moves this worker to rollup or dedup instead. It also keeps `attempts`
+        // off a unit whose only fault was queueing, which today feeds it to
+        // `abandon_running`'s bisect and its >=900s backoff floor.
+        //
+        // Repair is exempt and unchanged: 41 of its 42 units in that window ran
+        // 0s, returning at `repair_bin_already_sorted`/`take(1)` without ever
+        // reaching `stage_hot_bin`, so gating it would invent a starvation.
+        let light_permit = match operation {
+            Operation::HotPacking | Operation::SealedConsolidation => match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(false);
+                }
+            },
+            _ => None,
+        };
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
         let key = task.key.clone();
         self.log_task_started(&task);
@@ -2437,7 +2465,8 @@ impl Database {
         };
         let pass = if operation == crate::maintenance_coordinator::Operation::Repair { TailPass::Repair } else { TailPass::Pack };
         let runtime = self.coordinator_runtime_env();
-        let outcome = self.stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime) }).await;
+        let outcome =
+            self.stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit }).await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
                 let date = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()).unwrap_or_default();
@@ -5179,7 +5208,7 @@ impl Database {
         let planned = self.plan_tail_pass(table_ref, table_name, &today.to_string(), &policy).await?;
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
-        match self.stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None }).await? {
+        match self.stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None }).await? {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
             _ => Ok(None),
         }
@@ -5435,7 +5464,7 @@ impl Database {
                     let _in_flight = (pass == TailPass::Repair).then(|| in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(
                         left,
-                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None }),
+                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None, light_permit: None }),
                     )
                     .await
                     {
@@ -5509,7 +5538,7 @@ impl Database {
         options: HotStageOptions,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
-        let HotStageOptions { pass, runtime_env } = options;
+        let HotStageOptions { pass, runtime_env, light_permit } = options;
         // One read-lock, one table clone per bin: the pinned scan snapshot and
         // the writer's staging table both derive from it (a second clone per
         // bin was pure waste — K bins x up to 12 waves per tick).
@@ -5549,8 +5578,16 @@ impl Database {
         // hot-compact starvation) and burn the tick deadline waiting. Wave
         // staging is already bounded by K and sized by the light pool slice, so
         // this permit is a ceiling + the instrumented wait point below.
+        //
+        // A caller that already holds one waits for nothing here, which is the
+        // whole point: measured on prod 2026-08-25, every one of 46 staged bins
+        // spent 350-750s blocked on this line to do 0.25-15s of work, and the
+        // coordinator's 900s deadline was running the entire time.
         let permit_wait = std::time::Instant::now();
-        let _light_permit = self.light_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("light rewrite semaphore closed: {e}"))?;
+        let _light_permit = match light_permit {
+            Some(permit) => permit,
+            None => Arc::clone(&self.light_rewrite_sem).acquire_owned().await.map_err(|e| anyhow::anyhow!("light rewrite semaphore closed: {e}"))?,
+        };
         let permit_wait_ms = permit_wait.elapsed().as_millis() as u64;
         let stage_started = std::time::Instant::now();
         // Bytes read into this rewrite — free here (the Adds are already mapped)
