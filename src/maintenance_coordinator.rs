@@ -2645,6 +2645,7 @@ impl TaskJournal {
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
         let mut oldest_created = u64::MAX;
+        let mut beyond_horizon = 0u64;
         let mut latest_frontier_rollup: HashMap<(&str, &str, &str), &MaintenanceTask> = HashMap::new();
         let mut per_operation = [0u64; 6];
         let (mut eligible_base_rollup, mut eligible_sealed) = (0u64, 0u64);
@@ -2660,7 +2661,27 @@ impl TaskJournal {
             counts[index] = counts[index].saturating_add(1);
             if !matches!(task.state, TaskState::Complete | TaskState::Superseded) {
                 backlog_bytes = backlog_bytes.saturating_add(task.estimated_decoded_bytes);
-                oldest_created = oldest_created.min(task.created_unix_ms);
+                // Only work the scheduler still intends to do. Past
+                // `STARVATION_HORIZON_MICROS` a task is deliberately abandoned
+                // (see the constant), and an age gauge that counts abandoned
+                // work is pinned red: prod read 83 days on 2026-08-23 and 85.6 on
+                // 08-25, which is the seal time of one 2026-05-31 hygiene
+                // partition and says nothing about queue health inside the goal
+                // window.
+                //
+                // Aged from `created_unix_ms`, which for an invalidation-minted
+                // task is `observed_at` and can precede the slice end — so the
+                // gauge is bounded by the horizon plus one slice width, not by
+                // the horizon exactly.
+                //
+                // Counted instead, so the abandonment is sized rather than
+                // hidden — a definition change that only made a number smaller
+                // would be indistinguishable from the fix working.
+                if now_micros.saturating_sub(task.key.slice.end_micros) > STARVATION_HORIZON_MICROS {
+                    beyond_horizon = beyond_horizon.saturating_add(1);
+                } else {
+                    oldest_created = oldest_created.min(task.created_unix_ms);
+                }
                 if task.key.operation == Operation::SealedConsolidation {
                     sealed_debt_bytes = sealed_debt_bytes.saturating_add(task.estimated_decoded_bytes);
                 }
@@ -2713,6 +2734,7 @@ impl TaskJournal {
         let now = u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default();
         let oldest_age_secs = if oldest_created != u64::MAX { now.saturating_sub(oldest_created) / 1_000 } else { 0 };
         stats.maintenance_oldest_task_age_secs.store(oldest_age_secs, Relaxed);
+        stats.maintenance_beyond_horizon_tasks.store(beyond_horizon, Relaxed);
     }
 }
 
@@ -2816,8 +2838,21 @@ const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 /// debt to find; without a bound tied to the goal, oldest-first spends the whole
 /// escalation there and the days a 30d query actually needs wait behind it.
 ///
-/// Outside the window a partition still gets served by ordinary newest-first
-/// ordering. It is deprioritised, not abandoned.
+/// Outside the window a partition is ABANDONED, and that is the intent — the
+/// earlier claim here that it "is deprioritised, not abandoned" was wrong.
+/// Nominally it still ranks by newest-first inside its class, but that class is
+/// replenished continuously by ingest and by the 60 s hygiene planner, so a
+/// beyond-horizon task is reachable only when the 3-31 day band is empty of
+/// eligible work of its operation. It never is: `pending_sealed_consolidation`
+/// walked 76 -> 99 across 2026-08-25 while `out_of_policy_cells` held at 51 for
+/// thirteen consecutive censuses.
+///
+/// Prod paid for that phrasing. `oldest_task_age_seconds` read 83 days on
+/// 2026-08-23 and 85.6 on 2026-08-25 — the seal time of ONE 2026-05-31 hygiene
+/// partition — and was read as a scheduling stall rather than as this
+/// deliberate policy. `publish_statistics` now counts
+/// beyond-horizon work separately for exactly that reason. See
+/// `docs/plans/2026-08-25-oldest-task-tail.md`.
 const STARVATION_HORIZON_MICROS: i64 = 31 * 24 * 60 * 60 * 1_000_000;
 
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
@@ -3701,6 +3736,44 @@ mod tests {
         assert_eq!(stats.pending_repair.load(Relaxed), 1);
         assert_eq!(stats.eligible_base_rollup.load(Relaxed), 1, "only the due rollup is claimable now — this is the distinction tasks_pending cannot make");
         assert_eq!(stats.eligible_sealed_total.load(Relaxed), 2, "both due sealed tasks (rollup + repair) are claimable");
+    }
+
+    /// `oldest_task_age` reports work the scheduler intends to do; abandoned
+    /// work is COUNTED, not aged.
+    ///
+    /// Prod read 85.6 days for months. That was the seal time of one 2026-05-31
+    /// hygiene partition — `plan_compaction_debt` stamps sealed units with their
+    /// slice end — and past `STARVATION_HORIZON_MICROS` such a unit is
+    /// deliberately never scheduled. An age gauge dominated by abandoned work is
+    /// pinned red and reports nothing about the goal window.
+    ///
+    /// Both halves are asserted together on purpose: narrowing the age alone
+    /// would look identical to hiding the debt.
+    #[test]
+    fn the_age_gauge_skips_abandoned_work_and_counts_it_instead() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const DAY: i64 = 24 * 60 * 60 * 1_000_000;
+        let now = crate::support::now_micros();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let key = |start: i64| TaskKey {
+            physical_table: "t".into(),
+            source: "t".into(),
+            project_id: "p".into(),
+            slice: TimeSlice::new(start, start + DAY).expect("slice"),
+            operation: Operation::SealedConsolidation,
+        };
+        let stamp = |micros: i64| u64::try_from(micros.div_euclid(1_000)).unwrap_or_default();
+        // The prod shape: a hygiene unit aged from a seal time 85 days back...
+        journal.enqueue(key(now - 86 * DAY), now, 1, stamp(now - 85 * DAY));
+        // ...beside one inside the window, five days old.
+        journal.enqueue(key(now - 6 * DAY), now, 1, stamp(now - 5 * DAY));
+        journal.publish_statistics();
+
+        let stats = crate::observability::maintenance_stats();
+        assert_eq!(stats.maintenance_beyond_horizon_tasks.load(Relaxed), 1, "the abandoned unit must be sized, not silently dropped");
+        let age_days = stats.maintenance_oldest_task_age_secs.load(Relaxed) / 86_400;
+        assert_eq!(age_days, 5, "the gauge must report the oldest unit the scheduler will still escalate, not the 85-day tail");
     }
 
     /// The coarse-backfill migration must be narrow: fine sealed backfill goes,
