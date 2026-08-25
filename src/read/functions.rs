@@ -77,7 +77,7 @@ impl TypePlanner for PostgresTypePlanner {
 #[derive(Debug, Default)]
 pub struct VariantAwareExprPlanner;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum PathComponent {
     Field(String),
     Index(i64),
@@ -143,6 +143,19 @@ fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
 }
 
 fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
+    // `::` binds tighter than `->>`, so monoscope's `attributes->>'route'::text`
+    // parses as `attributes ->> CAST('route' AS text)` — the cast lands on the
+    // PATH, not the extracted value. Matching only a bare literal made this
+    // return `None`, `VariantAwareExprPlanner` fall through to
+    // datafusion-functions-json, and the query fail to PLAN against a Variant
+    // column: "Unexpected argument type to 'json_as_text' … got Struct([metadata,
+    // value])". Prod 2026-08-25: 17 of those in 90 minutes, one per chart load —
+    // the panel errors outright rather than rendering slowly. A cast around a
+    // path literal cannot change which field is addressed, so unwrap it.
+    let expr = match expr {
+        Expr::Cast(cast) => cast.expr.as_ref(),
+        expr => expr,
+    };
     let Expr::Literal(v, _) = expr else { return None };
     extract_utf8_string(v).map(PathComponent::Field).or_else(|| {
         Some(PathComponent::Index(match v {
@@ -1923,6 +1936,22 @@ fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &sql_json_path:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `::` binds tighter than `->>`, so monoscope emits a cast on the PATH.
+    /// Both spellings address the same field and must plan to the same
+    /// `variant_get`; before the cast was unwrapped the second one did not
+    /// plan at all against a Variant column.
+    #[test_case::test_case(false ; "bare path literal")]
+    #[test_case::test_case(true ; "cast path literal, the shape monoscope emits")]
+    fn an_arrow_path_literal_addresses_the_same_field_through_a_cast(cast: bool) {
+        let literal = datafusion::prelude::lit("route");
+        let expr = if cast { Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(literal), arrow::datatypes::DataType::Utf8)) } else { literal };
+        assert_eq!(
+            extract_path_component(&expr),
+            Some(PathComponent::Field("route".to_string())),
+            "a cast around a path literal cannot change which field is addressed"
+        );
+    }
 
     #[test]
     fn percentile_agg_state_is_bounded() {
