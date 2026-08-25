@@ -534,7 +534,9 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         (None, every) if every > 0 => start_micros + every,
         _ => i64::MAX,
     };
-    let tick = (cfg.horizon_micros / 48).max(3_600 * MICROS);
+    // 48 samples over the horizon, floored at five minutes: a 6-hour run
+    // needs a trajectory, not six points.
+    let tick = (cfg.horizon_micros / 48).max(300 * MICROS);
     let mut next_tick = start_micros + tick;
     let mut next_coarsen = start_micros + COARSEN_INTERVAL_MICROS;
     let mut report_coarsen = crate::maintenance_coordinator::CoarsenReport::default();
@@ -798,6 +800,81 @@ fn frontier_lag_secs(journal: &TaskJournal, now_micros: i64) -> u64 {
         .unwrap_or_default()
 }
 
+/// A synthetic queue with the shape the 2026-08-22 shred happened in, built
+/// through the `TaskJournal` API — never a hand-written `maintenance_tasks.json`,
+/// whose on-disk form is an internal serde detail that would rot silently.
+pub struct SynthQueue {
+    pub journal: TaskJournal,
+    pub model: ByteModel,
+    /// The cell that shredded: one day-wide unit over a day of ~100x
+    /// `MAX_DECODED_BYTES`.
+    pub whale_cell: String,
+    /// A lineage carrying `retry_or_split`'s synthetic `MAX_DECODED_BYTES + 1`
+    /// stamp, which is a "does not fit" signal and not a measurement.
+    pub stamped_cell: String,
+    /// Keeps the journal's directory alive for the caller's run.
+    pub dir: tempfile::TempDir,
+}
+
+/// Skewed cell sizes, many cells, and pre-existing shred debris — the three
+/// properties a uniform queue cannot reproduce. Everything starts with
+/// `parent_measured_bytes: None` except the deliberately stamped lineage, so
+/// the first split of each lineage is unconditional and the guard engages only
+/// from the second level down, which is the real sequence.
+pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64) -> SynthQueue {
+    let dir = tempfile::tempdir().expect("sim fixture tempdir");
+    let mut journal = TaskJournal::load(dir.path()).expect("sim fixture journal");
+    let mut model = ByteModel { floored, ..Default::default() };
+    let day = |back: i64| (start_micros.div_euclid(DAY_MICROS) - back) * DAY_MICROS;
+    let cell = |journal: &mut TaskJournal, model: &mut ByteModel, project: &str, back: i64, decoded_bytes: u64| {
+        let day_start = day(back);
+        model.insert(project, day_start, decoded_bytes);
+        let key = rollup_key(project, day_start, DAY_MICROS);
+        journal.enqueue(key.clone(), start_micros, decoded_bytes, 0);
+        cell_of(&key)
+    };
+
+    let whale_cell = cell(&mut journal, &mut model, "whale", 1, whale_x_max * MAX_DECODED_BYTES);
+    cell(&mut journal, &mut model, "mid", 1, 5 * MAX_DECODED_BYTES);
+    let stamped_cell = cell(&mut journal, &mut model, "stamped", 1, 10 * MAX_DECODED_BYTES);
+    // The `retry_or_split` stamp, applied after enqueue so the unit is
+    // otherwise ordinary.
+    let stamped_key = rollup_key("stamped", day(1), DAY_MICROS);
+    let mut stamped = journal.tasks().find(|task| task.key == stamped_key).cloned().expect("stamped unit");
+    stamped.parent_measured_bytes = Some(MAX_DECODED_BYTES + 1);
+    journal.upsert(stamped);
+
+    // The long tail: 70 projects x 3 sealed days, each a day that fits in one
+    // unit. 210 more cells, so `claim_next`'s ordering, the debt cap and
+    // coarsening all operate at a scale where they interact.
+    for project in 0u64..70 {
+        for back in 1..=3 {
+            cell(&mut journal, &mut model, &format!("tail-{project:02}"), back, 60_000_000 + project * 2_000_000);
+        }
+    }
+
+    // Pre-existing shred debris: 600 one-minute units on ONE partition, no
+    // `InputFootprint` and each claiming 4,466,185,462 bytes — prod project
+    // 87576849's consecutive minutes, over a partition of 35 files / 0.36 GB.
+    // Fusion can only rescue them once the partition ceiling is known.
+    let debris_day = day(2);
+    model.insert("debris", debris_day, 360_000_000);
+    for minute in 0..600 {
+        journal.enqueue(rollup_key("debris", debris_day + minute * MIN_SLICE_MICROS, MIN_SLICE_MICROS), start_micros, 4_466_185_462, 0);
+    }
+    SynthQueue { journal, model, whale_cell, stamped_cell, dir }
+}
+
+fn rollup_key(project_id: &str, start_micros: i64, width_micros: i64) -> TaskKey {
+    TaskKey {
+        physical_table: "otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(),
+        source: "otel_logs_and_spans".to_owned(),
+        project_id: project_id.to_owned(),
+        slice: crate::maintenance_coordinator::TimeSlice::new(start_micros, start_micros + width_micros).expect("fixture slice"),
+        operation: Operation::BaseRollup,
+    }
+}
+
 /// Load a journal from a copied-out prod file or data dir WITHOUT ever being
 /// able to write back to the source: the inputs are copied into a tempdir and
 /// the journal is loaded from there. Returns the journal and the tempdir
@@ -974,6 +1051,174 @@ mod tests {
             calm.pending_end,
             churning.pending_end
         );
+    }
+
+    /// The §3c run: `synth:whale`, 6 virtual hours, 16 workers, no minting —
+    /// the queue under study is the fixture, not the frontier.
+    fn synth_run(floored: bool, guard: SplitGuard) -> (SimReport, String, String) {
+        synth_run_at(floored, guard, 100)
+    }
+
+    fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64) -> (SimReport, String, String) {
+        let start = 100 * DAY_MICROS;
+        let queue = synthetic_whale_queue(start, floored, whale_x_max);
+        let cfg = SimConfig {
+            mint_frontier: false,
+            workers: 16,
+            horizon_micros: 6 * HOUR,
+            byte_model: Some(queue.model),
+            split_guard: guard,
+            ..Default::default()
+        };
+        let report = run(queue.journal, &cfg, start).unwrap();
+        (report, queue.whale_cell, queue.stamped_cell)
+    }
+
+    fn cell_units(report: &SimReport, cell: &str) -> usize {
+        report.units_per_cell.get(cell).copied().unwrap_or_default()
+    }
+
+    /// Walk the whale lineage one preflight at a time, printing what each level
+    /// measured against what its parent measured.
+    #[test]
+    fn whale_lineage_trace() {
+        let start = 100 * DAY_MICROS;
+        let queue = synthetic_whale_queue(start, true, 100);
+        let (mut journal, model) = (queue.journal, queue.model);
+        let mut report = SimReport::default();
+        for level in 0..6 {
+            let Some(task) = journal
+                .tasks()
+                .filter(|task| task.key.project_id == "whale" && task.state == TaskState::Pending)
+                .min_by_key(|task| task.key.slice.width())
+                .cloned()
+            else {
+                break;
+            };
+            let width = task.key.slice.width();
+            let observed = model.bytes(&task.key);
+            let before = report.byte_splits;
+            let split = preflight(&mut journal, &model, SplitGuard::Shipped, &task, &mut report).is_none();
+            println!(
+                "level {level}: width={:>6}s observed={:>6}MB parent_stamp={:>8} split={split} declined={} children_now={}",
+                width / MICROS,
+                observed / 1_000_000,
+                task.parent_measured_bytes.map_or("none".to_owned(), |bytes| format!("{}MB", bytes / 1_000_000)),
+                report.split_declined_at_floor,
+                journal.tasks().filter(|t| t.key.project_id == "whale" && t.state == TaskState::Pending).count(),
+            );
+            assert!(report.byte_splits >= before);
+        }
+    }
+
+    /// §3c.1 — the gate. With the floor modelled and the guard defeated, the
+    /// whale cell shreds to the one-minute floor exactly as prod did.
+    #[test]
+    fn a_floored_whale_shreds_to_the_minute_without_the_guard() {
+        let (report, whale, _) = synth_run(true, SplitGuard::Off);
+        assert!(cell_units(&report, &whale) > 1_000, "the shred must reproduce: {} units", cell_units(&report, &whale));
+        assert!(report.units_at_min_slice >= 1_000, "and it must reach MIN_SLICE_MICROS: {}", report.units_at_min_slice);
+    }
+
+    /// §3c.2 — the control. Bytes strictly proportional to width is the model
+    /// `byte_bounded_units` assumes; under it the same queue never approaches
+    /// the floor, with the guard on OR off. So the shred above is caused by the
+    /// floor, not by the scheduler.
+    #[test]
+    fn a_floorless_whale_never_reaches_the_floor() {
+        for guard in [SplitGuard::Off, SplitGuard::Shipped] {
+            let (report, whale, _) = synth_run(false, guard);
+            // 129 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves
+            // and bisection only makes powers of two. The discriminating
+            // property is that NOTHING reaches MIN_SLICE_MICROS.
+            assert!(cell_units(&report, &whale) < 200, "{guard:?}: {} units", cell_units(&report, &whale));
+            assert_eq!(report.units_at_min_slice, 0, "{guard:?}: nothing may reach the floor");
+        }
+    }
+
+    /// §3c.3/4 — **the fix does not hold on this queue, and this test pins
+    /// that.**
+    ///
+    /// `69e6503` compares a unit's measurement against `parent_measured_bytes`,
+    /// but `byte_bounded_units` descends MANY levels inside ONE call, stamping
+    /// every descendant with the same number. The whale's ladder is therefore
+    /// only two journal levels deep — day (82,867 MB, no stamp, splits
+    /// unconditionally into 5-minute children) then 5 minutes (1,751 MB against
+    /// a stamp of 82,867 MB, so it sheds 98% and splits again, into one-minute
+    /// children). The third level is AT `MIN_SLICE_MICROS`, where the preflight
+    /// never asks (`database/maintain.rs:1276` requires `width > MIN_SLICE`).
+    ///
+    /// The guard is a BETWEEN-call test on a WITHIN-call recursion, so it never
+    /// gets to fire: `split_declined_at_floor` stays 0 and the run is
+    /// byte-for-byte identical to the pre-fix one. It does not stall either —
+    /// nothing is declined, so nothing fails to run — but "does not stall" is
+    /// all §3c.4 can claim here.
+    #[test]
+    fn the_shipped_guard_never_engages_on_a_two_level_shred() {
+        let (fixed, whale, _) = synth_run(true, SplitGuard::Shipped);
+        let (unfixed, _, _) = synth_run(true, SplitGuard::Off);
+        assert_eq!(fixed.split_declined_at_floor, 0, "the guard never fires: the ladder is two levels, not three");
+        assert_eq!(cell_units(&fixed, &whale), cell_units(&unfixed, &whale), "so the fix changes nothing on this queue");
+        assert!(fixed.units_at_min_slice >= 1_000, "the shred survives the fix: {}", fixed.units_at_min_slice);
+        // The one thing that does hold: no execution exceeds the budget,
+        // because the runner hash-shards internally at any width. Every such
+        // run is AT the floor, never above it — which is what §3c.3 wanted and
+        // did not get.
+        assert!(fixed.max_run_bytes <= MAX_DECODED_BYTES, "{} bytes decoded in one run", fixed.max_run_bytes);
+        assert_eq!(fixed.sharded_runs_above_min_slice, 0, "no unit is hash-sharded ABOVE the floor");
+    }
+
+    /// §3c.6 — a lineage carrying `retry_or_split`'s synthetic
+    /// `MAX_DECODED_BYTES + 1` stamp must still split at journal scale, not
+    /// just in the predicate's unit test. A child measuring MORE than its
+    /// parent is evidence the parent's number was never a measurement.
+    #[test]
+    fn a_synthetic_stamp_still_splits_at_scale() {
+        let (report, _, stamped) = synth_run(true, SplitGuard::Shipped);
+        assert!(cell_units(&report, &stamped) > 1, "the stamped lineage must not freeze: {} units", cell_units(&report, &stamped));
+    }
+
+    /// §3c.5 — the threshold sweep, over three floor shapes. Printed rather
+    /// than asserted: the constant can only be argued from the table.
+    #[test]
+    fn threshold_sweep() {
+        for whale_x_max in [100, 20, 5] {
+            for guard in [SplitGuard::Ratio(1, 2), SplitGuard::Ratio(2, 3), SplitGuard::Ratio(3, 4), SplitGuard::Ratio(4, 5), SplitGuard::Off] {
+                let (report, whale, _) = synth_run_at(true, guard, whale_x_max);
+                println!(
+                    "whale={whale_x_max:>3}x guard={guard:?} whale_units={:>5} at_min={:>5} declined={:>4} completed={:>5} sharded_above_min={} pending_end={}",
+                    cell_units(&report, &whale),
+                    report.units_at_min_slice,
+                    report.split_declined_at_floor,
+                    report.completions.values().sum::<u64>(),
+                    report.sharded_runs_above_min_slice,
+                    report.pending_end,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn synth_criteria() {
+        for (floored, guard) in [(true, SplitGuard::Off), (false, SplitGuard::Off), (false, SplitGuard::Shipped), (true, SplitGuard::Shipped)] {
+            let (report, whale, stamped) = synth_run(floored, guard);
+            println!(
+                "floored={floored} guard={guard:?} whale={} stamped={} at_min={} declined={} splits={} sharded={}/{} narrowest={}s max_run={}MB pending {}->{} execs={}\n  samples={:?}",
+                cell_units(&report, &whale),
+                cell_units(&report, &stamped),
+                report.units_at_min_slice,
+                report.split_declined_at_floor,
+                report.byte_splits,
+                report.sharded_runs_above_min_slice,
+                report.sharded_runs,
+                report.narrowest_sharded_run_micros / MICROS,
+                report.max_run_bytes / 1_000_000,
+                report.pending_start,
+                report.pending_end,
+                report.executions,
+                report.samples.iter().map(|s| (s.max_cell_pending, s.split_declined_at_floor)).collect::<Vec<_>>(),
+            );
+        }
     }
 
     #[test]
