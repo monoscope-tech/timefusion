@@ -1648,7 +1648,9 @@ pub(crate) async fn match_aggregates(
     let mut routes = Vec::new();
     for spec in candidates {
         match route_with_spec(spec, &source, &schema.table_name, &predicates, aggregate, session).await {
-            Ok(route) => routes.push(route),
+            // The rewrite replaces the node that is IN the tree, never the
+            // inlined stand-in — `substitute` finds it by structural equality.
+            Ok(route) => routes.push(RoutedRollup { matched: matched.clone(), ..route }),
             // Report the FIRST spec's reason: it is the one the operator most
             // likely intended to serve this query, so it is the actionable gap.
             Err(reason) => first_miss = first_miss.or(Some(reason)),
@@ -2204,6 +2206,7 @@ mod tests {
                 "tiny_interior",
                 "too_many_branches",
                 "rewrite_schema_mismatch",
+                "unwalkable_source",
             ]
         );
     }
@@ -2797,6 +2800,59 @@ mod tests {
         let generated = generated_sql(&route);
         assert!(generated.contains("COALESCE(resource___service___name, 'null')"), "the coalesce must reach the rewrite verbatim: {generated}");
         assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The same chart with the `::text` cast monoscope actually emits. The cast
+    /// is the whole difference: `COALESCE(col, 'null')` repeats a bare column,
+    /// which CSE leaves alone, while `COALESCE(col::text, 'null')` repeats a
+    /// COMPUTATION and gets lifted into `__common_expr_1` — so the test above
+    /// passed for a year while every real panel declined. Prod 2026-08-25:
+    /// 39.2s here against 4.25s for the bare-column spelling, 7 days, one project.
+    #[tokio::test]
+    async fn a_grouped_chart_casting_its_dimension_routes_despite_cse() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(status_code::text, 'null') AS sc, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("COALESCE(status_code, 'null')"), "the coalesce must survive CSE into the rewrite: {generated}");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// A group expression the matcher cannot serve must DECLINE, not vanish.
+    /// `coalesce(status_code, level)` needs `level`, which no spec declares, so
+    /// this stays a miss — but before `UnwalkableSource` it left `match_aggregates`
+    /// through `Ok(Vec::new())` and no counter moved at all, which reads exactly
+    /// like a route. The distinction under test is `Err(_)` versus `Ok(None)`.
+    #[tokio::test]
+    async fn an_unservable_group_expression_is_counted_rather_than_silent() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(coalesce(status_code, level)::text, 'null') AS sc, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
+        );
+        assert!(matches!(route_for(&state, &sql).await, Err(_)), "an unservable group-by must report a reason, not fall through silently");
+    }
+
+    /// monoscope's log-explorer latency widget, verbatim down to the `HAVING
+    /// COUNT(*) > 0` — whose `count(*)` DataFusion folds into the aggregate
+    /// beside the digest. Under `duration IS NOT NULL` that count is exactly
+    /// `count(duration)`, so it resolves to `duration_count` instead of refusing
+    /// the whole query. Prod 2026-08-25: 35.7s raw against 3.34s routed.
+    #[tokio::test]
+    async fn a_percentile_widget_counting_under_a_null_guard_routes() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS digest \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1 HAVING COUNT(*) > 0"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("duration_digest"), "the digest measure must answer the percentile: {generated}");
+        assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
+        assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
     }
 
     /// The arm is deliberately narrow. A dimension the spec does not declare, a
