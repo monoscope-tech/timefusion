@@ -23,19 +23,23 @@ later data overturned. The net result, as of 2026-08-24 22:00:
    Frequent (2 of 3 sampling windows), and it explains the external
    connect-only stalls.
 
-**The system-level finding, which is bigger than either:** this process **fails
-to wake a 500 ms timer on time by 0.3–2.9 s, several times a minute,
-continuously**, on 48 workers with the host 40 % idle. The auth stalls sit inside
-that distribution. Causation is unproven precisely *because* the lag never stops
-— an always-present cause cannot be correlated with an intermittent effect — so
-the next step is per-connection accept-to-startup timing inside the server, not
-more outside correlation.
+**The system-level finding, which is bigger than either — and is now FIXED
+(`f7378af`, 2026-08-25).** The process was failing to wake a 500 ms timer on
+time by 0.3–2.9 s, several times a minute, on 48 workers with the host 40 %
+idle. Cause: **`fsync` running on runtime worker threads.**
+`TaskJournal::checkpoint` fsyncs while holding the journal mutex from 46 call
+sites — **606,953 holds totalling 28 minutes of frozen-worker time in 7 hours**
+— and a worker inside a blocking syscall polls *none* of the tasks queued on it.
+Fixed by routing that IO through `block_in_place`
+(`support::without_blocking_the_worker`), also applied to `compact` and
+`write_atomic_with`. Prod, at matched load (~30): **5.7 → 1.75 lag warns/min,
+3.3× fewer.** Not zero, so other worker-blockers remain — `BlockWatch` is the
+tool for finding them.
 
 **Eliminated, each with the instrument built for it:** host load (44.0 → 178 ms
 versus 32.9 → 4,460 ms — both directions); the maintenance journal mutex (held a
 worker 2,380 ms with *zero* effect on query cost); Delta snapshot refresh (hit
-403 ms/call while `connect` sat at 305 ms); worker starvation (`scheduling_lag_ms`
-0–1 through every stall); swap (100 % full at all times, so it differentiates
+403 ms/call while `connect` sat at 305 ms); swap (100 % full at all times, so it differentiates
 nothing).
 
 **The title premise is FALSE.** A 7.15-hour process — longer-lived than the 5 h
