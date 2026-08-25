@@ -1086,6 +1086,7 @@ impl StatsTableProvider {
             "dedup_bins_deferred_cold_total" => m.dedup_bins_deferred_cold,
             "dedup_passes_flush_yields_total" => m.dedup_passes_flush_yields,
             "dedup_bin_stage_timeouts_total" => m.dedup_bin_stage_timeouts,
+            "maintenance_schema_parked_total" => m.maintenance_schema_parked,
             "wave_commits_yielded_to_flush_total" => m.wave_commits_yielded_to_flush,
             "repair_resumed_total" => m.repair_resumed,
             "repair_resume_declined_stale_total" => m.repair_resume_declined_stale,

@@ -1171,6 +1171,12 @@ atomic_stats! {
     /// 6.5h stall, skips=77). Repeated hits are the same bin retrying —
     /// an oversized bin that can't finish inside the deadline, not noise.
     dedup_bin_stage_timeouts,
+    /// Maintenance units PARKED on a deterministic plan error (a missing field)
+    /// rather than bisected — the 2026-08-24 amplifier, where shredding one bad
+    /// rollup spec failed 477 of 658 claims in eight minutes. Nonzero means a
+    /// spec names a column its source files do not have; the fix is a rebuild or
+    /// a deploy, and no amount of retrying is one.
+    maintenance_schema_parked,
     /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
     /// on a per-table commit lock a flush was already waiting for — the flush
     /// starvation of prod 2026-07-30, where durability waited >600s behind
