@@ -3624,14 +3624,18 @@ pub struct CoverageEntry {
     pub end_micros: i64,
     pub generation: String,
     pub source_fingerprint: u64,
-    /// LOGICAL deduped source rows — the witness that this slice is not stale.
+    /// The witness that this slice is not stale: the source partition's PHYSICAL
+    /// `num_records` sum at build time, i.e. exactly `TAG_SOURCE_ROWS`, which is
+    /// what `record_readable_coverage` copies in here.
     ///
-    /// Deliberately not the tag's number. `TAG_SOURCE_ROWS` is compared against
-    /// `num_records`, which is PHYSICAL (tombstones plus merge-on-read
-    /// versions), so ordinary dedup or compaction changes it without changing
-    /// what the rollup aggregated and invalidates a correct slice. `None` means
-    /// no witness, which every read must treat as unverifiable rather than
-    /// fresh.
+    /// It is deliberately the same computation the read path re-derives, because
+    /// comparing unlike quantities is worse than not comparing at all — see
+    /// `rollup::slice_coverage_agrees`. Being physical is also its defect: a
+    /// dedup rewrite or a DML delete changes `num_records` without changing what
+    /// the rollup aggregated, and ingest anywhere else in the day moves it too,
+    /// so correct slices are voided. See
+    /// `docs/plans/2026-08-25-rollup-witness-design.md`. `None` means no witness,
+    /// which every read must treat as unverifiable rather than fresh.
     pub source_rows: Option<i64>,
     /// The tier files that SERVE this range.
     ///

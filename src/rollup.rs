@@ -627,9 +627,133 @@ pub(crate) const OPEN_END: i64 = i64::MAX;
 ///
 /// A slice with no witness predates the tag and CANNOT be verified, so it is
 /// refused; those dates read raw until the coordinator republishes them.
+///
+/// Expressed through [`verify_slice_witness`] so there is ONE definition of what
+/// re-proves a slice. This is `SliceWitness::Physical` and nothing else, so the
+/// answer is bit-identical to the hand-rolled comparison it replaces — asserted
+/// in `the_physical_variant_reproduces_slice_coverage_agrees_exactly`.
 pub(crate) fn slice_coverage_agrees(witnesses: &[Option<u64>], current: Option<u64>) -> bool {
-    let Some(current) = current else { return false };
-    !witnesses.is_empty() && witnesses.iter().all(|witness| *witness == Some(current))
+    let files = current.map(|rows| [SourceFile { min_ts: None, max_ts: None, rows }]);
+    let source = LiveSource { files: files.as_ref().map(<[_]>::as_ref), logical: None };
+    !witnesses.is_empty() && witnesses.iter().all(|witness| verify_slice_witness(witness.map(SliceWitness::Physical), source) == WitnessVerdict::Valid)
+}
+
+/// One live file of a rollup SOURCE partition, as the Delta add-actions
+/// describe it — not to be confused with [`LiveFile`], which is a file of the
+/// tier the source feeds.
+///
+/// `min_ts`/`max_ts` are `None` when the file carries no timestamp statistic.
+/// That is not the same as "spans nothing": a file that cannot say where its
+/// rows sit cannot be placed relative to a slice bound, so any bounded witness
+/// must refuse rather than guess (see [`verify_slice_witness`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceFile {
+    pub min_ts: Option<i64>,
+    /// INCLUSIVE, like a Delta file statistic and unlike `TimeSlice::end`.
+    pub max_ts: Option<i64>,
+    /// The add action's `num_records` — PHYSICAL, so it counts tombstones and
+    /// superseded merge-on-read versions.
+    pub rows: u64,
+}
+
+/// What a rollup slice recorded about its source partition at build time.
+///
+/// Versioned because the shapes are not comparable: a witness recorded under one
+/// variant can only ever be re-proved under the same variant, so old slices keep
+/// exactly the semantics they were written with and a shape change re-darkens
+/// nothing it did not have to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SliceWitness {
+    /// v1, what `TAG_SOURCE_ROWS` holds today: the WHOLE partition's
+    /// `num_records` sum, unbounded. Any ingest anywhere in the day moves it,
+    /// including hours no slice of this build ever claimed — which is why
+    /// `rollup_stale_grew` (4103) dwarfs `rollup_stale_shrank` (400) in prod.
+    Physical(u64),
+    /// v2: `num_records` summed over the live files lying WHOLLY BELOW the
+    /// slice's `covered_through`. Ingest past the bound no longer perturbs it.
+    ///
+    /// Not constructed outside the tests yet, and deliberately: STAMPING one
+    /// means a new Delta tag on the build path, which is the step this change
+    /// does not take. Kept in the type because a predicate that cannot express
+    /// the candidate cannot be used to evaluate it, and the case table is the
+    /// evaluation — see `docs/plans/2026-08-25-rollup-witness-design.md` §2.
+    #[allow(dead_code)]
+    PhysicalBelow { rows: u64, bound: i64 },
+    /// v3: the exact LOGICAL row count of `[lo, hi)` — deduped and
+    /// tombstone-aware, i.e. what the build actually aggregated. Invariant under
+    /// every rewrite that preserves logical content, and moves only on genuine
+    /// ingest or DML inside the slice's own range.
+    ///
+    /// Unconstructed for the same reason as `PhysicalBelow`.
+    #[allow(dead_code)]
+    Logical { rows: u64, lo: i64, hi: i64 },
+}
+
+/// The live facts a witness may be re-proved against.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LiveSource<'a> {
+    /// The source partition's live files. `None` when the Delta log could not be
+    /// read, which is an absence of evidence, never a disagreement.
+    pub files: Option<&'a [SourceFile]>,
+    /// `(lo, hi, rows)` — an exact logical row count and the range it was taken
+    /// over, when a logical-count index is resident and current for this
+    /// partition. `None` when there is no index to ask.
+    pub logical: Option<(i64, i64, u64)>,
+}
+
+/// Three-valued on purpose. `Stale` is a proven disagreement; `Unverifiable` is
+/// an absence of evidence. Both must keep the range off the tier, but they
+/// demand opposite work — `Stale` needs a rebuild, `Unverifiable` needs the
+/// evidence to exist — and collapsing them is what made `stale_coverage` a
+/// single undiagnosable bucket for months.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WitnessVerdict {
+    Valid,
+    Stale,
+    Unverifiable,
+}
+
+/// Re-prove one slice's witness against the source partition as it stands now.
+///
+/// Strictly generalises `slice_coverage_agrees`: `Physical` reproduces it
+/// exactly (see the case table), so v1 slices are judged by today's rule and
+/// only slices stamped with a newer witness get the newer semantics.
+///
+/// The straddle rule is the whole soundness argument for `PhysicalBelow`. Delta
+/// statistics are per FILE, so a file whose rows sit on both sides of the bound
+/// cannot be split by arithmetic: counting it admits rows the build never read,
+/// dropping it hides rows that landed INSIDE the covered range — the
+/// silent-wrong-number direction. It therefore poisons the whole witness. This
+/// is not free: once a day is packed into one file per date, every slice bound
+/// falls inside a file and the whole date reads `Unverifiable`. That cost is the
+/// reason `PhysicalBelow` is a candidate and not a recommendation.
+pub(crate) fn verify_slice_witness(witness: Option<SliceWitness>, source: LiveSource<'_>) -> WitnessVerdict {
+    let verdict = |expected: u64, actual: u64| if expected == actual { WitnessVerdict::Valid } else { WitnessVerdict::Stale };
+    let (Some(witness), Some(files)) = (witness, source.files) else { return WitnessVerdict::Unverifiable };
+    match witness {
+        SliceWitness::Physical(rows) => verdict(rows, files.iter().fold(0, |sum, file| sum.saturating_add(file.rows))),
+        SliceWitness::PhysicalBelow { rows, bound } => {
+            let mut below = 0u64;
+            for file in files {
+                let (Some(min_ts), Some(max_ts)) = (file.min_ts, file.max_ts) else { return WitnessVerdict::Unverifiable };
+                if min_ts < bound && max_ts >= bound {
+                    return WitnessVerdict::Unverifiable;
+                }
+                if max_ts < bound {
+                    below = below.saturating_add(file.rows);
+                }
+            }
+            verdict(rows, below)
+        }
+        // The witness carries its own range so a count taken over a DIFFERENT
+        // window cannot be mistaken for evidence about this one — the index is
+        // per (project, date) and every slice of that date asks it a different
+        // question.
+        SliceWitness::Logical { rows, lo, hi } => match source.logical {
+            Some((live_lo, live_hi, live)) if (live_lo, live_hi) == (lo, hi) => verdict(rows, live),
+            _ => WitnessVerdict::Unverifiable,
+        },
+    }
 }
 
 /// `[lo, hi)` minus `ranges` — the raw leg's share.
@@ -4014,6 +4138,90 @@ mod tests {
     #[test_case::test_case(&[Some(100)], None, false ; "the source partition reports no row count")]
     fn slice_coverage_is_trusted_only_when_every_witness_matches_the_partition_now(witnesses: &[Option<u64>], current: Option<u64>, trusted: bool) {
         assert_eq!(slice_coverage_agrees(witnesses, current), trusted);
+    }
+
+    /// One live file, spelled the way a Delta add action does: `max_ts` inclusive.
+    fn file(rows: u64, min_ts: i64, max_ts: i64) -> SourceFile {
+        SourceFile { min_ts: Some(min_ts), max_ts: Some(max_ts), rows }
+    }
+
+    /// The scenario every case below is a transition of: a slice covering
+    /// `[0, 600)` of a date whose live files at build time were `A[0,299]` and
+    /// `B[300,599]`, 100 physical rows each, of which 180 are logically distinct.
+    /// `C[700,900]` is later-in-the-day ingest that no slice of this build
+    /// claimed — the prod `rollup_stale_grew` shape.
+    const BOUND: i64 = 600;
+
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(100, 0, 299), file(100, 300, 599)], None, WitnessVerdict::Valid
+        ; "v1 baseline: nothing moved")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(100, 0, 299), file(100, 300, 599), file(50, 700, 900)], None, WitnessVerdict::Stale
+        ; "THE grew defect: hour-23 ingest voids an hour-00 slice under the v1 whole-partition witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(100, 0, 299), file(100, 300, 599), file(50, 700, 900)], None, WitnessVerdict::Valid
+        ; "and the bounded witness survives it — ingest past covered_through is not this slice's business")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(200, 0, 599)], None, WitnessVerdict::Valid
+        ; "benign bin-pack compaction preserves num_records, so even v1 survives it")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(200, 0, 599)], None, WitnessVerdict::Valid
+        ; "benign bin-pack compaction under the bounded witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(180, 0, 599)], None, WitnessVerdict::Stale
+        ; "benign DEDUP collapses 20 merge-on-read versions: physical witnesses call a correct slice stale")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(180)), &[file(180, 0, 599)], None, WitnessVerdict::Valid
+        ; "carry-forward: maintenance restamps the witness it knowingly invalidated, and the same slice is valid again")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(180, 0, 599)], Some((0, BOUND, 180)), WitnessVerdict::Valid
+        ; "the logical witness needs no carry-forward: dedup cannot change what it counts")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(100, 0, 299), file(100, 300, 599), file(10, 100, 200)], None, WitnessVerdict::Stale
+        ; "genuine LATE ingest inside the covered range is stale, which is the whole point of keeping a witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(190, 0, 599)], Some((0, BOUND, 190)), WitnessVerdict::Stale
+        ; "genuine late ingest under the logical witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(90, 0, 299), file(100, 300, 599)], None, WitnessVerdict::Stale
+        ; "a DML DELETE inside the covered range is stale under the bounded witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(170, 0, 599)], Some((0, BOUND, 170)), WitnessVerdict::Stale
+        ; "a DML DELETE inside the covered range is stale under the logical witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(100, 0, 299), file(150, 400, 800)], None, WitnessVerdict::Unverifiable
+        ; "STRADDLE POISON: a file spanning the bound cannot be split by arithmetic, so it refuses instead of guessing")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(250, 0, 900)], None, WitnessVerdict::Unverifiable
+        ; "THE COST of that rule: a day packed to one file per date straddles every slice bound and reads unverifiable")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[SourceFile { min_ts: None, max_ts: None, rows: 200 }], None, WitnessVerdict::Unverifiable
+        ; "a file with no timestamp statistic cannot be placed against the bound")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(180, 0, 599)], None, WitnessVerdict::Unverifiable
+        ; "a logical witness with no resident index is unverifiable, never assumed fresh")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(180, 0, 599)], Some((0, 300, 180)), WitnessVerdict::Unverifiable
+        ; "a count over a DIFFERENT window is not evidence about this slice, even when the numbers agree")]
+    #[test_case::test_case(None, &[file(200, 0, 599)], None, WitnessVerdict::Unverifiable ; "no witness at all")]
+    #[test_case::test_case(Some(SliceWitness::Physical(200)), &[], None, WitnessVerdict::Stale ; "an emptied partition is a disagreement, not an absence")]
+    fn witness_survives_benign_maintenance_and_still_catches_real_change(
+        witness: Option<SliceWitness>, files: &[SourceFile], logical: Option<(i64, i64, u64)>, expected: WitnessVerdict,
+    ) {
+        assert_eq!(verify_slice_witness(witness, LiveSource { files: Some(files), logical }), expected);
+    }
+
+    /// `Physical` must be today's rule and nothing else, so a slice stamped
+    /// before any of this cannot change meaning by being re-judged here.
+    #[test_case::test_case(Some(100), Some(100) ; "agrees")]
+    #[test_case::test_case(Some(100), Some(150) ; "grew")]
+    #[test_case::test_case(Some(100), Some(90) ; "shrank")]
+    #[test_case::test_case(None, Some(100) ; "witnessless")]
+    #[test_case::test_case(Some(100), None ; "no live count")]
+    fn the_physical_variant_reproduces_slice_coverage_agrees_exactly(witness: Option<u64>, current: Option<u64>) {
+        let files = current.map(|rows| [SourceFile { min_ts: None, max_ts: None, rows }]);
+        let verdict = verify_slice_witness(witness.map(SliceWitness::Physical), LiveSource { files: files.as_ref().map(<[_]>::as_ref), logical: None });
+        assert_eq!(verdict == WitnessVerdict::Valid, slice_coverage_agrees(&[witness], current));
     }
 
     #[test]
