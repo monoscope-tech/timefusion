@@ -2683,6 +2683,83 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
     Ok(())
 }
 
+/// The same chart wrapped in a derived table ROUTES, and answers what raw does.
+///
+/// A `SubqueryAlias` — any CTE or derived table under the aggregate — used to
+/// stop the walker dead, which made it the largest miss class on prod (126 of
+/// 414, 2026-08-25). Walking through it is only sound if the alias's
+/// re-qualification is undone on the way back: the aggregate's group field is
+/// `t.timestamp`-derived where the rewrite produces unqualified columns. The
+/// unit tests in `src/rollup.rs` pin that reassembly; this pins the ANSWER,
+/// because a routing change that returns wrong numbers is worse than a miss.
+#[serial]
+#[tokio::test]
+async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()> {
+    struct ClockGuard;
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            timefusion::support::unfreeze();
+        }
+    }
+    let _clock_guard = ClockGuard;
+    let cfg = (*TestConfigBuilder::new("rollup_derived_table").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+
+    for (i, (status, offset)) in [("OK", 17i64), ("ERROR", 61_000_000), ("OK", 3_661_000_000)].iter().enumerate() {
+        let batch = json_to_batch(vec![serde_json::json!({
+            "timestamp": yesterday_noon + offset, "id": format!("y{i}"), "name": "op", "project_id": project_id, "hashes": [],
+            "summary": ["derived table fixture"], "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(yesterday_noon + offset).unwrap().date_naive().to_string(),
+            "duration": 100i64 + i as i64, "kind": "server", "status_code": status, "resource___service___name": "cart",
+        })])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    }
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    timefusion::support::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
+    db.run_maintenance_units(1024).await?;
+
+    let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
+    // The grouped chart monoscope emits, moved under a derived table: the alias
+    // qualifies both the bucket's argument and the grouped dimension.
+    let query = format!(
+        "SELECT time_bucket('1 hours', t.timestamp) AS tb, t.status_code, count(*) AS c \
+         FROM (SELECT timestamp, status_code, project_id FROM otel_logs_and_spans \
+               WHERE project_id = '{project_id}' \
+                 AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})) t \
+         GROUP BY 1, 2 ORDER BY 1, 2"
+    );
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let hits = || {
+        let stats = timefusion::observability::maintenance_stats();
+        stats.rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed) + stats.rollup_hits_full.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = hits();
+    let routed = ctx.sql(&query).await?.collect().await?;
+    assert!(hits() > before, "a derived table only re-qualifies; the chart under it must route");
+
+    let rows = |batches: &[datafusion::arrow::array::RecordBatch]| {
+        batches
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .flat_map(|b| {
+                (0..b.num_rows()).map(|r| (b.column(1).as_string_view().value(r).to_string(), b.column(2).as_primitive::<Int64Type>().value(r)))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&routed), rows(&db.query_delta_only(&query).await?), "the ROUTED answer must equal raw, bucket for bucket and group for group");
+    Ok(())
+}
+
 // This is the shape production actually sends: microsecond-precision bounds
 /// running up to now. Before the union it was refused outright, so the feature
 /// never served a single query. A hybrid that merely *runs* is worthless — the

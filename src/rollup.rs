@@ -1765,17 +1765,53 @@ fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mu
             "Projection: {}",
             projection.expr.iter().filter(|expr| !matches!(expr, Expr::Column(_))).take(4).map(ToString::to_string).collect::<Vec<_>>().join(", ")
         ))),
-        // A derived table or CTE stops the walk at its ALIAS, which names
-        // nothing an operator could act on — every shape in the class printed
-        // `SubqueryAlias: f` and stopped. So report what is under it too, which
-        // also separates the two sub-populations: an inner refusal is a genuinely
-        // unroutable shape, while a walkable inner means the requalification is
-        // the ONLY blocker.
-        LogicalPlan::SubqueryAlias(alias) => Err(truncated(&format!(
-            "SubqueryAlias: {} over {}",
-            alias.alias,
-            source_and_filters(&alias.input, &mut Vec::new()).map_or_else(|inner| inner, |table| format!("a walkable scan of {table}"))
-        ))),
+        // A derived table or CTE — `count(1) FROM (SELECT id …) t` is the shape
+        // every monoscope benchmark and every top-K CTE emits, and it was the
+        // largest miss class on prod (126 of 414, 2026-08-25).
+        //
+        // An alias re-qualifies; it never RENAMES. `t.id` outside is
+        // `otel_logs_and_spans.id` inside, and every matcher below reads
+        // `Column::name` alone — `column_name`, `canonical`'s Column arm,
+        // `dimension_filter_sql`, `eq_literal`, `is_probe_scaffolding`. The chain
+        // admitted here holds exactly ONE TableScan (the projection arm above is
+        // rename-free and nothing else is walked), so a bare name still
+        // identifies exactly one column. A subquery that DOES rename is refused
+        // by that same projection arm, one level down — which is what stops
+        // `SELECT kind AS status_code` from being read as the dimension.
+        //
+        // On the output side the aggregate keeps the alias qualifier on its group
+        // fields; `dml::requalified` restores it onto the rewrite field for field,
+        // and `substitute`'s bottom-up `recompute_schema` re-resolves the parent's
+        // `Column(t, …)` against it, so a qualifier that did not line up fails
+        // there as a recorded miss rather than answering.
+        LogicalPlan::SubqueryAlias(alias) => {
+            let source = source_and_filters(&alias.input, filters)?;
+            // One spelling for the whole chain. The optimizer both leaves a
+            // predicate on a Filter and re-pushes it into the TableScan, so the
+            // same conjunct arrives twice — once qualified by the alias, once by
+            // the scan — and `canonical_and`'s idempotence dedup (see there)
+            // could no longer cancel the pair. Lossless: one scan, so the name
+            // is the identity.
+            use datafusion::{
+                common::{
+                    Column,
+                    tree_node::{Transformed, TreeNode},
+                },
+                logical_expr::Expr,
+            };
+            let unqualify = |node: Expr| {
+                Ok(match node {
+                    Expr::Column(column) => Transformed::yes(Expr::Column(Column::new_unqualified(column.name))),
+                    node => Transformed::no(node),
+                })
+            };
+            for filter in filters.iter_mut() {
+                if let Ok(stripped) = filter.clone().transform_up(unqualify) {
+                    *filter = stripped.data;
+                }
+            }
+            Ok(source)
+        }
         plan => Err(truncated(&plan.display().to_string())),
     }
 }
@@ -3542,6 +3578,64 @@ mod tests {
             Some(MissReason::UnknownGroupBy),
             "the 1h tier's grain complaint must not mask the 1m tier's real reason"
         );
+    }
+
+    /// THE benchmark shape from `docs/monoscope-query-shapes.md`: a bare
+    /// `count(*)` is answered from Delta statistics, so anything measuring the
+    /// scan is spelled `count(1) FROM (SELECT id …) t` — and that derived table
+    /// planned to a `SubqueryAlias` the walker refused, making it the largest
+    /// miss class on prod (126 of 414, 2026-08-25).
+    #[tokio::test]
+    async fn the_benchmark_count_shape_routes_through_its_derived_table() {
+        let state = session().await;
+        let sql = format!("SELECT count(1) FROM (SELECT id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t");
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        assert!(generated_sql(&route).contains("request_count"), "an unguarded count over a derived table is the tier's request_count");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The qualifier proof. An alias RE-QUALIFIES its output, so the aggregate's
+    /// group field is `t.status_code` while the rollup rewrite can only produce an
+    /// unqualified `status_code` — and the projection above still references
+    /// `t.status_code`. `dml::requalified` puts the qualifier back field for
+    /// field and `substitute`'s bottom-up `recompute_schema` re-resolves that
+    /// reference against the rewrite, so a qualifier that did not line up fails
+    /// there rather than answering from the wrong column.
+    ///
+    /// `assert_substitutes` runs exactly that reassembly — the same two functions
+    /// `dml.rs` calls, not a test-only copy — which is why this asserts through it
+    /// rather than through the generated SQL alone.
+    #[tokio::test]
+    async fn a_grouped_derived_table_keeps_its_alias_qualifier_through_the_rewrite() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', t.timestamp) AS tb, t.status_code, count(*)::float AS count_ \
+             FROM (SELECT timestamp, status_code, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t \
+             GROUP BY 1, 2"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("status_code"), "the alias must not hide the declared dimension: {generated}");
+        // The assertion IS the reassembly: the projection above this aggregate
+        // holds `Column(t, "status_code")`, and `substitute` rebuilds bottom-up
+        // with `recompute_schema`, so a rewrite that did not carry the `t`
+        // qualifier back fails to resolve here instead of answering.
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The boundary that makes the arm above safe. A subquery that RENAMES is
+    /// refused one level down, by the rename-free projection rule — and it has to
+    /// be, because `kind AS status_code` walked through would make the matcher
+    /// read the declared `status_code` dimension off `kind` and answer the wrong
+    /// rows without any error.
+    #[tokio::test]
+    async fn a_derived_table_that_renames_a_column_still_declines() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT t.status_code, count(*) \
+             FROM (SELECT kind AS status_code, timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t GROUP BY 1"
+        );
+        assert!(!matches!(route_for(&state, &sql).await, Ok(Some(_))), "a rename under an alias must never be read as the dimension it shadows");
     }
 
     /// The arm is deliberately narrow. A dimension the spec does not declare, a
