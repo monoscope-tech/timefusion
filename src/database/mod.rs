@@ -11212,7 +11212,6 @@ mod tests {
     async fn a_queued_unit_for_one_tier_does_not_veto_planning_another() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
         let mut cfg = (*create_test_config("per-tier-veto")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("veto_{}", uuid::Uuid::new_v4().simple());
@@ -11274,7 +11273,6 @@ mod tests {
         use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
         let mut cfg = (*create_test_config("backfill-ceiling-bypass")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
@@ -11328,7 +11326,6 @@ mod tests {
         use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
         let mut cfg = (*create_test_config("backfill-ceiling-pass")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
@@ -11376,7 +11373,6 @@ mod tests {
     #[tokio::test]
     async fn coverage_published_for_one_source_survives_planning_the_next() -> Result<()> {
         let mut cfg = (*create_test_config("multi-source-coverage")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("multi_{}", uuid::Uuid::new_v4().simple());
@@ -11724,7 +11720,6 @@ mod tests {
     async fn compaction_debt_skips_rollup_tier_tables() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
         let mut cfg = (*create_test_config("debt-skips-tiers")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("tier_{}", uuid::Uuid::new_v4().simple());
         let day = Utc::now() - chrono::Duration::days(4);
@@ -11759,7 +11754,6 @@ mod tests {
     async fn run_unit_runs_the_requested_project_and_not_another() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
         let mut cfg = (*create_test_config("run-unit-targeting")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         // The background coordinator would roll up BOTH projects on its own,
@@ -11826,7 +11820,6 @@ mod tests {
     async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
         let mut cfg = (*create_test_config("slice-rows-guard")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
@@ -11894,7 +11887,6 @@ mod tests {
     async fn recovery_queues_a_republish_for_a_slice_with_no_row_witness() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskState};
         let mut cfg = (*create_test_config("witnessless-republish")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
@@ -11988,7 +11980,6 @@ mod tests {
         };
         use object_store::ObjectStoreExt as _;
         let mut cfg = (*create_test_config("untagged-interior-gap")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
@@ -12086,7 +12077,6 @@ mod tests {
     async fn a_restart_routes_from_the_ledger_before_the_tag_replay_runs() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
         let mut cfg = (*create_test_config("ledger-seed")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         let cfg = std::sync::Arc::new(cfg);
         let db = Database::with_config(cfg.clone()).await?;
         db.cancel_maintenance();
@@ -12126,7 +12116,6 @@ mod tests {
     ) -> Result<(Database, crate::maintenance_coordinator::TaskKey, Vec<deltalake::kernel::Add>, Option<u64>, String, String)> {
         use crate::maintenance_coordinator::Operation;
         let mut cfg = (*create_test_config(label)).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
         let project = format!("resume_{}", uuid::Uuid::new_v4().simple());
@@ -12281,7 +12270,6 @@ mod tests {
         use crate::maintenance_coordinator::Operation;
         use crate::storage::CoverageLedger as _;
         let mut cfg = (*create_test_config("ledger-populate")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
         let project = format!("ledger_{}", uuid::Uuid::new_v4().simple());
@@ -12394,7 +12382,6 @@ mod tests {
         };
         use object_store::ObjectStoreExt as _;
         let mut cfg = (*create_test_config("untagged-selfheal")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
@@ -12535,7 +12522,6 @@ mod tests {
         };
         use object_store::ObjectStoreExt as _;
         let mut cfg = (*create_test_config("untagged-covered")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         db.cancel_maintenance();
@@ -12712,7 +12698,6 @@ mod tests {
         };
         use object_store::ObjectStoreExt as _;
         let mut cfg = (*create_test_config("untagged-immortal")).clone();
-        cfg.maintenance.timefusion_rollup_enabled = true;
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         let project = format!("untag_{}", uuid::Uuid::new_v4().simple());
