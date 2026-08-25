@@ -220,6 +220,95 @@ Unchanged from `tasks/09`, repeated because this document now supersedes it:
   estimate.
 - **Do not** add a production endpoint to export the journal (see §1).
 
+## 6. Results, 2026-08-25 — built, run, and the fix does NOT hold
+
+Implemented in `src/maintenance_sim.rs` only; `maintenance_coordinator.rs` is
+untouched. `DayShape`/`ByteModel` are the floored cost model (anchored: a
+9.2 GB / 1,000-file day models **302 MB at five minutes**, pinned by a doctest),
+`preflight()` runs at claim time where `database/maintain.rs:1273-1278` runs it,
+and `SplitGuard` selects the shipped predicate, the pre-fix behaviour (clearing
+`parent_measured_bytes`, so the coordinator's `None` arm does the work) or a
+swept threshold. `synthetic_whale_queue` builds 214 cells through the
+`TaskJournal` API, including the 600-unit footprint-less debris shape.
+
+**Criterion by criterion**, `synth:whale`, 6 virtual hours, 16 workers:
+
+| # | Claim | Result |
+|---|---|---|
+| 1 | Bug reproduces | **PASS** — floored + guard off: 1,697 units for the whale cell, 1,440 of them at `MIN_SLICE_MICROS` |
+| 2 | Floorless control is clean | **PASS** — 129 units, **zero** at the floor, guard on or off. The shred is caused by the floor, not the scheduler |
+| 3 | Fix works | **FAIL** — floored + shipped guard is **byte-for-byte identical to guard off**: 1,697 units, 1,440 at the floor, and **no unit hash-sharded above `MIN_SLICE_MICROS`**. Only the memory bound holds (max run 505 MB ≤ 512 MiB), via runner-internal sharding at the floor |
+| 4 | Fix does not stall | **N/A** — `split_declined_at_floor` stays **0**, so nothing is declined and nothing can stall. Not the good half of the criterion |
+| 5 | Threshold calibrated | **Swept, and 3/4 is on the wrong side of the only cliff** — see below |
+| 6 | Lineage guard holds | **PASS** — the `MAX_DECODED_BYTES + 1` synthetic-stamp lineage still splits at scale (49 units, not frozen) |
+
+### Why 3 fails: the guard is a between-call test on a within-call recursion
+
+The lineage trace (`whale_lineage_trace`):
+
+```
+level 0: width= 86400s observed= 82867MB parent_stamp=    none  split=true
+level 1: width=   300s observed=  1751MB parent_stamp= 82867MB  split=true
+level 2: width=    60s observed=  1517MB parent_stamp=  1751MB  split=false (never asked)
+```
+
+`byte_bounded_units` descends *many* levels inside **one** call — the day unit
+becomes 256 five-minute children in a single split — and stamps every
+descendant with the same measurement. So the whale's ladder is only **two**
+journal levels: the day (no stamp, splits unconditionally) and the five-minute
+child (1,751 MB against a stamp of 82,867 MB — it sheds 98%, so the guard
+correctly allows it). The third level is already **at** `MIN_SLICE_MICROS`,
+where `database/maintain.rs:1276` never calls `split_time_task` at all.
+
+The 60-second unit measures 1,517 MB against its parent's 1,751 MB — a 13%
+shed, which the guard *would* decline. It is never asked. `69e6503` can only
+fire on a lineage that takes **three or more measured levels** to reach the
+floor; a model that is wrong by 50x reaches the floor in two.
+
+### Criterion 5: the sweep
+
+`SPLIT_MUST_SHED_NUMERATOR/DENOMINATOR` against three floor shapes (whale day
+bytes as a multiple of `MAX_DECODED_BYTES`). Larger threshold = weaker guard;
+`Off` is the pre-fix baseline.
+
+| floor | 1/2 | 2/3 | **3/4 (shipped)** | 4/5 | off |
+|---|---|---|---|---|---|
+| 100x | 1697 / 1440@min / 0 declined | 1697 / 1440 / 0 | **1697 / 1440 / 0** | 1697 / 1440 / 0 | 1697 / 1440 / 0 |
+| 20x | 97 / 0 / 64 | 97 / 0 / 64 | **225 / 0 / 0** | 225 / 0 / 0 | 225 / 0 / 0 |
+| 5x | 25 / 0 / 0 | 25 / 0 / 0 | **25 / 0 / 0** | 25 / 0 / 0 | 25 / 0 / 0 |
+
+Read: `units / units at MIN_SLICE / splits declined`. Every run drained to
+`pending_end = 0`, so no threshold stalls the queue.
+
+Three findings, none of them arguable from a spreadsheet:
+
+1. **At 100x nothing helps.** The guard is never consulted, at any threshold.
+2. **At 20x the guard works and 3/4 is on the wrong side of the cliff.** 1/2 and
+   2/3 decline 64 splits and land the cell in **97** units with 64 executions
+   hash-sharded *above* the floor — exactly the behaviour §3c.3 wanted. 3/4 and
+   4/5 decline nothing and produce **225**. The transition sits between 2/3 and
+   3/4, so the shipped constant is not on a flat part of the curve; it is the
+   first value that does nothing. (Completed work: 324 against 388 — fewer,
+   larger units, not less progress.)
+3. **At 5x the threshold is irrelevant** — the model is close enough that no
+   second level is ever needed.
+
+### What this implies (not implemented — out of scope for this item)
+
+The fix as shipped is not wrong, it is *unreachable* in the shape that caused
+the incident. Two candidate directions, both needing their own decision:
+
+- Move the floor test **inside** `byte_bounded_units` — bisect one level per
+  measurement rather than a whole subtree per measurement — so the guard sees
+  every level. This changes the bisection arithmetic, which §5 forbids without
+  a decision.
+- Or tighten `SPLIT_MUST_SHED_*` to 2/3, which is free at 5x, strictly better at
+  20x, and still nothing at 100x.
+
+Neither should ship on this evidence alone: the floor's real per-tenant shape is
+the one thing §4 says a prod journal would calibrate, and it decides which of
+the three rows above production actually lives in.
+
 ## Done when
 
 §3c criteria 1-4 pass in CI as a `#[test]` over the synthetic fixture (not a

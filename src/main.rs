@@ -213,8 +213,9 @@ fn init_cli_tracing() {
         .try_init();
 }
 
-/// `timefusion sim <journal.json | data-dir> [--hours N] [--workers N]
-/// [--streams N] [--scale F] [--seed N] [--no-mint] [--json]`
+/// `timefusion sim <journal.json | data-dir | synth:whale> [--hours N]
+/// [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint]
+/// [--floorless] [--guard-off] [--json]`
 ///
 /// Replay a copied-out prod maintenance journal through the real scheduler on
 /// virtual time (`timefusion::maintenance_sim`). The answer to "does this
@@ -223,10 +224,11 @@ fn init_cli_tracing() {
 fn run_sim_cli() -> anyhow::Result<()> {
     use timefusion::maintenance_sim::{SimConfig, load_sandboxed, run};
     let mut it = std::env::args().skip(2);
-    let usage = "usage: timefusion sim <journal.json|data-dir> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--json]";
+    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--floorless] [--guard-off] [--json]";
     let input = it.next().context(usage)?;
     let mut cfg = SimConfig::default();
     let mut json = false;
+    let mut floorless = false;
     while let Some(a) = it.next() {
         let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
         match a.as_str() {
@@ -244,12 +246,28 @@ fn run_sim_cli() -> anyhow::Result<()> {
                     Some((value("--restart-at-hours")?.parse::<f64>().context("--restart-at-hours must be a number")? * 3_600_000_000.0) as i64)
             }
             "--no-mint" => cfg.mint_frontier = false,
+            // The floorless control, and the pre-69e6503 behaviour, for
+            // `synth:whale`.
+            "--floorless" => floorless = true,
+            "--guard-off" => cfg.split_guard = timefusion::maintenance_sim::SplitGuard::Off,
             "--json" => json = true,
             other => anyhow::bail!("unknown argument: {other} ({usage})"),
         }
     }
-    let (journal, _sandbox) = load_sandboxed(std::path::Path::new(&input))?;
-    let report = run(journal, &cfg, support::now_micros())?;
+    let now = support::now_micros();
+    // `synth:whale` needs no journal at all: the queue shape that shredded prod
+    // is reproducible locally, and it is the only input that exercises the byte
+    // preflight (a real journal carries estimates the sim would never read).
+    let report = if let Some(shape) = input.strip_prefix("synth:") {
+        anyhow::ensure!(shape == "whale", "the only synthetic queue is `synth:whale`");
+        let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100);
+        cfg.mint_frontier = false;
+        cfg.byte_model = Some(queue.model);
+        run(queue.journal, &cfg, now)?
+    } else {
+        let (journal, _sandbox) = load_sandboxed(std::path::Path::new(&input))?;
+        run(journal, &cfg, now)?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
