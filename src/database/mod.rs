@@ -4961,6 +4961,11 @@ impl Database {
             // the equivalent correlated `count(1) > 0` scalar subquery, which it
             // does decorrelate. Before TypeCoercion so the comparison coerces.
             Arc::new(crate::read::optimizers::ExistsInProjection),
+            // Reads a field off a Variant natively instead of serializing the
+            // whole struct to JSON text and re-parsing it. Before TypeCoercion
+            // so the `variant_get` / `json_to_pg_text` calls it splices in get
+            // coerced like any other UDF args.
+            Arc::new(crate::read::optimizers::VariantJsonAccessorPeephole),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
             Arc::new(crate::read::optimizers::VariantSelectRewriter),
         ];
