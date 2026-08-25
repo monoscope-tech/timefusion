@@ -560,7 +560,11 @@ impl SharedFoyerCache {
             metadata_memory_size_bytes: self.config.metadata_memory_size_bytes,
             metadata_disk_size_bytes: self.config.metadata_disk_size_bytes,
             l1_used_bytes: self.cache.memory().usage(),
-            l2_used_bytes: allocated_bytes(&self.config.cache_dir),
+            // A recursive `read_dir` + `metadata()` over the whole L2 cache
+            // directory — tens of thousands of files at the configured disk
+            // size — and `timefusion_stats` is a pgwire query, so this runs on
+            // a runtime worker every time anything reads the stats table.
+            l2_used_bytes: crate::support::without_blocking_the_worker(|| allocated_bytes(&self.config.cache_dir)),
             entry_count: self.cache.memory().entries(),
             evictions: self.evictions.load(Ordering::Relaxed),
         }
