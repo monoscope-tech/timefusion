@@ -165,3 +165,36 @@ Named risks, in the order I would check them:
 `maintenance_coordinator_unit_timed_out` for `SealedConsolidation`/`HotPacking`
 falls to ~zero over a quiet hour, and no `wave_bin_staged` line reports a
 `permit_wait_ms` above a few seconds — because a unit that waited never claimed.
+
+---
+
+## Shipped 2026-08-25 as `a90f881` (formatting fixed in `322463f`)
+
+Landed together with four sibling branches, deliberately: the preflight-floor fix
+makes declined units run WIDER (narrowest run 660 s against the 900 s deadline),
+so shipping it while the deadline was still being spent in a permit queue would
+have made timeouts worse. The two travel together or not at all.
+
+**CI on `a90f881`: Clippy, both test shards and E2E all PASSED**; the only
+failure was `cargo fmt --check`, which the auto-format workflow corrected in
+`322463f`. Worth recording because the local `make test` never ran — it was
+killed three times by memory pressure (32 GB box, ~127 MB free), so CI was the
+first full-suite run on this code.
+
+### The prediction to check, stated before reading anything
+
+**`compaction_permits_unavailable` climbs while
+`maintenance_coordinator_unit_timed_out` falls.** The change converts a 900 s
+timeout that commits NOTHING into a cheap refusal that frees the worker for
+rollup or dedup, so the queue is paid in refusals instead of in whole deadlines.
+
+Baseline being replaced, from the 90-minute window above: 46/46 staged bins
+waited 350-750 s to do 2.4 s of work; 50,100 worker-seconds against 86,400 of
+capacity — **58% of the maintenance pool** — with
+`maintenance_hygiene_tasks_retired` at **zero**.
+
+**If `compaction_permits_unavailable` stays at 0 while timeouts continue, the
+permit is not being taken where this change assumes it is** — that is the
+falsifier, and it should be read before any further tuning.
+
+Read it on a container with ≥2 h uptime; every counter here is process-scoped.
