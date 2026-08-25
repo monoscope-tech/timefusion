@@ -789,6 +789,44 @@ counters could not.
    reintroduce the churn stalls that dominated the first half of this
    investigation. Measure which is worse before trading one for the other.
 
+### THE FIX (2026-08-25, `f7378af`): fsync was freezing workers, and their queues with them
+
+Phase 1 named "workers are blocked, not busy". This is what was blocking them.
+
+`TaskJournal::checkpoint` does `write_all` + **`sync_all`** while holding the
+journal mutex, and it is called from **46 sites** — every claim, every
+completion, every retry, with 16 maintenance workers cycling. `compact`
+additionally serializes every live task (thousands) before its own fsync. All
+synchronous, all on tasks running on the shared runtime. `block.journal_hold.max_ms
+= 2,380` was measuring precisely this.
+
+The damage is not to the caller. A worker inside a blocking syscall cannot poll
+**any** of the tasks queued on it, so an fsync freezes unrelated work — a
+health probe, a timer, a client's connection setup. That is the whole distance
+between "maintenance does IO" and "`SELECT 1` costs seconds".
+
+`support::without_blocking_the_worker` runs such work through
+`tokio::task::block_in_place`, which hands the worker's remaining tasks to
+another thread *first*. Applied at three places: the journal fsync, the compact
+serialize+fsync, and inside `write_atomic_with` — the shared helper behind the
+storage sidecars, the rollup journal and WAL metadata, where `durable` costs two
+fsyncs. Outside a multi-thread runtime it calls straight through, so CLI
+subcommands and tests are unaffected. The mutex is still held across the IO:
+durability ordering is unchanged. `store_snapshot` was already on
+`spawn_blocking` and was left alone.
+
+**The test measures the right thing, which took two attempts.** One worker, a
+blocking task, a neighbour queued behind it: naive, the neighbour waits the full
+400 ms; through the helper it runs immediately (verified failing without the
+fix at 405 ms). The first version measured *timer lag* and passed even unfixed —
+tokio's time driver can be driven by the idle `block_on` thread, so timers keep
+firing while the worker is held. A probe that cannot see the defect is worse
+than no probe.
+
+**Verification, prod:** baseline **114 lag warns in 20 minutes (5.7/min)** on
+the pre-fix image. Post-deploy measurement of the identical window is recorded
+below.
+
 **Phase 2 — fix what Phase 1 names.** Deliberately unspecified. The failure mode
 to avoid is the one this session already hit twice: proposing a mechanism
 (a size limit; a witness rewrite) before measuring, then discovering the premise
