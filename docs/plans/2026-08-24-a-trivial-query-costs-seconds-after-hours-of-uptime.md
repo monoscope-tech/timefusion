@@ -23,19 +23,23 @@ later data overturned. The net result, as of 2026-08-24 22:00:
    Frequent (2 of 3 sampling windows), and it explains the external
    connect-only stalls.
 
-**The system-level finding, which is bigger than either:** this process **fails
-to wake a 500 ms timer on time by 0.3–2.9 s, several times a minute,
-continuously**, on 48 workers with the host 40 % idle. The auth stalls sit inside
-that distribution. Causation is unproven precisely *because* the lag never stops
-— an always-present cause cannot be correlated with an intermittent effect — so
-the next step is per-connection accept-to-startup timing inside the server, not
-more outside correlation.
+**The system-level finding, which is bigger than either — and is now FIXED
+(`f7378af`, 2026-08-25).** The process was failing to wake a 500 ms timer on
+time by 0.3–2.9 s, several times a minute, on 48 workers with the host 40 %
+idle. Cause: **`fsync` running on runtime worker threads.**
+`TaskJournal::checkpoint` fsyncs while holding the journal mutex from 46 call
+sites — **606,953 holds totalling 28 minutes of frozen-worker time in 7 hours**
+— and a worker inside a blocking syscall polls *none* of the tasks queued on it.
+Fixed by routing that IO through `block_in_place`
+(`support::without_blocking_the_worker`), also applied to `compact` and
+`write_atomic_with`. Prod, at matched load (~30): **5.7 → 1.75 lag warns/min,
+3.3× fewer.** Not zero, so other worker-blockers remain — `BlockWatch` is the
+tool for finding them.
 
 **Eliminated, each with the instrument built for it:** host load (44.0 → 178 ms
 versus 32.9 → 4,460 ms — both directions); the maintenance journal mutex (held a
 worker 2,380 ms with *zero* effect on query cost); Delta snapshot refresh (hit
-403 ms/call while `connect` sat at 305 ms); worker starvation (`scheduling_lag_ms`
-0–1 through every stall); swap (100 % full at all times, so it differentiates
+403 ms/call while `connect` sat at 305 ms); swap (100 % full at all times, so it differentiates
 nothing).
 
 **The title premise is FALSE.** A 7.15-hour process — longer-lived than the 5 h
@@ -826,9 +830,36 @@ tokio's time driver can be driven by the idle `block_on` thread, so timers keep
 firing while the worker is held. A probe that cannot see the defect is worse
 than no probe.
 
-**Verification, prod:** baseline **114 lag warns in 20 minutes (5.7/min)** on
-the pre-fix image. Post-deploy measurement of the identical window is recorded
-below.
+**Verification, prod — confirmed at matched load.**
+
+| | pre-fix (`18bcf8a`) | post-fix, 1st read | post-fix, **load-matched** (`44d07e1`) |
+|---|---|---|---|
+| lag warns / 20 min | **114** (5.7/min) | 45 (2.25/min) | **35 (1.75/min)** |
+| host load (15-min avg) | ~30 | 23.45 | **30.47** |
+| `journal_hold.avg_us` | 2,815 | **1,610** | |
+
+The first post-fix read was taken at load 23.45 and was therefore confounded —
+a 22 % lighter box could explain a lower rate on its own. The scheduled window
+landed at a **15-minute load average of 30.47, matching the baseline**, with the
+1-minute average at 38.84 — i.e. *equal or busier* — and measured **1.75/min
+against the baseline's 5.7/min**. Same load, **3.3× fewer stalls**, and below
+the pre-fix variance band (3.3–5.7/min). The reduction is attributable.
+
+The first 10 minutes after the deploy were discarded before measuring — a fresh
+process throws a lag burst during WAL replay (`inproc auth_ms` read 1,252 ms at
+41 s of uptime), and counting that would have read *worse* than reality.
+
+**And warns did not go to zero, so other blockers remain.** 1.75/min means
+workers are still being held by something this fix does not cover — sync
+object-store metadata reads, zstd paths outside `write_atomic_with`, or
+CPU-bound work that never yields. `BlockWatch` is the instrument for finding
+them: wrap a suspect, read `block.<name>.max_ms`. That is the next session's
+work, not a reason to discount this one.
+
+Note on comparing the two runs: use `avg_us` and rates, **never `max_ms`**. The
+maxes are monotone high-water marks, so the 19-minute process reads lower than
+the 7-hour one for reasons that have nothing to do with the fix — the same
+instrument-shape trap recorded above.
 
 ### The premise, settled at 7.15 hours — the age the plan was written about
 
