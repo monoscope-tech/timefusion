@@ -292,6 +292,13 @@ SELECT variant_to_json(json_to_variant('{"a": {"b": {"c": 1}}}'))->>'a';
 ----
 {"b":{"c":1}}
 
+# In a predicate, which is where monoscope actually puts it. The rewrite has to
+# be position-independent — an expression is an expression.
+query B
+SELECT variant_to_json(json_to_variant('{"system": {"device": "disk0"}}'))->'system'->>'device' = 'disk0';
+----
+true
+
 # === Arrow operators on JSON strings (via datafusion-functions-json) ===
 
 # Arrow operators on JSON strings
