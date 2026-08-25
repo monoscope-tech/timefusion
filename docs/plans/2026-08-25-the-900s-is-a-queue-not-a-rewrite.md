@@ -133,6 +133,33 @@ branch (`:1837`) returns before touching anything, precisely so the planner's
 **cannot** be reset by the planner, and the prod trace's monotone 1 → 2 is one
 surviving record. The sibling's hypothesis was disfavoured; it is now excluded.
 
+## Status of the code: UNVERIFIED — nothing was compiled
+
+The machine was at load ~200-240 and a cold `cargo check --lib` did not reach
+this crate before it was killed, so **nothing here has been compiled, linted or
+run.** The change is four edits and one test; what must pass before it merges:
+
+- `cargo lint` (0 warnings) and `cargo fmt` — comment reflow is the likeliest
+  complaint, and none of the new code is fmt-stable by inspection.
+- `cargo nextest run --lib a_packing_unit_never_claims_a_slot_it_cannot_start`
+  — **1 selected, 1 passed**. Needs the `timefusion-tests` MinIO bucket.
+- `cargo nextest run --lib wave_staging_permits_are_independent_of_heavy_rewrite_permits`
+  — the neighbouring test that pins the permit pool's identity and size.
+
+Named risks, in the order I would check them:
+
+1. `run_coordinator_compaction_once` was private and `mod maintain` is a child
+   module, so the test could not have called it; it is now `pub(crate)`, the
+   same visibility its `run_coordinator_dedup_once` sibling already has.
+2. `HotStageOptions` lost its `#[derive(Clone)]` because an
+   `OwnedSemaphorePermit` is not `Clone`. No call site clones it (three
+   constructions, one destructure), but the compiler is the authority.
+3. The test's **last** assertion — that the same turn claims once a permit is
+   free — is the one most likely to need adjusting: it depends on
+   `claim_next` admitting a 3-day-old `SealedConsolidation` unit in a scratch
+   journal. The three assertions before it are the discriminating ones and do
+   not depend on it.
+
 ## Done when
 
 `maintenance_coordinator_unit_timed_out` for `SealedConsolidation`/`HotPacking`

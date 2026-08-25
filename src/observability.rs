@@ -942,6 +942,15 @@ atomic_stats! {
     /// permanently-zero repair backlog on one table while this climbs means the
     /// other table is monopolising the permit.
     repair_ticks_yielded,
+    /// Packing/consolidation turns that declined to CLAIM because no
+    /// `light_rewrite_sem` permit was free. The alternative was claiming anyway
+    /// and blocking inside `stage_hot_bin` — prod 2026-08-25 spent 350-750s of
+    /// every 900s deadline exactly there, so a high number here is the queue
+    /// being paid in refusals (cheap, worker freed for rollup) instead of in
+    /// timeouts (a whole deadline, nothing committed). It is a saturation
+    /// gauge, not a fault: read it against
+    /// `maintenance_coordinator_unit_timed_out`, which it is meant to replace.
+    compaction_permits_unavailable,
     /// Dashboard aggregates served from a rollup, split by how much of the
     /// window the rollup owned. The OTel counters carry the same numbers but
     /// cannot be read back in-process, and these two are the only signal that
