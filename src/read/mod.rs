@@ -1878,8 +1878,11 @@ mod tests {
     #[test_case::test_case(&[(&["c"], &[30], &[Some(4)]), (&["c"], &[30], &[None])] ; "and in the other arrival order")]
     #[test_case::test_case(&[(&["a", "a", "a"], &[10, 10, 10], &[Some(1), Some(3), Some(2)]), (&["a"], &[10], &[Some(9)]), (&["b"], &[20], &[Some(1)])] ; "many versions in one batch, then a later winner")]
     #[test_case::test_case(&[(&["a"], &[10], &[Some(1)]), (&["b"], &[20], &[Some(1)]), (&["a"], &[10], &[Some(2)]), (&["b"], &[20], &[Some(2)])] ; "two keys updated alternately")]
-    // A TIE across the compaction: `beats` is strict, so the incumbent holds and
-    // the compaction must retain that same incumbent, not the equal challenger.
+    // A TIE across the compaction. `beats` is strict, so the equal challenger is
+    // never applied and the incumbent's row is the only one retained. The two
+    // versions are indistinguishable in every observable column, so what this
+    // pins is that a tie at the boundary loses no key and emits no duplicate —
+    // not which of the two identical rows survived.
     #[test_case::test_case(&[(&["a"], &[10], &[Some(5)]), (&["a"], &[10], &[Some(5)])] ; "an equal stamp does not unseat the incumbent")]
     fn a_winner_compaction_changes_no_answer(spec: &[BatchSpec<'_>]) {
         let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
