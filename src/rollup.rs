@@ -2850,7 +2850,7 @@ mod tests {
             "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(coalesce(status_code, level)::text, 'null') AS sc, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         );
-        assert!(matches!(route_for(&state, &sql).await, Err(_)), "an unservable group-by must report a reason, not fall through silently");
+        assert!(route_for(&state, &sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
     }
 
     /// monoscope's log-explorer latency widget, verbatim down to the `HAVING
