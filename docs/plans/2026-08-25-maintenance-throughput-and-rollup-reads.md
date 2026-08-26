@@ -625,6 +625,33 @@ still holds coverage down.
 - jemalloc `frag_pct 49.3`, `retained 1,084 GB` (RSS 31 GB, host has 109 GB free).
 - Ingest/flush **healthy**: pressure 19%, 0 backpressure, 0 failed flushes.
 
+## OPEN ITEMS as of 2026-08-26 — what is left, and why it is left
+
+Canonical list. Each row: the item, why it is not done, and what unblocks it.
+Nothing here is forgotten work; every row is blocked, deferred on a stated
+condition, or waiting on wall clock.
+
+| # | Item | Why not done | Unblocked by |
+|---|---|---|---|
+| 25 | Verify the repair converged; delete `DAMAGED_CELLS` | **Physics.** 71 forced pairs x ~21-min base units against a live backlog. Mechanism verified (`forced=71`, rebuilds +703, `pending_base_rollup` draining 2752→2338 — first drain all day); no sample pair converged yet | wall clock; a monitor watches the reference cell |
+| 27 | Attribute `unwalkable_source` from real traffic | **Not deployed yet.** The `rollup_declined_shape` warn is pushed but prod has not picked it up, so there are no logs. Attribution *by construction* was done instead | prod picking up the diagnostics |
+| 26 | Audit the measures the sweep never checked | **Scoped deliberately** to `request_count`, which answered the question asked (are cells short on ROWS). `CLEAN_LIST.csv` therefore reads as a bill of health and is not one | in progress |
+| 24 | `materialized_measures` checks schema presence, not value presence | Found while verifying #14, not while looking. Affects **two** measures now (`duration_digest`, `service_name_hll`) | in progress |
+| 23 | No read-side guard for a cell short on ROWS | Architecture question with a real fail-closed cost. Its motivating population may be mostly #24 + the already-fixed write path | #24's finding sizes it |
+| 18 | Variant projection below DedupExec | **Deprioritised twice.** Real (~2-4s at 24h) but touches dedup ordering, which is correctness-critical and produced three undercount incidents today. Its safer sibling (#17, 4.2x measured) shipped instead | everything else landing + a quiet prod; and proving the dedup keys do not depend on dropped columns |
+| 15 | `server_error_count` counts outbound client spans | **Deferred on stated preconditions**, unchanged: a filter change alters what the measure MEANS, so it must orphan the tier | repair converged + verified, backlog drained |
+| 28 | The `countif` near-miss | **Entangled with 15**, not hard. The one-line dashboard fix was prepared and REVERTED — it would make a tenth widget adopt the scope convention 15 questions, for ~2 declines/hr | resolved with 15, together |
+| 6 | `level` as a dimension | **Deferred on stated preconditions**, unchanged: a DIMENSION change alters the grouping of every stored row, so no per-cell mechanism rescues it. Unavoidable fleet rebuild | repair converged + verified, backlog drained, quiet process |
+
+**The defers (6, 15) stand.** Their preconditions have not arrived; only time has
+passed. They are decisions, not open questions — do not re-litigate them, check
+the conditions.
+
+**Pattern worth naming:** four of these rows (23, 24, 26, 27) exist because
+verifying a fix found a *different* problem. None was on any list this morning.
+The fixes were mostly straightforward; the expensive part was discovering that
+"clean" measurements were not.
+
 ## 2026-08-26 — short-cell repair DEPLOYED, and two spec changes DEFERRED
 
 **Damage, measured not estimated:** 320 comparable (project, date) pairs across 15
