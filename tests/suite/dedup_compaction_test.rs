@@ -2497,7 +2497,13 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
     let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
     let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
 
-    for (i, (duration, offset)) in [(Some(100i64), 17i64), (None, 61_000_000), (Some(300), 3_661_000_000)].iter().enumerate() {
+    // Spread across >= 4h: the interior must clear `MIN_INTERIOR_BUCKETS = 2`
+    // grains (2h at the 1h tier) or `TinyInterior` declines first.
+    for (i, (duration, offset)) in
+        [(Some(100i64), 17i64), (None, 61_000_000), (Some(300), 3_661_000_000), (Some(400), 7_261_000_000), (Some(500), 14_461_000_000)]
+            .iter()
+            .enumerate()
+    {
         let batch = json_to_batch(vec![serde_json::json!({
             "timestamp": yesterday_noon + offset, "id": format!("y{i}"), "name": "op", "project_id": project_id, "hashes": [],
             "summary": ["count fixture"], "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(yesterday_noon + offset).unwrap().date_naive().to_string(),
@@ -2512,7 +2518,11 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
     );
     db.run_maintenance_units(1024).await?;
 
-    let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
+    // Bound to YESTERDAY, where the fixture's rows are and the tier is certified.
+    // The refusal test this was inverted from ran to `midnight + 2h`, reaching into
+    // the live frontier: the certified interior is then a tiny slice of a ~14h
+    // window and `TinyInterior` declines before the guarded count is considered.
+    let (lo, hi) = (yesterday_noon + 17, midnight);
     let query = format!(
         "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c \
          FROM otel_logs_and_spans WHERE project_id = '{project_id}' \
