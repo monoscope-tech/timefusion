@@ -1536,7 +1536,9 @@ fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mu
         // Only a rename-free projection may be walked through. `hash AS name`
         // would otherwise make the matcher read a declared dimension off the
         // wrong source column and answer with the wrong values.
-        LogicalPlan::Projection(projection) if projection.expr.iter().all(|expr| matches!(expr, Expr::Column(_))) => source_and_filters(&projection.input, filters),
+        LogicalPlan::Projection(projection) if projection.expr.iter().all(|expr| matches!(expr, Expr::Column(_))) => {
+            source_and_filters(&projection.input, filters)
+        }
         LogicalPlan::Filter(filter) => {
             filters.push(filter.predicate.clone());
             source_and_filters(&filter.input, filters)
