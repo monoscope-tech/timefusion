@@ -771,6 +771,14 @@ impl TaskJournal {
     /// recovery, and re-enqueueing is idempotent at the journal.
     const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v2";
 
+    /// One-shot re-enqueue of the cells the 2026-08-25 derived-witness bug left
+    /// SHORT on disk. Distinct from `ORPHAN_REPAIR_MIGRATION` — that one bounded
+    /// by a DATE WINDOW, which re-enqueued every tier of every in-window day. The
+    /// damage here is a measured list of 81 (project, date) pairs out of 320
+    /// comparable, so a window would drag 236 clean pairs through a queue that
+    /// was measured GROWING at ~+80 units/hr with an 11-day-old starved tail.
+    const DAMAGE_REPAIR_MIGRATION: &'static str = "__maintenance_damage_repair_v1";
+
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
         let wal_path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.wal");
@@ -995,6 +1003,24 @@ impl TaskJournal {
     /// first — and if that is `otel_metrics`, the repair fires for a source that
     /// does not need it and NEVER runs for `otel_logs_and_spans`, which is the
     /// one whose spec changed. A silent no-op that looks like success.
+    /// Claim the one-shot damage repair for `source`. Same cursor discipline as
+    /// [`Self::repair_orphaned_coverage_once`]: the cursor is persisted BEFORE the
+    /// caller enqueues, so a crash cannot loop, and the cost of that choice is
+    /// that a pass which claims and then fails to enqueue burns the one-shot.
+    /// Bumping `DAMAGE_REPAIR_MIGRATION` is the intended recovery; re-enqueueing
+    /// is idempotent at the journal.
+    pub fn repair_damaged_cells_once(&mut self, source: &str) -> Option<u64> {
+        let key = format!("{}:{source}", Self::DAMAGE_REPAIR_MIGRATION);
+        let previous = self.snapshot.source_cursors.get(&key).copied().unwrap_or_default();
+        if previous >= 1 {
+            return None;
+        }
+        self.snapshot.source_cursors.insert(key.clone(), 1);
+        self.dirty_cursors.insert(key);
+        let _ = self.checkpoint();
+        Some(previous)
+    }
+
     pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> Option<u64> {
         let key = format!("{}:{source}", Self::ORPHAN_REPAIR_MIGRATION);
         let previous = self.snapshot.source_cursors.get(&key).copied().unwrap_or_default();
@@ -5956,6 +5982,28 @@ mod tests {
         }
         let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
         assert_eq!(reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
+    }
+
+    /// The damage repair is a SEPARATE one-shot from the orphan repair. If they
+    /// shared a cursor, claiming one would silently consume the other — and the
+    /// damage list is the thing that fixes ~211M rows the derived-witness bug
+    /// left short on disk, so consuming it as a no-op would look like success.
+    #[test]
+    fn the_damage_repair_is_a_separate_one_shot_from_the_orphan_repair() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        {
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "orphan repair claims");
+            assert_eq!(
+                journal.repair_damaged_cells_once("otel_logs_and_spans"),
+                Some(0),
+                "the damage repair must NOT have been consumed by the orphan repair's cursor"
+            );
+            assert_eq!(journal.repair_damaged_cells_once("otel_logs_and_spans"), None, "second call in the same process must not");
+            assert_eq!(journal.repair_damaged_cells_once("otel_metrics"), Some(0), "a different source claims independently");
+        }
+        let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
+        assert_eq!(reloaded.repair_damaged_cells_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with

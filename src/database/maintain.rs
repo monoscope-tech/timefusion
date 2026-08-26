@@ -45,6 +45,110 @@ fn fold_fleet_gauge(previous: u64, value: u64, seeded_by_real: bool, ramping: bo
 const ORPHAN_REPAIR_FROM: &str = "2026-08-01";
 const ORPHAN_REPAIR_BEFORE: &str = "2026-08-22";
 
+/// The (project, date) cells the 2026-08-25 derived-witness bug left SHORT, and
+/// the three it left OVER-counted. Measured 2026-08-26 by comparing every tier
+/// cell against a raw recount: 320 comparable pairs, 81 disagreeing, ~211M rows
+/// missing from the 1h tier. The full table is in the plan of record.
+///
+/// A LIST rather than a date window on purpose. The window form above re-enqueues
+/// every tier of every in-window day; here that would drag 236 CLEAN pairs into a
+/// queue measured growing at ~+80 units/hr with an 11-day-old starved tail. The
+/// list is ugly and it is bounded, which is the trade this queue needs.
+///
+/// Forcing a pair re-derives EVERY tier for it, which is what the two shapes need:
+/// 16 pairs have a short 1m BASE (the 1h tier faithfully reproduced it, so fixing
+/// 1h alone would not help), and the 3 over-counts have a healthy base and need a
+/// rebuild rather than a fill. Ordering is handled for us — the planner enqueues
+/// derived after base, and since 2026-08-25 a derived unit whose base does not
+/// tile its slice RETRIES instead of publishing short.
+///
+/// Delete this once the repair has converged; it is a one-shot, gated on
+/// `DAMAGE_REPAIR_MIGRATION`, and re-running it after convergence is wasted work
+/// rather than damage.
+const DAMAGED_CELLS: &[(&str, &str)] = &[
+    ("00000000-0000-0000-0000-000000000000", "2026-08-05"),
+    ("00000000-0000-0000-0000-000000000000", "2026-08-06"),
+    ("00000000-0000-0000-0000-000000000000", "2026-08-13"),
+    ("00000000-0000-0000-0000-000000000000", "2026-08-22"),
+    ("00000000-0000-0000-0000-000000000000", "2026-08-24"),
+    ("00000000-0000-0000-0000-000000000000", "2026-08-25"),
+    ("00000000-0000-0000-0000-000000000000", "2026-08-26"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-01"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-02"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-03"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-04"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-05"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-06"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-10"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-11"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-13"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-14"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-15"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-20"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-24"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-25"),
+    ("28f62f01-46a1-400e-8195-da7bc3505b5b", "2026-08-26"),
+    ("2a39bd83-edd9-49fe-883f-ba59b4777ff7", "2026-08-22"),
+    ("2a39bd83-edd9-49fe-883f-ba59b4777ff7", "2026-08-24"),
+    ("2a39bd83-edd9-49fe-883f-ba59b4777ff7", "2026-08-25"),
+    ("2a39bd83-edd9-49fe-883f-ba59b4777ff7", "2026-08-26"),
+    ("5032d82e-b2f5-45f2-961f-23f639014960", "2026-08-25"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-03"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-04"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-05"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-07"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-09"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-10"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-14"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-17"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-24"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-25"),
+    ("6297304f-89c0-48a9-9b5c-20bcac61f54e", "2026-08-26"),
+    ("8100121c-b47f-4ec0-a517-a12478f46239", "2026-08-22"),
+    ("8100121c-b47f-4ec0-a517-a12478f46239", "2026-08-24"),
+    ("8100121c-b47f-4ec0-a517-a12478f46239", "2026-08-25"),
+    ("8100121c-b47f-4ec0-a517-a12478f46239", "2026-08-26"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-01"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-02"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-04"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-07"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-08"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-09"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-10"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-11"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-12"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-13"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-14"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-15"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-24"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-25"),
+    ("87576849-4941-49d3-a15d-680fef88a1a8", "2026-08-26"),
+    ("94c5dc1f-88d4-41f6-a86e-ce87aa668cd7", "2026-08-24"),
+    ("94c5dc1f-88d4-41f6-a86e-ce87aa668cd7", "2026-08-25"),
+    ("94c5dc1f-88d4-41f6-a86e-ce87aa668cd7", "2026-08-26"),
+    ("98fdd4f3-3544-4087-ad91-1e7ca95aba29", "2026-08-24"),
+    ("98fdd4f3-3544-4087-ad91-1e7ca95aba29", "2026-08-25"),
+    ("98fdd4f3-3544-4087-ad91-1e7ca95aba29", "2026-08-26"),
+    ("be87ebc1-08b9-4293-a390-283460fa6202", "2026-08-24"),
+    ("be87ebc1-08b9-4293-a390-283460fa6202", "2026-08-25"),
+    ("be87ebc1-08b9-4293-a390-283460fa6202", "2026-08-26"),
+    ("d062e010-e3d0-4673-8dfe-d652d6826f49", "2026-08-24"),
+    ("d062e010-e3d0-4673-8dfe-d652d6826f49", "2026-08-25"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-03"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-04"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-05"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-06"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-07"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-08"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-10"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-13"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-14"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-15"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-24"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-25"),
+    ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-26"),
+];
+
 fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
 }
@@ -906,6 +1010,31 @@ impl Database {
                     before = ORPHAN_REPAIR_BEFORE,
                     event = "rollup_orphaned_coverage_repair",
                     "re-enqueueing coverage a spec change orphaned and the planner cannot see"
+                );
+            }
+            // The measured damage list, forced the same way and for the same
+            // reason: these cells HAVE tier output, so `missing_tiers` never sees
+            // them and no invalidation fires for a sealed day. Unlike the window
+            // repair above this is a bounded set, so it cannot flood the queue.
+            if let Some(cursor_was) = self.journal().repair_damaged_cells_once(&source) {
+                let mut forced = 0usize;
+                for (project, date) in DAMAGED_CELLS {
+                    let Ok(date) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") else { continue };
+                    // Only cells this source actually has candidates for — a pair
+                    // outside the retention horizon is not resurrectable and must
+                    // not be counted as forced.
+                    if candidates.contains(&((*project).to_string(), date)) {
+                        missing_tiers.insert(((*project).to_string(), date), (0..schema.rollups.len()).collect());
+                        forced += 1;
+                    }
+                }
+                warn!(
+                    source,
+                    forced,
+                    listed = DAMAGED_CELLS.len(),
+                    cursor_was,
+                    event = "rollup_damaged_cell_repair",
+                    "re-enqueueing cells the derived-witness bug published short"
                 );
             }
             // Publish the holes so `claim_next` can rank them ahead of days that
