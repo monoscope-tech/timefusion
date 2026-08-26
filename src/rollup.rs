@@ -1553,6 +1553,17 @@ fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mu
             "Projection: {}",
             projection.expr.iter().filter(|expr| !matches!(expr, Expr::Column(_))).take(4).map(ToString::to_string).collect::<Vec<_>>().join(", ")
         ))),
+        // A derived table or CTE stops the walk at its ALIAS, which names
+        // nothing an operator could act on — every shape in the class printed
+        // `SubqueryAlias: f` and stopped. So report what is under it too, which
+        // also separates the two sub-populations: an inner refusal is a genuinely
+        // unroutable shape, while a walkable inner means the requalification is
+        // the ONLY blocker.
+        LogicalPlan::SubqueryAlias(alias) => Err(truncated(&format!(
+            "SubqueryAlias: {} over {}",
+            alias.alias,
+            source_and_filters(&alias.input, &mut Vec::new()).map_or_else(|inner| inner, |table| format!("a walkable scan of {table}"))
+        ))),
         plan => Err(truncated(&plan.display().to_string())),
     }
 }
@@ -3164,16 +3175,19 @@ mod tests {
             "WITH f AS (SELECT floor(extract(epoch from timestamp) / 60)::bigint AS bucket_idx FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) \
              SELECT bucket_idx, count(*) FROM f GROUP BY bucket_idx"
         ),
-        "Projection"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
+        "SubqueryAlias: f over Projection: CAST(floor"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
     #[test_case::test_case(
         &format!(
             "SELECT count(*) FROM (SELECT timestamp FROM {SOURCE} WHERE project_id = 'a' AND {WINDOW} \
              UNION ALL SELECT timestamp FROM {SOURCE} WHERE project_id = 'b' AND {WINDOW}) u"
         ),
-        "Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
+        "SubqueryAlias: u over Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
     #[test_case::test_case(
         &format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d"),
         "Aggregate"; "an inner DISTINCT, which plans as a second Aggregate")]
+    #[test_case::test_case(
+        &format!("SELECT count(*) FROM (SELECT timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) s"),
+        "over a walkable scan of otel_logs_and_spans"; "a derived table whose ALIAS is the only blocker — the one shape a widening could reach")]
     #[tokio::test]
     async fn an_unwalkable_shape_is_counted_and_names_the_node_that_refused(sql: &str, expected_node: &str) {
         let state = session().await;
