@@ -869,6 +869,9 @@ impl Database {
             // changes `generation_id`, every slice built before it keeps the old
             // value, the READ path refuses those dates, and the planner counts
             // them covered and never re-derives them. They stay dark forever.
+            // ADDING a measure no longer does that (see `generation_id`); this
+            // repairs the cells the whole-spec identity already orphaned, and
+            // still covers a REDEFINED measure, which orphans by design.
             //
             // Measured 2026-08-24 on `dashboard_1m_v3`: 37 usable of 461 cells in
             // the 35-day window — 92% of the tier unreadable — while
@@ -1899,8 +1902,18 @@ impl Database {
         // when that day is rebuilt.
         let input_schema = if derived { get_schema(&from).unwrap_or(source_schema) } else { source_schema };
         let tier_dedup = derived.then(|| crate::rollup::rollup_tier_dedup(input_schema)).flatten();
-        let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp);
         let target_schema = get_schema(&key.physical_table).ok_or_else(|| anyhow::anyhow!("rollup target schema missing"))?;
+        // What these files can be READ for, which is not what the spec declares
+        // — see `materialized_measures`. Computed against the DECLARED target
+        // schema rather than the writer's, because `evolve_table_columns` below
+        // widens the physical table to the declared one and `?`-aborts the unit
+        // if it cannot: past that point the writer's schema holds every declared
+        // field, so the two agree.
+        //
+        // It is computed here, before the generation, because the generation is
+        // now taken over exactly this set — see `generation_id`.
+        let materialized = crate::rollup::materialized_measures(spec, derived, &present_columns, &target_schema.schema_ref());
+        let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp, Some(&materialized));
         let default_shard_keys = || ["project_id".to_owned(), "timestamp".to_owned()].into_iter().chain(spec.dimensions.iter().cloned()).collect::<Vec<_>>();
         let mut shard_keys = if derived { default_shard_keys() } else { source_schema.dedup_keys.clone() };
         if shard_keys.is_empty() {
@@ -2001,6 +2014,16 @@ impl Database {
         let stage_started = std::time::Instant::now();
 
         let target_ref = self.get_or_create_table(&key.project_id, &key.physical_table).await?;
+        // Declaring a measure does NOT widen the tier table, and the writer
+        // conforms to the table as it exists — so a newly declared measure was
+        // dropped from files written AFTER the declaration too, not merely
+        // absent from older ones. `duration_digest` was declared 2026-08-22 and
+        // first carried a value on 08-24, when the column happened to appear;
+        // every date 08-14..08-23 reads back `count(duration_digest) = 0`
+        // fleet-wide. Widen before the writer takes its schema, or this
+        // reproduces the bug it is fixing. Additive, nullable, metadata-only,
+        // and a no-op on every subsequent unit.
+        crate::database::evolve_table_columns(&target_ref, target_schema.schema_ref().fields()).await?;
         let staging_table = target_ref.read().await.clone();
         let stage_store = staging_table.log_store().object_store(None);
         let (batches, sorted) = self.sort_flush_group(target_schema, batches, UnsortedFallback::Forbid).await?;
@@ -2013,10 +2036,6 @@ impl Database {
         for batch in batches {
             writer.write(deltalake::kernel::schema::cast_record_batch(&batch?, arrow_schema.clone(), true, true)?).await?;
         }
-        // What these files can be READ for, which is not what the spec declares
-        // — see `materialized_measures`. Computed against the writer's schema
-        // because that is the one `cast_record_batch` above conformed to.
-        let materialized = crate::rollup::materialized_measures(spec, derived, &present_columns, &arrow_schema);
         let mut adds = writer.flush().await?.into_iter().map(Action::Add).collect::<Vec<_>>();
         let stage_ms = stage_started.elapsed().as_millis() as u64;
         let commit_started = std::time::Instant::now();
@@ -3827,23 +3846,29 @@ impl Database {
                     // the single most consequential silent skip in the rollup
                     // system.
                     //
-                    // `generation_id` hashes the whole spec, so ADDING A MEASURE
-                    // invalidates every slice built before it. The read path then
-                    // answers `not_built` for those dates forever, while
-                    // `rollup_coverage_contiguity` still reports 30 days because
-                    // the census counts DATE PARTITIONS, not generation matches.
-                    // A spec change therefore strips read coverage from the whole
-                    // history and no gauge moves. `duration_digest` on 2026-08-22
+                    // `generation_id` used to hash the WHOLE spec, so ADDING A
+                    // MEASURE invalidated every slice built before it. The read
+                    // path then answered `not_built` for those dates forever,
+                    // while `rollup_coverage_contiguity` still reported 30 days
+                    // because the census counts DATE PARTITIONS, not generation
+                    // matches — a spec edit stripped read coverage from the whole
+                    // history and no gauge moved. `duration_digest` on 2026-08-22
                     // is exactly that shape.
                     //
-                    // Counting it does not fix it — the cure is either a rebuild
-                    // or an identity that tolerates additive change — but it makes
-                    // the cost of a spec edit visible at the moment it is paid.
+                    // The identity now tolerates additive change: it is taken
+                    // over the measures this cell MATERIALIZED, so it still
+                    // rejects a REDEFINED measure and no longer rejects a cell
+                    // merely for predating a new one. The counter stays, because
+                    // a rejection is still coverage that exists on disk and
+                    // cannot be used.
                     if !complete {
                         fate(UnverifiableFate::JournalIncomplete);
                         continue;
                     }
-                    if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp) != generation {
+                    let measures =
+                        measures_by_identity.get(&(project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows)).cloned().flatten();
+                    let restrict = measures.as_ref().map(|names| names.iter().cloned().collect::<Vec<_>>());
+                    if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp, restrict.as_deref()) != generation {
                         fate(UnverifiableFate::StaleGeneration);
                         stale_generation += 1;
                         continue;
@@ -3852,8 +3877,6 @@ impl Database {
                         fate(UnverifiableFate::QueuedForRepublish);
                         witnessless.push((project_id.clone(), slice));
                     }
-                    let measures =
-                        measures_by_identity.get(&(project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows)).cloned().flatten();
                     // Past every readability filter, so this slice is exactly
                     // what the read path will serve — and therefore exactly what
                     // the ledger may claim.

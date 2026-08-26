@@ -9596,6 +9596,48 @@ fn date_partition_window(filters: &[Expr]) -> Option<(i64, i64)> {
     })
 }
 
+/// Widen a live table's STORED Delta schema to hold every field of `want` it
+/// lacks, by committing a ZERO-ROW batch of only the missing fields under
+/// `SchemaMode::Merge`. Metadata-only: it unions the columns without writing
+/// data or rewriting rows, and it is a no-op once they exist — so a caller may
+/// run it on every pass rather than remembering whether it has.
+///
+/// Added fields are forced NULLABLE. `Merge` cannot add a NOT NULL column to a
+/// table that already has rows, and every reader here null-fills a column a
+/// file lacks (`slice_input_sql`), which is what makes the addition safe
+/// against concurrent readers. Two writers racing this both commit zero-row
+/// merges; the loser either no-ops on the reloaded schema or resolves as an
+/// ordinary append conflict.
+pub(crate) async fn evolve_table_columns(table_ref: &Arc<RwLock<DeltaTable>>, want: &arrow_schema::Fields) -> Result<Vec<String>> {
+    let stored: HashSet<String> = { table_ref.read().await.snapshot()?.schema().fields().map(|f| f.name().to_string()).collect() };
+    let missing: Vec<arrow_schema::FieldRef> =
+        want.iter().filter(|f| !stored.contains(f.name())).map(|f| Arc::new(f.as_ref().clone().with_nullable(true))).collect();
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns = missing.iter().map(|f| arrow::array::new_empty_array(f.data_type())).collect();
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(missing.clone())), columns)?;
+    let table = { table_ref.read().await.clone() };
+    table
+        .write(vec![batch])
+        .with_save_mode(deltalake::protocol::SaveMode::Append)
+        .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
+        .await
+        .map_err(|e| anyhow::anyhow!("schema-merge commit failed: {e}"))?;
+
+    // Re-read from the log rather than trusting the write: the whole point is
+    // that storage, not our intent, carries the columns.
+    let after: HashSet<String> = {
+        let mut guard = table_ref.write().await;
+        guard.load().await?;
+        guard.snapshot()?.schema().fields().map(|f| f.name().to_string()).collect()
+    };
+    let added: Vec<String> = missing.iter().map(|f| f.name().clone()).collect();
+    let still: Vec<&String> = added.iter().filter(|name| !after.contains(*name)).collect();
+    anyhow::ensure!(still.is_empty(), "schema merge committed but columns are still absent from the stored schema: {still:?}");
+    Ok(added)
+}
+
 /// What [`Database::migrate_add_columns`] did.
 pub struct ColumnMigrationReport {
     pub stored_before: usize,
@@ -9612,8 +9654,8 @@ impl Database {
     /// first, then YAML may follow. Mechanism: commit a zero-row batch carrying only the new
     /// columns under `SchemaMode::Merge`. That unions them without writing data or rewriting
     /// rows. Columns already present are skipped, so a half-finished run can simply be re-run.
+    /// [`evolve_table_columns`] is the mechanism; this is the type-string front end for the CLI.
     pub async fn migrate_add_columns(&self, table_name: &str, adds: &[(String, String)], dry_run: bool) -> Result<ColumnMigrationReport> {
-        use arrow::array::{ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray};
         use arrow_schema::{DataType, Field, TimeUnit};
 
         let table_ref = self.get_or_create_unified_table(table_name).await?;
@@ -9627,14 +9669,11 @@ impl Database {
             return Ok(report(stored.len(), Vec::new()));
         }
 
-        let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = missing
+        let fields: Vec<Field> = missing
             .iter()
             .map(|(n, t)| match t.as_str() {
-                "timestamp" => Ok((
-                    Field::new(n, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
-                    Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()).with_timezone("UTC")) as ArrayRef,
-                )),
-                "boolean" => Ok((Field::new(n, DataType::Boolean, true), Arc::new(BooleanArray::from(Vec::<bool>::new())) as ArrayRef)),
+                "timestamp" => Ok(Field::new(n, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)),
+                "boolean" => Ok(Field::new(n, DataType::Boolean, true)),
                 // The types a ROLLUP MEASURE is actually made of. Without them
                 // this command could not widen a tier at all — counts are Int64,
                 // sums/min/max Int64 or Float64, and `tdigest`/`hll` states are
@@ -9646,40 +9685,20 @@ impl Database {
                 // The doc block on `run_migrate_columns_cli` already states the
                 // rule — "only once every live table has the columns may the
                 // YAML declare them" — and it was unfollowable for a measure.
-                "bigint" => Ok((Field::new(n, DataType::Int64, true), Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())) as ArrayRef)),
-                "double" => Ok((Field::new(n, DataType::Float64, true), Arc::new(arrow::array::Float64Array::from(Vec::<f64>::new())) as ArrayRef)),
-                "binary" => Ok((Field::new(n, DataType::Binary, true), Arc::new(arrow::array::BinaryArray::from(Vec::<&[u8]>::new())) as ArrayRef)),
+                "bigint" => Ok(Field::new(n, DataType::Int64, true)),
+                "double" => Ok(Field::new(n, DataType::Float64, true)),
+                "binary" => Ok(Field::new(n, DataType::Binary, true)),
                 other => anyhow::bail!("unsupported column type '{other}' (expected timestamp|boolean|bigint|double|binary)"),
             })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .unzip();
+            .collect::<Result<Vec<_>>>()?;
         // AFTER the type mapping, so a dry run rejects a typo instead of
         // reporting work it would then fail to do. `--dry-run` exists to be
         // trusted before a production migration.
         if dry_run {
             return Ok(report(stored.len(), missing.iter().map(|(n, _)| n.clone()).collect()));
         }
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)?;
-
-        let t = { table_ref.read().await.clone() };
-        t.write(vec![batch])
-            .with_save_mode(deltalake::protocol::SaveMode::Append)
-            .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
-            .await
-            .map_err(|e| anyhow::anyhow!("schema-merge commit failed: {e}"))?;
-
-        // Re-read from the log rather than trusting the write: the whole point
-        // is that storage, not our intent, carries the columns.
-        let after: Vec<String> = {
-            let mut g = table_ref.write().await;
-            g.load().await?;
-            g.snapshot()?.schema().fields().map(|f| f.name().to_string()).collect()
-        };
-        let added: Vec<String> = missing.iter().map(|(n, _)| n.clone()).collect();
-        let still: Vec<&String> = added.iter().filter(|n| !after.contains(n)).collect();
-        anyhow::ensure!(still.is_empty(), "migration committed but columns are still absent from the stored schema: {still:?}");
-        Ok(report(after.len(), added))
+        let added = evolve_table_columns(&table_ref, &fields.into()).await?;
+        Ok(report(stored.len() + added.len(), added))
     }
 }
 
@@ -11603,6 +11622,56 @@ mod tests {
 
     use super::*;
     use crate::{config::AppConfig, schema::get_default_schema, support::test_helpers::*};
+
+    /// A rollup tier that predates a measure gains the column, keeps it after a
+    /// second pass, and makes the measure MATERIALIZABLE — which is what lets
+    /// `TAG_MEASURES` record it and the read gate serve it.
+    ///
+    /// The narrow table is built exactly as prod's was: the declared tier schema
+    /// minus `duration_digest`, the measure declared on 2026-08-22 that no file
+    /// carried until the column happened to appear on 08-24.
+    #[tokio::test]
+    async fn a_tier_that_predates_a_measure_is_widened_to_hold_it() {
+        let source = get_schema("otel_logs_and_spans").expect("source schema");
+        let spec = source.rollups.first().expect("declared rollup");
+        const MEASURE: &str = "duration_digest";
+        let declared = get_schema(&spec.table_name("otel_logs_and_spans")).expect("tier schema");
+        let narrow: Vec<_> = declared.columns().expect("tier columns").into_iter().filter(|column| column.name() != MEASURE).collect();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = deltalake::operations::create::CreateBuilder::new()
+            .with_location(dir.path().to_string_lossy())
+            .with_columns(narrow)
+            .with_partition_columns(declared.partitions.clone())
+            .await
+            .expect("create the narrow tier");
+        let table = Arc::new(RwLock::new(table));
+        let fields = declared.schema_ref().fields().clone();
+
+        // Every input column is present, so only the TARGET arm can refuse the
+        // measure — which it does, on the table as it stands.
+        let present: HashSet<String> = source.fields.iter().map(|field| field.name.clone()).collect();
+        let stored = |table: &DeltaTable| table.snapshot().expect("snapshot").schema().fields().any(|field| field.name() == MEASURE);
+        let narrow_arrow = arrow_schema::Schema::new(fields.iter().filter(|field| field.name() != MEASURE).cloned().collect::<Vec<_>>());
+        assert!(!stored(&*table.read().await), "the tier must start without the measure");
+        assert!(
+            !crate::rollup::materialized_measures(spec, false, &present, &narrow_arrow).contains(&MEASURE.to_owned()),
+            "a measure the physical tier lacks is not materializable"
+        );
+
+        assert_eq!(evolve_table_columns(&table, &fields).await.expect("widen"), vec![MEASURE.to_owned()]);
+        assert!(stored(&*table.read().await), "the tier must gain the declared measure");
+        assert!(
+            crate::rollup::materialized_measures(spec, false, &present, declared.schema_ref().as_ref()).contains(&MEASURE.to_owned()),
+            "once the column exists the measure is materializable, so TAG_MEASURES records it"
+        );
+
+        // Idempotent: a second pass adds nothing and commits nothing, which is
+        // what lets every build call this unconditionally.
+        let version = { table.read().await.version() };
+        assert!(evolve_table_columns(&table, &fields).await.expect("second widen").is_empty());
+        assert_eq!(table.read().await.version(), version, "a no-op widening must not commit");
+    }
 
     /// A pass deadline no test will reach, for the drain's bounding parameter.
     /// `Instant` has no MAX, and adding `Duration::MAX` overflows.

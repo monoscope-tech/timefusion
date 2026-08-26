@@ -83,10 +83,37 @@ fn sql_literal(value: &str) -> String {
 /// them. The fingerprint remains in each Add tag and in the read ticket, where
 /// it is a validity check rather than a row-selection key.
 ///
-/// The spec participates because adding a measure without bumping the table
-/// name would otherwise serve rows built under the old spec as if current.
-pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64) -> String {
+/// The spec participates because a REDEFINED measure — same name, different
+/// `agg`/`column`/`filter` — would otherwise serve rows built under the old
+/// definition as if current. It participates through `measures`, which is the
+/// set the cell actually MATERIALIZED (`TAG_MEASURES`): the spec is restricted
+/// to those measures before hashing, so a cell is measured against the spec IT
+/// WAS BUILT UNDER rather than against every measure declared since.
+///
+/// That distinction is the difference between a cheap spec edit and a fleet-wide
+/// outage. Hashing the whole spec meant ADDING a measure changed every tier's
+/// generation, the recovery gate then refused every slice built before it, and
+/// the read path answered `not_built` for the entire history while no gauge
+/// moved — `duration_digest` on 2026-08-22 did exactly that. Addition is now
+/// covered per cell instead, by `TAG_MEASURES` + `measures_available`: a cell
+/// that does not hold a measure is refused for queries needing it and serves
+/// every other query unchanged.
+///
+/// Restricting rather than dropping measures from the hash is what keeps the
+/// change backward compatible: measures are appended, so the restricted spec's
+/// `Debug` is byte-identical to the spec that was live when the cell was built,
+/// and the generation already on S3 still matches. `None` — a cell with no tag,
+/// which proves nothing — keeps the old whole-spec comparison.
+pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64, measures: Option<&[String]>) -> String {
     use std::hash::{Hash, Hasher};
+    let restricted;
+    let spec = match measures {
+        Some(names) => {
+            restricted = RollupSpec { measures: spec.measures.iter().filter(|m| names.contains(&m.name)).cloned().collect(), ..spec.clone() };
+            &restricted
+        }
+        None => spec,
+    };
     let mut hasher = fnv::FnvHasher::default();
     format!("{spec:?}").hash(&mut hasher);
     (source, project_id, date).hash(&mut hasher);
@@ -911,7 +938,16 @@ const fn spans_whole_day(start: i64, end: i64) -> bool {
 /// - its TARGET column is missing. The writer conforms to the tier table as it
 ///   already exists, so `cast_record_batch` drops any measure the physical
 ///   schema has not been evolved to hold — which is how `duration_digest` was
-///   declared on 2026-08-22 and first written on 08-24.
+///   declared on 2026-08-22 and first written on 08-24. The build now widens
+///   the tier first (`evolve_table_columns`), so this arm only fires when the
+///   widening could not run; the INPUT arm is the one that still bites.
+///
+/// The input arm is checked against the source's SCHEMA, not its values. A
+/// derived tier reading base cells that predate the measure sees the column
+/// (the base tier was widened) and folds their NULLs into an empty state, so
+/// those hours tag the measure as materialized while holding nothing. That is
+/// the same hole a manual migration would have opened; closing it means reading
+/// the base cells' own `TAG_MEASURES`, which is a separate change.
 pub(crate) fn materialized_measures(
     spec: &RollupSpec, derived: bool, present: &std::collections::HashSet<String>, target: &arrow::datatypes::Schema,
 ) -> Vec<String> {
@@ -946,7 +982,9 @@ pub(crate) fn materialized_measures(
 ///
 /// A column the physical table lacks is projected NULL. Nothing is lost: no file
 /// anywhere holds a value for it, so NULL is what it has always been worth. This
-/// keeps the unit running; evolving the target schema is the separate real fix.
+/// keeps the unit running; the TARGET side is now evolved before the write (see
+/// `evolve_table_columns`), so a declared measure stops being inert from the
+/// first build after its declaration.
 pub(crate) fn slice_input_sql(
     schema: &crate::schema::TableSchema, dedup: Option<SliceDedup<'_>>, raw: &str, project_id: &str, (start, end): (i64, i64), shard_predicate: &str,
     present: Option<&std::collections::HashSet<String>>,
@@ -2783,7 +2821,44 @@ mod tests {
     #[test]
     fn slice_generation_is_stable_across_source_fingerprints() {
         let spec = spec();
-        assert_eq!(generation_id(&spec, SOURCE, "p", "2026-08-15", 1), generation_id(&spec, SOURCE, "p", "2026-08-15", 2));
+        assert_eq!(generation_id(&spec, SOURCE, "p", "2026-08-15", 1, None), generation_id(&spec, SOURCE, "p", "2026-08-15", 2, None));
+    }
+
+    /// THE property that stops a measure addition from orphaning the fleet, and
+    /// the one that stops it from serving a redefined measure as if current.
+    ///
+    /// A cell built under `before` carries `generation_id(before, …, None)` —
+    /// the whole-spec value written by every existing file on S3. Recovery
+    /// recomputes it from `after`, restricted to what the cell says it holds, so
+    /// the two must still agree; `duration_digest` on 2026-08-22 is the edit
+    /// that, under whole-spec hashing, made them disagree for every slice in the
+    /// 35-day window at once.
+    #[test]
+    fn adding_a_measure_keeps_older_cells_current_and_redefining_one_does_not() {
+        let mut before = spec();
+        before.measures.pop().expect("the spec declares measures");
+        let held: Vec<String> = before.measures.iter().map(|measure| measure.name.clone()).collect();
+        let after = spec();
+        assert_eq!(
+            generation_id(&before, SOURCE, "p", "2026-08-15", 1, None),
+            generation_id(&after, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            "a cell built before the measure existed must stay current"
+        );
+
+        let mut redefined = after.clone();
+        redefined.measures[0].filter = Some("status_code = 500".to_owned());
+        assert_ne!(
+            generation_id(&after, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            generation_id(&redefined, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            "redefining a measure the cell HOLDS must still orphan it"
+        );
+        let mut regrouped = after.clone();
+        regrouped.dimensions.push("name".to_owned());
+        assert_ne!(
+            generation_id(&after, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            generation_id(&regrouped, SOURCE, "p", "2026-08-15", 1, Some(&held)),
+            "a different GROUP BY is a different row set, whatever the cell holds"
+        );
     }
 
     #[test]
@@ -2904,9 +2979,9 @@ mod tests {
     /// declined as `missing_measure` and scanned raw (2026-08-22: 3,420 ms with
     /// the group-by lifted, 278 ms once an unfiltered digest existed).
     ///
-    /// Adding a measure changes `generation_id` — it hashes the whole spec — so
-    /// every pre-existing cell becomes unreadable and the tier rebuilds rather
-    /// than serving NULL digests as zeroed percentiles.
+    /// Adding a measure no longer changes `generation_id` for cells that predate
+    /// it; those cells stay readable and are refused per query by
+    /// `measures_available`, which is what the assertions below check.
     #[tokio::test]
     async fn an_unfiltered_percentile_routes_to_the_unfiltered_digest() {
         let state = session().await;
