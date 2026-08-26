@@ -2500,9 +2500,7 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
     // Spread across >= 4h: the interior must clear `MIN_INTERIOR_BUCKETS = 2`
     // grains (2h at the 1h tier) or `TinyInterior` declines first.
     for (i, (duration, offset)) in
-        [(Some(100i64), 17i64), (None, 61_000_000), (Some(300), 3_661_000_000), (Some(400), 7_261_000_000), (Some(500), 14_461_000_000)]
-            .iter()
-            .enumerate()
+        [(Some(100i64), 17i64), (None, 61_000_000), (Some(300), 3_661_000_000), (Some(400), 7_261_000_000), (Some(500), 14_461_000_000)].iter().enumerate()
     {
         let batch = json_to_batch(vec![serde_json::json!({
             "timestamp": yesterday_noon + offset, "id": format!("y{i}"), "name": "op", "project_id": project_id, "hashes": [],
