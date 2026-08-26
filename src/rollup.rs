@@ -942,23 +942,61 @@ const fn spans_whole_day(start: i64, end: i64) -> bool {
 ///   the tier first (`evolve_table_columns`), so this arm only fires when the
 ///   widening could not run; the INPUT arm is the one that still bites.
 ///
-/// The input arm is checked against the source's SCHEMA, not its values. A
-/// derived tier reading base cells that predate the measure sees the column
-/// (the base tier was widened) and folds their NULLs into an empty state, so
-/// those hours tag the measure as materialized while holding nothing. That is
-/// the same hole a manual migration would have opened; closing it means reading
-/// the base cells' own `TAG_MEASURES`, which is a separate change.
+/// A schema check is not enough on the DERIVED side, which is why
+/// `base_evidence` exists. A derived tier reading base cells that predate the
+/// measure sees the column (the base tier was widened) and folds their NULLs
+/// into an empty state, so those hours would tag the measure as materialized
+/// while holding nothing — and `measures_available`, the gate that exists to
+/// catch exactly this, TRUSTS a tag. Measured on prod 2026-08-25 as a p95 over
+/// 3,438 of 14,830 rows. A derived cell may therefore claim a measure only if
+/// every base cell it consumed proved it too: witness the table you actually
+/// read, the same rule the derived ROW witness follows.
+///
+/// EXPECTED REGRESSION: a derived cell built over old bases now tags HONESTLY,
+/// and the read gate refuses it for that measure where it used to serve it. Some
+/// latency charts get SLOWER on deploy — silent-wrong converted into visible
+/// raw-fallback. That is the intended trade, not a new bug; it clears as those
+/// base cells are rebuilt.
 pub(crate) fn materialized_measures(
     spec: &RollupSpec, derived: bool, present: &std::collections::HashSet<String>, target: &arrow::datatypes::Schema,
+    base_evidence: Option<&std::collections::HashSet<String>>,
 ) -> Vec<String> {
     spec.measures
         .iter()
         .filter(|measure| {
             let input = if derived { Some(measure.name.as_str()) } else { measure.column.as_deref() };
-            input.is_none_or(|column| present.contains(column)) && target.column_with_name(&measure.name).is_some()
+            input.is_none_or(|column| present.contains(column))
+                && (!derived || base_evidence.is_none_or(|proven| proven.contains(&measure.name)))
+                && target.column_with_name(&measure.name).is_some()
         })
         .map(|measure| measure.name.clone())
         .collect()
+}
+
+/// What the base cells feeding a derived slice ALL prove they hold, for
+/// `materialized_measures`.
+///
+/// `None` per cell is a cell with no `TAG_MEASURES` evidence, and it is resolved
+/// exactly as `measures_available(None)` resolves it — everything except
+/// `MEASURES_ABSENT_FROM_LEGACY_CELLS`. Treating it as "proves nothing" would
+/// zero the intersection and strip `request_count` from every derived cell built
+/// over a journal-recovered base, which is a fleet-wide count regression far
+/// wider than the digest hole this closes.
+///
+/// `None` overall means no base cell overlapped the slice at all. Vacuously
+/// permissive on purpose: the base-coverage gate above already retries on a real
+/// hole, so the remaining case is a range the source never held — an EMPTY
+/// derived cell, whose tags cannot mislead anything.
+pub(crate) fn base_measure_evidence<'a>(
+    spec: &RollupSpec, cells: impl Iterator<Item = Option<&'a std::collections::HashSet<String>>>,
+) -> Option<std::collections::HashSet<String>> {
+    cells
+        .map(|held| {
+            held.cloned().unwrap_or_else(|| {
+                spec.measures.iter().map(|measure| measure.name.clone()).filter(|name| !MEASURES_ABSENT_FROM_LEGACY_CELLS.contains(&name.as_str())).collect()
+            })
+        })
+        .reduce(|left, right| &left & &right)
 }
 
 /// The SELECT a rollup slice reads its input through, collapsing duplicates
@@ -3113,6 +3151,40 @@ mod tests {
             route.measures_available(Some(&route.needed_measure_columns().map(str::to_owned).collect())),
             "a cell that materialized every needed column must serve it"
         );
+    }
+
+    /// What a derived build TAGS, joined to what the read gate then DOES with
+    /// it: a base tier that cannot prove the digest must produce a derived cell
+    /// the percentile is refused for, while the count chart keeps routing.
+    ///
+    /// Tagging is checked at the call site by
+    /// `a_derived_cell_cannot_claim_a_measure_its_base_never_proved`; this pins
+    /// the consequence, which is the half that decides query correctness.
+    #[tokio::test]
+    async fn a_derived_tag_over_a_digestless_base_is_refused_for_the_percentile() {
+        let source = crate::schema::get_schema(SOURCE).expect("source schema");
+        let spec = source.rollups.iter().find(|spec| spec.derive_from.is_some()).expect("a derived tier");
+        let declared = crate::schema::get_schema(&spec.table_name(SOURCE)).expect("tier schema");
+        // Every column exists on both sides — only the base cells' own evidence
+        // can refuse anything, which is the whole point.
+        let present: std::collections::HashSet<String> = declared.fields.iter().map(|field| field.name.clone()).collect();
+        let digestless: std::collections::HashSet<String> =
+            spec.measures.iter().map(|measure| measure.name.clone()).filter(|name| name != "duration_digest").collect();
+        let evidence = base_measure_evidence(spec, [Some(&present), Some(&digestless), None].into_iter());
+        let tagged: std::collections::HashSet<String> =
+            materialized_measures(spec, true, &present, declared.schema_ref().as_ref(), evidence.as_ref()).into_iter().collect();
+        assert!(!tagged.contains("duration_digest"), "one base cell without the digest is enough to refuse it: {tagged:?}");
+        assert!(tagged.contains("request_count"), "a measure every base cell proved must survive: {tagged:?}");
+
+        let state = session().await;
+        let percentile = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, percentile_agg(CAST(duration AS DOUBLE PRECISION)) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
+        );
+        let count = format!("SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
+        let route = async |sql: &str| route_for(&state, sql).await.expect("match").expect("declared rollup route");
+        assert!(!route(&percentile).await.measures_available(Some(&tagged)), "the gate must refuse the percentile rather than answer it from an empty state");
+        assert!(route(&count).await.measures_available(Some(&tagged)), "the same cell must keep serving the measures it did materialize");
     }
 
     /// The other half of the same rule: a legacy cell is not refused wholesale.

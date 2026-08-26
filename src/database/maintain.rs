@@ -1723,15 +1723,23 @@ impl Database {
         // landing between the snapshot and this read would show as coverage the
         // snapshot does not contain — and the unit would publish short while
         // claiming the whole slice, which is the exact bug the gate exists for.
+        //
+        // Each cell's `TAG_MEASURES` evidence rides along: a derived cell may
+        // only claim a measure its base cells proved — see
+        // `materialized_measures`.
+        let mut base_evidence = None;
         let base_covered: Vec<(i64, i64)> = if derived {
-            self.rollup_slice_coverage
+            let cells = self
+                .rollup_slice_coverage
                 .iter()
                 .filter(|entry| {
                     let (project, source, table, start, end) = entry.key();
                     *project == key.project_id && *source == key.source && *table == from && key.slice.overlaps(*start, *end)
                 })
-                .map(|entry| (entry.key().3, entry.key().4))
-                .collect()
+                .map(|entry| ((entry.key().3, entry.key().4), entry.value().measures.clone()))
+                .collect::<Vec<_>>();
+            base_evidence = crate::rollup::base_measure_evidence(spec, cells.iter().map(|(_, measures)| measures.as_ref()));
+            cells.into_iter().map(|(span, _)| span).collect()
         } else {
             Vec::new()
         };
@@ -2041,7 +2049,7 @@ impl Database {
         //
         // It is computed here, before the generation, because the generation is
         // now taken over exactly this set — see `generation_id`.
-        let materialized = crate::rollup::materialized_measures(spec, derived, &present_columns, &target_schema.schema_ref());
+        let materialized = crate::rollup::materialized_measures(spec, derived, &present_columns, &target_schema.schema_ref(), base_evidence.as_ref());
         let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp, Some(&materialized));
         let default_shard_keys = || ["project_id".to_owned(), "timestamp".to_owned()].into_iter().chain(spec.dimensions.iter().cloned()).collect::<Vec<_>>();
         let mut shard_keys = if derived { default_shard_keys() } else { source_schema.dedup_keys.clone() };

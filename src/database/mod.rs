@@ -11655,14 +11655,14 @@ mod tests {
         let narrow_arrow = arrow_schema::Schema::new(fields.iter().filter(|field| field.name() != MEASURE).cloned().collect::<Vec<_>>());
         assert!(!stored(&*table.read().await), "the tier must start without the measure");
         assert!(
-            !crate::rollup::materialized_measures(spec, false, &present, &narrow_arrow).contains(&MEASURE.to_owned()),
+            !crate::rollup::materialized_measures(spec, false, &present, &narrow_arrow, None).contains(&MEASURE.to_owned()),
             "a measure the physical tier lacks is not materializable"
         );
 
         assert_eq!(evolve_table_columns(&table, &fields).await.expect("widen"), vec![MEASURE.to_owned()]);
         assert!(stored(&*table.read().await), "the tier must gain the declared measure");
         assert!(
-            crate::rollup::materialized_measures(spec, false, &present, declared.schema_ref().as_ref()).contains(&MEASURE.to_owned()),
+            crate::rollup::materialized_measures(spec, false, &present, declared.schema_ref().as_ref(), None).contains(&MEASURE.to_owned()),
             "once the column exists the measure is materializable, so TAG_MEASURES records it"
         );
 
@@ -12739,6 +12739,70 @@ mod tests {
         let (state, reason, claimed) = scenario(4, 0, 24).await?;
         assert_eq!(state, Some(TaskState::Complete), "a gap below the partition's first row must not block a publish: {reason:?}");
         assert_eq!(claimed, vec![(0, 24 * HOUR)]);
+        Ok(())
+    }
+
+    /// A DERIVED cell may not claim a measure its BASE cells never proved.
+    ///
+    /// `materialized_measures` used to read the TARGET tier's schema, so a
+    /// derived cell built after a measure was declared, over base cells that
+    /// predate it, saw the widened column, folded Delta's null-fill into an
+    /// empty state and tagged the measure as materialized. `measures_available`
+    /// TRUSTS a tag, so the read gate that exists for exactly this waved it
+    /// through and a wide window returned a plausible, low, silent number — prod
+    /// 2026-08-25 measured a p95 over 3,438 of 14,830 rows. Neither existing
+    /// guard reaches it: `MEASURES_ABSENT_FROM_LEGACY_CELLS` covers UNTAGGED
+    /// cells, and the cell carries the current generation honestly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_derived_cell_cannot_claim_a_measure_its_base_never_proved() -> Result<()> {
+        use crate::maintenance_coordinator::Operation;
+        const DIGEST: &str = "duration_digest";
+        const COUNT: &str = "request_count";
+        let db = Database::with_config(create_test_config("derived-measure-evidence")).await?;
+        db.cancel_maintenance();
+        let project = format!("evid_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+        let tier_of = |derived: bool| {
+            get_schema("otel_logs_and_spans")
+                .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some() == derived).map(|spec| spec.table_name("otel_logs_and_spans")))
+                .expect("a tier")
+        };
+        let (base_tier, derived_tier) = (tier_of(false), tier_of(true));
+        for hour in [20, 21, 22, 23] {
+            let at = day_start + hour * 3_600_000_000;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        }
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20).await?;
+
+        let measures = |table: &str| -> Vec<Option<HashSet<String>>> {
+            db.rollup_slice_coverage
+                .iter()
+                .filter(|entry| entry.key().0 == project && entry.key().2 == table)
+                .map(|entry| entry.value().measures.clone())
+                .collect()
+        };
+        // The base cells lose their digest proof — the prod shape, where the
+        // column was declared before any base file carried a value for it. The
+        // base tier's SCHEMA keeps it, which is what used to be consulted.
+        for mut entry in db.rollup_slice_coverage.iter_mut() {
+            if entry.key().0 == project && entry.key().2 == base_tier {
+                let held = entry.value().measures.clone().unwrap_or_default();
+                assert!(held.contains(DIGEST), "a fresh base build must prove the digest, or stripping it proves nothing");
+                entry.value_mut().measures = Some(held.into_iter().filter(|name| name != DIGEST).collect());
+            }
+        }
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20).await?;
+
+        let published = measures(&derived_tier);
+        assert!(!published.is_empty(), "the derived unit must publish over a fully covered base");
+        for held in &published {
+            let held = held.as_ref().expect("a derived cell must carry measure evidence");
+            assert!(!held.contains(DIGEST), "a derived cell whose base never proved the digest must not claim it: {held:?}");
+            // The other half: refusing wholesale would send every count chart
+            // back to a raw scan.
+            assert!(held.contains(COUNT), "a measure the base DID prove must survive: {held:?}");
+        }
         Ok(())
     }
 
