@@ -625,6 +625,64 @@ still holds coverage down.
 - jemalloc `frag_pct 49.3`, `retained 1,084 GB` (RSS 31 GB, host has 109 GB free).
 - Ingest/flush **healthy**: pressure 19%, 0 backpressure, 0 failed flushes.
 
+## 2026-08-26 — short-cell repair DEPLOYED, and two spec changes DEFERRED
+
+**Damage, measured not estimated:** 320 comparable (project, date) pairs across 15
+projects, **81 disagreeing**, ~**211M rows** missing from the 1h tier. 41 pairs are
+missing 15+ hours; many read `1/24` — one hour surviving a whole day. Three are
+OVER-counted instead (healthy base, full coverage — duplicate/MoR summing).
+Durable: `scratchpad/DAMAGE_LIST.csv`, `CLEAN_LIST.csv`.
+
+**Repair shipped** (`43ee5d8`, deployed `81f63de`): a one-shot on a NEW cursor
+(`__maintenance_damage_repair_v1`) forcing every tier of a measured LIST of 81 pairs
+into `missing_tiers`. A list, not a date window — the window form would have dragged
+236 clean pairs into a queue measured GROWING at ~+80 units/hr behind an 11.3-day
+starved tail. Ordering needed no special handling: `Journal::rank` compares
+`hole > 0` BEFORE `starved`, verified in code.
+
+Fired: `rollup_damaged_cell_repair forced=71 listed=81`. Within ~40 min
+`rollup_rebuilds_full` +703, `rollup_derived_base_incomplete` +252 (the
+derived-witness gate making derived units wait for their base), and
+**`pending_base_rollup` draining for the first time** (2752 → 2338). Convergence is
+wall-clock and NOT done.
+
+**⚠️ Exposure GREW before the repair landed.** On 28f62f01 / 2026-08-20:
+two-half split (does not route) = **3,580,826** (truth); plain day-range `count(*)`
+= 3,084,885 (the short tier); tier stored = 3,084,885. That same query fell back to
+raw and was CORRECT this morning. Routing over these cells widened during the day,
+converting "slow but correct" into "fast but wrong", and it is not limited to
+dashboards — any count over a damaged day is affected.
+
+**The gap that allows it:** there is a read gate for a cell missing a MEASURE
+(`measures_available`) but **none for a cell short on ROWS**. The derived-witness fix
+is write-side, and the source-row witness cannot help because a derived cell
+witnesses the RAW partition rather than the base tier it read, so it agrees forever
+on a sealed day.
+
+**Only `request_count` was audited** — `duration_*`, `error_count`, `server_*` and
+the digests were never compared. `CLEAN_LIST.csv` is NOT a full bill of health.
+
+### Two spec changes DEFERRED (decisions, not open questions)
+
+**`level` as a dimension** — a DIMENSION change alters the grouping of every stored
+row, so no per-cell mechanism rescues it (unlike measures, which `TAG_MEASURES` plus
+the narrowed `generation_id` now let coexist). Unavoidable fleet rebuild.
+Preconditions: repair converged and verified, base backlog drained, quiet process.
+Cardinality is NOT the blocker; the rebuild is.
+
+**`server_error_count` semantics** — 24,030 of 24,054 rows it counts are
+`kind='client'` spans named `monoscope.http`; only 24 are genuinely server. Faithful
+to the spec; the spec is wrong. A filter change alters what the measure MEANS, so it
+must orphan. Interim needing no spec change is monoscope-side: point genuine
+inbound-error charts at unscoped `error_count`, or relabel the widgets.
+
+**A one-line dashboard fix was prepared and DELIBERATELY REVERTED.** The "Error Rate"
+panel (`_overview.yaml:120`) uses a 2-term scope while nine siblings and the declared
+measure use 3 terms, so it declines `unknown_filter`. Adding the third term makes it
+route with no rebuild — but it would adopt the very convention the `server_error_count`
+decision is questioning, changes live numbers, and buys ~2 declines/hr. Ship it with
+that decision, not before. A deliberate omission, not an oversight.
+
 ## Explicitly excluded
 
 - **Compaction** — 161 GB/hr, 57 GB/hr net drain, ~9h to clear. Working. Don't touch.
