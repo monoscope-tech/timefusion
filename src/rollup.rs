@@ -1036,6 +1036,15 @@ pub(crate) fn slice_input_sql(
 /// 2026-08-22 (c4d615d) and not materialized until ~08-24 10:30 UTC, and every
 /// date 08-14..08-23 reads `count(duration_digest) = 0` across all 12 projects.
 ///
+/// BOUNDARY CORRECTED 2026-08-26, and it moved LATER, not earlier. Probing per
+/// row for `duration_count > 0 AND approx_percentile(0.5, duration_digest) IS
+/// NULL` — which catches a present-but-EMPTY sketch that the earlier count-based
+/// probe could not — the first fully healthy date is **2026-08-25**. Dates up to
+/// 08-23 are 100% unreadable; **08-24 is the dangerous one**, 22-45% empty, so it
+/// answers with a percentile computed from roughly half its rows instead of
+/// declining. Re-sampled 6 minutes apart it was byte-identical: the short-cell
+/// repair rebuilds `request_count`, NOT digests, so this does not self-heal.
+///
 /// Nor can the generation stand in for it: 08-22/08-23 cells carry the CURRENT
 /// generation and still hold no digest.
 ///
@@ -1051,6 +1060,29 @@ pub(crate) fn slice_input_sql(
 /// declared from now on belongs here until its history is rebuilt.
 const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 2] = ["duration_digest", "service_name_hll"];
 
+/// Measures refused on EVERY cell, tagged or not, because their stored state is
+/// known empty and a merge over an empty state answers with a NUMBER rather than
+/// declining. Strictly stronger than the list above, which only covers cells
+/// carrying no `TAG_MEASURES` at all.
+///
+/// This exists because a tag proves the COLUMN was present, not that a VALUE was
+/// written. A derived cell built over base cells that predate a measure sees the
+/// widened column, folds the NULLs Delta fills it with into an EMPTY state, and
+/// tags the measure materialized — so the gate above waves it through.
+///
+/// `service_name_hll` (declared 2026-08-26): audited the same day across four
+/// projects and both tiers, it is absent on EVERY date up to 2026-08-25 and only
+/// 26-68% present on 08-26. `hll_merge` skips NULLs and `distinct_count` of an
+/// empty sketch is **0**, not NULL — so a routed dcount over any window before
+/// 08-26 renders 0 services, and a mixed window renders a low number. Measured
+/// wrong: est 1 vs truth 2, and est 15 vs truth 18 over 08-20..08-26.
+///
+/// DELETE THE ENTRY when the value-presence fix lands AND an audit shows the
+/// measure reads back over the window being served. Until then dcount falls to
+/// raw — correct and slower, which is where it was before the measure existed.
+/// The declaration deliberately STAYS so history keeps accruing toward that day.
+const MEASURES_NOT_YET_SERVABLE: [&str; 1] = ["service_name_hll"];
+
 impl RoutedRollup {
     /// Every tier column this rewrite reads a state out of, the `HAVING` guard
     /// included — the guard is projected into each leg beside the measures, so
@@ -1064,6 +1096,11 @@ impl RoutedRollup {
     /// proves nothing either way, which is what
     /// `MEASURES_ABSENT_FROM_LEGACY_CELLS` exists to decide.
     pub(crate) fn measures_available(&self, have: Option<&std::collections::HashSet<String>>) -> bool {
+        // Checked first and against BOTH arms: a tag cannot vouch for a state
+        // that was never written, so `Some` is no safer than `None` here.
+        if self.needed_measure_columns().any(|column| MEASURES_NOT_YET_SERVABLE.contains(&column)) {
+            return false;
+        }
         match have {
             Some(have) => self.needed_measure_columns().all(|column| have.contains(column)),
             None => self.needed_measure_columns().all(|column| !MEASURES_ABSENT_FROM_LEGACY_CELLS.contains(&column)),
@@ -3114,6 +3151,27 @@ mod tests {
     /// COMPUTATION and gets lifted into `__common_expr_1` — so the test above
     /// passed for a year while every real panel declined. Prod 2026-08-25:
     /// 39.2s here against 4.25s for the bare-column spelling, 7 days, one project.
+    /// A measure on the not-yet-servable list is refused on a TAGGED cell, not
+    /// merely an untagged one. The tag proves the COLUMN existed; it cannot prove
+    /// a VALUE was written, and `distinct_count` of an empty sketch is 0 — so a
+    /// merge over empty states answers with a number instead of declining.
+    /// Audited 2026-08-26: `service_name_hll` is absent on every date up to
+    /// 08-25 and 26-68% present on 08-26 (est 1 vs truth 2; est 15 vs truth 18).
+    #[tokio::test]
+    async fn a_not_yet_servable_measure_is_refused_even_when_the_cell_tags_it() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, distinct_count(approx_count_distinct(resource___service___name)) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
+        );
+        // Required, not optional: an early return here would make the assertions
+        // below vacuous, which is the failure mode this whole area keeps hitting.
+        let route = route_for(&state, &sql).await.expect("match dcount").expect("the hll measure is declared, so it must route");
+        let tagged: std::collections::HashSet<String> = ["service_name_hll".to_owned()].into_iter().collect();
+        assert!(!route.measures_available(Some(&tagged)), "a TAGGED cell must not serve a measure whose stored state is known empty");
+        assert!(!route.measures_available(None), "and an untagged cell must not either");
+    }
+
     #[tokio::test]
     async fn a_grouped_chart_casting_its_dimension_routes_despite_cse() {
         let state = session().await;

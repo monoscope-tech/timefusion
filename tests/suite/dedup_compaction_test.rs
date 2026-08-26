@@ -2661,8 +2661,19 @@ async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> R
         let query = format!("SELECT {}", select.replace("{window}", &window));
         let before = hits();
         let routed = show(ctx.sql(&query).await?.collect().await?);
-        assert!(hits() > before, "the dcount widget must route, or this proves nothing about the hll measure: {query}");
-        assert_eq!(routed, show(db.query_delta_only(&query).await?), "the routed sketch must equal the raw one: {query}");
+        // Declared but DELIBERATELY NOT SERVABLE yet. `MEASURES_NOT_YET_SERVABLE`
+        // refuses `service_name_hll` on every cell, tagged or not, because an
+        // audit on 2026-08-26 found its stored state absent on every date up to
+        // 08-25 and only 26-68% present on 08-26 — and `distinct_count` of an
+        // EMPTY sketch is 0, not NULL, so a routed widget renders 0 services
+        // rather than declining (measured: est 1 vs truth 2, est 15 vs truth 18).
+        //
+        // So the assertion that matters here is the ANSWER, not the route: the
+        // query must fall back to raw and still be exact. Flip the first
+        // assertion back to `hits() > before` when the guard is lifted — that is
+        // what proves the measure earns its declaration.
+        assert_eq!(hits(), before, "the hll measure is on the not-yet-servable list, so this must NOT route: {query}");
+        assert_eq!(routed, show(db.query_delta_only(&query).await?), "and the raw answer must still be exact: {query}");
     }
     Ok(())
 }
