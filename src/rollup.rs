@@ -1522,24 +1522,47 @@ fn parse_bucket_micros(value: &str) -> Option<i64> {
     value.checked_mul(unit)
 }
 
-fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mut Vec<datafusion::logical_expr::Expr>) -> Option<String> {
-    use datafusion::logical_expr::LogicalPlan;
+/// The scanned table, or a description of the node that stopped the walk.
+///
+/// The `Err` side is the whole reason this returns a `Result` rather than an
+/// `Option`: `UnwalkableSource` became the largest miss reason in production
+/// (157 of 379 over 8h on 2026-08-25) while emitting nothing at all, so the
+/// class could not be attributed to a shape without a deploy. Describing the
+/// refusal at the point of refusal keeps that description single-sourced — a
+/// parallel "explain why it refused" walk drifts from the walk it explains.
+fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mut Vec<datafusion::logical_expr::Expr>) -> Result<String, String> {
+    use datafusion::logical_expr::{Expr, LogicalPlan};
     match plan {
         // Only a rename-free projection may be walked through. `hash AS name`
         // would otherwise make the matcher read a declared dimension off the
         // wrong source column and answer with the wrong values.
-        LogicalPlan::Projection(projection) if projection.expr.iter().all(|expr| matches!(expr, datafusion::logical_expr::Expr::Column(_))) => {
-            source_and_filters(&projection.input, filters)
-        }
+        LogicalPlan::Projection(projection) if projection.expr.iter().all(|expr| matches!(expr, Expr::Column(_))) => source_and_filters(&projection.input, filters),
         LogicalPlan::Filter(filter) => {
             filters.push(filter.predicate.clone());
             source_and_filters(&filter.input, filters)
         }
         LogicalPlan::TableScan(scan) => {
             filters.extend(scan.filters.clone());
-            Some(scan.table_name.table().to_string())
+            Ok(scan.table_name.table().to_string())
         }
-        _ => None,
+        // Name only the exprs that DISQUALIFIED the projection, never the whole
+        // node: the `SELECT *` variant-wrap over `otel_logs_and_spans` projects
+        // every column of a wide schema, and `display()` on it is a multi-KB
+        // log line.
+        LogicalPlan::Projection(projection) => Err(truncated(&format!(
+            "Projection: {}",
+            projection.expr.iter().filter(|expr| !matches!(expr, Expr::Column(_))).take(4).map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        ))),
+        plan => Err(truncated(&plan.display().to_string())),
+    }
+}
+
+/// One bounded log field: node descriptions are attacker-free but unbounded.
+fn truncated(text: &str) -> String {
+    const LIMIT: usize = 240;
+    match text.char_indices().nth(LIMIT) {
+        None => text.to_string(),
+        Some((cut, _)) => format!("{}…", &text[..cut]),
     }
 }
 
@@ -1694,8 +1717,8 @@ async fn measure_filters<'a>(
                     MissReason::UnknownFilter
                 })?;
                 let mut filters = Vec::new();
-                source_and_filters(&plan, &mut filters).ok_or_else(|| {
-                    tracing::warn!(event = "rollup_measure_probe_unwalkable", source, measure = %measure.name, plan = %plan.display_indent(), "a declared measure filter planned to a shape the matcher cannot read");
+                source_and_filters(&plan, &mut filters).map_err(|node| {
+                    tracing::warn!(event = "rollup_measure_probe_unwalkable", source, measure = %measure.name, node, plan = %plan.display_indent(), "a declared measure filter planned to a shape the matcher cannot read");
                     MissReason::UnknownFilter
                 })?;
                 canonical_and(filters.iter().flat_map(datafusion::logical_expr::utils::split_conjunction).filter(|term| !is_probe_scaffolding(term)))
@@ -1707,6 +1730,22 @@ async fn measure_filters<'a>(
     Ok(filters)
 }
 
+/// The outermost `Aggregate`, wherever the optimizer put it.
+///
+/// Nothing above it is inspected, peeled or rebuilt. The rewrite is
+/// substituted for this node IN PLACE, and a node carrying the aggregate's
+/// output names and types is interchangeable with it by construction —
+/// which is a property of the aggregate alone. Earlier versions matched a
+/// fixed grammar of parents (`Sort`, then `Limit`, then a second
+/// `Projection`…) and production kept producing one layer more than the
+/// grammar knew, because the shape depends on the session's analyzer rules.
+fn outermost_aggregate(plan: &datafusion::logical_expr::LogicalPlan) -> Option<&datafusion::logical_expr::LogicalPlan> {
+    match plan {
+        datafusion::logical_expr::LogicalPlan::Aggregate(_) => Some(plan),
+        plan => plan.inputs().into_iter().find_map(outermost_aggregate),
+    }
+}
+
 /// Every rollup that could serve this aggregate, best first.
 ///
 /// The caller picks: only it knows which tiers are actually BUILT for the dates
@@ -1715,22 +1754,6 @@ pub(crate) async fn match_aggregates(
     plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
 ) -> Result<Vec<RoutedRollup>, MissReason> {
     use datafusion::logical_expr::LogicalPlan;
-
-    /// The outermost `Aggregate`, wherever the optimizer put it.
-    ///
-    /// Nothing above it is inspected, peeled or rebuilt. The rewrite is
-    /// substituted for this node IN PLACE, and a node carrying the aggregate's
-    /// output names and types is interchangeable with it by construction —
-    /// which is a property of the aggregate alone. Earlier versions matched a
-    /// fixed grammar of parents (`Sort`, then `Limit`, then a second
-    /// `Projection`…) and production kept producing one layer more than the
-    /// grammar knew, because the shape depends on the session's analyzer rules.
-    fn outermost_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
-        match plan {
-            LogicalPlan::Aggregate(_) => Some(plan),
-            plan => plan.inputs().into_iter().find_map(outermost_aggregate),
-        }
-    }
 
     // Read paths only. Searching the whole tree — rather than a peeled root —
     // means an aggregate nested inside a statement is now reachable, and neither
@@ -1750,15 +1773,40 @@ pub(crate) async fn match_aggregates(
     // for; the inlined copy only ever answers "does this resemble a dimension".
     let inlined = inline_common_exprs(original);
     let aggregate = inlined.as_ref().unwrap_or(original);
+    let shape = || matched.display_indent_schema().to_string().lines().take(6).collect::<Vec<_>>().join(" | ");
     let mut predicates = Vec::new();
-    let Some(source) = source_and_filters(&aggregate.input, &mut predicates) else {
-        // Count this ONLY when a rollup-bearing table sits underneath; an
-        // aggregate over a join or `pg_catalog` was never a candidate and must
-        // not inflate the reason breakdown. See `MissReason::UnwalkableSource`.
-        if scanned_table(&aggregate.input).is_some_and(|table| crate::schema::get_schema(&table).is_some_and(|schema| !schema.rollups.is_empty())) {
-            crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
+    let source = match source_and_filters(&aggregate.input, &mut predicates) {
+        Ok(source) => source,
+        Err(node) => {
+            // Count this ONLY when a rollup-bearing table sits underneath; an
+            // aggregate over a join or `pg_catalog` was never a candidate and must
+            // not inflate the reason breakdown. See `MissReason::UnwalkableSource`.
+            if let Some(table) =
+                scanned_table(&aggregate.input).filter(|table| crate::schema::get_schema(table).is_some_and(|schema| !schema.rollups.is_empty()))
+            {
+                crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
+                // Unconditional warn, not `sample_rollup_miss`: that sampler is
+                // 1-in-512 across ALL misses, and this class runs ~20/hr, so
+                // sampling would print one line per day — the same invisibility
+                // this event exists to end. `node` is bounded by `truncated`.
+                //
+                // `inlined_cse` separates two populations that look identical in
+                // the dump: a `__common_expr_N` projection here means
+                // `inline_common_exprs` itself declined (mixed alias+rename,
+                // a dangling nested CSE reference, or a rebuild whose schema
+                // stopped matching), NOT that CSE is unhandled.
+                tracing::warn!(
+                    event = "rollup_declined_shape",
+                    source = %table,
+                    reason = MissReason::UnwalkableSource.label(),
+                    node,
+                    inlined_cse = inlined.is_some(),
+                    plan = %shape(),
+                    "the matcher could not walk from the aggregate down to the scan"
+                );
+            }
+            return Ok(Vec::new());
         }
-        return Ok(Vec::new());
     };
     let Some(schema) = crate::schema::get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(Vec::new()) };
 
@@ -1816,7 +1864,7 @@ pub(crate) async fn match_aggregates(
     // declared-schema question the counters already answer, and keeping those at
     // debug stops an ordinary unroutable panel from spamming prod's warn stream.
     let reason = miss.or(grain_miss).unwrap_or(MissReason::UnsupportedShape);
-    let shape = matched.display_indent_schema().to_string().lines().take(6).collect::<Vec<_>>().join(" | ");
+    let shape = shape();
     match reason {
         MissReason::UnsupportedShape => {
             tracing::warn!(event = "rollup_declined_shape", source, reason = reason.label(), plan = %shape, "no declared rollup can serve this aggregate")
@@ -3089,6 +3137,67 @@ mod tests {
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         );
         assert!(route_for(&state, &sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
+    }
+
+    /// The shapes that make `source_and_filters` refuse, each with the real
+    /// caller that emits it.
+    ///
+    /// `UnwalkableSource` became the largest miss reason in production — 157 of
+    /// 379 over 8h on 2026-08-25, more than every filter reason combined — while
+    /// emitting nothing at all, so the class could only be attributed by
+    /// construction. Each case asserts BOTH halves of the fix: the miss is
+    /// counted (it leaves through `Ok(Vec::new())`, so a counter is the only
+    /// evidence it happened) and the refusal NAMES the node that stopped the
+    /// walk, which is what a prod log has to carry to be worth anything.
+    ///
+    /// Deliberately absent: the `SELECT *` variant-wrap projection. It needs the
+    /// Variant analyzer rule, which a bare `MemTable` session does not register
+    /// — the same blind spot recorded at `measure_filters`.
+    #[test_case::test_case(
+        &format!("SELECT count(*) FROM (SELECT 1 FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} LIMIT 5000) s"),
+        "Limit"; "a bounded existence probe over a derived table — monoscope safetyNetReprocess, BackgroundJobs.hs:2127")]
+    #[test_case::test_case(
+        &format!("WITH f AS (SELECT status_code AS sc, timestamp FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) SELECT sc, count(*) FROM f GROUP BY sc"),
+        "Projection"; "a CTE that RENAMES the dimension the outer aggregate groups by")]
+    #[test_case::test_case(
+        &format!(
+            "WITH f AS (SELECT floor(extract(epoch from timestamp) / 60)::bigint AS bucket_idx FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) \
+             SELECT bucket_idx, count(*) FROM f GROUP BY bucket_idx"
+        ),
+        "Projection"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
+    #[test_case::test_case(
+        &format!(
+            "SELECT count(*) FROM (SELECT timestamp FROM {SOURCE} WHERE project_id = 'a' AND {WINDOW} \
+             UNION ALL SELECT timestamp FROM {SOURCE} WHERE project_id = 'b' AND {WINDOW}) u"
+        ),
+        "Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
+    #[test_case::test_case(
+        &format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d"),
+        "Aggregate"; "an inner DISTINCT, which plans as a second Aggregate")]
+    #[tokio::test]
+    async fn an_unwalkable_shape_is_counted_and_names_the_node_that_refused(sql: &str, expected_node: &str) {
+        let state = session().await;
+        let counter = &crate::observability::maintenance_stats().rollup_miss_unwalkable_source;
+        let before = counter.load(std::sync::atomic::Ordering::Relaxed);
+        let plan = optimized(&state, sql).await;
+
+        assert_eq!(
+            match_aggregates(&plan, &state).await.expect("an unwalkable plan declines, it does not error").len(),
+            0,
+            "an unwalkable plan must not route"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed) - before,
+            1,
+            "the miss must be counted exactly once — it leaves through Ok(Vec::new()), so nothing else records it: {}",
+            plan.display_indent()
+        );
+
+        // The description the warn carries. Read off the same walk the matcher
+        // runs, so a test-only re-derivation cannot drift from the log line.
+        let Some(datafusion::logical_expr::LogicalPlan::Aggregate(aggregate)) = outermost_aggregate(&plan) else { panic!("an aggregate") };
+        let refused = source_and_filters(aggregate.input.as_ref(), &mut Vec::new()).expect_err("the walk must refuse");
+        assert!(refused.contains(expected_node), "the refusal must name the node that stopped the walk, got {refused:?} for {}", plan.display_indent());
     }
 
     /// Under `col IS NOT NULL` — consumed above rather than pushed, so neither
