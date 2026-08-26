@@ -431,6 +431,14 @@ rollups:
       - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
       - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
       - { name: duration_digest, agg: tdigest, column: duration }
+      # monoscope's *Active Services* stat, `dcount(resource.service.name)`. It is
+      # the ONE dcount column that routes on a measure alone: the column is a
+      # declared dimension, so the widget's `IS NOT NULL` becomes a row filter.
+      # The other dcount panels guard on a NON-dimension (`name`, `body`,
+      # `context___trace_id`) and would each also need a `count` guard measure —
+      # *Unique Endpoints* additionally promotes a two-way `server` scope, which is
+      # a filter variant the tier deliberately does not declare.
+      - { name: service_name_hll, agg: hll, column: resource___service___name }
   # Coarse tier for wide windows. The matcher picks the coarsest grain that
   # divides the requested bucket width, so a 30-day chart (1d/6h buckets)
   # reads this and a 5-minute chart still reads the 1m tier. Derived from
@@ -457,6 +465,9 @@ rollups:
          - { name: server_error_count, agg: count, filter: "(kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http') AND (status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500)" }
          - { name: server_duration_digest, agg: tdigest, column: duration, filter: "kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http'" }
          - { name: duration_digest, agg: tdigest, column: duration }
+         # A derived tier that does not declare a measure cannot serve it, so the
+         # coarse grain would silently decline every wide dcount window.
+         - { name: service_name_hll, agg: hll, column: resource___service___name }
 
   # NO `level` TIER. Tried and withdrawn on 2026-08-24, after pricing three costs
   # against zero measured benefit:

@@ -1042,7 +1042,14 @@ pub(crate) fn slice_input_sql(
 /// Nor is "scalar measures are safe" a rule. `Merge::Count` and `Merge::Sum`
 /// fold with SQL `SUM`, which skips NULLs exactly as `tdigest_merge` does — a
 /// missing scalar undercounts just as silently as a missing sketch.
-const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 1] = ["duration_digest"];
+/// `service_name_hll` is here by the same rule read forward rather than
+/// backward: it is declared 2026-08-26, so it is absent from every cell written
+/// before it BY CONSTRUCTION, tagged or not. `hll_merge` skips the NULLs Delta
+/// fills the missing column with, so a window straddling the declaration would
+/// return a distinct count over only the rebuilt part — plausible, low, and
+/// silent, which is the exact failure the list exists to stop. Any measure
+/// declared from now on belongs here until its history is rebuilt.
+const MEASURES_ABSENT_FROM_LEGACY_CELLS: [&str; 2] = ["duration_digest", "service_name_hll"];
 
 impl RoutedRollup {
     /// Every tier column this rewrite reads a state out of, the `HAVING` guard

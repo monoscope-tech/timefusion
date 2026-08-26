@@ -284,7 +284,8 @@ As of 2026-08-22, after the routing work:
 | §3 percentiles, unfiltered | **yes** (since `0462eed`) | needed an unfiltered `duration_digest` |
 | §3 percentiles under a `server` filter | yes | `server_duration_digest` |
 | §4 error rate | only when the predicate matches the declared `error_count` exactly | otherwise `missing_measure` |
-| §5 dcount | no | no `hll` measure declared |
+| §5 dcount over `resource___service___name` | **yes** (since 2026-08-26) | `service_name_hll`; the column is a dimension, so `IS NOT NULL` is a row filter |
+| §5 dcount over `name` / `body` / `context___trace_id` | no | each guards on a non-dimension and needs a `count` guard measure too |
 | §6 top-K tables | no | `name`/endpoint not a dimension; `MAX(timestamp)-MIN(timestamp)` is not decomposable |
 | §7 facets | no | arbitrary field |
 | §8–§11 | n/a | not aggregates |

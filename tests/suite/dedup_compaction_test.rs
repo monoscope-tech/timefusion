@@ -2549,6 +2549,124 @@ async fn a_count_star_under_a_null_guard_routes_via_duration_count() -> Result<(
     Ok(())
 }
 
+/// monoscope's *Active Services* widget — `dcount(resource.service.name)`, which
+/// lowers to `distinct_count(approx_count_distinct(col))` — must route and must
+/// agree with the raw sketch, both as a bare scalar and bucketed.
+///
+/// `Merge::Hll` and the `hll_agg`/`hll_merge` UDAFs already existed; what was
+/// missing was a DECLARED `{agg: hll, …}` measure, so every dcount panel declined
+/// `missing_measure` (docs/monoscope-query-shapes.md §5). `resource___service___name`
+/// is the one dcount column that routes on the measure alone: it is a declared
+/// dimension, so its `IS NOT NULL` becomes a row filter. Every other dcount widget
+/// guards on a NON-dimension (`name`, `body`, `context___trace_id`) and would
+/// additionally need a `{agg: count, column: …}` guard measure.
+///
+/// Equality is exact rather than approximate: HLL merge is register-wise max and
+/// therefore associative, so the hybrid's `hll_merge(states) ∪ hll_agg(fringe)`
+/// is the same sketch the raw leg builds in one pass.
+#[serial]
+#[tokio::test]
+async fn a_distinct_count_over_services_routes_and_matches_the_raw_sketch() -> Result<()> {
+    struct ClockGuard;
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            timefusion::support::unfreeze();
+        }
+    }
+    let _clock_guard = ClockGuard;
+    let cfg = (*TestConfigBuilder::new("rollup_dcount").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+    let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+    db.cancel_maintenance();
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+    let row = |id: &str, service: Option<&str>, ts: i64| -> Result<_> {
+        json_to_batch(vec![serde_json::json!({
+            "timestamp": ts, "id": id, "name": "op", "project_id": project_id, "hashes": [], "summary": ["dcount fixture"],
+            "date": chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string(),
+            "duration": 100, "kind": "server", "status_code": "OK", "resource___service___name": service,
+        })])
+    };
+
+    // Services REPEAT within and across hours, so a distinct count differs from a
+    // row count and parity is not vacuous; one null-service row proves the
+    // `IS NOT NULL` row filter does work on both legs. Yesterday certifies into
+    // the tier, today can only come from the raw fringe.
+    let fixture = [
+        (Some("cart"), yesterday_noon + 17),
+        (Some("cart"), yesterday_noon + 61_000_000),
+        (Some("checkout"), yesterday_noon + 130_000_000),
+        (None, yesterday_noon + 3_661_000_000),
+        (Some("cart"), yesterday_noon + 3_700_000_000),
+        (Some("search"), yesterday_noon + 7_330_000_000),
+    ];
+    for (i, (service, ts)) in fixture.iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("y{i}"), *service, *ts)?], true, None).await?;
+    }
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+    timefusion::support::advance_micros(
+        timefusion::maintenance_coordinator::FINALIZATION_DELAY_MICROS + timefusion::maintenance_coordinator::INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
+    );
+    assert!(db.run_maintenance_units(1024).await? > 0, "eligible yesterday slices must be drained");
+
+    for (i, (service, offset)) in [(Some("cart"), 5_000_000i64), (Some("payments"), 3_700_000_000)].iter().enumerate() {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row(&format!("t{i}"), *service, midnight + offset)?], true, None).await?;
+    }
+
+    let (lo, hi) = (yesterday_noon + 17, midnight + 7_200_000_017);
+    let window = format!(
+        "project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi}) \
+         AND resource___service___name IS NOT NULL"
+    );
+
+    // The fixture must hold both a repeat and a null, or neither the distinct
+    // count nor the row filter is exercised.
+    let probe = db
+        .query_delta_only(&format!(
+            "SELECT COUNT(*)::BIGINT, COUNT(DISTINCT resource___service___name)::BIGINT FROM otel_logs_and_spans \
+             WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        ))
+        .await?;
+    let (rows, services) = probe
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .map(|b| (b.column(0).as_primitive::<Int64Type>().value(0), b.column(1).as_primitive::<Int64Type>().value(0)))
+        .next()
+        .expect("a probe row");
+    assert!(services > 1 && services < rows, "the fixture must repeat services and hold a null one, got {services} distinct over {rows} rows");
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let hits = || {
+        let stats = timefusion::observability::maintenance_stats();
+        stats.rollup_hits_hybrid.load(std::sync::atomic::Ordering::Relaxed) + stats.rollup_hits_full.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let show = |batches: Vec<datafusion::arrow::array::RecordBatch>| {
+        let kept = batches.into_iter().filter(|b| b.num_rows() > 0).collect::<Vec<_>>();
+        assert!(!kept.is_empty(), "an empty answer makes the parity assertion vacuous");
+        datafusion::arrow::util::pretty::pretty_format_batches(&kept).expect("format").to_string()
+    };
+
+    // The widget verbatim (a bare scalar), and its bucketed sibling.
+    for select in [
+        "distinct_count(approx_count_distinct(resource___service___name))::float AS dcount FROM otel_logs_and_spans WHERE {window}".to_string(),
+        "time_bucket('1 hours', timestamp) AS tb, distinct_count(approx_count_distinct(resource___service___name))::float AS dcount \
+         FROM otel_logs_and_spans WHERE {window} GROUP BY 1 ORDER BY 1"
+            .to_string(),
+    ] {
+        let query = format!("SELECT {}", select.replace("{window}", &window));
+        let before = hits();
+        let routed = show(ctx.sql(&query).await?.collect().await?);
+        assert!(hits() > before, "the dcount widget must route, or this proves nothing about the hll measure: {query}");
+        assert_eq!(routed, show(db.query_delta_only(&query).await?), "the routed sketch must equal the raw one: {query}");
+    }
+    Ok(())
+}
+
 // This is the shape production actually sends: microsecond-precision bounds
 /// running up to now. Before the union it was refused outright, so the feature
 /// never served a single query. A hybrid that merely *runs* is worthless — the
