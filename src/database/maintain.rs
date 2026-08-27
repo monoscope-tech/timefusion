@@ -149,7 +149,7 @@ const DAMAGED_CELLS: &[(&str, &str)] = &[
     ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-26"),
 ];
 
-fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
+pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
 }
 
@@ -5990,7 +5990,10 @@ impl Database {
             let slices: Vec<String> = match slice_col {
                 None => Vec::new(),
                 Some(col) => {
-                    let want = (bytes_in / slice_target.expect("slice column requires a target")).max(0) as usize + 1;
+                    // DECODED bytes on both sides — sizing this in compressed
+                    // bytes made every slice ~12x its intent (see
+                    // `REPAIR_SLICE_DECODED_TARGET_BYTES`).
+                    let want = repair_slice_want(bytes_in, slice_target.expect("slice column requires a target"));
                     let probe = format!(
                         "SELECT min(\"{col}\") AS lo, max(\"{col}\") AS hi, sum(CASE WHEN \"{col}\" IS NULL THEN 1 ELSE 0 END) AS nulls FROM {bin_table}"
                     );

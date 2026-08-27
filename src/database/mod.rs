@@ -6883,13 +6883,31 @@ fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
         .join(",")
 }
 
-/// Input bytes one repair slice may cover.
+/// **DECODED** bytes one repair slice may cover — the unit the sort allocates.
 ///
-/// A whole-file sort does not fit the light pool, so the unit must shrink. 256 MB is the only
-/// value with an observed successful completion. A 64 MB target was tried and reverted: the
-/// apparent throughput cliff was concurrent-bin contention, not size. If retuning, measure
-/// completion time for one bin of a known size on an idle box.
-const REPAIR_SLICE_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+/// This was `256 MB` of COMPRESSED input, which is the bug prod hit on 2026-08-27.
+/// `estimated_decoded_bytes` is 12x, so a 910 MB file cut into `910/256 + 1 = 4`
+/// slices of ~227 MB compressed — **~2.7 GB decoded each**. The reservation dump
+/// shows exactly that, and shows why it matters: `ExternalSorterMerge` is
+/// `can spill: false`, so two such slices pinned 3.0 GB + 1.08 GB of a 4.1 GB
+/// pool and a 21-file sealed consolidation failed asking for 2.1 MB with 126 KB
+/// left. The repair lane was starving every other maintenance lane, which is why
+/// the visible failures were in code that was working correctly.
+///
+/// Sized from the pool invariant, not from a throughput measurement:
+/// `target x TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY (2) <= ~half the 4.1 GB
+/// pool`, leaving the other half for the cheap lanes that only ever need
+/// single-digit MB. 1 GB decoded ~= 85 MB compressed per slice, so the 910 MB
+/// file becomes 11 slices instead of 4.
+///
+/// Do not raise this to reduce slice count without re-checking the deadline:
+/// each slice is a separate pass and `TIMEFUSION_REPAIR_RESUME_ENABLED` resumes
+/// only COMPLETED staging, so partial slice progress is lost on restart. The
+/// count must fit the 900 s deadline as well as the pool. The prior note that
+/// "64 MB was tried and reverted, the cliff was contention not size" still
+/// stands and is consistent with this: contention is what an oversized
+/// unspillable merge CAUSES.
+const REPAIR_SLICE_DECODED_TARGET_BYTES: i64 = 1024 * 1024 * 1024;
 
 /// Run the min/max/null probe for slice planning. `None` declines slicing —
 /// on any error, a non-i64 sort column, or a single NULL, because a NULL would
@@ -7670,12 +7688,28 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     selected.into_iter().map(|add| add.path).collect()
 }
 
+/// Per-slice budget, in **DECODED** bytes — the unit the sort actually allocates.
+///
+/// Returns a decoded budget; feed it to [`repair_slice_want`], never divide
+/// compressed `bytes_in` by it.
 fn coordinator_slice_target(pass: TailPass, input_files: usize, bytes_in: i64) -> Option<i64> {
     match pass {
-        TailPass::Repair => Some(REPAIR_SLICE_TARGET_BYTES),
-        TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => Some(COORDINATOR_L0_SORT_TARGET_BYTES),
+        TailPass::Repair => Some(REPAIR_SLICE_DECODED_TARGET_BYTES),
+        // Unchanged in effect: the same 16 MB compressed budget, re-expressed in
+        // decoded bytes so one unit runs through the whole slicing path.
+        TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => Some(crate::database::maintain::estimated_decoded_bytes(COORDINATOR_L0_SORT_TARGET_BYTES) as i64),
         TailPass::Pack => None,
     }
+}
+
+/// How many event-time slices a bin must be cut into so no single sort exceeds
+/// `decoded_slice_target` of decoded Arrow.
+///
+/// The `+ 1` matches the caller's gate: `want > 1` is what enables slicing at
+/// all, so a bin that fits whole returns 1 and is sorted in one pass.
+fn repair_slice_want(bytes_in: i64, decoded_slice_target: i64) -> usize {
+    let decoded = crate::database::maintain::estimated_decoded_bytes(bytes_in);
+    (decoded / (decoded_slice_target.max(1) as u64)) as usize + 1
 }
 
 /// Pick the files one light-optimize bin should rewrite. Pure so the policy is testable without a
@@ -15055,9 +15089,49 @@ mod tests {
             "an individually oversized L0 file remains progressable and is time-sliced by staging"
         );
 
-        assert_eq!(super::coordinator_slice_target(TailPass::Pack, 1, 40 * MB), Some(16 * MB));
         assert_eq!(super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB), None);
-        assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(super::REPAIR_SLICE_TARGET_BYTES));
+    }
+
+    /// A slice must bound DECODED bytes, because that is what the sort allocates.
+    ///
+    /// Prod 2026-08-27: two whale repair units held 3.0 GB and 1.08 GB in
+    /// `ExternalSorterMerge`, which `can spill: false`, filling the whole 4.1 GB
+    /// light pool — a 21-file sealed consolidation then failed asking for 2.1 MB
+    /// with 126 KB left. The slice target was 256 MB of COMPRESSED bytes, so the
+    /// 910 MB file cut into 4 slices of ~227 MB compressed = ~2.7 GB decoded,
+    /// matching the observed peak. Sizing in the wrong unit made every slice ~12x
+    /// its intent. The invariant below is the one that was missing.
+    #[test]
+    fn repair_slices_bound_decoded_bytes_not_compressed() {
+        use super::{REPAIR_SLICE_DECODED_TARGET_BYTES as TARGET, repair_slice_want};
+        use crate::database::maintain::estimated_decoded_bytes;
+        const MB: i64 = 1024 * 1024;
+
+        // The two prod files that held the pool, by their exact `bytes_in`.
+        for bytes_in in [910_749_060i64, 1_717_176_058, 722_216_602, 1_317_255_463] {
+            let want = repair_slice_want(bytes_in, TARGET);
+            let decoded_per_slice = estimated_decoded_bytes(bytes_in) / want as u64;
+            assert!(
+                decoded_per_slice <= TARGET as u64,
+                "bytes_in={bytes_in} cut into {want} slices leaves {decoded_per_slice} decoded bytes per slice, over the {TARGET} target"
+            );
+        }
+
+        // The regression itself: 4 slices was the broken answer for the 910 MB file.
+        assert_eq!(repair_slice_want(910_749_060, TARGET), 11, "a 910 MB file is ~10.9 GB decoded and needs 11 slices, not the 4 that compressed sizing gave");
+
+        // A bin small enough to sort whole is never sliced (`want > 1` gates it).
+        assert_eq!(repair_slice_want(1024, TARGET), 1, "a tiny bin must not be sliced");
+
+        // Pack's single-oversized-L0 path keeps its behaviour: the target is the
+        // same 16 MB compressed budget, expressed in decoded bytes.
+        assert_eq!(
+            super::coordinator_slice_target(TailPass::Pack, 1, 40 * MB),
+            Some(estimated_decoded_bytes(16 * MB) as i64),
+            "the L0 target is unchanged in effect, only re-denominated"
+        );
+        assert_eq!(repair_slice_want(40 * MB, estimated_decoded_bytes(16 * MB) as i64), 40 / 16 + 1, "re-denominating must not change how many slices an L0 file gets");
+        assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(TARGET));
     }
 
     /// A packing pass must never rewrite a file that is already at or above target.
@@ -16363,14 +16437,20 @@ mod tests {
     /// partition's declared ordering forever. Ingest keeps its fallback because its rows exist
     /// nowhere else. The slice target must split large files but leave small files unsliced, because
     /// each slice costs a scan of the input.
+    ///
+    /// Calls the real `repair_slice_want` rather than restating its arithmetic:
+    /// this test used to keep its own copy and so kept passing while the
+    /// production formula was wrong by a factor of 12.
     #[test]
     fn a_repair_slice_splits_big_files_but_leaves_small_ones_alone() {
         const MB: i64 = 1024 * 1024;
-        let slices = |input: i64| (input / super::REPAIR_SLICE_TARGET_BYTES).max(0) as usize + 1;
+        let slices = |input: i64| super::repair_slice_want(input, super::REPAIR_SLICE_DECODED_TARGET_BYTES);
         // shipbubble's blocker must be split; it is the file this exists for.
         assert!(slices(1_088_634_971) >= 4, "the 1.04 GiB blocker must be sliced, got {}", slices(1_088_634_971));
-        // ...but not shredded: every extra slice is another full scan.
-        assert!(slices(1_088_634_971) <= 8, "too many slices turns the rewrite into re-scans, got {}", slices(1_088_634_971));
+        // ...but not shredded: every extra slice is another full scan of an
+        // unsorted file, and repair resume only restores COMPLETED staging, so
+        // slice count has to fit the 900 s deadline as well as the pool.
+        assert!(slices(1_088_634_971) <= 16, "too many slices turns the rewrite into re-scans, got {}", slices(1_088_634_971));
         assert_eq!(slices(30 * MB), 1, "a small file is sorted whole");
     }
 
