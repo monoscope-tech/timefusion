@@ -236,6 +236,46 @@ Two separate questions, don't conflate them:
    scratch next tick. A brake that pauses rather than abandons would keep the
    planning work.
 
+### P3c — the STRUCTURAL repair debt: 917 whole-file sorts, 745 GB
+
+Measured 2026-08-28 while the P0 deploy was building. This is the reason repair
+holds the pool for so long, and it is a standing condition, not an incident.
+
+- **917 active files exceed 512 MB, totalling 745 GB.** Each is one repair unit
+  (`coordinator_compaction_files` does `.take(1)` for Repair), i.e. one
+  whole-file sort.
+- Sampling one large file per date across 12 dates: **11 NONE, 1 DECLARED, 0
+  errors** — they genuinely carry no declared sort order, so repair is right to
+  target them. (`ERROR` was tallied as its own bucket and never folded into
+  `NONE` — see `tf_ovh_checksum_breaks_pyarrow_footers_2026-08-19`.)
+- Whale 07-28 alone is 104 files / 86.6 GB with individual files at **1.6–1.9 GB**.
+  The 1717.2 MB file is exactly the `bytes_in=1717176058` repair keeps re-slicing.
+
+At the new sizing a 1.2 GB file is ~14 GB decoded ≈ 15 slices. 917 of these
+cannot drain against a 900 s deadline while sharing one pool with every other
+lane — even bounded, repair will occupy maintenance for a very long time.
+
+**The strategic question this raises** (do NOT act before the P0 measurement):
+historical repair competes directly with compaction of *recent* days, which is
+what queries actually read. Candidates, in order of preference:
+1. **Pool isolation** — give repair a bounded share so it can never starve the
+   lanes serving recent data. Principled, and directly serves "the backlog never
+   piles up".
+2. **Age-deprioritise repair** — a 07-28 file's sortedness benefits few queries;
+   recent days benefit many.
+3. **Off-box** via `timefusion optimize --recompress`.
+
+If P0 alone brings repair's footprint from 3 GB to ~1 GB and the other lanes
+drain, this may not need doing at all. **Measure first.**
+
+**Retracted, my own broken probe:** an earlier pass here reported "0 of 6,385
+files carry tags", i.e. every file repair-eligible. That was an artifact —
+`deltalake`'s `get_add_actions(flatten=True)` does not expose a `tags` key at
+all, so `.get("tags")` returned `None` for every row. The uniform extreme across
+100% of rows is the tell ([[tf_uniform_extreme_means_broken_probe_2026-08-19]]).
+Reading tags needs the `_delta_log` directly. The **footer** results above are
+unaffected — those came from pyarrow reading real footers, and they succeeded.
+
 ### P4 — find what broke on 08-24
 
 A cross-tenant, cross-table file-count cliff starts exactly at 08-24 (logs
