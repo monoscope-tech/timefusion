@@ -7697,7 +7697,9 @@ fn coordinator_slice_target(pass: TailPass, input_files: usize, bytes_in: i64) -
         TailPass::Repair => Some(REPAIR_SLICE_DECODED_TARGET_BYTES),
         // Unchanged in effect: the same 16 MB compressed budget, re-expressed in
         // decoded bytes so one unit runs through the whole slicing path.
-        TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => Some(crate::database::maintain::estimated_decoded_bytes(COORDINATOR_L0_SORT_TARGET_BYTES) as i64),
+        TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => {
+            Some(crate::database::maintain::estimated_decoded_bytes(COORDINATOR_L0_SORT_TARGET_BYTES) as i64)
+        }
         TailPass::Pack => None,
     }
 }
@@ -15130,7 +15132,11 @@ mod tests {
             Some(estimated_decoded_bytes(16 * MB) as i64),
             "the L0 target is unchanged in effect, only re-denominated"
         );
-        assert_eq!(repair_slice_want(40 * MB, estimated_decoded_bytes(16 * MB) as i64), 40 / 16 + 1, "re-denominating must not change how many slices an L0 file gets");
+        assert_eq!(
+            repair_slice_want(40 * MB, estimated_decoded_bytes(16 * MB) as i64),
+            40 / 16 + 1,
+            "re-denominating must not change how many slices an L0 file gets"
+        );
         assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(TARGET));
     }
 
