@@ -247,6 +247,43 @@ commit.
 
 ## Log
 
-- **2026-08-27 23:2x** — Plan created. Diagnosis complete and evidenced (see
-  above). Confirmed by reading source that Pack has neither ladder nor slicing
-  nor degradation recording, while Repair and Dedup have all three. Starting P0.
+- **2026-08-27 23:2x** — Plan created. Two diagnoses raised and both refuted (see
+  "Refuted along the way"). Third diagnosis — repair slices denominated in
+  compressed bytes — confirmed by the reservation dump and by prod logging
+  `slices=4` for `bytes_in=910749060` and `slices=7` for `1717176058`, exactly as
+  the arithmetic predicts.
+- **2026-08-27 23:4x** — `caf7963` (docs) and **`93cd806` (the fix)** committed.
+  `REPAIR_SLICE_TARGET_BYTES` (256 MB compressed) → `REPAIR_SLICE_DECODED_TARGET_BYTES`
+  (1 GB decoded), `repair_slice_want()` extracted so the formula has one home,
+  Pack's oversized-L0 path re-denominated through it and unchanged in effect.
+  Tests: 5 pass, including the invariant `decoded_per_slice <= target` on the four
+  exact prod `bytes_in` values.
+  - Note: `a_repair_slice_splits_big_files_but_leaves_small_ones_alone` kept its
+    **own copy** of the arithmetic, so it passed while production was wrong by
+    12×. It now calls the real function. Watch for this pattern elsewhere.
+
+### Predictions this fix makes (check these, in this order)
+
+| # | prediction | falsifies if |
+|---|---|---|
+| 1 | repair logs `slices=11` for `bytes_in=910749060` (was 4) | still 4 → fix not deployed |
+| 2 | `ExternalSorterMerge` peaks fall from 3.0 GB to ~1 GB | stays ~3 GB → wrong constant path |
+| 3 | `Light optimize staging failed` for **non-Repair** lanes → ~0, **with zero changes to sealed code** | persists → diagnosis incomplete ⬅ THE falsifier |
+| 4 | 08-24/25/26 file counts fall on the next chart pull | flat after ≥2 h → sealed lane has a second blocker |
+
+**Predicted residual, not a refutation:** the 1.7 GB file becomes ~21 slices and
+may still exceed the 900 s deadline. Bounded and next in line — and even then it
+no longer pins 3 GB of unspillable pool, so the other lanes drain regardless.
+
+**Do not retune from the measured ~73 s/slice.** That number was taken *inside*
+the failure mode: 2.7 GB slices thrashing a pinned pool, where the spill-merge is
+both the memory hog and much of the latency. A 1 GB slice against a ~2 GB fair
+share should mostly not spill. Treat 73 s as a ceiling, not an expectation.
+
+### Measurement discipline for the morning
+
+A push **restarts prod**, which resets process-scoped counters and kills the
+current retry storm (costing nothing — none of it was landing). Wait **≥2 h**
+before trusting any counter, and check `docker service ps` uptime first.
+Split staging-failure counts **by lane**: the fix is in Repair, the visible
+symptom was in Pack.
