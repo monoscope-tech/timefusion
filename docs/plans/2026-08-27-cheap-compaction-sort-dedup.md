@@ -240,8 +240,26 @@ Two separate questions, don't conflate them:
 
 A cross-tenant, cross-table file-count cliff starts exactly at 08-24 (logs
 22→561, metrics 251→523) with flat daily bytes. `tf_sealed_backlog_is_flat_2026-08-24`
-records the sealed backlog flat at 931→933 that same day. Not yet attributed to a
-commit.
+records the sealed backlog flat at 931→933 that same day.
+**Still unattributed — do not close it on mechanism resemblance.**
+
+Two candidates, neither confirmed:
+
+1. **Deploy density, not any single commit.** `git log --since=2026-08-22
+   --until=2026-08-25 -- src/database/ src/maintenance_coordinator.rs` returns
+   **30+ commits on 08-24 alone**. Every push restarts prod, and units average
+   ~21 min and die to process exit rather than to re-claiming
+   (`tf_units_die_to_restarts_2026-08-23`, `tf_deploy_cadence_starves_dedup_2026-08-18`).
+   A day of continuous deploys is a day in which no long unit completes — which
+   would fragment 08-24 — and the pool starvation above is then sufficient to
+   explain why it never recovered. Fits the "step, not slope" shape without
+   needing a logic defect.
+2. **`3465ecc` "a SealedConsolidation unit is never the live frontier"** — on-topic,
+   landed 08-24, unexamined.
+
+Both predict the cliff in both tables, so cross-table evidence does not separate
+them. The discriminator is when the whale Repair units were first enqueued —
+a journal query, not a log grep.
 
 ---
 
