@@ -218,6 +218,24 @@ from 08-22 outranks the 294-file otel_logs_and_spans cell from 08-26. Rank by
 estimated files removed, keep a starvation floor. **Do P0/P1 first** — ordering
 cannot help while nothing that gets picked finishes.
 
+### P3b — the cron light-optimize lane is brake-stopped more often than it commits
+
+`light_optimize_memory_brakes_total` = **263** vs `light_optimize_bins_committed_total`
+= **108**. The brake is `process_memory_bytes() > memory_brake_limit_bytes()`
+(prod `limit=68719476736` = **64 GB** RSS against the 120 GB cgroup), and it
+returns `Brake::Stop`, which ends the tick. Prod logs show **10 brakes inside
+5 ms** (23:10:00.986–.991) — the per-project loop hitting the same brake once per
+project, so a whole tick's planning is done and thrown away.
+
+Two separate questions, don't conflate them:
+1. *Why is RSS > 64 GB?* Known, long-running ([[tf_oom_peak_anon_back_to_124gb_2026-08-20]]).
+   The 3–4 GB unspillable repair merges are a contributor the P0 fix should
+   reduce — **check whether brake count falls after the deploy before doing
+   anything here.**
+2. *Should one brake stop the whole tick?* Stopping per project re-plans from
+   scratch next tick. A brake that pauses rather than abandons would keep the
+   planning work.
+
 ### P4 — find what broke on 08-24
 
 A cross-tenant, cross-table file-count cliff starts exactly at 08-24 (logs
