@@ -298,6 +298,12 @@ a journal query, not a log grep.
     **own copy** of the arithmetic, so it passed while production was wrong by
     12×. It now calls the real function. Watch for this pattern elsewhere.
 
+- **2026-08-28 00:0x** — Gate green: `cargo lint` clean, `make test` **1227/1227
+  passed** (232 s). Pushed `ba6390c..eadffa1` from a **detached worktree** pinned
+  at the tested commit, so a concurrent session could not alter what shipped.
+  Deploy triggered. Baseline for comparison is the table at the top of this file,
+  taken on `ba6390c` with 24 h uptime.
+
 ### Predictions this fix makes (check these, in this order)
 
 | # | prediction | falsifies if |
