@@ -185,6 +185,40 @@ ids in it contain nothing delta-rs encodes — and the unit test covers that
 instead. Stated because a test that looks like it covers something it does not
 is worse than no test.
 
+## PROD VERIFICATION — image `e50e50d`, deployed 2026-08-28 16:01Z
+
+Three log lines, and they vindicate the two cadence/logging fixes exactly:
+
+```
+16:01:43  footer_repair_verified_loaded  loaded=22545 dropped=0
+16:01:43  footer_repair_seed_swept       tables_read=0 candidates=0 verified=0
+16:02:55  footer_repair_seed_swept       tables_read=6 candidates=5000 verified=5000 unsorted=0
+```
+
+- **The first sweep read nothing** — the predicted boot race, running ahead of the
+  table load. It is visible ONLY because the empty path was made to log; with the
+  original early return this was silence, indistinguishable from a healthy fleet.
+- **The 60s retry did the real work**: 6 tables, 5,000 files probed, **5,000
+  verified sorted, 0 unsorted**. With the original hourly retry this second pass
+  would never have fired — the container dies in 20-40 minutes — and the seeding
+  would have been a permanent no-op that logged like a success.
+- **`unsorted = 0` of 5,000** is the substantive result: every file probed was
+  already correctly sorted. That is 5,000 pure suspects, each of which was
+  costing footer repair a ranged read, now permanently exonerated.
+- `loaded=22545` is the pre-existing persisted set, reloaded at boot.
+
+**The falsifier does not fire:** `repair_sorted_at_write_total` = **2**, non-zero,
+so the marking reaches the commit path. Stated honestly: 2 is small, and
+consistent with a ~12-minute-old container against a 600 s flush interval — about
+one flush cycle. **It must be re-read at higher uptime; a value that does not GROW
+is the same alarm as a zero.**
+
+`pending_repair` = **578** (589 before). Barely moved, and that is expected:
+`candidates` hit the 5,000 per-sweep cap, so most files remain unknown and a cell
+keeps its Repair task while ANY of its files is a suspect. The cap plus
+restart-driven re-seeding means roughly 5,000 files per boot; the number to watch
+is whether `pending_repair` trends down across boots, not within one.
+
 ## The e2e suite is red on master, and it is not a flake
 
 `smoke::count_star_returns_correct_value` failed during this work. It is filed as
