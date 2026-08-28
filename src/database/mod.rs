@@ -15143,7 +15143,10 @@ mod tests {
     async fn batch_size_dominates_narrow_row_staging() {
         use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
         use arrow_schema::{DataType, Field, Schema, TimeUnit};
-        use datafusion::{datasource::MemTable, prelude::{SessionConfig, SessionContext}};
+        use datafusion::{
+            datasource::MemTable,
+            prelude::{SessionConfig, SessionContext},
+        };
         use futures::StreamExt;
 
         const PARTS: usize = 23; // the prod bin's file count
@@ -15267,7 +15270,8 @@ mod tests {
             let batches: Vec<_> = (0..ROWS).step_by(batch_size).map(|off| make_batch(off, batch_size.min(ROWS - off))).collect();
             let mut buf: Vec<u8> = Vec::with_capacity(64 << 20);
             // zstd level 1 is `timefusion_zstd_level_intermediate`, what staging uses.
-            let props = WriterProperties::builder().set_compression(Compression::ZSTD(datafusion::parquet::basic::ZstdLevel::try_new(1).expect("level"))).build();
+            let props =
+                WriterProperties::builder().set_compression(Compression::ZSTD(datafusion::parquet::basic::ZstdLevel::try_new(1).expect("level"))).build();
             let mut writer = ArrowWriter::try_new(&mut buf, Arc::clone(&schema), Some(props)).expect("writer");
             let started = std::time::Instant::now();
             for b in &batches {
