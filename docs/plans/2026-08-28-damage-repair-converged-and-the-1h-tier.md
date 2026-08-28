@@ -516,3 +516,45 @@ file has no tags, but a file that IS tagged and fails the overlap or project tes
 is skipped with no counter at all — `rollup_untagged_inputs` reads 0 in prod
 while this happens. Instrumenting that skip is the cheapest next step and is
 strictly cheaper than reproducing the race.
+
+## 11. FIXED — the hour migration collapsed a DAY into hour 00 and dropped the other 23
+
+The section-5 observation "hours 21 and 22 have no derived unit in any state" has
+a cause, and it is a one-character-class bug in `migrate_derived_slices`.
+
+The guard was `task.key.slice.width() != DERIVED_SLICE_MICROS`. That matches
+slices **wider** than an hour as well as the ten-minute fragments the migration
+was written for — and the replacement key is the single hour containing the slice
+**start**:
+
+```rust
+let start = task.key.slice.start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
+key.slice = TimeSlice { start_micros: start, end_micros: start + DERIVED_SLICE_MICROS };
+```
+
+So a day-wide derived unit was marked `Superseded` and re-enqueued as **hour 00
+alone**. Its other 23 hours were never planned by anything.
+
+Measured on the captured journal, by the width of every task superseded with
+`migrated_to_aligned_hour_slice`:
+
+| width | count | |
+|---|---|---|
+| 1-45 min | 2,525 | the intended case — several fragments collapse into their hour |
+| 90 / 180 / 360 / 720 min | 17 | collapsed |
+| **1,440 min (a full day)** | **248** | collapsed to hour 00 |
+
+**265 collapses, roughly 5,799 hours of derived work silently dropped.**
+
+**Fix: `width() < DERIVED_SLICE_MICROS`** — migrate only what is narrower than an
+hour. A wider unit is left alone rather than expanded into 24 hour tasks, for two
+reasons: expanding mints 24x the journal entries this migration's own comment
+warns about (the 4,632-record incident), and section 10 measured day-wide derived
+units as the **healthy** shape — 0 of 398 published empty against 14.5% for
+hour-wide.
+
+Pinned by `the_hour_migration_leaves_a_slice_wider_than_an_hour_alone`, witnessed
+failing first (migrated 2 where 1 is right).
+
+Note this is NOT what `9f679039` fixed: that one excluded split children via
+`parent_measured_bytes`, a different way into the same function.

@@ -902,8 +902,20 @@ impl TaskJournal {
             // is set only by `split_time_task`, so it is the exact discriminator.
             // Recombining children stays `coarsen_to_width`'s job — it prices the
             // fusion, which this pass cannot.
+            // NARROWER than an hour, not merely "not an hour". `!=` also matched
+            // WIDER slices, and the replacement key below is the single hour
+            // containing the slice START — so a day-wide derived unit was
+            // superseded and re-enqueued as hour 00 with its other 23 hours
+            // silently dropped. Prod 2026-08-28: 265 such collapses, 248 of them
+            // day-wide, losing ~5,799 hours of derived work; it is why cell
+            // 28f62f01/08-25 has no derived unit at all for hours 21 and 22.
+            //
+            // Left alone rather than expanded into 24 hour units: expanding mints
+            // 24x the journal entries this comment already warns about, and
+            // day-wide units are the healthy ones — 0 of 398 published empty over
+            // a non-empty base against 14.5% for hour-wide.
             if !(task.key.operation == Operation::DerivedRollup
-                && task.key.slice.width() != DERIVED_SLICE_MICROS
+                && task.key.slice.width() < DERIVED_SLICE_MICROS
                 && task.parent_measured_bytes.is_none()
                 && !matches!(task.state, TaskState::Complete | TaskState::Superseded))
             {
@@ -4414,6 +4426,45 @@ mod tests {
         assert!(journal.tasks().any(|task| task.key.operation == Operation::DerivedRollup
             && task.key.slice.width() == NORMAL_SLICE_MICROS
             && task.state == TaskState::Superseded));
+    }
+
+    /// The hour migration must not touch a slice WIDER than an hour.
+    ///
+    /// Its guard was `width() != DERIVED_SLICE_MICROS`, which matches wider
+    /// slices as well as the ten-minute fragments it was written for — and the
+    /// replacement key is the single hour containing the slice START, so a
+    /// day-wide unit was superseded and re-enqueued as hour 00 with the other 23
+    /// hours silently dropped. The 2026-08-28 prod journal held 265 such
+    /// collapses (248 of them day-wide), losing roughly 5,799 hours of derived
+    /// work, and is why cell 28f62f01/08-25 has no derived unit at all for hours
+    /// 21 and 22.
+    ///
+    /// Left ALONE rather than expanded into 24 hour units: expanding mints 24x
+    /// the journal entries this migration's own comment warns about, and day-wide
+    /// derived units are empirically the healthy ones — 0 of 398 published empty
+    /// over a non-empty base, against 14.5% for hour-wide units.
+    #[test]
+    fn the_hour_migration_leaves_a_slice_wider_than_an_hour_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const DAY: i64 = 24 * DERIVED_SLICE_MICROS;
+        journal.upsert(task("p", 0, DAY, Operation::DerivedRollup));
+        // A genuine legacy fragment alongside it, so the migration is not simply inert.
+        journal.upsert(task("p", DAY, DAY + NORMAL_SLICE_MICROS, Operation::DerivedRollup));
+        journal.checkpoint().expect("checkpoint");
+
+        let mut journal = TaskJournal::load(dir.path()).expect("journal to migrate");
+        assert_eq!(journal.migrate_derived_slices(), 1, "only the sub-hour fragment may migrate");
+
+        let day_wide = journal
+            .tasks()
+            .find(|task| task.key.operation == Operation::DerivedRollup && task.key.slice.width() == DAY)
+            .expect("the day-wide unit must survive the migration");
+        assert_ne!(day_wide.state, TaskState::Superseded, "a day-wide derived unit must not be superseded by the hour migration");
+        assert!(
+            !journal.tasks().any(|task| task.key.slice.start_micros == 0 && task.key.slice.width() == DERIVED_SLICE_MICROS),
+            "the day must not be replaced by hour 00, which drops the other 23 hours"
+        );
     }
 
     #[test]
