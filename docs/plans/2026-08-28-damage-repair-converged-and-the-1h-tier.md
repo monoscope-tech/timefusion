@@ -622,3 +622,38 @@ is sound. And section 5's 11-47% figures came from `sum(request_count)` read out
 of the tables by SQL, i.e. MEASURE VALUES, not row counts; that comparison is
 valid and remains unexplained. **Measuring shortness of a derived tier requires
 measure sums from SQL. The journal alone can only prove EMPTY.**
+
+## 13. FIXED — rebuilding a base slice now reopens the derived cells over it
+
+Section 4.1's defect, the one that survives the 08-26 fix and would undo any
+rebuild. A derived cell's INPUT is the base tier but its WITNESS is the raw
+partition, which agrees forever on a sealed day — so when the base is rebuilt the
+cell keeps serving a faithful aggregate of a base that no longer exists, and never
+revisits it because its unit is `Complete`.
+
+`TaskJournal::reopen_derived_over(project, child_tier, start, end)` moves the
+`Complete` derived cells overlapping a republished base range back to `Pending`
+and **drops their publications** — `Publication` is what coverage is recovered
+from at boot, so leaving it would have the next process re-adopt the very cell
+the reopen exists to replace. The base publish site calls it for each of the
+tier's own derived children, and removes their slice coverage in the same step so
+that reads fall to the raw fringe (exact) while the rebuild is pending, rather
+than routing to stale rows.
+
+**Deliberately not `TaskJournal::invalidate`.** That also mints `Dedup` work over
+the same range, and dedup is the largest backlog in the queue — 3,592 pending on
+2026-08-28. Rebuilding a rollup tier says nothing about whether the raw partition
+needs deduplicating.
+
+**Volume is bounded by construction:** only `Complete` cells are touched, so the
+live frontier — where the derived task is already `Pending` — costs nothing, and
+the new work is exactly the republication case this exists for.
+
+**It terminates**, which is pinned rather than argued: the method only moves
+`Complete` to `Pending`, mints no task, and a *derived* publish never calls it.
+`republishing_a_base_slice_reopens_the_derived_cell_over_it` asserts the reopen,
+the dropped publication, that a cell outside the range is untouched, that the task
+count does not grow, and that a second call reopens nothing.
+
+**This unblocks the rebuild.** With the edge in place, rebuilding the 29 divergent
+cells is no longer undone by the next base repair.

@@ -2558,6 +2558,35 @@ impl Database {
                 );
             }
             journal.publish(&key, publication.clone());
+            // A BASE slice just changed underneath whatever derived cells were
+            // built over it. Their witness is the RAW partition, which agrees
+            // forever on a sealed day, so without this they keep serving a
+            // faithful aggregate of a base that no longer exists — prod
+            // 2026-08-28, 87576849/08-01: the 1h cell written 09:44:32 against a
+            // base rebuilt 09:49:13-14:46:12 still reads +70.6% over it.
+            //
+            // The COVERAGE goes with the task, and in this order: while the
+            // reopened cell is being rebuilt the read path must fall to the raw
+            // fringe, which is exact, rather than route to the stale rows. Only
+            // this tier's own derived children are touched.
+            if !derived {
+                for child_spec in
+                    source_schema.rollups.iter().filter(|candidate| spec.name.is_some() && candidate.derive_from.as_deref() == spec.name.as_deref())
+                {
+                    let child = child_spec.table_name(&key.source);
+                    let reopened = journal.reopen_derived_over(&key.project_id, &child, key.slice.start_micros, key.slice.end_micros);
+                    if reopened > 0 {
+                        self.rollup_slice_coverage.retain(|(project, _, table, start, end), _| {
+                            project != &key.project_id || table != &child || *start >= key.slice.end_micros || *end <= key.slice.start_micros
+                        });
+                        info!(
+                            table = %key.physical_table, project_id = %key.project_id, child = %child, reopened,
+                            slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+                            event = "maintenance_rollup_derived_reopened_after_base_republish"
+                        );
+                    }
+                }
+            }
             // An EMPTY publication over a base that is not empty in this slice.
             // It is then marked `complete`, so nothing revisits it — and because
             // `rollup_slice_coverage` records an empty publication as COVERED,

@@ -2789,6 +2789,51 @@ impl TaskJournal {
             .sum()
     }
 
+    /// Reopen the COMPLETE derived cells built over a base range that has just
+    /// been republished. Returns how many were reopened.
+    ///
+    /// A derived cell's input is the base tier, but its witness is the RAW
+    /// partition — which agrees forever on a sealed day. So when the base is
+    /// rebuilt underneath it, the cell keeps serving a faithful aggregate of a
+    /// base that no longer exists, and never revisits it because its unit is
+    /// `Complete`. Prod 2026-08-28: `87576849`/08-01's 1h cell was written
+    /// 09:44:32, its 1m base was rebuilt 09:49:13-14:46:12, and the cell reads
+    /// +70.6% over that base to this day.
+    ///
+    /// Deliberately NOT `invalidate`: that mints `Dedup` work over the same
+    /// range, and dedup is the largest backlog in the queue (3,592 pending on
+    /// 2026-08-28). Rebuilding a rollup tier says nothing about whether the RAW
+    /// partition needs deduplicating.
+    ///
+    /// Only `Complete` cells are touched, so the live frontier — where the
+    /// derived task is already Pending — costs nothing, and the new work is
+    /// exactly the republication case. It cannot loop: this only ever moves
+    /// Complete to Pending and mints no task, and a derived publish does not
+    /// call it.
+    pub fn reopen_derived_over(&mut self, project_id: &str, rollup_table: &str, start_micros: i64, end_micros: i64) -> usize {
+        let mut reopened = 0;
+        for task in &mut self.snapshot.tasks {
+            if task.state != TaskState::Complete
+                || task.key.operation != Operation::DerivedRollup
+                || task.key.project_id != project_id
+                || task.key.physical_table != rollup_table
+                || task.key.slice.start_micros >= end_micros
+                || task.key.slice.end_micros <= start_micros
+            {
+                continue;
+            }
+            task.state = TaskState::Pending;
+            task.retry_reason = None;
+            // Dropped with the state: `Publication` is what coverage is recovered
+            // from at boot, so leaving it would have the next process re-adopt
+            // the very cell this reopen exists to replace.
+            task.publication = None;
+            self.dirty_tasks.insert(task.key.clone());
+            reopened += 1;
+        }
+        reopened
+    }
+
     pub fn source_cursor(&self, source: &str) -> Option<u64> {
         self.snapshot.source_cursors.get(source).copied()
     }
@@ -4465,6 +4510,59 @@ mod tests {
             !journal.tasks().any(|task| task.key.slice.start_micros == 0 && task.key.slice.width() == DERIVED_SLICE_MICROS),
             "the day must not be replaced by hour 00, which drops the other 23 hours"
         );
+    }
+
+    /// Rebuilding a BASE slice must reopen the DERIVED cell built over it.
+    ///
+    /// Without this edge a derived cell is a faithful aggregate of a base that no
+    /// longer exists, and it never self-corrects because its unit is `Complete`.
+    /// Prod 2026-08-28: `87576849`/08-01's 1h cell was written 09:44:32 and its
+    /// 1m base was rebuilt 09:49:13-14:46:12 — the cell reads +70.6% over the
+    /// base to this day.
+    ///
+    /// Three properties, because the reopen is the easy one:
+    ///   1. a COMPLETE derived unit over the republished range goes back to Pending
+    ///   2. its stale publication is dropped, so nothing recovers coverage from it
+    ///   3. it TERMINATES — reopening does not itself mint more work. The
+    ///      4,632-superseded-record incident came from resurrect logic that did.
+    #[test]
+    fn republishing_a_base_slice_reopens_the_derived_cell_over_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const HOUR: i64 = DERIVED_SLICE_MICROS;
+        let derived = |start: i64, end: i64| TaskKey {
+            physical_table: "derived".into(),
+            source: "src".into(),
+            project_id: "p".into(),
+            slice: TimeSlice::new(start, end).expect("slice"),
+            operation: Operation::DerivedRollup,
+        };
+        let publication = || Publication { source_fingerprint: 7, generation: "g".into(), rows: 5, source_rows: Some(9) };
+        for (start, end) in [(0, HOUR), (HOUR, 2 * HOUR), (5 * HOUR, 6 * HOUR)] {
+            let key = derived(start, end);
+            journal.enqueue(key.clone(), 0, 1, 1);
+            journal.publish(&key, publication());
+            journal.complete(&key);
+        }
+        let before = journal.tasks().count();
+
+        // A base unit republishes 00:00-02:00 — two of the three derived cells.
+        let reopened = journal.reopen_derived_over("p", "derived", 0, 2 * HOUR);
+        assert_eq!(reopened, 2, "exactly the derived cells overlapping the republished range");
+        assert_eq!(journal.tasks().count(), before, "reopening must not MINT tasks — that is the resurrect loop");
+
+        let state_of = |journal: &TaskJournal, start: i64| {
+            journal
+                .tasks()
+                .find(|task| task.key.slice.start_micros == start && task.key.operation == Operation::DerivedRollup)
+                .map(|t| (t.state, t.publication.is_some()))
+        };
+        assert_eq!(state_of(&journal, 0), Some((TaskState::Pending, false)), "reopened, and its stale publication dropped");
+        assert_eq!(state_of(&journal, HOUR), Some((TaskState::Pending, false)), "reopened, and its stale publication dropped");
+        assert_eq!(state_of(&journal, 5 * HOUR), Some((TaskState::Complete, true)), "a cell outside the republished range must be untouched");
+
+        // Terminates: a second call over the same range has nothing left to do.
+        assert_eq!(journal.reopen_derived_over("p", "derived", 0, 2 * HOUR), 0, "reopening is idempotent");
     }
 
     #[test]
