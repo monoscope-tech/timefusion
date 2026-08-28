@@ -201,13 +201,23 @@ than by argument:
 
 **Why it is a real bug.** Seven INSERTs, each awaited and therefore acked,
 then `COUNT(*)`. It returned **4**, then **5**, then **4** — a *variable*
-shortfall, so a race, not an off-by-N and not a test miscounting. The
-discriminating detail is the query shape: the sibling smoke test counts with
-`... AND id = $2` and passes every time; the failing one filters **only by
-`project_id`**, the shape that goes through count pushdown / `LogicalCountCache`.
-A stale or approximate count from that path explains every observation.
-**Next step: re-run with a predicate that DEFEATS count pushdown. If that returns
-7 while the pushdown shape returns 5, the bug is in the count path.**
+shortfall, so a race, not an off-by-N and not a test miscounting.
+
+**My first hypothesis was count pushdown, and it is REFUTED.** The sibling smoke
+test counts with `... AND id = $2` and always passes; the failing one filters
+only by `project_id`, which looked like the count-pushdown shape. It is not:
+`finalize_window` does `let lo = lo?`, so `match_count_plan` requires a lower
+timestamp bound, and the failing query has no `timestamp` predicate — pushdown
+never engages for it. Recorded because I asserted it before reading that
+function. The two tests differ in TWO ways (query shape *and* seven rows versus
+one), and I attributed to the interesting one without checking that its
+suspected path was reachable at all.
+
+**What is left:** the seven rows share an identical timestamp (the test formats
+`Utc::now()` once, to second precision, before the loop) with distinct ids, under
+`dedup_keys = [timestamp, id]`. The live suspects are the read-side dedup /
+merge-on-read path and the MemBuffer+Delta union's time-range exclusion. Start by
+establishing which leg loses them.
 
 An earlier hypothesis of mine — that the seeding sweep's per-file
 `table_ref.read()` was delaying `refresh_table_snapshot` into a stale snapshot —
