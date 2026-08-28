@@ -771,13 +771,23 @@ impl TaskJournal {
     /// recovery, and re-enqueueing is idempotent at the journal.
     const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v2";
 
-    /// One-shot re-enqueue of the cells the 2026-08-25 derived-witness bug left
-    /// SHORT on disk. Distinct from `ORPHAN_REPAIR_MIGRATION` — that one bounded
-    /// by a DATE WINDOW, which re-enqueued every tier of every in-window day. The
-    /// damage here is a measured list of 81 (project, date) pairs out of 320
-    /// comparable, so a window would drag 236 clean pairs through a queue that
-    /// was measured GROWING at ~+80 units/hr with an 11-day-old starved tail.
-    const DAMAGE_REPAIR_MIGRATION: &'static str = "__maintenance_damage_repair_v1";
+    /// Re-enqueue of the cells the 2026-08-25 derived-witness bug left SHORT on
+    /// disk. Distinct from `ORPHAN_REPAIR_MIGRATION` — that one bounded by a DATE
+    /// WINDOW, which re-enqueued every tier of every in-window day. The damage
+    /// here is a measured list of 81 (project, date) pairs out of 320 comparable,
+    /// so a window would drag 236 clean pairs through a queue that was measured
+    /// GROWING at ~+80 units/hr with an 11-day-old starved tail.
+    ///
+    /// v2, and the cursor now counts CONSUMED PREFIX rather than done/not-done.
+    /// v1 was a one-shot that burned its cursor before the caller enqueued, so
+    /// the whole list was forced into exactly one planner pass — where
+    /// `BACKFILL_PARTITIONS_PER_PASS` (24) truncated it newest-first and dropped
+    /// the rest PERMANENTLY, because a cell that HAS tier output can never
+    /// re-enter `missing_tiers`. Measured on prod 2026-08-28: eight of eight
+    /// sampled pairs dated before 08-22 were still byte-identical at their
+    /// damaged values (28f62f01/08-03 at 1,071 rows against a truth of
+    /// 3,752,582), while the newest dates had repaired.
+    pub const DAMAGE_REPAIR_MIGRATION: &'static str = "__maintenance_damage_repair_v2";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -989,6 +999,37 @@ impl TaskJournal {
         })
     }
 
+    /// How much of `migration`'s ordered repair list `source` has CONSUMED.
+    ///
+    /// The durable form of a one-shot repair, and the difference is the whole
+    /// point: a claim-once cursor gives the caller exactly one planner pass, and
+    /// a pass admits a bounded number of cells, so any list longer than that
+    /// bound is silently truncated and the tail is lost. A prefix index survives
+    /// restarts and every pass forces only what it can actually fit — see
+    /// [`Self::DAMAGE_REPAIR_MIGRATION`].
+    pub fn repair_cursor(&self, migration: &str, source: &str) -> usize {
+        usize::try_from(self.snapshot.source_cursors.get(&format!("{migration}:{source}")).copied().unwrap_or_default()).unwrap_or(usize::MAX)
+    }
+
+    /// Record that `source` has consumed `consumed` entries of `migration`'s list.
+    ///
+    /// Monotonic, because WAL replay folds `SourceCursor` records with `max()`
+    /// and because the caller must only ever move forward: a pair that the pass
+    /// dropped keeps the cursor where it is, so the next pass re-offers it.
+    /// Persist AFTER the enqueue's own checkpoint — a crash in between re-offers,
+    /// which is idempotent (`enqueue` upserts by key), while the other order
+    /// re-creates the v1 bug.
+    pub fn advance_repair_cursor(&mut self, migration: &str, source: &str, consumed: usize) -> anyhow::Result<()> {
+        let key = format!("{migration}:{source}");
+        let consumed = u64::try_from(consumed).unwrap_or(u64::MAX);
+        if self.snapshot.source_cursors.get(&key).copied().unwrap_or_default() >= consumed {
+            return Ok(());
+        }
+        self.snapshot.source_cursors.insert(key.clone(), consumed);
+        self.dirty_cursors.insert(key);
+        self.checkpoint()
+    }
+
     /// Claim the one-shot orphaned-coverage repair, or `None` if it already ran.
     ///
     /// The caller does the work — it needs the tier partitions, which the journal
@@ -998,29 +1039,17 @@ impl TaskJournal {
     /// and this box restarts every few minutes. Re-enqueueing is idempotent at
     /// the journal (`enqueue` upserts by key), so the safe failure is running
     /// once and under-repairing, never looping.
+    ///
     /// PER SOURCE. The caller runs inside a loop over sources, so a single global
     /// cursor would be consumed by whichever source happens to be processed
     /// first — and if that is `otel_metrics`, the repair fires for a source that
     /// does not need it and NEVER runs for `otel_logs_and_spans`, which is the
     /// one whose spec changed. A silent no-op that looks like success.
-    /// Claim the one-shot damage repair for `source`. Same cursor discipline as
-    /// [`Self::repair_orphaned_coverage_once`]: the cursor is persisted BEFORE the
-    /// caller enqueues, so a crash cannot loop, and the cost of that choice is
-    /// that a pass which claims and then fails to enqueue burns the one-shot.
-    /// Bumping `DAMAGE_REPAIR_MIGRATION` is the intended recovery; re-enqueueing
-    /// is idempotent at the journal.
-    pub fn repair_damaged_cells_once(&mut self, source: &str) -> Option<u64> {
-        let key = format!("{}:{source}", Self::DAMAGE_REPAIR_MIGRATION);
-        let previous = self.snapshot.source_cursors.get(&key).copied().unwrap_or_default();
-        if previous >= 1 {
-            return None;
-        }
-        self.snapshot.source_cursors.insert(key.clone(), 1);
-        self.dirty_cursors.insert(key);
-        let _ = self.checkpoint();
-        Some(previous)
-    }
-
+    ///
+    /// Still one-shot, unlike the damage repair beside it, and deliberately: this
+    /// one forces a DATE WINDOW of live candidates rather than a fixed list, so a
+    /// prefix index into it has nothing stable to index, and re-firing it at a v3
+    /// would rebuild every in-window cell the v2 pass already repaired.
     pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> Option<u64> {
         let key = format!("{}:{source}", Self::ORPHAN_REPAIR_MIGRATION);
         let previous = self.snapshot.source_cursors.get(&key).copied().unwrap_or_default();
@@ -1824,8 +1853,17 @@ impl TaskJournal {
     /// `base_tier_present` records that the tier this unit aggregates already
     /// exists — see the field on [`MaintenanceTask`]. Only `plan_rollup_backfill`
     /// can prove it, because only it reads actual tier coverage.
-    pub fn enqueue_with_base_tier(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool) {
-        self.enqueue_inner(key, deadline_micros, estimated_decoded_bytes, created_unix_ms, base_tier_present, None);
+    ///
+    /// Returns whether the queue accepted the unit. `false` is one of the two
+    /// structural vetoes in `enqueue_inner` — a Superseded parent with a live
+    /// descendant, or a Retry parked on a worker/schema failure — both of which
+    /// are correct and both of which are otherwise INVISIBLE to the caller. The
+    /// damage repair counts them, because its whole failure mode is pairs that
+    /// look forced and are not.
+    pub fn enqueue_with_base_tier(
+        &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
+    ) -> bool {
+        self.enqueue_inner(key, deadline_micros, estimated_decoded_bytes, created_unix_ms, base_tier_present, None)
     }
 
     /// Queue a unit the planner has already MEASURED, carrying its footprint.
@@ -1861,10 +1899,14 @@ impl TaskJournal {
     ///   claim records its own footprint unconditionally. This is also what
     ///   heals the backlog: cells enqueued before this change gain a count on
     ///   the next planner tick instead of waiting for a first claim.
+    ///
+    /// Returns `true` when the unit is queued afterwards — minted now, or already
+    /// present and deliberately left alone. Only the two structural vetoes below
+    /// return `false`.
     fn enqueue_inner(
         &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
         input: Option<InputFootprint>,
-    ) {
+    ) -> bool {
         // Same rule as `upsert`, and it needs stating twice because this path
         // does not go through it: a key removed earlier in this write window and
         // enqueued again is CREATED, not removed. `coarsen_to_width` does
@@ -1895,7 +1937,7 @@ impl TaskJournal {
                         && matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)
                 });
                 if live_descendant {
-                    return;
+                    return false;
                 }
                 let task = &mut self.snapshot.tasks[index];
                 task.state = TaskState::Pending;
@@ -1907,7 +1949,7 @@ impl TaskJournal {
                 task.base_tier_present |= base_tier_present;
                 task.input = input.or(task.input);
                 self.dirty_tasks.insert(key);
-                return;
+                return true;
             }
             // `abandon_running`'s verdict outlives a planner tick. Its deadline
             // floor is the only bound on a doomed unit's duty cycle and its
@@ -1921,7 +1963,7 @@ impl TaskJournal {
             if self.snapshot.tasks[index].state == TaskState::Retry
                 && matches!(self.snapshot.tasks[index].retry_reason.as_deref(), Some(Self::WORKER_FAILURE_REASON | Self::SCHEMA_FAILURE_REASON))
             {
-                return;
+                return false;
             }
             let task = &mut self.snapshot.tasks[index];
             if task.state != TaskState::Running {
@@ -1950,7 +1992,7 @@ impl TaskJournal {
                     self.dirty_tasks.insert(key);
                 }
             }
-            return;
+            return true;
         }
         self.dirty_tasks.insert(key.clone());
         let index = self.snapshot.tasks.len();
@@ -1970,6 +2012,7 @@ impl TaskJournal {
             input,
             parent_measured_bytes: None,
         });
+        true
     }
 
     /// Drop every task the predicate rejects, recording a tombstone for each.
@@ -6028,26 +6071,28 @@ mod tests {
         assert_eq!(reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
     }
 
-    /// The damage repair is a SEPARATE one-shot from the orphan repair. If they
-    /// shared a cursor, claiming one would silently consume the other — and the
-    /// damage list is the thing that fixes ~211M rows the derived-witness bug
-    /// left short on disk, so consuming it as a no-op would look like success.
+    /// The damage repair's cursor is a consumed-PREFIX index, per source, and it
+    /// survives a restart. Sharing it with the orphan repair would let claiming
+    /// one silently consume the other — and the damage list is what fixes ~211M
+    /// rows the derived-witness bug left short, so consuming it as a no-op would
+    /// look exactly like success.
     #[test]
-    fn the_damage_repair_is_a_separate_one_shot_from_the_orphan_repair() {
+    fn the_damage_repair_cursor_is_a_per_source_prefix_that_survives_a_reload() {
         let dir = tempfile::tempdir().expect("temp dir");
+        const DAMAGE: &str = TaskJournal::DAMAGE_REPAIR_MIGRATION;
         {
             let mut journal = TaskJournal::load(dir.path()).expect("journal");
             assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "orphan repair claims");
-            assert_eq!(
-                journal.repair_damaged_cells_once("otel_logs_and_spans"),
-                Some(0),
-                "the damage repair must NOT have been consumed by the orphan repair's cursor"
-            );
-            assert_eq!(journal.repair_damaged_cells_once("otel_logs_and_spans"), None, "second call in the same process must not");
-            assert_eq!(journal.repair_damaged_cells_once("otel_metrics"), Some(0), "a different source claims independently");
+            assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 0, "the orphan repair's cursor must not consume the damage list");
+            journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 24).expect("advance");
+            assert_eq!(journal.repair_cursor(DAMAGE, "otel_metrics"), 0, "a different source is consumed independently");
+            // Monotonic: `SourceCursor` replay folds with `max()`, and a pass
+            // that resolved less than an earlier one must never rewind the list.
+            journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 3).expect("advance");
+            assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 24);
         }
-        let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
-        assert_eq!(reloaded.repair_damaged_cells_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
+        let reloaded = TaskJournal::load(dir.path()).expect("reload");
+        assert_eq!(reloaded.repair_cursor(DAMAGE, "otel_logs_and_spans"), 24, "a restart resumes at the prefix, it does not start over");
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with

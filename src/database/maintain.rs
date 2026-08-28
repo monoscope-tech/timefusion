@@ -62,9 +62,13 @@ const ORPHAN_REPAIR_BEFORE: &str = "2026-08-22";
 /// derived after base, and since 2026-08-25 a derived unit whose base does not
 /// tile its slice RETRIES instead of publishing short.
 ///
-/// Delete this once the repair has converged; it is a one-shot, gated on
-/// `DAMAGE_REPAIR_MIGRATION`, and re-running it after convergence is wasted work
-/// rather than damage.
+/// Consumed a PREFIX AT A TIME, not all at once — see `DAMAGE_REPAIR_MIGRATION`.
+/// Forcing the whole list into one pass is what v1 did, and the pass truncates
+/// to `BACKFILL_PARTITIONS_PER_PASS`, so everything past the newest 24 was
+/// dropped permanently.
+///
+/// Delete this once the repair has converged; it is gated on the migration
+/// cursor, and re-running it after convergence is wasted work rather than damage.
 const DAMAGED_CELLS: &[(&str, &str)] = &[
     ("00000000-0000-0000-0000-000000000000", "2026-08-05"),
     ("00000000-0000-0000-0000-000000000000", "2026-08-06"),
@@ -148,6 +152,51 @@ const DAMAGED_CELLS: &[(&str, &str)] = &[
     ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-25"),
     ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-26"),
 ];
+
+/// One (project, date) the rollup backfill can plan.
+pub(crate) type BackfillCell = (String, chrono::NaiveDate);
+
+/// `DAMAGED_CELLS` in the order the backfill consumes it — newest date first,
+/// the same order the pass itself ranks by. Sorted here rather than trusted from
+/// a hand-maintained const, because the cursor into it is durable and a reorder
+/// would silently re-target it.
+pub(crate) fn damaged_cells_newest_first() -> Vec<BackfillCell> {
+    let mut cells: Vec<BackfillCell> =
+        DAMAGED_CELLS.iter().filter_map(|(project, date)| Some(((*project).to_owned(), date.parse::<chrono::NaiveDate>().ok()?))).collect();
+    cells.sort_by(|(project_a, date_a), (project_b, date_b)| date_b.cmp(date_a).then_with(|| project_a.cmp(project_b)));
+    cells
+}
+
+/// Order one backfill pass, bound it, and report how much of its forced prefix
+/// it CONSUMED. `offered` is the unconsumed prefix of the repair list this pass
+/// tried, in list order; `forced` is the subset of it that reached `want`.
+///
+/// The consumed count stops at the first offered cell that TRUNCATION dropped —
+/// that cell and everything after it must be re-offered next pass, which is the
+/// whole point of a durable cursor. Every other disposition advances:
+///
+///   * admitted — it reached the enqueue loop, which is all this can promise;
+///   * not forced — outside this source's horizon, so not resurrectable here;
+///   * forced but vetoed by `queued_tables` — the work is already queued.
+///
+/// Advancing past a cell that was merely OFFERED is the 2026-08-28 bug in slower
+/// motion, so the truncation test is on identity, not on counts.
+///
+/// Forced cells sort FIRST. Ranking is otherwise newest-date-first, and every
+/// naturally-missing cell is a frontier day newer than any damaged one, so a
+/// forced 08-01 would lose the truncation on every pass forever. Bounded: at
+/// most `cap` per pass, over a list of 81, so it displaces ordinary backfill for
+/// a handful of passes and then never again.
+pub(crate) fn admit_backfill_pass(
+    mut want: Vec<BackfillCell>, offered: &[BackfillCell], forced: &HashSet<BackfillCell>, cap: usize,
+) -> (Vec<BackfillCell>, usize) {
+    let wanted: HashSet<BackfillCell> = want.iter().cloned().collect();
+    want.sort_by(|a, b| forced.contains(b).cmp(&forced.contains(a)).then_with(|| b.1.cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
+    want.truncate(cap);
+    let admitted: HashSet<BackfillCell> = want.iter().cloned().collect();
+    let consumed = offered.iter().take_while(|cell| !(forced.contains(*cell) && wanted.contains(*cell) && !admitted.contains(*cell))).count();
+    (want, consumed)
+}
 
 /// Arrow bytes one compressed parquet byte decodes to, at prod's zstd ratio.
 ///
@@ -1022,28 +1071,27 @@ impl Database {
             }
             // The measured damage list, forced the same way and for the same
             // reason: these cells HAVE tier output, so `missing_tiers` never sees
-            // them and no invalidation fires for a sealed day. Unlike the window
-            // repair above this is a bounded set, so it cannot flood the queue.
-            if let Some(cursor_was) = self.journal().repair_damaged_cells_once(&source) {
-                let mut forced = 0usize;
-                for (project, date) in DAMAGED_CELLS {
-                    let Ok(date) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") else { continue };
-                    // Only cells this source actually has candidates for — a pair
-                    // outside the retention horizon is not resurrectable and must
-                    // not be counted as forced.
-                    if candidates.contains(&((*project).to_string(), date)) {
-                        missing_tiers.insert(((*project).to_string(), date), (0..schema.rollups.len()).collect());
-                        forced += 1;
-                    }
-                }
-                warn!(
-                    source,
-                    forced,
-                    listed = DAMAGED_CELLS.len(),
-                    cursor_was,
-                    event = "rollup_damaged_cell_repair",
-                    "re-enqueueing cells the derived-witness bug published short"
-                );
+            // them and no invalidation fires for a sealed day.
+            //
+            // A PREFIX per pass, against a durable cursor, because the pass
+            // truncates to `BACKFILL_PARTITIONS_PER_PASS`. v1 forced all 81 into
+            // one pass and lost every cell past the newest 24 — permanently, the
+            // cursor being spent and `missing_tiers` structurally unable to
+            // re-contain a cell that has tier output. Nothing is consumed until
+            // it has survived truncation; see `admit_backfill_pass`.
+            let damage_repair = damaged_cells_newest_first();
+            let damage_from = self.journal().repair_cursor(crate::maintenance_coordinator::TaskJournal::DAMAGE_REPAIR_MIGRATION, &source);
+            // An empty candidate set is a source with no partitions at all, not
+            // evidence that the list is unrepairable there. Burning the cursor
+            // 24 at a time against it would drop the list exactly as v1 did.
+            let damage_offered: &[BackfillCell] = if candidates.is_empty() { &[] } else { damage_repair.get(damage_from..).unwrap_or_default() };
+            let damage_offered = &damage_offered[..damage_offered.len().min(BACKFILL_PARTITIONS_PER_PASS)];
+            // Only cells this source actually has candidates for — a pair outside
+            // the retention horizon is not resurrectable and must not read as
+            // forced, though it is still consumed.
+            let damage_forced: HashSet<BackfillCell> = damage_offered.iter().filter(|cell| candidates.contains(cell)).cloned().collect();
+            for cell in &damage_forced {
+                missing_tiers.insert(cell.clone(), (0..schema.rollups.len()).collect());
             }
             // Publish the holes so `claim_next` can rank them ahead of days that
             // already have tier output. Same coverage read, same 60s cadence.
@@ -1205,10 +1253,18 @@ impl Database {
             }
             // Newest first: recent days are what dashboards actually read, and
             // an oldest-first pass spends the whole horizon on data nobody has
-            // queried yet.
-            want.sort_by(|(pa, da), (pb, db)| db.cmp(da).then_with(|| pa.cmp(pb)));
+            // queried yet. Damage-repair cells outrank that — see
+            // `admit_backfill_pass`, which also decides how much of the repair
+            // list this pass may consume.
             let total = want.len();
-            want.truncate(BACKFILL_PARTITIONS_PER_PASS);
+            // Forced cells the already-queued veto ate, measured while `want`
+            // still distinguishes them from the ones truncation will drop.
+            let damage_queue_vetoed = {
+                let wanted: HashSet<&BackfillCell> = want.iter().collect();
+                damage_forced.iter().filter(|cell| !wanted.contains(cell)).count()
+            };
+            let (want, damage_consumed) = admit_backfill_pass(want, damage_offered, &damage_forced, BACKFILL_PARTITIONS_PER_PASS);
+            let damage_admitted: HashSet<BackfillCell> = want.iter().filter(|cell| damage_forced.contains(*cell)).cloned().collect();
             // DAY-sized units, not the frontier's ten-minute slices.
             //
             // `enqueue_maintenance_hours` goes through `invalidate`, which
@@ -1232,11 +1288,18 @@ impl Database {
             // this used to mint for history were pure waste.
             let now = crate::support::now_micros();
             let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            // Forced cells the QUEUE refused, from either veto that can eat one
+            // silently. Structurally real and, from outside this process, only
+            // measurable here: prod's journal lives under root-owned bind mounts
+            // on a distroless image, so a repair that never lands looks exactly
+            // like one that did.
+            let mut damage_vetoed = 0usize;
             {
                 let mut journal = self.journal();
                 for (project_id, date) in &want {
                     let Some(day_start) = date.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
                     let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
+                    let mut refused = false;
                     let mut enqueue = |physical_table: String, operation, base_tier_present| {
                         journal.enqueue_with_base_tier(
                             crate::maintenance_coordinator::TaskKey {
@@ -1250,7 +1313,7 @@ impl Database {
                             crate::maintenance_coordinator::MAX_DECODED_BYTES,
                             created_unix_ms,
                             base_tier_present,
-                        );
+                        )
                     };
                     // Only the tiers this day is actually missing. Enqueueing
                     // every tier for a day that lacks one re-reads the whole raw
@@ -1263,7 +1326,7 @@ impl Database {
                     // the common case here: 1m is 22-32 days deep while 1h is
                     // 2-6, so most queued days need the coarse tier alone.
                     if needs_source_scan && !queued_tables.contains(&(project_id.clone(), *date, source.clone())) {
-                        enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup, false);
+                        refused |= !enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup, false);
                     }
                     for index in missing {
                         let spec = &schema.rollups[index];
@@ -1293,11 +1356,45 @@ impl Database {
                             continue;
                         }
                         let base_proven = operation == crate::maintenance_coordinator::Operation::DerivedRollup && !needs_source_scan && *date < today;
-                        enqueue(physical_table, operation, base_proven);
+                        refused |= !enqueue(physical_table, operation, base_proven);
+                    }
+                    if refused && damage_admitted.contains(&(project_id.clone(), *date)) {
+                        damage_vetoed = damage_vetoed.saturating_add(1);
                     }
                     queued = queued.saturating_add(1);
                 }
                 journal.checkpoint()?;
+            }
+            // AFTER the enqueue's checkpoint, and only by cells that survived
+            // truncation. A crash in between re-offers the prefix, which
+            // `enqueue` upserts idempotently; the other order is v1.
+            if damage_consumed != 0 {
+                self.journal().advance_repair_cursor(
+                    crate::maintenance_coordinator::TaskJournal::DAMAGE_REPAIR_MIGRATION,
+                    &source,
+                    damage_from.saturating_add(damage_consumed),
+                )?;
+            }
+            if !damage_offered.is_empty() {
+                warn!(
+                    source,
+                    offered = damage_offered.len(),
+                    enqueued = damage_admitted.len().saturating_sub(damage_vetoed),
+                    // Cells the queue refused: already-queued rollup work, a
+                    // Superseded parent with live children, or a Retry parked on
+                    // a worker/schema failure. All three are correct refusals and
+                    // all three are indistinguishable from a repair without this.
+                    vetoed = damage_vetoed + damage_queue_vetoed,
+                    // Held back by the per-pass bound, NOT dropped: the cursor
+                    // does not move past these and the next pass re-offers them.
+                    truncated = damage_forced.len().saturating_sub(damage_admitted.len() + damage_queue_vetoed),
+                    out_of_horizon = damage_offered.len() - damage_forced.len(),
+                    cursor_was = damage_from,
+                    cursor = damage_from + damage_consumed,
+                    listed = damage_repair.len(),
+                    event = "rollup_damaged_cell_repair",
+                    "re-enqueueing cells the derived-witness bug published short"
+                );
             }
             // Never let a bounded pass read as "covered everything".
             info!(source, queued = want.len(), remaining = total - want.len(), horizon_days = horizon, event = "rollup_backfill_planned");
