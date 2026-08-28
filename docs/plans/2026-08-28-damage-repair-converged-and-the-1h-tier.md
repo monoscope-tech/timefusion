@@ -334,3 +334,45 @@ not be read as evidence that a retry fixes a partial hour.
    have no unit in any state).
 3. **A base rebuild must invalidate its derived tier** (section 4.1).
 4. Only then the v3 rebuild of the 29 cells.
+
+## 7. THE INVARIANT VIOLATION — 735 slices published EMPTY over a non-empty source
+
+Same journal, both tiers, every `complete` unit that recorded a publication:
+
+| tier | complete + published | published **0 rows** | of those, `source_rows == 0` |
+|---|---|---|---|
+| `base_rollup` | 21,775 | **450 (2.1%)** | **0** — median source_rows **3,284** |
+| `derived_rollup` | 2,309 | **285 (12.3%)** | **0** — median source_rows **1,174,646** |
+
+**Not one of the 735 empty publications was over an empty source.** Every single
+one had raw rows in its partition and published nothing, then marked itself
+`complete` — so none will ever be revisited.
+
+`base_tier_present` was `false` on **278 of the 279** empty hour-wide derived
+publications. It is a *claim* gate (`dependencies_complete`), not a publish gate,
+and the interval fallback admits units it cannot prove.
+
+### This is the propagation path, and it explains everything above
+
+A base slice publishes empty → `rollup_slice_coverage` records it, and **an empty
+publication counts as covered** (stated outright at the derived guard:
+"a genuinely empty base slice counts as covered and cannot deadlock this") → the
+derived unit over that slice sees no hole, is admitted, reads nothing, publishes
+empty, and completes. **Empty propagates up the tiers and freezes at every
+level.** The `base_tier_incomplete` guard cannot catch it because coverage is
+present; it is the *content* that is absent, and nothing compares content.
+
+### The guard this justifies
+
+`rows == 0 && source_rows > 0` ⇒ **do not complete.** It fires on exactly the 735
+observed bad units and, by construction, never on a genuinely empty source. It
+belongs at the publish site and applies to BOTH tiers — the base is 450 of them.
+
+Two things it must not become:
+* **An infinite retry.** The code's own warning ("refusing forever is its own
+  outage") applies. Bound it: retry while attempts are low, then complete and
+  COUNT it, so a persistent cause is visible instead of silent.
+* **A fix without a cause.** This guard stops empties becoming permanent; it does
+  not explain why a unit with 1.17M source rows reads zero. That cause is still
+  open, and section 5's fractional hours (11-47%) are probably the same cause
+  seen at partial strength.
