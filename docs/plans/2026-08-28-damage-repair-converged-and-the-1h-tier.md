@@ -657,3 +657,49 @@ count does not grow, and that a second call reopens nothing.
 
 **This unblocks the rebuild.** With the edge in place, rebuilding the 29 divergent
 cells is no longer undone by the next base repair.
+
+## 14. The rebuild's target population — 272 cells, and the two damage sets barely overlap
+
+Enumerated from the captured journal as `(project, tier, date)` cells:
+
+| damage set | cells |
+|---|---|
+| holds ≥1 derived slice published EMPTY over a non-empty base (§7, §12) | 55 |
+| its day-wide derived unit was COLLAPSED into hour 00 (§11) | 251 |
+| **overlap** | **34** |
+| **union — the rebuild target** | **272** |
+
+**They are largely disjoint, so neither alone is the target.** By tier:
+`dashboard_1h_v2` 164, `metrics_1h_v2` 104, `dashboard_level_1h_v1` 4.
+
+By date the two sets behave differently, and this confirms the section-11/12
+split rather than restating it:
+
+| | dates |
+|---|---|
+| empties | tight, 08-22 … 08-25 (fixed 08-26) |
+| collapses | **08-16 … 08-28**, including 9 cells on 08-16 and 3 after 08-26 |
+
+The collapse bug was a boot-time migration and was never date-bounded, which is
+exactly why it needed a code fix (§11) while the empties needed only a rebuild.
+
+### Regenerate rather than check in
+
+The enumeration is a ~30-line offline join over `maintenance_tasks.json`
+(`docker cp` recipe in the 2026-08-28 cursor note). Re-run it against a FRESH
+journal before rebuilding: with §11 and §13 now deployed the collapse set stops
+growing and the reopened cells will re-run on their own, so a list captured
+tonight will overstate the work. **The number to act on is the one measured after
+a quiet window on the deploy carrying both fixes.**
+
+### Order, restated with everything known
+
+1. **Done** — §11 hour-migration collapse, §13 base-rebuild → derived reopen.
+   Both are live-defect fixes and both had to precede any rebuild.
+2. **Verify live** — `rollup_published_empty_over_full_base` stays 0, new days get
+   24/24 hour units, and `maintenance_rollup_derived_reopened_after_base_republish`
+   fires when a base republishes.
+3. **Then rebuild** the union above, regenerated.
+4. **Still unexplained and NOT blocking** — §5's 11-47% partial hours, measured as
+   `sum(request_count)` via SQL. The journal cannot answer this (§12's trap); it
+   needs measure sums per cell.
