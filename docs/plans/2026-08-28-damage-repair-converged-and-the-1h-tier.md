@@ -161,87 +161,83 @@ mechanism. The actionable conclusion is unchanged: 23.1M is the number today.
   publishing short" guard was supposed to prevent. That guard is the first thing
   to look at.
 
-## 4. ROOT CAUSE — the short cells are a GENERATION SPLIT, and `service_name_hll` is the splitter
+## 4. The two directions are TWO DIFFERENT DEFECTS, and only one is a live bug
 
-Later on 2026-08-28, against a 2.7 h-quiet prod process on `2e45a8c`. The
-"short" half of section 3 is not a scan bug, a tiling bug, or lag. It is this:
+Later on 2026-08-28, against a 2.7 h-quiet prod process on `2e45a8c`. Section 3
+treated over-count and short as one derived-path bug. They are not.
 
-**A day can hold more than one `rollup_generation`, and the read path pins
-exactly one per `(project, date)`.** `RollupRewrite::sql` emits
-`(project_id = P AND date = D AND rollup_generation = G)` — one generation per
-(project, date) pair. Every row written under any other generation for that day
-is unreadable, forever, even though it is present and correct.
+### 4.1 The over-count is STALENESS. It is not an aggregation bug.
 
-### The measurement that finds it
+`87576849`/08-01, single generation, 39,412,317 against a verified base of
+23,103,653 (+70.6%). Write times settle it:
 
-Summing a rollup table directly — the natural check — sums ACROSS generations
-and therefore does NOT reproduce what a routed read returns. **Every 1h-tier
-comparison must group by `rollup_generation`.** The section-3 figures were
-generation-blind, which is why `28f62f01`/08-25 read as a single -75.7% cell.
-It is actually two cells:
-
-| generation | rows | sum(request_count) |
+| tier | min(updated_at) | max(updated_at) |
 |---|---|---|
-| `bc815739d2507900` | 73 | 765,340 |
-| `33903afe6182754a` | 4 | 140,962 |
+| `dashboard_1h_v2` | 2026-08-28 **09:44:32** | 2026-08-28 09:44:32 |
+| `dashboard_1m_v3` | 2026-08-28 **09:49:13** | 2026-08-28 **14:46:12** |
 
-against a base of 3,732,004. A reader pinning `33903afe` sees hour 00 and
-nothing else: **-96%**.
+The derived cell was built **five minutes before** its base began being rebuilt,
+and the base kept being rewritten for five more hours. The 1h cell is a faithful
+aggregate of the pre-repair base. And it will never correct itself: its unit is
+`complete`, and **rebuilding a base tier does not invalidate its derived tier.**
 
-### Why the day splits
+Ruled out by measurement, not by argument: there are **no duplicate**
+`(timestamp, service_name, kind, status_code)` rows in that cell, so it is not
+merge-on-read duplication at the output level.
 
-`rollup::generation_id` hashes the spec **restricted to the measures this unit
-materialized**:
+**The defect is therefore a missing invalidation edge: base rebuilt ⇒ derived
+stale.** That is what the v3 rebuild has to fix, and a rebuild alone is not
+enough — without the edge the next base repair reproduces it.
 
-```rust
-pub fn generation_id(spec, source, project_id, date, _source_fp, measures: Option<&[String]>)
-    // spec.measures filtered to `measures`, then hashed with (source, project_id, date)
-```
+### 4.2 A day now holds SEVERAL generations — real, new, and NOT lost rows
 
-and `maintain.rs:2102-2103` feeds it `materialized_measures(..., base_evidence)`
-— where `base_evidence` is what **the base cells overlapping THIS unit's slice**
-proved (`TAG_MEASURES`). Derived units are per HOUR. So two hours of the same
-day whose base cells proved different measure sets mint **different generation
-ids**, and the day is split.
+`generation_id` hashes the spec **restricted to the measures the cell
+materialized** (`7249b36c`, 2026-08-26 — deliberately, so that *appending* a
+measure stops orphaning 30 days of history). Derived units are per HOUR, so two
+hours whose base cells proved different measure sets now mint different
+generation ids.
 
-### The discriminator, measured
+Measured, `28f62f01`/08-25 `dashboard_1h_v2` — the two generations agree on every
+measure column except one:
 
-Column population per generation, `28f62f01`/08-25, 1h tier — identical on every
-measure except one:
+| generation | rows | request_count | duration_sum | server_duration_sum | **service_name_hll** |
+|---|---|---|---|---|---|
+| `33903afe6182754a` | 4 | 4 | 3 | 2 | **4** |
+| `bc815739d2507900` | 73 | 73 | 55 | 37 | **0** |
 
-| generation | rows | request_count | duration_sum | server_duration_sum | duration_digest | **service_name_hll** |
-|---|---|---|---|---|---|---|
-| `33903afe6182754a` | 4 | 4 | 3 | 2 | 4 | **4** |
-| `bc815739d2507900` | 73 | 73 | 55 | 37 | 73 | **0** |
+Days holding >1 generation, last 30 days: `28f62f01` 08-24/25/27/28, `87576849`
+08-24/25/26(**3**)/28, `6297304f` 08-26(**3**)/28. **Nothing before 08-24.**
 
-`service_name_hll` is materialized in one generation and absent from the other.
-That single measure is the whole split.
+**Correction to an earlier reading in this session.** I first concluded the read
+path pins ONE generation per `(project, date)` and that the rest of the day is
+therefore unreadable. **That is wrong.** `ProjectRoutingTable` pushes a
+`(project, date, generation)` triple **per SLICE**
+(`src/database/mod.rs`, the `for (key, coverage) in fresh` loop), and
+`RollupRewrite::sql` joins them with **`OR`**. A day with two generations is read
+as a disjunction over both. No rows are lost to the split itself.
 
-### It is a LIVE REGRESSION, not history
+What the split *does* cost is `measures_available`: it is checked **per slice**,
+so a query using `service_name_hll` now drops the `bc815739` slices to the raw
+fringe. Safe, but it converts a routed read into a partly-raw one. Before
+`7249b36c` a day's cells shared one measure set and this could not happen.
 
-Days holding >1 generation in `dashboard_1h_v2`, last 30 days:
+### 4.3 What is still unexplained — the short cells
 
-| project | split days |
-|---|---|
-| `28f62f01` | 08-24, 08-25, 08-27, 08-28 |
-| `87576849` | 08-24, 08-25, 08-26 (**3** gens), 08-28 |
-| `6297304f` | 08-26 (**3** gens), 08-28 |
+Generation handling does not account for it. `28f62f01`/08-25 holds **906,302
+across BOTH generations** against a base of 3,732,004 — still **-76%**. Hours
+01, 18, 20, 21, 22 are absent outright, and most present hours are fractions of
+their base (hour 02: 29,431 of 209,685). Hours 00 and 23 are exact.
 
-Nothing before 08-24 splits. The last five days do, on every project checked.
+"Absent hours plus fractional hours plus a few exact ones" is the shape of a day
+whose derived units were **split into children and only some children
+published** — `split_time_task` cuts a unit, and a sub-hour child publishes a row
+bucketed at the whole hour holding only its own range. **Not yet verified.** The
+captured journal (`maintenance_tasks.json`, 2026-08-28) is the place to check it:
+look for `derived_rollup` units on this cell whose slice is narrower than an hour.
 
-### What is still open
+### 4.4 Measurement rule this session established
 
-* **The over-count is a SEPARATE defect.** `87576849`/08-01 is a **single**
-  generation, 411 rows, 39,412,317 against a verified base of 23,103,653
-  (**+70.6%**). Generation splitting cannot explain it; the 2026-08-20 note on
-  derived rollups summing merge-on-read versions of base rows still stands as
-  the candidate, and is unverified.
-* **Two candidate fixes, not yet chosen.** Either (a) do not let the
-  materialized measure set enter `generation_id`, so a day keeps one generation
-  and a measure absent from some hours simply reads NULL; or (b) let the read
-  path accept the SET of generations covering a day rather than one. (a) is
-  smaller but changes what a generation id means; (b) touches the routing
-  predicate `RollupRewrite::sql` builds. **Decide before writing code.**
-* **The 29 bad cells will not self-heal** — their units are `complete`. A v3
-  migration-key rebuild is required after the mechanism is fixed, and must not
-  be run before it.
+**Summing a rollup table directly sums ACROSS generations and is NOT what a
+routed read returns.** Every tier comparison must `GROUP BY rollup_generation`
+and state which generations a routed read would name. A generation-blind sum
+reported `28f62f01`/08-25 as one -75.7% cell; it is two disjoint cells.
