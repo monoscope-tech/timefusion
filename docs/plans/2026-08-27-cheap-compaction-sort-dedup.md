@@ -389,6 +389,50 @@ the failure mode: 2.7 GB slices thrashing a pinned pool, where the spill-merge i
 both the memory hog and much of the latency. A 1 GB slice against a ~2 GB fair
 share should mostly not spill. Treat 73 s as a ceiling, not an expectation.
 
+## P0 RESULT — measured at 54 min on `eadffa1` (01:04 UTC)
+
+**The sealed lane is draining again.** The strongest evidence is Delta state,
+which no restart can reset:
+
+| partition | pre-deploy | at 54 min | Δ |
+|---|---|---|---|
+| logs 08-24 | 561 | **515** | **−46** |
+| logs 08-25 | 964 | 964 | 0 |
+| logs 08-26 | 736 | 736 | 0 |
+| logs 08-23 | 22 | 22 | 0 (converged) |
+| metrics 08-24 | 523 | **480** | **−43** |
+
+08-24 is the oldest unconverged day, so oldest-first draining it and not yet
+touching 08-25/26 is the expected shape. **Before this, 08-24/25/26 had not moved
+for days.**
+
+Process counters, same window (54 min vs a 24 h baseline — rates only):
+
+| metric | before | after |
+|---|---|---|
+| `Light optimize staging failed` | 3.3–4.8 /hr | **0** |
+| `Resources exhausted` | continuous | **0** |
+| `light_optimize_memory_brakes_total` | 263 / 24 h ≈ 11/hr | **0** |
+| `light_optimize_bins_committed_total` | 108 / 24 h ≈ 4.5/hr | 10 / 54 min ≈ **11/hr** |
+| `tasks_pending` | 6,613 | **6,112** |
+| `pending_sealed_consolidation` | 142 | **123** |
+
+**Verdict against the predictions:**
+- ✅ **3 (THE falsifier)** — non-Repair staging failures → 0 **with zero changes to
+  sealed code**. It survived.
+- ✅ **4** — 08-24 counts fell.
+- ✅ **2, indirectly** — zero `Resources exhausted` means no merge is over budget.
+- ❌ **1 STILL UNVERIFIED** — repair has not sliced once in 54 min (it sliced every
+  5–15 min before), because every Repair unit returns `Retry` at `ran_secs=0` via
+  the already-sorted short-circuit. `slices=11` is proven by the pure-fn test but
+  **not observed on prod**. Honest reading: the *effect* is confirmed; the
+  *mechanism* is inferred. Since P3b's brake also went to 0, the pool genuinely
+  has headroom it did not have — consistent with the diagnosis, not proof of it.
+
+**What this does NOT fix.** At ~46 files/hr, the remaining 2,215 files across
+logs 08-24/25/26 need **~48 hours** to drain. That is precisely the ceiling
+change 2 addresses, and this measurement is the argument for shipping it.
+
 ## Change 2 — READY, NOT PUSHED (`aeffc85`)
 
 **Held deliberately.** Pushing restarts prod and resets every counter, which would
