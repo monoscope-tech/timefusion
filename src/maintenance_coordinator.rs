@@ -4682,27 +4682,23 @@ mod tests {
     /// The `outranked_by` arm is the one no existing instrument could reach:
     /// `claimability_census` counts per-task reasons and `first_refused_sealed`
     /// returns a bare `CLAIMABLE` — true, and useless, because the refusal is in
-    /// A day's DEBT is divided by however many slices it was split into, so the
-    /// most indebted days rank LOWEST.
+    /// `benefit` is per UNIT, so any future SPLITTING of a cell divides its debt.
     ///
-    /// `benefit = -(input.files / BENEFIT_BUCKET_FILES)` is per UNIT, not per
-    /// cell. A day-wide unit reports the day's whole file count; the same day cut
-    /// into slices reports a fraction in each. Since heavy debt is exactly what
-    /// makes a day get split, the signal inverts: the worse a day is, the lower
-    /// every one of its units scores.
+    /// A LATENT hazard, not the cause of the 2026-08-28 starvation — that was
+    /// misdiagnosed twice before the numbers settled it, so both the property and
+    /// its limits are pinned here.
     ///
-    /// Prod 2026-08-28 is the shape this models. `SealedConsolidation` is ONE lane
-    /// across tables and took **22 of 22** claims on `otel_metrics` while
-    /// `otel_logs_and_spans` 08-24/25/26 (2,153 files, the primary query table)
-    /// went untouched for hours. The instrument named the fleet's worst cell as
-    /// `28f62f01:2026-08-27:files=433` — but that day holds **1,564** files, so
-    /// its unit carries barely a quarter of them.
+    /// The property is real: `benefit = -(input.files / BENEFIT_BUCKET_FILES)` is
+    /// computed per unit, so if one cell is ever cut into slices, each slice
+    /// reports a fraction of the debt and the cell sinks in the ordering — and
+    /// heavy debt is exactly what makes a cell a split candidate. Any change that
+    /// makes hygiene units narrower than one (project, date) must fix this first.
     ///
-    /// NOTE: with every cell day-wide, the ordering is CORRECT — `claim_next`
-    /// serves logs 964 and 737 first. The defect is not `starved` before
-    /// `benefit`; it is that splitting dilutes `benefit`.
+    /// It is NOT what starved `otel_logs_and_spans` on 2026-08-28. Hygiene units
+    /// there are per (project, date): prod's worst cell reported `files=433`,
+    /// which is that cell's *entire* file count. Nothing was split.
     #[test]
-    fn splitting_a_day_divides_its_benefit_and_inverts_the_ordering() {
+    fn splitting_a_cell_would_divide_its_benefit_and_invert_the_ordering() {
         const HOUR: i64 = 3_600_000_000;
         const DAY: i64 = 24 * HOUR;
         let now = 400 * DAY;
@@ -4715,38 +4711,71 @@ mod tests {
             t
         };
 
-        // Day-wide cells: benefit tracks the real debt and the ordering is right.
+        // One cell per day — how hygiene actually runs. Benefit tracks real debt.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut whole = TaskJournal::load(dir.path()).expect("journal");
         whole.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
         whole.enqueue_planned(&unit("logs", 3, 0, 1, 964));
         let first = whole.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
-        assert_eq!(first.key.project_id.as_str(), "logs", "day-wide, the 964-file cell correctly wins over 261");
+        assert_eq!(first.key.project_id.as_str(), "logs", "unsplit, the 964-file cell correctly outranks 261");
 
-        // The SAME logs day, split four ways, now loses to the smaller metrics
-        // cell — because each slice reports a quarter of the debt.
+        // The same debt, split four ways, now loses to a cell holding a quarter
+        // as much — the debt did not change, only its packaging.
         let dir2 = tempfile::tempdir().expect("temp dir 2");
         let mut split = TaskJournal::load(dir2.path()).expect("journal");
         split.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
         for slice in 0..4 {
             split.enqueue_planned(&unit("logs", 3, slice, 4, 964 / 4));
         }
-        let first = split.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
         assert_eq!(
-            first.key.project_id.as_str(),
+            split.claim_next(Operation::SealedConsolidation, now, true).expect("a claim").key.project_id.as_str(),
             "metrics",
-            "split four ways, the 964-file day is outranked by a 261-file one — the debt did not change, only its packaging"
+            "split four ways, a 964-file day is outranked by a 261-file one"
         );
 
-        // Worse: the INSTRUMENT is blinded by the same dilution. It picks the
-        // worst cell by `input.files`, which after splitting is the 261-file
-        // metrics unit — larger than any 241-file logs slice — and that cell wins
-        // its own claim, so `most_indebted_unclaimed` reports nothing at all. The
-        // starvation of a 964-file day is invisible from the log line.
+        // And `most_indebted_unclaimed` is blinded the same way: it ranks by
+        // per-unit files, so the largest is now the metrics cell, which wins its
+        // own claim — so nothing is reported starved at all.
         assert!(
             split.most_indebted_unclaimed(Operation::SealedConsolidation, now).is_none(),
-            "after splitting, the biggest per-UNIT debt is the metrics cell, so it wins and nothing is reported as starved — \
-             the 964-file logs day cannot be seen at all"
+            "the instrument cannot see a starved cell whose debt has been divided below its rivals"
+        );
+    }
+
+    /// The age window demotes the fleet's BIGGEST debts, at prod's real numbers.
+    ///
+    /// `starved` is `0` only for work aged 3-31 days and is compared BEFORE
+    /// `benefit`, so a cell that is merely young loses regardless of how much it
+    /// holds. Measured 2026-08-28, the three largest cells in the fleet were all
+    /// 1-2 days old and therefore all demoted:
+    ///
+    ///     433 files  otel_logs_and_spans 28f62f01 08-27   1 day   starved=1
+    ///     294 files  otel_logs_and_spans 28f62f01 08-26   2 days  starved=1
+    ///     283 files  otel_metrics        8100121c 08-27   1 day   starved=1
+    ///
+    /// while a 238-file cell three days old was eligible. Prod's instrument said
+    /// exactly this: `outranked_by:8100121c:2026-08-24:28f62f01:2026-08-27:files=433`.
+    #[test]
+    fn the_starvation_window_demotes_the_biggest_debt_when_it_is_young() {
+        const HOUR: i64 = 3_600_000_000;
+        const DAY: i64 = 24 * HOUR;
+        let now = 400 * DAY;
+        let cell = |project: &str, days_ago: i64, files: u32| {
+            let end = now - days_ago * DAY;
+            let mut t = task(project, end - DAY, end, Operation::SealedConsolidation);
+            t.input = Some(InputFootprint::new((0..files).map(|n| format!("{project}/{n}.parquet")), 1));
+            t
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        journal.enqueue_planned(&cell("biggest-but-young", 1, 433));
+        journal.enqueue_planned(&cell("smaller-but-aged", 3, 238));
+
+        let first = journal.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
+        assert_eq!(
+            first.key.project_id.as_str(),
+            "smaller-but-aged",
+            "a 238-file cell wins over a 433-file one solely because the bigger one is 1 day old"
         );
     }
 

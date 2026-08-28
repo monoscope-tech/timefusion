@@ -30,45 +30,52 @@ in the last 3 h — a 6× acceleration over the overnight rate.
   `refusal="outranked_by:8100121c:2026-08-22:28f62f01:2026-08-27:files=433"` —
   the fleet's most indebted cell (433 files, logs) is outranked by a 6-day-old
   metrics cell. Logs cells **are** enqueued (`planned=446`); they lose on order.
-### CAUSE — corrected 13:55. It is NOT `starved` before `benefit`.
+### CAUSE — settled 14:15, after TWO wrong turns of mine
 
-I first blamed the rank tuple's `starved` age window. **Modelled against the real
-prod backlog, that is refuted.** With every cell day-wide, `claim_next` serves
-`logs(964) → logs(737) → 7× metrics → logs(452)` — benefit ranking works, and the
-big logs cells win first. (Note `rank()` forces `width` and `order` to 0 when
-`hole == 0`, so for hygiene only `benefit` actually decides.)
+**Turn 1 (partly right):** I blamed `starved`, a pure [3 day, 31 day] age window
+compared BEFORE `benefit`.
+**Turn 2 (wrong, retracted):** I then "corrected" that to benefit-dilution by
+splitting — comparing a per-DATE total summed across projects (964) against a
+per-CELL count (261). Hygiene units are per **(project, date)**; prod's worst cell
+reported `files=433`, which is that cell's *entire* count. **Nothing is split.**
 
-**The real mechanism: splitting a day divides its benefit, so the most indebted
-days rank lowest.** `benefit = -(input.files / 64)` is per **UNIT**. A day-wide
-unit reports the day's whole file count; the same day cut into slices reports a
-fraction in each — and heavy debt is exactly what causes a day to be split.
+**What the real numbers show.** Top cells fleet-wide, 2026-08-28:
 
-| cell | benefit | outcome |
-|---|---|---|
-| metrics 261 files, day-wide | **−4** | |
-| logs 964 files, day-wide | −15 | **wins** ✓ |
-| logs 964 files **split 4 ways** | −3 each | **loses to metrics** ✗ |
-| logs 964 files split 8 ways | −1 each | loses badly |
+| files | table | cell | age | `starved` |
+|---|---|---|---|---|
+| **433** | logs | 28f62f01 08-27 | 1 d | **1 — demoted** |
+| **294** | logs | 28f62f01 08-26 | 2 d | **1 — demoted** |
+| **283** | metrics | 8100121c 08-27 | 1 d | **1 — demoted** |
+| 238 | metrics | 8100121c 08-25 | 3 d | 0 — eligible |
+| 225 | logs | 28f62f01 08-25 | 3 d | 0 — eligible |
 
-Prod corroborates: the instrument named the fleet's worst cell as
-`28f62f01:2026-08-27:files=433`, but that day holds **1,564** files — its unit
-carries barely a quarter.
+So turn 1 was right *for the biggest cells*: **the three largest debts in the fleet
+are all demoted purely for being 1–2 days old**, exactly as the instrument says
+(`outranked_by:8100121c:2026-08-24:28f62f01:2026-08-27:files=433`). Pinned by
+`the_starvation_window_demotes_the_biggest_debt_when_it_is_young`.
 
-**And the instrument is blinded by the same dilution.** `most_indebted_unclaimed`
-picks the worst cell by `input.files`; after splitting, that is the 261-file
-metrics unit (larger than any 241-file logs slice), which wins its own claim — so
-it reports **nothing at all**. A starved 964-file day is invisible from the log line.
+**A second, smaller effect:** `BENEFIT_BUCKET_FILES = 64` puts 238 and 225 in the
+same bucket (both `-3`), and `rank()` forces `width` and `order` to 0 when
+`hole == 0` — so those two tie completely and the winner is journal iteration
+order.
 
-Pinned by `splitting_a_day_divides_its_benefit_and_inverts_the_ordering`
-(`maintenance_coordinator.rs`), built from the measured prod counts.
+### STILL UNEXPLAINED — do not paper over this
 
-**Fix shape (unshipped, needs design):** rank by the debt of the CELL, not the
-unit — e.g. carry the day's total file count on each of its units, or aggregate
-sibling units when ranking. Note this interacts with splitting, which the deadline
-work *wants* — so the two must be designed together, not opposed.
+Eligible (`starved = 0`) cells with ≥8 files: **logs 32, metrics 46** — a 41/59
+split. That does **not** explain the observed **22/22 metrics, 0 logs**. Age and
+bucketing account for the biggest cells losing; they do not account for logs
+getting *nothing*. Candidates not yet tested: `fair_cursors` rotating on
+project_id (the same project IDs exist in BOTH tables, so a per-project cursor
+cannot separate them); per-table planning cadence; or logs units sitting in
+`Retry` with future deadlines. **Next step is to instrument or model this, not to
+change ordering on a partial explanation.**
 
-**Precondition to act:** a `timefusion sim` backtest. The rank tuple's own comments
-document repeated ordering regressions.
+**Latent hazard, kept separate:** `benefit` is per unit, so if hygiene units ever
+become narrower than one (project, date), each slice reports a fraction of the
+debt and the worst cells sink — and `most_indebted_unclaimed` goes blind the same
+way, reporting nothing. Pinned by
+`splitting_a_cell_would_divide_its_benefit_and_invert_the_ordering`. Must be fixed
+*before* any change that narrows hygiene units.
 
 ## NEW — zstd levels: measured, and the refactor's intent ≠ its implementation
 
