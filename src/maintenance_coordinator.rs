@@ -2757,6 +2757,26 @@ impl TaskJournal {
             .collect()
     }
 
+    /// Rows this project has PUBLISHED into `target` over slices overlapping
+    /// `[start, end)`.
+    ///
+    /// The comparator for an empty publication. Day-level `source_rows` cannot
+    /// serve: it is keyed on (project, date) while a unit is an hour, so a
+    /// genuinely empty hour of a busy day reads as non-empty. Joining the base
+    /// tier's own publications over the SAME slice separates the two — offline
+    /// against the 2026-08-28 prod journal it split 285 empty derived
+    /// completions into 276 with base rows available and 9 legitimately empty.
+    pub fn published_rows_overlapping(&self, project_id: &str, target: &str, start: i64, end: i64) -> u64 {
+        self.snapshot
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.key.project_id == project_id && task.key.physical_table == target && task.key.slice.start_micros < end && task.key.slice.end_micros > start
+            })
+            .filter_map(|task| task.publication.as_ref().map(|publication| publication.rows))
+            .sum()
+    }
+
     pub fn source_cursor(&self, source: &str) -> Option<u64> {
         self.snapshot.source_cursors.get(source).copied()
     }
@@ -4218,6 +4238,45 @@ mod tests {
 
         // One-shot: a second call must not re-run and drop the coarse re-plan.
         assert!(journal.migrate_fine_grained_backfill(now).is_none(), "migration must be guarded by its cursor");
+    }
+
+    /// The comparator for an empty publication must be the base tier's rows in
+    /// THIS slice, not the day.
+    ///
+    /// `source_rows` is keyed on (project, date) while a unit is an hour, so a
+    /// genuinely empty hour of a busy day reads as non-empty and a guard built
+    /// on it would fire on correct work. Joined offline against the 2026-08-28
+    /// prod journal, the per-slice comparator split 285 empty derived
+    /// completions into 276 real violations and 9 legitimately empty hours.
+    #[test]
+    fn published_rows_are_summed_per_slice_and_per_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const HOUR: i64 = 3_600_000_000;
+        let key = |project: &str, table: &str, hour: i64| TaskKey {
+            physical_table: table.into(),
+            source: "src".into(),
+            project_id: project.into(),
+            slice: TimeSlice::new(hour * HOUR, (hour + 1) * HOUR).expect("slice"),
+            operation: Operation::BaseRollup,
+        };
+        let publish = |journal: &mut TaskJournal, project: &str, table: &str, hour: i64, rows: u64| {
+            let key = key(project, table, hour);
+            journal.enqueue(key.clone(), 0, 1, 1);
+            journal.publish(&key, Publication { source_fingerprint: 0, generation: "g".into(), rows, source_rows: Some(1_000_000) });
+        };
+        publish(&mut journal, "p", "base", 1, 10);
+        publish(&mut journal, "p", "base", 2, 0); // an hour the base itself left empty
+        publish(&mut journal, "p", "base", 3, 7);
+        publish(&mut journal, "other", "base", 2, 999); // another tenant
+        publish(&mut journal, "p", "elsewhere", 2, 999); // another tier
+
+        let rows = |lo: i64, hi: i64| journal.published_rows_overlapping("p", "base", lo * HOUR, hi * HOUR);
+        assert_eq!(rows(1, 2), 10, "one slice");
+        assert_eq!(rows(1, 4), 17, "overlapping slices sum, and the empty hour adds nothing");
+        assert_eq!(rows(2, 3), 0, "an hour the base left empty is NOT a violation — this is the 9-of-285 case");
+        assert_eq!(rows(4, 5), 0, "a slice with no base publication at all");
+        assert_eq!(rows(0, 24), 17, "the day never picks up another tenant or another tier");
     }
 
     #[test]

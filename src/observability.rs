@@ -1040,6 +1040,19 @@ atomic_stats! {
         /// file already covered them. Expected to be rare; if it is not, a late row
         /// inside an already-published day may be going stale in the coarse tier.
         rollup_skipped_covered_by_wider,
+        /// Units that published ZERO rows while the tier they aggregate had published
+        /// rows over the SAME slice — and were then marked `complete`, so nothing
+        /// revisits them. Empty propagates: `rollup_slice_coverage` records an empty
+        /// publication as covered, so the next tier up sees no hole, reads nothing and
+        /// freezes the same way.
+        ///
+        /// Shipped as a counter first, on the `rollup_skipped_covered_by_wider`
+        /// precedent (#145): the failure has not been reproduced in a test, and the
+        /// obvious guard — retry instead of complete — risks refusing forever. The
+        /// 2026-08-28 prod journal held 276 derived and 450 base cases, none over an
+        /// empty source. If this moves, the guard is justified; the mechanism is still
+        /// open.
+        rollup_published_empty_over_full_base,
         /// Splits refused because the unit measured nearly what its parent measured:
         /// bisection has hit the row-group floor and halving the width again buys
         /// nothing but journal units.

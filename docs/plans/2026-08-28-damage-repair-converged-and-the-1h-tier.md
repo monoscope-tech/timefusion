@@ -364,9 +364,26 @@ present; it is the *content* that is absent, and nothing compares content.
 
 ### The guard this justifies
 
-`rows == 0 && source_rows > 0` ⇒ **do not complete.** It fires on exactly the 735
-observed bad units and, by construction, never on a genuinely empty source. It
-belongs at the publish site and applies to BOTH tiers — the base is 450 of them.
+**CORRECTION — `source_rows` is the wrong comparator.** It is keyed on
+`(project, date)` while a unit is an HOUR, so a genuinely empty hour of a busy day
+reads as non-empty and a guard built on it would fire on correct work. The claim
+"by construction never fires on a genuinely empty source" was an overclaim.
+
+The right comparator is **the base tier's own published rows over the SAME
+slice**, which the journal already holds. Joined offline, it splits the 285 empty
+derived completions cleanly:
+
+| | count | share |
+|---|---|---|
+| base published rows in the overlapping slices, derived published 0 | **276** | **96.8%** |
+| base also published 0 there — a legitimately empty hour | 9 | 3.2% |
+
+(median base rows available on a violation: **14,660**; max 844,029)
+
+So the guard is `rows == 0 && base rows in slice > 0`, at the publish site.
+**DERIVED only for now**: the base tier's comparator would be the raw source, and
+the only per-slice figure available there is the day-keyed `source_rows` — the
+same overclaim. The base tier's 450 need their own comparator and are NOT covered.
 
 Two things it must not become:
 * **An infinite retry.** The code's own warning ("refusing forever is its own
@@ -376,3 +393,21 @@ Two things it must not become:
   not explain why a unit with 1.17M source rows reads zero. That cause is still
   open, and section 5's fractional hours (11-47%) are probably the same cause
   seen at partial strength.
+
+### Shipped: the counter, not the guard
+
+`rollup_published_empty_over_full_base` — incremented at the publish site when a
+DERIVED unit publishes zero rows and
+`TaskJournal::published_rows_overlapping(project, base_tier, slice)` is non-zero,
+with a matching `maintenance_rollup_published_empty_over_full_base` warn carrying
+the slice.
+
+Counter first, on the `rollup_skipped_covered_by_wider` precedent (#145): that
+branch also shipped as a counter because its failure could not be reproduced in a
+test, and became behaviour only once the counter moved on prod. The comparator
+itself IS pinned — `published_rows_are_summed_per_slice_and_per_project` covers
+the empty-hour case that would make a `source_rows`-based guard wrong.
+
+**Read it against the offline number: 276 in one journal.** If it moves at a
+comparable rate, the bounded-retry guard is justified and the counter's firing
+conditions will name the mechanism the offline join cannot.

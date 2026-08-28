@@ -2534,6 +2534,31 @@ impl Database {
                 );
             }
             journal.publish(&key, publication.clone());
+            // An EMPTY publication over a base that is not empty in this slice.
+            // It is then marked `complete`, so nothing revisits it — and because
+            // `rollup_slice_coverage` records an empty publication as COVERED,
+            // the tier above sees no hole, reads nothing and freezes the same
+            // way. The 2026-08-28 prod journal held 276 such derived slices
+            // (median 14,660 base rows available) against 9 that were genuinely
+            // empty hours.
+            //
+            // Counter first, on the `rollup_skipped_covered_by_wider` precedent:
+            // the mechanism is not reproduced, and the obvious guard — retry
+            // rather than complete — can refuse forever.
+            //
+            // DERIVED only. The base tier's comparator would be the raw source,
+            // whose only per-slice figure here is the DAY-keyed `source_rows`;
+            // that reads non-empty for a genuinely empty hour of a busy day, so
+            // it would count legitimate empties as violations.
+            if derived && rows == 0 && journal.published_rows_overlapping(&key.project_id, &from, key.slice.start_micros, key.slice.end_micros) > 0 {
+                crate::observability::maintenance_stats().rollup_published_empty_over_full_base.fetch_add(1, Relaxed);
+                warn!(
+                    table = %key.physical_table, project_id = %key.project_id, base = %from,
+                    slice_start = key.slice.start_micros, slice_end = key.slice.end_micros,
+                    event = "maintenance_rollup_published_empty_over_full_base",
+                    "published zero rows although the base tier holds rows in this slice"
+                );
+            }
             journal.checkpoint()?;
             // Committed AND published, so the entry no longer describes work a
             // restart could finish. Cleared after the checkpoint rather than
