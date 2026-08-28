@@ -973,6 +973,7 @@ mod tests {
                 base_tier_present: false,
                 input: None,
                 parent_measured_bytes: None,
+                backfill_priority_micros: None,
             };
             journal.upsert(task.clone());
             task.key.operation = Operation::DerivedRollup;

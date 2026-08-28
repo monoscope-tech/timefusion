@@ -646,6 +646,7 @@ impl Database {
                         base_tier_present: false,
                         input: Some(footprint),
                         parent_measured_bytes: None,
+                        backfill_priority_micros: None,
                     });
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
@@ -674,6 +675,7 @@ impl Database {
                             base_tier_present: false,
                             input: Some(footprint),
                             parent_measured_bytes: None,
+                            backfill_priority_micros: None,
                         });
                     }
                 }
@@ -1673,6 +1675,7 @@ impl Database {
                     base_tier_present: true,
                     input: None,
                     parent_measured_bytes: None,
+                    backfill_priority_micros: None,
                 });
             }
             journal.enqueue(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());

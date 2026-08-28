@@ -361,6 +361,36 @@ pub struct MaintenanceTask {
     /// they did before.
     #[serde(default)]
     pub parent_measured_bytes: Option<u64>,
+    /// Scheduling weight inherited from the backfill unit this task was split
+    /// out of. `None` means "weigh me by my own width".
+    ///
+    /// Sealed ordering ranks wide units first because width PROXIES BACKFILL
+    /// PROVENANCE: a day-sized unit comes from the backfill planner and is the
+    /// only kind that advances the horizon, while a ten-minute one is what the
+    /// live path mints by the hundred. `split_time_task` breaks that proxy — a
+    /// day unit's children are still the backfill work that moves coverage, but
+    /// they now measure 180s and rank below every day-wide unit anywhere in
+    /// history.
+    ///
+    /// Prod 2026-08-19 is that shape exactly: `87576849`'s 2026-08-10 day unit
+    /// was split into 928 fragments in one burst on 08-17 11:23-11:31, and in
+    /// the 40 minutes measured afterwards sealed BaseRollup claims went to
+    /// 2026-07-22 — a month older — while 08-10 got none. That single day is the
+    /// hole capping `rollup_min_contiguous_days` at 2.
+    ///
+    /// Ageing does not cover this: both units are starved, and within the
+    /// starved set width still decides.
+    /// `default` so older journals deserialize as `None` and rank exactly as
+    /// they did before.
+    #[serde(default)]
+    pub backfill_priority_micros: Option<i64>,
+}
+
+impl MaintenanceTask {
+    /// Width for SCHEDULING only, never for planning or execution.
+    pub fn scheduling_width(&self) -> i64 {
+        self.backfill_priority_micros.unwrap_or_else(|| self.key.slice.width())
+    }
 }
 
 /// The file set behind a unit's byte estimate.
@@ -1486,6 +1516,7 @@ impl TaskJournal {
                 // guessing one would let the next width up under-price itself.
                 input: price.unanimous_input(),
                 parent_measured_bytes: None,
+                backfill_priority_micros: None,
             });
         }
         report
@@ -2022,6 +2053,7 @@ impl TaskJournal {
             base_tier_present,
             input,
             parent_measured_bytes: None,
+            backfill_priority_micros: None,
         });
         true
     }
@@ -2145,6 +2177,7 @@ impl TaskJournal {
                         base_tier_present: false,
                         input: None,
                         parent_measured_bytes: None,
+                        backfill_priority_micros: None,
                     });
                     self.dirty_tasks.insert(key);
                 }
@@ -2660,6 +2693,11 @@ impl TaskJournal {
             child.attempts = 0;
             child.retry_reason = None;
             child.publication = None;
+            // A split narrows the WORK, not the priority. Without this the
+            // children rank by their own 180s width and fall behind every
+            // day-wide unit in history, so the day never completes and the
+            // coverage hole it leaves is permanent.
+            child.backfill_priority_micros = Some(parent.scheduling_width());
             self.upsert(child);
         }
         true
@@ -3173,7 +3211,10 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         // Keyed on the AGE, not on `starved`: the graded term is 254 in-band, not
         // 0, so testing the rank value here would silently flip the whole backlog
         // to newest-first.
-        (1, starved, -task.key.slice.width(), benefit, if waited >= STARVATION_MICROS { recency } else { -recency })
+        // Width is read through `scheduling_width` so that SPLITTING a backfill
+        // unit does not demote its children out of reach. See
+        // `backfill_priority_micros`.
+        (1, starved, -task.scheduling_width(), benefit, if waited >= STARVATION_MICROS { recency } else { -recency })
     }
 }
 
@@ -3624,6 +3665,58 @@ mod tests {
         assert_eq!(not_before, now + exponential.max(floor), "the delay is the greater of the two, never the lesser");
     }
 
+    /// Splitting a backfill unit must narrow the WORK, not the priority.
+    ///
+    /// Sealed ordering ranks wide units first because width PROXIES backfill
+    /// provenance: a day-sized unit comes from the backfill planner and is the
+    /// only kind that advances the horizon, while a ten-minute one is what the
+    /// live path mints by the hundred. `split_time_task` breaks that proxy — the
+    /// children are still the backfill work that moves coverage, but they now
+    /// measure 180s and rank below every day-wide unit anywhere in history.
+    ///
+    /// Prod 2026-08-19: `87576849`'s 2026-08-10 day unit was split into 928
+    /// fragments on 08-17, and over the following 40 minutes sealed BaseRollup
+    /// claims went to 2026-07-22 — a month older — while 08-10 got none. That
+    /// day stayed at zero rollup rows and capped `rollup_min_contiguous_days`
+    /// at 2. Ageing does not cover it: both are starved, and width decides
+    /// within the starved set.
+    ///
+    /// Asserted on the WIDTH TERM of `scheduling_class` rather than on the order
+    /// `fair_ready_tasks` returns. The original fixture compared a recent split
+    /// day against an older day-wide one and asserted the recent won; that has
+    /// since become the wrong expectation for a reason unrelated to this fix —
+    /// `starved` is now a per-day SLOPE past the 31-day horizon, so a 39-day
+    /// unit legitimately outranks a 9-day one before width is ever consulted.
+    /// Comparing the two units at the same seal time isolates the one term this
+    /// change actually moves.
+    #[test]
+    fn a_split_backfill_child_keeps_its_parents_scheduling_width() {
+        const DAY: i64 = 24 * 60 * 60 * 1_000_000;
+        let now = 60 * DAY;
+        let (start, end) = (now - 10 * DAY, now - 9 * DAY);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+
+        let split = task("split", start, end, Operation::BaseRollup);
+        let key = split.key.clone();
+        journal.upsert(split);
+        assert!(journal.split_time_task(&key, 2 * MAX_DECODED_BYTES, None), "the day unit splits");
+
+        // The same day, same seal time, never split — what the children must not
+        // be demoted below.
+        let peer = task("peer", start, end, Operation::BaseRollup);
+        let peer_width = scheduling_class(&peer, now).2;
+
+        let child = journal.tasks().find(|task| task.key != key && task.key.project_id == "split").expect("a split child");
+        assert!(child.key.slice.width() < end - start, "the child really is narrower: {}", child.key.slice.width());
+        assert_eq!(
+            scheduling_class(child, now).2,
+            peer_width,
+            "a split child must rank at its PARENT's width, not its own {}",
+            child.key.slice.width()
+        );
+    }
+
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
         MaintenanceTask {
             key: TaskKey {
@@ -3645,6 +3738,7 @@ mod tests {
             base_tier_present: false,
             input: None,
             parent_measured_bytes: None,
+            backfill_priority_micros: None,
         }
     }
 
