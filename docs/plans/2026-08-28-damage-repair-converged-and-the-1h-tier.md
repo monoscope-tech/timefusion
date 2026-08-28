@@ -96,19 +96,48 @@ cell renders as a traffic spike that did not happen; a −99% cell renders as an
 outage that did not happen.
 
 **Correction to the record:** an earlier session logged `87576849`/08-01
-converging to "39,412,317 = truth". That number is the **1h tier's overcount**.
-The raw control today says **23,103,653**, and the 1m tier agrees with raw. The
-earlier note compared the repaired cell against the wrong reference.
+converging to "39,412,317 = truth". Today the raw control says **23,103,653** and
+the 1m tier agrees with raw, while **39,412,317 is exactly what the 1h tier
+holds**. Whether the old note read the wrong tier, or raw really was ~39M
+physical then and dedup compaction has since collapsed it (this project is in the
+32x-duplicates family), is **not re-verifiable after the fact** — do not assert a
+mechanism. The actionable conclusion is unchanged: 23.1M is the number today.
 
 ## What is NOT done, and why
 
-* **`DAMAGED_CELLS` deletion** — justified now (cursor past the end, base 81/81),
-  but it is a code change and any non-docs push redeploys prod, which kills
-  in-flight maintenance. Committed, not pushed.
-* **The 1h tier repair** — NOT started. It is a multi-day rebuild of a tier on a
-  box that restarts roughly hourly, and the failure is not yet attributed: the
-  −70% cluster on 08-24/08-25 is plausibly just derived lag behind the base
-  rebuild, while `28f62f01`/08-01 (3 rows, 3 weeks old) and the two overcounts
-  are not lag and need a root cause first. **Attribute before rebuilding** — the
-  overcount direction in particular means a rebuild could re-publish the same
-  inflated numbers.
+* **`DAMAGED_CELLS`** — emptied in `5d696741`, and made a config parameter.
+  Emptied rather than deleted: the 1h tier repair below needs the same machinery,
+  so refill it under a **v3** migration key (v2's cursor is spent). Emptying it
+  silently disarmed the end-to-end cursor guard — it drove a real pass against
+  the const and passed vacuously with nothing to consume, which is the v1
+  truncation bug's blind spot — so that test now supplies its own 30-cell list.
+  **Committed, not pushed**: a non-docs push redeploys prod and kills in-flight
+  maintenance.
+* **The 1h tier repair** — NOT started, and the attribution now says a rebuild
+  would be actively wrong.
+
+  **It is not lag.** Every one of the 29 has `derived_rollup` tasks in the
+  journal in state `complete`; none are pending. The units ran, finished, and the
+  tier is still wrong. The unit counts split the population: the old severely
+  short cells completed **1-2** derived units for a whole day (`28f62f01`/08-01:
+  2 units, and exactly 1 of 24 hour slots present), while the recent -70% cells
+  completed 40-49.
+
+  **And it is LIVE, not a stale artifact.** Dating the bad 1h cells by
+  `max(updated_at)`:
+
+  | 1h cell | written | delta |
+  |---|---|---|
+  | `87576849`/08-01 | **2026-08-28 09:44** | **+70.6%** |
+  | `28f62f01`/08-25 | **2026-08-28 12:31** | -75.7% |
+  | `6297304f`/08-17 | 2026-08-20 | +43.6% |
+  | `28f62f01`/08-01 | 2026-08-19 | -99.8% |
+
+  Two cells were written TODAY, after the 2026-08-26 fix (`43ee5d84`), and are
+  still publishing both inflated and short. So a rebuild re-runs the same code
+  that produced them. **Fix the derived path first, then rebuild** — and note the
+  -75.7% cell was derived while its base was itself mid-rebuild (that base had 2
+  `base_rollup` units still `pending`), which is precisely what the 2026-08-25
+  "a derived unit whose base does not tile its slice RETRIES instead of
+  publishing short" guard was supposed to prevent. That guard is the first thing
+  to look at.
