@@ -604,3 +604,21 @@ on a quiet process is not "too small a denominator" — it agrees with this tabl
 `created_unix_ms` is when the unit was *enqueued*, not when it ran, so a unit
 created 08-25 may have executed later. The bucketing is therefore approximate at
 the boundary. It is not approximate enough to explain 0/518 against 276/1,466.
+
+### A trap: `publication.rows` cannot measure "short" for a DERIVED unit
+
+Bucketing "derived published <50% of its base's rows" by creation day returns
+**87-100% on every day back to 08-17, including 08-26/27/28**. That is not a
+fleet-wide defect — it is the metric being wrong.
+
+`publication.rows` is the number of ROWS WRITTEN. A 1h tier aggregates a 1m base,
+so ~60 base rows per dimension combination collapse into 1 output row **by
+construction**. Comparing output rows to input rows across an aggregation makes
+every healthy unit look 98% short. Do not repeat this comparison.
+
+**What survives, and why:** the ZERO test is unaffected — no aggregation turns a
+non-empty input into zero output rows — which is why section 12's date bucketing
+is sound. And section 5's 11-47% figures came from `sum(request_count)` read out
+of the tables by SQL, i.e. MEASURE VALUES, not row counts; that comparison is
+valid and remains unexplained. **Measuring shortness of a derived tier requires
+measure sums from SQL. The journal alone can only prove EMPTY.**
