@@ -807,8 +807,7 @@ impl Database {
         // shut and none of them were the missing days.
         //
         // Bounded and self-limiting, which is what makes it safe: the pass
-        // admits at most `BACKFILL_PARTITIONS_PER_PASS` (24) cells, contiguity
-        // ordering aims them at the worst project's earliest hole, and coverage
+        // admits at most `BACKFILL_PARTITIONS_PER_PASS` (24) cells and coverage
         // reaching `COVERAGE_SHORT_DAYS` restores the ceiling. The cost the
         // ceiling exists to bound — `claim_next` scanning a longer task set — is
         // 24 cells per 60s against 43,000, which is noise next to never building
