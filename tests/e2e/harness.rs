@@ -54,6 +54,7 @@ pub struct E2eEnvBuilder {
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
     repair_resume: bool,
+    mark_sorted_at_write: bool,
 }
 
 impl Default for E2eEnvBuilder {
@@ -86,6 +87,7 @@ impl Default for E2eEnvBuilder {
             dml_coalesce_secs: 0,
             page_row_count_limit: None,
             repair_resume: false,
+            mark_sorted_at_write: true,
         }
     }
 }
@@ -110,6 +112,18 @@ impl E2eEnvBuilder {
     /// Commit staged-but-uncommitted repair parquet at boot instead of deleting
     /// it. Off in prod for the first deploy, so a test that asserts on resume
     /// MUST turn it on or the resume path is a silent no-op.
+    /// Leave flush output UNMARKED, so its files are footer-repair suspects.
+    ///
+    /// Write-time marking (2026-08-28) records a file as verified-sorted when the write stamps
+    /// its footer, which means a fixture built by flushing sorted rows has NO repair work — and
+    /// a test that needs repair to actually do something gets a silent no-op instead. Turning
+    /// the mechanism off is the honest way to restore that precondition: it is a real config
+    /// flag, not a test seam, and it gates the seeding sweep too (which would otherwise re-derive
+    /// the same marks from the footers).
+    pub fn without_write_time_sort_marking(mut self) -> Self {
+        self.mark_sorted_at_write = false;
+        self
+    }
     pub fn with_repair_resume(mut self) -> Self {
         self.repair_resume = true;
         self
@@ -268,6 +282,7 @@ impl E2eEnvBuilder {
             wide_scan_max_mb: self.wide_scan_max_mb,
             page_row_count_limit: self.page_row_count_limit,
             repair_resume: self.repair_resume,
+            mark_sorted_at_write: self.mark_sorted_at_write,
             test_id: &test_id,
         });
 
@@ -384,6 +399,7 @@ impl E2eEnv {
             wide_scan_max_mb: self.builder.wide_scan_max_mb,
             page_row_count_limit: self.builder.page_row_count_limit,
             repair_resume: self.builder.repair_resume,
+            mark_sorted_at_write: self.builder.mark_sorted_at_write,
             test_id: &self.test_id,
         });
 
@@ -504,6 +520,7 @@ struct BuildCfgArgs<'a> {
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
     repair_resume: bool,
+    mark_sorted_at_write: bool,
     test_id: &'a str,
 }
 
@@ -534,6 +551,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;
+    cfg.maintenance.timefusion_repair_mark_sorted_at_write = args.mark_sorted_at_write;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     // A 0% selectivity floor is the off switch for the WHOLE prefilter: any hit
     // set covers >= 0% of the indexed rows, so `decide_prefilter` always returns

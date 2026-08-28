@@ -6668,7 +6668,7 @@ impl Database {
     /// Marking the raw form would silently mark nothing for any tenant whose id needs encoding —
     /// a no-op that looks identical to a working feature.
     pub(crate) fn mark_written_sorted(&self, schema: &crate::schema::TableSchema, sorted: bool, adds: &[deltalake::kernel::Action]) {
-        if !sorted || schema.sorting_columns().is_empty() {
+        if !sorted || schema.sorting_columns().is_empty() || !self.config.maintenance.timefusion_repair_mark_sorted_at_write {
             return;
         }
         let paths: Vec<String> = adds
@@ -7292,6 +7292,11 @@ impl Database {
     /// spawned at boot, in front of a ~300s preload, will do.
     pub(crate) async fn seed_verified_sorted(&self, limit: usize) -> (usize, usize) {
         use futures::StreamExt;
+        // Gated with the marking, not separately: leaving the sweep on would have it re-derive
+        // from the footers, an hour later, exactly what the kill switch just turned off.
+        if !self.config.maintenance.timefusion_repair_mark_sorted_at_write {
+            return (0, 0);
+        }
         let mut unknown: Vec<(Arc<RwLock<DeltaTable>>, String)> = Vec::new();
         let mut tables_read = 0usize;
         for (_, source, table_ref) in self.all_tables().await {

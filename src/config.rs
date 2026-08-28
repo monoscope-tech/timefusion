@@ -2017,6 +2017,23 @@ pub struct MaintenanceConfig {
     /// the rewrite survive a restart at all.
     #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
+
+    /// Record a file as verified-sorted when the WRITE that produced it stamped a
+    /// `sorting_columns` footer, and sweep the files that predate that. False leaves
+    /// `repair_verified_sorted` fed only by the footer probe — the pre-2026-08-28 behaviour.
+    ///
+    /// Defaults ON. This is a kill switch for a mechanism that decides a file will NEVER be
+    /// offered to footer repair, which is the one direction that can hide a genuinely poisoned
+    /// file, so it gets an off switch on the same reasoning as
+    /// [`Self::timefusion_repair_resume_enabled`].
+    ///
+    /// **Its limits, stated because a half-working lever is worse than none:** turning this off
+    /// stops NEW marks, it does not un-mark anything. The set is persisted, so recovery from a
+    /// wrong exoneration is `rm <data_dir>/repair_verified_sorted.txt` and a restart — the flag
+    /// alone will not do it. It gates the seeding sweep too; gating only the marking would leave
+    /// the sweep re-deriving the same answer from the footers an hour later.
+    #[serde_inline_default(true)]
+    pub timefusion_repair_mark_sorted_at_write: bool,
     /// Days back (plus today) the dedup sweep scans.
     // 128: a lower bound put a multi-day floor under the backlog, but a much
     // higher one OOM'd the box — RSS climbed independent of query load, tracking

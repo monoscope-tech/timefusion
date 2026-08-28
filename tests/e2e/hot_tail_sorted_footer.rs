@@ -222,6 +222,13 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
         .with_optimize_sort_by()
         // Converged, so nothing but repair would ever look at these files.
         .with_light_optimize_target(1024)
+        // REQUIRED for this test to mean anything. The assertion counts lines in
+        // `repair_verified_sorted.txt`, and since 2026-08-28 the FLUSH writes that
+        // file too — so with marking on, `cleared >= before` is satisfied by the
+        // writes themselves and the repair pass could clear nothing at all and
+        // still pass. Turning marking off makes the probe the file's only author,
+        // which is what the assertion is actually about.
+        .without_write_time_sort_marking()
         .start()
         .await?;
     env.db().cancel_maintenance();
@@ -284,6 +291,15 @@ async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool
         .with_retention(Duration::from_secs(60 * 60))
         .with_optimize_sort_by()
         .with_light_optimize_target(1024)
+        // Without this the fixture has NO repair work at all: write-time marking
+        // (2026-08-28) records these flushed files as verified-sorted the moment
+        // they commit, so both passes find zero suspects, return in a single poll,
+        // and never overlap — `tokio::join!` polls sequentially, so a pass that
+        // does no IO releases the permit before the other is ever polled. The
+        // assertion below then reads 0 and looks like a broken permit rather than
+        // an empty queue. Contention is what this test is about, so it needs a
+        // pass with something to do.
+        .without_write_time_sort_marking()
         .start()
         .await?;
     env.db().cancel_maintenance();
