@@ -785,3 +785,31 @@ This telemetry goes SILENT on the worst failure: if the image crashloops, psql
 fails, the sampler appends nothing, and quiet reads as healthy. Confirm the new
 tag is live and check `docker service ps` for restart churn plus a panic grep
 over the first ten minutes before trusting any counter.
+
+## 17. How to actually drive the rebuild — reuse §13's method, not a v3 migration key
+
+Earlier notes assumed the rebuild needed a `DAMAGED_CELLS` refill under a **v3**
+migration key. It does not, and that route is worse.
+
+**`TaskJournal::reopen_derived_over(project, tier, start, end)` — shipped in §13 —
+IS the rebuild primitive.** Reopening a cell's derived tasks and dropping their
+publications is exactly what a rebuild needs: the coordinator then re-runs them
+through the normal path, with the normal budgets, ordering and resume, and the
+read path falls to the exact raw fringe meanwhile. A migration key would
+re-implement all of that beside it.
+
+So next session: a small CLI that reads the §14 target list and calls it per
+cell, rather than a const list compiled into the binary. The const-list mechanism
+is already spent — the v2 cursor read 81/81 and `DAMAGED_CELLS` was emptied in
+`5d696741`.
+
+**Do NOT drive it with `run-unit`.** That exists (`timefusion run-unit --project
+ID --date D --op derived`) and is the right tool for measuring ONE unit's cost,
+but at ~21 minutes per unit, 272 cells is ~95 hours serially. It is a probe, not
+a batch mechanism.
+
+**Prefer DAY-wide reopens where the shape allows it.** §10 measured day-wide
+derived units as the healthy shape — 0 of 398 published empty against 14.5% for
+hour-wide — and §11 now stops the migration collapsing them. A rebuild that
+enqueues day-wide units therefore avoids the shape that produced the damage in
+the first place.
