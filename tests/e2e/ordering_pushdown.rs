@@ -181,6 +181,9 @@ async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::
         .collect::<Vec<_>>()
         .join("\n");
     assert!(plan.contains("SortPreservingMergeExec"), "one unsorted file must not disable the streaming merge for the conforming majority; plan was:\n{plan}");
+    // The same lost claim is what drops `DedupExec` into its unbounded mode, so
+    // pin that too: keep-greatest must stay bounded.
+    assert!(!plan.contains("mode=full-set"), "DedupExec must stay bounded once the ordering is restored; plan was:\n{plan}");
 
     let ids: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
     assert_eq!(ids, vec!["s-8", "s-7", "s-6"], "wrong top-n or order; plan:\n{plan}");
