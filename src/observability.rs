@@ -1053,6 +1053,18 @@ atomic_stats! {
         /// empty source. If this moves, the guard is justified; the mechanism is still
         /// open.
         rollup_published_empty_over_full_base,
+        /// Base files a DERIVED unit refused although they carry slice tags, split by
+        /// which test refused them. `untagged_inputs` counts only files with NO tags,
+        /// so these two drops were invisible — prod read `rollup_untagged_inputs = 0`
+        /// while a unit could be skipping every input it had.
+        ///
+        /// `..._tag_range` is the width-sensitive one and is the instrument for the
+        /// 2026-08-28 finding that hour-wide derived units publish empty 14.5% of the
+        /// time while day-wide units never do (0 of 398). Read it against
+        /// `rollup_published_empty_over_full_base`: both moving together is the
+        /// selection hypothesis confirmed.
+        rollup_base_file_skipped_tag_project,
+        rollup_base_file_skipped_tag_range,
         /// Splits refused because the unit measured nearly what its parent measured:
         /// bisection has hit the row-group floor and halving the width again buys
         /// nothing but journal units.

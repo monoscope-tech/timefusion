@@ -1763,6 +1763,9 @@ impl Database {
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
+        // Tagged base files the derived selection loop refuses, by reason. See
+        // the counters' declarations and the skip site below.
+        let (mut skipped_tag_project, mut skipped_tag_range) = (0u64, 0u64);
         // Read STRICTLY BEFORE the snapshot below, and evaluated after it — see
         // the derived base-coverage gate. Coverage is inserted only AFTER the
         // base unit's Delta commit and only ever grows, so a range collected
@@ -1874,7 +1877,23 @@ impl Database {
                     // is the number that says whether tags are the reason.
                     match slice_tag_range(&add) {
                         Some((start, end)) => {
-                            if tag_project(&add) != Some(key.project_id.as_str()) || !key.slice.overlaps(start, end) {
+                            // A TAGGED file dropped here was silent: `untagged_inputs`
+                            // counts only files with NO tags, so prod read
+                            // `rollup_untagged_inputs = 0` while this skipped every
+                            // input a unit had. Split by reason — one label over two
+                            // refusals cannot say which, and this loop has exactly two.
+                            //
+                            // The range test is the width-sensitive one, which is why
+                            // it is the leading suspect for the 2026-08-28 finding that
+                            // hour-wide derived units publish empty 14.5% of the time
+                            // while day-wide units never do (0 of 398): a day-wide slice
+                            // overlaps every base file for the day and cannot miss one.
+                            if tag_project(&add) != Some(key.project_id.as_str()) {
+                                skipped_tag_project += 1;
+                                continue;
+                            }
+                            if !key.slice.overlaps(start, end) {
+                                skipped_tag_range += 1;
                                 continue;
                             }
                         }
@@ -1939,6 +1958,11 @@ impl Database {
         // children that fusion can only sum.
         if self.journal().record_input(&key, input_footprint) {
             self.journal().checkpoint()?;
+        }
+        if skipped_tag_project + skipped_tag_range > 0 {
+            let stats = crate::observability::maintenance_stats();
+            stats.rollup_base_file_skipped_tag_project.fetch_add(skipped_tag_project, Relaxed);
+            stats.rollup_base_file_skipped_tag_range.fetch_add(skipped_tag_range, Relaxed);
         }
         if untagged_inputs > 0 {
             crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
