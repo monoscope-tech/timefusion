@@ -594,6 +594,44 @@ Ruled out tonight, each with evidence:
   hypothesis to test: cold object-store reads** — these are 9–11 day old
   partitions, so foyer is cold, while the fast logs bins are today's data.
 
+### 02:31 UTC — unit-duration census, 407 finishes over 55 min
+
+Drain since change 2 deployed (62 min): logs **+0**, metrics **−1**. Flat,
+confirming the lane is pinned rather than slow.
+
+| operation | n | mean s | max s | ≥ deadline | outcomes |
+|---|---|---|---|---|---|
+| **SealedConsolidation** (900 s) | 9 | **900.6** | 905 | **9/9** | **9 Running — 100% abandoned, 0 completions** |
+| **Dedup** (300 s) | 185 | 210.8 | 386 | 84 | **102 Running**, 56 Complete, 24 Retry |
+| BaseRollup | 124 | 35.9 | 902 | 4 | 81 Complete, 38 Superseded |
+| Repair | 41 | **0.0** | 1 | 0 | 40 Retry (already-sorted short-circuit) |
+| DerivedRollup | 41 | 0.0 | 1 | 0 | 40 Retry |
+| HotPacking | 7 | 30.4 | 159 | 0 | healthy |
+
+**Two lanes are deadline-bound, not one.** Sealed consolidation completes
+**nothing** — 9 of 9 abandoned at the deadline. Dedup abandons **102 of 185
+(55%)** at its 300 s deadline with a mean of 211 s, i.e. it sits right on the
+edge; and dedup is the largest queue (`pending_dedup` 3,502,
+`dirty_bin_queue_depth` 31,369). Most maintenance capacity is being spent on
+units that never finish.
+
+**Change 2 is not implicated in either.** The 900 s sealed units are
+`otel_metrics` bins on the **all-sorted 256 MB path**, which change 2 does not
+touch (it only raised the budget for bins *containing unsorted files*). The new
+unsorted logs bins staged in **1–46 s**. Dedup uses a different selector entirely.
+
+**Reframing for the morning:** the goal is "compact/sort/dedup cheaply so the
+backlog never piles up". The measured obstacle is no longer memory — it is that
+**a unit's work does not fit its deadline** in the two lanes that carry the
+backlog. Two shapes, needing different answers:
+- *Sealed*: a 260 MB bin taking >900 s is anomalous — the deadline is not the
+  problem, the per-bin cost is. Find why (leading hypothesis: cold object-store
+  reads on 9–11 day old partitions; foyer is cold there and warm for the fast
+  logs bins).
+- *Dedup*: a 211 s mean against a 300 s deadline is a sizing mismatch — either
+  shard smaller or lengthen the deadline. This one is tractable and measurable,
+  and it is the biggest queue.
+
 ### Do NOT do these without the stated precondition
 
 1. **Do not revert either shipped fix.** No evidence against them; both measured.
