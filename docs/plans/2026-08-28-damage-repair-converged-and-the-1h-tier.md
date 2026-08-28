@@ -558,3 +558,49 @@ failing first (migrated 2 where 1 is right).
 
 Note this is NOT what `9f679039` fixed: that one excluded split children via
 `parent_measured_bytes`, a different way into the same function.
+
+## 12. CORRECTION — the empty-publication defect STOPPED on 08-26. It is damage, not a live bug.
+
+The same join, bucketed by the day each unit was **created**:
+
+| unit created | violations / total | rate |
+|---|---|---|
+| 08-17 … 08-20 | 0 / 321 | **0.0%** |
+| 08-22 | 10 / 77 | 13.0% |
+| 08-23 | 36 / 508 | 7.1% |
+| **08-24** | **148 / 468** | **31.6%** |
+| 08-25 | 82 / 413 | 19.9% |
+| **08-26** | **0 / 378** | **0.0%** |
+| **08-27** | **0 / 63** | **0.0%** |
+| **08-28** | **0 / 77** | **0.0%** |
+
+**Every one of the 276 violations was created in a four-day window, 08-22 to
+08-25. 518 units created since have produced none.** Something in the 08-26
+changes closed it — `7249b36c` and `43ee5d84` both landed that day.
+
+This is the correction that matters, so state it plainly: **sections 5-10 of this
+document describe historical damage, not an ongoing defect.** The live
+`rollup_published_empty_over_full_base` counter reading 0 across 45 full rebuilds
+on a quiet process is not "too small a denominator" — it agrees with this table.
+
+### What that changes
+
+* **Priority inverts.** No fix is needed for the empty-publication path; the
+  **rebuild** is the whole remaining job. The 276 slices are frozen `complete`
+  and will never self-heal, and they sit squarely in the dates the 1h tier is
+  wrong on.
+* **The counter is still worth having** — it is what proves the zero, and it
+  turns "we think it stopped" into a standing assertion. Keep it.
+* **The hour-migration fix (section 11) is unaffected** and remains correct: that
+  bug is in a boot-time migration, is not date-bounded, and its 265 collapses
+  include days across the whole retained range.
+* **The staleness defect (section 4.1) is also unaffected** — a base rebuild
+  still does not invalidate its derived tier, and that is what will re-damage the
+  1h tier the next time the base is repaired. **Fix that BEFORE the v3 rebuild,
+  or the rebuild is undone by the next base repair.**
+
+### Caveat on the method
+
+`created_unix_ms` is when the unit was *enqueued*, not when it ran, so a unit
+created 08-25 may have executed later. The bucketing is therefore approximate at
+the boundary. It is not approximate enough to explain 0/518 against 276/1,466.
