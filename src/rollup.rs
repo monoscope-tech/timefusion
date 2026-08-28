@@ -3467,7 +3467,13 @@ mod tests {
     ///
     /// Deliberately absent: the `SELECT *` variant-wrap projection. It needs the
     /// Variant analyzer rule, which a bare `MemTable` session does not register
-    /// — the same blind spot recorded at `measure_filters`.
+    /// — the same blind spot recorded at `measure_filters`. Also absent, and
+    /// deliberately so: the plain derived table this table used to carry as "the
+    /// one shape a widening could reach". The widening arrived — the walker now
+    /// descends through a `SubqueryAlias` — so that case ROUTES, and it is pinned
+    /// as such by `the_benchmark_count_shape_routes_through_its_derived_table`.
+    /// The two cases below still refuse, and now name the node that actually
+    /// stopped the walk rather than the alias that merely hid it.
     #[test_case::test_case(
         &format!("SELECT count(*) FROM (SELECT 1 FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} LIMIT 5000) s"),
         "Limit"; "a bounded existence probe over a derived table — monoscope safetyNetReprocess, BackgroundJobs.hs:2127")]
@@ -3479,19 +3485,16 @@ mod tests {
             "WITH f AS (SELECT floor(extract(epoch from timestamp) / 60)::bigint AS bucket_idx FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) \
              SELECT bucket_idx, count(*) FROM f GROUP BY bucket_idx"
         ),
-        "SubqueryAlias: f over Projection: CAST(floor"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
+        "Projection: CAST(floor"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
     #[test_case::test_case(
         &format!(
             "SELECT count(*) FROM (SELECT timestamp FROM {SOURCE} WHERE project_id = 'a' AND {WINDOW} \
              UNION ALL SELECT timestamp FROM {SOURCE} WHERE project_id = 'b' AND {WINDOW}) u"
         ),
-        "SubqueryAlias: u over Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
+        "Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
     #[test_case::test_case(
         &format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d"),
         "Aggregate"; "an inner DISTINCT, which plans as a second Aggregate")]
-    #[test_case::test_case(
-        &format!("SELECT count(*) FROM (SELECT timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) s"),
-        "over a walkable scan of otel_logs_and_spans"; "a derived table whose ALIAS is the only blocker — the one shape a widening could reach")]
     #[tokio::test]
     async fn an_unwalkable_shape_is_counted_and_names_the_node_that_refused(sql: &str, expected_node: &str) {
         let state = session().await;
