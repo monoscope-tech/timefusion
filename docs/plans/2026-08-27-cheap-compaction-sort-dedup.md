@@ -551,7 +551,38 @@ the cap mainly taxed the *first* pass over fresh flush output.
 file-count cap would go if merge fan-in ever needs bounding (the refuted
 diagnosis #2). Not needed on current evidence.
 
-## WHERE THE NIGHT ENDED (02:30 UTC) — read this first in the morning
+## MORNING (08:52 UTC) — 5 h quiet on `e45deef`. READ THIS FIRST.
+
+**The two shipped fixes hold, and the sealed lane is draining — my 02:30
+"pinned forever" framing was too pessimistic.**
+
+| partition | 23:15 (pre-fix) | 02:25 | **08:52** | total |
+|---|---|---|---|---|
+| logs 08-24 | 561 | 515 | **452** | **−109** |
+| metrics 08-24 | 523 | 479 | **349** | **−174** |
+| logs 08-25 / 08-26 | 964 / 736 | unchanged | unchanged | 0 |
+| metrics 08-25 / 08-26 | 1017 / 889 | unchanged | unchanged | 0 |
+
+`Light optimize staging failed`: **1 in the last 60 min** (was 3.3–4.8/hr).
+Process up 5 h, no restarts, no panics.
+
+**Corrected reading.** The lane is not dead. It is draining **08-24** at ~30
+files/hr combined and has not yet reached 08-25/26 — which is oldest-first
+working as designed, not a stall. At 02:30 I saw a 47-minute window with zero
+movement and over-read it; the drain is lumpy because one commit retires many
+files at once, exactly the calibration note I wrote and then ignored.
+
+**But the rate is the problem, and it is the open item.** Sealed 08-24…26 still
+holds **2,153 (logs) + 2,255 (metrics) = 4,408 files**. At ~30 files/hr that is
+~147 hours. Clearing 08-24 alone (801 files left) is ~27 more hours. **The fixes
+removed the memory ceiling; they did not make the lane fast enough for a backlog
+that will grow with message volume** — which is the actual goal.
+
+That is what `MAX_BIN_ROWS` (below, uncommitted at session end) targets: metrics
+bins of 5.08 M rows cannot finish in 900 s, so they burn a slot and commit
+nothing while 08-24 waits.
+
+## WHERE THE NIGHT ENDED (02:30 UTC)
 
 **Two fixes shipped and both hold. The remaining blocker is named, instrumented,
 and NOT the thing I would have guessed.**
