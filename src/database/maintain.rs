@@ -69,18 +69,43 @@ const DAMAGED_CELLS: &[(&str, &str)] = &[];
 /// One (project, date) the rollup backfill can plan.
 pub(crate) type BackfillCell = (String, chrono::NaiveDate);
 
-/// `DAMAGED_CELLS` in the order the backfill consumes it — newest date first,
+/// The repair list in the order the backfill consumes it — newest date first,
 /// the same order the pass itself ranks by. Sorted here rather than trusted from
-/// a hand-maintained const, because the cursor into it is durable and a reorder
+/// a hand-maintained list, because the cursor into it is durable and a reorder
 /// would silently re-target it.
+///
+/// `configured` REPLACES `DAMAGED_CELLS` when non-empty; the two are never
+/// merged, so a stale env value shadows a freshly refilled const entirely.
+///
+/// A malformed entry is WARNED, not silently skipped: a repair list that
+/// quietly loses cells is the v1 truncation bug's failure mode reintroduced at
+/// the parse layer, and this field gets hand-edited under exactly the
+/// conditions where nobody re-reads it.
 pub(crate) fn damaged_cells_newest_first(configured: &[String]) -> Vec<BackfillCell> {
     let listed: Vec<(String, String)> = if configured.is_empty() {
         DAMAGED_CELLS.iter().map(|(project, date)| ((*project).to_owned(), (*date).to_owned())).collect()
     } else {
-        configured.iter().filter_map(|cell| cell.split_once(':')).map(|(project, date)| (project.to_owned(), date.to_owned())).collect()
+        configured
+            .iter()
+            .filter_map(|cell| match cell.trim().split_once(':') {
+                Some((project, date)) => Some((project.trim().to_owned(), date.trim().to_owned())),
+                None => {
+                    warn!(entry = %cell, event = "damage_repair_cell_unparsed", "damage repair cell is not `project:YYYY-MM-DD`; it will NOT be repaired");
+                    None
+                }
+            })
+            .collect()
     };
-    let mut cells: Vec<BackfillCell> =
-        listed.iter().filter_map(|(project, date)| Some((project.clone(), date.parse::<chrono::NaiveDate>().ok()?))).collect();
+    let mut cells: Vec<BackfillCell> = listed
+        .iter()
+        .filter_map(|(project, date)| match date.parse::<chrono::NaiveDate>() {
+            Ok(date) => Some((project.clone(), date)),
+            Err(_) => {
+                warn!(project = %project, date = %date, event = "damage_repair_cell_unparsed", "damage repair cell has an unparseable date; it will NOT be repaired");
+                None
+            }
+        })
+        .collect();
     cells.sort_by(|(project_a, date_a), (project_b, date_b)| date_b.cmp(date_a).then_with(|| project_a.cmp(project_b)));
     cells
 }

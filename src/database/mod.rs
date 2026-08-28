@@ -12056,9 +12056,7 @@ mod tests {
         // is nothing to consume is exactly the v1 bug's blind spot.
         // Longer than `BACKFILL_PARTITIONS_PER_PASS`, or one pass consumes the
         // whole list and the truncation the v1 bug lost cells to never happens.
-        let listed: Vec<String> = (0..30)
-            .map(|i| format!("{project}:{}", (Utc::now() - chrono::Duration::days(3 + i)).format("%Y-%m-%d")))
-            .collect();
+        let listed: Vec<String> = (0..30).map(|i| format!("{project}:{}", (Utc::now() - chrono::Duration::days(3 + i)).format("%Y-%m-%d"))).collect();
         cfg.maintenance.timefusion_damage_repair_cells = listed.clone();
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
         for i in 0..3 {
@@ -12086,6 +12084,28 @@ mod tests {
         assert!(after_one < super::maintain::damaged_cells_newest_first(&listed).len(), "and must not swallow the whole list in one pass — that is the v1 bug");
         assert!(cursor(&db) > after_one, "the next pass takes the next prefix, got {} then {}", after_one, cursor(&db));
         Ok(())
+    }
+
+    /// A malformed repair cell is DROPPED, not treated as a wildcard or a panic —
+    /// and the survivors still come back newest-first. Silently losing a listed
+    /// cell is the v1 truncation bug's failure mode at the parse layer, so this
+    /// pins that the good entries are unaffected by a bad neighbour.
+    #[test]
+    fn a_malformed_damage_repair_cell_is_dropped_and_the_rest_survive() {
+        let listed: Vec<String> =
+            ["p1:2026-08-20", "no-colon-here", "p2:2026-8-1", " p3 : 2026-08-22 ", "p4:not-a-date"].iter().map(|s| (*s).to_owned()).collect();
+        let cells = super::maintain::damaged_cells_newest_first(&listed);
+        assert_eq!(
+            cells,
+            vec![
+                ("p3".to_owned(), chrono::NaiveDate::from_ymd_opt(2026, 8, 22).expect("date")),
+                ("p1".to_owned(), chrono::NaiveDate::from_ymd_opt(2026, 8, 20).expect("date")),
+                // Unpadded is ACCEPTED — chrono parses `2026-8-1` as 2026-08-01.
+                // Pinned so nobody "fixes" it into a silent drop.
+                ("p2".to_owned(), chrono::NaiveDate::from_ymd_opt(2026, 8, 1).expect("date")),
+            ],
+            "only well-formed cells survive, newest first, and whitespace is trimmed"
+        );
     }
 
     /// Ten damage-list-shaped cells, newest first, exactly as the planner orders them.

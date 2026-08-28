@@ -90,6 +90,25 @@ Slot analysis says there are two distinct failures:
   versions of base rows (see the 2026-08-20 note on derived rollups summing MoR
   versions).
 
+### It is NOT limited to `otel_logs_and_spans`
+
+The v2 cursor read 81/81 for **both** sources, and the same comparison on
+`otel_metrics_rollup_metrics_1h_v2` vs `_1m_v2` (`point_count`) over the same
+project/date pairs: **12 of 64 cells disagree by >0.5%**, all SHORT, up to
+**−84.7%**:
+
+| cell | 1h | 1m | delta |
+|---|---|---|---|
+| `6297304f`/08-25 | 728,651 | 4,754,256 | −84.7% |
+| `8100121c`/08-25 | 4,395,496 | 28,311,615 | −84.5% |
+| `8100121c`/08-24 | 6,779,495 | 34,116,402 | −80.1% |
+| … 9 more | | | −2.3% to −74.9% |
+
+Caveat on the reference: the **metrics 1m tier has not itself been verified
+against raw** — only the logs base was. So this measures *disagreement between
+tiers*, not which side is wrong. It is enough to say the derived path is not a
+logs-only problem, and no over-counts appeared on this table.
+
 **Why it matters:** the matcher picks the coarsest grain dividing the requested
 bucket width, so wide-window dashboards (30d charts) read *this* tier. A +70%
 cell renders as a traffic spike that did not happen; a −99% cell renders as an

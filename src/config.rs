@@ -2099,6 +2099,10 @@ pub struct MaintenanceConfig {
     /// as `project:YYYY-MM-DD`. Empty means "use `DAMAGED_CELLS`", which is
     /// itself empty since the 2026-08-25 damage converged.
     ///
+    /// Non-empty REPLACES the const rather than extending it — so a stale value
+    /// here silently shadows a const someone has just refilled for the next
+    /// repair. Malformed entries are warned and dropped, never silently.
+    ///
     /// A parameter rather than only a const so the end-to-end cursor guard can
     /// drive a real planner pass with a synthetic list — otherwise the wiring
     /// that the v1 truncation bug lived in is untested whenever the const is
