@@ -12918,6 +12918,55 @@ mod tests {
         assert_eq!(*kept.last().expect("bounded"), 88 * day, "the bound must cut from the OLD end, not the new one");
     }
 
+    /// The publish site must actually CALL `reopen_derived_over`, with the right
+    /// child tier name.
+    ///
+    /// `republishing_a_base_slice_reopens_the_derived_cell_over_it` pins the
+    /// journal method; nothing pinned the wiring, and a wrong
+    /// `child_spec.table_name(&key.source)` would match nothing SILENTLY — the
+    /// same class as `rollup_untagged_inputs = 0` and the coverage map that had
+    /// no producer. Prod could not settle it either: zero reopen events is
+    /// ambiguous whenever nothing happens to be republishing over a completed
+    /// derived cell.
+    ///
+    /// Without the edge, `87576849`/2026-08-01's 1h cell — written five minutes
+    /// before its base was rebuilt — reads +70.6% over that base forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn republishing_a_base_slice_reopens_the_derived_cell_from_the_publish_site() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let db = Database::with_config(create_test_config("reopen-derived-wiring")).await?;
+        db.cancel_maintenance();
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
+        let project = format!("reopen_{}", uuid::Uuid::new_v4().simple());
+        let derived_tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a derived tier");
+
+        for hour in [20, 21] {
+            let at = day_start + hour * 3_600_000_000;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        }
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20).await?;
+        let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20).await?;
+        assert_eq!(derived.state, Some(TaskState::Complete), "the derived unit must publish first: {:?}", derived.retry_reason);
+        let covered = || db.rollup_slice_coverage.iter().filter(|entry| entry.key().0 == project && entry.key().2 == derived_tier).count();
+        assert!(covered() > 0, "the derived cell must hold coverage before the base is rebuilt");
+
+        // The base republishes the SAME range. Nothing about the derived unit
+        // changed, so without the edge it stays Complete and serves the old rows.
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 4, 20).await?;
+
+        let derived_state = db
+            .journal()
+            .tasks()
+            .find(|task| task.key.operation == Operation::DerivedRollup && task.key.project_id == project)
+            .map(|task| (task.state, task.publication.is_some()));
+        assert_eq!(derived_state, Some((TaskState::Pending, false)), "a base republish must reopen the derived cell over it and drop its publication");
+        assert_eq!(covered(), 0, "and drop its slice coverage, so reads fall to the exact raw fringe until it is rebuilt");
+        Ok(())
+    }
+
     /// A DERIVED unit must not publish a cell over a HOLEY base tier.
     ///
     /// Its witness is the RAW partition (`route.source` is the raw table for

@@ -773,11 +773,27 @@ is wrong the reopen matches nothing and does so silently — the same
 silent-no-op class as `rollup_untagged_inputs = 0` and the coverage map that had
 no producer.
 
-**So: base units publishing while the reopen event stays at zero means the wiring
-matched nothing.** That is the check to run first, and it is free — the backfill
-guarantees the condition. Next session should also add the integration test the
-existing `run_unit_once` scenario helper makes cheap: base → derived completes →
-base publishes again → assert the derived task is `Pending` and its coverage gone.
+**RESOLVED, and the prod gate turned out to be the WRONG instrument.** On
+`53d4306` with 15 minutes of uptime: **14 base publishes, 0 reopen events.** That
+is not evidence of dead wiring — a reopen only fires when a **`Complete`** derived
+task overlaps the republished slice, and live-frontier base units publish over
+derived tasks that are still `Pending`. Zero is therefore ambiguous whenever
+nothing happens to be republishing over a completed cell, which is most of the
+time. **Do not treat this counter as the gate.**
+
+The wiring is instead pinned deterministically by
+`republishing_a_base_slice_reopens_the_derived_cell_from_the_publish_site`
+(`src/database/mod.rs`), built on the `run_unit_once` helper: base → derived
+completes → base publishes the same range again → assert the derived task is
+`Pending`, its publication dropped, and its slice coverage gone. **It was
+verified to FAIL when the child tier name is wrong** (suffixing
+`child_spec.table_name(&key.source)` reproduces `Complete` instead of `Pending`),
+so it tests the wiring rather than the journal method its sibling already covers.
+
+One caution for the next reading: `pending_derived_rollup` moved 296 → 306 over
+this window. **That is not evidence the edge fired** — ordinary frontier
+invalidation mints derived work too, and the reopen would have logged. Attribute
+a rise only when the reopen event accompanies it.
 
 ### And watch the deploy itself
 
