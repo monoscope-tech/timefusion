@@ -88,7 +88,23 @@ before reporting.
   sort each; footer sample 11 NONE / 1 DECLARED / 0 errors.
 - **P4** — what broke on 08-24. Two unconfirmed candidates (deploy density;
   `3465ecc`). Do not close on resemblance.
-- **`dirty_bin_queue_depth` = 32,680 and growing** (31,170 at 23:15). Unexplored.
+- **`dirty_bin_queue_depth` = 32,680 — explained: the queue is VESTIGIAL, not
+  stalled.** Chased the whole chain: `dedup_dirty_bins_for_table`
+  (`maintain.rs:4909`) is the **only** consumer of `dedup_dirty_bins`; its only
+  production caller is `run_dedup_for_table`; whose only caller is the legacy
+  `Dedup` cron (`mod.rs:4785`) — which **skips any table with rollups**
+  (`mod.rs:4821`, *"this legacy cron serves only tables with no slice tasks"*).
+  Both `otel_logs_and_spans` and `otel_metrics` define rollups, so neither is ever
+  served, and nothing else reads the queue. It has grown 31,170 → 32,680 in ~14 h
+  and will grow forever.
+  **Impact is modest and should not be overstated:** dedup for these tables is
+  handled by the coordinator's `Dedup` operation, so this is *not* a correctness
+  or throughput bug. The costs are (a) a misleading gauge that reads as a 32k
+  maintenance backlog when nothing will ever consume it, and (b) a sidecar
+  reloaded into a DashMap at every startup (`with_config` → `load_sidecar`), which
+  grows boot time and RSS a little more each day.
+  **Fix shape:** stop recording dirty bins for tables the coordinator owns, or
+  delete the queue with its cron. Cheap; not urgent.
 - **Deploy cadence** — 5 deploys in ~4 h today. A 900 s unit cannot survive a
   ~50 min redeploy cycle; this both kills in-flight work and resets every counter.
 
