@@ -2095,6 +2095,16 @@ pub struct MaintenanceConfig {
     pub timefusion_rollup_backfill_days: u16,
     #[serde_inline_default("0 */10 * * * *".to_string())]
     pub timefusion_rollup_backfill_schedule: String,
+    /// `(project_id, date)` cells a one-shot repair forces a full re-derive of,
+    /// as `project:YYYY-MM-DD`. Empty means "use `DAMAGED_CELLS`", which is
+    /// itself empty since the 2026-08-25 damage converged.
+    ///
+    /// A parameter rather than only a const so the end-to-end cursor guard can
+    /// drive a real planner pass with a synthetic list — otherwise the wiring
+    /// that the v1 truncation bug lived in is untested whenever the const is
+    /// empty, which is exactly when nobody is watching it.
+    #[serde_inline_default(Vec::new())]
+    pub timefusion_damage_repair_cells: Vec<String>,
     /// Skip the read-side DedupExec (and its key projection) for Delta-only
     /// queries whose every in-window (project, date) partition was verified
     /// duplicate-free by a sweep pass AND whose file set is unchanged since

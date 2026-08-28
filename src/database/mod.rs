@@ -12048,11 +12048,22 @@ mod tests {
     #[tokio::test]
     async fn a_backfill_pass_persists_how_far_the_damage_repair_reached() -> Result<()> {
         use crate::maintenance_coordinator::TaskJournal;
+        let project = format!("dmg_{}", uuid::Uuid::new_v4().simple());
         let mut cfg = (*create_test_config("damage-repair-cursor")).clone();
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        // The list is a PARAMETER here, not the shipped const — that const is
+        // empty between repairs, and a guard that silently passes because there
+        // is nothing to consume is exactly the v1 bug's blind spot.
+        // Longer than `BACKFILL_PARTITIONS_PER_PASS`, or one pass consumes the
+        // whole list and the truncation the v1 bug lost cells to never happens.
+        let listed: Vec<String> = (0..30)
+            .map(|i| format!("{project}:{}", (Utc::now() - chrono::Duration::days(3 + i)).format("%Y-%m-%d")))
+            .collect();
+        cfg.maintenance.timefusion_damage_repair_cells = listed.clone();
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
-        let project = format!("dmg_{}", uuid::Uuid::new_v4().simple());
-        insert_a_span(&db, &project, "a", (Utc::now() - chrono::Duration::days(3)).timestamp_micros()).await?;
+        for i in 0..3 {
+            insert_a_span(&db, &project, "a", (Utc::now() - chrono::Duration::days(3 + i)).timestamp_micros()).await?;
+        }
         // A pass with nothing to enqueue advances nothing — correct, and it means
         // the day must be free of queued rollup work before each pass or the
         // already-queued veto empties `want` and the pass returns early.
@@ -12072,7 +12083,7 @@ mod tests {
         db.plan_rollup_backfill().await?;
 
         assert!(after_one > 0, "a pass must record the prefix it resolved");
-        assert!(after_one < super::maintain::damaged_cells_newest_first().len(), "and must not swallow the whole list in one pass — that is the v1 bug");
+        assert!(after_one < super::maintain::damaged_cells_newest_first(&listed).len(), "and must not swallow the whole list in one pass — that is the v1 bug");
         assert!(cursor(&db) > after_one, "the next pass takes the next prefix, got {} then {}", after_one, cursor(&db));
         Ok(())
     }
