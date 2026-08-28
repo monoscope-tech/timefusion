@@ -2751,9 +2751,7 @@ async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()
         batches
             .iter()
             .filter(|b| b.num_rows() > 0)
-            .flat_map(|b| {
-                (0..b.num_rows()).map(|r| (b.column(1).as_string_view().value(r).to_string(), b.column(2).as_primitive::<Int64Type>().value(r)))
-            })
+            .flat_map(|b| (0..b.num_rows()).map(|r| (b.column(1).as_string_view().value(r).to_string(), b.column(2).as_primitive::<Int64Type>().value(r))))
             .collect::<Vec<_>>()
     };
     assert_eq!(rows(&routed), rows(&db.query_delta_only(&query).await?), "the ROUTED answer must equal raw, bucket for bucket and group for group");

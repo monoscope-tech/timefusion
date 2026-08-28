@@ -8270,12 +8270,8 @@ fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
 /// milliseconds between the read and the delete.
 async fn discard_bin_parquet(bins: &[StagedBin], live: &HashSet<String>) {
     for bin in bins {
-        let orphans: Vec<deltalake::kernel::Action> = bin
-            .adds
-            .iter()
-            .filter(|a| !matches!(a, deltalake::kernel::Action::Add(add) if live.contains(add.path.as_str())))
-            .cloned()
-            .collect();
+        let orphans: Vec<deltalake::kernel::Action> =
+            bin.adds.iter().filter(|a| !matches!(a, deltalake::kernel::Action::Add(add) if live.contains(add.path.as_str()))).cloned().collect();
         Database::cleanup_orphaned_parquet(&bin.stage_store, &orphans).await;
     }
 }
@@ -13509,7 +13505,10 @@ mod tests {
             return Ok(());
         }
         assert_eq!(stats.repair_resumed.load(Relaxed), resumed + 1, "the already-staged bin must be COMMITTED rather than rebuilt");
-        assert_eq!(live, killed.settled, "a resume must land EXACTLY the file set the killed process produced — any new path means it paid for the rewrite twice");
+        assert_eq!(
+            live, killed.settled,
+            "a resume must land EXACTLY the file set the killed process produced — any new path means it paid for the rewrite twice"
+        );
         // Completion semantics, and the reason this arm cannot just
         // `journal.complete`: a resumed bin is ONE bin, and Repair hands out
         // `take(1)`, so the cell still owes its other file. Completing here

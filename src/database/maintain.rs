@@ -6676,9 +6676,10 @@ impl Database {
         let live = match live {
             Some(live) => live,
             None => {
-                let ok = tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot))
-                    .await
-                    .is_ok_and(|r| r.is_ok());
+                let ok =
+                    tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot))
+                        .await
+                        .is_ok_and(|r| r.is_ok());
                 let fresh = if ok {
                     table_ref.read().await.snapshot().ok().map(|s| s.log_data().iter().map(|f| f.path().into_owned()).collect::<HashSet<_>>())
                 } else {
