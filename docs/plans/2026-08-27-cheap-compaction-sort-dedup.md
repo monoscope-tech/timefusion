@@ -866,6 +866,19 @@ Candidate ranking, now evidence-backed:
 3. I/O — **refuted**, 17.3 s for the whole bin.
 4. Sort/merge CPU — **refuted**, 114k rows/s even at the worst batch size.
 
+### 03:45 — the new counter answered its question immediately
+
+`b3d0a72b` deployed as part of `c3c90db`. First read, 11 min uptime:
+
+```
+split_declined_at_floor  = 7      (~38/hr, matching the 44/hr seen pre-deploy)
+split_declined_no_width  = 0
+```
+
+**Splits are declined exclusively at the floor; the no-width branch never fires.**
+That is a definitive answer the silent `return false` could not have given, and it
+narrows any future floor-guard work to one branch. Cost: one counter and a test.
+
 ### Do NOT do these without the stated precondition
 
 1. **Do not revert either shipped fix.** No evidence against them; both measured.
