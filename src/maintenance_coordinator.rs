@@ -2587,6 +2587,10 @@ impl TaskJournal {
         }
         let children = byte_bounded_units(&parent, observed_bytes);
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
+            // Counted for the same reason the floor decline is: a unit that can
+            // neither finish nor shrink is invisible otherwise. See
+            // `split_declined_no_width`.
+            crate::observability::maintenance_stats().split_declined_no_width.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         if let Some(index) = self.task_indices.get(key).copied() {
@@ -3696,6 +3700,46 @@ mod tests {
 
         let claimed = journal.claim_next(Operation::BaseRollup, now, true);
         assert_eq!(claimed.map(|task| task.key), Some(key), "the declined unit is the one a worker picks up, so the work still happens");
+    }
+
+    /// BOTH ways a split can be refused must be counted, or a pinned unit is
+    /// invisible.
+    ///
+    /// Prod 2026-08-28: day-wide sealed units carrying 22-25 GB estimates were
+    /// abandoned 9/9 at the 900 s deadline and re-claimed forever. That was only
+    /// attributable because `split_declined_at_floor` happened to be counted —
+    /// the sibling branch (`children.len() <= 1 || hash_shards > 1`) returned
+    /// `false` silently, so had the decline gone that way instead, nothing in the
+    /// process would have named it. Counters are per-process under nextest, so
+    /// these assertions are exact.
+    #[test]
+    fn both_split_declines_are_counted() {
+        let stats = crate::observability::maintenance_stats();
+        let floor0 = stats.split_declined_at_floor.load(std::sync::atomic::Ordering::Relaxed);
+        let width0 = stats.split_declined_no_width.load(std::sync::atomic::Ordering::Relaxed);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+
+        // Floor: the unit came back costing nearly what its parent cost.
+        let mut at_floor = task("whale", 0, DAY_MICROS / 2, Operation::BaseRollup);
+        at_floor.parent_measured_bytes = Some(100 * MAX_DECODED_BYTES);
+        let floor_key = at_floor.key.clone();
+        journal.upsert(at_floor);
+        assert!(!journal.split_time_task(&floor_key, 96 * MAX_DECODED_BYTES, None), "floor declines");
+
+        // No width: already at the minimum slice, so bisection yields no children.
+        let narrow = task("whale", DAY_MICROS, DAY_MICROS + MIN_SLICE_MICROS, Operation::BaseRollup);
+        let narrow_key = narrow.key.clone();
+        journal.upsert(narrow);
+        assert!(!journal.split_time_task(&narrow_key, 96 * MAX_DECODED_BYTES, None), "a minimum-width unit has nothing to split into");
+
+        assert_eq!(stats.split_declined_at_floor.load(std::sync::atomic::Ordering::Relaxed), floor0 + 1, "the floor decline is counted");
+        assert_eq!(
+            stats.split_declined_no_width.load(std::sync::atomic::Ordering::Relaxed),
+            width0 + 1,
+            "the no-width decline must be counted too — this is the branch that was silent"
+        );
     }
 
     /// The guard above is only as good as the evidence it reads, and that

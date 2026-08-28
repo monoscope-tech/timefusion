@@ -1011,6 +1011,17 @@ atomic_stats! {
         /// pending ALSO rises means units are being declined and then failing to
         /// run, which is worse than the shred, not better.
         split_declined_at_floor,
+        /// Splits refused for the OTHER reason: bisection produced one child or a
+        /// child that would need hash sharding, so there is no width to split to.
+        ///
+        /// Added 2026-08-28 because this branch returned `false` silently. The pin
+        /// that night — day-wide sealed units carrying 22-25 GB estimates, abandoned
+        /// 9/9 at the 900 s deadline and re-claimed forever — was only attributable
+        /// to `split_declined_at_floor` because that sibling happened to be counted.
+        /// Had it been this branch instead, nothing would have named it. Read the
+        /// two together: they are the complete set of reasons a unit that cannot
+        /// finish also cannot be made smaller.
+        split_declined_no_width,
         /// Dedup keys whose versions DISAGREE on a column declared immutable.
         ///
         /// Immutability is enforced for UPDATE only, so an INSERT can append a
