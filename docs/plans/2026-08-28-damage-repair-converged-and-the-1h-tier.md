@@ -297,3 +297,40 @@ gap — not generations, not splitting — is the short-cell defect.
 what it publishes to the 11-47% already there. If a fresh single run is exact,
 the defect is a race and the fix is in admission; if it reproduces the fraction,
 the defect is in selection and the fix is in the scan.
+
+## 6. Fleet-wide: 17.9% of first-attempt derived hours publish ZERO rows and complete
+
+The section-5 correlation was one cell. Tested against every `complete`
+hour-wide `derived_rollup` unit carrying a publication record in the same
+journal — **1,895 units across 144 cells**:
+
+| | n | zero-row publications | median rows |
+|---|---|---|---|
+| `attempts <= 1` | 1,546 | **277 (17.9%)** | 6 |
+| `attempts > 1` | 349 | **2 (0.6%)** | 9 |
+
+**A first attempt is ~30x more likely to publish nothing than a retry.** 277
+hours in one journal were published empty and marked `complete`, so they are
+never revisited. This is the fleet-wide form of hours 01/18/20 in section 5, and
+it is the single largest identified contributor to the coarse tier being short.
+
+### The partial-publication half does NOT generalize — do not carry it forward
+
+Within the 92 cells holding both first-attempt and retried units, the retried
+mean exceeded the first-attempt mean in **46 of 92 — exactly a coin flip.** So
+`attempts` explains the *zero* publications and says nothing about the 11-47%
+fractions in section 5. Those remain unexplained, and the section-5 table should
+not be read as evidence that a retry fixes a partial hour.
+
+### What to fix, in order
+
+1. **A derived unit that publishes ZERO rows must not be marked `complete`
+   unless its base is provably empty for that slice.** Coverage already records
+   empty publications as covered, which is what makes an empty publication
+   permanent. This is the one-line-shaped change with the largest measured
+   effect, and it needs a failing test first: a derived unit over a non-empty
+   base that publishes zero must retry, not complete.
+2. **The hour migration must mint all 24 hours** (section 5: hours 21 and 22
+   have no unit in any state).
+3. **A base rebuild must invalidate its derived tier** (section 4.1).
+4. Only then the v3 rebuild of the 29 cells.
