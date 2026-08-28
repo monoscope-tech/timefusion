@@ -4682,6 +4682,74 @@ mod tests {
     /// The `outranked_by` arm is the one no existing instrument could reach:
     /// `claimability_census` counts per-task reasons and `first_refused_sealed`
     /// returns a bare `CLAIMABLE` — true, and useless, because the refusal is in
+    /// A day's DEBT is divided by however many slices it was split into, so the
+    /// most indebted days rank LOWEST.
+    ///
+    /// `benefit = -(input.files / BENEFIT_BUCKET_FILES)` is per UNIT, not per
+    /// cell. A day-wide unit reports the day's whole file count; the same day cut
+    /// into slices reports a fraction in each. Since heavy debt is exactly what
+    /// makes a day get split, the signal inverts: the worse a day is, the lower
+    /// every one of its units scores.
+    ///
+    /// Prod 2026-08-28 is the shape this models. `SealedConsolidation` is ONE lane
+    /// across tables and took **22 of 22** claims on `otel_metrics` while
+    /// `otel_logs_and_spans` 08-24/25/26 (2,153 files, the primary query table)
+    /// went untouched for hours. The instrument named the fleet's worst cell as
+    /// `28f62f01:2026-08-27:files=433` — but that day holds **1,564** files, so
+    /// its unit carries barely a quarter of them.
+    ///
+    /// NOTE: with every cell day-wide, the ordering is CORRECT — `claim_next`
+    /// serves logs 964 and 737 first. The defect is not `starved` before
+    /// `benefit`; it is that splitting dilutes `benefit`.
+    #[test]
+    fn splitting_a_day_divides_its_benefit_and_inverts_the_ordering() {
+        const HOUR: i64 = 3_600_000_000;
+        const DAY: i64 = 24 * HOUR;
+        let now = 400 * DAY;
+        let unit = |project: &str, days_ago: i64, slice: i64, slices: i64, files: u32| {
+            let day_end = now - days_ago * DAY;
+            let width = DAY / slices;
+            let end = day_end - slice * width;
+            let mut t = task(project, end - width, end, Operation::SealedConsolidation);
+            t.input = Some(InputFootprint::new((0..files).map(|n| format!("{project}/{days_ago}/{slice}/{n}.parquet")), 1));
+            t
+        };
+
+        // Day-wide cells: benefit tracks the real debt and the ordering is right.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut whole = TaskJournal::load(dir.path()).expect("journal");
+        whole.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
+        whole.enqueue_planned(&unit("logs", 3, 0, 1, 964));
+        let first = whole.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
+        assert_eq!(first.key.project_id.as_str(), "logs", "day-wide, the 964-file cell correctly wins over 261");
+
+        // The SAME logs day, split four ways, now loses to the smaller metrics
+        // cell — because each slice reports a quarter of the debt.
+        let dir2 = tempfile::tempdir().expect("temp dir 2");
+        let mut split = TaskJournal::load(dir2.path()).expect("journal");
+        split.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
+        for slice in 0..4 {
+            split.enqueue_planned(&unit("logs", 3, slice, 4, 964 / 4));
+        }
+        let first = split.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
+        assert_eq!(
+            first.key.project_id.as_str(),
+            "metrics",
+            "split four ways, the 964-file day is outranked by a 261-file one — the debt did not change, only its packaging"
+        );
+
+        // Worse: the INSTRUMENT is blinded by the same dilution. It picks the
+        // worst cell by `input.files`, which after splitting is the 261-file
+        // metrics unit — larger than any 241-file logs slice — and that cell wins
+        // its own claim, so `most_indebted_unclaimed` reports nothing at all. The
+        // starvation of a 964-file day is invisible from the log line.
+        assert!(
+            split.most_indebted_unclaimed(Operation::SealedConsolidation, now).is_none(),
+            "after splitting, the biggest per-UNIT debt is the metrics cell, so it wins and nothing is reported as starved — \
+             the 964-file logs day cannot be seen at all"
+        );
+    }
+
     /// the ORDERING and neither reports the winner.
     #[test]
     fn the_most_indebted_hygiene_cell_names_what_outranks_it() {

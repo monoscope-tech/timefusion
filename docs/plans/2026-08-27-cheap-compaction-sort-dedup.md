@@ -30,16 +30,45 @@ in the last 3 h — a 6× acceleration over the overnight rate.
   `refusal="outranked_by:8100121c:2026-08-22:28f62f01:2026-08-27:files=433"` —
   the fleet's most indebted cell (433 files, logs) is outranked by a 6-day-old
   metrics cell. Logs cells **are** enqueued (`planned=446`); they lose on order.
-- Cause is `starved`, a pure **[3 day, 31 day]** age window, sitting **before**
-  `benefit` in `(class, damaged, starved, hole, width, benefit, order)`. Also
-  `width` precedes `benefit`, justified by "every hygiene unit is day-wide" —
-  which is false (a traced unit was a 12 h slice).
-- At 175 files/hr, metrics' older dates need ~10 more hours before logs is
-  reachable at all. **Logs waits ~21 h minimum.**
+### CAUSE — corrected 13:55. It is NOT `starved` before `benefit`.
 
-**Precondition to act:** `timefusion sim` backtest. The rank tuple's own comments
-document repeated ordering regressions. The sim needs the prod journal, which is
-in the container data dir → a `docker cp` across the read-only prod boundary.
+I first blamed the rank tuple's `starved` age window. **Modelled against the real
+prod backlog, that is refuted.** With every cell day-wide, `claim_next` serves
+`logs(964) → logs(737) → 7× metrics → logs(452)` — benefit ranking works, and the
+big logs cells win first. (Note `rank()` forces `width` and `order` to 0 when
+`hole == 0`, so for hygiene only `benefit` actually decides.)
+
+**The real mechanism: splitting a day divides its benefit, so the most indebted
+days rank lowest.** `benefit = -(input.files / 64)` is per **UNIT**. A day-wide
+unit reports the day's whole file count; the same day cut into slices reports a
+fraction in each — and heavy debt is exactly what causes a day to be split.
+
+| cell | benefit | outcome |
+|---|---|---|
+| metrics 261 files, day-wide | **−4** | |
+| logs 964 files, day-wide | −15 | **wins** ✓ |
+| logs 964 files **split 4 ways** | −3 each | **loses to metrics** ✗ |
+| logs 964 files split 8 ways | −1 each | loses badly |
+
+Prod corroborates: the instrument named the fleet's worst cell as
+`28f62f01:2026-08-27:files=433`, but that day holds **1,564** files — its unit
+carries barely a quarter.
+
+**And the instrument is blinded by the same dilution.** `most_indebted_unclaimed`
+picks the worst cell by `input.files`; after splitting, that is the 261-file
+metrics unit (larger than any 241-file logs slice), which wins its own claim — so
+it reports **nothing at all**. A starved 964-file day is invisible from the log line.
+
+Pinned by `splitting_a_day_divides_its_benefit_and_inverts_the_ordering`
+(`maintenance_coordinator.rs`), built from the measured prod counts.
+
+**Fix shape (unshipped, needs design):** rank by the debt of the CELL, not the
+unit — e.g. carry the day's total file count on each of its units, or aggregate
+sibling units when ranking. Note this interacts with splitting, which the deadline
+work *wants* — so the two must be designed together, not opposed.
+
+**Precondition to act:** a `timefusion sim` backtest. The rank tuple's own comments
+document repeated ordering regressions.
 
 ## NEW — zstd levels: measured, and the refactor's intent ≠ its implementation
 
