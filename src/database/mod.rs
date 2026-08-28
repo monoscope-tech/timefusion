@@ -11997,6 +11997,100 @@ mod tests {
         Ok(())
     }
 
+    /// The damage repair must be durable until CONSUMED, never one-shot.
+    ///
+    /// v1 forced all 81 measured cells into a single planner pass, and the pass
+    /// truncates to `BACKFILL_PARTITIONS_PER_PASS` newest-first — so everything
+    /// past the newest 24 was dropped PERMANENTLY, the cursor spent and
+    /// `missing_tiers` structurally unable to re-contain a cell that already has
+    /// tier output. Prod 2026-08-28: eight of eight sampled pairs dated before
+    /// 08-22 were still byte-identical at their damaged values.
+    #[test]
+    fn the_damage_repair_forces_its_whole_list_across_passes() {
+        const CAP: usize = 3;
+        let cells = damaged_like_cells(10);
+        let mut cursor = 0usize;
+        let mut reached_enqueue: Vec<super::maintain::BackfillCell> = Vec::new();
+        let mut first_pass = None;
+        for _ in 0..cells.len() {
+            let offered = &cells[cursor..(cursor + CAP).min(cells.len())];
+            let forced: std::collections::HashSet<_> = offered.iter().cloned().collect();
+            // The pass also wants a natural frontier cell, newer than every
+            // damaged one — the shape that wins newest-first truncation forever.
+            let mut want = vec![("frontier".to_owned(), chrono::NaiveDate::from_ymd_opt(2026, 8, 27).expect("date"))];
+            want.extend(offered.iter().cloned());
+            let (admitted, consumed) = super::maintain::admit_backfill_pass(want, offered, &forced, CAP);
+            reached_enqueue.extend(admitted.into_iter().filter(|cell| forced.contains(cell)));
+            cursor += consumed;
+            first_pass.get_or_insert(cursor);
+            if cursor == cells.len() {
+                break;
+            }
+        }
+        assert_eq!(first_pass, Some(CAP), "one pass consumes one pass's worth, and leaves the tail for the next");
+        assert_eq!(cursor, cells.len(), "and across passes the whole list is consumed");
+        assert_eq!(reached_enqueue, cells, "every listed cell must REACH the enqueue path, in list order");
+    }
+
+    /// The cursor advances by what survived truncation, never by what was merely
+    /// offered — that is the v1 bug in slower motion.
+    #[test]
+    fn the_repair_cursor_advances_only_past_cells_the_pass_resolved() {
+        let cells = damaged_like_cells(3);
+        let forced: std::collections::HashSet<_> = cells.iter().cloned().collect();
+        let (admitted, consumed) = super::maintain::admit_backfill_pass(cells.clone(), &cells, &forced, 1);
+        assert_eq!(admitted, cells[..1].to_vec(), "the per-pass bound admits exactly one");
+        assert_eq!(consumed, 1, "the two it truncated must be re-offered, so the cursor stops at the first of them");
+
+        // A cell outside the source's horizon (never forced) and one the
+        // already-queued veto ate (forced, absent from `want`) are RESOLVED, not
+        // truncated: holding the cursor on them would stall the tail forever
+        // behind a task parked on a worker failure.
+        let forced: std::collections::HashSet<_> = cells[1..].iter().cloned().collect();
+        let (admitted, consumed) = super::maintain::admit_backfill_pass(cells[2..].to_vec(), &cells, &forced, 8);
+        assert_eq!(admitted, cells[2..].to_vec(), "only the unvetoed forced cell is planned");
+        assert_eq!(consumed, cells.len(), "but the whole offered prefix is consumed");
+    }
+
+    /// The whole wiring: a real pass reads the cursor, forces a prefix, and
+    /// persists how far it got — so a restart resumes instead of starting over.
+    #[tokio::test]
+    async fn a_backfill_pass_persists_how_far_the_damage_repair_reached() -> Result<()> {
+        use crate::maintenance_coordinator::TaskJournal;
+        let mut cfg = (*create_test_config("damage-repair-cursor")).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let project = format!("dmg_{}", uuid::Uuid::new_v4().simple());
+        insert_a_span(&db, &project, "a", (Utc::now() - chrono::Duration::days(3)).timestamp_micros()).await?;
+        // A pass with nothing to enqueue advances nothing — correct, and it means
+        // the day must be free of queued rollup work before each pass or the
+        // already-queued veto empties `want` and the pass returns early.
+        let clear_queue = |db: &Database| {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+            for key in &keys {
+                journal.complete(key);
+            }
+        };
+        let cursor = |db: &Database| db.maintenance_tasks.lock().unwrap().repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, "otel_logs_and_spans");
+        assert_eq!(cursor(&db), 0, "a fresh journal has consumed nothing");
+        clear_queue(&db);
+        db.plan_rollup_backfill().await?;
+        let after_one = cursor(&db);
+        clear_queue(&db);
+        db.plan_rollup_backfill().await?;
+
+        assert!(after_one > 0, "a pass must record the prefix it resolved");
+        assert!(after_one < super::maintain::damaged_cells_newest_first().len(), "and must not swallow the whole list in one pass — that is the v1 bug");
+        assert!(cursor(&db) > after_one, "the next pass takes the next prefix, got {} then {}", after_one, cursor(&db));
+        Ok(())
+    }
+
+    /// Ten damage-list-shaped cells, newest first, exactly as the planner orders them.
+    fn damaged_like_cells(count: u32) -> Vec<super::maintain::BackfillCell> {
+        (0..count).map(|i| (format!("p{i}"), chrono::NaiveDate::from_ymd_opt(2026, 8, 20 - i).expect("date"))).collect()
+    }
+
     /// Coverage published for one source must survive planning the next.
     ///
     /// `set_base_tier_ready` / `set_tier_holes` replace wholesale, which is right because coverage can
