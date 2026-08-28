@@ -551,6 +551,69 @@ the cap mainly taxed the *first* pass over fresh flush output.
 file-count cap would go if merge fan-in ever needs bounding (the refuted
 diagnosis #2). Not needed on current evidence.
 
+## WHERE THE NIGHT ENDED (02:30 UTC) — read this first in the morning
+
+**Two fixes shipped and both hold. The remaining blocker is named, instrumented,
+and NOT the thing I would have guessed.**
+
+### Shipped and verified
+
+| | change | verified by |
+|---|---|---|
+| `93cd806` | repair slices sized in decoded bytes | 08-24 drained **561→515** (logs) and **523→480** (metrics) — first movement in days; staging failures 3.3–4.8/hr → **0**; memory brakes 11/hr → **0** |
+| `665f95e` | unsorted-bin budget in decoded bytes | bins **3–7 → 15–45 files**, mean 20.5; all-sorted path unchanged |
+
+The unspillable merge peak fell **3.0 GB → 1.46 GB**, and pool use went from
+4.08/4.1 GB to ~1.7/4.1 GB. That is prediction 2, confirmed.
+
+### The blocker now: SealedConsolidation is pinned by otel_metrics
+
+- **HotPacking is healthy.** logs bins of 28–45 files stage in **1–46 s**.
+- **Every 900 s unit is `otel_metrics`** (08-17/18/19), finishing
+  `outcome=Running` having committed nothing. Its bins *start* staging and never
+  emit `wave_bin_staged`.
+- Sealed logs 08-24/25/26 therefore got **0 capacity** and drained 0 since 01:29.
+- **P0 changed the failure shape here:** these metrics units used to die fast on
+  memory (121–763 s) and free the lane between attempts; now they grind the full
+  900 s. Same pinning, more expensive per attempt. Not a regression to revert —
+  the lane was pinned before too — but it is why the drain plateaued.
+
+### Why the metrics bins grind — NOT yet answered
+
+Ruled out tonight, each with evidence:
+- **Not tag/footer disagreement.** Probed the **smallest** files (what the
+  selector actually picks — my first probe wrongly sampled the largest):
+  **23/23 `DECLARED`, 0 errors**, and my reconstructed bin (23 files, 260.8 MB)
+  matches the staged one exactly.
+- **Not memory.** 0 staging failures; the pool has headroom now.
+- **Not permit contention.** `permit_wait_ms` = 0.0 s on every bin.
+- **Contributory, not sufficient:** metrics rows are **47 bytes** vs logs' **155**,
+  so a 260 MB metrics bin is **5.58 M rows / 21,786 batches** at the coordinator's
+  `batch_override = Some("256")`, against logs' 1.73 M rows / 6,740. A 3.2×
+  batch-count difference does not explain a ~300× time difference. **Next
+  hypothesis to test: cold object-store reads** — these are 9–11 day old
+  partitions, so foyer is cold, while the fast logs bins are today's data.
+
+### Do NOT do these without the stated precondition
+
+1. **Do not revert either shipped fix.** No evidence against them; both measured.
+2. **Do not change the rank tuple without a `timefusion sim` backtest.** The sim
+   exists (`timefusion sim <journal.json|data-dir|synth:whale> [--hours N]`).
+   Blocked tonight only because the journal lives in the container data dir and
+   fetching it needs a `docker cp`, which crosses the read-only prod boundary.
+   **Fetch the journal first, backtest, then change ordering.** The rank tuple's
+   own doc comments are a graveyard of ordering regressions.
+3. **Do not "fix" ordering by adding benefit ranking — it already exists.**
+   `scheduling_class` computes `benefit = -files/BENEFIT_BUCKET_FILES(64)` for
+   SealedConsolidation/HotPacking/Repair. The defect is upstream: the tuple is
+   `(class, damaged, starved, hole, width, benefit, order)` and **`starved` is a
+   pure age window `[3 days, 31 days]`** that sits before benefit. So
+   `28f62f01/08-27` with **433 files** (1 day old → `starved=1`) loses to
+   `00000000/08-20` with ~4 files (8 days old → `starved=0`). Also note **`width`
+   precedes `benefit`**, and the comment justifying that ("every hygiene unit is
+   day-wide") is false — the 8100121c unit traced tonight was a **12 h** slice.
+   Both need to be part of any redesign.
+
 ### Measurement discipline for the morning
 
 A push **restarts prod**, which resets process-scoped counters and kills the
