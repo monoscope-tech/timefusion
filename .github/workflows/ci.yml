@@ -7,7 +7,7 @@ on:
     branches: [master, main]
 
 permissions:
-  contents: read
+  contents: write # to publish attestation refs under refs/ci-attest/*
 
 # A newer push makes an in-flight run for the same branch obsolete. Keep pull
 # requests isolated from one another while avoiding wasted Blacksmith minutes
@@ -22,17 +22,47 @@ env:
   # Incremental compilation bloats the cache without helping CI (no warm
   # incremental state across runs). Disabling it makes target/ smaller.
   CARGO_INCREMENTAL: "0"
+  # Kill switch for the attestation cache: set the repo variable to "true" and
+  # every job runs every check again, no code change needed.
+  CI_ATTEST_DISABLED: ${{ vars.CI_ATTEST_DISABLED }}
 
 jobs:
+  # What CI does NOT have to do. Every check in ci/checks.tsv is fingerprinted
+  # over the content it depends on; if the identical content was already proven —
+  # by an earlier run, another branch, or a developer's `make ci` — the result is
+  # on the remote as a ref and the job below skips it. See docs/local-ci.md.
+  gate:
+    name: Gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      fingerprints: ${{ steps.checks.outputs.fingerprints }}
+      skip_fmt: ${{ steps.checks.outputs.skip_fmt }}
+      skip_clippy: ${{ steps.checks.outputs.skip_clippy }}
+      skip_test: ${{ steps.checks.outputs.skip_test }}
+      skip_pg_smoke: ${{ steps.checks.outputs.skip_pg_smoke }}
+      skip_e2e: ${{ steps.checks.outputs.skip_e2e }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: checks
+        run: scripts/ci/ci.sh gate
+
   fmt:
     name: Format
+    needs: gate
+    if: needs.gate.outputs.skip_fmt != 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       # rustfmt.toml is stable-only, and rust-toolchain.toml pins the stable
       # channel, so plain `cargo fmt` here uses the exact same rustfmt as every
       # contributor's local checkout — deterministic, no local-vs-CI drift.
-      - run: cargo fmt --all --check
+      - name: Format
+        env:
+          FINGERPRINTS: ${{ needs.gate.outputs.fingerprints }}
+        run: |
+          mkdir -p .ci && printf '%s\n' "$FINGERPRINTS" > .ci/fingerprints.tsv
+          export CI_FINGERPRINTS=.ci/fingerprints.tsv
+          scripts/ci/ci.sh run fmt
       # NOTE: a former step here grepped vendor/datafusion-postgres for the
       # `was_pre_optimized` optimize-skip patch. That crate is now a git dep
       # ([patch.crates-io] in Cargo.toml → apitoolkit/datafusion-postgres@timefusion-df54),
@@ -47,6 +77,8 @@ jobs:
   # family as tests so artifacts remain reusable across workflow runs.
   clippy:
     name: Clippy
+    needs: gate
+    if: needs.gate.outputs.skip_clippy != 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
@@ -63,12 +95,19 @@ jobs:
       # `cargo lint` is the alias in `.cargo/config.toml`; `make lint`, the
       # autofix workflow, and this gate therefore cannot drift.
       - name: Clippy
-        run: cargo lint
+        env:
+          FINGERPRINTS: ${{ needs.gate.outputs.fingerprints }}
+        run: |
+          mkdir -p .ci && printf '%s\n' "$FINGERPRINTS" > .ci/fingerprints.tsv
+          export CI_FINGERPRINTS=.ci/fingerprints.tsv
+          scripts/ci/ci.sh run clippy
 
   # Keep the existing check name to avoid invalidating branch-protection rules;
   # Clippy itself now runs in parallel in the dedicated job above.
   build-test:
     name: Clippy & Test (shard ${{ matrix.shard }})
+    needs: gate
+    if: needs.gate.outputs.skip_test != 'true' || needs.gate.outputs.skip_pg_smoke != 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # Tests run concurrently now. The old `--test-threads=1` was there because
     # every `WalManager` shared the process-global `WALRUS_DATA_DIR`, so two
@@ -169,8 +208,14 @@ jobs:
       # 2026-07-20). The e2e suite is owned by the `e2e` job below (single-
       # threaded); the only other features are `test` (unused) and `profiling`
       # (prod-only, already lint-covered by the Clippy step's --all-features).
+      # CI_NO_ATTEST: a partitioned run proves only its slice. The test-attest
+      # job below records the check once both shards are green.
       - name: Test
-        run: cargo nextest run --profile ci --locked --partition hash:${{ matrix.shard }}/2
+        if: needs.gate.outputs.skip_test != 'true'
+        env:
+          CI_PARTITION: hash:${{ matrix.shard }}/2
+          CI_NO_ATTEST: 'true'
+        run: scripts/ci/ci.sh run test
 
       # nextest does not run doctests, so nothing here ever did: two were broken
       # on master for hours on 2026-08-23 (prod log output in an indented doc
@@ -183,42 +228,38 @@ jobs:
       # libpq 18 sends a protocol-3.2 probe during startup. Exercise the real
       # client and its catalog meta-commands rather than only replaying SQL.
       - name: PostgreSQL 18 client smoke
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.gate.outputs.skip_pg_smoke != 'true'
+        env:
+          FINGERPRINTS: ${{ needs.gate.outputs.fingerprints }}
         run: |
-          set -euo pipefail
-          data_dir=$(mktemp -d)
-          log="$RUNNER_TEMP/timefusion-pg-client.log"
-          # Build BEFORE backgrounding. `cargo run &` compiles inside the
-          # background job while the 60x1s readiness loop below is already
-          # counting, so any run whose build exceeds 60s failed here no matter
-          # what the code did — the step's own log was cargo warnings and
-          # nothing else (CI red on d0d5757, 3ae2142, 03dccf0).
-          cargo build --locked --quiet --bin timefusion
-          TIMEFUSION_DATA_DIR="$data_dir" TIMEFUSION_ALLOW_INSECURE_AUTH=true PGWIRE_PASSWORD=postgres \
-            cargo run --locked --quiet --bin timefusion >"$log" 2>&1 &
-          pid=$!
-          cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$data_dir"; }
-          trap cleanup EXIT
-          ready=false
-          for _ in {1..60}; do
-            if docker run --rm --network host -e PGPASSWORD=postgres postgres:18.4 \
-              psql "postgresql://postgres@127.0.0.1:$PGWIRE_PORT/postgres" -Atqc 'SELECT 1' >/dev/null 2>&1; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          "$ready" || { cat "$log"; exit 1; }
-          for command in '\dt' '\d otel_logs_and_spans' '\l' '\du' '\dn'; do
-            docker run --rm --network host -e PGPASSWORD=postgres postgres:18.4 \
-              psql "postgresql://postgres@127.0.0.1:$PGWIRE_PORT/postgres" -v ON_ERROR_STOP=1 -c "$command"
-          done
+          mkdir -p .ci && printf '%s\n' "$FINGERPRINTS" > .ci/fingerprints.tsv
+          export CI_FINGERPRINTS=.ci/fingerprints.tsv
+          scripts/ci/ci.sh run pg-smoke
+
+  # `test` covers the whole suite, but CI proves it in two partitions. Record it
+  # once — and only once both slices are green, so a half-passing run can never
+  # let a later run skip the suite.
+  test-attest:
+    name: Attest test
+    needs: [gate, build-test]
+    if: always() && needs.build-test.result == 'success' && needs.gate.outputs.skip_test != 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Attest
+        env:
+          FINGERPRINTS: ${{ needs.gate.outputs.fingerprints }}
+        run: |
+          mkdir -p .ci && printf '%s\n' "$FINGERPRINTS" > .ci/fingerprints.tsv
+          CI_FINGERPRINTS=.ci/fingerprints.tsv scripts/ci/ci.sh attest test
 
   # E2E suite: full pgwire → BufferedWriteLayer → WAL → Delta path against a
   # per-test MinIO via testcontainers. Runs in its own job so failures are
   # attributable and the suite can be made a required check independently.
   e2e:
     name: E2E
+    needs: gate
+    if: needs.gate.outputs.skip_e2e != 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
@@ -242,4 +283,9 @@ jobs:
       # cold_start timeout). The WAL is per-test-config now, so the old
       # `--test-threads=1` is no longer a correctness requirement.
       - name: E2E
-        run: cargo nextest run --profile ci --features e2e --locked -E 'binary(e2e)' --test-threads 2
+        env:
+          FINGERPRINTS: ${{ needs.gate.outputs.fingerprints }}
+        run: |
+          mkdir -p .ci && printf '%s\n' "$FINGERPRINTS" > .ci/fingerprints.tsv
+          export CI_FINGERPRINTS=.ci/fingerprints.tsv
+          scripts/ci/ci.sh run e2e

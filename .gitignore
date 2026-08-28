@@ -19,3 +19,6 @@ bench/local/
 # Phase-0 sampler output: machine-local time series, appended to on every run
 bench/pass-condition/conncost_watch.csv
 scripts/local/
+
+# Local-CI attestation staging (scripts/ci/ci.sh)
+.ci/

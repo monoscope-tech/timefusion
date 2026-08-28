@@ -44,6 +44,47 @@ make test-all                       # also the #[ignore]d tests
   flush → Delta on MinIO → query) with a virtual clock; a failure there mirrors
   a prod failure.
 
+## Running CI locally
+
+Our GitHub runners are 4 vCPU; your machine almost certainly isn't. `make ci`
+runs **the same checks CI runs, from the same definition** — `ci/checks.tsv`,
+which both the workflow and the Makefile read, so the two cannot drift:
+
+```bash
+make ci                      # everything CI runs: fmt, clippy, test, pg-smoke, e2e
+make ci CHECKS="fmt clippy"  # just these
+make ci-status               # what CI would run right now, without running it
+make ci-down                 # stop the MinIO it started
+```
+
+**Use it before you push.** Each check is fingerprinted over the content it
+depends on, and a pass publishes that result as a git ref — so CI's gate skips
+any check already proven for the exact tree it is about to test. Run `make ci`
+and CI has little or nothing left to do.
+
+This is unusually faithful for a Rust project: `rust-toolchain.toml` pins the
+channel and `ci.yml` installs exactly that, so your `cargo` *is* CI's compiler.
+There is no container to reproduce — `make ci` runs natively and only supplies
+the MinIO that CI starts by hand, from the same pinned image.
+
+`make prepush` is still the right fast inner-loop gate. The difference is that
+`make ci` covers everything (including `e2e` and the pg client smoke) and its
+results are published, so they count.
+
+Two things worth knowing:
+
+- **Publishing requires push access.** From a fork, `make ci` still gives you
+  fast local feedback but CI re-runs the checks itself. That's deliberate: an
+  attestation is only as trustworthy as the ability to push code in the first
+  place.
+- **Reuse is conservative.** Each check declares the capabilities it needs
+  (`rust`, `protoc`, `nextest`, `minio`, `docker`) and each result records what
+  the environment actually had, so a run without MinIO can never stand in for one
+  that needs it.
+
+Full reference — every knob, and how to add or change a check:
+[docs/local-ci.md](docs/local-ci.md).
+
 ## Bug-fix workflow (required)
 
 When fixing a bug, **write a failing test first**, at the level closest to where
