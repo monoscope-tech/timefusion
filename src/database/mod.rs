@@ -1345,6 +1345,32 @@ fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Oper
 const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 
+/// Rows one compaction bin may cover, alongside the byte budget.
+///
+/// A byte budget prices a bin by what it READS; a rewrite costs what it must
+/// SORT AND WRITE, and that is rows. Measured on prod 2026-08-28, the two tables
+/// sit an order of magnitude apart in row density, so one byte budget buys wildly
+/// different amounts of work:
+///
+/// | table | bytes/row | rows in a 256 MB bin |
+/// |---|---|---|
+/// | `otel_logs_and_spans` | 155 B | 1.73 M |
+/// | `otel_metrics` | 47 B | **5.58 M** |
+///
+/// The consequence was a stuck lane: `otel_metrics` sealed bins of ~5.08 M rows
+/// ran past the 900 s deadline **9 times out of 9**, committing nothing and being
+/// re-claimed forever, while `otel_logs_and_spans` bins finished in seconds. The
+/// staging pipeline was measured at ~27.5 k rows/s composed on dev hardware and
+/// prod is several times slower, so ~5 M rows cannot fit a 900 s deadline.
+///
+/// 2 M is chosen to leave real margin at prod's observed rate while being **above
+/// the 1.73 M rows a 256 MB logs bin holds**, so the main table's behaviour is
+/// unchanged and only row-dense tables are split. Rows come from `numRecords` in
+/// the Add stats — exact, already parsed, no extra I/O. This is the same
+/// unit-of-measure family as `REPAIR_SLICE_DECODED_TARGET_BYTES` and
+/// `UNSORTED_BIN_DECODED_BUDGET_BYTES`: price the work in the unit that costs.
+const MAX_BIN_ROWS: u64 = 2_000_000;
+
 /// Rows per decode batch for any session that reads the wide OTel schema.
 ///
 /// Parquet decode buffer is the largest untracked consumer in the process: `batch_size × row width`
@@ -7615,6 +7641,10 @@ pub(crate) struct TailAdd {
     /// (min, max) event time from Add stats; None when stats are absent —
     /// one field so a half-present range is unrepresentable.
     pub event_range: Option<(i64, i64)>,
+    /// `numRecords` from the same Add stats. Rows, not bytes, are what a staging
+    /// rewrite actually costs — see [`MAX_BIN_ROWS`]. `None` means the stats were
+    /// absent, which the row cap treats as "unknown, do not count".
+    pub rows: Option<u64>,
 }
 
 impl TailAdd {
@@ -7626,7 +7656,11 @@ impl TailAdd {
     /// stats JSON instead.
     fn from_stats(path: String, size: i64, is_sorted_run: bool, stats: Option<&str>) -> Self {
         let range = stats.and_then(Database::event_time_range_from_stats);
-        Self { path, size, is_sorted_run, event_range: range }
+        // Same JSON blob the range comes from, so this costs nothing extra.
+        let rows = stats
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
+        Self { path, size, is_sorted_run, event_range: range, rows }
     }
 }
 
@@ -7690,6 +7724,7 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     // never compacts prunes worse than one whose runs overlap slightly.
     candidates.sort_by_key(|add| add.size);
     let mut bytes = 0i64;
+    let mut rows = 0u64;
     let mut selected = Vec::new();
     for add in candidates {
         // A file at or above target is converged and never packing's work,
@@ -7703,10 +7738,16 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
         if has_unsorted && add.is_sorted_run {
             continue;
         }
-        if !selected.is_empty() && bytes.saturating_add(add.size) > limit {
+        // ROWS, not just bytes. A byte budget prices a bin by how much it will
+        // read; a rewrite costs what it must SORT AND WRITE, which is rows. See
+        // `MAX_BIN_ROWS`. Unknown row counts (absent stats) do not accumulate, so
+        // this can never be stricter than the byte budget alone.
+        let next_rows = rows.saturating_add(add.rows.unwrap_or(0));
+        if !selected.is_empty() && (bytes.saturating_add(add.size) > limit || next_rows > MAX_BIN_ROWS) {
             break;
         }
         bytes = bytes.saturating_add(add.size);
+        rows = next_rows;
         selected.push(add);
     }
     if !has_unsorted && selected.len() < 2 {
@@ -15032,6 +15073,7 @@ mod tests {
             size,
             is_sorted_run: sorted,
             event_range: Some((min, max)),
+            rows: None,
         };
         // Seal lag: a file whose newest event is past the seal is still filling
         // (prod 2026-07-20: compacting it lost every OCC race).
@@ -15093,14 +15135,14 @@ mod tests {
 
         // Files with no event-time stats can't be binned disjointly (the
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
-        let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None }, f("a", 10, false, 1, 2)];
+        let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None, rows: None }, f("a", 10, false, 1, 2)];
         assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new());
     }
 
     #[test]
     fn coordinator_compaction_sorts_small_l0_units_before_merging_sorted_runs() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None };
+        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None, rows: None };
 
         // Sorted runs are still excluded while any L0 file is present, but the two
         // L0 files now share one unit instead of taking a unit each.
@@ -15314,6 +15356,49 @@ mod tests {
         let _ = &make_batch; // the low-cardinality builder above supersedes it
     }
 
+    /// A bin is capped by ROWS as well as bytes, because rows are what it costs.
+    ///
+    /// Prod 2026-08-28: the two tables sit an order of magnitude apart in row
+    /// density (155 B/row for logs, 47 B/row for metrics), so one 256 MB byte
+    /// budget bought 1.73 M rows on one table and 5.58 M on the other. The dense
+    /// side ran past its 900 s deadline 9 times out of 9, committed nothing, and
+    /// was re-claimed forever — while the sparse side finished in seconds.
+    #[test]
+    fn a_bin_is_capped_by_rows_not_only_bytes() {
+        const MB: i64 = 1024 * 1024;
+        let f = |path: &str, size_mb: i64, rows: u64| super::TailAdd {
+            path: path.into(),
+            size: size_mb * MB,
+            is_sorted_run: true,
+            event_range: None,
+            rows: Some(rows),
+        };
+
+        // Metrics shape: 47 B/row, so 256 MB of these is ~5.5 M rows. The byte
+        // budget alone would take them all; the row cap stops first.
+        let dense: Vec<_> = (0..23).map(|i| f(&format!("m{i:02}"), 11, 240_000)).collect();
+        let picked = super::select_coordinator_compaction_candidates(dense, super::COORDINATOR_SEALED_TARGET_BYTES);
+        let picked_rows = picked.len() as u64 * 240_000;
+        assert!(picked_rows <= super::MAX_BIN_ROWS, "a dense bin must stop at the row cap, took {picked_rows} rows");
+        assert!(picked.len() >= 2, "but it must still retire more than one file, got {}", picked.len());
+
+        // Logs shape: 155 B/row, so a full 256 MB bin is ~1.73 M rows — UNDER the
+        // cap. The main table's behaviour must be unchanged by this.
+        let sparse: Vec<_> = (0..23).map(|i| f(&format!("l{i:02}"), 11, 75_000)).collect();
+        let sparse_picked = super::select_coordinator_compaction_candidates(sparse, super::COORDINATOR_SEALED_TARGET_BYTES);
+        assert_eq!(sparse_picked.len(), 23, "a sparse bin is still bounded by BYTES, not clipped by the row cap");
+
+        // Absent stats must never make the cap stricter than bytes alone.
+        let unknown: Vec<_> = (0..23)
+            .map(|i| super::TailAdd { path: format!("u{i:02}"), size: 11 * MB, is_sorted_run: true, event_range: None, rows: None })
+            .collect();
+        assert_eq!(
+            super::select_coordinator_compaction_candidates(unknown, super::COORDINATOR_SEALED_TARGET_BYTES).len(),
+            23,
+            "unknown row counts do not accumulate, so the byte budget still governs"
+        );
+    }
+
     /// A bin holding unsorted files gets a budget sized in DECODED bytes too.
     ///
     /// Same bug class as `REPAIR_SLICE_DECODED_TARGET_BYTES`: the cap was
@@ -15328,7 +15413,7 @@ mod tests {
     #[test]
     fn an_unsorted_bin_is_budgeted_in_decoded_bytes() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: false, event_range: None };
+        let f = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: false, event_range: None, rows: None };
         let budget = super::unsorted_bin_budget_bytes();
 
         // The invariant the value is chosen from, stated as a test so a future
@@ -15410,7 +15495,7 @@ mod tests {
     #[test]
     fn coordinator_packing_never_rewrites_a_converged_file() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None };
+        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None, rows: None };
 
         // The whale/07-30 shape: converged files carrying no sorted-run tag, beside real small debt.
         let whale = vec![f("converged-a", 520, false), f("converged-b", 512, false), f("small-a", 6, false), f("small-b", 6, false)];
@@ -15444,7 +15529,7 @@ mod tests {
     #[test]
     fn packing_takes_the_small_files_even_when_a_large_one_sorts_first() {
         const MB: i64 = 1024 * 1024;
-        let run = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: true, event_range: None };
+        let run = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: true, event_range: None, rows: None };
 
         // Event-time order puts the 252 MB file first; the rest are tiny.
         let cell = vec![run("big-252", 252), run("t-a", 14), run("t-b", 14), run("t-c", 14)];
@@ -15491,7 +15576,7 @@ mod tests {
             super::COORDINATOR_FILE_REWRITE_TIMEOUT
         );
 
-        let run = |name: &str, mib: i64| super::TailAdd { path: name.into(), size: mib * MIB, is_sorted_run: true, event_range: None };
+        let run = |name: &str, mib: i64| super::TailAdd { path: name.into(), size: mib * MIB, is_sorted_run: true, event_range: None, rows: None };
         assert_eq!(
             super::select_coordinator_compaction_candidates(vec![run("a", 128), run("b", 128), run("c", 128)], super::COORDINATOR_SEALED_TARGET_BYTES),
             vec!["a", "b"],
@@ -15509,7 +15594,7 @@ mod tests {
     fn repair_pass_takes_the_newest_poisoned_file_then_the_smallest() {
         const TARGET: i64 = 1000;
         const SEAL: i64 = 10_000;
-        let f = |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)) };
+        let f = |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)), rows: None };
         let backlog = vec![f("may", 900, 10), f("july", 900, 500), f("june", 950, 100)];
         assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["july"], "newest poisoned file first");
 
@@ -16623,7 +16708,7 @@ mod tests {
     #[test]
     fn converged_sorted_runs_are_a_counterexample_to_compaction_dedup_convergence() {
         const TARGET: i64 = 1000;
-        let run = |path: &str, min: i64| super::TailAdd { path: path.into(), size: 900, is_sorted_run: true, event_range: Some((min, min + 1)) };
+        let run = |path: &str, min: i64| super::TailAdd { path: path.into(), size: 900, is_sorted_run: true, event_range: Some((min, min + 1)), rows: None };
         let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
 
         assert!(
