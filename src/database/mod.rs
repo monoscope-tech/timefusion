@@ -15146,10 +15146,7 @@ mod tests {
         // retune cannot quietly break it: one repair slice plus two concurrent
         // unsorted-bin sorts must still fit about half the light pool.
         let decoded = crate::database::maintain::estimated_decoded_bytes(budget) as i64;
-        assert!(
-            decoded + 2 * decoded <= super::REPAIR_SLICE_DECODED_TARGET_BYTES * 3,
-            "budget x concurrent sorts must stay within the pool share"
-        );
+        assert!(decoded + 2 * decoded <= super::REPAIR_SLICE_DECODED_TARGET_BYTES * 3, "budget x concurrent sorts must stay within the pool share");
         assert!(decoded <= super::REPAIR_SLICE_DECODED_TARGET_BYTES, "an unsorted bin must not out-reserve a repair slice");
 
         // 4 MB files are typical of a fragmented sealed day (08-25: 964 files /
