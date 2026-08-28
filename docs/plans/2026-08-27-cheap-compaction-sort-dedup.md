@@ -879,6 +879,57 @@ split_declined_no_width  = 0
 That is a definitive answer the silent `return false` could not have given, and it
 narrows any future floor-guard work to one branch. Cost: one counter and a test.
 
+## 03:47 — THE HEADLINE: the box is CPU-saturated, and concurrency is sized as if it weren't
+
+Everything above is per-unit efficiency. This is the capacity finding, and it
+explains the ~5× that per-unit measurement could not.
+
+```
+48 cores
+load average: 47.50, 38.36, 34.22          <- fully saturated
+srv-captain--timefusion   1837% CPU  (18.4 cores)   41.68GiB / 120GiB
+srv-captain--monoscope x3  ~755% CPU  (7.5 cores)
+```
+
+**Load 47.50 on 48 cores.** Every measurement I took was single-unit on an idle
+laptop; on prod each unit competes for a full run queue, so wall-clock inflates by
+the contention factor. A 185 s unit becomes a 900 s unit and the deadline discards
+it.
+
+**Why the concurrency is wrong.** `coordinator_jobs()` (`config.rs:456`) is
+`min(maintenance_pool/512MB, cores/3).clamp(1,16)` → with 48 cores that is
+**16 concurrent maintenance units**. Two problems:
+1. **`cores/3` assumes the box belongs to TimeFusion.** It does not — monoscope
+   runs three replicas on the same host using ~7.5 cores, and the load average
+   says the machine is fully committed.
+2. **The failure mode is already documented in that very function:** *"going wider
+   than that just converts coordinator slots into queueing (measured: at a 6:1
+   job:permit ratio, completions collapsed from ~0.6/s to 0.035/s)"*. That
+   collapse is exactly what tonight's census shows — **9/9 sealed units abandoned,
+   102/185 dedup abandoned** — arrived at through box-level CPU saturation rather
+   than the job:permit ratio.
+
+**The system is doing maximum CPU and minimum progress.** Work that is 90% done at
+the deadline is thrown away, so the CPU spent on it produced nothing; the unit is
+then re-claimed and re-does it. Under saturation, *more* concurrency strictly
+reduces completed work.
+
+**This is the real answer to "the backlog never piles up".** It is not per-unit
+inefficiency — the per-unit numbers are fine (27.5k rows/s composed). It is that
+concurrency is set above the knee, so throughput collapses into deadline churn.
+
+**Fix direction (needs a sim backtest before shipping):** size admitted
+concurrency on *available* CPU rather than nominal core count — measured load, a
+cgroup CPU quota, or simply a lower cap — so units finish inside their deadlines.
+`TIMEFUSION_COORDINATOR_JOB_WORKERS` already exists as the override, which makes
+this **testable in prod with an env change and no code deploy**, and reversible.
+Expected signature if correct: fewer units started, **more** units `Complete`,
+sealed days resume draining.
+
+**Caveat to check first:** confirm how much of TimeFusion's 18.4 cores is
+maintenance versus query serving before attributing it all to the coordinator.
+`timefusion_stats` has pgwire counters; a quiet-period comparison would settle it.
+
 ### Do NOT do these without the stated precondition
 
 1. **Do not revert either shipped fix.** No evidence against them; both measured.

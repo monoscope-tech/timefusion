@@ -15266,26 +15266,52 @@ mod tests {
             arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), cols).expect("batch")
         };
 
-        for batch_size in [256usize, 2048, 8192] {
-            let batches: Vec<_> = (0..ROWS).step_by(batch_size).map(|off| make_batch(off, batch_size.min(ROWS - off))).collect();
-            let mut buf: Vec<u8> = Vec::with_capacity(64 << 20);
-            // zstd level 1 is `timefusion_zstd_level_intermediate`, what staging uses.
-            let props =
-                WriterProperties::builder().set_compression(Compression::ZSTD(datafusion::parquet::basic::ZstdLevel::try_new(1).expect("level"))).build();
-            let mut writer = ArrowWriter::try_new(&mut buf, Arc::clone(&schema), Some(props)).expect("writer");
-            let started = std::time::Instant::now();
-            for b in &batches {
-                writer.write(b).expect("write");
+        // CARDINALITY is the variable the first version of this test missed. The
+        // synthetic `i % 97` strings dictionary-encode almost for free, while real
+        // otel columns (series_id, ids, attribute values) are near-unique — so the
+        // cheap case was being measured and reported as the writer's cost.
+        let make_batch_card = |offset: usize, n: usize, unique: bool| {
+            let s = |f: &dyn Fn(usize) -> String| -> arrow::array::ArrayRef { Arc::new(StringArray::from((0..n).map(|r| f(offset + r)).collect::<Vec<_>>())) };
+            let mut cols: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(TimestampMicrosecondArray::from((0..n as i64).map(|i| offset as i64 + i).collect::<Vec<_>>()).with_timezone("UTC")),
+                s(&|r| format!("metric_{}", r % 64)),
+                s(&|r| if unique { format!("series_{r}") } else { format!("series_{}", r % 512) }),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ];
+            cols.extend((0..COLS).map(|i| -> arrow::array::ArrayRef {
+                if i % 3 == 0 {
+                    s(&|r| if unique { format!("v{r}-{i}") } else { format!("v{}", r % 97) })
+                } else {
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()))
+                }
+            }));
+            arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), cols).expect("batch")
+        };
+
+        for (label, unique) in [("low-cardinality", false), ("HIGH-cardinality (realistic)", true)] {
+            for (zstd, batch_size) in [(1i32, 256usize), (1, 8192), (3, 8192)] {
+                let batches: Vec<_> = (0..ROWS).step_by(batch_size).map(|off| make_batch_card(off, batch_size.min(ROWS - off), unique)).collect();
+                let mut buf: Vec<u8> = Vec::with_capacity(256 << 20);
+                // zstd 1 is `timefusion_zstd_level_intermediate`, what staging uses.
+                let props = WriterProperties::builder()
+                    .set_compression(Compression::ZSTD(datafusion::parquet::basic::ZstdLevel::try_new(zstd).expect("level")))
+                    .build();
+                let mut writer = ArrowWriter::try_new(&mut buf, Arc::clone(&schema), Some(props)).expect("writer");
+                let started = std::time::Instant::now();
+                for b in &batches {
+                    writer.write(b).expect("write");
+                }
+                writer.close().expect("close");
+                let elapsed = started.elapsed();
+                println!(
+                    "WRITE {label:<28} zstd={zstd} batch={batch_size:>5}  {:>7.2}s  {:>9.0} rows/s  {:>7.1} MB out",
+                    elapsed.as_secs_f64(),
+                    ROWS as f64 / elapsed.as_secs_f64(),
+                    buf.len() as f64 / 1e6
+                );
             }
-            writer.close().expect("close");
-            let elapsed = started.elapsed();
-            println!(
-                "WRITE batch_size={batch_size:>5}  {ROWS} rows  {:>7.2}s  {:>9.0} rows/s  {:>6.1} MB out",
-                elapsed.as_secs_f64(),
-                ROWS as f64 / elapsed.as_secs_f64(),
-                buf.len() as f64 / 1e6
-            );
         }
+        let _ = &make_batch; // the low-cardinality builder above supersedes it
     }
 
     /// A bin holding unsorted files gets a budget sized in DECODED bytes too.
