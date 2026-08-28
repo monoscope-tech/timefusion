@@ -160,3 +160,88 @@ mechanism. The actionable conclusion is unchanged: 23.1M is the number today.
   "a derived unit whose base does not tile its slice RETRIES instead of
   publishing short" guard was supposed to prevent. That guard is the first thing
   to look at.
+
+## 4. ROOT CAUSE — the short cells are a GENERATION SPLIT, and `service_name_hll` is the splitter
+
+Later on 2026-08-28, against a 2.7 h-quiet prod process on `2e45a8c`. The
+"short" half of section 3 is not a scan bug, a tiling bug, or lag. It is this:
+
+**A day can hold more than one `rollup_generation`, and the read path pins
+exactly one per `(project, date)`.** `RollupRewrite::sql` emits
+`(project_id = P AND date = D AND rollup_generation = G)` — one generation per
+(project, date) pair. Every row written under any other generation for that day
+is unreadable, forever, even though it is present and correct.
+
+### The measurement that finds it
+
+Summing a rollup table directly — the natural check — sums ACROSS generations
+and therefore does NOT reproduce what a routed read returns. **Every 1h-tier
+comparison must group by `rollup_generation`.** The section-3 figures were
+generation-blind, which is why `28f62f01`/08-25 read as a single -75.7% cell.
+It is actually two cells:
+
+| generation | rows | sum(request_count) |
+|---|---|---|
+| `bc815739d2507900` | 73 | 765,340 |
+| `33903afe6182754a` | 4 | 140,962 |
+
+against a base of 3,732,004. A reader pinning `33903afe` sees hour 00 and
+nothing else: **-96%**.
+
+### Why the day splits
+
+`rollup::generation_id` hashes the spec **restricted to the measures this unit
+materialized**:
+
+```rust
+pub fn generation_id(spec, source, project_id, date, _source_fp, measures: Option<&[String]>)
+    // spec.measures filtered to `measures`, then hashed with (source, project_id, date)
+```
+
+and `maintain.rs:2102-2103` feeds it `materialized_measures(..., base_evidence)`
+— where `base_evidence` is what **the base cells overlapping THIS unit's slice**
+proved (`TAG_MEASURES`). Derived units are per HOUR. So two hours of the same
+day whose base cells proved different measure sets mint **different generation
+ids**, and the day is split.
+
+### The discriminator, measured
+
+Column population per generation, `28f62f01`/08-25, 1h tier — identical on every
+measure except one:
+
+| generation | rows | request_count | duration_sum | server_duration_sum | duration_digest | **service_name_hll** |
+|---|---|---|---|---|---|---|
+| `33903afe6182754a` | 4 | 4 | 3 | 2 | 4 | **4** |
+| `bc815739d2507900` | 73 | 73 | 55 | 37 | 73 | **0** |
+
+`service_name_hll` is materialized in one generation and absent from the other.
+That single measure is the whole split.
+
+### It is a LIVE REGRESSION, not history
+
+Days holding >1 generation in `dashboard_1h_v2`, last 30 days:
+
+| project | split days |
+|---|---|
+| `28f62f01` | 08-24, 08-25, 08-27, 08-28 |
+| `87576849` | 08-24, 08-25, 08-26 (**3** gens), 08-28 |
+| `6297304f` | 08-26 (**3** gens), 08-28 |
+
+Nothing before 08-24 splits. The last five days do, on every project checked.
+
+### What is still open
+
+* **The over-count is a SEPARATE defect.** `87576849`/08-01 is a **single**
+  generation, 411 rows, 39,412,317 against a verified base of 23,103,653
+  (**+70.6%**). Generation splitting cannot explain it; the 2026-08-20 note on
+  derived rollups summing merge-on-read versions of base rows still stands as
+  the candidate, and is unverified.
+* **Two candidate fixes, not yet chosen.** Either (a) do not let the
+  materialized measure set enter `generation_id`, so a day keeps one generation
+  and a measure absent from some hours simply reads NULL; or (b) let the read
+  path accept the SET of generations covering a day rather than one. (a) is
+  smaller but changes what a generation id means; (b) touches the routing
+  predicate `RollupRewrite::sql` builds. **Decide before writing code.**
+* **The 29 bad cells will not self-heal** — their units are `complete`. A v3
+  migration-key rebuild is required after the mechanism is fixed, and must not
+  be run before it.
