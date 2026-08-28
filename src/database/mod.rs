@@ -7657,9 +7657,7 @@ impl TailAdd {
     fn from_stats(path: String, size: i64, is_sorted_run: bool, stats: Option<&str>) -> Self {
         let range = stats.and_then(Database::event_time_range_from_stats);
         // Same JSON blob the range comes from, so this costs nothing extra.
-        let rows = stats
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
+        let rows = stats.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
         Self { path, size, is_sorted_run, event_range: range, rows }
     }
 }
@@ -15236,7 +15234,13 @@ mod tests {
     #[test]
     fn coordinator_compaction_sorts_small_l0_units_before_merging_sorted_runs() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None, rows: None };
+        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd {
+            path: path.into(),
+            size: size_mb * MB,
+            is_sorted_run: sorted,
+            event_range: None,
+            rows: None,
+        };
 
         // Sorted runs are still excluded while any L0 file is present, but the two
         // L0 files now share one unit instead of taking a unit each.
@@ -15483,9 +15487,8 @@ mod tests {
         assert_eq!(sparse_picked.len(), 23, "a sparse bin is still bounded by BYTES, not clipped by the row cap");
 
         // Absent stats must never make the cap stricter than bytes alone.
-        let unknown: Vec<_> = (0..23)
-            .map(|i| super::TailAdd { path: format!("u{i:02}"), size: 11 * MB, is_sorted_run: true, event_range: None, rows: None })
-            .collect();
+        let unknown: Vec<_> =
+            (0..23).map(|i| super::TailAdd { path: format!("u{i:02}"), size: 11 * MB, is_sorted_run: true, event_range: None, rows: None }).collect();
         assert_eq!(
             super::select_coordinator_compaction_candidates(unknown, super::COORDINATOR_SEALED_TARGET_BYTES).len(),
             23,
@@ -15589,7 +15592,13 @@ mod tests {
     #[test]
     fn coordinator_packing_never_rewrites_a_converged_file() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None, rows: None };
+        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd {
+            path: path.into(),
+            size: size_mb * MB,
+            is_sorted_run: sorted,
+            event_range: None,
+            rows: None,
+        };
 
         // The whale/07-30 shape: converged files carrying no sorted-run tag, beside real small debt.
         let whale = vec![f("converged-a", 520, false), f("converged-b", 512, false), f("small-a", 6, false), f("small-b", 6, false)];
@@ -15688,7 +15697,8 @@ mod tests {
     fn repair_pass_takes_the_newest_poisoned_file_then_the_smallest() {
         const TARGET: i64 = 1000;
         const SEAL: i64 = 10_000;
-        let f = |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)), rows: None };
+        let f =
+            |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)), rows: None };
         let backlog = vec![f("may", 900, 10), f("july", 900, 500), f("june", 950, 100)];
         assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["july"], "newest poisoned file first");
 
