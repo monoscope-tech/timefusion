@@ -468,3 +468,51 @@ length while the process tears down. It is caught (the audit logs and continues)
 and does not crash the process, and `immutable_column_disagreement_total` stood at
 118. Filed as an observation, not a defect: nothing was seen outside a drain
 window. If it is ever seen on a steady-state process, that changes.
+
+## 10. The empty publications are an HOUR-WIDE FIRST-ATTEMPT defect — day-wide units never do it
+
+Same join (derived unit published 0 rows while its base published >0 over the
+overlapping slices), split by unit shape. 276 violations against 2,033 healthy
+publications:
+
+| slice width | violations / total | rate |
+|---|---|---|
+| **60 min** | **274 / 1,895** | **14.5%** |
+| 1,440 min (day-wide) | **0 / 398** | **0.0%** |
+
+| attempts | violations / total | rate |
+|---|---|---|
+| **1** | **274 / 1,723** | **15.9%** |
+| 2 | 2 / 343 | 0.6% |
+| 3, 4, 5 | 0 / 231 | **0.0%** |
+
+**Not one day-wide derived unit has ever published empty over a non-empty base,
+across 398 of them. Not one unit on its third attempt or later, across 231.**
+
+By table: `otel_metrics_rollup_metrics_1h_v2` 15.5%, `dashboard_1h_v2` 8.0%. By
+project: 5.4% to 21.6%, every project affected — so it is not tenant-specific.
+By hour of day: spread across 01-22 at 4-35%, with hours **00 (1.9%) and 23
+(0.0%)** the near-clean ones. No clean time-of-day structure; width and attempts
+are the whole signal.
+
+### What this makes the question
+
+Not "why does a unit with 1.17M source rows read zero" but: **what does an
+hour-wide unit on its first attempt do that a day-wide unit never does, and that
+a retry of the same hour fixes?**
+
+The leading candidate is base-file SELECTION, which is width-sensitive in exactly
+this way. A derived unit selects base files by tag OVERLAP against its own slice
+(`src/database/maintain.rs`, the `derived` arm of the selection loop). A day-wide
+unit overlaps every base file for the day and cannot miss one. An hour-wide unit
+only takes files whose tagged range touches its hour — and a base file whose tag
+describes a different, narrower slice than the rows it physically holds (which is
+what compaction and re-publication at varying widths produce) is invisible to it.
+That also explains the retry: by the second attempt the base has been
+re-published at a width whose tag does overlap.
+
+**Note the drop is silent.** The selection loop counts `untagged_inputs` when a
+file has no tags, but a file that IS tagged and fails the overlap or project test
+is skipped with no counter at all — `rollup_untagged_inputs` reads 0 in prod
+while this happens. Instrumenting that skip is the cheapest next step and is
+strictly cheaper than reproducing the race.
