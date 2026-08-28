@@ -411,3 +411,32 @@ the empty-hour case that would make a `source_rows`-based guard wrong.
 **Read it against the offline number: 276 in one journal.** If it moves at a
 comparable rate, the bounded-retry guard is justified and the counter's firing
 conditions will name the mechanism the offline join cannot.
+
+## 8. The latency this costs: 7d is 11.7 s WARM and 30d does not complete
+
+Measured against prod `6693295` (2026-08-28), project `28f62f01`, same shapes
+monoscope's dashboards issue. Run twice to separate cold cache from structure:
+
+| shape | cold | **warm** |
+|---|---|---|
+| 1h count | 558 ms | 363 ms |
+| 24h count | 3,252 ms | **283 ms** — cache-bound, fine once warm |
+| 7d hourly chart | 19,978 ms | **11,698 ms** |
+| 30d daily chart | 60,271 ms | **times out at the 60 s statement limit** |
+
+24h collapses on a warm cache. **7d and 30d do not** — 11.7 s warm and a
+timeout are structural, not cold storage.
+
+**Those are exactly the windows the 1h tier exists to serve**, and they are the
+windows this document has just shown the 1h tier cannot answer: 276 derived
+slices published empty over a base holding rows, hours 21-22 never enqueued, and
+`measures_available` dropping the measure-poor generation's slices to the raw
+fringe. A 30d chart that cannot route reads raw across 30 days and hits the
+statement timeout.
+
+So the rollup work is not a data-quality side quest — **it is the 30-day
+dashboard latency.** Any latency measurement of these windows should be re-taken
+after the empty-publication cause is fixed, not before.
+
+Caveat on method: prod had been up ~10 minutes, so the cold column is a genuine
+cold-cache reading and the warm column is one repeat, not a distribution.
