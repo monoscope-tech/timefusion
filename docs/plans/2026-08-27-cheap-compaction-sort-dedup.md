@@ -433,7 +433,25 @@ Process counters, same window (54 min vs a 24 h baseline — rates only):
 logs 08-24/25/26 need **~48 hours** to drain. That is precisely the ceiling
 change 2 addresses, and this measurement is the argument for shipping it.
 
-## Change 2 — READY, NOT PUSHED (`aeffc85`)
+## Change 2 — PUSHED as `665f95e` (01:16 UTC)
+
+Gate: `cargo lint` clean; `make test` 1227/1228 with the single failure being a
+**MinIO connection error** (`error sending request`) — a concurrent session was
+creating `timefusion-kill-*` buckets against the same MinIO during the run. Not
+an assertion failure. Re-ran the test in isolation (pass) and the whole
+`dedup_compaction_test` module, nearest my change (**55/55 pass**).
+
+Rebased onto `0d88e9b`, the autofmt workflow's reformat of change 1 — inspected
+it first and it only reflowed long lines, no logic change. Ran `cargo fmt` myself
+before pushing so the workflow does not land a follow-up commit and a second
+restart (`cargo lint` does not catch rustfmt —
+[[tf_push_gates_and_deploy_triggers_2026-08-15]]).
+
+**Measure next:** `wave_bin_staging_started` `selected_files` for bins containing
+unsorted files should move from **3–7** to **~15–40**, and the 08-24/25/26 drain
+rate should rise from ~46 files/hr accordingly.
+
+### (history) Change 2 while it was held
 
 **Held deliberately.** Pushing restarts prod and resets every counter, which would
 end P0's clean measurement window and make P3c's "may not need doing at all"
