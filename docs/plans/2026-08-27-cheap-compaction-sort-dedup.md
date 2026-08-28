@@ -1,5 +1,100 @@
 # Cheap compaction, sort and dedup — so the backlog never piles up
 
+---
+
+# OPEN ITEMS — status as of 2026-08-28 13:40 UTC
+
+*(This file grew to 1,000+ lines chronologically. This section is the index; the
+narrative below is the evidence trail, newest-first, including superseded and
+refuted material kept deliberately.)*
+
+## SHIPPED and verified — all one root cause: a budget priced in the wrong unit
+
+| commit | budget was in | now | verified by |
+|---|---|---|---|
+| `93cd806` | compressed bytes | decoded (12×) | staging failures 3.3–4.8/hr → **0**; merge peak 3.0 → 1.46 GB |
+| `665f95e` | 16 MB compressed | decoded | bins 3–7 → **15–45 files** |
+| `8412b88b` | compressed bytes | **rows** (`MAX_BIN_ROWS` 2 M) | sealed units 900 s/`Running`×9 → **330–497 s/`Retry`, 0 deadline hits** |
+
+**Cumulative drain**, restart-immune Delta counts:
+`otel_metrics` tracked dates **4,215 → 3,696** (−519), running ~**175 files/hr**
+in the last 3 h — a 6× acceleration over the overnight rate.
+
+## THE live blocker: the sealed lane is 100% metrics; logs gets nothing
+
+- **22 of 22** `SealedConsolidation` claims in the last 55 min were `otel_metrics`.
+  **Zero** for `otel_logs_and_spans`.
+- `otel_logs_and_spans` 08-24/25/26 = **2,153 files, +0 change in 3 h** (and
+  unchanged since ~02:00). This is the **primary query table**.
+- The instrument names why:
+  `refusal="outranked_by:8100121c:2026-08-22:28f62f01:2026-08-27:files=433"` —
+  the fleet's most indebted cell (433 files, logs) is outranked by a 6-day-old
+  metrics cell. Logs cells **are** enqueued (`planned=446`); they lose on order.
+- Cause is `starved`, a pure **[3 day, 31 day]** age window, sitting **before**
+  `benefit` in `(class, damaged, starved, hole, width, benefit, order)`. Also
+  `width` precedes `benefit`, justified by "every hygiene unit is day-wide" —
+  which is false (a traced unit was a 12 h slice).
+- At 175 files/hr, metrics' older dates need ~10 more hours before logs is
+  reachable at all. **Logs waits ~21 h minimum.**
+
+**Precondition to act:** `timefusion sim` backtest. The rank tuple's own comments
+document repeated ordering regressions. The sim needs the prod journal, which is
+in the container data dir → a `docker cp` across the read-only prod boundary.
+
+## NEW — zstd levels: measured, and the refactor's intent ≠ its implementation
+
+`c0205dda` ("two zstd levels") set **working = 3, sealed = 9**. Measured on **real
+prod files**:
+
+| table | zstd 3 | zstd 9 | cost | size gain |
+|---|---|---|---|---|
+| **otel_metrics** | 7.81 s, 73.5 MB | 17.06 s, **72.5 MB** | **2.2× slower** | **1.4%** |
+| otel_logs_and_spans | 2.28 s, 38.9 MB | 2.75 s, 36.1 MB | 1.2× slower | 7.2% |
+
+**Two things follow.**
+
+1. **The sealed-consolidation staging path does NOT use the sealed level.**
+   `stage_hot_bin` (`maintain.rs:6076`) uses `timefusion_zstd_compression_level`
+   (**3**, and `.env.prod` pins 3), while `timefusion_zstd_level_warm` (9) is used
+   only by `compact.rs`. Per `c0205dda`'s stated intent — "sealed (compaction,
+   **consolidation**) = 9" — consolidation staging should be 9. It is 3.
+2. **Leaving it at 3 is nevertheless correct for metrics**, and the data says so:
+   2.2× the write time for 1.4% of size. Since the write side is ~62% of the
+   staging budget and sealed units sit at 350–497 s against a 900 s deadline,
+   raising it would consume most of the remaining margin for almost no space.
+
+**The hazard is the stale comment**, not the level. `maintain.rs:6074` still reads
+*"this output is rewritten tonight by consolidate/recompress, so it isn't worth max
+compression"* — and `c0205dda` deleted `consolidate`/`recompress` as unreachable.
+So the right behaviour now rests on a justification that no longer exists, and the
+obvious "cleanup" is to raise it to 9. **Do not**, on metrics, without re-measuring.
+
+*Predicted and NOT confirmed:* I expected zstd 9 to have already regressed sealed
+durations. It has not (350–497 s, unchanged) — because the path uses 3. Checked
+before reporting.
+
+## Retired / superseded items
+
+- **P3b (cron light-optimize brake-stopped)** — **moot.** `c0205dda` deleted
+  `run_hot_compact_sweep` and three sibling crons as unreachable behind
+  `COORDINATOR_OWNS_SLICE_MAINTENANCE`. The lane no longer exists; its zeroed
+  counters are not a young process.
+- **P0, P1, P2 (Pack ladder / Pack slicing / above-target exclusion)** — superseded
+  by the three shipped fixes; the underlying failure was memory denomination.
+
+## Still open, unranked
+
+- **P3c** — structural repair debt: 917 files >512 MB / 745 GB, one whole-file
+  sort each; footer sample 11 NONE / 1 DECLARED / 0 errors.
+- **P4** — what broke on 08-24. Two unconfirmed candidates (deploy density;
+  `3465ecc`). Do not close on resemblance.
+- **`dirty_bin_queue_depth` = 32,680 and growing** (31,170 at 23:15). Unexplored.
+- **Deploy cadence** — 5 deploys in ~4 h today. A 900 s unit cannot survive a
+  ~50 min redeploy cycle; this both kills in-flight work and resets every counter.
+
+---
+
+
 **Goal (user, 2026-08-27):** compaction / sort / dedup must be cheap and fast
 enough that the backlog never accumulates, ahead of a coming increase in message
 volume. Measurably improved, not just refactored.
