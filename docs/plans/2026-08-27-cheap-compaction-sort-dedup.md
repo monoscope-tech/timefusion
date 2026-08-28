@@ -59,16 +59,33 @@ same bucket (both `-3`), and `rank()` forces `width` and `order` to 0 when
 `hole == 0` — so those two tie completely and the winner is journal iteration
 order.
 
-### STILL UNEXPLAINED — do not paper over this
+### PARTIALLY EXPLAINED — how far the evidence actually goes
 
-Eligible (`starved = 0`) cells with ≥8 files: **logs 32, metrics 46** — a 41/59
-split. That does **not** explain the observed **22/22 metrics, 0 logs**. Age and
-bucketing account for the biggest cells losing; they do not account for logs
-getting *nothing*. Candidates not yet tested: `fair_cursors` rotating on
-project_id (the same project IDs exist in BOTH tables, so a per-project cursor
-cannot separate them); per-table planning cadence; or logs units sitting in
-`Retry` with future deadlines. **Next step is to instrument or model this, not to
-change ordering on a partial explanation.**
+Three effects, each measured, that bias the shared lane toward `otel_metrics`:
+
+1. **`starved` demotes the biggest debts.** The fleet's top 3 cells (433, 294, 283
+   files) are all 1–2 days old → `starved = 1`. Two of the three are logs.
+2. **Metrics holds 2 of the 3 cells at the best eligible rank.** At `benefit = −3`:
+   metrics `8100121c/08-25` (238) and `00000000/08-25` (196) versus logs
+   `28f62f01/08-25` (225). `BENEFIT_BUCKET_FILES = 64` collapses 196/225/238 into
+   one bucket, so a 196-file cell ties a 225-file one.
+3. **More eligible cells overall:** metrics 46 vs logs 32.
+
+**That is a ~2:1 bias. It does NOT explain the observed 22/22.** Do not write this
+up as solved.
+
+**The tie-break is `min by (project_id, deadline, key)` and `fair_cursors` is keyed
+on `project_id` ALONE** (`maintenance_coordinator.rs:2410`) — not on the table. The
+same project IDs (`00000000`, `8100121c`, `28f62f01`, `87576849`) exist in **both**
+tables, so a per-project cursor cannot rotate between them; advancing past a
+project after serving its metrics unit also steps over its logs unit.
+
+**What is still needed to close it:** whether logs cells at `starved = 0` actually
+hold *Pending* `SealedConsolidation` units. The instrument cannot answer this — it
+reports only the single max-by-`files` cell, which is the `starved = 1` logs 08-27
+one. That needs the journal, or a per-table claimability counter. **Do not change
+ordering until this is settled**; on the evidence so far a fairness fix might
+address only a third of the gap.
 
 **Latent hazard, kept separate:** `benefit` is per unit, so if hygiene units ever
 become narrower than one (project, date), each slice reports a fraction of the
