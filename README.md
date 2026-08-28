@@ -336,6 +336,18 @@ If it's missing the build fails with `invalid linker name`. Adjust the path in
 `.cargo/config.toml` for a different llvm version, or remove that file to fall
 back to the system linker.
 
+**Running CI locally:** `make ci` runs the same checks CI runs, from the same
+definition (`ci/checks.tsv`, read by both the workflow and the Makefile). Each
+pass is published as a git ref, so CI's gate skips anything already proven for
+that exact tree — run it before you push and CI has little left to do.
+`rust-toolchain.toml` pins the channel, so your `cargo` is CI's compiler and
+there is no container to reproduce. See [docs/local-ci.md](docs/local-ci.md).
+
+```bash
+make ci            # everything CI runs
+make ci-status     # what CI would run right now, without running it
+```
+
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License

@@ -1,4 +1,4 @@
-.PHONY: fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: ci ci-status ci-down ci-selftest fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # THE inner-loop command: the whole suite, every time you change something.
 #
@@ -170,3 +170,25 @@ tf-stop:
 	fi
 	@rm -f /tmp/timefusion.pid
 	@echo "timefusion stopped"
+	@echo "timefusion stopped"
+
+# ---------------------------------------------------------------------------
+# Local CI. `prepush` above is the fast pre-push gate; this is the real thing —
+# the same checks CI runs, defined once in ci/checks.tsv, with the MinIO CI
+# starts. Every pass publishes an attestation, and CI's gate skips any check
+# already proven for the exact tree it is about to test. See docs/local-ci.md.
+# Restrict with CHECKS: `make ci CHECKS="fmt clippy"`.
+CHECKS ?=
+
+ci:
+	./scripts/ci/ci.sh local $(CHECKS)
+
+# What CI would run right now, without running any of it.
+ci-status:
+	./scripts/ci/ci.sh gate $(CHECKS)
+
+ci-down:
+	./scripts/ci/ci.sh down
+
+ci-selftest:
+	./scripts/ci/ci.sh selftest
