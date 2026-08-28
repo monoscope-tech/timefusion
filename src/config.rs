@@ -1847,7 +1847,7 @@ pub struct MaintenanceConfig {
     /// sealed partitions the daily sweep never reached. Small on purpose: each
     /// pass is one ≤target sorted rewrite and its own commit, so a restart
     /// costs at most one pass and the next tick resumes. 0 disables.
-        // Every 6h, not daily: tombstones leave the checkpoint once older than the
+    // Every 6h, not daily: tombstones leave the checkpoint once older than the
     // retention window, so vacuum must run often enough to delete files before
     // their tombstones age out (VacuumMode::Full backstops any that slip through).
     #[serde_inline_default("0 15 */6 * * *".to_string())]
