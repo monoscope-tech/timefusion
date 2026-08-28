@@ -241,3 +241,59 @@ look for `derived_rollup` units on this cell whose slice is narrower than an hou
 routed read returns.** Every tier comparison must `GROUP BY rollup_generation`
 and state which generations a routed read would name. A generation-blind sum
 reported `28f62f01`/08-25 as one -75.7% cell; it is two disjoint cells.
+
+## 5. The short cells: units COMPLETE on the first attempt holding 11-47% of their base
+
+From the prod journal captured 2026-08-28 (`maintenance_tasks.json`, 59,076
+tasks), cell `28f62f01`/08-25, `dashboard_1h_v2`. Every derived unit against the
+rows it actually published:
+
+| hour | unit state | attempts | published | base | ratio |
+|---|---|---|---|---|---|
+| 00 | complete | **4** | 140,962 | 140,962 | **100.0%** |
+| 01 | complete | 1 | 0 | 136,778 | 0.0% |
+| 02 | complete | 1 | 29,431 | 209,685 | 14.0% |
+| 03-17 | complete | 1 | — | — | **11.4% - 46.6%** |
+| 18 | complete | 1 | 0 | 162,311 | 0.0% |
+| 19 | complete | 1 | 28,200 | 135,429 | 20.8% |
+| 20 | complete | 1 | 0 | 151,566 | 0.0% |
+| 21 | **NO UNIT** | — | 0 | 142,718 | 0.0% |
+| 22 | **NO UNIT** | — | 0 | 118,081 | 0.0% |
+| 23 | complete | **2** | 124,870 | 124,870 | **100.0%** |
+
+Two results, both sharp:
+
+**1. The `attempts` column is the whole story.** The only two hours that are
+EXACT are the only two that ran more than once. Every single-attempt unit
+published a fraction — and then marked itself `complete`, so it will never be
+retried. Whatever the first attempt races against, a second attempt wins.
+
+**2. Two hours were never enqueued at all.** The day's original day-wide derived
+unit is `superseded / migrated_to_aligned_hour_slice`; that migration minted 22
+hour units, not 24. Hours 21 and 22 have no `derived_rollup` task in the journal
+in any state. (`9f679039 leave split children out of the hour migration` is in
+the 2026-08-28 push and is in this territory — re-check after it is live.)
+
+### Two hypotheses refuted here, so they are not re-tried
+
+* **Split children.** Every `derived_rollup` unit for this cell is exactly
+  60 minutes wide. There are no sub-hour children. The section-4.3 hypothesis is
+  dead.
+* **"Fewer base units ⇒ smaller ratio."** Hour 02 has 2 of 6 ten-minute base
+  units and reads 14.0%; hour 17 has **all 6** and reads 14.0% as well. The
+  shortfall does not track base-unit count.
+
+### What this means for the guard
+
+`base_tier_incomplete` retries only when `rollup_slice_coverage` shows an
+uncovered range. These units saw no hole — they were admitted, ran, and published
+a fraction. So either coverage claimed a range whose rows were not yet readable
+by the derived scan, or the scan selected only part of what coverage promised.
+**The guard is checking a different thing from what the scan reads**, and that
+gap — not generations, not splitting — is the short-cell defect.
+
+**Next probe, and it is cheap:** re-run one of these hours as a single unit
+(`timefusion run-unit --op DerivedRollup`) against the same storage and compare
+what it publishes to the 11-47% already there. If a fresh single run is exact,
+the defect is a race and the fix is in admission; if it reproduces the fraction,
+the defect is in selection and the fix is in the scan.
