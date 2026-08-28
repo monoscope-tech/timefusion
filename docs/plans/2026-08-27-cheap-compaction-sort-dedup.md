@@ -551,7 +551,50 @@ the cap mainly taxed the *first* pass over fresh flush output.
 file-count cap would go if merge fan-in ever needs bounding (the refuted
 diagnosis #2). Not needed on current evidence.
 
-## MORNING (08:52 UTC) — 5 h quiet on `e45deef`. READ THIS FIRST.
+## 10:22 UTC — ROW CAP RESULT: the sealed lane went from 0 completions to all completions
+
+`MAX_BIN_ROWS` shipped as `8412b88b`, live in `ce178d7` (merged with a concurrent
+session's work). 45 min on the new build:
+
+| | before the cap | after |
+|---|---|---|
+| sealed metrics units | **900 s, `outcome=Running` ×9** — abandoned, committed nothing | **330–495 s, `outcome=Retry` ×12** |
+| bins staged | — | **28** |
+| staging failures | — | **0** |
+
+`Retry` here is the *productive* outcome: the unit staged a bin, committed it, and
+journaled `compaction_debt_remaining` for the rest. **Not one unit hit the
+deadline.** This is the prediction the cap was built on — 5.08 M-row bins could
+not fit 900 s; 2 M-row bins finish in a third of it.
+
+### Correction: I was measuring the wrong partitions
+
+The 08-24/25/26 window showed **+0** over those 45 min, and I nearly reported the
+cap as ineffective. The sealed lane is oldest-first and is currently on metrics
+**08-16 … 08-23**, not 08-24. Measured across the dates it is actually working:
+
+| metrics date | 23:15 | 10:22 | Δ |
+|---|---|---|---|
+| 08-18 | 320 | 262 | **−58** |
+| 08-19 | 314 | 295 | −19 |
+| 08-20 | 326 | 299 | −27 |
+| 08-21 | 303 | 295 | −8 |
+| 08-23 | 251 | 236 | −15 |
+| 08-24 | 523 | **349** | **−174** |
+| 08-25 / 08-26 | 1017 / 889 | unchanged | **0** |
+| **tracked total** | **4,215** | **3,914** | **−301** |
+
+Plus logs 08-24 **−109**. So ~**410 files** drained overnight, not the 109 I
+reported at 08:52 — that number only counted three partitions.
+
+**Lesson, third time tonight:** define the population before comparing. I did this
+with the tag probe, with the 4-column write model, and again here.
+
+**Still untouched: 08-25 and 08-26**, the two largest cells (1,017 and 889 on
+metrics; 964 and 737 on logs). Oldest-first will not reach them for a long time —
+which is precisely the ordering question left open below.
+
+## MORNING (08:52 UTC) — 5 h quiet on `e45deef`
 
 **The two shipped fixes hold, and the sealed lane is draining — my 02:30
 "pinned forever" framing was too pessimistic.**
