@@ -5219,9 +5219,6 @@ impl Database {
                 let mut rules = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules;
                 let pos = rules.iter().position(|r| r.name() == "EnforceDistribution").unwrap_or(0);
                 rules.insert(pos, Arc::new(crate::read::optimizers::OrderedUnionForTopK));
-                // Before that again: it repairs the Delta leg's own ordering
-                // claim, which is the input `OrderedUnionForTopK` looks for.
-                rules.insert(pos, Arc::new(crate::read::optimizers::SortIsolatedUnorderedScan::new(self.config.memory.timefusion_read_sort_unordered_leg_max_mb)));
                 // After EnforceSorting/EnforceDistribution, never before: this rule exists to
                 // undo their (locally correct) decision to discharge DedupExec's ordering as
                 // trivially satisfied when a pushed equality pins the sort column to a
@@ -9297,7 +9294,12 @@ impl ProjectRoutingTable {
         let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await;
         metrics::counter!(scan_metric_names::PROVIDER_SCAN_TOTAL).increment(1);
         metrics::counter!(scan_metric_names::PROVIDER_SCAN_US_TOTAL).increment(started.elapsed().as_micros() as u64);
-        let delta_plan = delta_plan?;
+        // Before anything reads the leg's ordering: give back the claim that the
+        // fork's footer-less-file isolation costs the conforming majority.
+        let delta_plan = crate::read::optimizers::repair_isolated_scan_ordering(
+            delta_plan?,
+            self.database.config.memory.timefusion_read_sort_unordered_leg_max_mb.saturating_mul(1 << 20),
+        )?;
 
         // Determine target schema based on projection
         let target_schema = match projection {

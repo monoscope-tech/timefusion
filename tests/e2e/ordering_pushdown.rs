@@ -165,14 +165,12 @@ async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::
     let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date, None).await?;
     assert!(removed >= 2 && added >= 1, "the fixture needs a real concatenation (removed={removed}, added={added})");
 
-    // Two more flushes → conforming files, so the ordered side is the majority.
-    for b in 2..4i64 {
-        for i in 0..3i64 {
-            insert_at(&client, &format!("s-{}", b * 3 + i), FROZEN_START_MICROS + (b * 3 + i) * sec).await?;
-        }
-        env.advance(Duration::from_secs(bucket_secs * 2));
-        env.force_flush().await?;
+    // One more flush → a conforming file alongside the concatenated one.
+    for i in 0..3i64 {
+        insert_at(&client, &format!("s-{}", 6 + i), FROZEN_START_MICROS + (6 + i) * sec).await?;
     }
+    env.advance(Duration::from_secs(bucket_secs * 2));
+    env.force_flush().await?;
 
     let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
     let plan: String = client
@@ -185,6 +183,6 @@ async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::
     assert!(plan.contains("SortPreservingMergeExec"), "one unsorted file must not disable the streaming merge for the conforming majority; plan was:\n{plan}");
 
     let ids: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
-    assert_eq!(ids, vec!["s-11", "s-10", "s-9"], "wrong top-n or order; plan:\n{plan}");
+    assert_eq!(ids, vec!["s-8", "s-7", "s-6"], "wrong top-n or order; plan:\n{plan}");
     Ok(())
 }

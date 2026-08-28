@@ -2236,65 +2236,48 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
 // where every file conforms, streams in 1.6 s. It is a cliff, not a gradient —
 // ONE non-conforming file flips it.
 //
-// The repair is to sort the isolated leg so the union is order-preserving again.
-// Sorting a whole-window parquet leg is itself the 2026-08-02 / 2026-08-07 OOM,
-// and the only thing separating that from this is SIZE, so the leg's selected
-// bytes are the admission test (`max_bytes`, 0 = rule off). No fetch is pushed:
-// this rule is anchored on the union's own advertised ordering rather than on a
-// downstream fetching sort, so it fires under `DedupExec` too — where a fetch cut
-// would truncate row versions — and sorting a child changes no rows.
-//
-// Scope: only unions whose children are ALL bare file scans, which is the fork's
-// isolation shape and nothing else. TimeFusion's own `mem ∪ delta` union has a
-// non-scan child, so it is never touched here.
-#[derive(Debug)]
-pub struct SortIsolatedUnorderedScan {
-    max_bytes: u64,
-}
-
-impl SortIsolatedUnorderedScan {
-    pub fn new(max_mb: u64) -> Self {
-        Self { max_bytes: max_mb.saturating_mul(1 << 20) }
+/// The repair, applied to a Delta leg as it leaves `provider.scan`: sort each
+/// isolated unordered child of a mixed scan union whose selected bytes fit
+/// `max_bytes`, so the union advertises the ordering again. `0` disables it.
+///
+/// Done HERE and not as a `PhysicalOptimizerRule` because `DedupExec` declares no
+/// required input ordering: a sort injected before `EnforceSorting` is deleted as
+/// unused. `ProjectRoutingTable::scan` builds — and pins — its own
+/// `SortPreservingMergeExec` over the leg, which is what keeps this alive.
+///
+/// No fetch is pushed: sorting a child changes no rows, so this is sound under
+/// `DedupExec`, where a top-n cut on a leg would truncate row versions.
+pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_bytes: u64) -> Result<Arc<dyn ExecutionPlan>> {
+    if max_bytes == 0 {
+        return Ok(plan);
     }
-}
-
-impl PhysicalOptimizerRule for SortIsolatedUnorderedScan {
-    fn name(&self) -> &str {
-        "sort_isolated_unordered_scan"
-    }
-
-    fn schema_check(&self) -> bool {
-        true
-    }
-
-    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.max_bytes == 0 {
-            return Ok(plan);
-        }
-        // Bottom-up so a rewritten union's new ordering propagates through the
-        // `DeltaScanExec` wrapping it as the parents are rebuilt.
-        Ok(plan
-            .transform_up(|node| {
-                let Some(union) = downcast::<UnionExec>(node.as_ref()) else {
-                    return Ok(Transformed::no(node));
-                };
-                let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
-                let Some(sizes) = children.iter().map(crate::database::selected_file_work).collect::<Option<Vec<_>>>() else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(req) = children.iter().find_map(|c| c.properties().output_ordering()).cloned() else {
-                    return Ok(Transformed::no(node));
-                };
-                // `sortable` is the byte budget; `require_ordered_child` keeps the
-                // rule inert when nothing advertises the ordering to merge toward.
-                let sortable: Vec<bool> = sizes.iter().map(|(_, bytes)| *bytes <= self.max_bytes).collect();
-                Ok(match ordered_children(&children, &req, None, &sortable, true)? {
-                    Some(ordered) => Transformed::yes(UnionExec::try_new(ordered)?),
-                    None => Transformed::no(node),
-                })
-            })?
-            .data)
-    }
+    // Bottom-up so a rewritten union's new ordering propagates through the
+    // `DeltaScanExec` wrapping it as the parents are rebuilt.
+    Ok(plan
+        .transform_up(|node| {
+            let Some(union) = downcast::<UnionExec>(node.as_ref()) else {
+                return Ok(Transformed::no(node));
+            };
+            let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
+            // Only the fork's isolation shape: every child a bare file scan.
+            // TimeFusion's own `mem ∪ delta` union has a non-scan child.
+            let Some(sizes) = children.iter().map(crate::database::selected_file_work).collect::<Option<Vec<_>>>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(req) = children.iter().find_map(|c| c.properties().output_ordering()).cloned() else {
+                return Ok(Transformed::no(node));
+            };
+            // `sortable` IS the byte budget. Sorting a whole-window parquet leg is
+            // the 2026-08-02 / 2026-08-07 OOM and size is the only thing that
+            // separates it from this; `ordered_children` bails on the whole union
+            // as soon as one over-budget child misses the ordering.
+            let sortable: Vec<bool> = sizes.iter().map(|(_, bytes)| *bytes <= max_bytes).collect();
+            Ok(match ordered_children(&children, &req, None, &sortable, true)? {
+                Some(ordered) => Transformed::yes(UnionExec::try_new(ordered)?),
+                None => Transformed::no(node),
+            })
+        })?
+        .data)
 }
 
 #[cfg(test)]
