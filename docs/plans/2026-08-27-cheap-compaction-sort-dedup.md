@@ -344,6 +344,33 @@ a journal query, not a log grep.
   Deploy triggered. Baseline for comparison is the table at the top of this file,
   taken on `ba6390c` with 24 h uptime.
 
+- **2026-08-28 00:09:50** — `eadffa1` live on prod. **First 25 minutes, new build:**
+
+  | signal | before (`ba6390c`, 24 h uptime) | after (25 min) |
+  |---|---|---|
+  | `Light optimize staging failed` | 3.3–4.8 /hr | **0** |
+  | `Resources exhausted` | continuous | **0** |
+  | BaseRollup `Complete` | — | **44** |
+  | Dedup `Complete` | — | **21** |
+  | `repair_bin_sliced` | every 5–15 min | **0** (see below) |
+
+  **Do not read this as confirmation yet — two reasons.**
+  1. **The process is 25 minutes old.** Comparing it to a 24 h process is the
+     exact trap in [[tf_young_process_reads_as_fixed_2026-08-23]]; accrual has
+     read 0 → 124/hr on age alone. The ≥2 h quiet window still applies.
+  2. **Prediction 1 is UNVERIFIED.** Repair has not sliced anything, because all
+     20 of its units returned `outcome=Retry` at **`ran_secs=0`** — the
+     `repair_bin_already_sorted` / `take(1)` short-circuit. It has not yet
+     reached one of the 1.6–1.9 GB whale files, so `slices=11` is still untested.
+     The *effect* (no exhaustion, other lanes completing) is visible; the
+     *mechanism* is not. Until a big-file repair slices, an alternative
+     explanation — that the restart alone cleared the retry storm — is not
+     excluded.
+
+  Also note the first watcher window spanned the restart and returned
+  `bytes_in=722216602 slices=3`, the OLD value. Timestamping showed every such
+  line predated 00:09:50. Any post-deploy claim must filter on timestamp.
+
 ### Predictions this fix makes (check these, in this order)
 
 | # | prediction | falsifies if |
