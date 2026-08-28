@@ -131,6 +131,43 @@ Then the real question, on a container with ≥1h uptime:
 restarts every 20-40 minutes. Stamp `docker service ps` uptime and the running
 image on any number before quoting it.
 
+## The change broke two e2e tests, and the one that PASSED was the problem
+
+Both fixtures build repair work by flushing sorted rows. Marking now records
+those at write time, so the fixtures have no repair work at all.
+
+- `a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool`
+  failed loudly on `repair_ticks_yielded = 0`. **Not a broken permit — an empty
+  queue.** The permit is taken *before* planning, so the counter does not depend
+  on there being work; it depends on the two passes OVERLAPPING. With zero
+  suspects a pass completes in a single poll, and `tokio::join!` polls
+  sequentially, so the first releases the permit before the second is ever
+  polled. The test's real precondition was "the pass does enough IO to yield",
+  which was incidental and is now gone.
+
+- `one_repair_pass_clears_every_sorted_suspect_not_one_per_pass` **passed, and
+  should not have.** It counts lines in `repair_verified_sorted.txt` and asserts
+  `cleared >= before` — but the flush now appends to that same file, so the
+  assertion was satisfied by the writes themselves. The repair pass could have
+  cleared nothing. This was found only by asking what a green test was proving,
+  which is the habit worth keeping: **the failing test cost an hour; the passing
+  one would have cost a regression.**
+
+Both now disable the mechanism for their fixture via a real config flag,
+`timefusion_repair_mark_sorted_at_write` (default on). Not a test seam — a
+mechanism that decides a file will never be offered to repair deserves an off
+switch on the same reasoning as `timefusion_repair_resume_enabled`. Documented
+limit: it stops NEW marks and does not un-mark anything, so recovery from a
+wrong exoneration is deleting the file and restarting. It gates the seeding
+sweep too, because gating only the marking leaves the sweep re-deriving the same
+answer an hour later — a kill switch that does not kill.
+
+The better fix, genuinely-unsorted fixtures, is **not reachable**:
+`flush_sort_pool_bytes()` floors at 64 MB so the pool cannot be starved into the
+unsorted fallback, and the sibling test's own docstring already records that
+`with_sort_skip_bytes(0)` stopped producing footer-less files once flush began
+escalating to a pooled sort. Manufacturing one needs a hand-written parquet.
+
 ## Verification
 
 `cargo lint` exit 0. Five targeted tests pass, and the two that matter were
