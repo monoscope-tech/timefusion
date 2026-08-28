@@ -859,3 +859,41 @@ collapsing it. **Reopen day-wide.**
 Caveat: 30/hr is one 30-minute window on a partly-warm process while the backfill
 competes for the same pool, so treat it as an order of magnitude. The conclusion
 survives a factor of two either way.
+
+## 19. Closing reading — 63 minutes quiet on `1266e87`, 50,612 queries
+
+The first genuinely quiet window of the night (no restart), so these are the
+numbers to compare against next time.
+
+**Latency is healthy and warming monotonically.** p95 across the window:
+512 → 339 → 328 → 316 → 302 → 293 → 284 → 277 → **276 ms**. Final:
+p50 **58.7 ms**, p95 **279.8 ms**, p99 **732.8 ms**, p999 **2.76 s**.
+
+**The three new counters, verified present (not absent-and-therefore-zero):**
+
+| counter | value | reading |
+|---|---|---|
+| `rollup_published_empty_over_full_base` | **0** | agrees with §12 — the defect is not live |
+| `rollup_base_file_skipped_tag_project` | **0** | that refusal is DEAD; one of the loop's two tests never fires |
+| `rollup_base_file_skipped_tag_range` | **3,075** (~0.8/s) | the drop that was invisible before |
+
+**The rollup tier served nothing to real traffic in this window: 808 misses,
+0 hits.** That is not a regression — the pre-deploy baseline was 2 full + 5 hybrid
+over 2.7 h — but it is the number that makes the rebuild worth doing. Attribution:
+
+| reason | count |
+|---|---|
+| `filter_not_eligible` | 250 |
+| `unaligned_bucket` | 200 |
+| `unwalkable_source` | 151 |
+| `unknown_filter` | 96 |
+| `not_built` | 71 |
+| `stale_coverage` | 39 |
+
+Note `not_built` (71) and `stale_coverage` (39) — the two the rebuild addresses —
+are together only **14%** of misses. The larger share is query SHAPE
+(`filter_not_eligible`, `unaligned_bucket`, `unknown_filter`, `unwalkable_source`
+= 86%). **So the rebuild alone will not move routing much**, and the next
+throughput/routing session should start from the shape reasons, not from
+coverage. One caveat carried from §8: a single query probes many candidate specs,
+so these counters are not one-miss-per-query.
