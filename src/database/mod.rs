@@ -2718,6 +2718,9 @@ pub struct Database {
     repair_verified_sorted: Arc<dashmap::DashSet<String>>,
     /// Serializes appends to the persisted verified-sorted list.
     repair_verified_lock: Arc<std::sync::Mutex<()>>,
+    /// Paths appended since the list was last truncated, so runtime compaction
+    /// amortizes to one rewrite per `REPAIR_VERIFIED_PERSIST_CAP` appends.
+    repair_verified_appends: Arc<std::sync::atomic::AtomicUsize>,
     /// Consecutive staging failures per repair candidate — an always-failing
     /// file starves every candidate behind it; see `REPAIR_QUARANTINE_AFTER`.
     repair_failures: Arc<dashmap::DashMap<String, u32>>,
@@ -3449,6 +3452,7 @@ impl Database {
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             repair_verified_sorted: Arc::new(dashmap::DashSet::new()),
             repair_verified_lock: Arc::new(std::sync::Mutex::new(())),
+            repair_verified_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_failures: Arc::new(dashmap::DashMap::new()),
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
@@ -4546,6 +4550,33 @@ impl Database {
         // sorted in earlier processes, so this one does not spend its pass
         // re-clearing them. See `load_verified_sorted`.
         db.load_verified_sorted();
+
+        // Then seed from what is ALREADY on storage. `load_verified_sorted` only
+        // re-adopts what an earlier process happened to probe; write-time marking
+        // only covers what this build writes. Neither reaches the files that were
+        // already there when this shipped — the whole fleet, on day one — and
+        // leaving them to repair's own `.take(1)` walk is what made admission
+        // O(every file ever written) in the first place.
+        //
+        // Detached and bounded, never on the boot path: a 300s preload already
+        // sits between boot and the first useful maintenance tick, and adding
+        // object-store round trips in front of it would trade a slow queue for a
+        // slow start. Repeats every hour because new files keep arriving from
+        // paths that do not mark (schema-evolution merges, resumed staged bins);
+        // the sweep is a no-op once they are known, since it only probes unknowns.
+        {
+            let db = Arc::clone(&db);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+                    }
+                }
+            });
+        }
 
         // Coordinator planning and DataFusion execution must not share Tokio
         // workers with PGWire. In production the old arrangement accepted the
@@ -7448,6 +7479,13 @@ const fn max_waves(pass: TailPass) -> usize {
 }
 
 const REPAIR_VERIFY_CONCURRENCY: usize = 16;
+
+/// Files one seeding sweep will probe. Sized to clear a fleet of this shape in a
+/// couple of passes rather than to be exhaustive in one: prod's whole
+/// `otel_logs_and_spans` log held 1,648 add actions when it was last counted
+/// (2026-08-19), so this is roughly "everything", with a ceiling that keeps the
+/// sweep bounded if a tenant's file count grows an order of magnitude.
+const REPAIR_VERIFY_SEED_LIMIT: usize = 5_000;
 
 /// How many verified-sorted paths survive a restart. One path is ~150 bytes, so
 /// 200k is ~30 MB on disk and bounds boot-time load. Newest wins, because the
@@ -17750,6 +17788,37 @@ mod tests {
         // looks like, and it is indistinguishable from "nothing to do".
         assert!(!marked.is_empty(), "no file was marked at write time — the marking is not reaching the commit path");
         assert_eq!(marked, live, "every marked path must be a path admission will look up, byte for byte");
+        Ok(())
+    }
+
+    /// Files that already exist must be seeded, not left to repair's own walk.
+    ///
+    /// Write-time marking covers only what this build writes, so on the day it ships every file
+    /// on storage is unknown — and an unknown file is a repair SUSPECT that costs a whole bin's
+    /// admission to clear, one `.take(1)` at a time. Clearing the set after a real write is an
+    /// exact stand-in for that fleet: correctly-sorted files on storage that nothing has told
+    /// this process about.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_seeding_sweep_reaches_files_that_predate_write_time_marking() -> Result<()> {
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let t = "otel_logs_and_spans";
+        let project = format!("seed-{prefix}");
+        db.insert_records_batch(&project, t, vec![json_to_batch(vec![test_span("s", "span", &project)])?], true, None).await?;
+
+        // Forget everything, as a process that predates the marking would have.
+        let written: HashSet<String> = db.repair_verified_sorted.iter().map(|entry| entry.key().clone()).collect();
+        assert!(!written.is_empty(), "the write must have marked something for this test to mean anything");
+        db.repair_verified_sorted.clear();
+
+        let seeded = db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await;
+        assert!(seeded > 0, "the sweep must re-derive sortedness from the footers already on storage");
+        let after: HashSet<String> = db.repair_verified_sorted.iter().map(|entry| entry.key().clone()).collect();
+        assert!(written.is_subset(&after), "every file the write knew was sorted must be recovered by the probe");
+
+        // Idempotent, and cheap the second time: nothing is unknown any more, so
+        // the sweep does no IO at all rather than re-probing the same footers.
+        assert_eq!(db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await, 0, "a second sweep must find nothing unknown");
         Ok(())
     }
 

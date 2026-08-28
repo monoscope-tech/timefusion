@@ -6711,6 +6711,44 @@ impl Database {
         if let Err(e) = write {
             warn!("verified-sorted append failed ({:?}): {} — repair will re-probe these footers after a restart", file_path, e);
         }
+
+        // RUNTIME compaction, amortized to one rewrite per cap's worth of appends.
+        //
+        // This file used to be fed only by the footer probe — a few paths per repair tick — so
+        // truncating it once at boot was enough, and prod restarting every 20-40 minutes hid the
+        // rest. Write-time marking feeds it on every commit instead, orders of magnitude faster,
+        // and the process that would grow it without bound is precisely the long-lived one this
+        // work is meant to produce. Bounding it at boot only would make the leak a REWARD for
+        // fixing the restarts.
+        //
+        // The in-memory set is trimmed to match: an entry dropped here costs one footer probe,
+        // never correctness, which is the same trade the cap already makes at boot.
+        let appended = self.repair_verified_appends.fetch_add(paths.len(), std::sync::atomic::Ordering::Relaxed) + paths.len();
+        if appended >= REPAIR_VERIFIED_PERSIST_CAP {
+            self.repair_verified_appends.store(0, std::sync::atomic::Ordering::Relaxed);
+            let (kept, dropped) = self.truncate_verified_file_locked();
+            let keep: HashSet<&str> = kept.iter().map(String::as_str).collect();
+            self.repair_verified_sorted.retain(|path| keep.contains(path.as_str()));
+            info!(kept = kept.len(), dropped, event = "footer_repair_verified_compacted");
+        }
+    }
+
+    /// Truncate the persisted verified-sorted list to its most recent
+    /// [`REPAIR_VERIFIED_PERSIST_CAP`] entries; returns `(kept, dropped)`. Newest entries win —
+    /// the tail of the file is the most recently written or probed. Caller holds
+    /// `repair_verified_lock`.
+    fn truncate_verified_file_locked(&self) -> (Vec<String>, usize) {
+        let file_path = self.repair_verified_path();
+        let Ok(contents) = std::fs::read_to_string(&file_path) else { return (Vec::new(), 0) };
+        let all: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+        let kept: Vec<String> = all[all.len().saturating_sub(REPAIR_VERIFIED_PERSIST_CAP)..].iter().map(|line| (*line).to_string()).collect();
+        let dropped = all.len() - kept.len();
+        if dropped > 0
+            && let Err(e) = std::fs::write(&file_path, kept.iter().map(|path| format!("{path}\n")).collect::<String>())
+        {
+            warn!("verified-sorted compaction failed ({:?}): {e}", file_path);
+        }
+        (kept, dropped)
     }
 
     /// Load the persisted verified-sorted paths at boot, compacting the file if
@@ -6718,19 +6756,11 @@ impl Database {
     /// tail of the file is the most recently probed.
     pub(crate) fn load_verified_sorted(&self) {
         let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let file_path = self.repair_verified_path();
-        let Ok(contents) = std::fs::read_to_string(&file_path) else { return };
-        let all: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
-        let kept = &all[all.len().saturating_sub(REPAIR_VERIFIED_PERSIST_CAP)..];
-        for path in kept {
-            self.repair_verified_sorted.insert((*path).to_string());
+        let (kept, dropped) = self.truncate_verified_file_locked();
+        for path in &kept {
+            self.repair_verified_sorted.insert(path.clone());
         }
-        if all.len() > kept.len()
-            && let Err(e) = std::fs::write(&file_path, kept.iter().map(|p| format!("{p}\n")).collect::<String>())
-        {
-            warn!("verified-sorted compaction failed ({:?}): {e}", file_path);
-        }
-        info!(loaded = kept.len(), dropped = all.len() - kept.len(), event = "footer_repair_verified_loaded");
+        info!(loaded = kept.len(), dropped, event = "footer_repair_verified_loaded");
     }
 
     fn staged_intent_path(&self) -> PathBuf {
@@ -7206,15 +7236,9 @@ impl Database {
     /// Records the bin in `repair_verified_sorted` when true so admission stops offering it.
     /// Unreadable footer is not evidence of sortedness, so returns false.
     async fn repair_bin_already_sorted(&self, table_ref: &Arc<RwLock<DeltaTable>>, files: &[String]) -> bool {
-        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
-        use object_store::{ObjectStoreExt, path::Path as OsPath};
         let object_store = { table_ref.read().await.log_store().object_store(None) };
         for path in files {
-            let os_path = OsPath::from(path.as_str());
-            let Ok(meta) = object_store.head(&os_path).await else { return false };
-            let mut reader = ParquetObjectReader::new(object_store.clone(), os_path).with_file_size(meta.size);
-            let Ok(pq) = reader.get_metadata(None).await else { return false };
-            if pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty())) {
+            if !Self::footer_declares_sorted(&object_store, path).await {
                 return false;
             }
         }
@@ -7224,6 +7248,84 @@ impl Database {
         self.persist_verified_sorted(files);
         info!(files = files.len(), event = "footer_repair_suspect_cleared");
         true
+    }
+
+    /// True if every row group of this object carries a non-empty `sorting_columns` footer.
+    /// An unreadable footer is NOT evidence of sortedness — it returns false and the file stays
+    /// a suspect, which is the direction that costs a rewrite rather than a silent wrong answer.
+    async fn footer_declares_sorted(object_store: &Arc<dyn object_store::ObjectStore>, path: &str) -> bool {
+        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+        use object_store::{ObjectStoreExt, path::Path as OsPath};
+        let os_path = OsPath::from(path);
+        let Ok(meta) = object_store.head(&os_path).await else { return false };
+        let mut reader = ParquetObjectReader::new(object_store.clone(), os_path).with_file_size(meta.size);
+        let Ok(pq) = reader.get_metadata(None).await else { return false };
+        !pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty()))
+    }
+
+    /// Seed the verified-sorted set from files that ALREADY EXIST.
+    ///
+    /// Write-time marking only ever covers files this build writes. Everything already on
+    /// storage — which is the whole fleet the moment this ships — would still buy its
+    /// exoneration through repair's own walk, one bin at a time, at `.take(1)` per plan and
+    /// behind repair's rewrite budget. That population is precisely the one the change is
+    /// supposed to help, so it gets an explicit sweep instead of being left to drain by luck.
+    ///
+    /// Bounded three ways: `limit` files per call, `REPAIR_VERIFY_CONCURRENCY` in flight, and
+    /// only files not already known. Every probe is a ranged metadata read through the same
+    /// object store (and the same Foyer cache) a scan would warm, so a repeated sweep is cheap
+    /// even when it finds nothing.
+    ///
+    /// Negatives are deliberately NOT recorded. A file whose footer is unsorted is real repair
+    /// work and leaves the population by being rewritten; persisting it as "known bad" would
+    /// create a second durable set to keep consistent with the first, and the failure mode of
+    /// THAT is a file marked bad forever after it has been fixed.
+    pub(crate) async fn seed_verified_sorted(&self, limit: usize) -> usize {
+        use futures::StreamExt;
+        let mut unknown: Vec<(Arc<RwLock<DeltaTable>>, String)> = Vec::new();
+        for (_, source, table_ref) in self.all_tables().await {
+            // A table declaring no sort order has no footer to lose, so it has no
+            // suspects — probing it would be pure IO for a set nothing reads.
+            if schema_or_default(&source).sorting_columns.is_empty() {
+                continue;
+            }
+            {
+                let table = table_ref.read().await;
+                let Ok(snapshot) = table.snapshot() else { continue };
+                for file in snapshot.log_data().iter() {
+                    let path = file.path().into_owned();
+                    if !self.repair_verified_sorted.contains(&path) {
+                        unknown.push((Arc::clone(&table_ref), path));
+                    }
+                }
+            }
+            if unknown.len() >= limit {
+                break;
+            }
+        }
+        unknown.truncate(limit);
+        if unknown.is_empty() {
+            return 0;
+        }
+        let candidates = unknown.len();
+        let verified: Vec<String> = futures::stream::iter(unknown)
+            .map(|(table_ref, path)| async move {
+                let object_store = { table_ref.read().await.log_store().object_store(None) };
+                Self::footer_declares_sorted(&object_store, &path).await.then_some(path)
+            })
+            .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        for path in &verified {
+            self.repair_verified_sorted.insert(path.clone());
+        }
+        self.persist_verified_sorted(&verified);
+        // Both numbers, always. `verified` alone cannot distinguish "the fleet is
+        // healthy" from "the sweep found nothing to look at", and the difference
+        // between them is the entire size of the repair backlog.
+        info!(candidates, verified = verified.len(), unsorted = candidates - verified.len(), event = "footer_repair_seed_swept");
+        verified.len()
     }
 
     /// Each pass is budgeted from its own cron period because their units are orders of magnitude
