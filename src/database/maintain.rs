@@ -149,8 +149,16 @@ const DAMAGED_CELLS: &[(&str, &str)] = &[
     ("dcad860a-9a98-4c9e-9e69-20d52dcf90e2", "2026-08-26"),
 ];
 
+/// Arrow bytes one compressed parquet byte decodes to, at prod's zstd ratio.
+///
+/// Named because it is the conversion between what a file *is* (`Add.size`,
+/// compressed) and what sorting it *costs* (decoded). Every sort budget in this
+/// crate is denominated in decoded bytes and divided by this; getting that
+/// backwards is the 2026-08-27 pool-exhaustion incident.
+pub(crate) const DECODED_BYTES_PER_COMPRESSED: i64 = 12;
+
 pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
-    u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(12)
+    u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(DECODED_BYTES_PER_COMPRESSED as u64)
 }
 
 /// (project, slice_start, slice_end, generation, source_fp, source_rows) — the

@@ -7635,9 +7635,36 @@ impl TailAdd {
 /// physical target. Mixing the two levels forces a full sort of the entire
 /// 256/512 MiB group; in production those units either exhausted the 512 MiB
 /// pool or timed out after five minutes and made no durable progress.
+/// DECODED working set one bin-of-unsorted-files may sort.
+///
+/// This budget used to be `COORDINATOR_L0_SORT_TARGET_BYTES` — 16 MB of
+/// COMPRESSED input, i.e. ~192 MB decoded, against a 4.1 GB pool. Prod
+/// 2026-08-28 shows what that cost: staged bins were bimodal, with unsorted bins
+/// retiring **3-7 files (0.4-13.2 MB)** against all-sorted bins retiring
+/// **21-24 files (260-266 MB)**. The sorted-run tag is written only by OPTIMIZE,
+/// so a bin over fresh flush output essentially always takes the capped path —
+/// the fragmented partitions that most need compaction were the ones compacting
+/// 16 MB at a time.
+///
+/// Sized from the same invariant as [`REPAIR_SLICE_DECODED_TARGET_BYTES`]:
+/// `budget x concurrent sorts <= ~half the pool`. At 768 MB decoded (= 64 MB
+/// compressed) one repair slice plus two of these is ~2.5 GB of 4.1 GB, leaving
+/// real headroom — a sort that spills grows an unspillable merge, so the margin
+/// is the point. Deliberately kept at or below the repair slice budget so a bin
+/// can never out-reserve the heavier lane.
+const UNSORTED_BIN_DECODED_BUDGET_BYTES: i64 = 768 * 1024 * 1024;
+
+/// The unsorted-bin budget in COMPRESSED bytes, which is what `Add.size` is.
+fn unsorted_bin_budget_bytes() -> i64 {
+    UNSORTED_BIN_DECODED_BUDGET_BYTES / crate::database::maintain::DECODED_BYTES_PER_COMPRESSED
+}
+
 fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target: i64) -> Vec<String> {
     let has_unsorted = candidates.iter().any(|add| !add.is_sorted_run);
-    let limit = if has_unsorted { COORDINATOR_L0_SORT_TARGET_BYTES } else { target };
+    // DECODED-sized, like every other sort budget here. NOT
+    // `COORDINATOR_L0_SORT_TARGET_BYTES` — that constant still gates single
+    // oversized L0 files into the slicing path and must keep its own value.
+    let limit = if has_unsorted { unsorted_bin_budget_bytes() } else { target };
     // SMALLEST FIRST. Candidates arrive in EVENT-TIME order, and the loop below
     // pushes the first one unconditionally, so a single large file fills the
     // budget by itself, the next candidate breaks the loop, and the unit selects
@@ -15075,11 +15102,15 @@ mod tests {
         const MB: i64 = 1024 * 1024;
         let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: sorted, event_range: None };
 
+        // Sorted runs are still excluded while any L0 file is present, but the two
+        // L0 files now share one unit instead of taking a unit each.
         let mixed = vec![f("l0-a", 20, false), f("sorted", 10, true), f("l0-b", 20, false)];
-        assert_eq!(super::select_coordinator_compaction_candidates(mixed, 256 * MB), vec!["l0-a"]);
+        assert_eq!(super::select_coordinator_compaction_candidates(mixed, 256 * MB), vec!["l0-a", "l0-b"]);
 
+        // 32 MB of small L0 files fits the unsorted-bin budget, so ALL of them go
+        // in one unit. Under the old 16 MB cap this stopped at two.
         let small_l0 = vec![f("a", 8, false), f("b", 8, false), f("c", 8, false), f("d", 8, false)];
-        assert_eq!(super::select_coordinator_compaction_candidates(small_l0, 256 * MB), vec!["a", "b"]);
+        assert_eq!(super::select_coordinator_compaction_candidates(small_l0, 256 * MB), vec!["a", "b", "c", "d"]);
 
         let runs = vec![f("a", 100, true), f("b", 100, true), f("c", 100, true)];
         assert_eq!(super::select_coordinator_compaction_candidates(runs, 256 * MB), vec!["a", "b"]);
@@ -15092,6 +15123,44 @@ mod tests {
         );
 
         assert_eq!(super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB), None);
+    }
+
+    /// A bin holding unsorted files gets a budget sized in DECODED bytes too.
+    ///
+    /// Same bug class as `REPAIR_SLICE_DECODED_TARGET_BYTES`: the cap was
+    /// `COORDINATOR_L0_SORT_TARGET_BYTES` = 16 MB of COMPRESSED input, i.e. only
+    /// ~192 MB decoded against a 4.1 GB pool — roughly 20x too conservative.
+    /// Measured on prod 2026-08-28, staged bins were bimodal: bins containing an
+    /// unsorted file retired **3-7 files (0.4-13.2 MB)** while all-sorted bins
+    /// retired **21-24 files (260-266 MB)**. Since the sorted-run tag is written
+    /// only by OPTIMIZE, nearly every bin over fresh flush output takes the
+    /// 16 MB path — so the cap taxed exactly the fragmented partitions that
+    /// needed compaction most.
+    #[test]
+    fn an_unsorted_bin_is_budgeted_in_decoded_bytes() {
+        const MB: i64 = 1024 * 1024;
+        let f = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: false, event_range: None };
+        let budget = super::unsorted_bin_budget_bytes();
+
+        // The invariant the value is chosen from, stated as a test so a future
+        // retune cannot quietly break it: one repair slice plus two concurrent
+        // unsorted-bin sorts must still fit about half the light pool.
+        let decoded = crate::database::maintain::estimated_decoded_bytes(budget) as i64;
+        assert!(
+            decoded + 2 * decoded <= super::REPAIR_SLICE_DECODED_TARGET_BYTES * 3,
+            "budget x concurrent sorts must stay within the pool share"
+        );
+        assert!(decoded <= super::REPAIR_SLICE_DECODED_TARGET_BYTES, "an unsorted bin must not out-reserve a repair slice");
+
+        // 4 MB files are typical of a fragmented sealed day (08-25: 964 files /
+        // 3.55 GB). The bin must now take many of them, not three.
+        let many: Vec<_> = (0..40).map(|i| f(&format!("s{i:02}"), 4)).collect();
+        let picked = super::select_coordinator_compaction_candidates(many, super::COORDINATOR_SEALED_TARGET_BYTES);
+        assert!(picked.len() >= 15, "a fragmented cell must retire many files per unit, got {}", picked.len());
+        assert!((picked.len() as i64) * 4 * MB <= budget, "...but never more than the decoded budget allows");
+
+        // The 16 MB cap would have stopped at 4 of these.
+        assert!(picked.len() > 4, "the old compressed-byte cap must not still be binding");
     }
 
     /// A slice must bound DECODED bytes, because that is what the sort allocates.
