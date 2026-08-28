@@ -389,6 +389,44 @@ the failure mode: 2.7 GB slices thrashing a pinned pool, where the spill-merge i
 both the memory hog and much of the latency. A 1 GB slice against a ~2 GB fair
 share should mostly not spill. Treat 73 s as a ceiling, not an expectation.
 
+## Change 2 — READY, NOT PUSHED (`aeffc85`)
+
+**Held deliberately.** Pushing restarts prod and resets every counter, which would
+end P0's clean measurement window and make P3c's "may not need doing at all"
+unanswerable. Order is fixed: measure P0 at ~02:10 UTC → record → then push.
+
+**The same bug class, found by looking for it.** A bin containing any unsorted
+file was capped at `COORDINATOR_L0_SORT_TARGET_BYTES` = **16 MB compressed**
+(~192 MB decoded) against a 4.1 GB pool. Prod 2026-08-28, staged bins are bimodal:
+
+| bin | files retired | bytes |
+|---|---|---|
+| contains an unsorted file | **3–7** | 0.4–13.2 MB |
+| all sorted runs | **21–24** | 260–266 MB |
+
+The sorted-run tag is written only by OPTIMIZE (the selector's own comment says
+it "effectively never ran"), so a bin over fresh flush output essentially always
+takes the capped path. **The cap taxed exactly the fragmented partitions that
+most need compaction** — 08-25 holds 964 files in 3.55 GB and drains ~4 per unit.
+
+Adds `UNSORTED_BIN_DECODED_BUDGET_BYTES` = 768 MB decoded (64 MB compressed),
+sized from the same `budget × concurrent sorts ≤ ~half pool` invariant and kept
+at or below the repair slice budget so a bin can never out-reserve the heavier
+lane. `DECODED_BYTES_PER_COMPRESSED` now names the conversion.
+
+`COORDINATOR_L0_SORT_TARGET_BYTES` is **left alone on purpose** — it also gates
+single oversized L0 files into the slicing path, and raising it in place would
+silently stop slicing 20–80 MB files. That double duty is the trap here.
+
+**Prediction:** bins containing unsorted files go from 3–7 files / ≤16 MB to
+~15–40 files, so sealed drain per unit rises ~4–5×. Self-limiting by design:
+outputs carry `SORTED_RUN_TAG`, so second-pass bins graduate to the 256 MB path —
+the cap mainly taxed the *first* pass over fresh flush output.
+
+**Hygiene noted, not bundled:** the `has_unsorted → limit` line is where a
+file-count cap would go if merge fan-in ever needs bounding (the refuted
+diagnosis #2). Not needed on current evidence.
+
 ### Measurement discipline for the morning
 
 A push **restarts prod**, which resets process-scoped counters and kills the
