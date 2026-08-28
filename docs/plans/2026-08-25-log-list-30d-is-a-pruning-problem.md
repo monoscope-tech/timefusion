@@ -114,10 +114,13 @@ Two constraints it respects, both bought with prior outages:
 
 * **A byte budget, not a heuristic.** Sorting a whole-window parquet leg is the
   2026-08-02 and 2026-08-07 OOMs; size is the only thing separating those from
-  this. `timefusion_read_sort_unordered_leg_max_mb` (default 256, **0 disables
-  the repair**) is the admission test, and `ordered_children` bails on the whole
-  union as soon as one over-budget child misses the ordering — so the bad case is
-  structurally unreachable rather than merely unlikely.
+  this. `timefusion_read_sort_unordered_leg_max_mb` (default **64**, **0 disables the
+  repair**) is the admission test, and `ordered_children` bails on the whole union
+  as soon as one over-budget child misses the ordering — so the bad case is
+  structurally unreachable rather than merely unlikely. 64 MB is COMPRESSED
+  selected bytes, ~0.8 GB decoded: the same number and the same reason as
+  `timefusion_wide_scan_max_mb`, and the repair runs on every Delta-reading query,
+  so the ceiling is paid concurrently rather than once.
 * **In the scan path, not as a `PhysicalOptimizerRule`.** `DedupExec` declares no
   required input ordering, so a sort injected before `EnforceSorting` is deleted
   as unused — the first attempt fired and was silently undone. Doing it where
@@ -126,15 +129,18 @@ Two constraints it respects, both bought with prior outages:
   sorting a child changes no rows, so it stays sound beneath keep-greatest, where
   a top-n cut on a leg would truncate row versions.
 
-Verified: the regression test fails before and passes after, asserting **both**
-halves — `SortPreservingMergeExec` present and `DedupExec` not in `full-set`
-mode.
+Verified: the regression test was witnessed FAILING first, and now asserts **both**
+halves of the repair (`SortPreservingMergeExec` present, `DedupExec` not in
+`full-set` mode) **and** the decline at budget 0 — which returns the un-repaired
+plan and the same rows. Budget 0 is not a separate early return, so pinning the
+decline also pins the comparison's direction. `cargo lint` 0; `make test`
+1230/1230; `make test-e2e` 62/62.
 
 ## What this does NOT fix, and what to measure next
 
 1. **The budget may not admit prod's legs.** A compacted whale file is ~307 MB
-   compressed, so a single non-conforming file already exceeds the 256 MB
-   default. The repair lands the common case (a handful of freshly-concatenated
+   compressed, so a single non-conforming file already exceeds the 64 MB
+   default by ~5x. The repair lands the common case (a handful of freshly-concatenated
    small files among thousands of sorted ones); it does not rescue a window whose
    unsorted side is itself whale-sized. **The lever for that remains REPAIR of
    the footers, not read-time sorting** — which is what the maintenance backlog
