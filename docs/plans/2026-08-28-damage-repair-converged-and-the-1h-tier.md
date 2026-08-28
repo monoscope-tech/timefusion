@@ -703,3 +703,46 @@ a quiet window on the deploy carrying both fixes.**
 4. **Still unexplained and NOT blocking** — §5's 11-47% partial hours, measured as
    `sum(request_count)` via SQL. The journal cannot answer this (§12's trap); it
    needs measure sums per cell.
+
+## 15. RESOLVED — the partial hours stopped on 08-26 too. Nothing in the content path is still live.
+
+Section 5's 11-47% partial hours were the last unexplained defect, and §12 showed
+the journal cannot answer it. Measured the only way that works — `sum(request_count)`
+per hour, 1h tier against its 1m base, per (project, date):
+
+| date | project | hours in 1h tier | of those, **SHORT** (<90% of base) | day total vs base |
+|---|---|---|---|---|
+| 08-20 | `28f62f01` | 24 / 24 | **0** | 100.0% |
+| 08-20 | `87576849` | 23 / 24 | 7 | 82.7% |
+| 08-23 | `28f62f01` | 24 / 24 | **0** | 100.0% |
+| 08-23 | `87576849` | 24 / 24 | **0** | 100.0% |
+| **08-25** | `28f62f01` | 19 / 24 | **17** | **24.3%** |
+| **08-25** | `87576849` | 13 / 24 | **12** | **12.1%** |
+| 08-27 | `28f62f01` | 7 / 24 | **0** | 26.8% |
+| 08-27 | `87576849` | 1 / 24 | **0** | 4.3% |
+
+**The two failure modes separate on the date, and it is the same boundary again.**
+
+* **08-25 is corrupted**: hours missing *and* the hours that exist hold a fraction
+  of their base — 17 of 19 present hours short.
+* **08-27 is merely INCOMPLETE**: far fewer hours built, but **every hour that
+  exists is exact** (0 short). That is backlog, not damage — consistent with
+  `pending_derived_rollup` sitting at ~296.
+
+So the partial-content defect stopped on 08-26 exactly as the empty-publication
+defect did (§12). **There is no remaining live content defect in the derived
+path.** What is left after 08-26 is throughput: the tier lags.
+
+### The plan collapses to two things
+
+1. **Rebuild** the 08-22 … 08-25 damage (§14's union, regenerated) — now safe,
+   because §13 stops the next base repair undoing it and §11 stops the migration
+   dropping 23 hours of it.
+2. **Throughput** — 08-27 having 7 and 1 of 24 hours built is the pre-existing
+   maintenance-queue problem, tracked in
+   `docs/plans/2026-08-25-maintenance-throughput-and-rollup-reads.md`. It is not
+   a correctness bug and does not block the rebuild.
+
+Caveat: one day per project, and 08-27 is recent enough that its hours may still
+be building — which is the point of calling it incompleteness. The contrast that
+carries the conclusion is 0 short hours on 08-27 against 17 and 12 on 08-25.
