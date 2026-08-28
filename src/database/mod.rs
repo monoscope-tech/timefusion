@@ -4143,7 +4143,18 @@ impl Database {
             match self.rollup_rewrite_for(route, session).await {
                 Ok(Some(rewrite)) => return Ok(Some(rewrite)),
                 Ok(None) => return Ok(None),
-                Err(reason) => best_miss = best_miss.or(Some(reason)),
+                // A measure decline OUTRANKS whatever an earlier spec reported.
+                // `.or()` alone keeps the FIRST reason, so a tier that simply has
+                // no cells (`NotBuilt`) masked the specific, actionable signal
+                // that a cell EXISTS and is fresh but cannot prove the measure.
+                // That is why `rollup_miss_measure_not_stored_total` read 0 for
+                // 15h on prod while the not-yet-servable gate was refusing every
+                // cell by construction. Same masking shape as the grain-vs-real
+                // reason fix one layer down, and it hid the newer signal.
+                Err(reason) => {
+                    let specific = matches!(reason, crate::rollup::MissReason::MeasureNotStored);
+                    best_miss = if specific { Some(reason) } else { best_miss.or(Some(reason)) };
+                }
             }
         }
         Err(best_miss.unwrap_or(crate::rollup::MissReason::NotBuilt))
@@ -4433,7 +4444,11 @@ impl Database {
         // With the tail off, the pre-fringe contract stands exactly: the rollup
         // answers the whole window or nothing at all.
         if !realtime && (miss.is_some() || horizon < route.hi || route.lo.rem_euclid(route.grain) != 0 || route.hi.rem_euclid(route.grain) != 0) {
-            return Err(miss.unwrap_or(crate::rollup::MissReason::IncompleteCoverage));
+            return Err(if measure_declined {
+                crate::rollup::MissReason::MeasureNotStored
+            } else {
+                miss.unwrap_or(crate::rollup::MissReason::IncompleteCoverage)
+            });
         }
         let interiors = crate::rollup::interiors(route.lo, route.hi, route.grain, horizon, &covered);
         if interiors.is_empty() {
@@ -4458,7 +4473,7 @@ impl Database {
                     "coverage produced no usable interior for this window"
                 );
             }
-            return Err(miss.unwrap_or(crate::rollup::MissReason::TinyInterior));
+            return Err(if measure_declined { crate::rollup::MissReason::MeasureNotStored } else { miss.unwrap_or(crate::rollup::MissReason::TinyInterior) });
         }
         if crate::rollup::hybrid_branch_count(route.lo, route.hi, &interiors) > 32 {
             return Err(crate::rollup::MissReason::TooManyBranches);
@@ -4470,7 +4485,7 @@ impl Database {
         ticket.retain(|((_, _, _, date), ..)| reads(date));
         slice_ticket.retain(|((_, _, _, start, end), ..)| interiors.iter().any(|(covered_start, covered_end)| *start < *covered_end && *end > *covered_start));
         if generations.is_empty() {
-            return Err(miss.unwrap_or(crate::rollup::MissReason::NotBuilt));
+            return Err(if measure_declined { crate::rollup::MissReason::MeasureNotStored } else { miss.unwrap_or(crate::rollup::MissReason::NotBuilt) });
         }
         if measure_declined {
             crate::observability::record_rollup_miss(crate::rollup::MissReason::MeasureNotStored);
@@ -12693,6 +12708,28 @@ mod tests {
                         .iter()
                         .any(|((.., start, _), ..)| { chrono::DateTime::from_timestamp_micros(*start).is_some_and(|time| time.date_naive() == days[1]) }),
                 "the sibling day proves the digest and must keep routing"
+            );
+        }
+
+        // TOTAL decline: strip the digest from the sibling day too, so NO date
+        // can prove it. That is the shape a not-yet-servable measure produces by
+        // construction, and it is the case the counter could not report.
+        {
+            for mut entry in db.rollup_slice_coverage.iter_mut() {
+                if entry.key().0 == project {
+                    strip(&mut entry.value_mut().measures);
+                }
+            }
+            for mut entry in db.rollup_coverage.iter_mut() {
+                if entry.key().0 == project {
+                    strip(&mut entry.value_mut().measures);
+                }
+            }
+            let total = route(&db, sql(&shapes[1], true)).await;
+            let reason = total.expect_err("no date can prove the digest, so nothing may route").to_string();
+            assert!(
+                reason.contains(crate::rollup::MissReason::MeasureNotStored.label()),
+                "a TOTAL measure decline must report measure_not_stored — got {reason}"
             );
         }
         Ok(())
