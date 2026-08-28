@@ -6737,18 +6737,24 @@ impl Database {
     /// [`REPAIR_VERIFIED_PERSIST_CAP`] entries; returns `(kept, dropped)`. Newest entries win —
     /// the tail of the file is the most recently written or probed. Caller holds
     /// `repair_verified_lock`.
+    /// The read+rewrite is multi-MB once the cap is reached and this is reachable from the FLUSH
+    /// commit path, so it goes through `without_blocking_the_worker` exactly like the append
+    /// beside it. Blocking IO inline on a tokio worker is this codebase's recurring incident
+    /// shape — a journal fsync on the ingest path was worth 5.7 lag warns/min until it moved.
     fn truncate_verified_file_locked(&self) -> (Vec<String>, usize) {
         let file_path = self.repair_verified_path();
-        let Ok(contents) = std::fs::read_to_string(&file_path) else { return (Vec::new(), 0) };
-        let all: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
-        let kept: Vec<String> = all[all.len().saturating_sub(REPAIR_VERIFIED_PERSIST_CAP)..].iter().map(|line| (*line).to_string()).collect();
-        let dropped = all.len() - kept.len();
-        if dropped > 0
-            && let Err(e) = std::fs::write(&file_path, kept.iter().map(|path| format!("{path}\n")).collect::<String>())
-        {
-            warn!("verified-sorted compaction failed ({:?}): {e}", file_path);
-        }
-        (kept, dropped)
+        crate::support::without_blocking_the_worker(|| {
+            let Ok(contents) = std::fs::read_to_string(&file_path) else { return (Vec::new(), 0) };
+            let all: Vec<&str> = contents.lines().filter(|line| !line.is_empty()).collect();
+            let kept: Vec<String> = all[all.len().saturating_sub(REPAIR_VERIFIED_PERSIST_CAP)..].iter().map(|line| (*line).to_string()).collect();
+            let dropped = all.len() - kept.len();
+            if dropped > 0
+                && let Err(e) = std::fs::write(&file_path, kept.iter().map(|path| format!("{path}\n")).collect::<String>())
+            {
+                warn!("verified-sorted compaction failed ({:?}): {e}", file_path);
+            }
+            (kept, dropped)
+        })
     }
 
     /// Load the persisted verified-sorted paths at boot, compacting the file if
@@ -7280,9 +7286,14 @@ impl Database {
     /// work and leaves the population by being rewritten; persisting it as "known bad" would
     /// create a second durable set to keep consistent with the first, and the failure mode of
     /// THAT is a file marked bad forever after it has been fixed.
-    pub(crate) async fn seed_verified_sorted(&self, limit: usize) -> usize {
+    /// Returns `(tables_read, verified)`. The first is not a statistic — it is how the caller
+    /// tells "the fleet is already seeded" apart from "this ran before the tables existed".
+    /// Those two produce an identical `verified = 0`, and the second is exactly what a sweep
+    /// spawned at boot, in front of a ~300s preload, will do.
+    pub(crate) async fn seed_verified_sorted(&self, limit: usize) -> (usize, usize) {
         use futures::StreamExt;
         let mut unknown: Vec<(Arc<RwLock<DeltaTable>>, String)> = Vec::new();
+        let mut tables_read = 0usize;
         for (_, source, table_ref) in self.all_tables().await {
             // A table declaring no sort order has no footer to lose, so it has no
             // suspects — probing it would be pure IO for a set nothing reads.
@@ -7292,6 +7303,7 @@ impl Database {
             {
                 let table = table_ref.read().await;
                 let Ok(snapshot) = table.snapshot() else { continue };
+                tables_read += 1;
                 for file in snapshot.log_data().iter() {
                     let path = file.path().into_owned();
                     if !self.repair_verified_sorted.contains(&path) {
@@ -7304,10 +7316,15 @@ impl Database {
             }
         }
         unknown.truncate(limit);
-        if unknown.is_empty() {
-            return 0;
-        }
         let candidates = unknown.len();
+        if unknown.is_empty() {
+            // Logged even though there is nothing to report, because THIS is the
+            // ambiguous reading: `tables_read = 0` means the sweep ran before the
+            // tables were loaded and did nothing, which is indistinguishable from
+            // a fully-seeded fleet if the only evidence is a missing log line.
+            info!(tables_read, candidates = 0, verified = 0, event = "footer_repair_seed_swept");
+            return (tables_read, 0);
+        }
         let verified: Vec<String> = futures::stream::iter(unknown)
             .map(|(table_ref, path)| async move {
                 let object_store = { table_ref.read().await.log_store().object_store(None) };
@@ -7324,8 +7341,8 @@ impl Database {
         // Both numbers, always. `verified` alone cannot distinguish "the fleet is
         // healthy" from "the sweep found nothing to look at", and the difference
         // between them is the entire size of the repair backlog.
-        info!(candidates, verified = verified.len(), unsorted = candidates - verified.len(), event = "footer_repair_seed_swept");
-        verified.len()
+        info!(tables_read, candidates, verified = verified.len(), unsorted = candidates - verified.len(), event = "footer_repair_seed_swept");
+        (tables_read, verified.len())
     }
 
     /// Each pass is budgeted from its own cron period because their units are orders of magnitude

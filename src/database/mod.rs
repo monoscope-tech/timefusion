@@ -4558,21 +4558,30 @@ impl Database {
         // leaving them to repair's own `.take(1)` walk is what made admission
         // O(every file ever written) in the first place.
         //
-        // Detached and bounded, never on the boot path: a 300s preload already
+        // Detached and bounded, never on the boot path: a ~300s preload already
         // sits between boot and the first useful maintenance tick, and adding
         // object-store round trips in front of it would trade a slow queue for a
-        // slow start. Repeats every hour because new files keep arriving from
-        // paths that do not mark (schema-evolution merges, resumed staged bins);
-        // the sweep is a no-op once they are known, since it only probes unknowns.
+        // slow start.
+        //
+        // THE CADENCE IS LOAD-BEARING, and an hourly loop would have been wrong.
+        // This sweep is spawned here, so its FIRST pass runs while the tables are
+        // still loading and reads nothing — and prod containers live 20-40
+        // minutes, so an hourly retry would never fire a second time. The seeding
+        // would have been a permanent no-op that logged like a success. So retry
+        // on a short interval until a pass actually READS a table, then fall back
+        // to hourly for the trickle of files from paths that do not mark
+        // (schema-evolution merges, resumed staged bins). Persistence means the
+        // fleet only has to be seeded once ever — but some boot has to get there.
         {
             let db = Arc::clone(&db);
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 loop {
-                    db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await;
+                    let (tables_read, _) = db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await;
+                    let wait = if tables_read == 0 { std::time::Duration::from_secs(60) } else { std::time::Duration::from_secs(3600) };
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+                        _ = tokio::time::sleep(wait) => {}
                     }
                 }
             });
@@ -17811,14 +17820,15 @@ mod tests {
         assert!(!written.is_empty(), "the write must have marked something for this test to mean anything");
         db.repair_verified_sorted.clear();
 
-        let seeded = db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await;
+        let (tables_read, seeded) = db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await;
+        assert!(tables_read > 0, "the sweep must have READ a table — reading none is the boot race, not a clean fleet");
         assert!(seeded > 0, "the sweep must re-derive sortedness from the footers already on storage");
         let after: HashSet<String> = db.repair_verified_sorted.iter().map(|entry| entry.key().clone()).collect();
         assert!(written.is_subset(&after), "every file the write knew was sorted must be recovered by the probe");
 
         // Idempotent, and cheap the second time: nothing is unknown any more, so
         // the sweep does no IO at all rather than re-probing the same footers.
-        assert_eq!(db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await, 0, "a second sweep must find nothing unknown");
+        assert_eq!(db.seed_verified_sorted(REPAIR_VERIFY_SEED_LIMIT).await.1, 0, "a second sweep must find nothing unknown");
         Ok(())
     }
 
