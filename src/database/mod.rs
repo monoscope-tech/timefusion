@@ -2805,8 +2805,6 @@ pub struct Database {
     dedup_sweep_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Which table a dedup tick starts with.
     dedup_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
-    /// Which table a hot-compaction tick starts with.
-    hot_compact_table_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// One repair pass process-wide: the light pool is shared by every table,
     /// and two tables repairing concurrently can exhaust it and kill a bin
     /// that still had headroom.
@@ -3040,14 +3038,6 @@ impl Database {
         let guard = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(wait);
         crate::observability::Watched::new("journal_hold", guard)
-    }
-
-    /// All maintenance targets (unified + custom project tables) as `(name, table)` pairs,
-    /// for cron jobs that sweep every table.
-    async fn all_maintenance_targets(&self) -> Vec<(String, Arc<RwLock<DeltaTable>>)> {
-        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> = self.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-        targets.extend(self.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
-        targets
     }
 
     /// Perform a Delta table UPDATE operation
@@ -3479,7 +3469,6 @@ impl Database {
             light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_sweep_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dedup_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            hot_compact_table_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair_pass_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             staged_intent_manifest_lock: Arc::new(std::sync::Mutex::new(())),
         };

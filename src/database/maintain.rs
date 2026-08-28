@@ -5383,56 +5383,6 @@ impl Database {
         }
     }
 
-    async fn run_hot_compact_for_table(
-        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str, pass: TailPass, tick_deadline: Option<std::time::Instant>,
-    ) {
-        use std::sync::atomic::Ordering::Relaxed;
-        const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
-        let t0 = std::time::Instant::now();
-        let m = crate::observability::maintenance_stats();
-        // Per-tick counter deltas in every outcome line — tick health (planned
-        // vs completed, bins landed, brakes hit) must be readable from one log
-        // line, not reconstructed from counter scrapes (2026-08-05 review:
-        // brake-starved ticks were invisible until SSH + grep).
-        let snap = || {
-            [
-                m.light_optimize_projects_planned.load(Relaxed),
-                m.light_optimize_projects_completed.load(Relaxed),
-                m.light_optimize_bins_committed.load(Relaxed),
-                m.light_optimize_memory_brakes.load(Relaxed),
-            ]
-        };
-        let before = snap();
-        let result = self.optimize_table_light_until(table, table_name, pass, tick_deadline).await;
-        let after = snap();
-        let [planned, completed, bins, brakes] = std::array::from_fn(|i| after[i] - before[i]);
-        let elapsed = t0.elapsed();
-        match result {
-            Ok(()) if elapsed > OPTIMIZE_WARN => {
-                warn!(
-                    "Light optimize for {label} took {elapsed:?} (exceeds {OPTIMIZE_WARN:?} threshold): planned={planned} completed={completed} bins={bins} brakes={brakes}"
-                );
-                m.light_optimize_timed_out.fetch_add(1, Relaxed);
-            }
-            Ok(()) => info!("Light optimize completed for {label} in {elapsed:?}: planned={planned} completed={completed} bins={bins} brakes={brakes}"),
-            // PARTIAL is not FAILED. `optimize_table_light` returns Err if ANY
-            // bin failed, so a tick that compacted 6 of 9 projects logged at
-            // ERROR identically to one that compacted nothing. That cost real
-            // diagnosis time on 2026-08-08: the otel_metrics recovery from
-            // `completed=0` to `completed=6` was invisible, because both states
-            // printed the same red line. Reserve ERROR for "this tick achieved
-            // nothing", which is the condition actually worth paging on.
-            Err(e) if bins > 0 => {
-                m.light_optimize_failed.fetch_add(1, Relaxed);
-                warn!("Light optimize PARTIAL for {label} in {elapsed:?} (planned={planned} completed={completed} bins={bins} brakes={brakes}): {e}");
-            }
-            Err(e) => {
-                m.light_optimize_failed.fetch_add(1, Relaxed);
-                error!("Light optimize failed for {label} in {elapsed:?} (planned={planned} completed={completed} bins={bins} brakes={brakes}): {e}");
-            }
-        }
-    }
-
     /// Sealed dates a REPAIR pass scans for footer repair (yesterday backwards).
     /// A packing pass carries none: the two passes own disjoint partitions.
     fn repair_dates(&self, today: chrono::NaiveDate, pass: TailPass) -> Vec<String> {
