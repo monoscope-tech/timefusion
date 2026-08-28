@@ -465,10 +465,53 @@ Two failures at 01:29:00 belong to the *old* process being terminated mid-unit b
 the deploy (the `foyer close` line follows them) — deploy artifacts, not a new
 failure mode. Always filter on the process start, not the log window.
 
-**Watch next:** the 08-24/25/26 drain rate against the ~46 files/hr baseline, and
-unit durations — larger bins do more work per unit, and the pre-deploy metrics
-unit was already running 667–889 s against a 900 s deadline. If units start
-dying at the deadline, the budget is too large and 512 MB decoded is the fallback.
+### DRAIN STALLED at 47 min — and it is NOT change 2
+
+logs 08-24/25/26 moved **0** files in the 47 min after change 2 (metrics: −1),
+against −89 in the P0 window. Investigated before touching anything:
+
+- **Change 2 is exonerated.** The new unsorted bins are 15–29 files / 0.2–62 MB,
+  all inside budget; permit waits are **0.0 s**; memory failures are **0**. No
+  mechanism links it to the stall.
+- **All six 900 s units are `otel_metrics`** — projects `00000000` and
+  `8100121c`, slices **08-17, 08-18, 08-19** — finishing `outcome=Some(Running)
+  ran_secs=900`, i.e. abandoned at the deadline having committed nothing. Not one
+  is `otel_logs_and_spans`. **The logs bins are never reached because the shared
+  sealed lane is pinned by old metrics cells.**
+- **Refuted en route:** the tag/footer disagreement theory (that all-sorted bins
+  silently fall back to a whole-bin sort because OPTIMIZE strips tags). Probed
+  the 10 largest files in those exact cells: **10/10 `DECLARED`, 0 errors.** They
+  really are sorted; the cheap streaming SPM should apply.
+- **Also checked and dismissed:** a second restart. The container ID changed
+  between samples, but `docker service ps` shows `df2vdc2…` = `665f95e` up 47 min
+  — the other ID was the old `eadffa1` container.
+
+**The blocker, named by our own instrument:**
+
+```
+SealedConsolidation refusal="outranked_by:00000000:2026-08-20:28f62f01:2026-08-27:files=433"
+```
+
+The most indebted cell in the fleet — **28f62f01 / 08-27, 433 files** — is
+outranked by a small, nearly-converged 08-20 cell, and the metrics cells at
+08-17/18/19 are older still, so they win the lane and burn 900 s each.
+
+**This promotes P3 (rank by benefit, not age) from "later" to THE measured
+blocker.** P0 removed the memory ceiling and change 2 raised per-unit yield ~4×;
+what remains is that the lane is pointed at the wrong work. It is the same defect
+the 08-20 and 08-22 chart revisions both named and neither fixed — now with an
+instrument that prints the victim and the winner on every tick.
+
+**Second, separate defect to keep:** a metrics cell that cannot finish in 900 s
+is a bug regardless of ordering — 861 files / 13.5 GB across 08-17…19, median
+13.4 MB, all sorted, yet a ~263 MB bin grinds the full deadline. Ordering will
+stop it *monopolising* the lane but not make it complete. Needs its own
+investigation (candidate: cost is the commit, not the sort —
+[[tf_rollup_unit_cost_is_the_commit_2026-08-19]]).
+
+**Calibration:** drains are lumpy (one commit retires 20–46 files), so 0-in-47-min
+is only ~2 missed commit events and weak alone. The **six Running@900
+abandonments** are the real signal.
 
 ### (history) Change 2 while it was held
 
