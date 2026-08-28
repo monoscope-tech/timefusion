@@ -5219,6 +5219,9 @@ impl Database {
                 let mut rules = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules;
                 let pos = rules.iter().position(|r| r.name() == "EnforceDistribution").unwrap_or(0);
                 rules.insert(pos, Arc::new(crate::read::optimizers::OrderedUnionForTopK));
+                // Before that again: it repairs the Delta leg's own ordering
+                // claim, which is the input `OrderedUnionForTopK` looks for.
+                rules.insert(pos, Arc::new(crate::read::optimizers::SortIsolatedUnorderedScan::new(self.config.memory.timefusion_read_sort_unordered_leg_max_mb)));
                 // After EnforceSorting/EnforceDistribution, never before: this rule exists to
                 // undo their (locally correct) decision to discharge DedupExec's ordering as
                 // trivially satisfied when a pushed equality pins the sort column to a
@@ -9738,7 +9741,7 @@ impl Database {
 /// Files and bytes a scan will actually open, read off the plan's file groups
 /// AFTER pruning. `None` when the plan carries no file scan (so the caller must
 /// not read "no files" as "no work").
-fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
+pub(crate) fn selected_file_work(plan: &Arc<dyn ExecutionPlan>) -> Option<(usize, u64)> {
     if let Some(src) = (plan.as_ref() as &dyn std::any::Any).downcast_ref::<DataSourceExec>()
         && let Some(conf) = (src.data_source().as_ref() as &dyn std::any::Any).downcast_ref::<FileScanConfig>()
     {

@@ -2217,6 +2217,86 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
     }
 }
 
+// Give back the ordering claim that delta-rs's "isolate, don't surrender" split
+// costs the conforming majority.
+//
+// The fork no longer lets one footer-less file void the `[timestamp DESC]` claim
+// for a whole scan: conforming files keep it in one `DataSourceExec` and the rest
+// become a sibling with no claim, unioned together. But a `UnionExec` advertises
+// an ordering only when EVERY child does, so the Delta leg as a whole advertises
+// none — and every consumer downstream degrades at once:
+//
+// * `ProjectRoutingTable::scan` cannot build its `SortPreservingMergeExec`, so
+//   `DedupExec` falls from bounded keep-greatest to the unbounded `full-set` mode;
+// * `OrderedUnionForTopK` finds no ordered child and no-ops, so `ORDER BY
+//   timestamp DESC LIMIT n` stays a BLOCKING `SortExec` over the whole window.
+//
+// That is the 30-day `log_list` mechanism: a 251-row newest-first listing that
+// reads every selected byte (prod p1 selected 431 GB) while the same query at 14 d,
+// where every file conforms, streams in 1.6 s. It is a cliff, not a gradient —
+// ONE non-conforming file flips it.
+//
+// The repair is to sort the isolated leg so the union is order-preserving again.
+// Sorting a whole-window parquet leg is itself the 2026-08-02 / 2026-08-07 OOM,
+// and the only thing separating that from this is SIZE, so the leg's selected
+// bytes are the admission test (`max_bytes`, 0 = rule off). No fetch is pushed:
+// this rule is anchored on the union's own advertised ordering rather than on a
+// downstream fetching sort, so it fires under `DedupExec` too — where a fetch cut
+// would truncate row versions — and sorting a child changes no rows.
+//
+// Scope: only unions whose children are ALL bare file scans, which is the fork's
+// isolation shape and nothing else. TimeFusion's own `mem ∪ delta` union has a
+// non-scan child, so it is never touched here.
+#[derive(Debug)]
+pub struct SortIsolatedUnorderedScan {
+    max_bytes: u64,
+}
+
+impl SortIsolatedUnorderedScan {
+    pub fn new(max_mb: u64) -> Self {
+        Self { max_bytes: max_mb.saturating_mul(1 << 20) }
+    }
+}
+
+impl PhysicalOptimizerRule for SortIsolatedUnorderedScan {
+    fn name(&self) -> &str {
+        "sort_isolated_unordered_scan"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        if self.max_bytes == 0 {
+            return Ok(plan);
+        }
+        // Bottom-up so a rewritten union's new ordering propagates through the
+        // `DeltaScanExec` wrapping it as the parents are rebuilt.
+        Ok(plan
+            .transform_up(|node| {
+                let Some(union) = downcast::<UnionExec>(node.as_ref()) else {
+                    return Ok(Transformed::no(node));
+                };
+                let children: Vec<Arc<dyn ExecutionPlan>> = union.children().into_iter().cloned().collect();
+                let Some(sizes) = children.iter().map(crate::database::selected_file_work).collect::<Option<Vec<_>>>() else {
+                    return Ok(Transformed::no(node));
+                };
+                let Some(req) = children.iter().find_map(|c| c.properties().output_ordering()).cloned() else {
+                    return Ok(Transformed::no(node));
+                };
+                // `sortable` is the byte budget; `require_ordered_child` keeps the
+                // rule inert when nothing advertises the ordering to merge toward.
+                let sortable: Vec<bool> = sizes.iter().map(|(_, bytes)| *bytes <= self.max_bytes).collect();
+                Ok(match ordered_children(&children, &req, None, &sortable, true)? {
+                    Some(ordered) => Transformed::yes(UnionExec::try_new(ordered)?),
+                    None => Transformed::no(node),
+                })
+            })?
+            .data)
+    }
+}
+
 #[cfg(test)]
 mod ordered_union_for_topk_tests {
     use datafusion::{

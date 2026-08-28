@@ -124,3 +124,67 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
 
     Ok(())
 }
+
+// One non-conforming file must not cost the conforming majority its ordering
+// claim — the 30-day `log_list` mechanism.
+//
+// The delta-rs fork deliberately ISOLATES files whose footer does not declare
+// the scan's common ordering: the conforming files keep the `[timestamp DESC]`
+// claim in one `DataSourceExec` and the rest are unioned in as a sibling with no
+// claim ("isolate, don't surrender"). But a `UnionExec` advertises an ordering
+// only when EVERY child does, so the Delta leg as a whole then advertises none —
+// and `ProjectRoutingTable::scan`'s own `mem ∪ delta` union sees an unordered,
+// unsortable Delta leg, bails, and DataFusion plants a BLOCKING `SortExec` over
+// the entire window. A `LIMIT 251` newest-first listing therefore reads every
+// selected byte instead of the newest few files: prod p1 at 30 d selected 431 GB
+// for 251 rows, while the same query at 14 d (all files conforming) streamed in
+// 1.6 s.
+//
+// Fixture: a plain (non-SortBy) `compact_date` concatenates two flushed files
+// into one file with no declared footer order, then two further flushes add
+// conforming files. Majority conforms; the pushdown must survive.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::Result<()> {
+    let bucket_secs = 60u64;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
+    let client = env.pg_client().await?;
+    let sec = 1_000_000i64;
+
+    // Two flushes → two conforming files, then concatenate them into ONE file
+    // that declares no sort order.
+    for b in 0..2i64 {
+        for i in 0..3i64 {
+            insert_at(&client, &format!("u-{}", b * 3 + i), FROZEN_START_MICROS + (b * 3 + i) * sec).await?;
+        }
+        env.advance(Duration::from_secs(bucket_secs * 2));
+        env.force_flush().await?;
+    }
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().date_naive();
+    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date, None).await?;
+    assert!(removed >= 2 && added >= 1, "the fixture needs a real concatenation (removed={removed}, added={added})");
+
+    // Two more flushes → conforming files, so the ordered side is the majority.
+    for b in 2..4i64 {
+        for i in 0..3i64 {
+            insert_at(&client, &format!("s-{}", b * 3 + i), FROZEN_START_MICROS + (b * 3 + i) * sec).await?;
+        }
+        env.advance(Duration::from_secs(bucket_secs * 2));
+        env.force_flush().await?;
+    }
+
+    let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
+    let plan: String = client
+        .query(&format!("EXPLAIN {sql}"), &[])
+        .await?
+        .iter()
+        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("SortPreservingMergeExec"), "one unsorted file must not disable the streaming merge for the conforming majority; plan was:\n{plan}");
+
+    let ids: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
+    assert_eq!(ids, vec!["s-11", "s-10", "s-9"], "wrong top-n or order; plan:\n{plan}");
+    Ok(())
+}
