@@ -879,7 +879,64 @@ split_declined_no_width  = 0
 That is a definitive answer the silent `return false` could not have given, and it
 narrows any future floor-guard work to one branch. Cost: one counter and a test.
 
-## 03:47 — THE HEADLINE: the box is CPU-saturated, and concurrency is sized as if it weren't
+## 03:55 — RETRACTED: the box is NOT CPU-saturated
+
+**The section below is wrong and is kept only so the reasoning chain is honest.**
+Load average 47.5 counts uninterruptible tasks as well as runnable ones, so it is
+not a CPU-contention measurement. `vmstat 2 3` settles it:
+
+```
+ r  b   ...  us sy id wa
+27  0        13  5 82  0
+24  0        35 16 47  2
+33  1        31 15 52  2
+```
+
+**~50% of CPU is IDLE.** And TimeFusion has **no CPU quota** at all
+(`NanoCpus=0 CpuQuota=0`, only `Memory=128849018880` = 120 GB), so it is not
+throttled either. Both halves of the saturation story are refuted by direct
+measurement. I should not have written it as "THE HEADLINE" off a load average.
+
+Two things from that reading *are* real and unexplained: **~200k context
+switches/s** and **~87 MB/s of block writes**. Neither is CPU starvation.
+
+**The P0-window contradiction I had not acknowledged:** the P0 window
+(00:09–01:29) drained 89 files under the *same* 16-worker configuration. If
+concurrency were the binding constraint, that drain should not have happened. So
+"concurrency was always wrong" is not defensible.
+
+**What is defensible instead — the fixes moved the bottleneck.** P0 and change 2
+converted work that used to fail fast on memory into work that actually runs:
+dedup went from failing on the pool to running full 211 s units, and sealed units
+went from dying at 121–763 s to grinding the full 900 s. That is progress — memory
+was the ceiling and is not any more — but it raised CPU demand, and the deadline
+is now what discards the work.
+
+### The leading hypothesis now: bins are budgeted in BYTES, but cost is ROWS
+
+Prod does ~**5,600 rows/s** on the grinding bin (5.08 M rows / 900 s) against
+**27,500 rows/s** composed on dev hardware — some of that gap is simply the
+server's slower cores, which no amount of remote measurement will resolve.
+
+But the *structural* point stands and is a third instance of tonight's bug class:
+`COORDINATOR_SEALED_TARGET_BYTES` is **256 MB of compressed bytes**, while the
+cost of a bin is its **row count**. Measured:
+
+| table | bytes/row | rows in a 256 MB bin |
+|---|---|---|
+| `otel_logs_and_spans` | 155 B | **1.73 M** |
+| `otel_metrics` | 47 B | **5.58 M** — 3.2× |
+
+Same byte budget, 3.2× the work. Logs bins stage in **1–46 s**; metrics bins
+exceed **900 s**. A row-denominated (or throughput-denominated) budget would size
+both correctly, exactly as decoded-bytes did for the sort budgets.
+
+**Verify before building:** get row counts for the *fast* logs bins to confirm the
+ratio explains the time difference rather than only pointing the same direction —
+3.2× rows should not by itself produce a 20× time difference, so something else
+is still unaccounted.
+
+## SUPERSEDED (wrong) — "the box is CPU-saturated, and concurrency is sized as if it weren't"
 
 Everything above is per-unit efficiency. This is the capacity finding, and it
 explains the ~5× that per-unit measurement could not.
