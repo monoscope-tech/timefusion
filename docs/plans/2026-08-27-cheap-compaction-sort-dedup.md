@@ -788,6 +788,44 @@ does not need to finish the whole day in 900 s. These units are dying inside
 staging **one** bin. The floor guard is doing the right thing; the bin is just
 too slow. The guard question stands on its own merits but is NOT what pins this lane.
 
+### 03:45 — batch size measured locally: real but PARTIAL (~1.5×), not the cause
+
+Built a repeatable experiment rather than waiting on a prod profile:
+`batch_size_dominates_narrow_row_staging` (`#[ignore]`d; run with
+`cargo nextest run --lib batch_size_dominates --run-ignored all --no-capture`).
+It sorts 920k narrow rows across 23 partitions through `execute_stream` — what
+staging does — at each batch size.
+
+| schema | 256 | 2,048 | 8,192 |
+|---|---|---|---|
+| 4 cols | 507k rows/s | 617k | 598k |
+| **69 cols (`otel_metrics`)** | **114k rows/s** | 159k | **175k (+53%)** |
+
+**My first run of this used 4 columns and wrongly exonerated batch size** (17%
+spread). `otel_metrics` has **69 columns**, and per-batch cost is paid per column,
+so a 4-column model understates it ~17×. Corrected, raising the coordinator's
+`batch_override` from 256 toward 8192 is worth **~1.5×** on this shape — a real
+win, and cheap.
+
+**But it is not the cause.** Even at 256 rows the pipeline sustains **114k
+rows/s**, while the prod grind implies **~5,600 rows/s** — still ~20× unexplained.
+So the answer is downstream of the sort.
+
+**What the experiment does NOT cover — and the next thing to measure:** the write
+side. `cast_variant_columns_to_binary` (metrics has 3 Variant columns),
+`cast_record_batch` to the target schema, and `RecordBatchWriter::write` + zstd
+encode + upload. Those run per batch, per column, and are the only large component
+left between 114k rows/s and 5,600. **Next experiment: extend this test to write
+through `RecordBatchWriter` to a tempdir and re-measure.** That closes the gap or
+moves it somewhere new; either is progress.
+
+Ordered candidates now:
+1. **Writer path** (untested, largest remaining) — variant cast + zstd + per-batch flush.
+2. **Batch size** (measured, ~1.5×) — cheap, safe, but partial. Worth shipping
+   *after* the writer is understood, so the two are not confounded.
+3. I/O — **refuted**, 17.3 s for the whole bin.
+4. Sort/merge CPU — **refuted**, 114k rows/s at the worst batch size.
+
 ### Do NOT do these without the stated precondition
 
 1. **Do not revert either shipped fix.** No evidence against them; both measured.

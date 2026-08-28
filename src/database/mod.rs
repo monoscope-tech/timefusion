@@ -15125,6 +15125,95 @@ mod tests {
         assert_eq!(super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB), None);
     }
 
+    /// Does `batch_override = Some("256")` explain the metrics staging grind?
+    ///
+    /// Prod 2026-08-28: a 23-file / 260.8 MB `otel_metrics` bin reads from OVH in
+    /// **17.3 s** (5.08 M rows, 6.16 GB decoded, 293k rows/s) but staging it
+    /// exceeds the **900 s** deadline — so the pipeline runs ~50x slower than I/O
+    /// and the cost is CPU-side. The coordinator staging path passes a 256-row
+    /// batch, chosen for WIDE otel rows; metrics rows are 47 B against logs' 155 B,
+    /// so the same batch buys ~3x less work per unit of fixed overhead.
+    ///
+    /// `#[ignore]`d because it is a measurement, not an assertion — run it with
+    /// `cargo nextest run --lib batch_size_dominates --ignored --no-capture`.
+    /// It sorts the same rows at each batch size through `execute_stream`, which
+    /// is what staging actually does.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measurement, not an assertion — run explicitly with --ignored --no-capture"]
+    async fn batch_size_dominates_narrow_row_staging() {
+        use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use datafusion::{datasource::MemTable, prelude::{SessionConfig, SessionContext}};
+        use futures::StreamExt;
+
+        const PARTS: usize = 23; // the prod bin's file count
+        const ROWS_PER_PART: usize = 40_000;
+        // otel_metrics carries 69 columns. Per-batch cost is paid PER COLUMN, so a
+        // 4-column model understates it ~17x — the first run of this experiment
+        // made exactly that mistake and wrongly exonerated batch size.
+        let build = |extra_cols: usize| {
+            let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+            let mut fields = vec![
+                Field::new("timestamp", ts, false),
+                Field::new("metric_name", DataType::Utf8, false),
+                Field::new("series_id", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ];
+            fields.extend((0..extra_cols).map(|i| Field::new(format!("attr_{i}"), if i % 3 == 0 { DataType::Utf8 } else { DataType::Int64 }, true)));
+            let schema = Arc::new(Schema::new(fields));
+            let partitions: Vec<Vec<_>> = (0..PARTS)
+                .map(|p| {
+                    let base = (p * ROWS_PER_PART) as i64;
+                    let mut cols: Vec<arrow::array::ArrayRef> = vec![
+                        Arc::new(TimestampMicrosecondArray::from((0..ROWS_PER_PART as i64).map(|i| base + i).collect::<Vec<_>>()).with_timezone("UTC")),
+                        Arc::new(StringArray::from((0..ROWS_PER_PART).map(|i| format!("metric_{}", i % 64)).collect::<Vec<_>>())),
+                        Arc::new(StringArray::from((0..ROWS_PER_PART).map(|i| format!("series_{}", i % 512)).collect::<Vec<_>>())),
+                        Arc::new(Int64Array::from((0..ROWS_PER_PART as i64).collect::<Vec<_>>())),
+                    ];
+                    cols.extend((0..extra_cols).map(|i| -> arrow::array::ArrayRef {
+                        if i % 3 == 0 {
+                            Arc::new(StringArray::from((0..ROWS_PER_PART).map(|r| format!("v{}", r % 97)).collect::<Vec<_>>()))
+                        } else {
+                            Arc::new(Int64Array::from((0..ROWS_PER_PART as i64).collect::<Vec<_>>()))
+                        }
+                    }));
+                    vec![arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), cols).expect("batch")]
+                })
+                .collect();
+            (schema, partitions)
+        };
+
+        let total_rows = PARTS * ROWS_PER_PART;
+        for (label, extra) in [("4 cols", 0usize), ("69 cols (metrics)", 65)] {
+            let (schema, partitions) = build(extra);
+            for batch_size in [256usize, 2048, 8192] {
+                let cfg = SessionConfig::new().with_target_partitions(1).with_batch_size(batch_size);
+                let ctx = SessionContext::new_with_config(cfg);
+                ctx.register_table("bin", Arc::new(MemTable::try_new(Arc::clone(&schema), partitions.clone()).expect("memtable"))).expect("register");
+                let started = std::time::Instant::now();
+                let mut stream = ctx
+                    .sql("SELECT * FROM bin ORDER BY \"timestamp\" DESC, metric_name, series_id")
+                    .await
+                    .expect("plan")
+                    .execute_stream()
+                    .await
+                    .expect("stream");
+                let (mut rows, mut batches) = (0usize, 0usize);
+                while let Some(b) = stream.next().await {
+                    rows += b.expect("batch").num_rows();
+                    batches += 1;
+                }
+                let elapsed = started.elapsed();
+                assert_eq!(rows, total_rows, "every row must come back at {label} batch_size={batch_size}");
+                println!(
+                    "{label:<18} batch_size={batch_size:>5}  {batches:>6} batches  {:>7.2}s  {:>9.0} rows/s",
+                    elapsed.as_secs_f64(),
+                    rows as f64 / elapsed.as_secs_f64()
+                );
+            }
+        }
+    }
+
     /// A bin holding unsorted files gets a budget sized in DECODED bytes too.
     ///
     /// Same bug class as `REPAIR_SLICE_DECODED_TARGET_BYTES`: the cap was
