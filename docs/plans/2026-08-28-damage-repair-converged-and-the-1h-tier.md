@@ -813,3 +813,33 @@ derived units as the healthy shape — 0 of 398 published empty against 14.5% fo
 hour-wide — and §11 now stops the migration collapsing them. A rebuild that
 enqueues day-wide units therefore avoids the shape that produced the damage in
 the first place.
+
+## 18. Derived throughput is ~30 units/hour — which decides the rebuild's SHAPE
+
+Measured from prod logs on `17370ac`, `maintenance_task_finished` over 30 minutes:
+
+| operation | finished in 30 min |
+|---|---|
+| Dedup | 71 |
+| BaseRollup | 45 |
+| Repair | 19 |
+| **DerivedRollup** | **15** (~30/hour) |
+
+So derived work IS draining — `pending_derived_rollup` sitting at exactly 296
+across three samples is inflow ≈ outflow, not a stall.
+
+**At 30 units/hour the §14 rebuild's shape is the whole cost:**
+
+| reopened as | units | wall clock at 30/hr |
+|---|---|---|
+| hour-wide (272 cells x 24h) | 6,528 | **~218 hours — 9 days** |
+| **day-wide (272 cells x 1)** | **272** | **~9 hours** |
+
+That is a 24x difference and it settles §17's recommendation with a number rather
+than a preference. Day-wide is also the shape §10 measured as the healthy one
+(0 of 398 published empty against 14.5% hour-wide), and §11 stops the migration
+collapsing it. **Reopen day-wide.**
+
+Caveat: 30/hr is one 30-minute window on a partly-warm process while the backfill
+competes for the same pool, so treat it as an order of magnitude. The conclusion
+survives a factor of two either way.
