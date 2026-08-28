@@ -734,6 +734,60 @@ Not everything is stuck, and the headline number should say so:
 `tasks_pending` is falling ~200/hr. The sealed lane is pinned; the rest of
 maintenance is making progress it was not making before tonight.
 
+### 03:30 — timed the grinding bin: NOT I/O, and the decode ratio is wrong for metrics
+
+Read the exact 23-file bin (the one prod stages and abandons) straight from OVH:
+
+```
+23 files, 260.8 MB compressed
+TOTAL 17.3 s for 5,076,367 rows, 6.16 GB decoded
+(15.1 MB/s compressed, 293,090 rows/s)   decode ratio: 23.6x
+```
+
+**Two findings.**
+
+**1. The cold-read hypothesis is refuted.** The whole bin reads in **17.3 s**, not
+900 s. I/O is not the bottleneck. Since staging that same bin exceeds 900 s, the
+pipeline is running at roughly **5,600 rows/s against a 293,000 rows/s read** —
+about **50× slower than I/O**, so the cost is **CPU-side**.
+
+Leading candidate, and it fits the numbers: the coordinator staging path passes
+`batch_override = Some("256")`. At 256 rows, 5.08 M rows is **19,830 batches**,
+each paying SPM poll + `cast_variant_columns_to_binary` + `cast_record_batch` +
+writer + zstd. ~45 ms of fixed cost per batch is all it takes to reach 900 s. The
+256-row batch was chosen for **wide** otel rows; metrics rows are narrow (47 B vs
+155 B compressed), so the same batch is ~3× less work per unit of overhead.
+**Test before fixing:** this needs a profile or a `run-unit` timing, not a guess —
+profiling is off in prod since the 08-11 SIGSEGV.
+
+**2. The decode ratio is PER TABLE, and 12× is wrong for metrics.**
+
+| table | measured ratio | vs `DECODED_BYTES_PER_COMPRESSED` = 12 |
+|---|---|---|
+| `otel_logs_and_spans` (08-18) | **11.7×** | correct |
+| `otel_metrics` (08-18) | **23.6×** | **~2× under** |
+
+Consequence for **tonight's shipped constants**: they are right for
+`otel_logs_and_spans` (where repair actually runs) but **under-correct for
+otel_metrics by ~2×** — `REPAIR_SLICE_DECODED_TARGET_BYTES` = 1 GB yields ~2 GB
+decoded there, and `UNSORTED_BIN_DECODED_BUDGET_BYTES` = 768 MB yields ~1.5 GB.
+Not dangerous today (metrics staging is CPU-bound, not memory-bound, and the pool
+has headroom), but it is a real gap in the invariant those constants claim.
+
+**Do not just raise the constant to 24×** — that would halve unit sizes on the
+main table too, where 12× is accurate, and the advisor's deadline warning applies:
+more slices means more passes against the same 900 s. The right shape is a
+**per-table ratio**, ideally derived rather than hardcoded (the Add actions carry
+`num_records`, so decoded size is estimable from rows × width instead of a flat
+compression multiple). Design it, size it against both tables, and sim it.
+
+**Also corrected:** my "floor guard vs deadline" framing above is a **red
+herring** for this cell. Sealed consolidation **commits per bin** and journals
+`compaction_debt_remaining`, so progress persists across claims — a day-wide unit
+does not need to finish the whole day in 900 s. These units are dying inside
+staging **one** bin. The floor guard is doing the right thing; the bin is just
+too slow. The guard question stands on its own merits but is NOT what pins this lane.
+
 ### Do NOT do these without the stated precondition
 
 1. **Do not revert either shipped fix.** No evidence against them; both measured.
