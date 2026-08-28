@@ -185,6 +185,40 @@ ids in it contain nothing delta-rs encodes — and the unit test covers that
 instead. Stated because a test that looks like it covers something it does not
 is worse than no test.
 
+## The e2e suite is red on master, and it is not a flake
+
+`smoke::count_star_returns_correct_value` failed during this work. It is filed as
+a flake (`tasks/01-NEXT` item 10, "1 failure in 2 full runs"). It is not one, and
+it is not caused by this change. Both claims were established by control rather
+than by argument:
+
+1. **Cheap control:** a full e2e run with
+   `timefusion_repair_mark_sorted_at_write = false` for every test — which makes
+   marking AND seeding inert — failed **identically**, same test, same position.
+2. **Expensive control:** pristine `origin/master` (`07185b46`), its own
+   worktree and its own `CARGO_TARGET_DIR` so it could not be served this
+   branch's binary, failed the **same test at the same position**, 58/59.
+
+**Why it is a real bug.** Seven INSERTs, each awaited and therefore acked,
+then `COUNT(*)`. It returned **4**, then **5**, then **4** — a *variable*
+shortfall, so a race, not an off-by-N and not a test miscounting. The
+discriminating detail is the query shape: the sibling smoke test counts with
+`... AND id = $2` and passes every time; the failing one filters **only by
+`project_id`**, the shape that goes through count pushdown / `LogicalCountCache`.
+A stale or approximate count from that path explains every observation.
+**Next step: re-run with a predicate that DEFEATS count pushdown. If that returns
+7 while the pushdown shape returns 5, the bug is in the count path.**
+
+An earlier hypothesis of mine — that the seeding sweep's per-file
+`table_ref.read()` was delaying `refresh_table_snapshot` into a stale snapshot —
+was **refuted**: the failure survived that fix. The fix is kept regardless,
+because background hygiene should not be able to contend with the foreground.
+
+Worth stating plainly: **rate-matching a known flake is not evidence of the same
+cause.** "1 in 2, same as recorded" is what made this look settled for three
+days. It took a control to separate the questions, and it took reading *which*
+assertion failed to see the pre-existing thing was never a flake at all.
+
 ## Not done, deliberately
 
 The other ranked sorting items are untouched and remain separate: derive the
