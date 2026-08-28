@@ -848,9 +848,14 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
     };
     let mut cfg2 = (*cfg).clone();
     cfg2.parquet.timefusion_cold_optimize_target_size = median * 5 / 2;
+    // The daily cold sweep that used to wrap this resolved the same target per
+    // date and looped; with one partition under test, calling the binned
+    // consolidation directly is the identical work and keeps the coverage on the
+    // function the CLI still calls.
+    let cold_target = cfg2.parquet.timefusion_cold_optimize_target_size;
     let db = Arc::new(Database::with_config(Arc::new(cfg2)).await?);
     let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
-    db.consolidate_sealed_partitions(&table_ref, "otel_logs_and_spans").await?;
+    db.consolidate_date_binned(&table_ref, "otel_logs_and_spans", date, cold_target, None, usize::MAX).await?;
 
     // Collect (min,max) event-time ranges of the partition's live files.
     let filters = vec![
@@ -876,7 +881,7 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
 
     // Idempotence: a second sweep must not rewrite converged runs.
     let before: Vec<(i64, i64)> = sorted.clone();
-    db.consolidate_sealed_partitions(&table_ref, "otel_logs_and_spans").await?;
+    db.consolidate_date_binned(&table_ref, "otel_logs_and_spans", date, cold_target, None, usize::MAX).await?;
     let after: Vec<(i64, i64)> = {
         use futures::TryStreamExt;
         let guard = table_ref.read().await;

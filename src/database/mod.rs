@@ -1278,12 +1278,6 @@ const REPAIR_SORT_PARTITIONS: usize = 16;
 /// is partitions x reservation; change one at a time.
 const REPAIR_SORT_RESERVATION_BYTES: usize = 512 * 1024 * 1024;
 
-/// How long after boot the one-shot footer repair waits. Long enough for WAL
-/// replay and snapshot load to finish, short enough that a process which only
-/// lives ~20 minutes between deploys still gets a repair pass in.
-const STARTUP_REPAIR_DELAY: std::time::Duration = std::time::Duration::from_secs(180);
-const COORDINATOR_OWNS_SLICE_MAINTENANCE: bool = true;
-
 /// Maximum wall time for one ordinary coordinator unit.
 ///
 /// Dedup and rollup source windows split recursively, so they retain the old
@@ -4780,90 +4774,6 @@ impl Database {
 
         // Schedule settings remain accepted during migration, but these loops
         // no longer own packing or repair once the durable coordinator is on.
-        if !COORDINATOR_OWNS_SLICE_MAINTENANCE {
-            // Hot compact — bin-pack today's small files (every ~5 min). Runs WITHOUT
-            // the maintenance_job_sem so it can't be starved behind the dedup backlog
-            // or a long full-optimize: prod 2026-07-20 showed the busy project only
-            // got compacted ~every 40 min because dedup churning an old-date backlog
-            // wedged the shared serial pass >600s. Compaction touches only today; dedup
-            // skips today — disjoint partitions, so decoupling is safe. Peak heap stays
-            // bounded by the wave engine's OWN light_rewrite_sem (+ the light pool
-            // slice it is sized from), never the heavy maintenance_rewrite_sem:
-            // sharing that one re-couples the two engines (prod 2026-07-30).
-            spawn_db_cron(&db, "Hot compact", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), |db| async move {
-                if !db.config.maintenance.timefusion_light_optimize_enabled {
-                    return;
-                }
-                info!("Running scheduled hot-tail compaction on today's small files");
-                db.run_hot_compact_sweep(TailPass::Pack).await;
-                // Hot compaction only ever touches TODAY's partition, so a
-                // sealed day the daily cold sweep failed to finish stays
-                // fragmented forever. Piggy-back a bounded catch-up slice on
-                // this tick, which actually runs often enough to converge.
-                let passes = db.config.maintenance.timefusion_consolidate_catchup_passes;
-                for (_, table_name, table) in db.all_tables().await {
-                    if db.maintenance_shutdown.is_cancelled() || passes == 0 {
-                        return;
-                    }
-                    if let Err(e) = db.consolidate_catchup(&table, &table_name, passes).await {
-                        warn!("consolidate-catchup failed for '{}': {}", table_name, e);
-                    }
-                }
-            });
-
-            // Footer repair — rewrite sealed-date files with no `sorting_columns`
-            // on its OWN cron: one repair unit is a whole 700MB-1GiB file, so a
-            // 5-minute tick budget discarded every attempt forever. Disjoint from
-            // packing (sealed vs today). `repair_guard` is ONE try_lock for every
-            // repair entry point — spawn_cron_job only skips ticks it started
-            // itself, and two concurrent repair passes together starve packing.
-            let repair_guard = Arc::new(tokio::sync::Mutex::new(()));
-            spawn_cron_job("Footer repair", &self.config.maintenance.timefusion_footer_repair_schedule, cancel.clone(), {
-                let db = db.clone();
-                let repair_guard = repair_guard.clone();
-                move || {
-                    let db = db.clone();
-                    let repair_guard = repair_guard.clone();
-                    async move {
-                        let Ok(_guard) = repair_guard.try_lock() else {
-                            info!("Scheduled footer repair skipped — a repair pass is already running");
-                            return;
-                        };
-                        if !db.config.maintenance.timefusion_light_optimize_enabled || db.config.maintenance.timefusion_light_optimize_repair_days == 0 {
-                            return;
-                        }
-                        info!("Running scheduled footer repair on sealed partitions");
-                        db.run_hot_compact_sweep(TailPass::Repair).await;
-                    }
-                }
-            });
-
-            // ...and once shortly after boot: a backlog that only drains between
-            // restarts never drains when restarts outpace the schedule. The delay
-            // lets boot settle; it takes `repair_guard`, so startup and cron
-            // passes stand down for each other.
-            {
-                let db = db.clone();
-                let cancel = cancel.clone();
-                let repair_guard = repair_guard.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = cancel.cancelled() => return,
-                        _ = tokio::time::sleep(STARTUP_REPAIR_DELAY) => {}
-                    }
-                    let Ok(_guard) = repair_guard.try_lock() else {
-                        info!("Startup footer repair skipped — a repair pass is already running");
-                        return;
-                    };
-                    if !db.config.maintenance.timefusion_light_optimize_enabled || db.config.maintenance.timefusion_light_optimize_repair_days == 0 {
-                        return;
-                    }
-                    info!(delay_secs = STARTUP_REPAIR_DELAY.as_secs(), "Running startup footer repair (not waiting for the next tick)");
-                    db.run_hot_compact_sweep(TailPass::Repair).await;
-                });
-            }
-        }
-
         // Dedup — collapse duplicates in sealed (< today) partitions on its own
         // cron, decoupled from hot compaction above. Keeps the job_sem so it stays
         // serialized against the full optimize job (the other job_sem holder).
@@ -4918,54 +4828,6 @@ impl Database {
 
         // Rollup backfill schedule settings remain accepted for migration, but
         // the durable coordinator above is the sole rollup owner.
-
-        if !COORDINATOR_OWNS_SLICE_MAINTENANCE {
-            // Kept only as a migration fallback. The coordinator plans the same
-            // packing debt by snapshot and must be its sole writer once active.
-            spawn_db_cron(&db, "Optimize", &self.config.maintenance.timefusion_optimize_schedule, cancel.clone(), |db| async move {
-                let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
-                    return;
-                };
-                info!("Running scheduled optimize on all tables");
-                for (project_id, table_name, table) in db.all_tables().await {
-                    if let Err(e) = db.optimize_table(&table, &table_name, None).await {
-                        error!("Optimize failed for {}: {}", Self::table_label(&project_id, &table_name), e);
-                    }
-                }
-            });
-        }
-
-        if !COORDINATOR_OWNS_SLICE_MAINTENANCE {
-            // Consolidate — daily cold sweep bin-packing sealed partitions (older than
-            // cold_optimize_after_days) to the 512MB cold target, beyond the 48h warm window.
-            spawn_db_cron(&db, "Consolidate", &self.config.maintenance.timefusion_consolidate_schedule, cancel.clone(), |db| async move {
-                info!("Running scheduled cold consolidation on sealed partitions");
-                let targets = db.all_maintenance_targets().await;
-                for (name, table) in &targets {
-                    if let Err(e) = db.consolidate_sealed_partitions(table, name).await {
-                        error!("Consolidate (cold tier) failed for '{}': {}", name, e);
-                    }
-                }
-            });
-        }
-
-        // Recompress — daily tier upgrade for cold (14d+). Skips partitions whose
-        // probe file already advertises the target tier, so re-runs are cheap.
-        let cold_cutoff = self.config.parquet.timefusion_cold_cutoff_days;
-        let zstd_cold = self.config.parquet.timefusion_zstd_level_cold;
-        // Cold sweep upper bound — older partitions fall under vacuum.
-        let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
-        if !COORDINATOR_OWNS_SLICE_MAINTENANCE {
-            spawn_db_cron(&db, "Recompress", &self.config.maintenance.timefusion_recompress_schedule, cancel.clone(), move |db| async move {
-                info!("Running scheduled tier recompression (warm→cold@{}d zstd={})", cold_cutoff, zstd_cold);
-                let targets = db.all_maintenance_targets().await;
-                for (name, table) in &targets {
-                    if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
-                        error!("Recompress (cold tier) failed for '{}': {}", name, e);
-                    }
-                }
-            });
-        }
 
         // Vacuum — expired-file removal (default: daily at 2AM).
         let vacuum_retention = self.config.maintenance.timefusion_vacuum_retention_hours;
@@ -15432,7 +15294,7 @@ mod tests {
             for (zstd, batch_size) in [(1i32, 256usize), (1, 8192), (3, 8192)] {
                 let batches: Vec<_> = (0..ROWS).step_by(batch_size).map(|off| make_batch_card(off, batch_size.min(ROWS - off), unique)).collect();
                 let mut buf: Vec<u8> = Vec::with_capacity(256 << 20);
-                // zstd 1 is `timefusion_zstd_level_intermediate`, what staging uses.
+                // zstd 3 is `timefusion_zstd_compression_level`, what staging uses.
                 let props = WriterProperties::builder()
                     .set_compression(Compression::ZSTD(datafusion::parquet::basic::ZstdLevel::try_new(zstd).expect("level")))
                     .build();
@@ -16592,38 +16454,6 @@ mod tests {
         assert_eq!(calls.iter().filter(|(p, _)| p == "converged").count(), 1, "converged project must not be retried");
         assert_eq!(calls.iter().filter(|(p, _)| p == "broken").count(), 1, "failed project must not be retried");
         assert_eq!(calls.iter().filter(|(p, _)| p == "busy").count(), 3, "busy project keeps its rounds");
-    }
-
-    /// A hot-compaction sweep spends one tick budget across all tables and starts at a different
-    /// table each tick.
-    ///
-    /// Each table used to derive its own full budget, so a sweep over many tables could run
-    /// multiples of the schedule. The two properties are inseparable: a shared budget without rotation
-    /// just moves the starvation from the tail of the tick to the tail of the table list.
-    #[tokio::test]
-    async fn a_hot_compact_sweep_shares_one_budget_and_rotates_its_starting_table() -> Result<()> {
-        let db = Database::with_config(create_test_config(&format!("hotcompact-sweep-{}", uuid::Uuid::new_v4().simple()))).await?;
-        for name in ["otel_logs_and_spans", "otel_metrics"] {
-            db.get_or_create_unified_table(name).await?;
-        }
-        let tables = db.all_tables().await.len();
-        assert!(tables > 1, "the sweep's whole point needs more than one table");
-
-        // The budget is shared, so the sweep cannot take a multiple of it. This
-        // is a no-op sweep (nothing to compact), so the real assertion is the
-        // ROTATION below; this one guards the shape.
-        let started = std::time::Instant::now();
-        db.run_hot_compact_sweep(TailPass::Pack).await;
-        assert!(started.elapsed() < db.tail_pass_tick_budget(TailPass::Pack), "the sweep must fit inside one tick budget, not one per table");
-
-        // Consecutive ticks must start at different tables, or the tail of the
-        // list is never compacted once the budget is genuinely contended.
-        use std::sync::atomic::Ordering::Relaxed;
-        let offset = || sweep_resume_offset(tables, db.hot_compact_table_cursor.load(Relaxed));
-        let first = offset();
-        db.run_hot_compact_sweep(TailPass::Pack).await;
-        assert_ne!(first, offset(), "the sweep must rotate its starting table between ticks");
-        Ok(())
     }
 
     /// The tick must stop starting rounds past its wall-clock budget rather than overrunning its

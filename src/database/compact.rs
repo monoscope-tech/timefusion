@@ -855,91 +855,6 @@ impl Database {
         }
     }
 
-    /// Sweep partitions in [age_min_days, age_max_days) and recompress any
-    /// whose probe tier is below `target_level`. Iterates day-by-day; each
-    /// day's optimize is its own Delta commit so a mid-sweep failure leaves
-    /// completed days at the new tier.
-    pub async fn recompress_tier_window(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, age_min_days: u64, age_max_days: u64, target_level: i32,
-    ) -> Result<()> {
-        let today = Utc::now().date_naive();
-        for days_ago in age_min_days..age_max_days {
-            let date = today - chrono::Duration::days(days_ago as i64);
-            if let Err(e) = self.recompress_partition(table_ref, table_name, date, target_level, None).await {
-                warn!("recompress_tier_window: skipping date={} after error: {}", date, e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Daily cold consolidation: bin-pack every sealed partition (date older
-    /// than `cold_optimize_after_days`) toward the 512MB cold target. Calendar-age
-    /// driven and idempotent — converged runs are excluded from re-selection,
-    /// so already-consolidated partitions cost a snapshot scan, not a rewrite
-    /// (bounds S3 I/O across the whole cold backlog). Covers "previous days and
-    /// further", picking up backfill that landed in old partitions.
-    pub async fn consolidate_sealed_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
-        let today = crate::support::today_utc();
-        let after_days = self.config.parquet.cold_optimize_after_days();
-        let dates: Vec<chrono::NaiveDate> = self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
-        info!("consolidate: table={} sweeping {} sealed partition(s) older than {}d", table_name, dates.len(), after_days);
-        for date in dates {
-            let target = self.optimize_target_for_date(date);
-            if let Err(e) = self.consolidate_date_binned(table_ref, table_name, date, target, None, usize::MAX).await {
-                warn!("consolidate: skipping date={} after error: {}", date, e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Incremental catch-up for the cold sweep, for partitions it has not reached.
-    ///
-    /// `consolidate_sealed_partitions` runs once a day and sweeps every cold date in one long job,
-    /// which only helps if the process survives the whole sweep. Prod restarts frequently, so the
-    /// newest sealed day often never gets consolidated. This does the same work from the frequent
-    /// tick in a bounded slice: pick the single most fragmented cold partition and give it a few
-    /// passes. Each pass is its own commit, so whatever finishes before a restart is kept and the
-    /// next tick resumes from the new snapshot. No date can starve.
-    pub async fn consolidate_catchup(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, max_passes: usize) -> Result<()> {
-        let today = crate::support::today_utc();
-        let after_days = self.config.parquet.cold_optimize_after_days();
-        let target_of = |d| self.optimize_target_for_date(d);
-        // Count only files still BELOW their date's target: a partition of big
-        // converged runs is done, however many of them there are, and must not
-        // out-rank a genuinely fragmented one.
-        let worst = {
-            let table = table_ref.read().await;
-            table
-                .snapshot()?
-                .log_data()
-                .iter()
-                .filter_map(|f| {
-                    let path = f.path();
-                    let date = path.split('/').find_map(|s| s.strip_prefix("date="))?.parse::<chrono::NaiveDate>().ok()?;
-                    let project_id = path.split('/').find_map(|s| s.strip_prefix("project_id="))?.to_owned();
-                    (Self::date_is_cold(today, date, after_days) && f.size() < target_of(date)).then_some((date, project_id))
-                })
-                .fold(HashMap::<(chrono::NaiveDate, String), usize>::new(), |mut acc, key| {
-                    *acc.entry(key).or_default() += 1;
-                    acc
-                })
-                .into_iter()
-                // Ties break to the NEWEST date: it is the one queries read.
-                .filter(|(_, n)| *n >= 2)
-                .max_by(|((a_date, a_project), a_n), ((b_date, b_project), b_n)| {
-                    a_n.cmp(b_n).then_with(|| a_date.cmp(b_date)).then_with(|| b_project.cmp(a_project))
-                })
-        };
-        let Some(((date, project_id), small_files)) = worst else {
-            return Ok(());
-        };
-        info!(
-            "consolidate-catchup: table={} project={} date={} {} small file(s), running up to {} pass(es)",
-            table_name, project_id, date, small_files, max_passes
-        );
-        self.consolidate_date_binned(table_ref, table_name, date, target_of(date), Some(&project_id), max_passes).await
-    }
-
     /// Leveled consolidation of one sealed `date`: per project, repeatedly select the earliest
     /// event-time slice of small files up to the cold target and rewrite it as one sorted run.
     ///
@@ -1625,7 +1540,7 @@ impl Database {
                             // A retained tombstone costs one row per deleted key forever; a
                             // dropped one silently resurrects the row. Retain.
                             let sorted = !schema_order_by_clause(schema).is_empty();
-                            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
+                            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
                             let mut writer = deltalake::writer::RecordBatchWriter::for_table(staging_table)
                                 .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
                                 .with_writer_properties(writer_properties);

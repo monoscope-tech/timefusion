@@ -2271,7 +2271,7 @@ impl Database {
         let (batches, sorted) = self.sort_flush_group(target_schema, batches, UnsortedFallback::Forbid).await?;
         let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)?.with_writer_properties(self.create_writer_properties(
             target_schema,
-            self.config.parquet.timefusion_zstd_level_intermediate,
+            self.config.parquet.timefusion_zstd_compression_level,
             sorted,
         ));
         let arrow_schema = writer.arrow_schema();
@@ -5383,32 +5383,6 @@ impl Database {
         }
     }
 
-    /// Run `pass` over every table under one shared tick deadline, rotating the starting table.
-    ///
-    /// Each table used to derive its own full budget, so a sweep over many tables could run
-    /// multiples of the schedule's budget and hold the maintenance semaphore without yielding.
-    /// Sharing one deadline prevents overruns; rotating prevents the head of the list from
-    /// starving the tail every tick.
-    pub(crate) async fn run_hot_compact_sweep(&self, pass: TailPass) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let deadline = std::time::Instant::now() + self.tail_pass_tick_budget(pass);
-        let mut tables = self.all_tables().await;
-        let start = sweep_resume_offset(tables.len(), self.hot_compact_table_cursor.fetch_add(1, Relaxed));
-        tables.rotate_left(start);
-        for (project_id, table_name, table) in tables {
-            if self.maintenance_shutdown.is_cancelled() {
-                return;
-            }
-            // A table reached with no budget left can only plan a bin it cannot
-            // finish. Leave it for the next tick, which rotation puts first.
-            if std::time::Instant::now() >= deadline {
-                info!(?pass, event = "hot_compact_tick_budget_exhausted");
-                return;
-            }
-            self.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name), pass, Some(deadline)).await;
-        }
-    }
-
     async fn run_hot_compact_for_table(
         &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str, pass: TailPass, tick_deadline: Option<std::time::Instant>,
     ) {
@@ -6149,7 +6123,7 @@ impl Database {
             }
             // Intermediate tier: this output is rewritten tonight by
             // consolidate/recompress, so it isn't worth max compression.
-            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
+            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
             let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
                 .with_writer_properties(writer_properties);

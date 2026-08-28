@@ -1584,27 +1584,28 @@ impl CacheConfig {
 pub struct ParquetConfig {
     #[serde_inline_default(20_000)]
     pub timefusion_page_row_count_limit: usize,
-    /// ZSTD level for hot writes (flush + today's light optimize). Default 3.
-    /// Aliased by the legacy env name; lower = faster ingest.
+    /// ZSTD level for every WORKING write: flush, hot-tail packing, and dedup
+    /// staging. Default 3 — low enough not to charge ingest latency for data
+    /// that may be rewritten again, high enough to be a reasonable resting
+    /// place if it never is.
+    ///
+    /// There are exactly TWO levels in the system, and that is deliberate. A
+    /// third "intermediate" level of 1 used to sit here, justified by a comment
+    /// promising that "recompress still re-tiers it" — but the recompress and
+    /// consolidate crons were gated off when the coordinator took over slice
+    /// maintenance, so nothing re-tiered anything. Compaction wrote at 9 and
+    /// dedup staging then rewrote the SAME data down to 1, permanently, because
+    /// staged parquet is the final file. A cheap-and-temporary write became the
+    /// cheap-and-permanent one. Do not reintroduce a level whose correctness
+    /// depends on a later pass unless that pass provably runs.
     #[serde_inline_default(3)]
     #[serde(alias = "timefusion_zstd_level_hot")]
+    #[serde(alias = "timefusion_zstd_level_intermediate")]
     pub timefusion_zstd_compression_level: i32,
-    /// ZSTD level for same-day INTERMEDIATE rewrites (hot-tail light optimize,
-    /// dedup), later rewritten again by nightly consolidate/recompress. Default
-    /// 1: trades transient hot-day file size for less compress CPU and faster
-    /// decompress on recent queries. Steady-state size is unaffected — the
-    /// tier-1 footer stays below both warm and cold tiers, so recompress still
-    /// re-tiers it.
-    // Tiered compression by partition age. Hot writes prioritize ingest latency;
-    // older data is rewritten at progressively higher levels by `recompress_tier`.
-    #[serde_inline_default(1)]
-    pub timefusion_zstd_level_intermediate: i32,
+    /// ZSTD level for SEALED writes — compaction and consolidation, where the
+    /// data is not expected to be rewritten again. Default 9.
     #[serde_inline_default(9)]
     pub timefusion_zstd_level_warm: i32,
-    #[serde_inline_default(19)]
-    pub timefusion_zstd_level_cold: i32,
-    #[serde_inline_default(14)]
-    pub timefusion_cold_cutoff_days: u64,
     #[serde_inline_default(128 * MIB)]
     pub timefusion_max_row_group_size: usize,
     #[serde_inline_default(10)]
@@ -1842,23 +1843,15 @@ pub struct MaintenanceConfig {
     pub timefusion_dirty_bin_dedup_enabled: bool,
     #[serde_inline_default("0 */30 * * * *".to_string())]
     pub timefusion_optimize_schedule: String,
-    // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 512MB
-    // cold target. Calendar-age driven; idempotent (skips ≥-target files).
-    #[serde_inline_default("0 30 2 * * *".to_string())]
-    pub timefusion_consolidate_schedule: String,
     /// Passes of cold consolidation to run on each hot-compaction tick, for
     /// sealed partitions the daily sweep never reached. Small on purpose: each
     /// pass is one ≤target sorted rewrite and its own commit, so a restart
     /// costs at most one pass and the next tick resumes. 0 disables.
-    #[serde_inline_default(4)]
-    pub timefusion_consolidate_catchup_passes: usize,
-    // Every 6h, not daily: tombstones leave the checkpoint once older than the
+        // Every 6h, not daily: tombstones leave the checkpoint once older than the
     // retention window, so vacuum must run often enough to delete files before
     // their tombstones age out (VacuumMode::Full backstops any that slip through).
     #[serde_inline_default("0 15 */6 * * *".to_string())]
     pub timefusion_vacuum_schedule: String,
-    #[serde_inline_default("0 0 3 * * *".to_string())]
-    pub timefusion_recompress_schedule: String,
     /// Out-of-band checkpoint + expired-log-cleanup schedule. See d_checkpoint_schedule.
     // Out-of-band checkpoint + expired-log cleanup, driven here instead of
     // delta-rs's commit-path hook: a hook failure surfaced as a commit error
@@ -2691,10 +2684,11 @@ mod tests {
         // rewrites that nightly consolidate/recompress will rewrite anyway)
         // sits below hot and stays eligible for re-tiering.
         let p = &config.parquet;
-        assert_eq!(p.timefusion_zstd_level_intermediate, 1);
-        assert!(p.timefusion_zstd_level_intermediate < p.timefusion_zstd_compression_level);
-        assert!(p.timefusion_zstd_level_intermediate < p.timefusion_zstd_level_warm);
-        assert!(p.timefusion_zstd_level_intermediate < p.timefusion_zstd_level_cold);
+        // TWO levels, working < sealed. The old four-level ladder is gone: see
+        // the field docs for why an intermediate level that relies on a later
+        // re-tier is unsafe when the re-tiering cron is gated off.
+        assert_eq!(p.timefusion_zstd_compression_level, 3);
+        assert!(p.timefusion_zstd_compression_level < p.timefusion_zstd_level_warm);
     }
 
     // Prod-shaped box (120 GiB / 48 cores, 11 hot projects): K lands in the
