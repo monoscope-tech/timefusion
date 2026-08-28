@@ -15214,6 +15214,76 @@ mod tests {
         }
     }
 
+    /// The WRITE side of staging, which the sort measurement above does not cover.
+    ///
+    /// Between the sort's measured 114k rows/s and the ~5,600 rows/s the prod
+    /// grind implies sits the writer: `cast_record_batch` to the target schema
+    /// plus `ArrowWriter` + zstd. This times parquet encoding of the same wide
+    /// narrow-row shape at each batch size, which is the only large untested
+    /// component left.
+    ///
+    /// `#[ignore]`d — a measurement. Run with
+    /// `cargo nextest run --lib staging_write_throughput --run-ignored all --no-capture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measurement, not an assertion — run explicitly with --run-ignored all --no-capture"]
+    async fn staging_write_throughput_by_batch_size() {
+        use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use datafusion::parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+
+        const ROWS: usize = 200_000;
+        const COLS: usize = 65;
+        let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let mut fields = vec![
+            Field::new("timestamp", ts, false),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("series_id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ];
+        fields.extend((0..COLS).map(|i| Field::new(format!("attr_{i}"), if i % 3 == 0 { DataType::Utf8 } else { DataType::Int64 }, true)));
+        let schema = Arc::new(Schema::new(fields));
+
+        // Batches are built OUTSIDE the timer. Building them inside timed 4.4M
+        // string allocations rather than the writer — the first run of this made
+        // exactly that mistake and reported the writer 3x slower than it is.
+        let make_batch = |offset: usize, n: usize| {
+            let mut cols: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(TimestampMicrosecondArray::from((0..n as i64).map(|i| offset as i64 + i).collect::<Vec<_>>()).with_timezone("UTC")),
+                Arc::new(StringArray::from((0..n).map(|i| format!("metric_{}", i % 64)).collect::<Vec<_>>())),
+                Arc::new(StringArray::from((0..n).map(|i| format!("series_{}", i % 512)).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ];
+            cols.extend((0..COLS).map(|i| -> arrow::array::ArrayRef {
+                if i % 3 == 0 {
+                    Arc::new(StringArray::from((0..n).map(|r| format!("v{}", r % 97)).collect::<Vec<_>>()))
+                } else {
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()))
+                }
+            }));
+            arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), cols).expect("batch")
+        };
+
+        for batch_size in [256usize, 2048, 8192] {
+            let batches: Vec<_> = (0..ROWS).step_by(batch_size).map(|off| make_batch(off, batch_size.min(ROWS - off))).collect();
+            let mut buf: Vec<u8> = Vec::with_capacity(64 << 20);
+            // zstd level 1 is `timefusion_zstd_level_intermediate`, what staging uses.
+            let props = WriterProperties::builder().set_compression(Compression::ZSTD(datafusion::parquet::basic::ZstdLevel::try_new(1).expect("level"))).build();
+            let mut writer = ArrowWriter::try_new(&mut buf, Arc::clone(&schema), Some(props)).expect("writer");
+            let started = std::time::Instant::now();
+            for b in &batches {
+                writer.write(b).expect("write");
+            }
+            writer.close().expect("close");
+            let elapsed = started.elapsed();
+            println!(
+                "WRITE batch_size={batch_size:>5}  {ROWS} rows  {:>7.2}s  {:>9.0} rows/s  {:>6.1} MB out",
+                elapsed.as_secs_f64(),
+                ROWS as f64 / elapsed.as_secs_f64(),
+                buf.len() as f64 / 1e6
+            );
+        }
+    }
+
     /// A bin holding unsorted files gets a budget sized in DECODED bytes too.
     ///
     /// Same bug class as `REPAIR_SLICE_DECODED_TARGET_BYTES`: the cap was

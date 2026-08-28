@@ -819,12 +819,52 @@ left between 114k rows/s and 5,600. **Next experiment: extend this test to write
 through `RecordBatchWriter` to a tempdir and re-measure.** That closes the gap or
 moves it somewhere new; either is progress.
 
-Ordered candidates now:
-1. **Writer path** (untested, largest remaining) — variant cast + zstd + per-batch flush.
-2. **Batch size** (measured, ~1.5×) — cheap, safe, but partial. Worth shipping
-   *after* the writer is understood, so the two are not confounded.
+### 04:00 — the writer measured: it IS the dominant term, and batch size cannot help it
+
+`staging_write_throughput_by_batch_size` (also `#[ignore]`d) times `ArrowWriter`
++ zstd level 1 — the staging writer's settings — over 200k rows × 69 columns,
+with the batches **pre-built outside the timer** (the first run had data
+generation inside it and understated the writer by ~13%).
+
+| batch_size | rows/s | out |
+|---|---|---|
+| 256 | 41,313 | 0.9 MB |
+| 2,048 | 42,538 | 2.2 MB |
+| 8,192 | 41,454 | 7.0 MB |
+
+**~41.4k rows/s, flat.** Batch size does nothing for the write side.
+
+Whole pipeline for this shape, measured end to end:
+
+| stage | rows/s | share of a serial budget |
+|---|---|---|
+| read (real, from OVH) | 293,090 | 14% |
+| sort (worst batch size) | 114,515 | 24% |
+| **write (zstd, 69 cols)** | **41,400** | **62%** |
+
+Serial composition ≈ **27,500 rows/s**, so the prod bin's 5.08 M rows ≈ **185 s**.
+Prod exceeds 900 s, so ~5× remains unexplained — but the shape of the answer has
+changed: **staging a wide, narrow-row table is bounded by parquet encoding**, and
+the sort/batch-size lever tops out at ~10% overall because the sort is only a
+quarter of the budget.
+
+**What this changes about the plan.** Shipping a batch-size bump would have been a
+~10% win presented as a fix. The real levers are on the write side:
+- **column count** — 69 columns is the multiplier on every per-batch cost;
+- **zstd level** for an intermediate output that gets rewritten again anyway;
+- **variant casting** (metrics has 3 Variant columns, absent from this test);
+- whether the writer can run concurrently with the sort rather than serially.
+
+Remaining ~5× to attribute: real data is far higher-cardinality than this
+synthetic (dictionary encoding does much less work here), plus variant casting and
+the object-store upload, neither of which this test covers.
+
+Candidate ranking, now evidence-backed:
+1. **Writer path** — measured dominant (62%), batch-size independent.
+2. **Batch size** — measured ~1.5× on the sort only, so ~10% overall. Cheap, but
+   do not ship it as "the fix".
 3. I/O — **refuted**, 17.3 s for the whole bin.
-4. Sort/merge CPU — **refuted**, 114k rows/s at the worst batch size.
+4. Sort/merge CPU — **refuted**, 114k rows/s even at the worst batch size.
 
 ### Do NOT do these without the stated precondition
 
