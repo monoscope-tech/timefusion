@@ -651,7 +651,47 @@ claimed, grinds the full deadline, is abandoned `outcome=Running`, and — being
 enough to sit inside the `starved` window — wins the lane again. That is the pin,
 and it explains precisely why 08-25/26 never drain while HotPacking is healthy.
 
-**Hypothesis for the morning (checkable):** `coarsen_sealed_slices` fuses sealed
+#### 03:07 — WHY they never split: the floor guard reasons about MEMORY, the failure is TIME
+
+Chased to the line. My earlier hypothesis ("the deadline-abandon path never
+reaches the split") is **refuted by the code**: `abandon_running`
+(`maintenance_coordinator.rs:2483`) *does* call
+`split_time_task(key, MAX_DECODED_BYTES + 1, None)` once `attempts >= 2`, and the
+observed units are at attempts 2. The split is attempted and **declined**.
+
+Which decline: `split_time_task` has two, and only the first is instrumented.
+Prod reads **`split_declined_at_floor = 71`** in ~1.6 h (~44/hr), so it is the
+first — `split_sheds_enough`. Its comment states the intent plainly:
+
+> *"The parent's measurement is the evidence: if this unit came back costing most
+> of what its parent cost, the floor has been reached and there is nothing left
+> for bisection to win. **Decline, and let the unit RUN** — the runner already
+> hash-shards internally at any width, which bounds memory without minting a
+> single journal unit."*
+
+**That reasoning is entirely about memory, and it is correct about memory.** The
+runner does hash-shard, so the unit will not OOM. But **nothing in that path
+considers the deadline**, and the unit cannot finish 23 GB of work in 900 s. So
+the guard hands back a unit that is memory-safe and time-impossible, the reaper
+kills it at 900 s, `starved` hands it the lane again, and the cycle repeats.
+`split_declined_at_floor` at 44/hr is that loop, counted.
+
+**This is the fix to design (NOT tonight, needs the sim):** the floor guard needs
+a second axis. "Bisection can win no more *bytes*" must not imply "let it run"
+when the unit has already proven it cannot complete in its deadline. Options, in
+rough order of conservatism: let a unit that has been *deadline-abandoned* N times
+split past the byte floor; or make the floor deadline-aware (`observed_bytes` vs
+what this operation can process in `operation_deadline_secs`); or cap sealed unit
+WIDTH directly so a day-wide unit is never minted for a 23 GB day.
+
+**Instrumentation gap worth closing regardless:** the second decline
+(`children.len() <= 1 || child.hash_shards > 1`, line 2589) returns `false`
+**silently**. If the first counter had not existed, this would have been
+undiagnosable — the same "no instrument" hole as
+[[tf_planned_never_claimed_instrument_2026-08-24]]. Adding a counter there is a
+safe, behaviour-free change.
+
+**Superseded hypothesis (kept for the chain):** `coarsen_sealed_slices` fuses sealed
 units up to day width when *the summed estimate fits* `MAX_DECODED_BYTES`. These
 were presumably fused while their estimate was unpriced/zero, and the preflight
 later stamped the real 23 GB — with nothing re-splitting them afterwards. Related
