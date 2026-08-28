@@ -39,7 +39,32 @@ unsorted write must neither exonerate nor be exonerated by its neighbours.
 Plus a **seeding sweep** for files that already exist, because neither marking
 nor `load_verified_sorted` reaches the fleet that was on storage the day this
 ships. Bounded three ways (5,000 files per sweep, 16 in flight, unknowns only),
-detached from boot, repeated hourly.
+detached from boot.
+
+### The sweep's cadence is load-bearing, and my first version was a no-op
+
+I wrote it as an hourly loop. Two facts already recorded in this repo kill that,
+and only kill it when you put them side by side:
+
+- the sweep is spawned inside `start_maintenance_schedulers`, so its **first**
+  pass runs while tables are still loading — maintenance workers wait ~300s for
+  that preload for precisely this reason — and reads nothing;
+- **prod containers live 20-40 minutes**, so an hourly retry never fires a
+  second time.
+
+Every boot would have swept nothing, forever, while looking like it had run. And
+the empty path took an early return that **skipped the log line**, so the
+evidence would have been silence — indistinguishable from a fully-seeded fleet.
+
+Fixed both: retry every 60s until a pass actually READS a table, then hourly for
+the trickle from paths that do not mark; and return + log `tables_read`,
+including on the empty path. `tables_read` is not a statistic. It is the only
+thing that separates "nothing to do" from "ran too early".
+
+The general lesson: **a periodic task's interval has to be checked against the
+process's lifetime, not just against the work's natural period.** On a box that
+restarts every 20-40 minutes, anything hourly runs exactly once — at the worst
+possible moment, during startup.
 
 ## Two things that would have failed silently
 
@@ -63,6 +88,15 @@ the repair that exists to fix it. The predicate tests the conversion.
 exoneration. That is why a resumed staged bin takes it — its intent manifest
 does not record what an earlier *process* declared, and guessing about someone
 else's write is not worth one avoided read.
+
+## Blocking IO, again
+
+Runtime compaction (below) read and rewrote a multi-MB file with bare
+`std::fs` while holding the mutex — reachable from the **flush commit path**.
+The append beside it was already wrapped in `without_blocking_the_worker`; the
+new code was not. Inline blocking IO on a tokio worker is this codebase's
+recurring incident shape: a journal fsync on the ingest path was worth 5.7 lag
+warns per minute until it moved. Wrapped now.
 
 ## A leak this work would have introduced
 
