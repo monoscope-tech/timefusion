@@ -4772,11 +4772,7 @@ mod tests {
         journal.enqueue_planned(&cell("smaller-but-aged", 3, 238));
 
         let first = journal.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
-        assert_eq!(
-            first.key.project_id.as_str(),
-            "smaller-but-aged",
-            "a 238-file cell wins over a 433-file one solely because the bigger one is 1 day old"
-        );
+        assert_eq!(first.key.project_id.as_str(), "smaller-but-aged", "a 238-file cell wins over a 433-file one solely because the bigger one is 1 day old");
     }
 
     /// the ORDERING and neither reports the winner.
