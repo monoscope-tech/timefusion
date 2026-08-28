@@ -632,6 +632,68 @@ backlog. Two shapes, needing different answers:
   shard smaller or lengthen the deadline. This one is tractable and measurable,
   and it is the biggest queue.
 
+### 02:40 — THE PIN, named: day-wide sealed units are unsatisfiable by construction
+
+`maintenance_task_started` for the stuck SealedConsolidation units:
+
+| project | slice (day-aligned) | `estimated_decoded_bytes` | attempts |
+|---|---|---|---|
+| `00000000` | 08-17 | **23.5 GB** | 2 |
+| `00000000` | 08-18 | **25.2 GB** | 2 |
+| `00000000` | 08-19 | **23.7 GB** | 1, 2 |
+| `8100121c` | 08-18 | **22.6 GB** | 2 |
+| `8100121c` | 08-20 | **22.1 GB** | 1, 2 |
+
+`MAX_DECODED_BYTES` is **512 MB**. These units are **~45× over it**, they are
+**day-wide**, and a claim can only stage ~260 MB per bin against a **900 s**
+deadline. **A day-wide 23 GB unit cannot complete in one claim, ever.** So it is
+claimed, grinds the full deadline, is abandoned `outcome=Running`, and — being old
+enough to sit inside the `starved` window — wins the lane again. That is the pin,
+and it explains precisely why 08-25/26 never drain while HotPacking is healthy.
+
+**Hypothesis for the morning (checkable):** `coarsen_sealed_slices` fuses sealed
+units up to day width when *the summed estimate fits* `MAX_DECODED_BYTES`. These
+were presumably fused while their estimate was unpriced/zero, and the preflight
+later stamped the real 23 GB — with nothing re-splitting them afterwards. Related
+and already known: [[tf_fusion_prices_file_sets_2026-08-23]] and the note that the
+preflight floor `69e6503` never engages. `retry_or_split` increments `attempts`
+(observed 1→2) but the width is not shrinking; find out whether the deadline-abandon
+path (`Ok(Retry)` from the reaper) reaches the split at all, or whether only `Err`
+does. **If the abandon path does not split, these units grind forever — and that
+accounting gap is the fix.**
+
+### Dedup cap change — DESIGNED, GATED, and de-urgent
+
+Investigated and deliberately **not shipped**. Three premises failed:
+1. **"55% abandoned = waste" does not reconcile** — 102 finished `Running` but only
+   84 ran ≥300 s, so `Running` is not purely deadline death. Dedup is also built to
+   truncate and resume (`sweep_resume_offset`), so truncation may be cadence, not loss.
+2. **The scaling premise was wrong at the input.** Dedup units are admitted at
+   **256 MB**, not the 512 MB cap I assumed, and unit cost in this repo is
+   documented as commit/fixed-cost dominated ([[tf_rollup_unit_cost_is_the_commit_2026-08-19]]),
+   so halving the cap could *reduce* throughput by paying fixed costs twice.
+3. **No urgency:** `pending_dedup` **3,458 → 3,502 → 3,433** across the night —
+   flat. Dedup is keeping pace.
+
+If it ever ships, the framing is "**admission should be deadline-aware per
+operation**" (mirroring `operation_deadline_secs`), and it ships only behind a
+`timefusion sim` backtest — lowering an admission cap re-splits the pending queue
+through `split_time_task`, the machinery that once turned 204 cells into 87,000 units.
+
+### The overall queue IS draining
+
+Not everything is stuck, and the headline number should say so:
+
+| counter | pre-deploy | 01:04 | 02:35 |
+|---|---|---|---|
+| `tasks_pending` | 6,613 | 6,112 | **5,951** |
+| `tasks_complete` | 49,440 | 49,927 | **50,234** |
+| `pending_sealed_consolidation` | 142 | 123 | 123 |
+| `pending_dedup` | 3,458 | 3,502 | 3,433 |
+
+`tasks_pending` is falling ~200/hr. The sealed lane is pinned; the rest of
+maintenance is making progress it was not making before tonight.
+
 ### Do NOT do these without the stated precondition
 
 1. **Do not revert either shipped fix.** No evidence against them; both measured.
