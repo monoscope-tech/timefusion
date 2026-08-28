@@ -53,6 +53,7 @@ pub struct E2eEnvBuilder {
     light_optimize_enabled: bool,
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
+    unordered_leg_sort_max_mb: Option<u64>,
     repair_resume: bool,
     mark_sorted_at_write: bool,
 }
@@ -77,6 +78,7 @@ impl Default for E2eEnvBuilder {
             light_optimize_enabled: true,
             wide_scan_max_files: None,
             wide_scan_max_mb: None,
+            unordered_leg_sort_max_mb: None,
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
@@ -149,6 +151,11 @@ impl E2eEnvBuilder {
     /// admission gate (the prod default is 256 files).
     pub fn with_wide_scan_max_files(mut self, files: usize) -> Self {
         self.wide_scan_max_files = Some(files);
+        self
+    }
+    /// Budget for `repair_isolated_scan_ordering`; 0 turns the repair off.
+    pub fn with_unordered_leg_sort_max_mb(mut self, mb: u64) -> Self {
+        self.unordered_leg_sort_max_mb = Some(mb);
         self
     }
     pub fn with_wide_scan_max_mb(mut self, mb: u64) -> Self {
@@ -280,6 +287,7 @@ impl E2eEnvBuilder {
             light_optimize_enabled: self.light_optimize_enabled,
             wide_scan_max_files: self.wide_scan_max_files,
             wide_scan_max_mb: self.wide_scan_max_mb,
+            unordered_leg_sort_max_mb: self.unordered_leg_sort_max_mb,
             page_row_count_limit: self.page_row_count_limit,
             repair_resume: self.repair_resume,
             mark_sorted_at_write: self.mark_sorted_at_write,
@@ -397,6 +405,7 @@ impl E2eEnv {
             light_optimize_enabled: self.builder.light_optimize_enabled,
             wide_scan_max_files: self.builder.wide_scan_max_files,
             wide_scan_max_mb: self.builder.wide_scan_max_mb,
+            unordered_leg_sort_max_mb: self.builder.unordered_leg_sort_max_mb,
             page_row_count_limit: self.builder.page_row_count_limit,
             repair_resume: self.builder.repair_resume,
             mark_sorted_at_write: self.builder.mark_sorted_at_write,
@@ -519,6 +528,7 @@ struct BuildCfgArgs<'a> {
     light_optimize_enabled: bool,
     wide_scan_max_files: Option<usize>,
     wide_scan_max_mb: Option<u64>,
+    unordered_leg_sort_max_mb: Option<u64>,
     repair_resume: bool,
     mark_sorted_at_write: bool,
     test_id: &'a str,
@@ -573,6 +583,9 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     }
     if let Some(files) = args.wide_scan_max_files {
         cfg.memory.timefusion_wide_scan_max_files = files;
+    }
+    if let Some(mb) = args.unordered_leg_sort_max_mb {
+        cfg.memory.timefusion_read_sort_unordered_leg_max_mb = mb;
     }
     if let Some(mb) = args.wide_scan_max_mb {
         cfg.memory.timefusion_wide_scan_max_mb = mb;

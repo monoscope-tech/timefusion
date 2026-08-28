@@ -2434,16 +2434,22 @@ pub struct MemoryConfig {
     // genuinely small, well-pruned history reads ungated.
     #[serde_inline_default(64)]
     pub timefusion_wide_scan_max_mb: u64,
-    /// Largest isolated non-conforming Delta leg (compressed selected bytes) that
-    /// `SortIsolatedUnorderedScan` will sort at read time so the conforming
-    /// majority keeps its `[timestamp DESC]` claim. **0 disables the rule.**
+    /// Largest isolated non-conforming Delta leg that `repair_isolated_scan_ordering`
+    /// will sort at read time so the conforming majority keeps its `[timestamp DESC]`
+    /// claim. **0 disables the repair.**
     ///
     /// A budget, not a heuristic: sorting a WHOLE-window parquet leg is the
     /// 2026-08-02 / 2026-08-07 OOM, and the only thing separating the two cases
     /// is size. Bounding it here makes the bad case structurally unreachable
     /// while the ordinary one (a handful of freshly-concatenated files among
     /// thousands of sorted ones) is repaired.
-    #[serde_inline_default(256)]
+    ///
+    /// COMPRESSED selected bytes, which understate the sort's Arrow heap by ~12x
+    /// on OTel data — 64 MB here is ~0.8 GB decoded. Same number and the same
+    /// reason as `timefusion_wide_scan_max_mb`; raise it only against a measured
+    /// distribution of isolated-leg sizes, and remember the repair runs on EVERY
+    /// Delta-reading query, so the ceiling is paid concurrently.
+    #[serde_inline_default(64)]
     pub timefusion_read_sort_unordered_leg_max_mb: u64,
     /// Selected bytes above which a single scan is REFUSED outright, rather than admitted
     /// into the gate above. **0 disables it, and 0 is the default.**

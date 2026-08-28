@@ -141,18 +141,24 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
 // 1.6 s.
 //
 // Fixture: a plain (non-SortBy) `compact_date` concatenates two flushed files
-// into one file with no declared footer order, then two further flushes add
-// conforming files. Majority conforms; the pushdown must survive.
-#[serial_test::serial]
-#[tokio::test(flavor = "multi_thread")]
-async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::Result<()> {
+// into one file with no declared footer order, then one further flush adds a
+// conforming file beside it. The claim must survive the isolation split.
+/// Build the fixture at a given repair budget and return `(plan, top-3 ids)`.
+///
+/// A plain (non-SortBy) `compact_date` concatenates two flushed files into one
+/// file with no declared footer order; one further flush adds a conforming file
+/// beside it, which is the fork's isolation shape.
+async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<String>)> {
     let bucket_secs = 60u64;
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_unordered_leg_sort_max_mb(budget_mb)
+        .start()
+        .await?;
     let client = env.pg_client().await?;
     let sec = 1_000_000i64;
 
-    // Two flushes → two conforming files, then concatenate them into ONE file
-    // that declares no sort order.
     for b in 0..2i64 {
         for i in 0..3i64 {
             insert_at(&client, &format!("u-{}", b * 3 + i), FROZEN_START_MICROS + (b * 3 + i) * sec).await?;
@@ -165,7 +171,6 @@ async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::
     let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date, None).await?;
     assert!(removed >= 2 && added >= 1, "the fixture needs a real concatenation (removed={removed}, added={added})");
 
-    // One more flush → a conforming file alongside the concatenated one.
     for i in 0..3i64 {
         insert_at(&client, &format!("s-{}", 6 + i), FROZEN_START_MICROS + (6 + i) * sec).await?;
     }
@@ -180,12 +185,39 @@ async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::
         .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plan.contains("SortPreservingMergeExec"), "one unsorted file must not disable the streaming merge for the conforming majority; plan was:\n{plan}");
-    // The same lost claim is what drops `DedupExec` into its unbounded mode, so
-    // pin that too: keep-greatest must stay bounded.
-    assert!(!plan.contains("mode=full-set"), "DedupExec must stay bounded once the ordering is restored; plan was:\n{plan}");
+    let ids = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
+    Ok((plan, ids))
+}
 
-    let ids: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
+// One non-conforming file must not cost the conforming majority its ordering
+// claim — the 30-day `log_list` mechanism.
+//
+// The delta-rs fork deliberately ISOLATES files whose footer does not declare the
+// scan's common ordering: the conforming files keep the `[timestamp DESC]` claim
+// in one `DataSourceExec` and the rest are unioned in as a sibling with no claim
+// ("isolate, don't surrender"). But a `UnionExec` advertises an ordering only when
+// EVERY child does, so the Delta leg as a whole then advertises none — `DedupExec`
+// falls to its unbounded `full-set` mode and `ORDER BY timestamp DESC LIMIT n`
+// stays a BLOCKING `SortExec` over the whole window. A 251-row newest-first
+// listing therefore READS every selected byte: prod p1 at 30 d selected 431 GB for
+// 251 rows, while the same query at 14 d (all files conforming) streamed in 1.6 s.
+//
+// Both directions are asserted. Budget 0 is not a separate early return in
+// `repair_isolated_scan_ordering` — it flows through the same `bytes <= max_bytes`
+// test — so pinning the declining case also pins the comparison's direction.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::Result<()> {
+    let (plan, ids) = isolated_union_plan(64).await?;
+    assert!(plan.contains("SortPreservingMergeExec"), "one unsorted file must not disable the streaming merge for the conforming majority; plan was:\n{plan}");
+    // The same lost claim is what drops `DedupExec` into its unbounded mode.
+    assert!(!plan.contains("mode=full-set"), "DedupExec must stay bounded once the ordering is restored; plan was:\n{plan}");
     assert_eq!(ids, vec!["s-8", "s-7", "s-6"], "wrong top-n or order; plan:\n{plan}");
+
+    // Budget 0: the repair must decline, restoring the un-repaired plan exactly —
+    // this is the guard that keeps a whole-window leg from ever being sorted.
+    let (off, off_ids) = isolated_union_plan(0).await?;
+    assert!(!off.contains("SortPreservingMergeExec") && off.contains("mode=full-set"), "budget 0 must leave the plan un-repaired; plan was:\n{off}");
+    assert_eq!(off_ids, ids, "declining the repair must not change the answer");
     Ok(())
 }

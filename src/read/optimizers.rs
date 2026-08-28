@@ -2248,9 +2248,10 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
 /// No fetch is pushed: sorting a child changes no rows, so this is sound under
 /// `DedupExec`, where a top-n cut on a leg would truncate row versions.
 pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_bytes: u64) -> Result<Arc<dyn ExecutionPlan>> {
-    if max_bytes == 0 {
-        return Ok(plan);
-    }
+    // No early return for `max_bytes == 0`: letting 0 fall through to the
+    // `bytes <= max_bytes` test below is what makes the disabled case exercise the
+    // budget comparison, so a test that pins it also pins the comparison's
+    // direction — inverting it would admit everything at 0.
     // Bottom-up so a rewritten union's new ordering propagates through the
     // `DeltaScanExec` wrapping it as the parents are rebuilt.
     Ok(plan
