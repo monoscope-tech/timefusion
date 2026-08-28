@@ -434,9 +434,37 @@ slices published empty over a base holding rows, hours 21-22 never enqueued, and
 fringe. A 30d chart that cannot route reads raw across 30 days and hits the
 statement timeout.
 
-So the rollup work is not a data-quality side quest — **it is the 30-day
-dashboard latency.** Any latency measurement of these windows should be re-taken
-after the empty-publication cause is fixed, not before.
+**The shape was verified routable — that control is required and it passed.**
+Reading `rollup_miss_*`/`rollup_hits_*` either side of one 7d run:
+`rollup_hits_hybrid_total` **4 → 5**. So the tier DID answer part of the window
+and the query still took 11.7 s warm, which is what an incomplete tier plus wide
+raw fringes costs. Had the shape merely declined, the timing would have been
+evidence about raw-scan cost and nothing about the tier.
+
+(The same run also moved `rollup_miss_unaligned_bucket_total` +9 and
+`rollup_miss_filter_not_eligible_total` +2 — one query probes many candidate
+specs, so a miss counter moving does not mean the query missed.)
+
+**The 30d attribution is NOT controlled and must not be stated as one.** That
+query timed out, so no hit/miss can be attributed to it, and it should not be
+re-run as a probe: a 60 s raw scan on a memory-tight instance is the shape that
+OOMs prod. What is supported: *the 7d window routes, is served partly by the
+tier, and is still 11.7 s.* Fixing the empty publications should move that
+number, and it is the one to re-measure — not the 30d timeout.
 
 Caveat on method: prod had been up ~10 minutes, so the cold column is a genuine
 cold-cache reading and the warm column is one repeat, not a distribution.
+
+
+## 9. Side observation — a maintenance-worker panic during drain
+
+`thread 'maintenance-worker' panicked at bytes-1.11.1/src/bytes.rs:392: range end
+out of bounds: 1367439 <= 1196032` (and `4899040 <= 81920`), surfacing as
+`immutable-column audit failed error=Join Error` in `database::compact`.
+
+Six occurrences in 90 minutes, **all on the one draining task**, clustered at the
+shutdown instant — a truncated object-store read being sliced at its intended
+length while the process tears down. It is caught (the audit logs and continues)
+and does not crash the process, and `immutable_column_disagreement_total` stood at
+118. Filed as an observation, not a defect: nothing was seen outside a drain
+window. If it is ever seen on a steady-state process, that changes.
