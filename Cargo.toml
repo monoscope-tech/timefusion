@@ -86,6 +86,10 @@ url = "2.5.4"
 # dispatching ticks in prod (2026-07-13: 0 maintenance runs over 14h uptime).
 croner = "3"
 object_store = "0.13.2"
+# Delta stores `Add.path` URL-ENCODED while `LogicalFile::path()` decodes. Every
+# path set in this crate is keyed on the decoded form, so the write side has to
+# decode to match. See `mark_written_sorted`.
+percent-encoding = "2"
 foyer = { version = "0.22.3", features = ["serde"] }
 ahash = "0.8"
 lru = "0.16.1"

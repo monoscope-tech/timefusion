@@ -1443,6 +1443,10 @@ impl Database {
             // profile put `md5::compress` at 5.71% of all CPU — larger than the ZSTD
             // decompression it serves, because each of K passes hashes every row to
             // keep 1/K of them.
+            // ONE binding, read both by the writer properties below and by the
+            // StagedBin this function returns — `mark_written_sorted` must be
+            // told the same fact that decided the footer, not a re-derivation.
+            let sorted = !schema_order_by_clause(schema).is_empty();
             let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
             let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
             // Independent narrow oracle for the staged output count. The
@@ -1539,7 +1543,6 @@ impl Database {
                             //      sit in date partitions this sweep never holds together.
                             // A retained tombstone costs one row per deleted key forever; a
                             // dropped one silently resurrects the row. Retain.
-                            let sorted = !schema_order_by_clause(schema).is_empty();
                             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
                             let mut writer = deltalake::writer::RecordBatchWriter::for_table(staging_table)
                                 .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
@@ -1749,6 +1752,7 @@ impl Database {
                 adds,
                 stage_store,
                 dedup: Some(DedupUnit { key: key.clone(), date: date_str.to_string(), label: label.to_string(), before: before as u64, after: after as u64 }),
+                sorted,
             }));
         }
         anyhow::bail!("dedup rewrite: re-plan attempts exhausted for table={} chunk=[{}]", table_name, label)

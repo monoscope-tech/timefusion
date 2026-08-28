@@ -5933,6 +5933,12 @@ impl Database {
         info!(table_name, project_id, selected_files = targets.len(), bytes_in, permit_wait_ms, event = "wave_bin_staging_started");
         let stage_store = staging_table.log_store().object_store(None);
         let mut adds: Vec<Action> = Vec::new();
+        // Hoisted out of the staging block so the StagedBin below can carry
+        // `sorted` to `mark_written_sorted` — recomputing it there would be a
+        // second copy of the predicate that decides the footer, which is exactly
+        // the drift `mark_written_sorted` warns about.
+        let order_by = schema_order_by_clause(schema);
+        let sorted = !order_by.is_empty();
         let staged: Result<()> = async {
             // File-scoped provider over the pinned snapshot: reads exactly this
             // bin's files, so no predicate and no per-file stats parsing.
@@ -5995,8 +6001,6 @@ impl Database {
             // that spills into the light pool where they are not — instead of
             // materialising the whole bin 2-3x with no pool and no spill. The
             // footer declaration is then honest by construction.
-            let order_by = schema_order_by_clause(schema);
-            let sorted = !order_by.is_empty();
             // SLICE a repair rewrite, or one individually oversized L0 file,
             // by event time so no single sort has to fit the whole file. See
             // `REPAIR_SLICE_TARGET_BYTES` for why no partition count can do
@@ -6071,8 +6075,10 @@ impl Database {
             if !slices.is_empty() {
                 info!(table_name, project_id, bytes_in, slices = slices.len(), event = "repair_bin_sliced");
             }
-            // Intermediate tier: this output is rewritten tonight by
-            // consolidate/recompress, so it isn't worth max compression.
+            // The WORKING level, shared with flush and dedup staging. This used
+            // to be a separate "intermediate" level justified by a nightly
+            // consolidate/recompress that would re-tier it — those crons were
+            // deleted with the tier, so this output is now what a reader gets.
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
             let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
@@ -6248,7 +6254,7 @@ impl Database {
                 self.repair_degradation.remove(path);
             }
         }
-        Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, dedup: None }))
+        Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, dedup: None, sorted }))
     }
 
     /// Commit one WAVE: every staged unit's Remove+Add in a single transaction.
@@ -6387,7 +6393,7 @@ impl Database {
                     "a previous attempt's commit LANDED despite erroring — crediting its bins instead of deleting their (now live) files"
                 );
                 self.clear_bin_intents(&self_landed);
-                Self::record_wave_landed(&self_landed, data_change);
+                self.record_wave_landed(&self_landed, data_change, table_name);
                 carried.extend(self_landed);
             }
             // Two dirty 10-minute bins can live in the same compacted parquet
@@ -6451,7 +6457,7 @@ impl Database {
                     // every wave (the 2026-07-21 cache-thrash lesson).
                     let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
                     self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
-                    Self::record_wave_landed(&fresh, data_change);
+                    self.record_wave_landed(&fresh, data_change, table_name);
                     return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
                 }
                 Err(CommitFailure { message: e, timed_out }) => {
@@ -6481,7 +6487,7 @@ impl Database {
                             let live_uris = self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
                             self.reindex_wave_outputs(table_ref, table_name, &fresh, &live_uris).await;
                             self.clear_bin_intents(&fresh);
-                            Self::record_wave_landed(&fresh, data_change);
+                            self.record_wave_landed(&fresh, data_change, table_name);
                             return WaveResult { landed: carried.tap_mut(|landed| landed.extend(fresh)), failed };
                         }
                         CommitProbe::NotLanded => {
@@ -6587,9 +6593,17 @@ impl Database {
     /// reported HERE and nowhere else: staging knows `before`/`after` long before
     /// the transaction exists, and a unit that loses the liveness check or the
     /// commit dropped exactly zero rows from the table.
-    fn record_wave_landed(landed: &[StagedBin], data_change: bool) {
+    fn record_wave_landed(&self, landed: &[StagedBin], data_change: bool, table_name: &str) {
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
+        // The wave engine's output is the other big producer of correctly-sorted
+        // files, and until now it bought its own exoneration back with a footer
+        // read like everything else. Marked HERE because this is the single
+        // point both landing branches agree the commit is real.
+        let schema = schema_or_default(table_name);
+        for bin in landed {
+            self.mark_written_sorted(schema, bin.sorted, &bin.adds);
+        }
         if data_change {
             for dropped in landed.iter().filter_map(|b| b.dedup.as_ref()).map(DedupUnit::dropped).filter(|d| *d > 0) {
                 crate::observability::record_compaction_dedup_dropped(dropped);
@@ -6628,6 +6642,50 @@ impl Database {
     /// Path where verified-sorted paths are remembered across restarts.
     fn repair_verified_path(&self) -> PathBuf {
         self.maintenance_state_path("repair_verified_sorted.txt")
+    }
+
+    /// Record files THIS process just wrote with an honest `sorting_columns` footer, so footer
+    /// repair never offers them as suspects at all.
+    ///
+    /// `repair_verified_sorted` was previously populated only by
+    /// [`Self::repair_bin_already_sorted`], i.e. by reading a footer back. That makes admission
+    /// O(every file ever written): flush is the dominant producer and does not tag its output —
+    /// 1,593 of 1,648 prod add actions carry no tags at all (measured 2026-08-19) — so every
+    /// flushed file becomes a suspect and buys its exoneration with a ranged read. But the write
+    /// path already KNOWS the answer; it chose the footer. Recording it here makes the suspect set
+    /// O(files actually written unsorted), which is the set repair exists to fix.
+    ///
+    /// **The predicate must mirror [`build_writer_properties`] exactly.** The footer is stamped
+    /// only when `declare_sorted` AND the parquet CONVERSION is non-empty — `schema.sorting_columns()`
+    /// maps names to physical leaf indices and drops anything it cannot place, so a schema can
+    /// declare an order whose conversion is empty. Prod 2026-08-07 held a 924 MB file with
+    /// `sorting_columns=()` written by a path that believed it declared order; marking on the
+    /// schema field alone would make that file permanently invisible to the repair that exists to
+    /// fix it. Testing the conversion is what closes the drift.
+    ///
+    /// Paths are DECODED before insertion. Delta stores `Add.path` URL-encoded, while admission
+    /// (`plan_compaction_debt`) and the probe both key on `LogicalFile::path()`, which decodes.
+    /// Marking the raw form would silently mark nothing for any tenant whose id needs encoding —
+    /// a no-op that looks identical to a working feature.
+    pub(crate) fn mark_written_sorted(&self, schema: &crate::schema::TableSchema, sorted: bool, adds: &[deltalake::kernel::Action]) {
+        if !sorted || schema.sorting_columns().is_empty() {
+            return;
+        }
+        let paths: Vec<String> = adds
+            .iter()
+            .filter_map(|action| match action {
+                deltalake::kernel::Action::Add(add) => Some(percent_encoding::percent_decode_str(&add.path).decode_utf8_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        for path in &paths {
+            self.repair_verified_sorted.insert(path.clone());
+        }
+        crate::observability::maintenance_stats().repair_sorted_at_write.fetch_add(paths.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.persist_verified_sorted(&paths);
     }
 
     /// Persist footers already probed as sorted, so a restart does not re-probe them.
@@ -6965,6 +7023,12 @@ impl Database {
                         adds,
                         stage_store: Arc::clone(&store),
                         dedup: None,
+                        // A resumed bin's staged parquet was written by an
+                        // earlier PROCESS and the intent manifest does not
+                        // record whether it declared a footer. Claiming sorted
+                        // here would be a guess about someone else's write; let
+                        // the probe answer it and lose nothing but one read.
+                        sorted: false,
                     });
                 }
             }

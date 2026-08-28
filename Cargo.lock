@@ -8500,6 +8500,7 @@ dependencies = [
  "parquet-variant",
  "parquet-variant-compute",
  "parquet-variant-json",
+ "percent-encoding",
  "pprof",
  "proptest",
  "rand 0.10.0",

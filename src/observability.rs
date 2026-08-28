@@ -960,6 +960,17 @@ atomic_stats! {
         /// touching its partition (query-time SortExec, unordered MOR dedup), so
         /// any nonzero here is a read-path incident in the making (2026-08-03).
         flush_sort_unsorted_fallbacks as "flush_sort_unsorted_fallbacks_total",
+        /// Files marked verified-sorted BY THE WRITE that produced them, rather than
+        /// by reading their footer back. Every count here is a ranged read footer
+        /// repair does not have to pay, and a suspect that never enters admission.
+        ///
+        /// Read it against `flush_sort_unsorted_fallbacks`: this counts the files
+        /// whose footer we stamped, that one counts the files we could not. If this
+        /// stays 0 on a busy process the marking is not reaching the commit path —
+        /// and because the failure mode is a silently-empty path set (encoded vs
+        /// decoded `Add.path`), 0 here reads exactly like a working feature with
+        /// nothing to do. It is the falsifier for the whole mechanism.
+        repair_sorted_at_write as "repair_sorted_at_write_total",
         /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
         /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
         /// outrunning flush often enough that compaction is running at the floor.

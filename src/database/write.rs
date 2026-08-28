@@ -538,7 +538,7 @@ impl Database {
                 None
             }
         };
-        Ok(PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer })
+        Ok(PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted })
     }
 
     /// Insert batches and return the URIs of files newly added by this commit
@@ -640,7 +640,7 @@ impl Database {
 
         span.record("use_queue", false);
 
-        let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer } =
+        let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted } =
             self.prepare_staged_write(&project_id, &table_name, batches).await?;
 
         // Hoist out of the retry loop — the watermark is the same on every attempt.
@@ -752,6 +752,11 @@ impl Database {
                         let pre_uris: HashSet<String> = file_uris(&new_table);
                         new_table.state = Some(finalized.snapshot());
                         drop(commit_guard);
+                        // AFTER the commit lands, never before: an abandoned
+                        // attempt's staged parquet is deleted, and marking a
+                        // deleted path is harmless but a marked path that never
+                        // committed is a lie we would keep forever.
+                        self.mark_written_sorted(schema, sorted, &adds);
                         let _t_record = std::time::Instant::now();
                         let _committed = self
                             .record_committed_write(
@@ -964,11 +969,11 @@ impl Database {
         let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
         let staged: Vec<(usize, (String, String), Result<StagedUnit>)> = stream::iter(stageable)
             .map(|(i, prep, key)| async move {
-                let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, staged_writer, .. } = prep;
+                let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, staged_writer, sorted, .. } = prep;
                 let mut writer = staged_writer.expect("filtered above");
                 let adds: Result<Vec<Action>> =
                     Self::stage_batches(&mut writer, batches, max_file_bytes).await.map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
-                (i, key, adds.map(|adds| StagedUnit { table_ref, schema, dirty_bins, adds, stage_store }))
+                (i, key, adds.map(|adds| StagedUnit { table_ref, schema, dirty_bins, adds, stage_store, sorted }))
             })
             .buffer_unordered(parallelism)
             .collect()
@@ -1012,7 +1017,16 @@ impl Database {
                         .await
                         .map(|added| attribute_added_files(added, &projects));
                     match outcome {
-                        Ok(per_project_added) => indices.into_iter().zip(per_project_added).map(|(i, a)| (i, Ok(a))).collect::<Vec<_>>(),
+                        Ok(per_project_added) => {
+                            // PER UNIT, not per group: a group is one commit but
+                            // many prepared writes, and one unit degrading to an
+                            // unsorted write must not exonerate its neighbours'
+                            // files — nor be exonerated by them.
+                            for (_, unit) in &group {
+                                self.mark_written_sorted(unit.schema, unit.sorted, &unit.adds);
+                            }
+                            indices.into_iter().zip(per_project_added).map(|(i, a)| (i, Ok(a))).collect::<Vec<_>>()
+                        }
                         Err(e) => {
                             // Fail EVERY project in the group identically — no
                             // partial settle. The caller requeues each one's buckets

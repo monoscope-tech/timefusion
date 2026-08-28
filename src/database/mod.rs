@@ -2113,6 +2113,9 @@ struct StagedUnit {
     dirty_bins: Vec<(String, i64)>,
     adds: Vec<deltalake::kernel::Action>,
     stage_store: Arc<dyn object_store::ObjectStore>,
+    /// Carried from [`PreparedWrite::sorted`] so the coalesced commit can mark
+    /// its output verified-sorted — see [`Database::mark_written_sorted`].
+    sorted: bool,
 }
 
 /// Marks a commit error where landing could not be confirmed. The staged parquet must be left in
@@ -2209,6 +2212,11 @@ struct PreparedWrite {
     /// batch-prepare of N units doesn't hold N sorted buckets at once.
     batches: FlushBatches,
     writer_properties: WriterProperties,
+    /// Whether `batches` were actually sorted into schema order, i.e. exactly the
+    /// `declare_sorted` argument `writer_properties` was built with. Kept because
+    /// the footer this write stamps is the one fact footer repair wants, and
+    /// re-deriving it later costs a ranged read per file.
+    sorted: bool,
     /// Store the staged parquet lands in — used to clean it up on a terminal
     /// commit failure (those objects have no Add/Remove, so VACUUM never
     /// reclaims them).
@@ -2698,10 +2706,15 @@ pub struct Database {
     /// Exponential failure backoff per dedup target, else a failing partition
     /// re-runs every sweep tick. In-memory only; a restart retries once.
     dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
-    /// Repair candidates whose footer proved sorted, excluded after one footer
-    /// read per process. The `delta-rs.optimize.sort_by` tag ≠ a
-    /// `sorting_columns` footer (flush sorts without the tag), so untagged
-    /// means suspect, not unsorted — admission by tag would rewrite healthy files.
+    /// Paths known to carry an honest `sorting_columns` footer, and therefore excluded from repair
+    /// admission. Populated from two directions, and the cheap one is meant to dominate:
+    /// `mark_written_sorted` records a file when the write that produced it stamped the footer,
+    /// and `repair_bin_already_sorted` reads a footer back for anything older than that mechanism.
+    /// Persisted (`repair_verified_sorted.txt`) and reloaded at boot, so neither kind of exoneration
+    /// is re-paid after a restart.
+    ///
+    /// The `delta-rs.optimize.sort_by` tag ≠ a `sorting_columns` footer (flush sorts without the
+    /// tag), so untagged means suspect, not unsorted — admission by tag would rewrite healthy files.
     repair_verified_sorted: Arc<dashmap::DashSet<String>>,
     /// Serializes appends to the persisted verified-sorted list.
     repair_verified_lock: Arc<std::sync::Mutex<()>>,
@@ -7153,6 +7166,11 @@ pub(crate) struct StagedBin {
     adds: Vec<deltalake::kernel::Action>,
     /// Store the staged parquet was written to, for `cleanup_orphaned_parquet`.
     stage_store: Arc<dyn object_store::ObjectStore>,
+    /// Whether this bin's `adds` were written with a declared `sorting_columns`
+    /// footer — see [`Database::mark_written_sorted`], which `commit_wave` calls
+    /// once the bin lands. False is always SAFE: it costs a footer probe later,
+    /// never a wrong exoneration.
+    sorted: bool,
     /// Dedup-only accounting; `None` for hot compaction bins. Also THE source of
     /// truth for `data_change` (see [`StagedBin::data_change`]) — a dedup unit
     /// drops rows by definition, a compaction unit cannot.
@@ -15728,6 +15746,7 @@ mod tests {
         let staged = vec![deltalake::kernel::Action::Add(test_add(&format!("{project}-new.parquet")))];
         let (removes, adds) = super::staged_actions(&targets, staged, dedup.is_some());
         super::StagedBin {
+            sorted: false,
             project_id: project.to_string(),
             wave_id: format!("wave-{project}"),
             target_paths: paths.iter().map(|p| p.to_string()).collect(),
@@ -16875,6 +16894,59 @@ mod tests {
         // Loading twice must not duplicate or drop anything.
         restarted.load_verified_sorted();
         assert_eq!(restarted.repair_verified_sorted.len(), paths.len(), "idempotent");
+        Ok(())
+    }
+
+    fn add_action(path: &str) -> deltalake::kernel::Action {
+        deltalake::kernel::Action::Add(deltalake::kernel::Add { path: path.to_string(), size: 1, ..Default::default() })
+    }
+
+    /// THE failure mode of write-time marking, and it is silent.
+    ///
+    /// Delta stores `Add.path` URL-ENCODED; `LogicalFile::path()` — which is what repair admission
+    /// and the footer probe both key on — returns it DECODED. Marking the raw form would insert
+    /// strings nothing ever looks up: the counter would climb, the file would still be a suspect,
+    /// and the feature would look finished. Any tenant id containing a character Delta encodes
+    /// (here a space) is enough to trigger it, so this cannot be dismissed as exotic.
+    #[tokio::test]
+    async fn a_marked_path_is_stored_decoded_so_admission_can_find_it() -> Result<()> {
+        let db = Database::with_config(create_test_config("sortmark-decode")).await?;
+        let schema = crate::schema::get_schema("otel_logs_and_spans").expect("the default schema declares a sort order");
+        assert!(!schema.sorting_columns().is_empty(), "this test is vacuous unless the parquet conversion is non-empty");
+
+        let encoded = "project_id=acme%20corp/date=2026-07-30/part-0.parquet";
+        let decoded = "project_id=acme corp/date=2026-07-30/part-0.parquet";
+        db.mark_written_sorted(schema, true, &[add_action(encoded)]);
+
+        assert!(db.repair_verified_sorted.contains(decoded), "admission keys on the decoded path, so that is what must be stored");
+        assert!(!db.repair_verified_sorted.contains(encoded), "storing the raw form is the silent no-op this test exists to catch");
+        Ok(())
+    }
+
+    /// The two ways a write must NOT be credited, both of which would make a file
+    /// permanently invisible to the repair that exists to fix it.
+    #[tokio::test]
+    async fn marking_declines_an_unsorted_write_and_an_empty_parquet_conversion() -> Result<()> {
+        let db = Database::with_config(create_test_config("sortmark-declines")).await?;
+        let schema = crate::schema::get_schema("otel_logs_and_spans").expect("schema");
+
+        // (a) The sort degraded, so no footer was declared.
+        db.mark_written_sorted(schema, false, &[add_action("project_id=p/date=2026-07-30/a.parquet")]);
+        assert!(db.repair_verified_sorted.is_empty(), "an unsorted write must stay a suspect");
+
+        // (b) The schema DECLARES an order whose parquet conversion is empty —
+        // `sorting_columns()` drops names it cannot map to a physical leaf index,
+        // and `build_writer_properties` then stamps no footer. Prod 2026-08-07 held
+        // a 924 MB file in exactly this state. Testing `schema.sorting_columns`
+        // (the field) instead of `schema.sorting_columns()` (the conversion) would
+        // pass here and exonerate that file forever.
+        let mut drifted = schema.clone();
+        drifted.sorting_columns.truncate(1);
+        drifted.sorting_columns[0].name = "a_column_that_does_not_exist".to_string();
+        assert!(drifted.sorting_columns().is_empty(), "the conversion drops unmappable names");
+        assert!(!drifted.sorting_columns.is_empty(), "while the declaration still looks non-empty — that IS the drift");
+        db.mark_written_sorted(&drifted, true, &[add_action("project_id=p/date=2026-07-30/b.parquet")]);
+        assert!(db.repair_verified_sorted.is_empty(), "a declared-but-unstamped order must not exonerate anything");
         Ok(())
     }
 
