@@ -139,7 +139,7 @@ content but moves the **mtime backwards**, so cargo skips the rebuild and the ne
 already-correct fix came from that, and the file on disk looked right the whole time.
 Touch the file, or witness a failure by other means.
 
-**Down from 33 branches to 7.**
+**Down from 33 branches to 4.**
 
 ## Phase 0 — hygiene (no gates needed)
 
@@ -219,7 +219,7 @@ Per-commit triage, expect to drop most: `fix/dml-bounded-key-pushdown` (12d, hal
 - [ ] `cleanup/docs-triage` — a 48-file docs deletion, 8 days old against heavy docs
       churn. Ask, or regenerate the triage against today's `docs/`.
 
-## What is actually left — 7 branches
+## What is actually left — 4 branches
 
 Ordered by value. Each line says what is *provably* absent from master, so the next
 session does not repeat the triage.
@@ -237,24 +237,32 @@ session does not repeat the triage.
    `file_slices` all absent, and master has no merged-slice concept at all. Real
    feature (122 lines in the pre-split `src/database.rs`), needs a genuine port into
    `src/database/{compact,maintain}.rs`, not a rebase.
-3. **`5a139c67` alone, out of `{simnew, simtest, fix/precise-restart-reconcile}`** —
-   `backfill_cells_by_contiguity`. See the stale-comment note above: master *claims*
-   contiguity ordering and *does* newest-first, deliberately. This one needs a
-   decision before a port, because it contradicts a stated rationale. Its sibling
-   `eef020a3` is landed; `25242120` is landed; everything else in those three
-   branches is the module split. **Delete all three once this commit is extracted.**
-4. **`worktree-agent-a4dd3af67abdf7806`** — `bf831539`'s wall-time bisection gate.
+3. **`worktree-agent-a4dd3af67abdf7806`** — `bf831539`'s wall-time bisection gate.
    Master solved the same incident with a better discriminator (deterministic schema
    failure), so only the residual matters: a unit failing fast for a *non-schema*
    reason is still bisected. Needs `ran_micros` threaded through `TaskLease` and a
    4-arg `abandon_running`, ~8 call sites.
-5. **`hold/schema-evolution`** (2 live commits) — a revert of "Give read pruning its
-   own row span" plus a guarded-count fixture. Decide whether the revert is still
-   wanted; `bf8b9a16` (the MemBuffer→Delta mask fix) has since touched the same
-   territory.
-6. **`cleanup/docs-triage`** — a 48-file docs deletion, now 8 days stale against heavy
-   docs churn. Regenerate rather than merge.
-7. `master` — the concurrent session's local branch, not part of this triage.
+4. **`hold/backfill-contiguity`** — parked, not pending. `5a139c67` preserved on its
+   own ref after the decision to **keep newest-first**. Nothing to do unless the
+   ordering policy is revisited.
+
+### Closed by decision or by evidence
+
+* **`5a139c67` / the sim trio** — newest-first stands. `simnew`, `simtest` and
+  `fix/precise-restart-reconcile` deleted; the one live commit is on
+  `hold/backfill-contiguity`; master's comment falsely claiming contiguity ordering
+  was corrected (`051d7a71`).
+* **`hold/schema-evolution` — DELETED, and the evidence is the interesting part.**
+  Its revert of "Give read pruning its own row span" set its own re-land bar: *"the
+  regression guard must be green before this re-lands."* On today's master
+  `row_min_ts` is still live (8 references) **and**
+  `a_coalesced_dimension_folds_null_and_the_literal_identically_through_the_rollup`
+  passes 4/4. So the undercount was fixed forward and the revert would have undone a
+  working read path. Its second commit's contents (`a_count_star_under_a_null_guard_
+  routes_via_duration_count`, the 08-25 plan doc) are both on master already.
+* **`cleanup/docs-triage`** — deleted; regenerate against today's `docs/` if wanted.
+* **`cleanup/remove-grpc`** — deleted, already landed: master has no `proto/`, no
+  `build.rs`, no gRPC test. The user decision this plan reserved was not needed.
 
 ## Ledger
 
