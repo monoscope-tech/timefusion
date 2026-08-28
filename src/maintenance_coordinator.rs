@@ -3709,12 +3709,7 @@ mod tests {
 
         let child = journal.tasks().find(|task| task.key != key && task.key.project_id == "split").expect("a split child");
         assert!(child.key.slice.width() < end - start, "the child really is narrower: {}", child.key.slice.width());
-        assert_eq!(
-            scheduling_class(child, now).2,
-            peer_width,
-            "a split child must rank at its PARENT's width, not its own {}",
-            child.key.slice.width()
-        );
+        assert_eq!(scheduling_class(child, now).2, peer_width, "a split child must rank at its PARENT's width, not its own {}", child.key.slice.width());
     }
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
