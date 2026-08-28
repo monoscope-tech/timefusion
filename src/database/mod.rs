@@ -17707,6 +17707,52 @@ mod tests {
     /// `table_lock_key` already serialized them behind one mutex), carrying every
     /// project's files and every project's watermark. Each project's result must
     /// list only its own files (path-attributed) so the tantivy sidecar keeps
+    /// The write MARKS a path; admission LOOKS ONE UP. If those two strings differ the
+    /// feature fails silently — `repair_sorted_at_write_total` climbs, every file stays a
+    /// suspect, and nothing is ever wrong out loud.
+    ///
+    /// So this asserts against what `plan_compaction_debt` actually reads: the snapshot's
+    /// `LogicalFile::path()`, produced by real delta-rs. That is deliberate — delta-rs stores
+    /// `Add.path` URL-ENCODED and decodes it in `LogicalFile::path()`, and no amount of
+    /// reasoning about our own code can pin a convention that lives in the dependency.
+    ///
+    /// Both commit paths, because they mark from different places: the single staged commit
+    /// and the coalesced group commit.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_time_marks_use_the_same_path_strings_admission_reads() -> Result<()> {
+        use walrus_rust::WalPosition;
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let t = "otel_logs_and_spans";
+        let solo = format!("mark-solo-{prefix}");
+        let group: Vec<String> = (0..2).map(|i| format!("mark-grp{i}-{prefix}")).collect();
+
+        db.insert_records_batch(&solo, t, vec![json_to_batch(vec![test_span("s", "span", &solo)])?], true, None).await?;
+        let units: Vec<CoalescedWriteUnit> = group
+            .iter()
+            .enumerate()
+            .map(|(i, p)| CoalescedWriteUnit {
+                project_id: p.clone(),
+                table_name: t.to_string(),
+                batches: vec![json_to_batch(vec![test_span(&format!("g{i}"), "span", p)]).unwrap()],
+                watermark: vec![Some(WalPosition { block_id: 700 + i as u64, offset: i as u64 })],
+            })
+            .collect();
+        for result in db.insert_records_batches_coalesced(units).await {
+            result.expect("coalesced commit failed");
+        }
+
+        let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
+        let live: HashSet<String> = table_ref.read().await.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).collect();
+        let marked: HashSet<String> = db.repair_verified_sorted.iter().map(|entry| entry.key().clone()).collect();
+
+        // THE falsifier. An empty marked set is what a decoding or wiring bug
+        // looks like, and it is indistinguishable from "nothing to do".
+        assert!(!marked.is_empty(), "no file was marked at write time — the marking is not reaching the commit path");
+        assert_eq!(marked, live, "every marked path must be a path admission will look up, byte for byte");
+        Ok(())
+    }
+
     /// indexing per project, and every project's rows must be queryable from that
     /// same commit.
     #[serial]
