@@ -746,3 +746,42 @@ path.** What is left after 08-26 is throughput: the tier lags.
 Caveat: one day per project, and 08-27 is recent enough that its hours may still
 be building — which is the point of calling it incompleteness. The contrast that
 carries the conclusion is 0 short hours on 08-27 against 17 and 12 on 08-25.
+
+## 16. What §13 should look like after it deploys — read this BEFORE calling it a regression
+
+The reopen edge is the only scheduler behaviour change here, and its healthy
+signature looks like a regression on two of the gauges this document has been
+quoting. Pre-registered so the next reading is not misread:
+
+* **`pending_derived_rollup` will RISE.** There are ~1,467 pending base rollups;
+  as that backfill drains, every base publish over an old day now reopens the
+  `Complete` derived cells above it. **Rising is the edge working.** Flat while
+  base units publish is the failure case — see the gate below.
+* **7d/30d latency may get WORSE before it gets better.** A reopen drops the
+  derived slice coverage, so those windows fall to the raw fringe until the
+  re-run lands. That is the deliberate trade: exact-but-slower beats
+  fast-and-stale. Expect a dip on rebuilt windows, then recovery.
+* **`maintenance_rollup_derived_reopened_after_base_republish` should fire
+  repeatedly** within the first hour.
+
+### THE VERIFICATION GATE — the wiring has no unit-test witness
+
+`republishing_a_base_slice_reopens_the_derived_cell_over_it` pins
+`reopen_derived_over` itself. **Nothing pins the publish site calling it with the
+right child table name** (`child_spec.table_name(&key.source)`). If that string
+is wrong the reopen matches nothing and does so silently — the same
+silent-no-op class as `rollup_untagged_inputs = 0` and the coverage map that had
+no producer.
+
+**So: base units publishing while the reopen event stays at zero means the wiring
+matched nothing.** That is the check to run first, and it is free — the backfill
+guarantees the condition. Next session should also add the integration test the
+existing `run_unit_once` scenario helper makes cheap: base → derived completes →
+base publishes again → assert the derived task is `Pending` and its coverage gone.
+
+### And watch the deploy itself
+
+This telemetry goes SILENT on the worst failure: if the image crashloops, psql
+fails, the sampler appends nothing, and quiet reads as healthy. Confirm the new
+tag is live and check `docker service ps` for restart churn plus a panic grep
+over the first ten minutes before trusting any counter.
