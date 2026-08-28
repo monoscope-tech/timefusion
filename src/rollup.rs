@@ -627,9 +627,137 @@ pub(crate) const OPEN_END: i64 = i64::MAX;
 ///
 /// A slice with no witness predates the tag and CANNOT be verified, so it is
 /// refused; those dates read raw until the coordinator republishes them.
+///
+/// Expressed through [`verify_slice_witness`] so there is ONE definition of what
+/// re-proves a slice. This is `SliceWitness::Physical` and nothing else, so the
+/// answer is bit-identical to the hand-rolled comparison it replaces. What proves
+/// that is the PRE-EXISTING case table below
+/// (`slice_coverage_is_trusted_only_when_every_witness_matches_the_partition_now`):
+/// its nine hard-coded verdicts were written against the old body and still hold
+/// against this one. A fresh test comparing the two would be circular — after the
+/// delegation both sides run the same code.
 pub(crate) fn slice_coverage_agrees(witnesses: &[Option<u64>], current: Option<u64>) -> bool {
-    let Some(current) = current else { return false };
-    !witnesses.is_empty() && witnesses.iter().all(|witness| *witness == Some(current))
+    let files = current.map(|rows| [SourceFile { min_ts: None, max_ts: None, rows }]);
+    let source = LiveSource { files: files.as_ref().map(|files| &files[..]), logical: None };
+    !witnesses.is_empty() && witnesses.iter().all(|witness| verify_slice_witness(witness.map(SliceWitness::Physical), source) == WitnessVerdict::Valid)
+}
+
+/// One live file of a rollup SOURCE partition, as the Delta add-actions
+/// describe it — not to be confused with [`LiveFile`], which is a file of the
+/// tier the source feeds.
+///
+/// `min_ts`/`max_ts` are `None` when the file carries no timestamp statistic.
+/// That is not the same as "spans nothing": a file that cannot say where its
+/// rows sit cannot be placed relative to a slice bound, so any bounded witness
+/// must refuse rather than guess (see [`verify_slice_witness`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceFile {
+    pub min_ts: Option<i64>,
+    /// INCLUSIVE, like a Delta file statistic and unlike `TimeSlice::end`.
+    pub max_ts: Option<i64>,
+    /// The add action's `num_records` — PHYSICAL, so it counts tombstones and
+    /// superseded merge-on-read versions.
+    pub rows: u64,
+}
+
+/// What a rollup slice recorded about its source partition at build time.
+///
+/// Versioned because the shapes are not comparable: a witness recorded under one
+/// variant can only ever be re-proved under the same variant, so old slices keep
+/// exactly the semantics they were written with and a shape change re-darkens
+/// nothing it did not have to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SliceWitness {
+    /// v1, what `TAG_SOURCE_ROWS` holds today: the WHOLE partition's
+    /// `num_records` sum, unbounded. Any ingest anywhere in the day moves it,
+    /// including hours no slice of this build ever claimed — which is why
+    /// `rollup_stale_grew` (4103) dwarfs `rollup_stale_shrank` (400) in prod.
+    Physical(u64),
+    /// v2: `num_records` summed over the live files lying WHOLLY BELOW the
+    /// slice's `covered_through`. Ingest past the bound no longer perturbs it.
+    ///
+    /// Not constructed outside the tests yet, and deliberately: STAMPING one
+    /// means a new Delta tag on the build path, which is the step this change
+    /// does not take. Kept in the type because a predicate that cannot express
+    /// the candidate cannot be used to evaluate it, and the case table is the
+    /// evaluation — see `docs/plans/2026-08-25-rollup-witness-design.md` §2.
+    #[allow(dead_code)]
+    PhysicalBelow { rows: u64, bound: i64 },
+    /// v3: the exact LOGICAL row count of `[lo, hi)` — deduped and
+    /// tombstone-aware, i.e. what the build actually aggregated. Invariant under
+    /// every rewrite that preserves logical content, and moves only on genuine
+    /// ingest or DML inside the slice's own range.
+    ///
+    /// Unconstructed for the same reason as `PhysicalBelow`.
+    #[allow(dead_code)]
+    Logical { rows: u64, lo: i64, hi: i64 },
+}
+
+/// The live facts a witness may be re-proved against.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LiveSource<'a> {
+    /// The source partition's live files. `None` when the Delta log could not be
+    /// read, which is an absence of evidence, never a disagreement.
+    pub files: Option<&'a [SourceFile]>,
+    /// `(lo, hi, rows)` — an exact logical row count and the range it was taken
+    /// over, when a logical-count index is resident and current for this
+    /// partition. `None` when there is no index to ask.
+    pub logical: Option<(i64, i64, u64)>,
+}
+
+/// Three-valued on purpose. `Stale` is a proven disagreement; `Unverifiable` is
+/// an absence of evidence. Both must keep the range off the tier, but they
+/// demand opposite work — `Stale` needs a rebuild, `Unverifiable` needs the
+/// evidence to exist — and collapsing them is what made `stale_coverage` a
+/// single undiagnosable bucket for months.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WitnessVerdict {
+    Valid,
+    Stale,
+    Unverifiable,
+}
+
+/// Re-prove one slice's witness against the source partition as it stands now.
+///
+/// Strictly generalises `slice_coverage_agrees`: `Physical` reproduces it
+/// exactly (see the case table), so v1 slices are judged by today's rule and
+/// only slices stamped with a newer witness get the newer semantics.
+///
+/// The straddle rule is the whole soundness argument for `PhysicalBelow`. Delta
+/// statistics are per FILE, so a file whose rows sit on both sides of the bound
+/// cannot be split by arithmetic: counting it admits rows the build never read,
+/// dropping it hides rows that landed INSIDE the covered range — the
+/// silent-wrong-number direction. It therefore poisons the whole witness. This
+/// is not free: once a day is packed into one file per date, every slice bound
+/// falls inside a file and the whole date reads `Unverifiable`. That cost is the
+/// reason `PhysicalBelow` is a candidate and not a recommendation.
+pub(crate) fn verify_slice_witness(witness: Option<SliceWitness>, source: LiveSource<'_>) -> WitnessVerdict {
+    let verdict = |expected: u64, actual: u64| if expected == actual { WitnessVerdict::Valid } else { WitnessVerdict::Stale };
+    let (Some(witness), Some(files)) = (witness, source.files) else { return WitnessVerdict::Unverifiable };
+    match witness {
+        SliceWitness::Physical(rows) => verdict(rows, files.iter().fold(0, |sum, file| sum.saturating_add(file.rows))),
+        SliceWitness::PhysicalBelow { rows, bound } => {
+            let mut below = 0u64;
+            for file in files {
+                let (Some(min_ts), Some(max_ts)) = (file.min_ts, file.max_ts) else { return WitnessVerdict::Unverifiable };
+                if min_ts < bound && max_ts >= bound {
+                    return WitnessVerdict::Unverifiable;
+                }
+                if max_ts < bound {
+                    below = below.saturating_add(file.rows);
+                }
+            }
+            verdict(rows, below)
+        }
+        // The witness carries its own range so a count taken over a DIFFERENT
+        // window cannot be mistaken for evidence about this one — the index is
+        // per (project, date) and every slice of that date asks it a different
+        // question.
+        SliceWitness::Logical { rows, lo, hi } => match source.logical {
+            Some((live_lo, live_hi, live)) if (live_lo, live_hi) == (lo, hi) => verdict(rows, live),
+            _ => WitnessVerdict::Unverifiable,
+        },
+    }
 }
 
 /// `[lo, hi)` minus `ranges` — the raw leg's share.
@@ -1637,17 +1765,53 @@ fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mu
             "Projection: {}",
             projection.expr.iter().filter(|expr| !matches!(expr, Expr::Column(_))).take(4).map(ToString::to_string).collect::<Vec<_>>().join(", ")
         ))),
-        // A derived table or CTE stops the walk at its ALIAS, which names
-        // nothing an operator could act on — every shape in the class printed
-        // `SubqueryAlias: f` and stopped. So report what is under it too, which
-        // also separates the two sub-populations: an inner refusal is a genuinely
-        // unroutable shape, while a walkable inner means the requalification is
-        // the ONLY blocker.
-        LogicalPlan::SubqueryAlias(alias) => Err(truncated(&format!(
-            "SubqueryAlias: {} over {}",
-            alias.alias,
-            source_and_filters(&alias.input, &mut Vec::new()).map_or_else(|inner| inner, |table| format!("a walkable scan of {table}"))
-        ))),
+        // A derived table or CTE — `count(1) FROM (SELECT id …) t` is the shape
+        // every monoscope benchmark and every top-K CTE emits, and it was the
+        // largest miss class on prod (126 of 414, 2026-08-25).
+        //
+        // An alias re-qualifies; it never RENAMES. `t.id` outside is
+        // `otel_logs_and_spans.id` inside, and every matcher below reads
+        // `Column::name` alone — `column_name`, `canonical`'s Column arm,
+        // `dimension_filter_sql`, `eq_literal`, `is_probe_scaffolding`. The chain
+        // admitted here holds exactly ONE TableScan (the projection arm above is
+        // rename-free and nothing else is walked), so a bare name still
+        // identifies exactly one column. A subquery that DOES rename is refused
+        // by that same projection arm, one level down — which is what stops
+        // `SELECT kind AS status_code` from being read as the dimension.
+        //
+        // On the output side the aggregate keeps the alias qualifier on its group
+        // fields; `dml::requalified` restores it onto the rewrite field for field,
+        // and `substitute`'s bottom-up `recompute_schema` re-resolves the parent's
+        // `Column(t, …)` against it, so a qualifier that did not line up fails
+        // there as a recorded miss rather than answering.
+        LogicalPlan::SubqueryAlias(alias) => {
+            let source = source_and_filters(&alias.input, filters)?;
+            // One spelling for the whole chain. The optimizer both leaves a
+            // predicate on a Filter and re-pushes it into the TableScan, so the
+            // same conjunct arrives twice — once qualified by the alias, once by
+            // the scan — and `canonical_and`'s idempotence dedup (see there)
+            // could no longer cancel the pair. Lossless: one scan, so the name
+            // is the identity.
+            use datafusion::{
+                common::{
+                    Column,
+                    tree_node::{Transformed, TreeNode},
+                },
+                logical_expr::Expr,
+            };
+            let unqualify = |node: Expr| {
+                Ok(match node {
+                    Expr::Column(column) => Transformed::yes(Expr::Column(Column::new_unqualified(column.name))),
+                    node => Transformed::no(node),
+                })
+            };
+            for filter in filters.iter_mut() {
+                if let Ok(stripped) = filter.clone().transform_up(unqualify) {
+                    *filter = stripped.data;
+                }
+            }
+            Ok(source)
+        }
         plan => Err(truncated(&plan.display().to_string())),
     }
 }
@@ -1880,10 +2044,11 @@ pub(crate) async fn match_aggregates(
                 scanned_table(&aggregate.input).filter(|table| crate::schema::get_schema(table).is_some_and(|schema| !schema.rollups.is_empty()))
             {
                 crate::observability::record_rollup_miss(MissReason::UnwalkableSource);
-                // Unconditional warn, not `sample_rollup_miss`: that sampler is
-                // 1-in-512 across ALL misses, and this class runs ~20/hr, so
-                // sampling would print one line per day — the same invisibility
-                // this event exists to end. `node` is bounded by `truncated`.
+                // Unconditional warn, not `sample_rollup_miss`: even budgeted per
+                // reason that sampler is 1-in-64, and this class runs ~20/hr, so
+                // sampling would print one line every three hours — the same
+                // invisibility this event exists to end. `node` is bounded by
+                // `truncated`.
                 //
                 // `inlined_cse` separates two populations that look identical in
                 // the dump: a `__common_expr_N` projection here means
@@ -3302,7 +3467,13 @@ mod tests {
     ///
     /// Deliberately absent: the `SELECT *` variant-wrap projection. It needs the
     /// Variant analyzer rule, which a bare `MemTable` session does not register
-    /// — the same blind spot recorded at `measure_filters`.
+    /// — the same blind spot recorded at `measure_filters`. Also absent, and
+    /// deliberately so: the plain derived table this table used to carry as "the
+    /// one shape a widening could reach". The widening arrived — the walker now
+    /// descends through a `SubqueryAlias` — so that case ROUTES, and it is pinned
+    /// as such by `the_benchmark_count_shape_routes_through_its_derived_table`.
+    /// The two cases below still refuse, and now name the node that actually
+    /// stopped the walk rather than the alias that merely hid it.
     #[test_case::test_case(
         &format!("SELECT count(*) FROM (SELECT 1 FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} LIMIT 5000) s"),
         "Limit"; "a bounded existence probe over a derived table — monoscope safetyNetReprocess, BackgroundJobs.hs:2127")]
@@ -3314,19 +3485,16 @@ mod tests {
             "WITH f AS (SELECT floor(extract(epoch from timestamp) / 60)::bigint AS bucket_idx FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) \
              SELECT bucket_idx, count(*) FROM f GROUP BY bucket_idx"
         ),
-        "SubqueryAlias: f over Projection: CAST(floor"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
+        "Projection: CAST(floor"; "a CTE computing the bucket — monoscope endpointRequestStatsByProject and rollupServiceEdges")]
     #[test_case::test_case(
         &format!(
             "SELECT count(*) FROM (SELECT timestamp FROM {SOURCE} WHERE project_id = 'a' AND {WINDOW} \
              UNION ALL SELECT timestamp FROM {SOURCE} WHERE project_id = 'b' AND {WINDOW}) u"
         ),
-        "SubqueryAlias: u over Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
+        "Union"; "a UNION ALL of two scans — monoscope rollupServiceEdges hops")]
     #[test_case::test_case(
         &format!("SELECT count(DISTINCT status_code) FROM (SELECT DISTINCT status_code FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) d"),
         "Aggregate"; "an inner DISTINCT, which plans as a second Aggregate")]
-    #[test_case::test_case(
-        &format!("SELECT count(*) FROM (SELECT timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) s"),
-        "over a walkable scan of otel_logs_and_spans"; "a derived table whose ALIAS is the only blocker — the one shape a widening could reach")]
     #[tokio::test]
     async fn an_unwalkable_shape_is_counted_and_names_the_node_that_refused(sql: &str, expected_node: &str) {
         let state = session().await;
@@ -3413,6 +3581,64 @@ mod tests {
             Some(MissReason::UnknownGroupBy),
             "the 1h tier's grain complaint must not mask the 1m tier's real reason"
         );
+    }
+
+    /// THE benchmark shape from `docs/monoscope-query-shapes.md`: a bare
+    /// `count(*)` is answered from Delta statistics, so anything measuring the
+    /// scan is spelled `count(1) FROM (SELECT id …) t` — and that derived table
+    /// planned to a `SubqueryAlias` the walker refused, making it the largest
+    /// miss class on prod (126 of 414, 2026-08-25).
+    #[tokio::test]
+    async fn the_benchmark_count_shape_routes_through_its_derived_table() {
+        let state = session().await;
+        let sql = format!("SELECT count(1) FROM (SELECT id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t");
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        assert!(generated_sql(&route).contains("request_count"), "an unguarded count over a derived table is the tier's request_count");
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The qualifier proof. An alias RE-QUALIFIES its output, so the aggregate's
+    /// group field is `t.status_code` while the rollup rewrite can only produce an
+    /// unqualified `status_code` — and the projection above still references
+    /// `t.status_code`. `dml::requalified` puts the qualifier back field for
+    /// field and `substitute`'s bottom-up `recompute_schema` re-resolves that
+    /// reference against the rewrite, so a qualifier that did not line up fails
+    /// there rather than answering from the wrong column.
+    ///
+    /// `assert_substitutes` runs exactly that reassembly — the same two functions
+    /// `dml.rs` calls, not a test-only copy — which is why this asserts through it
+    /// rather than through the generated SQL alone.
+    #[tokio::test]
+    async fn a_grouped_derived_table_keeps_its_alias_qualifier_through_the_rewrite() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT time_bucket('1 hours', t.timestamp) AS tb, t.status_code, count(*)::float AS count_ \
+             FROM (SELECT timestamp, status_code, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t \
+             GROUP BY 1, 2"
+        );
+        let route = route_for(&state, &sql).await.expect("match count").expect("declared rollup route");
+        let generated = generated_sql(&route);
+        assert!(generated.contains("status_code"), "the alias must not hide the declared dimension: {generated}");
+        // The assertion IS the reassembly: the projection above this aggregate
+        // holds `Column(t, "status_code")`, and `substitute` rebuilds bottom-up
+        // with `recompute_schema`, so a rewrite that did not carry the `t`
+        // qualifier back fails to resolve here instead of answering.
+        assert_substitutes(&state, &sql, None).await;
+    }
+
+    /// The boundary that makes the arm above safe. A subquery that RENAMES is
+    /// refused one level down, by the rename-free projection rule — and it has to
+    /// be, because `kind AS status_code` walked through would make the matcher
+    /// read the declared `status_code` dimension off `kind` and answer the wrong
+    /// rows without any error.
+    #[tokio::test]
+    async fn a_derived_table_that_renames_a_column_still_declines() {
+        let state = session().await;
+        let sql = format!(
+            "SELECT t.status_code, count(*) \
+             FROM (SELECT kind AS status_code, timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t GROUP BY 1"
+        );
+        assert!(!matches!(route_for(&state, &sql).await, Ok(Some(_))), "a rename under an alias must never be read as the dimension it shadows");
     }
 
     /// The arm is deliberately narrow. A dimension the spec does not declare, a
@@ -4014,6 +4240,77 @@ mod tests {
     #[test_case::test_case(&[Some(100)], None, false ; "the source partition reports no row count")]
     fn slice_coverage_is_trusted_only_when_every_witness_matches_the_partition_now(witnesses: &[Option<u64>], current: Option<u64>, trusted: bool) {
         assert_eq!(slice_coverage_agrees(witnesses, current), trusted);
+    }
+
+    /// One live file, spelled the way a Delta add action does: `max_ts` inclusive.
+    fn file(rows: u64, min_ts: i64, max_ts: i64) -> SourceFile {
+        SourceFile { min_ts: Some(min_ts), max_ts: Some(max_ts), rows }
+    }
+
+    /// The scenario every case below is a transition of: a slice covering
+    /// `[0, 600)` of a date whose live files at build time were `A[0,299]` and
+    /// `B[300,599]`, 100 physical rows each, of which 180 are logically distinct.
+    /// `C[700,900]` is later-in-the-day ingest that no slice of this build
+    /// claimed — the prod `rollup_stale_grew` shape.
+    const BOUND: i64 = 600;
+
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(100, 0, 299), file(100, 300, 599)], None, WitnessVerdict::Valid
+        ; "v1 baseline: nothing moved")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(100, 0, 299), file(100, 300, 599), file(50, 700, 900)], None, WitnessVerdict::Stale
+        ; "THE grew defect: hour-23 ingest voids an hour-00 slice under the v1 whole-partition witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(100, 0, 299), file(100, 300, 599), file(50, 700, 900)], None, WitnessVerdict::Valid
+        ; "and the bounded witness survives it — ingest past covered_through is not this slice's business")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(200, 0, 599)], None, WitnessVerdict::Valid
+        ; "benign bin-pack compaction preserves num_records, so even v1 survives it")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(200, 0, 599)], None, WitnessVerdict::Valid
+        ; "benign bin-pack compaction under the bounded witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(200)), &[file(180, 0, 599)], None, WitnessVerdict::Stale
+        ; "benign DEDUP collapses 20 merge-on-read versions: physical witnesses call a correct slice stale")]
+    #[test_case::test_case(
+        Some(SliceWitness::Physical(180)), &[file(180, 0, 599)], None, WitnessVerdict::Valid
+        ; "carry-forward: maintenance restamps the witness it knowingly invalidated, and the same slice is valid again")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(180, 0, 599)], Some((0, BOUND, 180)), WitnessVerdict::Valid
+        ; "the logical witness needs no carry-forward: dedup cannot change what it counts")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(100, 0, 299), file(100, 300, 599), file(10, 100, 200)], None, WitnessVerdict::Stale
+        ; "genuine LATE ingest inside the covered range is stale, which is the whole point of keeping a witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(190, 0, 599)], Some((0, BOUND, 190)), WitnessVerdict::Stale
+        ; "genuine late ingest under the logical witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(90, 0, 299), file(100, 300, 599)], None, WitnessVerdict::Stale
+        ; "a DML DELETE inside the covered range is stale under the bounded witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(170, 0, 599)], Some((0, BOUND, 170)), WitnessVerdict::Stale
+        ; "a DML DELETE inside the covered range is stale under the logical witness")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(100, 0, 299), file(150, 400, 800)], None, WitnessVerdict::Unverifiable
+        ; "STRADDLE POISON: a file spanning the bound cannot be split by arithmetic, so it refuses instead of guessing")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[file(250, 0, 900)], None, WitnessVerdict::Unverifiable
+        ; "THE COST of that rule: a day packed to one file per date straddles every slice bound and reads unverifiable")]
+    #[test_case::test_case(
+        Some(SliceWitness::PhysicalBelow { rows: 200, bound: BOUND }), &[SourceFile { min_ts: None, max_ts: None, rows: 200 }], None, WitnessVerdict::Unverifiable
+        ; "a file with no timestamp statistic cannot be placed against the bound")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(180, 0, 599)], None, WitnessVerdict::Unverifiable
+        ; "a logical witness with no resident index is unverifiable, never assumed fresh")]
+    #[test_case::test_case(
+        Some(SliceWitness::Logical { rows: 180, lo: 0, hi: BOUND }), &[file(180, 0, 599)], Some((0, 300, 180)), WitnessVerdict::Unverifiable
+        ; "a count over a DIFFERENT window is not evidence about this slice, even when the numbers agree")]
+    #[test_case::test_case(None, &[file(200, 0, 599)], None, WitnessVerdict::Unverifiable ; "no witness at all")]
+    #[test_case::test_case(Some(SliceWitness::Physical(200)), &[], None, WitnessVerdict::Stale ; "an emptied partition is a disagreement, not an absence")]
+    fn witness_survives_benign_maintenance_and_still_catches_real_change(
+        witness: Option<SliceWitness>, files: &[SourceFile], logical: Option<(i64, i64, u64)>, expected: WitnessVerdict,
+    ) {
+        assert_eq!(verify_slice_witness(witness, LiveSource { files: Some(files), logical }), expected);
     }
 
     #[test]

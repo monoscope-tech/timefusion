@@ -2481,7 +2481,7 @@ impl Database {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
             return Ok(true);
         }
-        self.record_staged_intent(&StagedIntent {
+        self.record_staged_intent(StagedIntent {
             wave_id: resume_wave.clone(),
             table_name: key.physical_table.clone(),
             project_id: key.project_id.clone(),
@@ -2495,6 +2495,7 @@ impl Database {
                 source_rows: publication.source_rows,
                 date: date_string.clone(),
             }),
+            instance: None,
         });
         if !actions.is_empty() {
             let commit_lock = self.commit_lock(&key.project_id, &key.physical_table).await;
@@ -2820,14 +2821,50 @@ impl Database {
             return Ok(true);
         };
         let pass = if operation == crate::maintenance_coordinator::Operation::Repair { TailPass::Repair } else { TailPass::Pack };
+        // A staged-but-uncommitted rewrite from a previous process is COMMITTED
+        // here rather than redone. `stage_hot_bin` records an intent for every
+        // bin it stages, but when the coordinator took ownership of slice
+        // maintenance the only consumer of those intents went with it: every
+        // caller of `resumable_staged_bin` sits under
+        // `!COORDINATOR_OWNS_SLICE_MAINTENANCE`, which is `true`. So prod kept
+        // writing intents that nothing could ever redeem, and the only remaining
+        // reader was the boot-time reconcile — which DELETES the staged parquet.
+        // A repair bin is one 40+ minute whole-file rewrite against a process
+        // replaced every 15-28 minutes, so that discarded a complete, sorted,
+        // row-exact replacement on almost every pass.
+        let date_marker =
+            chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| format!("date={}/", time.date_naive())).unwrap_or_default();
+        if let Some(bin) = self.resumable_staged_bin(&table_ref, &key.source, &key.project_id, &files).await {
+            let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![bin], 0).await;
+            let landed = result.failed.is_empty() && !result.landed.is_empty();
+            info!(table_name = %key.source, project_id = %key.project_id, landed, event = "resumed_bin_committed_early");
+            if landed {
+                // A resumed bin is one BIN, never by construction the whole
+                // cell: `coordinator_compaction_files` hands Repair `take(1)`
+                // and hands packing one budgeted bin-pack. Completing here
+                // unconditionally retired a unit whose partition still carried
+                // debt — the same test the staging arm below and the
+                // already-sorted arm above both make, and for the same reason.
+                let remaining = !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty();
+                let mut journal = self.journal();
+                if remaining {
+                    journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
+                } else {
+                    journal.complete(&key);
+                }
+                journal.checkpoint()?;
+                return Ok(true);
+            }
+            // The resume lost its race (inputs no longer live). Fall through and
+            // stage normally rather than failing the unit.
+        }
         let runtime = self.coordinator_runtime_env();
         let outcome = self
             .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
             .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
-                let date = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()).unwrap_or_default();
-                let result = self.commit_wave(&table_ref, &key.source, &[format!("date={date}/")], false, vec![unit], 0).await;
+                let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![unit], 0).await;
                 result.failed.is_empty() && !result.landed.is_empty()
             }
             Ok(BinOutcome::Converged) => true,
@@ -6217,7 +6254,7 @@ impl Database {
         // Record the intent BEFORE the bin can be handed to a wave commit, so a
         // crash anywhere in the staging→commit window leaves a trail to clean up.
         let wave_id = uuid::Uuid::new_v4().to_string();
-        self.record_staged_intent(&StagedIntent {
+        self.record_staged_intent(StagedIntent {
             wave_id: wave_id.clone(),
             table_name: table_name.to_string(),
             project_id: project_id.to_string(),
@@ -6229,6 +6266,7 @@ impl Database {
             target_paths: files.clone(),
             adds: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.clone()) } else { None }).collect(),
             rollup: None,
+            instance: None,
         });
         // Data-preserving compaction: BOTH sides carry data_change=false so the
         // fork's snapshot-isolation downgrade applies and concurrent ingest
@@ -6333,7 +6371,7 @@ impl Database {
                 // live) targets. Dedup's bins go back on the dirty queue via the
                 // `failed` list — a partition with duplicates still in it must
                 // never be certified clean.
-                self.discard_bins(&bins).await;
+                self.discard_bins(table_ref, &bins, None).await;
                 failed.extend(bins);
                 return WaveResult { landed: carried, failed };
             }
@@ -6358,7 +6396,7 @@ impl Database {
                 Err(e) => {
                     drop(commit_guard);
                     error!("{engine} wave: no snapshot for {table_name}: {e}");
-                    self.discard_bins(&bins).await;
+                    self.discard_bins(table_ref, &bins, None).await;
                     failed.extend(bins);
                     return WaveResult { landed: carried, failed };
                 }
@@ -6381,7 +6419,7 @@ impl Database {
             for bin in &stale {
                 debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit");
             }
-            self.discard_bins(&stale).await;
+            self.discard_bins(table_ref, &stale, Some(&live)).await;
             failed.extend(stale);
             if !self_landed.is_empty() {
                 warn!(
@@ -6414,7 +6452,7 @@ impl Database {
             for bin in &overlapping {
                 debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_overlapping_target");
             }
-            self.discard_bins(&overlapping).await;
+            self.discard_bins(table_ref, &overlapping, Some(&live)).await;
             failed.extend(overlapping);
             if fresh.is_empty() {
                 drop(commit_guard);
@@ -6493,7 +6531,7 @@ impl Database {
                         CommitProbe::NotLanded => {
                             crate::observability::record_optimize_failed();
                             error!("{engine} wave commit failed for '{}': {}", table_name, e);
-                            self.discard_bins(&fresh).await;
+                            self.discard_bins(table_ref, &fresh, None).await;
                             failed.extend(fresh);
                             return WaveResult { landed: carried, failed };
                         }
@@ -6622,10 +6660,39 @@ impl Database {
     /// Cleanup + intent-clear for bins leaving the wave uncommitted. One helper
     /// because the pair IS the crash-safety invariant — a drifted copy that
     /// cleans without clearing (or vice versa) breaks the manifest's meaning.
-    pub(crate) async fn discard_bins(&self, bins: &[StagedBin]) {
-        for bin in bins {
-            Self::cleanup_orphaned_parquet(&bin.stage_store, &bin.adds).await;
-        }
+    ///
+    /// The delete is gated on LIVENESS (`discard_bin_parquet`): a concurrent
+    /// instance can resume our staged intent and commit these very objects, and
+    /// deleting them then is data loss, not reclaimed waste. `live` is the
+    /// caller's set when it already holds one under the commit lock; otherwise we
+    /// re-read the log here, because a stale in-memory snapshot cannot see the
+    /// commit that just landed and deciding a delete on it IS the bug.
+    ///
+    /// Liveness unknown ⇒ delete nothing AND clear nothing: the intent is what
+    /// lets boot-time reconcile reclaim the files later (it spares referenced
+    /// paths), so clearing it here would trade a leak for an unreclaimable one.
+    pub(crate) async fn discard_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, bins: &[StagedBin], live: Option<&HashSet<String>>) {
+        let refreshed;
+        let live = match live {
+            Some(live) => live,
+            None => {
+                let ok = tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                let fresh = if ok {
+                    table_ref.read().await.snapshot().ok().map(|s| s.log_data().iter().map(|f| f.path().into_owned()).collect::<HashSet<_>>())
+                } else {
+                    None
+                };
+                let Some(fresh) = fresh else {
+                    warn!("wave discard: no fresh snapshot — leaving {} bins' staged parquet AND intents for boot reconcile", bins.len());
+                    return;
+                };
+                refreshed = fresh;
+                &refreshed
+            }
+        };
+        discard_bin_parquet(bins, live).await;
         self.clear_bin_intents(bins);
     }
 
@@ -6769,14 +6836,18 @@ impl Database {
         info!(loaded = kept.len(), dropped, event = "footer_repair_verified_loaded");
     }
 
-    fn staged_intent_path(&self) -> PathBuf {
+    pub(crate) fn staged_intent_path(&self) -> PathBuf {
         self.maintenance_state_path("staged_intent.jsonl")
     }
 
     /// Append one bin's staged paths. Best-effort: a manifest write failure
     /// must never fail the compaction, only widen the VACUUM backstop's job.
-    pub(crate) fn record_staged_intent(&self, entry: &StagedIntent) {
+    pub(crate) fn record_staged_intent(&self, entry: StagedIntent) {
         use std::io::Write;
+        // Stamped HERE, never by callers: a site that forgot would write an
+        // entry indistinguishable from a pre-upgrade one and lose its resume to
+        // the legacy age gate forever (see `resume_guarded`).
+        let entry = StagedIntent { instance: Some(crate::observability::instance_id().to_owned()), ..entry };
         let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.staged_intent_path();
         let write = crate::support::without_blocking_the_worker(|| -> std::io::Result<()> {
@@ -6784,7 +6855,7 @@ impl Database {
                 std::fs::create_dir_all(dir)?;
             }
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-            writeln!(file, "{}", serde_json::to_string(entry)?)
+            writeln!(file, "{}", serde_json::to_string(&entry)?)
         });
         if let Err(e) = write {
             warn!("staged-intent manifest append failed ({:?}): {} — orphan cleanup falls back to VACUUM", path, e);
@@ -6851,9 +6922,13 @@ impl Database {
     pub(crate) async fn resume_rollup_unit(&self, key: &crate::maintenance_coordinator::TaskKey, current_source_rows: Option<u64>) -> Result<bool> {
         use deltalake::protocol::{DeltaOperation, SaveMode};
         use std::sync::atomic::Ordering::Relaxed;
+        let stats = crate::observability::maintenance_stats();
         let contents = {
             let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else { return Ok(false) };
+            let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else {
+                stats.rollup_resume_no_intent.fetch_add(1, Relaxed);
+                return Ok(false);
+            };
             contents
         };
         // Paired with its evidence, so the commit path below cannot re-ask
@@ -6864,6 +6939,7 @@ impl Database {
             .filter_map(|entry| entry.rollup.clone().filter(|rollup| &rollup.key == key).map(|rollup| (entry, rollup)))
             .collect();
         if candidates.is_empty() {
+            stats.rollup_resume_no_intent.fetch_add(1, Relaxed);
             return Ok(false);
         }
         let Some(date_string) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else {
@@ -6899,11 +6975,15 @@ impl Database {
         };
         let live_view: HashMap<&str, Option<(i64, i64)>> = partition.iter().map(|(path, (slice, _))| (path.as_str(), *slice)).collect();
         let now_secs = crate::support::now_secs();
-        let stats = crate::observability::maintenance_stats();
         for (entry, rollup) in &candidates {
             let verdict = classify_rollup_resume(entry, &key.physical_table, now_secs, &live_view, current_source_rows);
             match verdict {
-                ResumeVerdict::Skip | ResumeVerdict::RowMismatch { .. } => continue,
+                // `classify_rollup_resume` cannot return RowMismatch — a rollup
+                // aggregates — so this arm is the ownership guard and nothing else.
+                ResumeVerdict::Skip | ResumeVerdict::RowMismatch { .. } => {
+                    stats.rollup_resume_skipped.fetch_add(1, Relaxed);
+                    continue;
+                }
                 ResumeVerdict::AlreadyLanded => {
                     // The Delta commit landed and only the bookkeeping was lost.
                     // PUBLISH anyway: without a journal publication the coverage
@@ -6911,6 +6991,7 @@ impl Database {
                     // planner sees a hole and re-enqueues the whole scan — the
                     // exact cost this exists to avoid.
                     self.publish_resumed_rollup(rollup, &entry.wave_id)?;
+                    stats.rollup_resume_already_landed.fetch_add(1, Relaxed);
                     info!(table = %key.physical_table, project_id = %key.project_id, wave_id = %entry.wave_id, event = "rollup_resume_already_landed");
                     return Ok(true);
                 }
@@ -7016,10 +7097,14 @@ impl Database {
                 // A repair intent never carries the rollup evidence, so these
                 // two verdicts are unreachable here by construction — see
                 // `classify_rollup_resume`, which is the only producer.
-                ResumeVerdict::Skip | ResumeVerdict::SourceMoved | ResumeVerdict::WouldDoubleCount => continue,
+                ResumeVerdict::Skip | ResumeVerdict::SourceMoved | ResumeVerdict::WouldDoubleCount => {
+                    stats.repair_resume_skipped.fetch_add(1, Relaxed);
+                    continue;
+                }
                 ResumeVerdict::AlreadyLanded => {
                     // The commit landed and only the bookkeeping was lost. Never
                     // re-commit: that would Remove the files it just Added.
+                    stats.repair_resume_already_landed.fetch_add(1, Relaxed);
                     info!(table_name, project_id, wave_id = %entry.wave_id, event = "staged_intent_already_landed");
                     self.clear_staged_intent(&[entry.wave_id.as_str()]);
                 }

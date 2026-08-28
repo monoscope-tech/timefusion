@@ -265,7 +265,7 @@ impl QueryPlanner for DmlQueryPlanner {
                 // queries — the two need opposite fixes. Sampled so a
                 // multiple-per-second rate cannot flood the log, and the plan is
                 // only rendered when a sample is actually taken.
-                if crate::observability::sample_rollup_miss() {
+                if crate::observability::sample_rollup_miss(reason.label()) {
                     warn!(
                         reason = reason.label(),
                         plan = %fmt_capped(&logical_plan.display_indent().to_string(), 1200),
@@ -850,7 +850,7 @@ impl DmlContext<'_> {
 /// debug-prints to ~50MB, and building that string on the DV-merge failure
 /// path (i.e. during overload) broke OTLP export for the whole process
 /// (2026-07-26 incident).
-fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
+pub(crate) fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
     struct Trunc {
         buf: String,
         limit: usize,

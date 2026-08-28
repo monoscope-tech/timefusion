@@ -4427,10 +4427,10 @@ impl Database {
         // Always on. This was a `#[serde(default)]` bool that prod set to `true`
         // and nothing else ever set at all — see the note in `config.rs`.
         let realtime = true;
-        // Sampled on the same limiter as `rollup_miss_sampled`, so a
-        // multiple-per-second miss rate cannot flood the log.
+        // Sampled on its OWN key, so a multiple-per-second miss rate cannot
+        // flood the log and cannot spend another site's budget either.
         if let Some(project) = &first_uncovered
-            && crate::observability::sample_rollup_miss()
+            && crate::observability::sample_rollup_miss("rollup_uncovered_project")
         {
             warn!(
                 project_id = %project,
@@ -4455,7 +4455,7 @@ impl Database {
             // The most common refusal, and ambiguous from the counter alone: no
             // overlapping coverage vs the buffered horizon cutting it away vs a
             // survivor narrower than one grain — opposite fixes, so log the shape.
-            if crate::observability::sample_rollup_miss() {
+            if crate::observability::sample_rollup_miss("rollup_empty_interior") {
                 warn!(
                     lo = route.lo,
                     hi = route.hi,
@@ -7021,6 +7021,13 @@ pub(crate) struct StagedIntent {
     /// been indistinguishable from a real rollup with zero rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rollup: Option<RollupResume>,
+    /// WHICH instance staged this (`crate::observability::instance_id`). A
+    /// different id means some other process staged it and this one is certainly
+    /// not mid-staging it — the question the wall-clock age gate could only
+    /// guess at. `None` = written before this field existed, so the guess is all
+    /// there is. See [`resume_guarded`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
 }
 
 /// What a killed rollup unit needs in order to be COMMITTED on the next boot
@@ -7075,6 +7082,36 @@ fn parse_staged_intents(contents: &str) -> Vec<StagedIntent> {
 /// younger than `STAGED_INTENT_MIN_AGE_SECS` may belong to a live instance sharing the volume and are
 /// left for its own wave commit, the next boot, or VACUUM.
 const STAGED_INTENT_MIN_AGE_SECS: u64 = 30 * 60;
+
+/// Must this entry be left alone for now, i.e. might we ourselves still be
+/// staging it?
+///
+/// The age gate was never about age: it stood in for "is another instance still
+/// working this?", and as a proxy it FORFEITED the resume rather than delaying
+/// it — `requeue_running` re-claims a unit within minutes of a restart while its
+/// intent is still young, so prod read `repair_resumed_total` and
+/// `rollup_resumed_total` flat 0 with every decline counter also 0. Identity
+/// answers the question exactly:
+///
+/// - a DIFFERENT id is another process's staging. Every record site appends the
+///   entry only after the last parquet flush returns, so a manifest entry never
+///   describes half-written output, and the Commit arm re-verifies the objects
+///   (`staged_objects_complete`) anyway. Eligible immediately.
+/// - OUR id may be a unit still in flight in this very process, so it keeps the
+///   wall-clock gate — which also lets a unit requeued by its own deadline
+///   resume eventually instead of never.
+/// - NO id predates this field. There is nothing to compare, so it keeps the
+///   gate; treating it as eligible would reintroduce the hazard on the first
+///   boot after an upgrade.
+///
+/// Deliberately NOT used by `staged_orphan_deletions`: identity proves "not
+/// ours", never "its owner is dead", and committing another instance's finished
+/// staging merely risks losing a Delta OCC race, while DELETING its parquet
+/// before its own commit destroys the work.
+fn resume_guarded(entry: &StagedIntent, now_secs: u64) -> bool {
+    entry.instance.as_deref().is_none_or(|id| id == crate::observability::instance_id())
+        && now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS
+}
 
 fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs: u64, referenced: &HashSet<String>) -> Vec<String> {
     entries
@@ -7148,7 +7185,7 @@ fn classify_rollup_resume(
     entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<(i64, i64)>>, current_source_rows: Option<u64>,
 ) -> ResumeVerdict {
     let Some(rollup) = entry.rollup.as_ref() else { return ResumeVerdict::Skip };
-    if entry.table_name != table_name || entry.adds.is_empty() || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS {
+    if entry.table_name != table_name || entry.adds.is_empty() || resume_guarded(entry, now_secs) {
         return ResumeVerdict::Skip;
     }
     // Same argument as `classify_resume`: staged parquet is uuid-named by the
@@ -7179,14 +7216,10 @@ fn classify_rollup_resume(
 /// (`None` = the Add carries no stats, which makes row preservation
 /// unverifiable and is therefore never committable).
 fn classify_resume(entry: &StagedIntent, table_name: &str, now_secs: u64, live: &HashMap<&str, Option<i64>>) -> ResumeVerdict {
-    // Same age gate, same reason, as `staged_orphan_deletions`: on an
-    // overlapping rolling deploy a still-running instance may be mid-staging,
-    // and committing its half-written output is exactly the hazard.
-    if entry.table_name != table_name
-        || entry.target_paths.is_empty()
-        || entry.adds.is_empty()
-        || now_secs.saturating_sub(entry.recorded_at) < STAGED_INTENT_MIN_AGE_SECS
-    {
+    // The one hazard this owes: on an overlapping rolling deploy the staging
+    // instance may still be alive and about to commit its own output. Ownership,
+    // not age, is what answers that — see `resume_guarded`.
+    if entry.table_name != table_name || entry.target_paths.is_empty() || entry.adds.is_empty() || resume_guarded(entry, now_secs) {
         return ResumeVerdict::Skip;
     }
     // Staged parquet is uuid-named by the writer, so nobody else can produce
@@ -8217,6 +8250,34 @@ fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
         _ => None,
     });
     adds.next().is_some_and(|first| live.contains(first) && adds.all(|p| live.contains(p)))
+}
+
+/// Delete the staged parquet of bins leaving a wave uncommitted — MINUS anything
+/// the snapshot references.
+///
+/// `bin_adds_live` answers the same question per bin for the self-landed split;
+/// this filters per ADD because the cost is asymmetric. Deleting a live object is
+/// data loss; leaking a dead one costs pennies until VACUUM/boot reconcile. The
+/// difference matters because a resuming instance commits our staging BIN BY BIN,
+/// so a wave can be part-live, and `probe_commit_landed` is all-or-nothing over
+/// the whole wave's Adds — one resumed bin makes it report `NotLanded` for all of
+/// them (49bf7f9 replaced the resume age gate with an ownership gate, which is
+/// what made another instance's commit reachable at any moment).
+///
+/// Not a lock: the other instance can still commit between the caller's snapshot
+/// read and these deletes. Closing that needs cross-instance coordination; the
+/// re-read shrinks the window from "any time since we staged" to the few
+/// milliseconds between the read and the delete.
+async fn discard_bin_parquet(bins: &[StagedBin], live: &HashSet<String>) {
+    for bin in bins {
+        let orphans: Vec<deltalake::kernel::Action> = bin
+            .adds
+            .iter()
+            .filter(|a| !matches!(a, deltalake::kernel::Action::Add(add) if live.contains(add.path.as_str())))
+            .cloned()
+            .collect();
+        Database::cleanup_orphaned_parquet(&bin.stage_store, &orphans).await;
+    }
 }
 
 /// Per-project outcome of one round's staging. `Result<Option<T>>` overloaded `None`: "converged"
@@ -13175,7 +13236,7 @@ mod tests {
 
         // The intent the killed process would have left, aged past the
         // rolling-deploy window so it is unambiguously a crash leftover.
-        db.record_staged_intent(&super::StagedIntent {
+        db.record_staged_intent(super::StagedIntent {
             wave_id: uuid::Uuid::new_v4().to_string(),
             table_name: tier.clone(),
             project_id: project.clone(),
@@ -13189,6 +13250,7 @@ mod tests {
                 source_rows: publication.source_rows,
                 date: day.to_string(),
             }),
+            instance: None,
         });
         Ok(KilledUnit { db, key, staged, source_rows: publication.source_rows, project, tier })
     }
@@ -13254,6 +13316,236 @@ mod tests {
             crate::observability::maintenance_stats().rollup_resume_declined.load(std::sync::atomic::Ordering::Relaxed) > before,
             "and the refusal is visible rather than silent"
         );
+        Ok(())
+    }
+
+    /// The state a container killed between STAGING and COMMITTING a compaction
+    /// bin leaves behind, reconstructed the same way `staged_but_uncommitted_rollup`
+    /// does it: run the unit for real, then rewind the Delta log. The staged
+    /// parquet survives a Remove, so what is left is byte-for-byte the
+    /// killed-mid-stage state and only real machinery produced it.
+    struct KilledBin {
+        db: Database,
+        project: String,
+        day: chrono::NaiveDate,
+        table_ref: Arc<RwLock<DeltaTable>>,
+        /// The committed-then-un-committed output: what a resume must commit.
+        staged: Vec<deltalake::kernel::Add>,
+        /// Its inputs, live again.
+        targets: Vec<deltalake::kernel::Add>,
+        /// The file set the killed process had already produced — what a resume
+        /// must reproduce EXACTLY, since any new path means it re-staged.
+        settled: HashSet<String>,
+    }
+
+    async fn live_adds(table_ref: &Arc<RwLock<DeltaTable>>) -> Vec<deltalake::kernel::Add> {
+        let table = table_ref.read().await;
+        #[allow(deprecated)]
+        table.snapshot().expect("snapshot").log_data().iter().map(|file| file.add_action()).collect()
+    }
+
+    impl KilledBin {
+        /// The manifest entry the killed process left. `aged`/`foreign` are the
+        /// two axes `resume_guarded` decides on.
+        fn record_intent(&self, aged: bool, foreign: bool) -> Result<()> {
+            self.db.record_staged_intent(super::StagedIntent {
+                wave_id: uuid::Uuid::new_v4().to_string(),
+                table_name: "otel_logs_and_spans".to_owned(),
+                project_id: self.project.clone(),
+                recorded_at: crate::support::now_secs() - if aged { super::STAGED_INTENT_MIN_AGE_SECS + 1 } else { 0 },
+                paths: self.staged.iter().map(|add| add.path.clone()).collect(),
+                target_paths: self.targets.iter().map(|add| add.path.clone()).collect(),
+                adds: self.staged.clone(),
+                rollup: None,
+                instance: None,
+            });
+            if foreign {
+                // `record_staged_intent` stamps OUR instance id unconditionally
+                // — deliberately, so no call site can forget — so a PREVIOUS
+                // process's entry can only be built by rewriting the manifest.
+                let path = self.db.staged_intent_path();
+                let contents = std::fs::read_to_string(&path)?.replace(crate::observability::instance_id(), &uuid::Uuid::new_v4().to_string());
+                std::fs::write(&path, contents)?;
+            }
+            Ok(())
+        }
+
+        async fn run_unit(&self) -> Result<UnitRunReport> {
+            run_consolidation(&self.db, &self.project, self.day).await
+        }
+    }
+
+    async fn run_consolidation(db: &Database, project: &str, day: chrono::NaiveDate) -> Result<UnitRunReport> {
+        db.run_unit_once("otel_logs_and_spans", project, day, crate::maintenance_coordinator::Operation::SealedConsolidation, 24, 0).await
+    }
+
+    /// One metadata-only Delta commit. The fixture below rewinds and re-tags the
+    /// log three times; none of it touches object storage.
+    async fn commit_actions(table_ref: &Arc<RwLock<DeltaTable>>, actions: Vec<deltalake::kernel::Action>) -> Result<()> {
+        let mut table = table_ref.read().await.clone();
+        let schema = get_schema("otel_logs_and_spans").expect("source schema");
+        let op = deltalake::protocol::DeltaOperation::Write {
+            mode: deltalake::protocol::SaveMode::Append,
+            partition_by: Some(schema.partitions.clone()),
+            predicate: None,
+        };
+        let finalized = deltalake::kernel::transaction::CommitBuilder::default()
+            .with_actions(actions)
+            .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
+            .await?;
+        table.state = Some(finalized.snapshot());
+        *table_ref.write().await = table;
+        Ok(())
+    }
+
+    async fn staged_but_uncommitted_bin(label: &str) -> Result<KilledBin> {
+        let db = Database::with_config(create_test_config(label)).await?;
+        db.cancel_maintenance();
+        let project = format!("repair_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(4)).date_naive();
+        let noon = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        // THREE flushes. Two become the bin; the third is tagged an
+        // already-sorted run below and is therefore skipped by the selection
+        // while staying LIVE — which is what leaves the cell owing work after
+        // the bin commits, and so what makes the resumed unit's completion
+        // semantics observable at all.
+        //
+        // NOT Repair, deliberately: `repair_bin_already_sorted` reads the
+        // parquet footer, and an ingest-flushed file already carries sorting
+        // columns, so a Repair unit clears the file as a false suspect and
+        // never stages anything. (An earlier version of this fixture used
+        // Repair and only "passed" when object-store reads failed under load —
+        // a rewrite that never happened read as a rewrite.)
+        for (id, offset) in [("a", 0), ("b", 60_000_000), ("c", 120_000_000)] {
+            insert_a_span(&db, &project, id, noon + offset).await?;
+        }
+        let table_ref = db.get_or_create_table(&project, "otel_logs_and_spans").await?;
+        let ingested = live_adds(&table_ref).await;
+        assert_eq!(ingested.len(), 3, "three flushes, three files");
+
+        // Tag one file as a sorted run. Packing skips sorted runs while any
+        // unsorted candidate remains, so this one is excluded from the bin and
+        // survives it. Two commits, so a Remove and an Add of the same path can
+        // never race each other's ordering within one version.
+        let mut held = ingested[0].clone();
+        commit_actions(&table_ref, vec![deltalake::kernel::Action::Remove(super::remove_for_add(&held, false))]).await?;
+        let mut tags = held.tags.clone().unwrap_or_default();
+        tags.insert(super::SORTED_RUN_TAG.to_owned(), Some("true".to_owned()));
+        held.tags = Some(tags);
+        commit_actions(&table_ref, vec![deltalake::kernel::Action::Add(held.clone())]).await?;
+
+        let before = live_adds(&table_ref).await;
+        assert_eq!(before.len(), 3, "re-tagging is metadata only and must not lose a file");
+
+        // The process that "died": it packed the two untagged files into one
+        // committed output. This also asserts the unit did real work — a
+        // short-circuit that retires nothing produces the same retry_reason.
+        let first = run_consolidation(&db, &project, day).await?;
+        assert_eq!(
+            first.retry_reason.as_deref(),
+            Some("compaction_debt_remaining"),
+            "the held sorted run is still live and under target, so the cell owes work — the semantics the resume arm has to match: {first}"
+        );
+        let after = live_adds(&table_ref).await;
+        let paths = |adds: &[deltalake::kernel::Add]| adds.iter().map(|add| add.path.clone()).collect::<HashSet<_>>();
+        let (was, settled) = (paths(&before), paths(&after));
+        let staged: Vec<_> = after.iter().filter(|add| !was.contains(&add.path)).cloned().collect();
+        let targets: Vec<_> = before.iter().filter(|add| !settled.contains(&add.path)).cloned().collect();
+        assert_eq!(
+            (staged.is_empty(), targets.len()),
+            (false, 2),
+            "the two untagged files must have been packed into a fresh output, or there is nothing to resume: {first}"
+        );
+
+        // Rewind: drop the output from the log, put its inputs back. The
+        // output's parquet stays in the object store — that IS the staged bin.
+        commit_actions(
+            &table_ref,
+            staged
+                .iter()
+                .map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, true)))
+                .chain(targets.iter().cloned().map(deltalake::kernel::Action::Add))
+                .collect(),
+        )
+        .await?;
+        Ok(KilledBin { db, project, day, table_ref, staged, targets, settled })
+    }
+
+    /// A compaction bin staged by a process that died before committing must be
+    /// COMMITTED on the next claim, not rewritten from scratch.
+    ///
+    /// `resumable_staged_bin` was unreachable in prod: both its callers sat under
+    /// `!COORDINATOR_OWNS_SLICE_MAINTENANCE`, which is `true`, so the live path
+    /// went straight to `stage_hot_bin` — which kept RECORDING intents. The only
+    /// remaining reader was the boot-time reconcile, and that DELETES the staged
+    /// parquet as an orphan. A repair bin is one 40+ minute whole-file rewrite
+    /// against a process replaced every 15-28 minutes, so a complete, sorted,
+    /// row-exact replacement was discarded on almost every pass.
+    ///
+    /// The YOUNG case is the one that matters and the reason this is a case
+    /// table: `requeue_running` sets `deadline = now`, so a killed unit is
+    /// re-claimed within MINUTES while its intent is still young. Under the old
+    /// wall-clock `STAGED_INTENT_MIN_AGE_SECS` gate that skipped, and a test
+    /// using only artificially aged intents would have passed while prod
+    /// no-opped — exactly the trap that hid this.
+    #[test_case::test_case(true, true, true; "a previous instance, aged past the legacy gate")]
+    #[test_case::test_case(true, false, true; "a previous instance, seconds old — THE prod timing")]
+    #[test_case::test_case(false, false, false; "our own young intent may still be in flight here")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coordinator_commits_a_resumable_staged_bin_instead_of_restaging(foreign: bool, aged: bool, resumes: bool) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let killed = staged_but_uncommitted_bin(&format!("repair-resume-{foreign}-{aged}")).await?;
+        killed.record_intent(aged, foreign)?;
+
+        let stats = crate::observability::maintenance_stats();
+        let (resumed, skipped) = (stats.repair_resumed.load(Relaxed), stats.repair_resume_skipped.load(Relaxed));
+        let report = killed.run_unit().await?;
+        let live = live_paths(&killed.db, &killed.project, "otel_logs_and_spans").await;
+
+        if !resumes {
+            assert_eq!(stats.repair_resumed.load(Relaxed), resumed, "an intent this process may still be staging must not be committed under it");
+            assert!(stats.repair_resume_skipped.load(Relaxed) > skipped, "and the guard's refusal must be counted, not silent");
+            assert!(killed.staged.iter().all(|add| !live.contains(&add.path)), "the staged output stays uncommitted; the unit rewrote its input instead");
+            return Ok(());
+        }
+        assert_eq!(stats.repair_resumed.load(Relaxed), resumed + 1, "the already-staged bin must be COMMITTED rather than rebuilt");
+        assert_eq!(live, killed.settled, "a resume must land EXACTLY the file set the killed process produced — any new path means it paid for the rewrite twice");
+        // Completion semantics, and the reason this arm cannot just
+        // `journal.complete`: a resumed bin is ONE bin, and Repair hands out
+        // `take(1)`, so the cell still owes its other file. Completing here
+        // retires a partition that is still out of policy.
+        assert_eq!(
+            report.retry_reason.as_deref(),
+            Some("compaction_debt_remaining"),
+            "the cell still owes work after the resumed bin, so the unit must requeue — completing it retires live debt"
+        );
+        assert_eq!(report.state, Some(crate::maintenance_coordinator::TaskState::Retry), "and `complete` clears the reason, so the state has to agree");
+        Ok(())
+    }
+
+    /// A resume whose staged parquet is gone must fall through to normal staging,
+    /// not fail the unit. This is the common way an intent outlives what it
+    /// describes: the boot-time reconcile deletes exactly these objects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_whose_staged_parquet_is_gone_stages_normally() -> Result<()> {
+        use object_store::ObjectStoreExt;
+        use std::sync::atomic::Ordering::Relaxed;
+        let killed = staged_but_uncommitted_bin("repair-resume-gone").await?;
+        killed.record_intent(true, true)?;
+        let store = { killed.table_ref.read().await.log_store().object_store(None) };
+        for add in &killed.staged {
+            store.delete(&object_store::path::Path::from(add.path.as_str())).await?;
+        }
+
+        let stats = crate::observability::maintenance_stats();
+        let (resumed, incomplete) = (stats.repair_resumed.load(Relaxed), stats.repair_resume_declined_incomplete.load(Relaxed));
+        let report = killed.run_unit().await?;
+
+        assert_eq!(stats.repair_resumed.load(Relaxed), resumed, "there is nothing to commit — the objects are gone");
+        assert!(stats.repair_resume_declined_incomplete.load(Relaxed) > incomplete, "and the decline is counted");
+        assert_eq!(report.retry_reason.as_deref(), Some("compaction_debt_remaining"), "the unit staged normally and requeued; it must not fail");
+        let live = live_paths(&killed.db, &killed.project, "otel_logs_and_spans").await;
+        assert!(killed.targets.iter().all(|add| !live.contains(&add.path)), "the input was genuinely rewritten by the fall-through");
         Ok(())
     }
 
@@ -15869,6 +16161,31 @@ mod tests {
         );
     }
 
+    /// A wave whose commit fails must never delete parquet another instance has
+    /// already made LIVE. `probe_commit_landed` is all-or-nothing over the whole
+    /// wave, and a resuming instance commits our staged intent bin by bin — so a
+    /// part-resumed wave reports `NotLanded` and used to delete the resumed bin's
+    /// files out of the table. The other direction is asserted too: a genuinely
+    /// orphaned bin still gets cleaned up, or "delete nothing" would pass.
+    #[tokio::test]
+    async fn wave_discard_spares_adds_committed_by_another_instance() {
+        use object_store::ObjectStoreExt;
+        let path_of = |bin: &super::StagedBin| match &bin.adds[0] {
+            deltalake::kernel::Action::Add(add) => add.path.to_string(),
+            other => panic!("unexpected action {other:?}"),
+        };
+        // [0] = resumed and committed by instance B; [1] = in no commit at all.
+        let bins = vec![staged_unit("alpha", &["old-a.parquet"], None), staged_unit("beta", &["old-b.parquet"], None)];
+        let stores: Vec<_> = bins.iter().map(|b| b.stage_store.clone()).collect();
+        let paths: Vec<_> = bins.iter().map(|b| object_store::path::Path::from(path_of(b))).collect();
+        for (store, path) in stores.iter().zip(&paths) {
+            store.put(path, object_store::PutPayload::from_static(b"parquet")).await.unwrap();
+        }
+        super::discard_bin_parquet(&bins, &[path_of(&bins[0])].into_iter().collect()).await;
+        assert!(stores[0].head(&paths[0]).await.is_ok(), "live parquet must survive a failed wave commit");
+        assert!(stores[1].head(&paths[1]).await.is_err(), "parquet in no commit is still reclaimed");
+    }
+
     fn dedup_unit(date: &str, before: u64, after: u64) -> super::DedupUnit {
         super::DedupUnit { key: None, date: date.to_string(), label: "chunk".into(), before, after }
     }
@@ -16020,8 +16337,9 @@ mod tests {
         let entries = super::parse_staged_intents(contents);
         assert_eq!(entries.len(), 1, "only the intact line survives: {entries:?}");
         assert_eq!(entries[0].paths, vec!["p1", "p2"]);
-        // Pre-resume lines carry neither resume field and stay cleanup-only.
-        assert!(entries[0].target_paths.is_empty() && entries[0].adds.is_empty());
+        // Pre-resume lines carry neither resume field and stay cleanup-only, and
+        // no instance id — which is what keeps them on the wall-clock gate.
+        assert!(entries[0].target_paths.is_empty() && entries[0].adds.is_empty() && entries[0].instance.is_none());
         assert!(super::parse_staged_intents("").is_empty());
         assert!(super::parse_staged_intents("garbage").is_empty());
     }
@@ -16040,6 +16358,7 @@ mod tests {
             target_paths: Vec::new(),
             adds: Vec::new(),
             rollup: None,
+            instance: None,
         };
         let old = super::STAGED_INTENT_MIN_AGE_SECS + 1;
         let entries = vec![
@@ -16073,6 +16392,7 @@ mod tests {
             target_paths: targets.iter().map(|s| s.to_string()).collect(),
             adds,
             rollup: None,
+            instance: None,
         }
     }
 
@@ -16091,7 +16411,7 @@ mod tests {
         assert_eq!(super::classify_resume(&ok, "logs", 100_000, &live), Commit);
         // Another table's entry is not this reconcile's to judge.
         assert_eq!(super::classify_resume(&ok, "metrics", 100_000, &live), Skip);
-        // Young: a still-running instance on a shared volume may be mid-staging.
+        // Young and OURS: this process may still be staging it.
         let young = super::StagedIntent { recorded_at: 100_000 - 10, ..ok.clone() };
         assert_eq!(super::classify_resume(&young, "logs", 100_000, &live), Skip);
         // Pre-resume (and dedup) entries carry neither field: cleanup-only.
@@ -16114,6 +16434,33 @@ mod tests {
         // re-commit (re-committing would remove files the landed commit added).
         let landed = resume_intent(&["in1"], vec![resume_add("out1", 100)]);
         assert_eq!(super::classify_resume(&landed, "logs", 100_000, &resume_live(&[("out1", Some(100))])), AlreadyLanded);
+    }
+
+    /// Resume is gated on OWNERSHIP, not on age.
+    ///
+    /// `requeue_running` re-claims a killed unit within minutes of a restart,
+    /// so the 30-minute wall-clock gate never DELAYED a resume — it forfeited
+    /// it, and prod read `repair_resumed_total` = `rollup_resumed_total` = 0
+    /// with every decline counter also 0. A previous instance's intent is
+    /// eligible the moment it is seen; our own — possibly still in flight — and
+    /// a pre-upgrade entry that cannot say whose it is keep the gate.
+    #[test]
+    fn a_previous_instances_staged_intent_resumes_without_waiting_out_the_age_gate() {
+        use super::ResumeVerdict::*;
+        let ok = resume_intent(&["in1", "in2"], vec![resume_add("out1", 100)]);
+        let owned_by =
+            |instance: Option<&str>, age: u64| super::StagedIntent { instance: instance.map(str::to_string), recorded_at: 100_000 - age, ..ok.clone() };
+        let live = resume_live(&[("in1", Some(30)), ("in2", Some(70))]);
+        let verdict = |entry: &super::StagedIntent| super::classify_resume(entry, "logs", 100_000, &live);
+        assert_eq!(verdict(&owned_by(Some("a-dead-instance"), 10)), Commit);
+        assert_eq!(verdict(&owned_by(Some(crate::observability::instance_id()), 10)), Skip);
+        assert_eq!(verdict(&owned_by(None, 10)), Skip, "no id: nothing to compare, so the wall-clock proxy stands");
+        assert_eq!(verdict(&owned_by(None, super::STAGED_INTENT_MIN_AGE_SECS + 1)), Commit);
+        assert_eq!(
+            verdict(&owned_by(Some(crate::observability::instance_id()), super::STAGED_INTENT_MIN_AGE_SECS + 1)),
+            Commit,
+            "our own unit requeued by its own deadline resumes eventually, not never"
+        );
     }
 
     /// The rollup half of resume, decided WITHOUT IO.
@@ -16175,9 +16522,16 @@ mod tests {
         // publication was lost. The caller publishes; it must never re-commit.
         let landed = live(&[("out1", Some((1_000, 2_000)))]);
         assert_eq!(super::classify_rollup_resume(&ok, "logs", 100_000, &landed, Some(100)), AlreadyLanded);
-        // A still-running instance on a shared volume may be mid-staging.
-        let young = super::StagedIntent { recorded_at: 100_000 - 10, ..ok.clone() };
-        assert_eq!(super::classify_rollup_resume(&young, "logs", 100_000, &inside, Some(100)), Skip);
+        // Ownership, not age — the same ladder `classify_resume` obeys: another
+        // instance's staging is eligible at once, ours may still be in flight,
+        // and a pre-upgrade entry keeps the wall-clock proxy.
+        let owned_by =
+            |instance: Option<&str>, age: u64| super::StagedIntent { instance: instance.map(str::to_string), recorded_at: 100_000 - age, ..ok.clone() };
+        let verdict = |entry: &super::StagedIntent| super::classify_rollup_resume(entry, "logs", 100_000, &inside, Some(100));
+        assert_eq!(verdict(&owned_by(Some("a-dead-instance"), 10)), Commit);
+        assert_eq!(verdict(&owned_by(Some(crate::observability::instance_id()), 10)), Skip);
+        assert_eq!(verdict(&owned_by(None, 10)), Skip);
+        assert_eq!(verdict(&owned_by(None, super::STAGED_INTENT_MIN_AGE_SECS + 1)), Commit);
     }
 
     /// The Add stats column list must be the narrow prune set, not the whole schema, and must never

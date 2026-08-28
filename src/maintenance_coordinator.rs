@@ -862,8 +862,19 @@ impl TaskJournal {
         let mut replacements: HashMap<TaskKey, (i64, u64, u64)> = HashMap::new();
         let mut migrated = 0usize;
         for task in &mut self.snapshot.tasks {
+            // A SPLIT CHILD is not a legacy fragment. This migration exists for
+            // the old 10-minute derived units; collapsing a child back to its
+            // hour erases the bisection ladder and re-enqueues the parent key,
+            // which `enqueue_inner` then resurrects to Pending — the loop that
+            // turned one schema break into 4,632 superseded derived records on
+            // 2026-08-22/23 (not one survived at width 1.0h; the migrated
+            // population peaked at the 1-minute floor). `parent_measured_bytes`
+            // is set only by `split_time_task`, so it is the exact discriminator.
+            // Recombining children stays `coarsen_to_width`'s job — it prices the
+            // fusion, which this pass cannot.
             if !(task.key.operation == Operation::DerivedRollup
                 && task.key.slice.width() != DERIVED_SLICE_MICROS
+                && task.parent_measured_bytes.is_none()
                 && !matches!(task.state, TaskState::Complete | TaskState::Superseded))
             {
                 continue;
@@ -1560,10 +1571,10 @@ impl TaskJournal {
     ///
     /// DAMAGE leads its class, ahead of `starved`, because the starvation window
     /// is a FRESHNESS heuristic and damage is not a freshness question.
-    /// `starved` is only set for work aged 3 to 31 days; every untagged file left
-    /// on prod 2026-08-23 was 32 to 37 days old, so it fell outside the window
-    /// and ranked below the entire ~12,000-unit backfill queue — unreachable in
-    /// practice, whatever `hole_rank` said, because `starved` is compared first.
+    /// `starved` grades AGE and is compared first, so whatever `hole_rank` says
+    /// about a damaged cell is only reached once age has spoken: every untagged
+    /// file left on prod 2026-08-23 was 32 to 37 days old, which under the old
+    /// hard horizon put it below the entire ~12,000-unit backfill queue.
     ///
     /// Damage does not order by width OR recency — every damage unit ties, so the
     /// per-project cursor in `claim_next` rotates across the damaged CELLS
@@ -2368,11 +2379,10 @@ impl TaskJournal {
         // CONTIGUITY, and 30 contiguous days is a contiguity goal.
         // DAMAGE leads its class, ahead of `starved`, because the starvation
         // window is a FRESHNESS heuristic and damage is not a freshness
-        // question. `starved` is only set for work aged 3 to 31 days; every
-        // untagged file left on prod 2026-08-23 was 32 to 37 days old, so it
-        // fell outside the window and ranked below the entire ~12,000-unit
-        // backfill queue — unreachable in practice, whatever `hole_rank` said,
-        // because `starved` is compared first.
+        // question. `starved` grades AGE and is compared first: every untagged
+        // file left on prod 2026-08-23 was 32 to 37 days old, which under the
+        // old hard horizon put it below the entire ~12,000-unit backfill queue,
+        // unreachable whatever `hole_rank` said.
         //
         // Bounded and self-terminating: the set comes from files that exist and
         // empties as they are retired.
@@ -2997,11 +3007,17 @@ const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 /// 2026-08-13 exactly where it was. Making everything starved is the same as
 /// making nothing starved.
 ///
-/// Beyond this bound a task is deliberately NOT starved. `scheduling_class`'s
-/// own history records why: plain oldest-first sent 10 of 10 historical starts
-/// to data months old while the last 30 days went untouched.
+/// Beyond this bound a task stops gaining escalation from the WINDOW and starts
+/// gaining it one step per further day instead — see the graded term in
+/// `scheduling_class`. It was a hard cut-off until 2026-08-25, which is a
+/// different thing entirely: past the bound a task ranked below every task
+/// inside it, forever. The bound exists because plain oldest-first sent 10 of 10
+/// historical starts to data months old while the last 30 days went untouched;
+/// flattening the escalation across the goal window keeps that from recurring,
+/// whereas cutting it off merely made the far tail unreachable.
 ///
-/// 31 days, because the escape valve must cover the GOAL window and no more.
+/// 31 days, because the flat part of the escalation must cover the GOAL window
+/// and no more.
 /// At 45 it did not: prod 2026-08-19 had hygiene claiming 2026-07-17, 07-19 and
 /// 07-20 — correctly oldest-first, and 30+ days back, so outside the window any
 /// 30d panel reads. The source table spans 2023-01-01 to 2026-08-19 with 75 of
@@ -3087,7 +3103,33 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
         // and `-width` then breaks the tie in favour of the day-wide unit, which
         // is exactly the desired order.
         let waited = now_micros.saturating_sub(task.key.slice.end_micros);
-        let starved = u8::from(!(STARVATION_MICROS..=STARVATION_HORIZON_MICROS).contains(&waited));
+        // The horizon is a SLOPE, not a cliff. `starved` used to be 0 only inside
+        // [3d, 31d], and it is compared before `hole`, `width` and `benefit` in a
+        // strict-priority tuple — so a slice one day past the horizon lost to
+        // everything inside it and was never compared on any other term. Prod
+        // 2026-08-25: 1,237 units older than 31 days were permanently
+        // unclaimable and `oldest_task_age_seconds` sat at 85 days, unable to
+        // decrease; 40 minutes of `maintenance_task_started` showed ZERO claims
+        // in 05-30..07-20. Nor could it heal: the 3-31d band refills every
+        // midnight and its timed-out residue crosses the cliff (207 of the tail
+        // at attempts=1 — tried inside the window, then aged out).
+        //
+        // So: below the floor is worst (fresh slices still settle before being
+        // processed), the whole [floor, horizon] band ties, and each further DAY
+        // past the horizon is one step better, saturating at 0 (~285 d). Ties
+        // across the band are the point — every ordering the band has learned
+        // (`hole`, `-width`, `benefit`, oldest-first) still decides inside it,
+        // and only work the horizon had abandoned gains rank.
+        //
+        // DAYS, not raw age, for the reason `PRIORITY_BUCKET_MICROS` and
+        // `BENEFIT_BUCKET_FILES` exist: `claim_next` matches the winning tuple
+        // EXACTLY, so a continuous key makes one unit the sole winner of every
+        // claim and defeats the per-project rotation in `fair_cursors`.
+        let starved = if waited < STARVATION_MICROS {
+            u8::MAX
+        } else {
+            (u8::MAX - 1).saturating_sub(u8::try_from(waited.saturating_sub(STARVATION_HORIZON_MICROS).max(0) / DAY_MICROS).unwrap_or(u8::MAX))
+        };
         // Starved work drains OLDEST-first; fresh work stays newest-first.
         //
         // This is the half that was missing. Escalating a starved task above
@@ -3128,7 +3170,10 @@ fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i6
             }
             _ => 0,
         };
-        (1, starved, -task.key.slice.width(), benefit, if starved == 0 { recency } else { -recency })
+        // Keyed on the AGE, not on `starved`: the graded term is 254 in-band, not
+        // 0, so testing the rank value here would silently flip the whole backlog
+        // to newest-first.
+        (1, starved, -task.key.slice.width(), benefit, if waited >= STARVATION_MICROS { recency } else { -recency })
     }
 }
 
@@ -4897,24 +4942,65 @@ mod tests {
         let narrow = super::scheduling_class(&task("e", end - NORMAL_SLICE_MICROS, end, Operation::SealedConsolidation), now);
         assert!(overdue_older < narrow, "width breaks the tie: the day-wide unit leads its own day's slices");
 
-        // Past the horizon a day stops escalating, so months-old data can never
-        // take the sealed budget — the failure `scheduling_class` records as 10
-        // of 10 historical starts landing on data months old.
+        // Past the horizon a day keeps escalating rather than falling off it.
+        // This pair asserted the opposite until 2026-08-25 — it codified the
+        // defect: the cut-off left 1,237 units permanently unclaimable and
+        // `oldest_task_age_seconds` pinned at 85 days. What the horizon still
+        // buys is the FLAT band beneath it: every day inside the goal window
+        // ties on age, so `hole`, `-width` and `benefit` decide there, and only
+        // the tail the cut-off had abandoned gains rank over them.
         let ancient = super::scheduling_class(&sealed_hours_ago("f", 60 * 24), now);
-        assert!(recent_new < ancient, "past STARVATION_HORIZON_MICROS a day no longer escalates");
+        assert!(ancient < recent_new, "past STARVATION_HORIZON_MICROS a day still escalates, it does not fall off");
 
-        // The bound tracks the GOAL window, not merely "old". A day 40 days back
-        // is outside what a 30d panel reads, and at a 45-day horizon prod spent
-        // the escalation on 2026-07-17..07-20 while the days a 30d query needed
-        // waited behind them. The source table always has older debt to find —
-        // it spans 2023-01-01 with 75 of 89 partition-days above 10 files.
         let outside_goal_window = super::scheduling_class(&sealed_hours_ago("h", 40 * 24), now);
         let inside_goal_window = super::scheduling_class(&sealed_hours_ago("i", 25 * 24), now);
-        assert!(inside_goal_window < outside_goal_window, "a day inside the 30d window must outrank one outside it");
+        assert!(outside_goal_window < inside_goal_window, "a day outside the window is behind in the drain, not beneath it");
+        // ...and inside the window age is FLAT, so the terms the band has learned
+        // still order it: 25 days and 10 days tie on `starved`.
+        let (_, inside_starved, ..) = inside_goal_window;
+        let (_, ten_days_starved, ..) = super::scheduling_class(&sealed_hours_ago("j", 10 * 24), now);
+        assert_eq!(inside_starved, ten_days_starved, "the goal window is one band: `hole`/`width`/`benefit` order inside it");
 
         // And starvation never lets sealed work outrank the live frontier.
         let frontier = super::scheduling_class(&task("g", now - 600_000_000, now, Operation::BaseRollup), now);
         assert!(frontier < overdue_older, "class still leads: the frontier outranks even overdue sealed work");
+    }
+
+    /// Age must keep accruing rank past the horizon instead of falling off it.
+    ///
+    /// The horizon used to be a CLIFF: `starved` was 0 only inside [3d, 31d],
+    /// and it sits ahead of `hole`/`width`/`benefit` in a strict-priority tuple,
+    /// so a slice one day past the horizon lost to everything inside it and was
+    /// never compared on any other term. Prod 2026-08-25: 1,237 units older than
+    /// 31 days were permanently unclaimable, `oldest_task_age_seconds` was 85
+    /// days and could not decrease — 40 minutes of `maintenance_task_started`
+    /// showed ZERO claims anywhere in 05-30..07-20. It cannot self-heal either:
+    /// the 3-31d band is refilled every midnight and its timed-out residue
+    /// crosses the cliff (1,019 of the tail at attempts=0, but 207 at
+    /// attempts=1 — tried inside the window, then aged out).
+    #[test]
+    fn age_past_the_starvation_horizon_keeps_accruing_rank() {
+        const DAY: i64 = 24 * 3_600_000_000;
+        let now = 800 * DAY;
+        // Day-wide, no footprint: width and benefit tie, so only age can order these.
+        let aged = |project: &str, days: i64| {
+            let end = now - days * DAY;
+            super::scheduling_class(&task(project, end - DAY, end, Operation::SealedConsolidation), now)
+        };
+
+        assert!(aged("ancient", 71) < aged("recent", 10), "a 71-day-old unit must not rank behind a 10-day-old one");
+        assert!(aged("settling", 2) > aged("recent", 10), "the 3-day floor holds: work still settling does not jump the queue");
+
+        // Monotonic past the floor: older never ranks worse than younger, and the
+        // grade saturates so ancient work ties rather than fanning out forever.
+        let ladder: Vec<_> = [4, 10, 31, 32, 71, 300, 400].into_iter().map(|days| aged("p", days)).collect();
+        assert!(ladder.windows(2).all(|pair| pair[1] <= pair[0]), "rank must be non-increasing in age: {ladder:?}");
+        // Saturation ties the GRADED term — the tuple below it still drains them
+        // oldest-first, which is what keeps the far tail converging rather than
+        // fanning into one sole winner of every claim.
+        let (_, at_300, ..) = aged("p", 300);
+        let (_, at_400, ..) = aged("p", 400);
+        assert_eq!((at_300, at_400), (0, 0), "the grade saturates instead of running out of `u8`");
     }
 
     /// A hole must be claimed before a day that already has tier output.
@@ -5205,27 +5291,34 @@ mod tests {
     /// Damage outranks starvation, because the starvation window is a
     /// FRESHNESS heuristic and damage is not a freshness question.
     ///
-    /// `starved` is set only for work aged 3 to 31 days and is compared BEFORE
-    /// `hole_rank`. Every untagged file left on prod 2026-08-23 was 32 to 37
-    /// days old, so it fell outside the window and sorted below the whole
-    /// ~12,000-unit backfill queue — the hole rank could never be reached.
+    /// `starved` grades age and is compared BEFORE `hole_rank`, so a damaged
+    /// cell whose age loses is unreachable however damaged it is. Every untagged
+    /// file left on prod 2026-08-23 was 32 to 37 days old and sorted below the
+    /// whole ~12,000-unit backfill queue.
+    ///
+    /// The age that loses used to be "past the 31-day horizon"; since the
+    /// horizon became a slope (2026-08-25) old work no longer loses on age at
+    /// all, so the damaged cell here is a SETTLING one — two days sealed, under
+    /// `STARVATION_MICROS` — which is now the only way age can rank a cell last.
+    /// Its previous shape made the control vacuous: the 36-day cell won on age
+    /// alone and the damage flag proved nothing.
     #[test]
     fn damage_outranks_work_inside_the_starvation_window() {
         let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
-        // 36 days sealed: PAST the horizon, so `starved` is 1 and it loses to
-        // anything inside the window on the old ordering.
         let seed = |journal: &mut TaskJournal| {
-            let mut ancient = task("damaged", 3 * DAY, 4 * DAY, Operation::BaseRollup);
-            ancient.key.physical_table = "rollup_1m".to_owned();
-            ancient.deadline_micros = 0;
-            ancient.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            // Two days sealed: under the floor, so it loses to anything in the
+            // band — and past LIVE_FRONTIER_WINDOW_MICROS, so still class 1.
+            let mut settling = task("damaged", 37 * DAY, 38 * DAY, Operation::BaseRollup);
+            settling.key.physical_table = "rollup_1m".to_owned();
+            settling.deadline_micros = 0;
+            settling.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
             let mut inside = task("recent", 30 * DAY, 31 * DAY, Operation::BaseRollup);
             inside.key.physical_table = "rollup_1m".to_owned();
             inside.deadline_micros = 0;
-            inside.created_unix_ms = ancient.created_unix_ms;
-            journal.upsert(ancient);
+            inside.created_unix_ms = settling.created_unix_ms;
+            journal.upsert(settling);
             journal.upsert(inside);
         };
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
@@ -5233,17 +5326,17 @@ mod tests {
         assert_eq!(
             journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
             "recent",
-            "control: inside the starvation window leads work that is past the horizon"
+            "control: work inside the starvation window leads work still settling under the floor"
         );
 
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         seed(&mut journal);
-        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-01-04".to_owned())]);
+        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-02-07".to_owned())]);
         assert_eq!(
             journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
             "damaged",
-            "a damaged cell past the starvation horizon must still lead, or it is unreachable"
+            "a damaged cell the age ordering ranks last must still lead, or it is unreachable"
         );
     }
 
