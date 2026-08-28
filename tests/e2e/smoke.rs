@@ -55,7 +55,49 @@ async fn count_star_returns_correct_value() -> anyhow::Result<()> {
         client.execute(&insert, &[&"e2e_project", &format!("smoke-{i}"), &"s", &"OK", &"m", &"INFO", &vec!["s"]]).await?;
     }
     let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 7);
+    if count != 7 {
+        // WHICH LEG lost them. A bare `4 != 7` cannot distinguish rows that were
+        // never durable from rows that exist but are momentarily unreadable, and
+        // this failure was filed as a flake for three days on exactly that
+        // ambiguity. Everything below is READ-ONLY diagnosis of a live failure.
+        let ids: Vec<String> = client
+            .query("SELECT id FROM otel_logs_and_spans WHERE project_id = $1 ORDER BY id", &[&"e2e_project"])
+            .await?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        // Is it TRANSIENT? If a second identical query returns 7, the rows were
+        // always durable and the first read was wrong — a read-path race, not loss.
+        let again: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+        // MemBuffer's own view, bypassing SQL entirely.
+        let mem_rows: usize = env
+            .db()
+            .buffered_layer()
+            .map(|layer| {
+                layer
+                    .mem_buffer()
+                    .query("e2e_project", "otel_logs_and_spans", &[])
+                    .map(|batches| batches.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum())
+                    .unwrap_or(usize::MAX)
+            })
+            .unwrap_or(0);
+        // Delta's own view, bypassing SQL entirely.
+        let delta_files = match env.db().resolve_table("e2e_project", "otel_logs_and_spans").await {
+            Ok(table_ref) => {
+                let table = table_ref.read().await;
+                table.snapshot().map(|s| s.log_data().iter().count()).unwrap_or(0)
+            }
+            Err(_) => 0,
+        };
+        panic!(
+            "COUNT(*) returned {count} of 7 acked inserts.\n  \
+             visible ids ({}): {ids:?}\n  \
+             re-query immediately: {again} (== 7 means TRANSIENT: rows were durable, the read was wrong)\n  \
+             MemBuffer rows: {mem_rows}\n  \
+             Delta files: {delta_files}",
+            ids.len()
+        );
+    }
     Ok(())
 }
 

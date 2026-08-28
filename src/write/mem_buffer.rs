@@ -1744,6 +1744,29 @@ impl MemBuffer {
                 // exclusion armed for a later DML + airborne-commit race on
                 // this bucket, which relies on the mask.
                 let (min, max) = g.iter().filter_map(batch_timestamp_range).fold((i64::MAX, i64::MIN), |a, r| (a.0.min(r.0), a.1.max(r.1)));
+                // ...but narrowing ALONE cannot save a drained row that shares an
+                // instant with a survivor, because the mask is a time RANGE while
+                // the rows differ only by key. A survivor at exactly the drained
+                // row's timestamp still covers it, so the committed Delta copy
+                // stays hidden while memory no longer holds it — the row is
+                // invisible until the survivor itself flushes.
+                //
+                // This is the same class the `row_min_ts` field doc records
+                // ("masks Delta rows that share a timestamp with buffered ones —
+                // it dropped 15 of 20 rows across a dirty restart"), reached
+                // through the narrowing path instead. So the mask must begin
+                // strictly AFTER everything this drain committed.
+                //
+                // What that gives up, stated plainly: survivors at or below the
+                // drained max stop being masked. They are in memory and NOT in
+                // Delta — the snapshot did not include them — so the only exposure
+                // is the later DML + airborne-commit race the mask also defends,
+                // and on a keyed table read-side dedup collapses that anyway.
+                // Trading a rare double-count for a certain disappearance is the
+                // right side of this: a masked row is WRONG, a duplicated one is
+                // deduped.
+                let drained_max = b.batches.iter().filter_map(batch_timestamp_range).map(|(_, hi)| hi).max();
+                let min = drained_max.map_or(min, |hi| min.max(hi.saturating_add(1)));
                 bucket.min_timestamp.store(min, Ordering::Relaxed);
                 bucket.max_timestamp.store(max, Ordering::Relaxed);
             }
@@ -3756,6 +3779,47 @@ mod tests {
 
         let ranges = buffer.get_bucket_ranges("project1", "table1");
         assert_eq!(ranges, vec![(late_ts, late_ts + 1)], "survivor's mask must cover only the late rows so the drained rows' Delta copies stay visible");
+    }
+
+    /// The narrowing above CANNOT save a drained row that shares its timestamp with a survivor,
+    /// and that is a live correctness bug, not a corner case.
+    ///
+    /// The mask is a time RANGE; the rows differ only by `id`. So when a flushed row and a
+    /// retained row sit at the same instant, narrowing the survivor's range to `(ts, ts+1)` still
+    /// covers the drained row's freshly committed Delta copy — it is masked out of the Delta leg
+    /// while no longer being in the memory leg, and the row is invisible to queries until the
+    /// survivors themselves flush.
+    ///
+    /// Reproduced end to end 2026-08-28 by `e2e smoke::count_star_returns_correct_value` under
+    /// machine load: seven INSERTs at an identical timestamp, `COUNT(*)` = 6, the missing row is
+    /// the FIRST one, MemBuffer holds exactly the other 6, and an immediate re-query still says 6
+    /// (so it is masked, not in flight). Filed as a flake for three days.
+    ///
+    /// Identical timestamps are the common case for this workload, not an edge: a batch of OTel
+    /// spans arrives stamped to the same instant.
+    #[test]
+    fn a_drained_row_sharing_a_timestamp_with_a_survivor_is_not_masked() {
+        let buffer = MemBuffer::new();
+        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+
+        // The row that will be flushed to Delta and drained.
+        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
+
+        // A survivor at the SAME instant — the only difference from
+        // `prefix_drain_narrows_survivor_range_to_late_rows`, which uses ts+60s.
+        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        assert!(buffer.finish_flushed_snapshot(&snap));
+
+        // The drained row's Delta copy lives at exactly `ts`. Any mask covering
+        // `ts` hides a committed row that memory no longer holds.
+        let ranges = buffer.get_bucket_ranges("project1", "table1");
+        assert!(
+            !ranges.iter().any(|&(start, end)| (start..end).contains(&ts)),
+            "the survivor's mask covers the drained row's committed Delta copy, so that row is \
+             invisible to every query until the survivor flushes: ranges={ranges:?}, drained ts={ts}"
+        );
     }
 
     /// Regression: a DML that empties a sealed bucket leaves an empty shell
