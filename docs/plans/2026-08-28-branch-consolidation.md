@@ -109,6 +109,38 @@ distinctive test-fn names present on master (`slice_input_sql`,
 `an_uncovered_project_reads_raw_while_the_others_still_route`), the last two because
 they refactor files master no longer has.
 
+## Progress — later on 2026-08-28
+
+**Landed and pushed** (`f7be1f74..8f773923`, then the docs branch, then the split
+port): the integration train, the local-CI runner, `docs/measured-rollup-gap`, and
+`fix/split-inherits-backfill-priority`.
+
+`ci/local-run-attestation` needed more than a rebase. Its `ci/checks.tsv` and
+pathsets named `proto/` and `build.rs`, which **left the tree with the gRPC ingest
+removal** — so `cleanup/remove-grpc` turns out to be *already landed*, needing no
+user decision, and `protoc` drops out of every check's capability list. Left as-is
+the branch would have failed its own `every declared input path exists` assertion,
+which is exactly the check that exists to catch a pathspec matching nothing.
+`make ci-selftest`: all good.
+
+**`fix/split-inherits-backfill-priority` ported, and its test had to be rewritten
+rather than carried.** The original compared a *recent* split day against an *older*
+day-wide unit and asserted the recent won. That is now the wrong expectation for a
+reason unrelated to the fix: `starved` has since become a per-day **slope** past the
+31-day horizon, so a 39-day unit legitimately outranks a 9-day one *before width is
+consulted at all*. Carrying the fixture over would have produced a red test that
+looked like the port failing. The replacement compares two units at the **same seal
+time** and asserts on the width term of `scheduling_class` — the one term this change
+moves — and was witnessed failing first (child at 12h against the parent's 24h).
+
+**A tooling trap worth remembering:** `sed -i.bak … && mv file.bak file` restores the
+content but moves the **mtime backwards**, so cargo skips the rebuild and the next
+`nextest` run silently re-runs the *previous* binary. Two "failures" of an
+already-correct fix came from that, and the file on disk looked right the whole time.
+Touch the file, or witness a failure by other means.
+
+**Down from 33 branches to 7.**
+
 ## Phase 0 — hygiene (no gates needed)
 
 - [ ] Delete `worktree-agent-addf7c8a238435a91` — `git cherry` says **unmerged=0**;
@@ -186,6 +218,43 @@ Per-commit triage, expect to drop most: `fix/dml-bounded-key-pushdown` (12d, hal
       ingest through the gRPC path. Ask before deleting the interface.
 - [ ] `cleanup/docs-triage` — a 48-file docs deletion, 8 days old against heavy docs
       churn. Ask, or regenerate the triage against today's `docs/`.
+
+## What is actually left — 7 branches
+
+Ordered by value. Each line says what is *provably* absent from master, so the next
+session does not repeat the triage.
+
+1. **`tier1-14d-30d-complete`** (8 commits) — the biggest remaining prize, and mostly
+   unlanded. **Absent:** the per-query scan byte ceiling
+   (`the_scan_ceiling_refuses_only_an_oversize_scan_and_only_when_enabled`,
+   `wide_scan_rejection`, `timefusion_max_concurrent_scan_readers`), and both
+   null-guard fixes (`the_latency_panels_null_guard_does_not_block_routing`,
+   `a_null_guard_on_a_non_measure_column_stays_ineligible`,
+   `the_null_guards_raw_fringe_counts_the_column_not_the_rows`). **Landed:** only
+   `d291219c`, the cancellable-operators fix. Master *does* have `null_guards`
+   handling, so port per-feature — do not assume the whole file.
+2. **`fix/tier-merge-slice-set`** — `TAG_MERGED_SLICES`, `encode/decode_merged_slices`,
+   `file_slices` all absent, and master has no merged-slice concept at all. Real
+   feature (122 lines in the pre-split `src/database.rs`), needs a genuine port into
+   `src/database/{compact,maintain}.rs`, not a rebase.
+3. **`5a139c67` alone, out of `{simnew, simtest, fix/precise-restart-reconcile}`** —
+   `backfill_cells_by_contiguity`. See the stale-comment note above: master *claims*
+   contiguity ordering and *does* newest-first, deliberately. This one needs a
+   decision before a port, because it contradicts a stated rationale. Its sibling
+   `eef020a3` is landed; `25242120` is landed; everything else in those three
+   branches is the module split. **Delete all three once this commit is extracted.**
+4. **`worktree-agent-a4dd3af67abdf7806`** — `bf831539`'s wall-time bisection gate.
+   Master solved the same incident with a better discriminator (deterministic schema
+   failure), so only the residual matters: a unit failing fast for a *non-schema*
+   reason is still bisected. Needs `ran_micros` threaded through `TaskLease` and a
+   4-arg `abandon_running`, ~8 call sites.
+5. **`hold/schema-evolution`** (2 live commits) — a revert of "Give read pruning its
+   own row span" plus a guarded-count fixture. Decide whether the revert is still
+   wanted; `bf8b9a16` (the MemBuffer→Delta mask fix) has since touched the same
+   territory.
+6. **`cleanup/docs-triage`** — a 48-file docs deletion, now 8 days stale against heavy
+   docs churn. Regenerate rather than merge.
+7. `master` — the concurrent session's local branch, not part of this triage.
 
 ## Ledger
 
