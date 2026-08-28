@@ -7297,8 +7297,19 @@ impl Database {
         if !self.config.maintenance.timefusion_repair_mark_sorted_at_write {
             return (0, 0);
         }
-        let mut unknown: Vec<(Arc<RwLock<DeltaTable>>, String)> = Vec::new();
+        // The object store is captured HERE, once per table, so the probe stage below takes NO
+        // table locks at all. Re-locking per file would put 16 concurrent readers against a lock
+        // that `refresh_table_snapshot` needs to WRITE — and a delayed refresh is a stale
+        // snapshot, i.e. committed rows a query cannot see. Background hygiene must never be
+        // able to do that to the foreground.
+        // Grouped BY TABLE, and the store is taken once while the enumeration lock is already
+        // held, so the probe stage below takes NO table locks at all. Re-locking per file would
+        // put `REPAIR_VERIFY_CONCURRENCY` readers against a lock `refresh_table_snapshot` needs
+        // to WRITE — and a delayed refresh is a stale snapshot, i.e. committed rows a query
+        // cannot see. Background hygiene must never be able to do that to the foreground.
+        let mut unknown: Vec<(Arc<dyn object_store::ObjectStore>, Vec<String>)> = Vec::new();
         let mut tables_read = 0usize;
+        let mut candidates = 0usize;
         for (_, source, table_ref) in self.all_tables().await {
             // A table declaring no sort order has no footer to lose, so it has no
             // suspects — probing it would be pure IO for a set nothing reads.
@@ -7309,20 +7320,24 @@ impl Database {
                 let table = table_ref.read().await;
                 let Ok(snapshot) = table.snapshot() else { continue };
                 tables_read += 1;
+                let object_store = table.log_store().object_store(None);
+                let mut paths: Vec<String> = Vec::new();
                 for file in snapshot.log_data().iter() {
                     let path = file.path().into_owned();
-                    if !self.repair_verified_sorted.contains(&path) {
-                        unknown.push((Arc::clone(&table_ref), path));
+                    if !self.repair_verified_sorted.contains(&path) && candidates + paths.len() < limit {
+                        paths.push(path);
                     }
                 }
+                candidates += paths.len();
+                if !paths.is_empty() {
+                    unknown.push((object_store, paths));
+                }
             }
-            if unknown.len() >= limit {
+            if candidates >= limit {
                 break;
             }
         }
-        unknown.truncate(limit);
-        let candidates = unknown.len();
-        if unknown.is_empty() {
+        if candidates == 0 {
             // Logged even though there is nothing to report, because THIS is the
             // ambiguous reading: `tables_read = 0` means the sweep ran before the
             // tables were loaded and did nothing, which is indistinguishable from
@@ -7330,15 +7345,23 @@ impl Database {
             info!(tables_read, candidates = 0, verified = 0, event = "footer_repair_seed_swept");
             return (tables_read, 0);
         }
-        let verified: Vec<String> = futures::stream::iter(unknown)
-            .map(|(table_ref, path)| async move {
-                let object_store = { table_ref.read().await.log_store().object_store(None) };
-                Self::footer_declares_sorted(&object_store, &path).await.then_some(path)
-            })
-            .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
-            .filter_map(std::future::ready)
-            .collect()
-            .await;
+        let mut verified: Vec<String> = Vec::new();
+        for (object_store, paths) in unknown {
+            let found: Vec<String> = futures::stream::iter(paths)
+                .map(|path| {
+                    // Cloned INSIDE the closure so its parameter is a plain `String`. With the
+                    // store in the closure's parameter instead, inference demands a higher-ranked
+                    // `FnOnce` over the trait object's lifetime that it cannot satisfy, and the
+                    // error surfaces far away at the `tokio::spawn` that drives this.
+                    let object_store = Arc::clone(&object_store);
+                    async move { Self::footer_declares_sorted(&object_store, &path).await.then_some(path) }
+                })
+                .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
+                .filter_map(std::future::ready)
+                .collect()
+                .await;
+            verified.extend(found);
+        }
         for path in &verified {
             self.repair_verified_sorted.insert(path.clone());
         }
