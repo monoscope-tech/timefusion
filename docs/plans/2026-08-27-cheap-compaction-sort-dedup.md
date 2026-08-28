@@ -447,9 +447,28 @@ before pushing so the workflow does not land a follow-up commit and a second
 restart (`cargo lint` does not catch rustfmt —
 [[tf_push_gates_and_deploy_triggers_2026-08-15]]).
 
-**Measure next:** `wave_bin_staging_started` `selected_files` for bins containing
-unsorted files should move from **3–7** to **~15–40**, and the 08-24/25/26 drain
-rate should rise from ~46 files/hr accordingly.
+### CHANGE 2 RESULT — confirmed at 5 min (01:34 UTC), live 01:29:14
+
+Post-deploy `wave_bin_staging_started`:
+
+| bin type | baseline | after |
+|---|---|---|
+| contains unsorted files | 3–7 files, 0.4–13.2 MB | **15 files / 47.8 MB**, **20 files / 29.8 MB** |
+| all sorted runs | 21–24 files, 260–266 MB | 24 files / 263 MB (unchanged, as designed) |
+
+Both new bins sit under the 64 MB compressed budget, so the cap is doing what it
+should rather than being unbounded. **~3–4× more files retired per unit**, and
+the all-sorted path is untouched.
+
+`Light optimize staging failed` strictly after the new process started: **0**.
+Two failures at 01:29:00 belong to the *old* process being terminated mid-unit by
+the deploy (the `foyer close` line follows them) — deploy artifacts, not a new
+failure mode. Always filter on the process start, not the log window.
+
+**Watch next:** the 08-24/25/26 drain rate against the ~46 files/hr baseline, and
+unit durations — larger bins do more work per unit, and the pre-deploy metrics
+unit was already running 667–889 s against a 900 s deadline. If units start
+dying at the deadline, the budget is too large and 512 MB decoded is the fallback.
 
 ### (history) Change 2 while it was held
 
