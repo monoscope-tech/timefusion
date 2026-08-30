@@ -155,6 +155,87 @@ mod test_json_functions {
         Ok(())
     }
 
+    // Regression: the RUM dashboard widgets rendered error overlays with
+    // "Error during planning: Invalid function 'jsonb_path_query_first'".
+    // Monoscope's KQL compiler (shared/src/Pkg/Parser/Expr.hs,
+    // `transformFlattenedAttribute`) emits this for EVERY `attributes.exception.*`
+    // field, because an OTel SDK may carry the exception as a span event rather
+    // than a flattened attribute, so it COALESCEs both sources. Anything
+    // exception-related — log explorer, monitors, dashboards — failed to plan.
+    #[tokio::test]
+    async fn test_jsonb_path_query_first_returns_the_matched_value() -> Result<()> {
+        let db = std::sync::Arc::new(Database::new().await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        async fn text(ctx: &datafusion::prelude::SessionContext, expr: &str) -> Result<Option<String>> {
+            let batch = &ctx.sql(&format!("SELECT {expr} AS r")).await?.collect().await?[0];
+            let col = batch.column(0);
+            Ok((!col.is_null(0)).then(|| get_str(col.as_ref(), 0).to_string()))
+        }
+
+        // The exact span-event shape monoscope reads, and the exact path it emits.
+        const EVENTS: &str = r#"[{"event_name":"exception","event_attributes":{"exception":{"type":"TypeError","message":"Cannot read cart"}}}]"#;
+        let path = r#"'$[*] ? (@.event_name == "exception").event_attributes.exception.type'"#;
+
+        // `#>> '{}'` is the whole document as TEXT: the JSON string must be unwrapped.
+        // `TypeError`, never `"TypeError"` — a widget showing the quotes is still broken.
+        assert_eq!(
+            text(&ctx, &format!(r#"jsonb_path_query_first(json_to_variant('{EVENTS}'), {path}) #>> '{{}}'"#)).await?,
+            Some("TypeError".to_string()),
+            "the composed expression monoscope emits must yield unquoted text"
+        );
+        // Same over a plain JSON string column, not just Variant.
+        assert_eq!(
+            text(&ctx, &format!(r#"jsonb_path_query_first('{EVENTS}', {path}) #>> '{{}}'"#)).await?,
+            Some("TypeError".to_string()),
+            "JSON-string input must behave like Variant input"
+        );
+        // Without the `#>>`, the function itself returns jsonb — so, quoted.
+        assert_eq!(
+            text(&ctx, &format!(r#"jsonb_path_query_first(json_to_variant('{EVENTS}'), {path})"#)).await?,
+            Some("\"TypeError\"".to_string()),
+            "bare jsonb_path_query_first returns jsonb, which for a string leaf is quoted"
+        );
+        // No match, NULL input, and non-exception events all mean NULL, never an error:
+        // a span without an exception is the common case, not a failure.
+        for (label, expr) in [
+            ("no exception event", format!(r#"jsonb_path_query_first(json_to_variant('[{{"event_name":"log"}}]'), {path})"#)),
+            ("empty array", format!(r#"jsonb_path_query_first(json_to_variant('[]'), {path})"#)),
+            ("NULL input", format!(r#"jsonb_path_query_first(json_to_variant(NULL), {path})"#)),
+        ] {
+            assert_eq!(text(&ctx, &expr).await?, None, "{label} must be NULL");
+        }
+        // First match wins, as the name promises.
+        let two = r#"[{"event_name":"exception","event_attributes":{"exception":{"type":"First"}}},{"event_name":"exception","event_attributes":{"exception":{"type":"Second"}}}]"#;
+        assert_eq!(
+            text(&ctx, &format!(r#"jsonb_path_query_first(json_to_variant('{two}'), {path}) #>> '{{}}'"#)).await?,
+            Some("First".to_string()),
+            "with several exception events the FIRST must win"
+        );
+
+        // The full COALESCE monoscope actually emits: the flattened column wins when
+        // present, and the span event is the fallback when it is NULL.
+        assert_eq!(
+            text(&ctx, &format!(r#"COALESCE(CAST(NULL AS VARCHAR), jsonb_path_query_first(json_to_variant('{EVENTS}'), {path}) #>> '{{}}')"#)).await?,
+            Some("TypeError".to_string()),
+            "the COALESCE fallback must reach the span event when the flattened column is NULL"
+        );
+
+        // The verbatim widget SQL from the production log, which is what actually
+        // rendered the error overlay. Planning is the assertion: it died at
+        // "Invalid function 'jsonb_path_query_first'" before reaching execution.
+        for sql in [
+            r#"SELECT distinct_count(approx_count_distinct(attributes___session___id))::float AS dcount_attributes_session_id FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' and timestamp BETWEEN '2026-08-30T12:58:53.348826Z' AND '2026-08-30T13:58:53.348826Z' and ((resource___telemetry___sdk___language = 'webjs' AND attributes___session___id IS NOT NULL AND (status_code = 'ERROR' OR COALESCE(attributes___exception___type, (jsonb_path_query_first(events, '$[*] ? (@.event_name == "exception").event_attributes.exception.type') #>> '{}')) IS NOT NULL) AND ('' = '' OR resource___service___name = '')))"#,
+            r#"SELECT distinct_count(approx_count_distinct(attributes___user___id))::float AS dcount_attributes_user_id FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' and timestamp BETWEEN '2026-08-30T12:58:53.403066Z' AND '2026-08-30T13:58:53.403066Z' and ((resource___telemetry___sdk___language = 'webjs' AND attributes___user___id IS NOT NULL AND (status_code = 'ERROR' OR COALESCE(attributes___exception___type, (jsonb_path_query_first(events, '$[*] ? (@.event_name == "exception").event_attributes.exception.type') #>> '{}')) IS NOT NULL) AND ('' = '' OR resource___service___name = '')))"#,
+            r#"SELECT extract(epoch from time_bucket('10 seconds', timestamp))::integer, 'value', count(*)::float AS count_ FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' and timestamp BETWEEN '2026-08-30T12:58:53.404809Z' AND '2026-08-30T13:58:53.404809Z' and ((resource___telemetry___sdk___language = 'webjs' AND (status_code = 'ERROR' OR COALESCE(attributes___exception___type, (jsonb_path_query_first(events, '$[*] ? (@.event_name == "exception").event_attributes.exception.type') #>> '{}')) IS NOT NULL) AND ('' = '' OR resource___service___name = ''))) GROUP BY time_bucket('10 seconds', timestamp) ORDER BY time_bucket('10 seconds', timestamp) DESC"#,
+        ] {
+            ctx.sql(sql).await.map_err(|e| anyhow::anyhow!("production widget SQL must plan, got: {e}\n  sql: {sql}"))?;
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_complex_query() -> Result<()> {
         // Initialize database

@@ -109,6 +109,23 @@ impl ExprPlanner for VariantAwareExprPlanner {
             _ => return Ok(PlannerResult::Original(expr)),
         };
 
+        // The empty path addresses the whole document: PG's `x #> '{}'` is `x`, and
+        // `x #>> '{}'` is `x` rendered as text (a JSON string losing its quotes).
+        // Monoscope emits exactly `jsonb_path_query_first(...) #>> '{}'` to read an
+        // exception field out of a span event, so without this arm that whole family
+        // of queries fails to plan with "Operator #>> is not yet supported" — the
+        // function existing is not enough on its own.
+        if path_is_array && is_empty_path_array(&expr.right) {
+            let base = unalias(&expr.left);
+            let json =
+                if is_variant_column(&base, schema) { Expr::ScalarFunction(ScalarFunction { func: variant_to_json_udf(), args: vec![base] }) } else { base };
+            return Ok(PlannerResult::Planned(if is_long_arrow {
+                Expr::ScalarFunction(ScalarFunction { func: json_to_pg_text_udf(), args: vec![json] })
+            } else {
+                json
+            }));
+        }
+
         let (base_expr, mut path_parts) = if path_is_array { (unalias(&expr.left), vec![]) } else { collect_arrow_chain(&expr.left) };
         let Some(components) = (if path_is_array { extract_path_array(&expr.right) } else { extract_path_component(&expr.right).map(|c| vec![c]) }) else {
             return Ok(PlannerResult::Original(expr));
@@ -149,11 +166,23 @@ fn unalias(expr: &Expr) -> Expr {
     }
 }
 
+/// `{}` — the empty `text[]` path, which addresses the whole document rather than
+/// any leaf inside it. Handled by its own arm in the planner above, so
+/// 'extract_path_array' can keep rejecting it instead of returning a path that
+/// would silently address nothing.
+fn is_empty_path_array(expr: &Expr) -> bool {
+    let expr = match expr {
+        Expr::Cast(cast) => cast.expr.as_ref(),
+        expr => expr,
+    };
+    matches!(expr, Expr::Literal(v, _) if extract_utf8_string(v).is_some_and(|raw| raw.trim() == "{}"))
+}
+
 /// Path operand of `#>`/`#>>`. Postgres spells it `text[]`, which reaches the
 /// planner either as the unparsed literal `{a,b,c}` or as an already-built list.
 /// Quoted elements (`{"a b",c}`) are unquoted, matching Postgres array-literal
-/// parsing; an empty path is rejected so `#>> '{}'` falls through unchanged
-/// rather than silently addressing the whole document.
+/// parsing; an empty path is rejected here and handled by the whole-document arm
+/// in the planner instead.
 fn extract_path_array(expr: &Expr) -> Option<Vec<PathComponent>> {
     let expr = match expr {
         Expr::Cast(cast) => cast.expr.as_ref(),
@@ -489,6 +518,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
         datafusion_variant::VariantObjectConstruct::default(),
         datafusion_variant::VariantObjectInsert::default(),
         JsonbPathExistsUDF::new(),
+        JsonbPathQueryFirstUDF::new(),
         ApproxPercentileUDF::new(),
     );
 
@@ -1976,6 +2006,99 @@ fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath
 }
 
 /// Evaluate JSONPath on a JSON string array
+// ============================================================================
+// jsonb_path_query_first: the matched VALUE, where jsonb_path_exists returns
+// only whether one existed.
+//
+// Monoscope's KQL compiler emits this for every `attributes.exception.*` field
+// (`transformFlattenedAttribute`), because OTel SDKs may carry an exception as a
+// span *event* rather than a flattened attribute, so the compiler COALESCEs both
+// sources. Without this function every such query — log explorer, monitors, the
+// RUM dashboard widgets — failed to plan with "Invalid function".
+// ============================================================================
+
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct JsonbPathQueryFirstUDF {
+    signature: Signature,
+}
+
+impl JsonbPathQueryFirstUDF {
+    fn new() -> Self {
+        Self { signature: Signature::any(2, Volatility::Immutable) }
+    }
+}
+
+impl ScalarUDFImpl for JsonbPathQueryFirstUDF {
+    scalar_udf_boilerplate!("jsonb_path_query_first");
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8View)
+    }
+
+    // Tagged jsonb, like the other jsonb-returning UDFs: PG returns jsonb here, and the
+    // tag is what makes `#>> '{}'` on the result mean "unwrap this document to text".
+    fn return_field_from_args(&self, _: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<FieldRef> {
+        Ok(jsonb_tagged_field())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let [json, path] = args.args.as_slice() else {
+            return Err(DataFusionError::Execution("jsonb_path_query_first requires exactly 2 arguments: json/variant and jsonpath".to_string()));
+        };
+        let json_array = as_array(json)?;
+        let path_str = match path {
+            ColumnarValue::Scalar(scalar) => extract_utf8_string(scalar).ok_or_else(|| DataFusionError::Execution("JSONPath must be a string".to_string()))?,
+            ColumnarValue::Array(_) => return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string())),
+        };
+        let json_path = sql_json_path::JsonPath::new(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {e}")))?;
+        let result = if is_variant_type(json_array.data_type()) {
+            query_first_on_variant(&json_array, &json_path)?
+        } else {
+            query_first_on_json_string(&json_array, &json_path)?
+        };
+        Ok(ColumnarValue::Array(result))
+    }
+}
+
+/// First match as JSON text, or NULL. Unlike `jsonb_path_exists` there is no
+/// `variant_get` fast lane: monoscope's paths all carry a `? (...)` filter, which
+/// is not a simple path, so that lane could never engage for the queries this
+/// exists to serve — and writing one would duplicate the strict/lax hazard
+/// documented on `evaluate_jsonpath_on_variant`.
+fn query_first_on_variant(array: &ArrayRef, json_path: &sql_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
+    use datafusion::arrow::array::StructArray;
+    use parquet_variant::Variant;
+    let struct_array = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
+    let metadata_col = struct_array.column_by_name("metadata").ok_or_else(|| DataFusionError::Execution("Variant missing metadata column".to_string()))?;
+    let value_col = struct_array.column_by_name("value").ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
+    let metadata_binary = BinaryAccessor::try_new(metadata_col, "metadata")?;
+    let value_binary = BinaryAccessor::try_new(value_col, "value")?;
+    // Lax mode (PG default): a data-dependent eval error is no match, not a query failure.
+    let out: StringViewArray = (0..struct_array.len())
+        .map(|i| {
+            if struct_array.is_null(i) {
+                Ok(None)
+            } else {
+                variant_to_serde_json(&Variant::new(metadata_binary.value(i), value_binary.value(i)), 0)
+                    .map(|json| json_path.query_first(&json).ok().flatten().map(|found| found.to_string()))
+            }
+        })
+        .collect::<datafusion::error::Result<_>>()?;
+    Ok(Arc::new(out))
+}
+
+fn query_first_on_json_string(array: &ArrayRef, json_path: &sql_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
+    let eval = |s: &str| serde_json::from_str::<JsonValue>(s).ok().and_then(|v| json_path.query_first(&v).ok().flatten().map(|found| found.to_string()));
+    let iter: Box<dyn Iterator<Item = Option<&str>>> = if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        Box::new(a.iter())
+    } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        Box::new(a.iter())
+    } else {
+        return Err(DataFusionError::Execution("jsonb_path_query_first requires JSON string or Variant input".to_string()));
+    };
+    Ok(Arc::new(iter.map(|opt| opt.and_then(eval)).collect::<StringViewArray>()))
+}
+
 fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &sql_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
     // Path exists per row; invalid JSON or a lax-mode eval error → false (PG parity).
     let eval = |s: &str| serde_json::from_str::<JsonValue>(s).ok().and_then(|v| json_path.exists(&v).ok()).unwrap_or(false);
