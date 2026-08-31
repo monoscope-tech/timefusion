@@ -12,7 +12,7 @@ use datafusion::{
             Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
             TimestampNanosecondArray,
         },
-        datatypes::{DataType, Field, FieldRef, TimeUnit},
+        datatypes::{DataType, Field, FieldRef, IntervalUnit, TimeUnit},
     },
     common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err},
     functions::regex::expr_fn::regexp_match,
@@ -548,7 +548,7 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
     // create_udf-based UDFs that carry construction logic.
     ctx.register_udf(create_jsonb_array_elements_udf());
-    ctx.register_udf(create_time_bucket_udf());
+    ctx.register_udf(ScalarUDF::from(TimeBucketUDF::new()));
     ctx.register_udaf(create_percentile_agg_udaf());
     ctx.register_udaf(create_tdigest_merge_udaf());
     ctx.register_udaf(AggregateUDF::from(HllAggUDF::default()));
@@ -1168,23 +1168,69 @@ fn list_to_json_values<O: datafusion::arrow::array::OffsetSizeTrait>(array: &Arr
         .collect()
 }
 
-/// Create the time_bucket UDF for time-series bucketing (similar to TimescaleDB)
-fn create_time_bucket_udf() -> ScalarUDF {
-    let time_bucket_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-        let [interval, ts] = args else {
+/// TimescaleDB's `time_bucket`, and deliberately BOTH of its spellings for the
+/// bucket width: our own KQL emits a string (`time_bucket('5 minutes', ts)`),
+/// but real Timescale SQL — which is what a hand-written widget or a migrated
+/// dashboard contains — passes an INTERVAL. Accepting only the string form gave
+/// "Failed to coerce arguments … time_bucket(Interval(MonthDayNano),
+/// Timestamp)" and lost the whole query (issue 3812a29a, 2026-08-28).
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct TimeBucketUDF {
+    signature: Signature,
+}
+
+impl TimeBucketUDF {
+    fn new() -> Self {
+        let ts = DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")));
+        Self {
+            signature: Signature::one_of(
+                vec![
+                    TypeSignature::Exact(vec![DataType::Utf8View, ts.clone()]),
+                    TypeSignature::Exact(vec![DataType::Interval(IntervalUnit::MonthDayNano), ts]),
+                ],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TimeBucketUDF {
+    scalar_udf_boilerplate!("time_bucket");
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let [width, ts] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("time_bucket requires exactly 2 arguments: interval and timestamp".to_string()));
         };
-        let bucket_size_micros = parse_interval_to_micros(&extract_scalar_string(interval, "Interval")?)?;
-        Ok(ColumnarValue::Array(bucket_timestamps(&as_array(ts)?, bucket_size_micros)?))
-    });
+        let micros = match width {
+            ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(i))) => interval_to_micros(i.months, i.days, i.nanoseconds)?,
+            _ => parse_interval_to_micros(&extract_scalar_string(width, "Interval")?)?,
+        };
+        Ok(ColumnarValue::Array(bucket_timestamps(&as_array(ts)?, micros)?))
+    }
+}
 
-    create_udf(
-        "time_bucket",
-        vec![DataType::Utf8View, DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))],
-        DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
-        Volatility::Immutable,
-        time_bucket_fn,
-    )
+/// Width of an `INTERVAL` bucket in microseconds.
+///
+/// Months are REJECTED, not approximated: a month is 28-31 days, so folding it
+/// to a fixed width would silently mis-bucket every row — a wrong-answer bug,
+/// strictly worse than the error it replaces. TimescaleDB refuses month widths
+/// in this form for the same reason (it has `time_bucket_ng` for calendar
+/// buckets). Days and nanoseconds are exact.
+fn interval_to_micros(months: i32, days: i32, nanoseconds: i64) -> datafusion::error::Result<i64> {
+    if months != 0 {
+        return Err(DataFusionError::Execution(
+            "time_bucket does not support month or year intervals (a month is not a fixed width); use days or smaller, e.g. INTERVAL '30 days'".to_string(),
+        ));
+    }
+    i64::from(days)
+        .checked_mul(86_400_000_000)
+        .and_then(|d| d.checked_add(nanoseconds / 1_000))
+        .filter(|m| *m > 0)
+        .ok_or_else(|| DataFusionError::Execution("time_bucket interval must be a positive, representable width".to_string()))
 }
 
 /// Parse interval string to microseconds

@@ -148,4 +148,37 @@ mod tests {
         state.optimize(&plan)?;
         Ok(())
     }
+
+    /// TimescaleDB spells the bucket width as an INTERVAL; our own KQL emits a
+    /// string. Accepting only the string lost every hand-written Timescale-style
+    /// widget to "Failed to coerce arguments … time_bucket(Interval(...),
+    /// Timestamp)" (issue 3812a29a). Both spellings must agree, and a month
+    /// width must be REFUSED rather than silently approximated to 30 days.
+    #[tokio::test]
+    async fn time_bucket_accepts_an_interval_and_refuses_month_widths() -> Result<()> {
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx)?;
+
+        // The INTERVAL and string spellings must land on the same bucket.
+        for (width, expected) in [
+            ("INTERVAL '5 minutes'", "2026-08-31 14:35:00"),
+            ("'5 minutes'", "2026-08-31 14:35:00"),
+            ("INTERVAL '1 hour'", "2026-08-31 14:00:00"),
+            ("INTERVAL '1 day'", "2026-08-31 00:00:00"),
+        ] {
+            let sql = format!("SELECT to_char(time_bucket({width}, TIMESTAMPTZ '2026-08-31 14:37:45+00'), 'YYYY-MM-DD HH24:MI:SS')");
+            let results = ctx.sql(&sql).await?.collect().await?;
+            assert_eq!(get_str(results[0].column(0).as_ref(), 0), expected, "{width}");
+        }
+
+        // A month is 28-31 days: refuse it instead of bucketing by a wrong width.
+        let err = ctx.sql("SELECT time_bucket(INTERVAL '1 month', TIMESTAMPTZ '2026-08-31 14:37:45+00')").await;
+        let err = match err {
+            Ok(df) => df.collect().await.err().map(|e| e.to_string()).unwrap_or_default(),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("month"), "month intervals must be refused with a clear message, got: {err}");
+
+        Ok(())
+    }
 }
