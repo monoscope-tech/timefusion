@@ -296,6 +296,33 @@ So the repair wedge is: **~40 s of compute, done 13 times, over a network.**
 | D | `split_time_task` declines for Repair | — | bisecting a whole-file unit sheds nothing and mints duplicates |
 | E | Retry reasons counted per (operation, reason) instead of one "last reason" string | — | the missing instrument: today `retry_reason` is a single `String` (observability.rs:35) |
 
+### Open items — evidence gathered tonight, work not done
+
+- **The dirty-bin drain admitted zero bins.** `dirty_bin_eligible_total = 0`
+  with `dirty_bin_queue_depth = 40,792` and growing. The increment sits at
+  `maintain.rs:5150`, inside the staging stream, so *something upstream returns
+  before admitting* — this is the same signature as the 2026-08-20 "drain had no
+  caller" bug and it is still unexplained.
+- **HotPacking's 14 completions vs 472 retries is still unattributed.** Note
+  that `retry("compaction_debt_remaining")` is a *success* requeue, not a
+  failure, so some large share of those 472 is progress. The new
+  per-`(operation, reason)` retry histogram answers this directly after the
+  deploy — read it before assuming HotPacking is broken.
+- **`rollup_oldest_invalidation_age_seconds` is 16.3 days** (an invalidation
+  from ~2026-08-15 still unserved). Not chased.
+- **Write-side: cap row groups by BYTES, not rows** (finding 6). The 819 MB
+  row group is a memory hazard for every reader and rewrite, and it is the
+  cause the read path shares with maintenance. `set_max_row_group_bytes` does
+  not bind in parquet-rs, so this needs the writer to cut on accumulated
+  decoded bytes.
+- **The scheduling tuple ranks age above benefit.** RocksDB made
+  benefit-per-byte the default in 6.0 and demoted age to an escalation floor;
+  see the prior-art doc. Worth revisiting once throughput is fixed — IOx gets
+  by with **no ranking at all**.
+- **Admission is a flat `MAX_DECODED_BYTES`.** ClickHouse scales the cap by free
+  pool slots so a busy pool only admits small work, which subsumes a deadline.
+  The single most transferable idea in the survey, and not done tonight.
+
 ### Success metrics to read in the morning (≥2h after the deploy)
 
 1. journal: `repair` tasks in state `complete` grows; the 2026-05-30/31

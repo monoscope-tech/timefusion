@@ -97,11 +97,25 @@ pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 /// verbatim prod text in `capacity_failures_are_recognised_from_prod_text`.
 /// Operation deadlines also bound retry backoff so oversized units cannot
 /// monopolize a worker.
+/// Since `run_until_idle`, this is an IDLE window, not a budget: it fires only
+/// after this long with no rows written. That makes a longer window nearly free
+/// on healthy units and changes what the number has to cover — the longest
+/// stretch a working unit can go without producing a row.
+///
+/// Repair gets an hour for exactly that reason. `ORDER BY` is blocking, so a
+/// repair unit produces its first row only after the whole input is downloaded,
+/// decoded and spilled; on the table's largest file (2.3 GB compressed, ~28 GB
+/// decoded, uncached because it is past `cache_recent_days`) that silent
+/// stretch can exceed 15 minutes on its own. The cost of the longer window is
+/// that a genuinely hung repair holds a worker and one of ~2 `light_rewrite_sem`
+/// permits for an hour; that is affordable for a `take(1)` lane with a finite
+/// backlog, and it is strictly better than killing a unit that was working.
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
         // Dedup may use an unpooled collecting path; keep its exposure shorter.
         Operation::Dedup => 5 * 60,
-        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
+        Operation::Repair => 60 * 60,
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
     }
 }
 
