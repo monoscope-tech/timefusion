@@ -104,11 +104,16 @@ async fn main() {
     println!("\nfile {} ({:.1} MB compressed), pool {pool_mb} MB", path, bytes as f64 / 1e6);
     println!("{:<26} {:>8} {:>11} {:>10}", "variant", "secs", "rows", "MB/s in");
 
+    // Each row is flushed as it completes: a variant that hangs or OOMs must not
+    // take the rows already measured with it.
     let mut run = async |label: String, batch: &str, partitions: usize, slices: usize, sorted: bool| {
-        match pass(&path, batch, partitions, slices, sorted, pool_mb * 1024 * 1024, spill.path()).await {
-            Ok((secs, rows)) => println!("{label:<26} {secs:>8.1} {rows:>11} {:>10.2}", bytes as f64 / 1e6 / secs),
-            Err(error) => println!("{label:<26} {:>8} {error}", "FAILED"),
-        }
+        use std::io::Write;
+        let line = match pass(&path, batch, partitions, slices, sorted, pool_mb * 1024 * 1024, spill.path()).await {
+            Ok((secs, rows)) => format!("{label:<26} {secs:>8.1} {rows:>11} {:>10.2}", bytes as f64 / 1e6 / secs),
+            Err(error) => format!("{label:<26} {:>8} {error}", "FAILED"),
+        };
+        println!("{line}");
+        let _ = std::io::stdout().flush();
     };
 
     run("scan only".to_owned(), "8192", 1, 1, false).await;
