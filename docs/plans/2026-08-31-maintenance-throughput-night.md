@@ -371,6 +371,16 @@ in `run_maintenance_coordinator_once` inlines all six operation paths, so
 anything that holds it is stack-hostile. Boxing per arm at the dispatch site
 would shrink it for every holder, not just this one. Follow-up, not tonight.
 
+### Gate result
+
+`make prepush`: lint clean, **1286/1286** integration tests pass. `make test-e2e`:
+**59/60**, the one failure being `smoke::count_star_returns_correct_value` — the
+already-documented count-pushdown defect (memory
+`tf_count_star_is_wrong_not_flaky_2026-08-28`), which passes in isolation here
+and is not touched by this branch. `ordering_pushdown::one_unsorted_file_…`
+failed once under full-suite load and passed 4/4 in isolation, and passes with
+either new knob reverted — a load flake, not a regression.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
