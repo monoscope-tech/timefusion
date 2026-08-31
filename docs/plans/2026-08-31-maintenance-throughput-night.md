@@ -409,7 +409,21 @@ pending_sealed_consolidation           169
 tasks_pending / tasks_retry     3,140 / 2,717
 ```
 
-Full dump: `scratchpad/before_deploy_stats.txt`; journal: `scratchpad/mt.json.gz`.
+Re-read at 02:20 CEST, minutes before the push (image `54e5152`):
+
+```
+backlog_bytes            3,580,107,474,211   (+43.5 GB in 1h45)
+dirty_bin_queue_depth               40,948
+oldest_task_age_seconds          1,466,072
+pending_base_rollup                    408
+pending_dedup                        4,975
+pending_repair                         432   (unchanged all night)
+pending_sealed_consolidation           171
+sealed_compaction_debt_bytes 1,074,884,551,884
+tasks_pending / tasks_retry     3,306 / 2,723
+```
+
+Nothing moved except backlog, which grew.
 
 ### Success metrics to read in the morning (≥2h after the deploy)
 
