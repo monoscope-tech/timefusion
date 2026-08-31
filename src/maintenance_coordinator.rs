@@ -110,6 +110,11 @@ pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 /// that a genuinely hung repair holds a worker and one of ~2 `light_rewrite_sem`
 /// permits for an hour; that is affordable for a `take(1)` lane with a finite
 /// backlog, and it is strictly better than killing a unit that was working.
+/// The longest per-unit idle window any operation gets. `COORDINATOR_LOOP_TIMEOUT`
+/// is derived from this so the outer guard can never quietly become the real
+/// deadline again.
+pub const MAX_OPERATION_DEADLINE_SECS: u64 = operation_deadline_secs(Operation::Repair);
+
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
         // Dedup may use an unpooled collecting path; keep its exposure shorter.

@@ -1294,10 +1294,23 @@ const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration =
 const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(crate::maintenance_coordinator::operation_deadline_secs(crate::maintenance_coordinator::Operation::Repair));
 
-/// Last-resort guard around planning plus one operation-specific unit. The
-/// operation itself has the tighter bound above; this catches a wedged planner
-/// or dispatcher without racing the file-rewrite timeout at the same instant.
-const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
+/// Last-resort guard around planning plus one operation-specific unit.
+///
+/// It must sit WELL above the longest per-unit clock, or it — not that clock —
+/// is the real deadline. It was 16 minutes against a 15-minute unit bound, a
+/// one-minute margin that only worked while every operation shared that bound;
+/// raising Repair's idle window to an hour would otherwise have left the fix
+/// unreachable, with units killed at 16 minutes exactly as before.
+///
+/// The two clocks now guard different things and must not be confused. The
+/// per-unit clock (`run_until_idle`) measures IDLENESS and can legitimately
+/// extend for as long as a unit keeps writing rows, so it is the thing that
+/// judges whether a unit is working. This one only catches a hang OUTSIDE a
+/// unit — a wedged planning scan or dispatcher — which the per-unit clock
+/// cannot see, so it is sized for "no plausible planning pass takes this long",
+/// not for the work.
+const COORDINATOR_LOOP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2 * crate::maintenance_coordinator::MAX_OPERATION_DEADLINE_SECS);
 
 /// How often coverage recovery re-reads the tiers' Delta logs.
 ///

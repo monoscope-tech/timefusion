@@ -177,6 +177,55 @@ pub(crate) fn batch_rows_for(decoded_bytes: u64, rows: u64, target_bytes: u64) -
 }
 
 #[cfg(test)]
+mod liveness_clock_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    };
+
+    /// The whole point: a unit that is still writing rows outlives its window.
+    /// Killing it discards uncommitted work and re-queues the identical slice,
+    /// which is the treadmill every one of prod's 432 repair units was on.
+    #[tokio::test(start_paused = true)]
+    async fn work_that_keeps_writing_rows_outlives_its_idle_window() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let ticker = Arc::clone(&progress);
+        let work = async move {
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                ticker.fetch_add(1, Relaxed);
+            }
+            "committed"
+        };
+        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, work).await;
+        assert_eq!(result.ok(), Some("committed"), "100s of steady progress must survive a 30s idle window");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_that_writes_nothing_is_given_up_on() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let stalled = async { std::future::pending::<&str>().await };
+        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, stalled).await;
+        assert!(result.is_err(), "an idle unit must not hold its worker forever");
+    }
+
+    /// The outer loop guard wraps this clock, so it must never be the binding
+    /// one — a one-minute margin over a shared 15-minute bound silently became
+    /// the real deadline the moment one operation's window grew.
+    #[test]
+    fn the_loop_guard_sits_above_every_per_unit_window() {
+        use crate::maintenance_coordinator::{MAX_OPERATION_DEADLINE_SECS, Operation, operation_deadline_secs};
+        for operation in [Operation::Dedup, Operation::Repair, Operation::HotPacking, Operation::SealedConsolidation, Operation::BaseRollup, Operation::DerivedRollup] {
+            assert!(operation_deadline_secs(operation) <= MAX_OPERATION_DEADLINE_SECS, "{operation:?} exceeds the declared maximum");
+        }
+        assert!(
+            crate::database::COORDINATOR_LOOP_TIMEOUT.as_secs() > MAX_OPERATION_DEADLINE_SECS,
+            "the outer guard must not fire before a unit's own clock does"
+        );
+    }
+}
+
+#[cfg(test)]
 mod batch_rows_tests {
     /// One assertion per regime, because the whole point of the function is that
     /// one row count cannot serve rows that differ 60x in width.
