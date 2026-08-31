@@ -4657,6 +4657,13 @@ impl Database {
                                 journal.compact()?;
                                 info!(cleared, event = "maintenance_stale_estimates_cleared");
                             }
+                            // One-shot: the repair queue's attempt history was
+                            // written by a rewrite that could not finish. Left in
+                            // place it quarantines every unit the fix is for.
+                            if let Some(reset) = journal.reset_repair_attempts() {
+                                journal.compact()?;
+                                info!(reset, event = "maintenance_repair_attempts_reset");
+                            }
                             let coarsened = journal.migrate_fine_grained_backfill(crate::support::now_micros()).unwrap_or_default();
                             if coarsened != 0 {
                                 info!(coarsened, event = "maintenance_coarse_backfill_migrated");

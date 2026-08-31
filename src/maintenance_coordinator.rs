@@ -837,6 +837,8 @@ impl TaskJournal {
     /// damaged values (28f62f01/08-03 at 1,071 rows against a truth of
     /// 3,752,582), while the newest dates had repaired.
     pub const DAMAGE_REPAIR_MIGRATION: &'static str = "__maintenance_damage_repair_v2";
+    /// See [`TaskJournal::reset_repair_attempts`].
+    const REPAIR_SINGLE_PASS_MIGRATION: &'static str = "__maintenance_repair_single_pass_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -1042,6 +1044,39 @@ impl TaskJournal {
         self.snapshot.source_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned(), 1);
         self.dirty_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned());
         Some(cleared)
+    }
+
+    /// One-shot: forget the attempt history of every Repair unit.
+    ///
+    /// `attempts` is evidence about the code that produced it, and for Repair
+    /// that code no longer exists. Prod 2026-09-01 carried 432 repair units,
+    /// every one `worker_error`, one at `attempts = 100`, under a rewrite that
+    /// re-read its input once per event-time slice and could not finish inside
+    /// any deadline. With the rewrite single-pass, that history is not evidence
+    /// — it is a sentence: `attempts >= 2` makes a unit QUARANTINED (claimable
+    /// only through `coordinator_jobs / 8` slots) and floors its retry backoff
+    /// at `operation_deadline_secs`, now an hour. 432 units through ~2 slots at
+    /// an hour each is over a week before the fix is even attempted once.
+    ///
+    /// Clearing the deadline too, because the floor is already stamped into
+    /// `deadline_micros` on units that were abandoned before this shipped.
+    /// Safe in the same way `clear_stale_estimates` is: zero is what a freshly
+    /// minted unit carries, and the claim path re-derives everything else.
+    pub fn reset_repair_attempts(&mut self) -> Option<usize> {
+        if self.snapshot.source_cursors.get(Self::REPAIR_SINGLE_PASS_MIGRATION).copied().unwrap_or_default() >= 1 {
+            return None;
+        }
+        let mut reset = 0usize;
+        for task in self.snapshot.tasks.iter_mut().filter(|task| task.key.operation == Operation::Repair && task.state != TaskState::Complete) {
+            task.attempts = 0;
+            task.retry_reason = None;
+            task.deadline_micros = 0;
+            reset += 1;
+        }
+        self.dirty_tasks.clear();
+        self.snapshot.source_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned(), 1);
+        self.dirty_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned());
+        Some(reset)
     }
 
     /// Drop queued work for a rollup tier that is no longer DECLARED.
@@ -6326,6 +6361,35 @@ mod tests {
     ///
     /// Measured after #178: BaseRollup timed out at 900s for the first time (4 in
     /// a 10-minute window) and rollup output collapsed from ~9,000 rows/min to 10.
+    /// The fix is only reachable if it can claim the units it is for.
+    /// `attempts >= 2` quarantines a unit and floors its backoff at the
+    /// operation deadline, so prod's 432 `worker_error` repair units would
+    /// otherwise have drained through ~2 slots at an hour each.
+    #[test]
+    fn the_repair_migration_unquarantines_the_queue_it_is_for() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut wedged = task("p", 0, DAY_MICROS, Operation::Repair);
+        wedged.attempts = 100;
+        wedged.state = TaskState::Retry;
+        wedged.retry_reason = Some("worker_error".to_owned());
+        wedged.deadline_micros = i64::MAX;
+        let repair = wedged.key.clone();
+        journal.upsert(wedged);
+        // A neighbour that the migration must not touch.
+        let mut dedup = task("p", 0, DAY_MICROS, Operation::Dedup);
+        dedup.attempts = 7;
+        let untouched = dedup.key.clone();
+        journal.upsert(dedup);
+
+        assert_eq!(journal.reset_repair_attempts(), Some(1), "one repair unit reset");
+        let after = journal.tasks().find(|candidate| candidate.key == repair).expect("still queued");
+        assert_eq!(after.attempts, 0, "quarantine is keyed on attempts");
+        assert_eq!(after.deadline_micros, 0, "and the stamped backoff floor must go with it");
+        assert_eq!(journal.attempts(&untouched), 7, "other operations keep their history");
+        assert_eq!(journal.reset_repair_attempts(), None, "the migration must not run twice");
+    }
+
     /// A Repair unit rewrites ONE whole file, so halving its slice halves
     /// nothing: `coordinator_compaction_files` still hands every child the same
     /// `take(1)`. Prod 2026-08-31 had 432 repair units bisected to 12h/0.75h/
