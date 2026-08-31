@@ -153,6 +153,42 @@ pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(DECODED_BYTES_PER_COMPRESSED as u64)
 }
 
+/// Rows per scan batch that put one batch near `target_bytes` of decoded Arrow.
+///
+/// The rewrite paths pinned 256 ROWS, but the two things a batch size actually
+/// controls are both denominated in BYTES: the sort's indivisible admission
+/// unit, and the granularity of every spill write. otel rows differ in width by
+/// more than 20x between tenants, so one row count cannot serve both — 256 is
+/// right for a 63 KB whale row and ~30x too small for an ordinary 1 KB one.
+///
+/// Clamped rather than trusted: the floor keeps a pathologically wide bin from
+/// asking for a sub-batch the writer cannot fill, and the ceiling is
+/// DataFusion's own default, so this can only ever move between the two numbers
+/// the codebase already ran with.
+///
+/// ```
+/// # use timefusion::database::batch_rows_for;
+/// // Ordinary otel rows (~1 KB decoded) get a real batch, not 256 rows.
+/// assert_eq!(batch_rows_for(1_000_000_000, 1_000_000, 4 << 20), 4194);
+/// // The whale's 63 KB rows stay at the floor, which is where they belong.
+/// assert_eq!(batch_rows_for(63_000_000, 1_000, 4 << 20), 256);
+/// // No rows measured (missing stats) is not a licence to guess big.
+/// assert_eq!(batch_rows_for(1_000_000_000, 0, 4 << 20), 256);
+/// ```
+pub fn batch_rows_for(decoded_bytes: u64, rows: u64, target_bytes: u64) -> usize {
+    const MIN_BATCH_ROWS: u64 = 256;
+    const MAX_BATCH_ROWS: u64 = 8192;
+    let Some(per_row) = decoded_bytes.checked_div(rows).filter(|width| *width > 0) else {
+        return MIN_BATCH_ROWS as usize;
+    };
+    (target_bytes / per_row).clamp(MIN_BATCH_ROWS, MAX_BATCH_ROWS) as usize
+}
+
+/// Rows an `Add` declares in its Delta statistics, when it declares any.
+pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
+}
+
 /// (project, slice_start, slice_end, generation, source_fp, source_rows) — the
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
@@ -1414,7 +1450,7 @@ impl Database {
         // overlap this exact slice. Without this preflight a whale project's
         // ordinary no-duplicate probe occupied one worker for 235 seconds in
         // production while still reporting `estimated_decoded_bytes=0`.
-        let (estimated_bytes, whole_file_bytes, selected_paths) = {
+        let (estimated_bytes, whole_file_bytes, selected_paths, dedup_rows) = {
             let schema = schema_or_default(&key.source);
             let required_columns = 3usize.saturating_add(schema.dedup_keys.len()).saturating_add(usize::from(schema.dedup_tiebreak.is_some()));
             let projected_numerator = u64::try_from(required_columns).unwrap_or(u64::MAX);
@@ -1447,15 +1483,15 @@ impl Database {
                     let decoded = estimated_decoded_bytes(add.size);
                     let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
                     let (share, whole) = slice_share_of_file(min, max, key.slice, estimated_row_groups(add.size));
-                    Some((file.path().to_string(), projected.saturating_mul(share).div_ceil(whole.max(1)), projected))
+                    Some((file.path().to_string(), projected.saturating_mul(share).div_ceil(whole.max(1)), projected, add_row_count(&add).unwrap_or_default()))
                 })
                 // The prorated sum is this unit's own estimate; the unprorated
                 // one is what a SIBLING over the same files would re-read, and
                 // fusion needs both to price a bucket without counting a row
                 // group once per child.
-                .fold((0u64, 0u64, Vec::new()), |(share, whole, mut paths), (path, file_share, file_whole)| {
+                .fold((0u64, 0u64, Vec::new(), 0u64), |(share, whole, mut paths, rows), (path, file_share, file_whole, file_rows)| {
                     paths.push(path);
-                    (share.saturating_add(file_share), whole.saturating_add(file_whole), paths)
+                    (share.saturating_add(file_share), whole.saturating_add(file_whole), paths, rows.saturating_add(file_rows))
                 })
         };
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(selected_paths, whole_file_bytes);
@@ -1490,6 +1526,10 @@ impl Database {
             max_concurrent_shards: 1,
             probe_hash_shards,
             sort_partitions: dedup_sort_partitions(task.attempts),
+            // The preflight above already summed this unit's decoded bytes over
+            // exactly the files it will read; `pre_files` is not available yet,
+            // so rows come from the same snapshot walk's statistics.
+            batch_rows: batch_rows_for(estimated_bytes, dedup_rows, self.config.maintenance.timefusion_maintenance_batch_target_bytes),
         };
         // Certification is a property of the whole PARTITION — the read path keys
         // `dedup_clean_fp` on (project, table, date) and refuses the skip if ANY
@@ -5983,6 +6023,10 @@ impl Database {
         // Bytes read into this rewrite — free here (the Adds are already mapped)
         // and the divisor that turns staging duration into observed R2 throughput.
         let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
+        // Batch size from THIS bin's measured row width, not a fleet constant.
+        let batch_size =
+            batch_rows_for(estimated_decoded_bytes(bytes_in), targets.iter().filter_map(add_row_count).sum(), self.config.maintenance.timefusion_maintenance_batch_target_bytes)
+                .to_string();
         // Emitted BEFORE the rewrite, because the interesting bins are the ones
         // that never reach `wave_bin_staged`. A timed-out bin used to report
         // only "exceeded the Ns left in the tick budget" — no size, no file
@@ -6025,7 +6069,7 @@ impl Database {
                     build_optimize_session_state_tuned(
                         self.config.memory.timefusion_query_partitions,
                         runtime,
-                        Some("256"),
+                        Some(&batch_size),
                         Some(UncappedSort { partitions: 1, reservation_bytes: Some(32 * 1024 * 1024) }),
                     )
                 },

@@ -6366,6 +6366,10 @@ pub(crate) struct DedupExecutionLimits {
     probe_hash_shards: usize,
     /// Sort parallelism for this attempt — see [`dedup_sort_partitions`].
     sort_partitions: usize,
+    /// Rows per scan batch, from this unit's measured row width — see
+    /// [`crate::database::batch_rows_for`]. A fleet constant cannot serve both a
+    /// 1 KB row and a 63 KB one.
+    batch_rows: usize,
 }
 
 #[derive(Clone)]

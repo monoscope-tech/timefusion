@@ -355,17 +355,29 @@ impl DerivedBudget {
     /// at 16 jobs that sliced the pool below `ExternalSorterMerge`'s 32 MB
     /// floor and units failed instead of spilling.
     ///
-    /// `jobs x MAX_DECODED_BYTES` is the ceiling a fully-rollup-loaded
-    /// coordinator could want, not what it typically runs — only rollup units
-    /// draw on this pool, DEDUP units sort on the heavy share. Letting the
-    /// ceiling take half the pool starved the sorting share instead. A quarter
-    /// still leaves each job ~260 MB, above the 32 MB floor, and hands the
-    /// difference back to the tiers that were measurably short.
+    /// `jobs x MAX_DECODED_BYTES` is the ceiling a fully-loaded coordinator
+    /// could want, and it is now allowed to reach it.
+    ///
+    /// The quarter cap was written when only rollup units drew on this pool and
+    /// "DEDUP units sort on the heavy share". That stopped being true when the
+    /// coordinator took ownership of slice maintenance: `compact.rs`'s limited
+    /// dedup path, `stage_hot_bin`, Repair and SealedConsolidation all pass
+    /// `coordinator_runtime_env()`. So a quarter of the pool — 4.2 GB, split 16
+    /// ways by the `FairSpillPool` — gave each rewrite ~265 MB against a 512 MB
+    /// admission ceiling, and prod's journal carried 243 dedup units failed
+    /// with "Not enough memory to continue external sort" (2026-08-31).
+    ///
+    /// Meanwhile the light share it was protecting (~7.6 GB) feeds
+    /// `light_optimize_session_state` and `repair_session_state`, whose only
+    /// callers sit under `stage_hot_bin`'s `runtime_env: None` arm and
+    /// `optimize_table_light` — and `COORDINATOR_OWNS_SLICE_MAINTENANCE` left
+    /// that function with no callers at all. The cap moves to three fifths so
+    /// the ceiling binds instead: the pool that does the work gets the budget.
     pub fn coordinator_share_bytes(&self) -> usize {
         match self.profile {
             // The CLI drives engines directly; no coordinator runs.
             BudgetProfile::MaintenanceCli => 0,
-            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes / 4),
+            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes * 3 / 5),
         }
     }
 
@@ -1685,6 +1697,23 @@ pub struct MaintenanceConfig {
     pub timefusion_log_retention_hours: u64,
     #[serde_inline_default(48)]
     pub timefusion_optimize_window_hours: u64,
+    /// Target DECODED bytes in one maintenance scan batch.
+    ///
+    /// A batch is the sort's indivisible admission unit AND the granularity of
+    /// every spill write, so the cost that matters is bytes, not rows — and
+    /// otel rows differ in width by more than 20x between tenants. The
+    /// coordinator rewrite paths pinned 256 ROWS instead, which is right for a
+    /// 63 KB whale row and ~30x too small for an ordinary 1 KB one: measured on
+    /// prod 2026-08-31, `wave_bin_staged` reported 0.29-1.7 MB/s compressed
+    /// across every lane, and got WORSE with bin size (5.6 MB/s at 20 MB in,
+    /// 0.29 MB/s at 94 MB in) because spilling at 256-row granularity pays
+    /// Arrow IPC framing over 97 columns per record.
+    ///
+    /// 4 MB keeps a deep merge affordable: peak merge memory is
+    /// `fan_in x batch_bytes`, so ~50 spill runs cost ~200 MB against a
+    /// per-worker coordinator share of ~500 MB.
+    #[serde_inline_default(4 * MIB as u64)]
+    pub timefusion_maintenance_batch_target_bytes: u64,
     /// Use Z-order clustering for the periodic full OPTIMIZE. Default OFF:
     /// Z-order runs a memory-heavy global sort that can exhaust the pool on
     /// large windows, and its space-filling curve loosens timestamp locality.
