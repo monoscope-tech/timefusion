@@ -365,6 +365,12 @@ Discriminating it took a worktree on master and two env-knob runs (batch target
 forced to the floor, slicing restored) to rule out the two config changes first
 — which is the argument for putting every behavior change behind a knob.
 
+The `Box::pin` is load-bearing and looks like a needless allocation, so it will
+be "simplified" eventually. The structural fix is upstream: the dispatch future
+in `run_maintenance_coordinator_once` inlines all six operation paths, so
+anything that holds it is stack-hostile. Boxing per arm at the dispatch site
+would shrink it for every holder, not just this one. Follow-up, not tonight.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
