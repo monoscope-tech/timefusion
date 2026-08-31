@@ -300,6 +300,22 @@ Note when reading E: `compaction_debt_remaining` is a **success** requeue — th
 partition still has debt after a bin landed — not a failure. HotPacking's 472
 "retries" are largely that.
 
+### There were always TWO clocks, and the outer one was one minute away
+
+`COORDINATOR_LOOP_TIMEOUT` (16 min) wraps planning **plus** one unit; the
+per-operation deadline (15 min) wraps the unit. A one-minute margin, which held
+only while every operation shared the 15-minute bound. Raising Repair's window
+to an hour would have changed nothing on its own — the outer guard would have
+killed the unit at 16 minutes, dropped its `TaskLease` and requeued it, which is
+the treadmill exactly. `COORDINATOR_LOOP_TIMEOUT` is now derived from
+`MAX_OPERATION_DEADLINE_SECS`, and a test pins the ordering.
+
+The two clocks answer different questions and should not be conflated again:
+`run_until_idle` asks *is this unit working?* (and a working unit may
+legitimately outlive any fixed window); the loop guard asks *is something hung
+outside a unit?* — planning scans and the claim path, which the per-unit
+counter cannot see.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin drain admitted zero bins.** `dirty_bin_eligible_total = 0`
