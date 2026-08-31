@@ -414,7 +414,7 @@ would shrink it for every holder, not just this one. Follow-up, not tonight.
   pool slots so a busy pool only admits small work, which subsumes a deadline.
   The single most transferable idea in the survey, and not done tonight.
 
-### Pre-deploy baseline (2026-09-01 00:35 CEST, captured before the push)
+### Pre-deploy baseline (2026-09-01, captured before the push)
 
 ```
 backlog_bytes            3,576,339,029,140
@@ -429,10 +429,10 @@ pending_sealed_consolidation           169
 tasks_pending / tasks_retry     3,140 / 2,717
 ```
 
-Re-read at 02:20 CEST, minutes before the push (image `54e5152`):
+Re-read shortly before the push (image `54e5152`):
 
 ```
-backlog_bytes            3,580,107,474,211   (+43.5 GB in 1h45)
+backlog_bytes            3,580,107,474,211   (+43.5 GB since the first sample)
 dirty_bin_queue_depth               40,948
 oldest_task_age_seconds          1,466,072
 pending_base_rollup                    408
