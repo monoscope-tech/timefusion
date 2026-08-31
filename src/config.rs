@@ -205,7 +205,10 @@ const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// `PER_SORT_BUDGET_BYTES`; going lower still yields the same K for packing
 /// while buying heavy little, since heavy's concurrency is bounded by
 /// rewrite permits, not bytes.
-const HEAVY_MIN_SHARE: f64 = 0.40;
+/// Heavy maintenance's slice of the whole maintenance pool. 0.30 is what the
+/// old `0.40 of the residual` came to before the coordinator's share grew; see
+/// `heavy_share_bytes` for why it is no longer expressed against the residual.
+const HEAVY_POOL_SHARE: f64 = 0.30;
 
 /// Pool slice per in-flight coordinator job. Kept equal to the admission
 /// ceiling so a job that is allowed to decode N bytes has N bytes of pool to
@@ -386,15 +389,22 @@ impl DerivedBudget {
         self.maintenance_pool_bytes - self.coordinator_share_bytes()
     }
 
-    /// Heavy maintenance (dedup/optimize/recompress) share — at least
-    /// `HEAVY_MIN_SHARE` of the maintenance pool.
+    /// Heavy maintenance (dedup/optimize/recompress) share.
+    ///
+    /// A fraction of the WHOLE maintenance pool, not of what the coordinator
+    /// left behind. As a fraction of the residual it moved whenever the
+    /// coordinator's share moved — so raising the coordinator's cap would have
+    /// quietly cut the heavy pool by 30%, and `stage_dedup_chunk` (the dedup
+    /// REWRITE, as opposed to its probe) draws on exactly this pool. The
+    /// fraction is chosen to hold the share it had when the coupling was
+    /// removed; only the dead light share pays for the coordinator's increase.
     pub fn heavy_share_bytes(&self) -> usize {
         // MaintenanceCli: engines run one command at a time and each engine's
         // pool is a separate FairSpillPool, so both shares may claim ~the whole
         // pool — only the active engine ever allocates.
         match self.profile {
             BudgetProfile::MaintenanceCli => ((self.maintenance_pool_bytes as f64) * 0.85) as usize,
-            BudgetProfile::Server => ((self.maintenance_split_bytes() as f64) * HEAVY_MIN_SHARE) as usize,
+            BudgetProfile::Server => ((self.maintenance_pool_bytes as f64) * HEAVY_POOL_SHARE).min(self.maintenance_split_bytes() as f64 * 0.9) as usize,
         }
     }
 
