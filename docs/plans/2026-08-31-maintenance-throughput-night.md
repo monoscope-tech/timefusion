@@ -285,16 +285,20 @@ Three conclusions, none of which needed a deploy:
 
 So the repair wedge is: **~40 s of compute, done 13 times, over a network.**
 
-## Planned changes (one deploy, each behind an env knob)
+## What shipped
 
 | # | change | knob | why |
 |---|---|---|---|
-| A | Repair rewrites in ONE pass (spilling sort) instead of N event-time slices | `TIMEFUSION_REPAIR_SINGLE_PASS` | 13 rescans of an unprunable 1-row-group file is the wedge |
-| A2 | Raise the Repair unit deadline (900s → 3600s) or scale it by real bytes | `TIMEFUSION_REPAIR_DEADLINE_SECS` | staging records its `StagedIntent` only at the END, so a timeout mid-staging loses everything and resume can never engage |
-| B | Coordinator pool cap `pool/4` → `pool*3/5` (≈4.2 → 8 GB, i.e. jobs × `MAX_DECODED_BYTES`) | `TIMEFUSION_COORDINATOR_POOL_FRACTION` | 265 MB per worker vs a 512 MB admission ceiling is why 243 dedup units died on external-sort memory |
-| C | Batch size derived from measured row width (target ~8-16 MB/batch, clamp [256, 8192]) instead of the constant 256 | `TIMEFUSION_MAINTENANCE_BATCH_TARGET_BYTES` | 256 rows is right for 63 KB whale rows and ~30x too small for ordinary ones; the fleet runs at 0.3-1.7 MB/s |
-| D | `split_time_task` declines for Repair | — | bisecting a whole-file unit sheds nothing and mints duplicates |
-| E | Retry reasons counted per (operation, reason) instead of one "last reason" string | — | the missing instrument: today `retry_reason` is a single `String` (observability.rs:35) |
+| A | Repair rewrites in **one pass**; event-time slicing is off | `TIMEFUSION_REPAIR_SLICE_DECODED_TARGET_BYTES` (0 = off, the default) | 13 rescans of an unprunable, uncached 1-row-group file is the wedge |
+| A2 | The unit deadline became an **idle** clock (`run_until_idle`), and Repair's is 3600s | — | IOx's `timeout_with_progress_checking`: made progress, keep going; made none, quarantine. Killing a working unit discards uncommitted work and re-queues the same slice |
+| B | Coordinator pool cap `pool/4` → `pool*3/5` (4.2 → 8 GB, i.e. `jobs x MAX_DECODED_BYTES`) | — | 265 MB per worker against a 512 MB admission ceiling is why 243 dedup units died on external-sort memory |
+| C | Batch size from **measured row width** (`batch_rows_for`, target 8 MB, clamp [256, 8192]) instead of the constant 256 | `TIMEFUSION_MAINTENANCE_BATCH_TARGET_BYTES` | measured 39.4s → 20.3s on the same file, same pool, same plan |
+| D | `split_time_task` declines for Repair | — | bisecting a whole-file unit sheds nothing and mints duplicates that all fight over the same file |
+| E | Retries counted per `(operation, reason)` | — | the missing instrument; `retry_reason` was a single "last reason" `String` |
+
+Note when reading E: `compaction_debt_remaining` is a **success** requeue — the
+partition still has debt after a bin landed — not a failure. HotPacking's 472
+"retries" are largely that.
 
 ### Open items — evidence gathered tonight, work not done
 
