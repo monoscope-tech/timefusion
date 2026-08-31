@@ -6865,13 +6865,11 @@ fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
 /// single-digit MB. 1 GB decoded ~= 85 MB compressed per slice, so the 910 MB
 /// file becomes 11 slices instead of 4.
 ///
-/// Do not raise this to reduce slice count without re-checking the deadline:
-/// each slice is a separate pass and `TIMEFUSION_REPAIR_RESUME_ENABLED` resumes
-/// only COMPLETED staging, so partial slice progress is lost on restart. The
-/// count must fit the 900 s deadline as well as the pool. The prior note that
-/// "64 MB was tried and reverted, the cliff was contention not size" still
-/// stands and is consistent with this: contention is what an oversized
-/// unspillable merge CAUSES.
+/// The size slicing WOULD cut at, if `coordinator_slice_target` ever returned a
+/// target again. Retained as the value the sizing invariants are asserted
+/// against, not as live policy — slicing is off (see that function), because
+/// each slice is a whole extra pass over an input nothing can prune.
+#[cfg(test)]
 const REPAIR_SLICE_DECODED_TARGET_BYTES: i64 = 1024 * 1024 * 1024;
 
 /// Run the min/max/null probe for slice planning. `None` declines slicing —
@@ -15941,7 +15939,11 @@ mod tests {
             40 / 16 + 1,
             "re-denominating must not change how many slices an L0 file gets"
         );
-        assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(TARGET));
+        // Repair no longer slices at all: a slice is a whole extra pass over an
+        // input nothing can prune. The sizing invariants above stay asserted
+        // against `TARGET` so re-enabling the knob cannot re-enable the
+        // wrong-unit bug this test was written for.
+        assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), None, "repair rewrites in one pass");
     }
 
     /// A packing pass must never rewrite a file that is already at or above target.

@@ -3642,7 +3642,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         let day = 86_400_000_000;
-        let mut unit = task("p", 0, day, Operation::Repair);
+        // NOT Repair: its cost is a whole file, so it declines to split by
+        // construction (see `a_repair_unit_is_never_bisected_...`). The
+        // hot-loop invariant this test guards belongs to every other operation.
+        let mut unit = task("p", 0, day, Operation::SealedConsolidation);
         unit.attempts = 3;
         unit.estimated_decoded_bytes = 1_100_000_000_000; // the observed 1.1TB
         let key = unit.key.clone();
@@ -3694,7 +3697,7 @@ mod tests {
     fn a_replanned_day_does_not_resurrect_a_superseded_parent() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut unit = task("p", 0, DAY_MICROS, Operation::Repair);
+        let mut unit = task("p", 0, DAY_MICROS, Operation::SealedConsolidation);
         unit.attempts = 2;
         unit.state = TaskState::Running;
         let key = unit.key.clone();
