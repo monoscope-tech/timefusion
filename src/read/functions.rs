@@ -15,14 +15,14 @@ use datafusion::{
         datatypes::{DataType, Field, FieldRef, TimeUnit},
     },
     common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err},
+    functions::regex::expr_fn::regexp_match,
+    functions_nested::expr_fn::array_element,
     logical_expr::{
         Accumulator, AggregateUDF, ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature,
         TypeSignature, Volatility, create_udaf, create_udf,
         expr::{Alias, ScalarFunction},
         planner::{ExprPlanner, PlannerResult, RawBinaryExpr, TypePlanner},
     },
-    functions::regex::expr_fn::regexp_match,
-    functions_nested::expr_fn::array_element,
     prelude::lit,
     sql::sqlparser::ast::{BinaryOperator, DataType as SqlDataType},
 };
@@ -174,7 +174,8 @@ impl ExprPlanner for VariantAwareExprPlanner {
     fn plan_substring(&self, args: Vec<Expr>) -> datafusion::error::Result<PlannerResult<Vec<Expr>>> {
         // Only a string LITERAL routes. A column-typed operand is genuinely
         // ambiguous, and an offset must keep reaching the default planner.
-        let [value, pattern @ Expr::Literal(ScalarValue::Utf8(Some(_)) | ScalarValue::Utf8View(Some(_)) | ScalarValue::LargeUtf8(Some(_)), _)] = args.as_slice()
+        let [value, pattern @ Expr::Literal(ScalarValue::Utf8(Some(_)) | ScalarValue::Utf8View(Some(_)) | ScalarValue::LargeUtf8(Some(_)), _)] =
+            args.as_slice()
         else {
             return Ok(PlannerResult::Original(args));
         };
