@@ -69,4 +69,47 @@ mod tests {
 
         Ok(())
     }
+
+    /// `SUBSTRING(x FROM 'regex')` is Postgres regex extraction, but sqlparser
+    /// lowers it to the same 2-arg `substr` as the offset form, so DataFusion
+    /// rejected it with "Function 'substr' requires Int64, but received String"
+    /// and the whole statement failed to plan.
+    ///
+    /// Pins PG's two result rules (whole match vs first capture group), the
+    /// NULL-on-no-match case, and that the offset forms still route to `substr`.
+    ///
+    /// Built through `create_session_context`, not a bare `SessionContext`: the
+    /// fix is partly one of expr-planner ORDER, and only the real session builds
+    /// that order.
+    #[tokio::test]
+    async fn substring_from_regex_matches_postgres_semantics() -> Result<()> {
+        let db = std::sync::Arc::new(timefusion::database::Database::new().await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        // (sql, expected) — None expects a NULL result.
+        let cases: Vec<(&str, Option<&str>)> = vec![
+            // No capturing group: the whole match. The pattern an operator ran
+            // against widget access logs on 2026-08-31.
+            (r#"SELECT SUBSTRING('GET /widget.png?w=3 HTTP/1.1' FROM 'widget.png[^"]{0,20}')"#, Some("widget.png?w=3 HTTP/1.1")),
+            // One capturing group: that group, NOT the whole match.
+            (r#"SELECT SUBSTRING('"GET / HTTP/1.1" 404 12' FROM 'HTTP/[0-9.]+" ([0-9]{3})')"#, Some("404")),
+            // No match is NULL, not the empty string.
+            (r#"SELECT SUBSTRING('nothing here' FROM 'HTTP/[0-9.]+')"#, None),
+            // Offsets are untouched: both spellings still mean `substr`.
+            ("SELECT SUBSTRING('abcdef' FROM 3)", Some("cdef")),
+            ("SELECT SUBSTRING('abcdef' FROM 2 FOR 3)", Some("bcd")),
+        ];
+
+        for (sql, expected) in cases {
+            let results = ctx.sql(sql).await?.collect().await?;
+            let column = results[0].column(0);
+            match expected {
+                Some(want) => assert_eq!(get_str(column.as_ref(), 0), want, "{sql}"),
+                None => assert!(column.is_null(0), "{sql} should be NULL, got {:?}", get_str(column.as_ref(), 0)),
+            }
+        }
+
+        Ok(())
+    }
 }

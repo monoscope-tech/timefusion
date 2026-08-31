@@ -5200,6 +5200,18 @@ impl Database {
             .with_config(options.into())
             .with_runtime_env(runtime_env)
             .with_default_features()
+            // Ours FIRST, ahead of DataFusion's defaults — same ordering
+            // mem_buffer.rs builds by hand. `register_custom_functions` only
+            // ever appended it, which is invisible for `->`/`#>` (the default
+            // planners decline those) but fatal for `SUBSTRING(x FROM 'pat')`:
+            // CoreFunctionPlanner claims every substring unconditionally, so
+            // the PG regex form was rewritten to `substr(text, text)` and died
+            // in type coercion before our arm could see it.
+            .with_expr_planners(
+                std::iter::once(Arc::new(crate::read::functions::VariantAwareExprPlanner) as Arc<dyn datafusion::logical_expr::planner::ExprPlanner>)
+                    .chain(datafusion::execution::SessionStateDefaults::default_expr_planners())
+                    .collect(),
+            )
             .with_analyzer_rules(analyzer_rules)
             // Appended after DataFusion's defaults so push_down_limit has
             // already folded LIMIT into Sort.fetch — see the rule's docs.

@@ -21,6 +21,9 @@ use datafusion::{
         expr::{Alias, ScalarFunction},
         planner::{ExprPlanner, PlannerResult, RawBinaryExpr, TypePlanner},
     },
+    functions::regex::expr_fn::regexp_match,
+    functions_nested::expr_fn::array_element,
+    prelude::lit,
     sql::sqlparser::ast::{BinaryOperator, DataType as SqlDataType},
 };
 use serde_json::{Value as JsonValue, json};
@@ -156,6 +159,26 @@ impl ExprPlanner for VariantAwareExprPlanner {
         };
         let alias_name = format!("{base_repr} {op_str} {}", path_repr(&path_parts));
         Ok(PlannerResult::Planned(Expr::Alias(Alias::new(result, None::<&str>, alias_name))))
+    }
+
+    // PG's `substring(string FROM pattern)`: when the FROM operand is a string
+    // rather than an offset it is a POSIX regex, and the result is the matched
+    // text — the first capturing group when the pattern has one, the whole match
+    // when it has none. sqlparser lowers that spelling and the offset spelling to
+    // the same 2-arg form, so DataFusion saw `substr(Utf8View, Utf8)` and gave up
+    // at "Function 'substr' requires Int64, but received String" — an operator
+    // reading widget access logs out of `body` lost the whole query to it.
+    //
+    // `regexp_match` is specified with exactly those group/whole-match semantics,
+    // so element 1 of its list IS PG's result, NULL-on-no-match included.
+    fn plan_substring(&self, args: Vec<Expr>) -> datafusion::error::Result<PlannerResult<Vec<Expr>>> {
+        // Only a string LITERAL routes. A column-typed operand is genuinely
+        // ambiguous, and an offset must keep reaching the default planner.
+        let [value, pattern @ Expr::Literal(ScalarValue::Utf8(Some(_)) | ScalarValue::Utf8View(Some(_)) | ScalarValue::LargeUtf8(Some(_)), _)] = args.as_slice()
+        else {
+            return Ok(PlannerResult::Original(args));
+        };
+        Ok(PlannerResult::Planned(array_element(regexp_match(value.clone(), pattern.clone(), None), lit(1i64))))
     }
 }
 
