@@ -636,10 +636,37 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     use datafusion::sql::sqlparser::{
         ast::{
             CastKind, DataType as SqlDataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, TimezoneInfo, Value, ValueWithSpan,
-            visit_expressions_mut,
+            visit_expressions, visit_expressions_mut,
         },
         tokenizer::Span,
     };
+    // A regex `SUBSTRING(x FROM 'pat')` must keep its pattern INLINE. Lifted to
+    // `$N` it becomes an untyped placeholder that coerces to Int64 (substr's
+    // declared arg 2) before it is ever bound, and the query dies in
+    // `simplify_expressions` with "Cannot cast string '…' to value of Int64" —
+    // prod 2026-08-31, logged shape `select substring(? from ?)`.
+    //
+    // Same hazard as the PG array literals below, but there is no content marker
+    // to test for, and the pattern is not reachable from a value-context parent
+    // the way `take_number` filters numbers. So the whole statement opts out of
+    // shape caching: regex-substring is an operator diagnostic, never a hot
+    // cached path, and uncached means the literal survives to the planner where
+    // `VariantAwareExprPlanner::plan_substring` rewrites it correctly.
+    // The offset forms carry `Value::Number` and are unaffected.
+    let mut has_regex_substring = false;
+    let _: ControlFlow<()> = visit_expressions(stmt, |e: &SqlExpr| {
+        if let SqlExpr::Substring { substring_from: Some(from), .. } = e
+            && let SqlExpr::Value(vs) = &**from
+            && matches!(vs.value, Value::SingleQuotedString(_))
+        {
+            has_regex_substring = true;
+        }
+        ControlFlow::Continue(())
+    });
+    if has_regex_substring {
+        return None;
+    }
+
     let mut stmt = stmt.clone();
     let mut values: Vec<ScalarValue> = Vec::new();
 
@@ -1156,6 +1183,27 @@ mod tests {
         assert_eq!(values, vec![ScalarValue::Int64(Some(60)), ScalarValue::Utf8(Some("p".into()))], "the repeated 60 is stored once");
         assert_eq!(text.matches("time_bucket($1,").count(), 3, "all three time_bucket calls share one placeholder: {text}");
         assert!(!text.contains("$3"), "no placeholder beyond the two distinct literals: {text}");
+    }
+
+    /// `SUBSTRING(x FROM 'pat')` is PG regex extraction, and the pattern must
+    /// reach the planner as a literal. Parameterizing it produced the prod
+    /// failure `select substring(? from ?)` → "Cannot cast string
+    /// 'Number 782574.0' to value of Int64" (2026-08-31), because `$N` coerces
+    /// to substr's declared Int64 arg 2 before it is bound. Opting the whole
+    /// statement out of shape caching is what keeps the literal inline.
+    #[test]
+    fn a_regex_substring_pattern_is_never_lifted_to_a_placeholder() {
+        // Bare scalar (the exact prod shape) and one over a real table.
+        for sql in ["SELECT substring('abc-def' FROM '^[a-z]+')", "SELECT substring(body FROM 'HTTP/[0-9.]+') FROM t WHERE project_id = 'p'"] {
+            assert!(parameterize_statement(&parse(sql), 0, true).is_none(), "regex substring must opt out of shape caching: {sql}");
+        }
+
+        // Offsets carry a number, not a string — they still parameterize, and
+        // the surrounding literals must keep lifting as before.
+        let (param, values) = parameterize_statement(&parse("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'"), 0, true)
+            .expect("an offset substring still caches");
+        assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))]);
+        assert!(param.to_string().contains("FROM 3"), "the offset stays inline: {param}");
     }
 
     #[test]
