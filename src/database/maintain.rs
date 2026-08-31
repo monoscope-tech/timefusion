@@ -271,7 +271,11 @@ async fn run_until_idle<T>(
     idle: std::time::Duration, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>,
 ) -> Result<T, tokio::time::error::Elapsed> {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut work = std::pin::pin!(work);
+    // BOXED, not `pin!`ed on the stack. `work` is the coordinator's whole
+    // dispatch future and this frame sits inside an already-deep async stack:
+    // holding it inline overflowed the worker stack in a debug build
+    // (`a_partly_covered_window_unions_the_rollup_with_raw...`, SIGABRT).
+    let mut work = Box::pin(work);
     let mut last = progress.load(Relaxed);
     loop {
         match tokio::time::timeout(idle, &mut work).await {

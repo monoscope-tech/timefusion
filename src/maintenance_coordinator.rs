@@ -1073,6 +1073,13 @@ impl TaskJournal {
             task.deadline_micros = 0;
             reset += 1;
         }
+        // A journal with no repair queue has nothing to forgive, so it must not
+        // spend the one-shot cursor — or the migration would be consumed by a
+        // boot that happened to precede the queue, and the caller would compact
+        // for nothing on every fresh journal.
+        if reset == 0 {
+            return None;
+        }
         self.dirty_tasks.clear();
         self.snapshot.source_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned(), 1);
         self.dirty_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned());
@@ -6388,6 +6395,14 @@ mod tests {
         assert_eq!(after.deadline_micros, 0, "and the stamped backoff floor must go with it");
         assert_eq!(journal.attempts(&untouched), 7, "other operations keep their history");
         assert_eq!(journal.reset_repair_attempts(), None, "the migration must not run twice");
+
+        // A journal with no repair queue must not spend the cursor, or a boot
+        // that precedes the queue consumes the one shot.
+        let empty = tempfile::tempdir().expect("temp dir");
+        let mut fresh = TaskJournal::load(empty.path()).expect("journal");
+        assert_eq!(fresh.reset_repair_attempts(), None, "nothing to forgive, nothing spent");
+        fresh.upsert(task("p", 0, DAY_MICROS, Operation::Repair));
+        assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
     }
 
     /// A Repair unit rewrites ONE whole file, so halving its slice halves
