@@ -189,6 +189,35 @@ pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
 }
 
+/// Run `work`, giving up only after `idle` passes with **no progress**.
+///
+/// A wall clock on a maintenance unit is a LIVENESS check, not a budget. Killing
+/// a unit that is still writing rows discards work that was never committed and
+/// re-queues the identical slice, so the next claim pays the same cost and dies
+/// the same way: every one of prod's 432 active Repair units carried
+/// `retry_reason = worker_error` on 2026-08-31, one of them at `attempts = 100`.
+///
+/// This is InfluxDB IOx's `timeout_with_progress_checking` rule — made no
+/// progress, quarantine; made some, keep going — and it is what every surveyed
+/// system does instead of abandoning partial work on a timer (see
+/// `docs/plans/2026-08-31-how-other-systems-schedule-maintenance.md`). The
+/// counter is per-unit, never shared, so one worker's progress cannot excuse
+/// another's stall.
+async fn run_until_idle<T>(idle: std::time::Duration, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>) -> Result<T, tokio::time::error::Elapsed> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut work = std::pin::pin!(work);
+    let mut last = progress.load(Relaxed);
+    loop {
+        match tokio::time::timeout(idle, &mut work).await {
+            Ok(value) => return Ok(value),
+            Err(elapsed) => match progress.load(Relaxed) {
+                moved if moved != last => last = moved,
+                _ => return Err(elapsed),
+            },
+        }
+    }
+}
+
 /// (project, slice_start, slice_end, generation, source_fp, source_rows) — the
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
@@ -1682,7 +1711,7 @@ impl Database {
                 self.run_coordinator_rollup_once(operation).await?;
             }
             _ => {
-                self.run_coordinator_compaction_once(operation).await?;
+                self.run_coordinator_compaction_once(operation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?;
             }
         }
         let wall = started.elapsed();
@@ -2804,7 +2833,7 @@ impl Database {
         Ok(selected)
     }
 
-    pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
+    pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation, progress: Arc<std::sync::atomic::AtomicU64>) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
         // The rewrite permit BEFORE the claim, never inside `stage_hot_bin`.
         //
@@ -2923,7 +2952,7 @@ impl Database {
         }
         let runtime = self.coordinator_runtime_env();
         let outcome = self
-            .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
+            .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit, progress: Some(progress) })
             .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
@@ -3114,11 +3143,16 @@ impl Database {
                 },
             };
             let timeout = coordinator_operation_timeout(operation);
+            // What the unit has written so far. The deadline below fires only
+            // when this stops moving — see `run_until_idle`.
+            let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let work = async {
                 match operation {
                     Operation::Dedup => self.run_coordinator_dedup_once().await,
                     Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await,
-                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await,
+                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => {
+                        self.run_coordinator_compaction_once(operation, Arc::clone(&progress)).await
+                    }
                 }
             };
             // A unit's DURATION is the number every deadline decision needs and
@@ -3131,7 +3165,7 @@ impl Database {
             // answered from the timeout count alone, because a timeout says only
             // "longer than the deadline", never how much longer.
             let started = std::time::Instant::now();
-            let completed = match tokio::time::timeout(timeout, work).await {
+            let completed = match run_until_idle(timeout, Arc::clone(&progress), work).await {
                 Ok(result) => {
                     let elapsed = started.elapsed();
                     // Only the slow tail: a unit finishing well inside its
@@ -5636,7 +5670,7 @@ impl Database {
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
         match self
-            .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None })
+            .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None })
             .await?
         {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
@@ -5894,7 +5928,7 @@ impl Database {
                     let _in_flight = (pass == TailPass::Repair).then(|| in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(
                         left,
-                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None, light_permit: None }),
+                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None }),
                     )
                     .await
                     {
@@ -5968,7 +6002,7 @@ impl Database {
         options: HotStageOptions,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
-        let HotStageOptions { pass, runtime_env, light_permit } = options;
+        let HotStageOptions { pass, runtime_env, light_permit, progress } = options;
         // One read-lock, one table clone per bin: the pinned scan snapshot and
         // the writer's staging table both derive from it (a second clone per
         // bin was pure waste — K bins x up to 12 waves per tick).
@@ -6215,6 +6249,11 @@ impl Database {
                         continue;
                     }
                     rows_staged += batch.num_rows();
+                    // The unit is alive as long as this moves; `run_until_idle`
+                    // reads it instead of a fixed budget.
+                    if let Some(progress) = &progress {
+                        progress.fetch_add(batch.num_rows() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
                     // Cut the file at the ceiling instead of buffering the whole bin

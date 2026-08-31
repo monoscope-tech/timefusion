@@ -252,6 +252,39 @@ of the `Not enough memory to continue external sort` failures**, and it is a
 write-time defect: the fix belongs where the file is produced, not where it is
 read.
 
+### 7. Bench: the real file, `benches/rewrite_throughput.rs`
+
+Prod's worst repair input (`big1148.parquet`, 1.148 GB compressed, 1,035,264
+rows, 7.0 GB decoded, ONE row group), release build, 4 GB pool, local disk —
+so no OVH latency, which makes these numbers a *lower bound* on prod's:
+
+| variant | secs | MB/s in |
+|---|---|---|
+| scan only (no sort) | **7.3** | 156.7 |
+| sort b256 p1 — **what prod does per slice** | 39.4 | 29.1 |
+| sort b256 p8 | 30.5 | 37.6 |
+| sort b2048 p1 | 23.4 | 49.0 |
+| sort b2048 p8 | 20.2 | 57.0 |
+| sort b8192 p1 | 20.3 | 56.5 |
+| sort b8192 p8 | 20.2 | 56.8 |
+| **PROD: b256 p1 x13 slices** | **94.3** | 12.2 |
+
+Three conclusions, none of which needed a deploy:
+
+1. **Decode is not the problem.** 7.3 s to decode 7 GB is ~960 MB/s. The whole
+   file's data movement is cheap; everything above the 7.3 s floor is the sort.
+2. **`batch_size = 256` costs ~2x.** 39.4 s → 20.3 s just by moving to 8192, on
+   identical hardware, identical pool, identical plan. Partitions are worth
+   almost nothing (30.5 vs 39.4) because ONE row group means one scan
+   partition no matter what `target_partitions` says.
+3. **Slicing costs 13 decodes.** 94.3 s ≈ 13 x 7.3 s of scan — the sort is
+   cheaper per slice, but the rescans dominate. Locally that is only 2.4x
+   worse than one pass; on prod each slice ALSO re-downloads 1.1 GB from OVH
+   (the file is 93 days old, past `cache_recent_days = 35`), which is what
+   turns 40 s of work into a 900 s timeout.
+
+So the repair wedge is: **~40 s of compute, done 13 times, over a network.**
+
 ## Planned changes (one deploy, each behind an env knob)
 
 | # | change | knob | why |

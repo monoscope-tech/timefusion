@@ -1709,11 +1709,21 @@ pub struct MaintenanceConfig {
     /// 0.29 MB/s at 94 MB in) because spilling at 256-row granularity pays
     /// Arrow IPC framing over 97 columns per record.
     ///
-    /// 4 MB keeps a deep merge affordable: peak merge memory is
-    /// `fan_in x batch_bytes`, so ~50 spill runs cost ~200 MB against a
-    /// per-worker coordinator share of ~500 MB.
-    #[serde_inline_default(4 * MIB as u64)]
+    /// 8 MB keeps a deep merge affordable — peak merge memory is
+    /// `fan_in x batch_bytes`, so a 16-way merge costs ~128 MB against a
+    /// per-worker coordinator share of ~500 MB — and it is where the measured
+    /// win is: on prod's worst repair input (1.148 GB, 6.8 KB/row) the sort ran
+    /// 39.4s at 256 rows, 23.4s at 2048 and 20.3s at 8192, against a 7.3s
+    /// scan-only floor (`benches/rewrite_throughput.rs`, 2026-08-31).
+    #[serde_inline_default(8 * MIB as u64)]
     pub timefusion_maintenance_batch_target_bytes: u64,
+    /// Decoded bytes per event-time slice of a REPAIR rewrite. **0 disables
+    /// slicing**, which is the default and the only setting that has ever been
+    /// measured to work — see `coordinator_slice_target`. Kept as a kill switch,
+    /// not a tuning dial: any non-zero value reinstates one full re-read and
+    /// re-decode of the input file per slice.
+    #[serde_inline_default(0)]
+    pub timefusion_repair_slice_decoded_target_bytes: u64,
     /// Use Z-order clustering for the periodic full OPTIMIZE. Default OFF:
     /// Z-order runs a memory-heavy global sort that can exhaust the pool on
     /// large windows, and its space-filling curve loosens timestamp locality.

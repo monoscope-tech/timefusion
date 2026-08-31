@@ -36,6 +36,37 @@ pub fn maintenance_retry_reason() -> String {
     MAINTENANCE_RETRY_REASON.get_or_init(|| Mutex::new(String::new())).lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
+/// Retries counted per `(operation, reason)`.
+///
+/// The single "last reason" string above cannot distinguish a lane that retries
+/// once from one that has retried forever, and answering "why is HotPacking at
+/// 14 completions and 472 retries?" on 2026-08-31 meant copying a 52 MB journal
+/// out of the prod container. `retry_or_split` writes the reason into the task,
+/// so the fleet-level histogram was the only thing missing.
+static MAINTENANCE_RETRIES: OnceLock<dashmap::DashMap<String, AtomicU64>> = OnceLock::new();
+
+/// Bounded on purpose: a reason can carry error text (`"dedup: Not enough
+/// memory ..."`), so the key is its head and the map stops accepting new keys
+/// once it is full rather than growing with distinct error strings.
+pub fn count_maintenance_retry(operation: &str, reason: &str) {
+    const MAX_REASONS: usize = 128;
+    let head = reason.split([':', '(']).next().unwrap_or(reason).trim();
+    let map = MAINTENANCE_RETRIES.get_or_init(dashmap::DashMap::new);
+    let key = format!("{operation}.{head}");
+    if let Some(count) = map.get(&key) {
+        count.fetch_add(1, Relaxed);
+    } else if map.len() < MAX_REASONS {
+        map.entry(key).or_default().fetch_add(1, Relaxed);
+    }
+}
+
+pub fn maintenance_retry_rows() -> Vec<(String, u64)> {
+    MAINTENANCE_RETRIES
+        .get()
+        .map(|map| map.iter().map(|entry| (format!("retry.{}", entry.key()), entry.value().load(Relaxed))).collect())
+        .unwrap_or_default()
+}
+
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Meter},

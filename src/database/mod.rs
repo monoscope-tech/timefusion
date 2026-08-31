@@ -6389,6 +6389,10 @@ struct HotStageOptions {
     /// `docs/plans/2026-08-25-the-900s-is-a-queue-not-a-rewrite.md`. Ownership
     /// is moved in so "the caller holds it" cannot be asserted falsely.
     light_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Rows written so far, for the caller's liveness clock — see
+    /// [`crate::database::maintain`]'s `run_until_idle`. `None` for callers that
+    /// spend a tick budget rather than a deadline.
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 struct CompactionDebtFile {
@@ -7740,7 +7744,25 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
 /// compressed `bytes_in` by it.
 fn coordinator_slice_target(pass: TailPass, input_files: usize, bytes_in: i64) -> Option<i64> {
     match pass {
-        TailPass::Repair => Some(REPAIR_SLICE_DECODED_TARGET_BYTES),
+        // A repair slice is NOT a cheaper piece of the rewrite — it is a whole
+        // extra pass over the same file. The predicate cannot prune, because
+        // the file is a repair candidate precisely for being unsorted, so its
+        // row-group statistics overlap every slice; and the file is sealed, so
+        // it is older than `cache_recent_days` and each pass re-downloads it.
+        //
+        // Prod 2026-08-31: one 1.148 GB input became `slices=13`, i.e. ~180 GB
+        // decoded and ~15 GB of egress to rewrite 1.1 GB, and never reached
+        // `wave_bin_staged` inside the 900s deadline. Measured on that exact
+        // file, ONE pass — scan, sort, stream out — is 39s.
+        //
+        // The memory this was defending is bounded by the spilling sort plus
+        // `batch_rows_for`, both of which price the real cost. The knob stays as
+        // a kill switch: set the target to re-enable slicing at that size.
+        TailPass::Repair => crate::config::try_config()
+            .map_or(0, |cfg| cfg.maintenance.timefusion_repair_slice_decoded_target_bytes)
+            .try_into()
+            .ok()
+            .filter(|target: &i64| *target > 0),
         // Unchanged in effect: the same 16 MB compressed budget, re-expressed in
         // decoded bytes so one unit runs through the whole slicing path.
         TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => {
@@ -17710,7 +17732,7 @@ mod tests {
         // Every light-rewrite permit taken, exactly as prod's steady state.
         let held = Arc::clone(&db.light_rewrite_sem).acquire_many_owned(db.light_rewrite_sem.available_permits() as u32).await?;
 
-        let claimed = db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?;
+        let claimed = db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?;
         let (state, attempts) = {
             let journal = db.maintenance_tasks.lock().unwrap();
             (journal.state(&key), journal.tasks().find(|task| task.key == key).map(|task| task.attempts))
@@ -17721,7 +17743,7 @@ mod tests {
 
         // And with a permit free, the same turn does claim it.
         drop(held);
-        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "the refusal must be the permit, not the queue being empty");
+        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?, "the refusal must be the permit, not the queue being empty");
         Ok(())
     }
 

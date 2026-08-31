@@ -2530,6 +2530,7 @@ impl TaskJournal {
         task.state = TaskState::Retry;
         tracing::debug!(?key, %reason, attempts = task.attempts, not_before_micros, "maintenance task retry");
         crate::observability::set_maintenance_retry_reason(&reason);
+        crate::observability::count_maintenance_retry(&format!("{:?}", key.operation), &reason);
         task.retry_reason = Some(reason);
         task.deadline_micros = not_before_micros;
         self.dirty_tasks.insert(key.clone());
@@ -2656,6 +2657,17 @@ impl TaskJournal {
     }
 
     pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64, input: Option<InputFootprint>) -> bool {
+        // A Repair unit's cost is the FILE it rewrites, and time-bisection
+        // cannot shrink a file. `coordinator_compaction_files` hands Repair
+        // `take(1)` of a whole file whatever the slice width is, so every child
+        // of a split fights over the same file and pays the same cost — the
+        // split only multiplies the number of units paying it. Prod 2026-08-31:
+        // the 432 active repair units had been bisected to 12h/0.75h/0.38h
+        // widths over four dates, all in `worker_error`, one at `attempts=100`.
+        if key.operation == Operation::Repair {
+            crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let mut parent = self.snapshot.tasks[index].clone();
         // Children of a split read the parent's files — every one of them, since
@@ -6292,6 +6304,25 @@ mod tests {
     ///
     /// Measured after #178: BaseRollup timed out at 900s for the first time (4 in
     /// a 10-minute window) and rollup output collapsed from ~9,000 rows/min to 10.
+    /// A Repair unit rewrites ONE whole file, so halving its slice halves
+    /// nothing: `coordinator_compaction_files` still hands every child the same
+    /// `take(1)`. Prod 2026-08-31 had 432 repair units bisected to 12h/0.75h/
+    /// 0.38h widths across four dates, every one of them `worker_error`.
+    #[test]
+    fn a_repair_unit_is_never_bisected_because_its_cost_is_a_whole_file() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let repair = task("p", DAY_MICROS, DAY_MICROS + DAY_MICROS, Operation::Repair).key;
+        journal.enqueue(repair.clone(), 0, MAX_DECODED_BYTES, 0);
+        let before = journal.snapshot.tasks.len();
+
+        // Day-wide, and measured far over budget: every condition a split needs.
+        assert!(!journal.split_time_task(&repair, MAX_DECODED_BYTES * 8, None), "repair must decline to split");
+        assert_eq!(journal.snapshot.tasks.len(), before, "a declined split must mint no children");
+        assert_eq!(journal.state(&repair), Some(TaskState::Pending), "and must not supersede the parent");
+    }
+
     #[test]
     fn coarsening_skips_a_day_that_would_not_fit_the_decode_budget() {
         const DAY_MICROS: i64 = 86_400_000_000;
