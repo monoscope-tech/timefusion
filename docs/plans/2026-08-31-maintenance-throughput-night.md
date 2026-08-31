@@ -139,7 +139,80 @@ overhead is the entire cost.
 
 One fix here lifts four lanes at once. That is the lever.
 
-### 3. Next: attribute the cost on the real file
-Downloading the two wedged parquet files to bench against locally, rather than
-synthetic rows — the shape (63 KB rows, variant blobs, ~200 columns) is
-probably what makes it slow.
+### 3. The file has ONE row group of 7 GB
+
+`big1148.parquet`: 1,035,264 rows, **1 row group**, 94 columns, 7,017 MB
+uncompressed. Three consequences, all bad:
+
+- **No scan parallelism is possible.** DataFusion partitions a parquet scan by
+  row group. One row group = one partition, whatever `target_partitions` says.
+- **No pruning is possible.** One set of stats covers the whole file, so the
+  13 event-time slice predicates each select the entire row group.
+- Every read of any part of it decodes 7 GB.
+
+Current writer properties (`build_writer_properties`, mod.rs:8567) do bound
+row groups — `set_max_row_group_bytes(128 MB)` plus
+`set_max_row_group_row_count(row_group_row_count(...))`, which clamps to
+[32,768, 1,048,576] rows. This file has 1,035,264 rows in one group, i.e. it
+predates that or hit the ceiling. Note the row-count model estimates otel at
+~4.5 KB/row while the whale's May files are ~63 KB/row decoded — **14x off**,
+so even today's cap can emit a 2 GB row group for that tenant.
+
+### 4. The journal says every repair unit dies the same death
+
+`maintenance_tasks.json` (52 MB, 73,005 tasks), states by operation:
+
+| operation | complete | superseded | pending | retry | running |
+|---|---|---|---|---|---|
+| base_rollup | 31,630 | 7,773 | 131 | 200 | 3 |
+| dedup | 13,051 | 3,602 | 2,847 | 1,988 | 13 |
+| derived_rollup | 3,546 | 5,351 | 21 | 18 | 0 |
+| repair | 2,064 | 335 | 0 | 432 | 0 |
+
+Retry reasons on everything not complete:
+
+```
+7773  base_rollup      split_into_smaller_slices
+3602  dedup            split_into_smaller_slices
+2790  derived_rollup   migrated_to_aligned_hour_slice
+2561  derived_rollup   split_into_smaller_slices
+1693  dedup            worker_error            <- timed out
+ 432  repair           worker_error            <- ALL of them
+ 243  dedup            "Not enough memory to continue external sort"
+ 183  base_rollup      worker_error
+```
+
+- **All 432 active repair units are `worker_error`.** The lane is not slow, it
+  is 0%.
+- **Dedup's failures are memory and time**, in that order of interest: 243
+  units died with `Not enough memory to continue external sort` and 1 with
+  `Additional allocation failed for SortPreservingMerge`.
+- Repair units all carry `estimated_decoded_bytes = 268,435,457`
+  (= `MAX_DECODED_BYTES/2 + 1`, stamped by `byte_bounded_units`) while the real
+  file is 13.8 GB decoded — **the admission and slicing decisions are made on a
+  number that is 50x wrong.**
+- Repair units have been bisected to widths of 12h/0.75h/0.38h. Bisecting a
+  repair unit sheds nothing: `coordinator_compaction_files` hands Repair
+  `take(1)` of a *whole file* regardless of slice width, so all the children
+  fight over the same file.
+- Dedup's active units: 1,653 at 10-min width, 1,436 at **1-min** width — the
+  bisect debris of the same failures. Each still pays the full fixed cost
+  (claim, resolve, snapshot walks, provider, plan, ≥1 row group per overlapping
+  file, commit).
+- Dedup backlog age: 1,750 units are stuck on 2026-07-23/24/25 while 2,051 are
+  from today — a five-week-old head-of-line blockage plus the live stream.
+
+### 5. The coordinator pool is 4 GB shared by 16 workers
+
+`coordinator_share_bytes()` = `min(jobs × MAX_DECODED_BYTES, maintenance_pool/4)`
+= min(8 GB, 4.24 GB) = **4.24 GB**, and `tasks_running` is 16. A `FairSpillPool`
+splits that ~16 ways: **~265 MB per concurrent rewrite**, against a per-unit
+admission estimate of 512 MB. That is the direct cause of the 243
+`Not enough memory to continue external sort` failures.
+
+Meanwhile `maintenance_pool_mb` is 16,964 and the remaining ~12.7 GB sits in
+the heavy/light/repair pools, whose only callers are the legacy
+`optimize_table_light` path that `COORDINATOR_OWNS_SLICE_MAINTENANCE` disabled.
+The comment on `coordinator_share_bytes` still says "DEDUP units sort on the
+heavy share" — they do not: `compact.rs:998` hands coordinator dedup
+`coordinator_runtime_env()`.
