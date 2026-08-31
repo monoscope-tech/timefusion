@@ -351,6 +351,20 @@ legitimately outlive any fixed window); the loop guard asks *is something hung
 outside a unit?* — planning scans and the claim path, which the per-unit
 counter cannot see.
 
+### One regression the suite caught, worth remembering
+
+`run_until_idle` is an extra async layer that holds the coordinator's **whole
+dispatch future** for the life of the unit. Pinning it on the stack
+(`std::pin::pin!`) overflowed the worker stack in a debug build —
+`dedup_compaction_test::a_partly_covered_window_unions_the_rollup_with_raw…`
+SIGABRT'd on the branch and passed on master. `Box::pin` fixes it. The previous
+shape avoided this by not adding a layer at all: `tokio::time::timeout` took the
+future by value at the call site.
+
+Discriminating it took a worktree on master and two env-knob runs (batch target
+forced to the floor, slicing restored) to rule out the two config changes first
+— which is the argument for putting every behavior change behind a knob.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
