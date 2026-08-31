@@ -285,6 +285,36 @@ Three conclusions, none of which needed a deploy:
 
 So the repair wedge is: **~40 s of compute, done 13 times, over a network.**
 
+#### The same file at a 256 MB pool — prod's per-worker share today
+
+`4.24 GB FairSpillPool / 16 concurrent jobs ≈ 265 MB`. Re-run at 256 MB:
+
+| variant | secs |
+|---|---|
+| scan only | 6.7 |
+| sort b256 p1 | 39.2 |
+| sort b256 p8 | **FAILED** — `Additional allocation failed for SortPreservingMergeExec` |
+| sort b2048 p1 | 47.1 |
+| sort b2048 p8 | 50.0 |
+| sort b8192 p1 | **FAILED** — `Not enough memory to continue external sort` |
+| sort b8192 p8 | **FAILED** — same |
+| PROD: b256 p1 x13 | 82.8 |
+
+This is the prod journal's error text, reproduced on a laptop: those are the
+verbatim messages behind 243 dedup units and the one
+`SortPreservingMerge` failure. Two things follow, and they are the whole
+argument for pricing a batch in BYTES:
+
+- **A row count cannot be safe.** 8192 rows is 109 MB per batch on this file and
+  fails; on `otel_metrics` (47 B/row) the same 8192 is 385 KB and is
+  ~30x too *small*. `batch_rows_for` caps the BYTES, so it produces 630 rows
+  here and 8192 there — both ~8 MB.
+- **The optimum inverts with pool size.** At 4 GB, bigger batches are faster
+  (39.4 → 20.3 s); at 256 MB they are slower (39.2 → 47.1 s) and then fail,
+  because spilling dominates. That is why the pool increase and the batch
+  change belong in the same deploy: the batch change alone, at today's pool,
+  would have been neutral-to-worse.
+
 ## What shipped
 
 | # | change | knob | why |
