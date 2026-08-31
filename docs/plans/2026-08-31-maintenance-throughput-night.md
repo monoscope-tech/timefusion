@@ -381,7 +381,33 @@ counter cannot see.
   pool slots so a busy pool only admits small work, which subsumes a deadline.
   The single most transferable idea in the survey, and not done tonight.
 
+### Pre-deploy baseline (2026-09-01 00:35 CEST, captured before the push)
+
+```
+backlog_bytes            3,576,339,029,140
+dirty_bin_queue_depth               40,904
+oldest_task_age_seconds          1,464,125   (16.95 d)
+pending_base_rollup                    314
+pending_dedup                        4,905
+pending_derived_rollup                  36
+pending_hot_packing                     16
+pending_repair                         432
+pending_sealed_consolidation           169
+tasks_pending / tasks_retry     3,140 / 2,717
+```
+
+Full dump: `scratchpad/before_deploy_stats.txt`; journal: `scratchpad/mt.json.gz`.
+
 ### Success metrics to read in the morning (≥2h after the deploy)
+
+**Expect repair to drain slowly at first, and do not mistake that for failure.**
+All 432 repair units have `attempts >= 2` with `worker_error`, so they are
+QUARANTINED: claimable only through `maintenance_quarantine_slots`
+(`coordinator_jobs / 8` ≈ 2 of 16), and `abandon_running`'s backoff floor for
+`attempts >= 2` is `operation_deadline_secs` — which is now 3600s for Repair.
+So the lane drains through a 2-slot straw with hour-long retry floors. The
+signal in hour one is **the 2026-05-30/31 87576849 slices landing** and
+`worker_error` not re-accruing, not the completion count.
 
 1. journal: `repair` tasks in state `complete` grows; the 2026-05-30/31
    87576849 slices disappear from `retry/worker_error`.
