@@ -106,7 +106,7 @@ async fn main() {
 
     // Each row is flushed as it completes: a variant that hangs or OOMs must not
     // take the rows already measured with it.
-    let mut run = async |label: String, batch: &str, partitions: usize, slices: usize, sorted: bool| {
+    let run = async |label: String, batch: &str, partitions: usize, slices: usize, sorted: bool| {
         use std::io::Write;
         let line = match pass(&path, batch, partitions, slices, sorted, pool_mb * 1024 * 1024, spill.path()).await {
             Ok((secs, rows)) => format!("{label:<26} {secs:>8.1} {rows:>11} {:>10.2}", bytes as f64 / 1e6 / secs),
