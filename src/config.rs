@@ -214,6 +214,12 @@ const COORDINATOR_JOB_POOL_BYTES: usize = crate::maintenance_coordinator::MAX_DE
 /// Floor so a tiny box never zeroes the maintenance pool.
 const MAINTENANCE_FLOOR_BYTES: usize = GIB;
 
+/// Ceiling on the query session's `target_partitions` — see the long note at
+/// the `TIMEFUSION_QUERY_PARTITIONS` tune site. It bounds the sort machinery's
+/// per-partition, non-spillable reservations, which is what exhausted the query
+/// pool on the 48-core box.
+const QUERY_PARTITIONS_MAX: usize = 16;
+
 /// The number the whole tree derives from: the detected limit, LOWERED by an
 /// operator request — budgeting above the cgroup is never valid, so an
 /// over-large request is clamped rather than honoured.
@@ -3095,7 +3101,32 @@ pub fn apply(config: &mut AppConfig) {
     // pinning but not the CFS quota (`docker --cpus`), so a throttled container
     // would oversubscribe by splitting even small files into too many scan
     // groups. `detect_cores` derives from the cgroup quota instead.
-    tune("TIMEFUSION_QUERY_PARTITIONS", &mut config.memory.timefusion_query_partitions, cpus, "");
+    //
+    // CAPPED at QUERY_PARTITIONS_MAX, which is a MEMORY bound, not a CPU one.
+    // Sort machinery reserves per partition and the merge halves cannot spill,
+    // so the peak scales with `target_partitions`, not with how much work there
+    // is. On the 48-core prod box that is what killed queries repeatedly:
+    //
+    //   Resources exhausted: Additional allocation failed for
+    //   ExternalSorterMerge[18] … 4 x ExternalSorterMerge (can spill: false)
+    //   holding 666.7 MB each … greedy(used: 16.0 GB, pool_size: 16.0 GB)
+    //
+    // (2026-08-31 ExternalSorterMerge; 2026-08-30 TopK and
+    // SortPreservingMergeExec; 2026-08-28 "Not enough memory to continue
+    // external sort" — plus the RUM/containers `row_number() OVER (PARTITION
+    // BY … ORDER BY timestamp DESC)` queries, which surfaced as
+    // HasqlException/XX000 in monoscope.) The window functions and
+    // `ORDER BY timestamp LIMIT n` TopKs those pages run are all sort-bound, so
+    // their unspillable reservation falls ~3x at 16 partitions while the scan
+    // still parallelises 16 ways. `sort_spill_reservation_bytes` only pads
+    // ExternalSorter's own merge and does nothing for TopK/SPM, which is why
+    // the partition count is the lever and that knob was only a stopgap.
+    //
+    // Trade-off, stated plainly: this costs large-scan CPU parallelism above 16
+    // cores to buy sort-memory headroom. 16 is a starting point, not a law —
+    // `TIMEFUSION_QUERY_PARTITIONS` still overrides, so tuning and rollback are
+    // env-only and need no redeploy.
+    tune("TIMEFUSION_QUERY_PARTITIONS", &mut config.memory.timefusion_query_partitions, cpus.min(QUERY_PARTITIONS_MAX), "");
 
     if applied.is_empty() {
         info!("Auto-tune: no overrides applied (user has set all knobs explicitly or host signals unavailable)");
