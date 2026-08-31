@@ -230,6 +230,28 @@ call site classified):
 **~7.6 GB of the maintenance budget is reserved for two code paths that cannot
 run**, while the path that runs everything gets 4.2 GB split 16 ways.
 
+### 6. Row groups are capped by ROWS, and rows vary 22x in width
+
+A *recent* compacted whale file (`date=2026-08-30`, 204 MB, 1.64 M rows) is
+healthy in shape — **51 row groups, every one exactly 32,768 rows** (the floor
+of `row_group_row_count`), with honest `sorting_columns`. So the write path
+fixed the 1-row-group problem for new files.
+
+But the decoded size of those equal-row groups ranges from **37 MB to 819 MB**:
+
+```
+rg uncompressed MB: 45.6, 39.2, 41.2, 45.5, 46.8, 47.5, 629.4, 819.0, 44.9, ...
+rg rows:            32768 (every one)
+```
+
+`set_max_row_group_bytes(128 MB)` is set but does not bind (parquet-rs), so the
+row-count cap is the only real control and it is blind to payload width. A
+reader or a rewrite that touches row group #8 must decode 819 MB — against a
+coordinator share of ~265 MB per worker. **This is a second, independent cause
+of the `Not enough memory to continue external sort` failures**, and it is a
+write-time defect: the fix belongs where the file is produced, not where it is
+read.
+
 ## Planned changes (one deploy, each behind an env knob)
 
 | # | change | knob | why |
