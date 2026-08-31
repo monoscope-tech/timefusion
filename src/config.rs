@@ -205,7 +205,10 @@ const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// `PER_SORT_BUDGET_BYTES`; going lower still yields the same K for packing
 /// while buying heavy little, since heavy's concurrency is bounded by
 /// rewrite permits, not bytes.
-const HEAVY_MIN_SHARE: f64 = 0.40;
+/// Heavy maintenance's slice of the whole maintenance pool. 0.30 is what the
+/// old `0.40 of the residual` came to before the coordinator's share grew; see
+/// `heavy_share_bytes` for why it is no longer expressed against the residual.
+const HEAVY_POOL_SHARE: f64 = 0.30;
 
 /// Pool slice per in-flight coordinator job. Kept equal to the admission
 /// ceiling so a job that is allowed to decode N bytes has N bytes of pool to
@@ -355,17 +358,29 @@ impl DerivedBudget {
     /// at 16 jobs that sliced the pool below `ExternalSorterMerge`'s 32 MB
     /// floor and units failed instead of spilling.
     ///
-    /// `jobs x MAX_DECODED_BYTES` is the ceiling a fully-rollup-loaded
-    /// coordinator could want, not what it typically runs — only rollup units
-    /// draw on this pool, DEDUP units sort on the heavy share. Letting the
-    /// ceiling take half the pool starved the sorting share instead. A quarter
-    /// still leaves each job ~260 MB, above the 32 MB floor, and hands the
-    /// difference back to the tiers that were measurably short.
+    /// `jobs x MAX_DECODED_BYTES` is the ceiling a fully-loaded coordinator
+    /// could want, and it is now allowed to reach it.
+    ///
+    /// The quarter cap was written when only rollup units drew on this pool and
+    /// "DEDUP units sort on the heavy share". That stopped being true when the
+    /// coordinator took ownership of slice maintenance: `compact.rs`'s limited
+    /// dedup path, `stage_hot_bin`, Repair and SealedConsolidation all pass
+    /// `coordinator_runtime_env()`. So a quarter of the pool — 4.2 GB, split 16
+    /// ways by the `FairSpillPool` — gave each rewrite ~265 MB against a 512 MB
+    /// admission ceiling, and prod's journal carried 243 dedup units failed
+    /// with "Not enough memory to continue external sort" (2026-08-31).
+    ///
+    /// Meanwhile the light share it was protecting (~7.6 GB) feeds
+    /// `light_optimize_session_state` and `repair_session_state`, whose only
+    /// callers sit under `stage_hot_bin`'s `runtime_env: None` arm and
+    /// `optimize_table_light` — and `COORDINATOR_OWNS_SLICE_MAINTENANCE` left
+    /// that function with no callers at all. The cap moves to three fifths so
+    /// the ceiling binds instead: the pool that does the work gets the budget.
     pub fn coordinator_share_bytes(&self) -> usize {
         match self.profile {
             // The CLI drives engines directly; no coordinator runs.
             BudgetProfile::MaintenanceCli => 0,
-            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes / 4),
+            BudgetProfile::Server => (self.coordinator_jobs() * COORDINATOR_JOB_POOL_BYTES).min(self.maintenance_pool_bytes * 3 / 5),
         }
     }
 
@@ -374,15 +389,22 @@ impl DerivedBudget {
         self.maintenance_pool_bytes - self.coordinator_share_bytes()
     }
 
-    /// Heavy maintenance (dedup/optimize/recompress) share — at least
-    /// `HEAVY_MIN_SHARE` of the maintenance pool.
+    /// Heavy maintenance (dedup/optimize/recompress) share.
+    ///
+    /// A fraction of the WHOLE maintenance pool, not of what the coordinator
+    /// left behind. As a fraction of the residual it moved whenever the
+    /// coordinator's share moved — so raising the coordinator's cap would have
+    /// quietly cut the heavy pool by 30%, and `stage_dedup_chunk` (the dedup
+    /// REWRITE, as opposed to its probe) draws on exactly this pool. The
+    /// fraction is chosen to hold the share it had when the coupling was
+    /// removed; only the dead light share pays for the coordinator's increase.
     pub fn heavy_share_bytes(&self) -> usize {
         // MaintenanceCli: engines run one command at a time and each engine's
         // pool is a separate FairSpillPool, so both shares may claim ~the whole
         // pool — only the active engine ever allocates.
         match self.profile {
             BudgetProfile::MaintenanceCli => ((self.maintenance_pool_bytes as f64) * 0.85) as usize,
-            BudgetProfile::Server => ((self.maintenance_split_bytes() as f64) * HEAVY_MIN_SHARE) as usize,
+            BudgetProfile::Server => ((self.maintenance_pool_bytes as f64) * HEAVY_POOL_SHARE).min(self.maintenance_split_bytes() as f64 * 0.9) as usize,
         }
     }
 
@@ -1685,6 +1707,33 @@ pub struct MaintenanceConfig {
     pub timefusion_log_retention_hours: u64,
     #[serde_inline_default(48)]
     pub timefusion_optimize_window_hours: u64,
+    /// Target DECODED bytes in one maintenance scan batch.
+    ///
+    /// A batch is the sort's indivisible admission unit AND the granularity of
+    /// every spill write, so the cost that matters is bytes, not rows — and
+    /// otel rows differ in width by more than 20x between tenants. The
+    /// coordinator rewrite paths pinned 256 ROWS instead, which is right for a
+    /// 63 KB whale row and ~30x too small for an ordinary 1 KB one: measured on
+    /// prod 2026-08-31, `wave_bin_staged` reported 0.29-1.7 MB/s compressed
+    /// across every lane, and got WORSE with bin size (5.6 MB/s at 20 MB in,
+    /// 0.29 MB/s at 94 MB in) because spilling at 256-row granularity pays
+    /// Arrow IPC framing over 97 columns per record.
+    ///
+    /// 8 MB keeps a deep merge affordable — peak merge memory is
+    /// `fan_in x batch_bytes`, so a 16-way merge costs ~128 MB against a
+    /// per-worker coordinator share of ~500 MB — and it is where the measured
+    /// win is: on prod's worst repair input (1.148 GB, 6.8 KB/row) the sort ran
+    /// 39.4s at 256 rows, 23.4s at 2048 and 20.3s at 8192, against a 7.3s
+    /// scan-only floor (`benches/rewrite_throughput.rs`, 2026-08-31).
+    #[serde_inline_default(8 * MIB as u64)]
+    pub timefusion_maintenance_batch_target_bytes: u64,
+    /// Decoded bytes per event-time slice of a REPAIR rewrite. **0 disables
+    /// slicing**, which is the default and the only setting that has ever been
+    /// measured to work — see `coordinator_slice_target`. Kept as a kill switch,
+    /// not a tuning dial: any non-zero value reinstates one full re-read and
+    /// re-decode of the input file per slice.
+    #[serde_inline_default(0)]
+    pub timefusion_repair_slice_decoded_target_bytes: u64,
     /// Use Z-order clustering for the periodic full OPTIMIZE. Default OFF:
     /// Z-order runs a memory-heavy global sort that can exhaust the pool on
     /// large windows, and its space-filling curve loosens timestamp locality.

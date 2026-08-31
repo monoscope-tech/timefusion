@@ -97,11 +97,30 @@ pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 /// verbatim prod text in `capacity_failures_are_recognised_from_prod_text`.
 /// Operation deadlines also bound retry backoff so oversized units cannot
 /// monopolize a worker.
+/// Since `run_until_idle`, this is an IDLE window, not a budget: it fires only
+/// after this long with no rows written. That makes a longer window nearly free
+/// on healthy units and changes what the number has to cover — the longest
+/// stretch a working unit can go without producing a row.
+///
+/// Repair gets an hour for exactly that reason. `ORDER BY` is blocking, so a
+/// repair unit produces its first row only after the whole input is downloaded,
+/// decoded and spilled; on the table's largest file (2.3 GB compressed, ~28 GB
+/// decoded, uncached because it is past `cache_recent_days`) that silent
+/// stretch can exceed 15 minutes on its own. The cost of the longer window is
+/// that a genuinely hung repair holds a worker and one of ~2 `light_rewrite_sem`
+/// permits for an hour; that is affordable for a `take(1)` lane with a finite
+/// backlog, and it is strictly better than killing a unit that was working.
+/// The longest per-unit idle window any operation gets. `COORDINATOR_LOOP_TIMEOUT`
+/// is derived from this so the outer guard can never quietly become the real
+/// deadline again.
+pub const MAX_OPERATION_DEADLINE_SECS: u64 = operation_deadline_secs(Operation::Repair);
+
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
         // Dedup may use an unpooled collecting path; keep its exposure shorter.
         Operation::Dedup => 5 * 60,
-        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
+        Operation::Repair => 60 * 60,
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
     }
 }
 
@@ -818,6 +837,8 @@ impl TaskJournal {
     /// damaged values (28f62f01/08-03 at 1,071 rows against a truth of
     /// 3,752,582), while the newest dates had repaired.
     pub const DAMAGE_REPAIR_MIGRATION: &'static str = "__maintenance_damage_repair_v2";
+    /// See [`TaskJournal::reset_repair_attempts`].
+    const REPAIR_SINGLE_PASS_MIGRATION: &'static str = "__maintenance_repair_single_pass_v1";
 
     pub fn load(data_dir: &Path) -> anyhow::Result<Self> {
         let path = crate::write::wal::meta_path(data_dir, "maintenance_tasks.json");
@@ -1023,6 +1044,46 @@ impl TaskJournal {
         self.snapshot.source_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned(), 1);
         self.dirty_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned());
         Some(cleared)
+    }
+
+    /// One-shot: forget the attempt history of every Repair unit.
+    ///
+    /// `attempts` is evidence about the code that produced it, and for Repair
+    /// that code no longer exists. Prod 2026-09-01 carried 432 repair units,
+    /// every one `worker_error`, one at `attempts = 100`, under a rewrite that
+    /// re-read its input once per event-time slice and could not finish inside
+    /// any deadline. With the rewrite single-pass, that history is not evidence
+    /// — it is a sentence: `attempts >= 2` makes a unit QUARANTINED (claimable
+    /// only through `coordinator_jobs / 8` slots) and floors its retry backoff
+    /// at `operation_deadline_secs`, now an hour. 432 units through ~2 slots at
+    /// an hour each is over a week before the fix is even attempted once.
+    ///
+    /// Clearing the deadline too, because the floor is already stamped into
+    /// `deadline_micros` on units that were abandoned before this shipped.
+    /// Safe in the same way `clear_stale_estimates` is: zero is what a freshly
+    /// minted unit carries, and the claim path re-derives everything else.
+    pub fn reset_repair_attempts(&mut self) -> Option<usize> {
+        if self.snapshot.source_cursors.get(Self::REPAIR_SINGLE_PASS_MIGRATION).copied().unwrap_or_default() >= 1 {
+            return None;
+        }
+        let mut reset = 0usize;
+        for task in self.snapshot.tasks.iter_mut().filter(|task| task.key.operation == Operation::Repair && task.state != TaskState::Complete) {
+            task.attempts = 0;
+            task.retry_reason = None;
+            task.deadline_micros = 0;
+            reset += 1;
+        }
+        // A journal with no repair queue has nothing to forgive, so it must not
+        // spend the one-shot cursor — or the migration would be consumed by a
+        // boot that happened to precede the queue, and the caller would compact
+        // for nothing on every fresh journal.
+        if reset == 0 {
+            return None;
+        }
+        self.dirty_tasks.clear();
+        self.snapshot.source_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned(), 1);
+        self.dirty_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned());
+        Some(reset)
     }
 
     /// Drop queued work for a rollup tier that is no longer DECLARED.
@@ -2530,6 +2591,7 @@ impl TaskJournal {
         task.state = TaskState::Retry;
         tracing::debug!(?key, %reason, attempts = task.attempts, not_before_micros, "maintenance task retry");
         crate::observability::set_maintenance_retry_reason(&reason);
+        crate::observability::count_maintenance_retry(&format!("{:?}", key.operation), &reason);
         task.retry_reason = Some(reason);
         task.deadline_micros = not_before_micros;
         self.dirty_tasks.insert(key.clone());
@@ -2656,6 +2718,17 @@ impl TaskJournal {
     }
 
     pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64, input: Option<InputFootprint>) -> bool {
+        // A Repair unit's cost is the FILE it rewrites, and time-bisection
+        // cannot shrink a file. `coordinator_compaction_files` hands Repair
+        // `take(1)` of a whole file whatever the slice width is, so every child
+        // of a split fights over the same file and pays the same cost — the
+        // split only multiplies the number of units paying it. Prod 2026-08-31:
+        // the 432 active repair units had been bisected to 12h/0.75h/0.38h
+        // widths over four dates, all in `worker_error`, one at `attempts=100`.
+        if key.operation == Operation::Repair {
+            crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let mut parent = self.snapshot.tasks[index].clone();
         // Children of a split read the parent's files — every one of them, since
@@ -3616,7 +3689,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         let day = 86_400_000_000;
-        let mut unit = task("p", 0, day, Operation::Repair);
+        // NOT Repair: its cost is a whole file, so it declines to split by
+        // construction (see `a_repair_unit_is_never_bisected_...`). The
+        // hot-loop invariant this test guards belongs to every other operation.
+        let mut unit = task("p", 0, day, Operation::SealedConsolidation);
         unit.attempts = 3;
         unit.estimated_decoded_bytes = 1_100_000_000_000; // the observed 1.1TB
         let key = unit.key.clone();
@@ -3668,7 +3744,7 @@ mod tests {
     fn a_replanned_day_does_not_resurrect_a_superseded_parent() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut unit = task("p", 0, DAY_MICROS, Operation::Repair);
+        let mut unit = task("p", 0, DAY_MICROS, Operation::SealedConsolidation);
         unit.attempts = 2;
         unit.state = TaskState::Running;
         let key = unit.key.clone();
@@ -6292,6 +6368,62 @@ mod tests {
     ///
     /// Measured after #178: BaseRollup timed out at 900s for the first time (4 in
     /// a 10-minute window) and rollup output collapsed from ~9,000 rows/min to 10.
+    /// The fix is only reachable if it can claim the units it is for.
+    /// `attempts >= 2` quarantines a unit and floors its backoff at the
+    /// operation deadline, so prod's 432 `worker_error` repair units would
+    /// otherwise have drained through ~2 slots at an hour each.
+    #[test]
+    fn the_repair_migration_unquarantines_the_queue_it_is_for() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut wedged = task("p", 0, DAY_MICROS, Operation::Repair);
+        wedged.attempts = 100;
+        wedged.state = TaskState::Retry;
+        wedged.retry_reason = Some("worker_error".to_owned());
+        wedged.deadline_micros = i64::MAX;
+        let repair = wedged.key.clone();
+        journal.upsert(wedged);
+        // A neighbour that the migration must not touch.
+        let mut dedup = task("p", 0, DAY_MICROS, Operation::Dedup);
+        dedup.attempts = 7;
+        let untouched = dedup.key.clone();
+        journal.upsert(dedup);
+
+        assert_eq!(journal.reset_repair_attempts(), Some(1), "one repair unit reset");
+        let after = journal.tasks().find(|candidate| candidate.key == repair).expect("still queued");
+        assert_eq!(after.attempts, 0, "quarantine is keyed on attempts");
+        assert_eq!(after.deadline_micros, 0, "and the stamped backoff floor must go with it");
+        assert_eq!(journal.attempts(&untouched), 7, "other operations keep their history");
+        assert_eq!(journal.reset_repair_attempts(), None, "the migration must not run twice");
+
+        // A journal with no repair queue must not spend the cursor, or a boot
+        // that precedes the queue consumes the one shot.
+        let empty = tempfile::tempdir().expect("temp dir");
+        let mut fresh = TaskJournal::load(empty.path()).expect("journal");
+        assert_eq!(fresh.reset_repair_attempts(), None, "nothing to forgive, nothing spent");
+        fresh.upsert(task("p", 0, DAY_MICROS, Operation::Repair));
+        assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
+    }
+
+    /// A Repair unit rewrites ONE whole file, so halving its slice halves
+    /// nothing: `coordinator_compaction_files` still hands every child the same
+    /// `take(1)`. Prod 2026-08-31 had 432 repair units bisected to 12h/0.75h/
+    /// 0.38h widths across four dates, every one of them `worker_error`.
+    #[test]
+    fn a_repair_unit_is_never_bisected_because_its_cost_is_a_whole_file() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let repair = task("p", DAY_MICROS, DAY_MICROS + DAY_MICROS, Operation::Repair).key;
+        journal.enqueue(repair.clone(), 0, MAX_DECODED_BYTES, 0);
+        let before = journal.snapshot.tasks.len();
+
+        // Day-wide, and measured far over budget: every condition a split needs.
+        assert!(!journal.split_time_task(&repair, MAX_DECODED_BYTES * 8, None), "repair must decline to split");
+        assert_eq!(journal.snapshot.tasks.len(), before, "a declined split must mint no children");
+        assert_eq!(journal.state(&repair), Some(TaskState::Pending), "and must not supersede the parent");
+    }
+
     #[test]
     fn coarsening_skips_a_day_that_would_not_fit_the_decode_budget() {
         const DAY_MICROS: i64 = 86_400_000_000;

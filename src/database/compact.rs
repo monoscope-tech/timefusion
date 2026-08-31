@@ -994,11 +994,11 @@ impl Database {
         // statistics replay that made fresh states harmful in production.
         let state = limits.map_or_else(
             || build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()),
-            |_limits| {
+            |limits| {
                 build_optimize_session_state_tuned(
                     self.config.memory.timefusion_query_partitions,
                     self.coordinator_runtime_env(),
-                    Some("256"),
+                    Some(&limits.batch_rows.to_string()),
                     Some(UncappedSort { partitions: 1, reservation_bytes: Some(32 * 1024 * 1024) }),
                 )
             },

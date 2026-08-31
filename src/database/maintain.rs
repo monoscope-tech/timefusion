@@ -153,6 +153,141 @@ pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
     u64::try_from(compressed_size.max(0)).unwrap_or_default().saturating_mul(DECODED_BYTES_PER_COMPRESSED as u64)
 }
 
+/// Rows per scan batch that put one batch near `target_bytes` of decoded Arrow.
+///
+/// The rewrite paths pinned 256 ROWS, but the two things a batch size actually
+/// controls are both denominated in BYTES: the sort's indivisible admission
+/// unit, and the granularity of every spill write. otel rows differ in width by
+/// more than 20x between tenants, so one row count cannot serve both — 256 is
+/// right for a 63 KB whale row and ~30x too small for an ordinary 1 KB one.
+///
+/// Clamped rather than trusted: the floor keeps a pathologically wide bin from
+/// asking for a sub-batch the writer cannot fill, and the ceiling is
+/// DataFusion's own default, so this can only ever move between the two numbers
+/// the codebase already ran with.
+///
+/// See `batch_rows_for_prices_bytes_not_rows` for the shapes it must produce.
+pub(crate) fn batch_rows_for(decoded_bytes: u64, rows: u64, target_bytes: u64) -> usize {
+    const MIN_BATCH_ROWS: u64 = 256;
+    const MAX_BATCH_ROWS: u64 = 8192;
+    let Some(per_row) = decoded_bytes.checked_div(rows).filter(|width| *width > 0) else {
+        return MIN_BATCH_ROWS as usize;
+    };
+    (target_bytes / per_row).clamp(MIN_BATCH_ROWS, MAX_BATCH_ROWS) as usize
+}
+
+#[cfg(test)]
+mod liveness_clock_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    };
+
+    /// The whole point: a unit that is still writing rows outlives its window.
+    /// Killing it discards uncommitted work and re-queues the identical slice,
+    /// which is the treadmill every one of prod's 432 repair units was on.
+    #[tokio::test(start_paused = true)]
+    async fn work_that_keeps_writing_rows_outlives_its_idle_window() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let ticker = Arc::clone(&progress);
+        let work = async move {
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                ticker.fetch_add(1, Relaxed);
+            }
+            "committed"
+        };
+        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, work).await;
+        assert_eq!(result.ok(), Some("committed"), "100s of steady progress must survive a 30s idle window");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_that_writes_nothing_is_given_up_on() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let stalled = async { std::future::pending::<&str>().await };
+        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, stalled).await;
+        assert!(result.is_err(), "an idle unit must not hold its worker forever");
+    }
+
+    /// The outer loop guard wraps this clock, so it must never be the binding
+    /// one — a one-minute margin over a shared 15-minute bound silently became
+    /// the real deadline the moment one operation's window grew.
+    #[test]
+    fn the_loop_guard_sits_above_every_per_unit_window() {
+        use crate::maintenance_coordinator::{MAX_OPERATION_DEADLINE_SECS, Operation, operation_deadline_secs};
+        for operation in
+            [Operation::Dedup, Operation::Repair, Operation::HotPacking, Operation::SealedConsolidation, Operation::BaseRollup, Operation::DerivedRollup]
+        {
+            assert!(operation_deadline_secs(operation) <= MAX_OPERATION_DEADLINE_SECS, "{operation:?} exceeds the declared maximum");
+        }
+        assert!(
+            crate::database::COORDINATOR_LOOP_TIMEOUT.as_secs() > MAX_OPERATION_DEADLINE_SECS,
+            "the outer guard must not fire before a unit's own clock does"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_rows_tests {
+    /// One assertion per regime, because the whole point of the function is that
+    /// one row count cannot serve rows that differ 60x in width.
+    #[test]
+    fn batch_rows_for_prices_bytes_not_rows() {
+        use super::{batch_rows_for, estimated_decoded_bytes};
+        const TARGET: u64 = 8 << 20;
+        // Ordinary otel rows (~1 KB decoded) get a real batch, not 256 rows.
+        assert_eq!(batch_rows_for(1_000_000_000, 1_000_000, TARGET), 8192, "1 KB rows reach the ceiling");
+        // Prod's worst repair input, priced the way the caller prices it — off
+        // `DECODED_BYTES_PER_COMPRESSED`, which calls this file 13.3 KB/row
+        // against its true 6.8. The overestimate lands on the safe side.
+        assert_eq!(batch_rows_for(estimated_decoded_bytes(1_148_230_580), 1_035_264, TARGET), 630, "a mid-width bin lands between the clamps");
+        // The whale's widest rows stay at the floor, which is where they belong.
+        assert_eq!(batch_rows_for(63_000_000, 1_000, TARGET), 256, "63 KB rows cannot afford more");
+        // No rows measured (missing statistics) is not a licence to guess big.
+        assert_eq!(batch_rows_for(1_000_000_000, 0, TARGET), 256, "an unmeasurable bin keeps the old constant");
+    }
+}
+
+/// Rows an `Add` declares in its Delta statistics, when it declares any.
+pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
+}
+
+/// Run `work`, giving up only after `idle` passes with **no progress**.
+///
+/// A wall clock on a maintenance unit is a LIVENESS check, not a budget. Killing
+/// a unit that is still writing rows discards work that was never committed and
+/// re-queues the identical slice, so the next claim pays the same cost and dies
+/// the same way: every one of prod's 432 active Repair units carried
+/// `retry_reason = worker_error` on 2026-08-31, one of them at `attempts = 100`.
+///
+/// This is InfluxDB IOx's `timeout_with_progress_checking` rule — made no
+/// progress, quarantine; made some, keep going — and it is what every surveyed
+/// system does instead of abandoning partial work on a timer (see
+/// `docs/plans/2026-08-31-how-other-systems-schedule-maintenance.md`). The
+/// counter is per-unit, never shared, so one worker's progress cannot excuse
+/// another's stall.
+async fn run_until_idle<T>(
+    idle: std::time::Duration, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // BOXED, not `pin!`ed on the stack. `work` is the coordinator's whole
+    // dispatch future and this frame sits inside an already-deep async stack:
+    // holding it inline overflowed the worker stack in a debug build
+    // (`a_partly_covered_window_unions_the_rollup_with_raw...`, SIGABRT).
+    let mut work = Box::pin(work);
+    let mut last = progress.load(Relaxed);
+    loop {
+        match tokio::time::timeout(idle, &mut work).await {
+            Ok(value) => return Ok(value),
+            Err(elapsed) => match progress.load(Relaxed) {
+                moved if moved != last => last = moved,
+                _ => return Err(elapsed),
+            },
+        }
+    }
+}
+
 /// (project, slice_start, slice_end, generation, source_fp, source_rows) — the
 /// coverage identity `recover_rollup_coverage` reads back off a tier file's tags.
 type TaggedSliceIdentity = (String, i64, i64, String, u64, Option<u64>);
@@ -1414,7 +1549,7 @@ impl Database {
         // overlap this exact slice. Without this preflight a whale project's
         // ordinary no-duplicate probe occupied one worker for 235 seconds in
         // production while still reporting `estimated_decoded_bytes=0`.
-        let (estimated_bytes, whole_file_bytes, selected_paths) = {
+        let (estimated_bytes, whole_file_bytes, selected_paths, dedup_rows) = {
             let schema = schema_or_default(&key.source);
             let required_columns = 3usize.saturating_add(schema.dedup_keys.len()).saturating_add(usize::from(schema.dedup_tiebreak.is_some()));
             let projected_numerator = u64::try_from(required_columns).unwrap_or(u64::MAX);
@@ -1447,15 +1582,15 @@ impl Database {
                     let decoded = estimated_decoded_bytes(add.size);
                     let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
                     let (share, whole) = slice_share_of_file(min, max, key.slice, estimated_row_groups(add.size));
-                    Some((file.path().to_string(), projected.saturating_mul(share).div_ceil(whole.max(1)), projected))
+                    Some((file.path().to_string(), projected.saturating_mul(share).div_ceil(whole.max(1)), projected, add_row_count(&add).unwrap_or_default()))
                 })
                 // The prorated sum is this unit's own estimate; the unprorated
                 // one is what a SIBLING over the same files would re-read, and
                 // fusion needs both to price a bucket without counting a row
                 // group once per child.
-                .fold((0u64, 0u64, Vec::new()), |(share, whole, mut paths), (path, file_share, file_whole)| {
+                .fold((0u64, 0u64, Vec::new(), 0u64), |(share, whole, mut paths, rows), (path, file_share, file_whole, file_rows)| {
                     paths.push(path);
-                    (share.saturating_add(file_share), whole.saturating_add(file_whole), paths)
+                    (share.saturating_add(file_share), whole.saturating_add(file_whole), paths, rows.saturating_add(file_rows))
                 })
         };
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(selected_paths, whole_file_bytes);
@@ -1490,6 +1625,10 @@ impl Database {
             max_concurrent_shards: 1,
             probe_hash_shards,
             sort_partitions: dedup_sort_partitions(task.attempts),
+            // The preflight above already summed this unit's decoded bytes over
+            // exactly the files it will read; `pre_files` is not available yet,
+            // so rows come from the same snapshot walk's statistics.
+            batch_rows: batch_rows_for(estimated_bytes, dedup_rows, self.config.maintenance.timefusion_maintenance_batch_target_bytes),
         };
         // Certification is a property of the whole PARTITION — the read path keys
         // `dedup_clean_fp` on (project, table, date) and refuses the skip if ANY
@@ -1642,7 +1781,7 @@ impl Database {
                 self.run_coordinator_rollup_once(operation).await?;
             }
             _ => {
-                self.run_coordinator_compaction_once(operation).await?;
+                self.run_coordinator_compaction_once(operation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?;
             }
         }
         let wall = started.elapsed();
@@ -2764,7 +2903,9 @@ impl Database {
         Ok(selected)
     }
 
-    pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
+    pub(crate) async fn run_coordinator_compaction_once(
+        &self, operation: crate::maintenance_coordinator::Operation, progress: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
         // The rewrite permit BEFORE the claim, never inside `stage_hot_bin`.
         //
@@ -2883,7 +3024,14 @@ impl Database {
         }
         let runtime = self.coordinator_runtime_env();
         let outcome = self
-            .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
+            .stage_hot_bin(
+                &table_ref,
+                &key.source,
+                schema,
+                &key.project_id,
+                files,
+                HotStageOptions { pass, runtime_env: Some(runtime), light_permit, progress: Some(progress) },
+            )
             .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
@@ -3074,11 +3222,16 @@ impl Database {
                 },
             };
             let timeout = coordinator_operation_timeout(operation);
+            // What the unit has written so far. The deadline below fires only
+            // when this stops moving — see `run_until_idle`.
+            let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let work = async {
                 match operation {
                     Operation::Dedup => self.run_coordinator_dedup_once().await,
                     Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await,
-                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await,
+                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => {
+                        self.run_coordinator_compaction_once(operation, Arc::clone(&progress)).await
+                    }
                 }
             };
             // A unit's DURATION is the number every deadline decision needs and
@@ -3091,7 +3244,7 @@ impl Database {
             // answered from the timeout count alone, because a timeout says only
             // "longer than the deadline", never how much longer.
             let started = std::time::Instant::now();
-            let completed = match tokio::time::timeout(timeout, work).await {
+            let completed = match run_until_idle(timeout, Arc::clone(&progress), work).await {
                 Ok(result) => {
                     let elapsed = started.elapsed();
                     // Only the slow tail: a unit finishing well inside its
@@ -5596,7 +5749,14 @@ impl Database {
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
         match self
-            .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None })
+            .stage_hot_bin(
+                table_ref,
+                table_name,
+                schema,
+                &project_id,
+                files.clone(),
+                HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None },
+            )
             .await?
         {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
@@ -5854,7 +6014,14 @@ impl Database {
                     let _in_flight = (pass == TailPass::Repair).then(|| in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(
                         left,
-                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None, light_permit: None }),
+                        self.stage_hot_bin(
+                            table_ref,
+                            table_name,
+                            schema,
+                            &project_id,
+                            files,
+                            HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None },
+                        ),
                     )
                     .await
                     {
@@ -5928,7 +6095,7 @@ impl Database {
         options: HotStageOptions,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
-        let HotStageOptions { pass, runtime_env, light_permit } = options;
+        let HotStageOptions { pass, runtime_env, light_permit, progress } = options;
         // One read-lock, one table clone per bin: the pinned scan snapshot and
         // the writer's staging table both derive from it (a second clone per
         // bin was pure waste — K bins x up to 12 waves per tick).
@@ -5983,6 +6150,13 @@ impl Database {
         // Bytes read into this rewrite — free here (the Adds are already mapped)
         // and the divisor that turns staging duration into observed R2 throughput.
         let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
+        // Batch size from THIS bin's measured row width, not a fleet constant.
+        let batch_size = batch_rows_for(
+            estimated_decoded_bytes(bytes_in),
+            targets.iter().filter_map(add_row_count).sum(),
+            self.config.maintenance.timefusion_maintenance_batch_target_bytes,
+        )
+        .to_string();
         // Emitted BEFORE the rewrite, because the interesting bins are the ones
         // that never reach `wave_bin_staged`. A timed-out bin used to report
         // only "exceeded the Ns left in the tick budget" — no size, no file
@@ -6025,7 +6199,7 @@ impl Database {
                     build_optimize_session_state_tuned(
                         self.config.memory.timefusion_query_partitions,
                         runtime,
-                        Some("256"),
+                        Some(&batch_size),
                         Some(UncappedSort { partitions: 1, reservation_bytes: Some(32 * 1024 * 1024) }),
                     )
                 },
@@ -6171,6 +6345,11 @@ impl Database {
                         continue;
                     }
                     rows_staged += batch.num_rows();
+                    // The unit is alive as long as this moves; `run_until_idle`
+                    // reads it instead of a fixed budget.
+                    if let Some(progress) = &progress {
+                        progress.fetch_add(batch.num_rows() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
                     // Cut the file at the ceiling instead of buffering the whole bin

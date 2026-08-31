@@ -172,6 +172,10 @@ harness = false
 name = "dedup_benchmarks"
 harness = false
 
+[[bench]]
+name = "rewrite_throughput"
+harness = false
+
 [features]
 default = []
 test = []

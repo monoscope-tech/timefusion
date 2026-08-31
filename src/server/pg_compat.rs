@@ -970,6 +970,10 @@ impl StatsTableProvider {
         // row is the bug class that cost 53% of prefilter skips their attribution
         // on 2026-08-24, and it cannot happen here.
         maintenance.extend(crate::database::rollup_unverifiable::gauge_rows().map(|(key, value)| ("maintenance", key, value.to_string())));
+        // Same reason, same shape: one row per (operation, retry reason) the
+        // process has actually seen, rather than a hand-kept list that a new
+        // reason silently misses.
+        maintenance.extend(crate::observability::maintenance_retry_rows().into_iter().map(|(key, value)| ("maintenance", key, value.to_string())));
 
         let plan_cache = crate::read::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();

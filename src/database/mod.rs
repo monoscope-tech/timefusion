@@ -1294,10 +1294,22 @@ const COORDINATOR_STANDARD_UNIT_TIMEOUT: std::time::Duration =
 const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(crate::maintenance_coordinator::operation_deadline_secs(crate::maintenance_coordinator::Operation::Repair));
 
-/// Last-resort guard around planning plus one operation-specific unit. The
-/// operation itself has the tighter bound above; this catches a wedged planner
-/// or dispatcher without racing the file-rewrite timeout at the same instant.
-const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
+/// Last-resort guard around planning plus one operation-specific unit.
+///
+/// It must sit WELL above the longest per-unit clock, or it — not that clock —
+/// is the real deadline. It was 16 minutes against a 15-minute unit bound, a
+/// one-minute margin that only worked while every operation shared that bound;
+/// raising Repair's idle window to an hour would otherwise have left the fix
+/// unreachable, with units killed at 16 minutes exactly as before.
+///
+/// The two clocks now guard different things and must not be confused. The
+/// per-unit clock (`run_until_idle`) measures IDLENESS and can legitimately
+/// extend for as long as a unit keeps writing rows, so it is the thing that
+/// judges whether a unit is working. This one only catches a hang OUTSIDE a
+/// unit — a wedged planning scan or dispatcher — which the per-unit clock
+/// cannot see, so it is sized for "no plausible planning pass takes this long",
+/// not for the work.
+const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * crate::maintenance_coordinator::MAX_OPERATION_DEADLINE_SECS);
 
 /// How often coverage recovery re-reads the tiers' Delta logs.
 ///
@@ -4644,6 +4656,13 @@ impl Database {
                                 journal.compact()?;
                                 info!(cleared, event = "maintenance_stale_estimates_cleared");
                             }
+                            // One-shot: the repair queue's attempt history was
+                            // written by a rewrite that could not finish. Left in
+                            // place it quarantines every unit the fix is for.
+                            if let Some(reset) = journal.reset_repair_attempts() {
+                                journal.compact()?;
+                                info!(reset, event = "maintenance_repair_attempts_reset");
+                            }
                             let coarsened = journal.migrate_fine_grained_backfill(crate::support::now_micros()).unwrap_or_default();
                             if coarsened != 0 {
                                 info!(coarsened, event = "maintenance_coarse_backfill_migrated");
@@ -6366,6 +6385,10 @@ pub(crate) struct DedupExecutionLimits {
     probe_hash_shards: usize,
     /// Sort parallelism for this attempt — see [`dedup_sort_partitions`].
     sort_partitions: usize,
+    /// Rows per scan batch, from this unit's measured row width — see
+    /// [`crate::database::batch_rows_for`]. A fleet constant cannot serve both a
+    /// 1 KB row and a 63 KB one.
+    batch_rows: usize,
 }
 
 #[derive(Clone)]
@@ -6385,6 +6408,10 @@ struct HotStageOptions {
     /// `docs/plans/2026-08-25-the-900s-is-a-queue-not-a-rewrite.md`. Ownership
     /// is moved in so "the caller holds it" cannot be asserted falsely.
     light_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Rows written so far, for the caller's liveness clock — see
+    /// [`crate::database::maintain`]'s `run_until_idle`. `None` for callers that
+    /// spend a tick budget rather than a deadline.
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 struct CompactionDebtFile {
@@ -6857,13 +6884,11 @@ fn stats_columns_for(schema: &crate::schema::TableSchema) -> String {
 /// single-digit MB. 1 GB decoded ~= 85 MB compressed per slice, so the 910 MB
 /// file becomes 11 slices instead of 4.
 ///
-/// Do not raise this to reduce slice count without re-checking the deadline:
-/// each slice is a separate pass and `TIMEFUSION_REPAIR_RESUME_ENABLED` resumes
-/// only COMPLETED staging, so partial slice progress is lost on restart. The
-/// count must fit the 900 s deadline as well as the pool. The prior note that
-/// "64 MB was tried and reverted, the cliff was contention not size" still
-/// stands and is consistent with this: contention is what an oversized
-/// unspillable merge CAUSES.
+/// The size slicing WOULD cut at, if `coordinator_slice_target` ever returned a
+/// target again. Retained as the value the sizing invariants are asserted
+/// against, not as live policy — slicing is off (see that function), because
+/// each slice is a whole extra pass over an input nothing can prune.
+#[cfg(test)]
 const REPAIR_SLICE_DECODED_TARGET_BYTES: i64 = 1024 * 1024 * 1024;
 
 /// Run the min/max/null probe for slice planning. `None` declines slicing —
@@ -7736,7 +7761,25 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
 /// compressed `bytes_in` by it.
 fn coordinator_slice_target(pass: TailPass, input_files: usize, bytes_in: i64) -> Option<i64> {
     match pass {
-        TailPass::Repair => Some(REPAIR_SLICE_DECODED_TARGET_BYTES),
+        // A repair slice is NOT a cheaper piece of the rewrite — it is a whole
+        // extra pass over the same file. The predicate cannot prune, because
+        // the file is a repair candidate precisely for being unsorted, so its
+        // row-group statistics overlap every slice; and the file is sealed, so
+        // it is older than `cache_recent_days` and each pass re-downloads it.
+        //
+        // Prod 2026-08-31: one 1.148 GB input became `slices=13`, i.e. ~180 GB
+        // decoded and ~15 GB of egress to rewrite 1.1 GB, and never reached
+        // `wave_bin_staged` inside the 900s deadline. Measured on that exact
+        // file, ONE pass — scan, sort, stream out — is 39s.
+        //
+        // The memory this was defending is bounded by the spilling sort plus
+        // `batch_rows_for`, both of which price the real cost. The knob stays as
+        // a kill switch: set the target to re-enable slicing at that size.
+        TailPass::Repair => crate::config::try_config()
+            .map_or(0, |cfg| cfg.maintenance.timefusion_repair_slice_decoded_target_bytes)
+            .try_into()
+            .ok()
+            .filter(|target: &i64| *target > 0),
         // Unchanged in effect: the same 16 MB compressed budget, re-expressed in
         // decoded bytes so one unit runs through the whole slicing path.
         TailPass::Pack if input_files == 1 && bytes_in > COORDINATOR_L0_SORT_TARGET_BYTES => {
@@ -15915,7 +15958,11 @@ mod tests {
             40 / 16 + 1,
             "re-denominating must not change how many slices an L0 file gets"
         );
-        assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), Some(TARGET));
+        // Repair no longer slices at all: a slice is a whole extra pass over an
+        // input nothing can prune. The sizing invariants above stay asserted
+        // against `TARGET` so re-enabling the knob cannot re-enable the
+        // wrong-unit bug this test was written for.
+        assert_eq!(super::coordinator_slice_target(TailPass::Repair, 1, 40 * MB), None, "repair rewrites in one pass");
     }
 
     /// A packing pass must never rewrite a file that is already at or above target.
@@ -17706,7 +17753,7 @@ mod tests {
         // Every light-rewrite permit taken, exactly as prod's steady state.
         let held = Arc::clone(&db.light_rewrite_sem).acquire_many_owned(db.light_rewrite_sem.available_permits() as u32).await?;
 
-        let claimed = db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?;
+        let claimed = db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?;
         let (state, attempts) = {
             let journal = db.maintenance_tasks.lock().unwrap();
             (journal.state(&key), journal.tasks().find(|task| task.key == key).map(|task| task.attempts))
@@ -17717,7 +17764,10 @@ mod tests {
 
         // And with a permit free, the same turn does claim it.
         drop(held);
-        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "the refusal must be the permit, not the queue being empty");
+        assert!(
+            db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?,
+            "the refusal must be the permit, not the queue being empty"
+        );
         Ok(())
     }
 
