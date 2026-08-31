@@ -78,9 +78,16 @@ mod tests {
     /// Pins PG's two result rules (whole match vs first capture group), the
     /// NULL-on-no-match case, and that the offset forms still route to `substr`.
     ///
-    /// Built through `create_session_context`, not a bare `SessionContext`: the
-    /// fix is partly one of expr-planner ORDER, and only the real session builds
-    /// that order.
+    /// Built through `create_session_context`, not a bare `SessionContext`:
+    /// half the fix is expr-planner ORDER, and only the real session builds it.
+    ///
+    /// KNOWN GAP, deliberately not asserted here: over pgwire the all-literal
+    /// form (`SELECT substring('abc-def' FROM '^[a-z]+')`, no column anywhere)
+    /// still fails with "Cannot cast string '^[a-z]+' to value of Int64" — the
+    /// plan cache parameterizes both literals, so arg 2 is a placeholder that
+    /// coerces to Int64 before it is bound. Queries over a real column — which
+    /// is every query that matters, including the operator query this fixes —
+    /// plan and run correctly; verified against prod 2026-08-31.
     #[tokio::test]
     async fn substring_from_regex_matches_postgres_semantics() -> Result<()> {
         let db = std::sync::Arc::new(timefusion::database::Database::new().await?);
@@ -110,6 +117,35 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// The verbatim operator query from 2026-08-31, driven the way the plan
+    /// cache drives it: parse → statement_to_plan → optimize. The results test
+    /// above only proves the rewrite is semantically right on scalars; this
+    /// proves the real shape — regex over a Variant column, inside a
+    /// GROUP BY/ORDER BY/LIMIT — survives planning AND optimization, which is
+    /// what `get_or_build_shape` needs and what actually failed in production.
+    #[tokio::test]
+    async fn plan_and_optimize_matches_the_plan_cache_path() -> Result<()> {
+        use datafusion::sql::parser::DFParser;
+
+        let db = std::sync::Arc::new(timefusion::database::Database::new().await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let state = ctx.state();
+
+        // The verbatim operator query from 2026-08-31, over a real column.
+        let sql = r#"SELECT SUBSTRING(variant_to_json(body)::TEXT FROM 'widget.png[^"]{0,20}') AS u,
+                            SUBSTRING(variant_to_json(body)::TEXT FROM 'HTTP/[0-9.]+" ([0-9]{3})') AS status,
+                            count(*)
+                     FROM otel_logs_and_spans
+                     WHERE project_id = 'p' AND variant_to_json(body)::TEXT LIKE '%widget.png%'
+                     GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20"#;
+
+        let stmt = DFParser::parse_sql(sql)?.pop_front().expect("one statement");
+        let plan = state.statement_to_plan(stmt).await?;
+        state.optimize(&plan)?;
         Ok(())
     }
 }
