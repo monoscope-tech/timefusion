@@ -400,14 +400,17 @@ Full dump: `scratchpad/before_deploy_stats.txt`; journal: `scratchpad/mt.json.gz
 
 ### Success metrics to read in the morning (≥2h after the deploy)
 
-**Expect repair to drain slowly at first, and do not mistake that for failure.**
-All 432 repair units have `attempts >= 2` with `worker_error`, so they are
-QUARANTINED: claimable only through `maintenance_quarantine_slots`
-(`coordinator_jobs / 8` ≈ 2 of 16), and `abandon_running`'s backoff floor for
-`attempts >= 2` is `operation_deadline_secs` — which is now 3600s for Repair.
-So the lane drains through a 2-slot straw with hour-long retry floors. The
-signal in hour one is **the 2026-05-30/31 87576849 slices landing** and
-`worker_error` not re-accruing, not the completion count.
+**The repair queue is un-quarantined on boot, once.** Without that the fix
+would have been invisible: all 432 units carry `attempts >= 2` with
+`worker_error`, which makes them claimable only through
+`maintenance_quarantine_slots` (`coordinator_jobs / 8` ≈ 2 of 16) and floors
+their retry backoff at `operation_deadline_secs` — now an hour. 432 units
+through 2 slots at an hour each is **over a week** before the fix is attempted
+once. `reset_repair_attempts` (cursor `__maintenance_repair_single_pass_v1`)
+zeroes `attempts`, `retry_reason` and the stamped deadline for non-complete
+Repair units on the first boot after this deploy. Look for
+`event="maintenance_repair_attempts_reset" reset=432` in the startup log — **if
+that line is missing, nothing below will move.**
 
 1. journal: `repair` tasks in state `complete` grows; the 2026-05-30/31
    87576849 slices disappear from `retry/worker_error`.
