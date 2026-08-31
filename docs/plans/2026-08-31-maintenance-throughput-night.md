@@ -318,11 +318,19 @@ counter cannot see.
 
 ### Open items — evidence gathered tonight, work not done
 
-- **The dirty-bin drain admitted zero bins.** `dirty_bin_eligible_total = 0`
-  with `dirty_bin_queue_depth = 40,792` and growing. The increment sits at
-  `maintain.rs:5150`, inside the staging stream, so *something upstream returns
-  before admitting* — this is the same signature as the 2026-08-20 "drain had no
-  caller" bug and it is still unexplained.
+- **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
+  fixed. `dirty_bin_eligible_total = 0` against a depth of 40,792 is not a
+  missing caller: `mod.rs:4887` skips `run_dedup_for_table` for every table that
+  declares rollups, deliberately (`954d516`, reverting `d5688fd`) because one
+  admitted bin can hold `maintenance_job_sem` for its 3600s stage deadline. Both
+  producing tables — `otel_logs_and_spans` and `otel_metrics` — declare rollups,
+  so **nothing can ever drain this queue**, while `enqueue_dirty_bin` keeps
+  adding to it at ~100/hour and `persist_dirty_bins` rewrites the entire
+  40k-entry sidecar on **every** enqueue. The coordinator's Dedup units do the
+  real work; this queue is vestigial for those tables. The fix is to stop
+  enqueuing for coordinator-owned tables (check `DedupRangeOptions.dirty_key`
+  first — `run_coordinator_dedup_once` passes `None`, but confirm no other
+  reader).
 - **HotPacking's 14 completions vs 472 retries is still unattributed.** Note
   that `retry("compaction_debt_remaining")` is a *success* requeue, not a
   failure, so some large share of those 472 is progress. The new
