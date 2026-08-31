@@ -166,22 +166,35 @@ pub(crate) fn estimated_decoded_bytes(compressed_size: i64) -> u64 {
 /// DataFusion's own default, so this can only ever move between the two numbers
 /// the codebase already ran with.
 ///
-/// ```
-/// # use timefusion::database::batch_rows_for;
-/// // Ordinary otel rows (~1 KB decoded) get a real batch, not 256 rows.
-/// assert_eq!(batch_rows_for(1_000_000_000, 1_000_000, 4 << 20), 4194);
-/// // The whale's 63 KB rows stay at the floor, which is where they belong.
-/// assert_eq!(batch_rows_for(63_000_000, 1_000, 4 << 20), 256);
-/// // No rows measured (missing stats) is not a licence to guess big.
-/// assert_eq!(batch_rows_for(1_000_000_000, 0, 4 << 20), 256);
-/// ```
-pub fn batch_rows_for(decoded_bytes: u64, rows: u64, target_bytes: u64) -> usize {
+/// See `batch_rows_for_prices_bytes_not_rows` for the shapes it must produce.
+pub(crate) fn batch_rows_for(decoded_bytes: u64, rows: u64, target_bytes: u64) -> usize {
     const MIN_BATCH_ROWS: u64 = 256;
     const MAX_BATCH_ROWS: u64 = 8192;
     let Some(per_row) = decoded_bytes.checked_div(rows).filter(|width| *width > 0) else {
         return MIN_BATCH_ROWS as usize;
     };
     (target_bytes / per_row).clamp(MIN_BATCH_ROWS, MAX_BATCH_ROWS) as usize
+}
+
+#[cfg(test)]
+mod batch_rows_tests {
+    /// One assertion per regime, because the whole point of the function is that
+    /// one row count cannot serve rows that differ 60x in width.
+    #[test]
+    fn batch_rows_for_prices_bytes_not_rows() {
+        use super::{batch_rows_for, estimated_decoded_bytes};
+        const TARGET: u64 = 8 << 20;
+        // Ordinary otel rows (~1 KB decoded) get a real batch, not 256 rows.
+        assert_eq!(batch_rows_for(1_000_000_000, 1_000_000, TARGET), 8192, "1 KB rows reach the ceiling");
+        // Prod's worst repair input, priced the way the caller prices it — off
+        // `DECODED_BYTES_PER_COMPRESSED`, which calls this file 13.3 KB/row
+        // against its true 6.8. The overestimate lands on the safe side.
+        assert_eq!(batch_rows_for(estimated_decoded_bytes(1_148_230_580), 1_035_264, TARGET), 630, "a mid-width bin lands between the clamps");
+        // The whale's widest rows stay at the floor, which is where they belong.
+        assert_eq!(batch_rows_for(63_000_000, 1_000, TARGET), 256, "63 KB rows cannot afford more");
+        // No rows measured (missing statistics) is not a licence to guess big.
+        assert_eq!(batch_rows_for(1_000_000_000, 0, TARGET), 256, "an unmeasurable bin keeps the old constant");
+    }
 }
 
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
