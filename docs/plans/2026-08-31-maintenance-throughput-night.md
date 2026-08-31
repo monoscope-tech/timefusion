@@ -216,3 +216,37 @@ the heavy/light/repair pools, whose only callers are the legacy
 The comment on `coordinator_share_bytes` still says "DEDUP units sort on the
 heavy share" — they do not: `compact.rs:998` hands coordinator dedup
 `coordinator_runtime_env()`.
+
+Which of the four maintenance pools are actually live (every `*_runtime_env()`
+call site classified):
+
+| pool | share | live callers |
+|---|---|---|
+| coordinator | 4,241 MB | **all coordinator rewrites** (maintain.rs:2884, compact.rs:1000, mod.rs:4551) |
+| heavy | 5,089 MB | dedup cron for non-coordinator tables, delta-write session, maintenance scans |
+| light: pack | 3,817 MB | `light_optimize_session_state` — only from `stage_hot_bin`'s `runtime_env: None` arm and `optimize_table_light`, **which has no callers** |
+| light: repair | 3,817 MB | `repair_session_state` — same dead arm |
+
+**~7.6 GB of the maintenance budget is reserved for two code paths that cannot
+run**, while the path that runs everything gets 4.2 GB split 16 ways.
+
+## Planned changes (one deploy, each behind an env knob)
+
+| # | change | knob | why |
+|---|---|---|---|
+| A | Repair rewrites in ONE pass (spilling sort) instead of N event-time slices | `TIMEFUSION_REPAIR_SINGLE_PASS` | 13 rescans of an unprunable 1-row-group file is the wedge |
+| A2 | Raise the Repair unit deadline (900s → 3600s) or scale it by real bytes | `TIMEFUSION_REPAIR_DEADLINE_SECS` | staging records its `StagedIntent` only at the END, so a timeout mid-staging loses everything and resume can never engage |
+| B | Coordinator pool cap `pool/4` → `pool*3/5` (≈4.2 → 8 GB, i.e. jobs × `MAX_DECODED_BYTES`) | `TIMEFUSION_COORDINATOR_POOL_FRACTION` | 265 MB per worker vs a 512 MB admission ceiling is why 243 dedup units died on external-sort memory |
+| C | Batch size derived from measured row width (target ~8-16 MB/batch, clamp [256, 8192]) instead of the constant 256 | `TIMEFUSION_MAINTENANCE_BATCH_TARGET_BYTES` | 256 rows is right for 63 KB whale rows and ~30x too small for ordinary ones; the fleet runs at 0.3-1.7 MB/s |
+| D | `split_time_task` declines for Repair | — | bisecting a whole-file unit sheds nothing and mints duplicates |
+| E | Retry reasons counted per (operation, reason) instead of one "last reason" string | — | the missing instrument: today `retry_reason` is a single `String` (observability.rs:35) |
+
+### Success metrics to read in the morning (≥2h after the deploy)
+
+1. journal: `repair` tasks in state `complete` grows; the 2026-05-30/31
+   87576849 slices disappear from `retry/worker_error`.
+2. journal: dedup `worker_error` and `Not enough memory to continue external
+   sort` stop accruing.
+3. `wave_bin_staged.staging_ms` for similar `bytes_in` drops by ~an order.
+4. `pending_dedup` and `backlog_bytes` slope negative over a quiet window.
+5. `maintenance_processed_bytes_total / uptime` up from the current ~5.8 MB/s.
