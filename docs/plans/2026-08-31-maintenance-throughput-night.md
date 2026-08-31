@@ -289,6 +289,11 @@ So the repair wedge is: **~40 s of compute, done 13 times, over a network.**
 
 `4.24 GB FairSpillPool / 16 concurrent jobs ≈ 265 MB`. Re-run at 256 MB:
 
+At 512 MB — the per-worker share AFTER the pool change — `scan only` is 7.0 s
+and `sort b256 p1` 31.2 s; `b256 p8` still fails on the merge reservation, which
+is why the coordinator path sorts with `partitions: 1`. The larger-batch rows
+did not complete (see open items).
+
 | variant | secs |
 |---|---|
 | scan only | 6.7 |
@@ -377,6 +382,14 @@ counter cannot see.
   benefit-per-byte the default in 6.0 and demoted age to an escalation floor;
   see the prior-art doc. Worth revisiting once throughput is fixed — IOx gets
   by with **no ranking at all**.
+- **Unconfirmed: `b2048 p1` at a 512 MB pool may WEDGE rather than error.** The
+  same variant completes in 47.1 s at 256 MB and 23.4 s at 4 GB, but at 512 MB
+  it produced nothing in 15 minutes with the process at 0% CPU. Not chased and
+  not confirmed (the process also showed an implausible 3 MB RSS, so it may
+  simply have been a stuck leftover). It does not gate the deploy —
+  `batch_rows_for` caps a batch at ~8 MB and this variant is 27 MB — but if
+  post-deploy units start dying to zero-progress kills rather than errors, this
+  is the first thing to reproduce.
 - **Admission is a flat `MAX_DECODED_BYTES`.** ClickHouse scales the cap by free
   pool slots so a busy pool only admits small work, which subsumes a deadline.
   The single most transferable idea in the survey, and not done tonight.
