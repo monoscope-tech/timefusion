@@ -1200,8 +1200,8 @@ mod tests {
 
         // Offsets carry a number, not a string — they still parameterize, and
         // the surrounding literals must keep lifting as before.
-        let (param, values) = parameterize_statement(&parse("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'"), 0, true)
-            .expect("an offset substring still caches");
+        let (param, values) =
+            parameterize_statement(&parse("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'"), 0, true).expect("an offset substring still caches");
         assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))]);
         assert!(param.to_string().contains("FROM 3"), "the offset stays inline: {param}");
     }
