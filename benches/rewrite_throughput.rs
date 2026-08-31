@@ -60,7 +60,9 @@ fn session(batch: &str, partitions: usize) -> SessionConfig {
 
 /// One measured rewrite. `slices > 1` reproduces `repair_bin_sliced`: N
 /// event-time windows, each a separate full pass over the same file.
-async fn pass(path: &str, batch: &str, partitions: usize, slices: usize, sorted: bool, pool_bytes: usize, spill: &std::path::Path) -> Result<(f64, u64), String> {
+async fn pass(
+    path: &str, batch: &str, partitions: usize, slices: usize, sorted: bool, pool_bytes: usize, spill: &std::path::Path,
+) -> Result<(f64, u64), String> {
     use datafusion::execution::SessionStateBuilder;
     let state = SessionStateBuilder::new().with_config(session(batch, partitions)).with_runtime_env(runtime(pool_bytes, spill)).with_default_features().build();
     let ctx = SessionContext::new_with_state(state);
@@ -81,7 +83,9 @@ async fn pass(path: &str, batch: &str, partitions: usize, slices: usize, sorted:
             String::new()
         } else {
             let (lo, hi) = (min + width * slice as i64, min + width * (slice as i64 + 1));
-            format!(" WHERE timestamp >= arrow_cast({lo}, 'Timestamp(Microsecond, Some(\"UTC\"))') AND timestamp < arrow_cast({hi}, 'Timestamp(Microsecond, Some(\"UTC\"))')")
+            format!(
+                " WHERE timestamp >= arrow_cast({lo}, 'Timestamp(Microsecond, Some(\"UTC\"))') AND timestamp < arrow_cast({hi}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
+            )
         };
         let sql = format!("SELECT * FROM bin{filter}{}", if sorted { ORDER_BY } else { "" });
         let mut stream = ctx.sql(&sql).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;

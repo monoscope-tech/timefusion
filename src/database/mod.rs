@@ -1309,8 +1309,7 @@ const COORDINATOR_FILE_REWRITE_TIMEOUT: std::time::Duration =
 /// unit — a wedged planning scan or dispatcher — which the per-unit clock
 /// cannot see, so it is sized for "no plausible planning pass takes this long",
 /// not for the work.
-const COORDINATOR_LOOP_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2 * crate::maintenance_coordinator::MAX_OPERATION_DEADLINE_SECS);
+const COORDINATOR_LOOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * crate::maintenance_coordinator::MAX_OPERATION_DEADLINE_SECS);
 
 /// How often coverage recovery re-reads the tiers' Delta logs.
 ///
@@ -17765,7 +17764,10 @@ mod tests {
 
         // And with a permit free, the same turn does claim it.
         drop(held);
-        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?, "the refusal must be the permit, not the queue being empty");
+        assert!(
+            db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?,
+            "the refusal must be the permit, not the queue being empty"
+        );
         Ok(())
     }
 

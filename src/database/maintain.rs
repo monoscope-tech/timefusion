@@ -215,7 +215,9 @@ mod liveness_clock_tests {
     #[test]
     fn the_loop_guard_sits_above_every_per_unit_window() {
         use crate::maintenance_coordinator::{MAX_OPERATION_DEADLINE_SECS, Operation, operation_deadline_secs};
-        for operation in [Operation::Dedup, Operation::Repair, Operation::HotPacking, Operation::SealedConsolidation, Operation::BaseRollup, Operation::DerivedRollup] {
+        for operation in
+            [Operation::Dedup, Operation::Repair, Operation::HotPacking, Operation::SealedConsolidation, Operation::BaseRollup, Operation::DerivedRollup]
+        {
             assert!(operation_deadline_secs(operation) <= MAX_OPERATION_DEADLINE_SECS, "{operation:?} exceeds the declared maximum");
         }
         assert!(
@@ -265,7 +267,9 @@ pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
 /// `docs/plans/2026-08-31-how-other-systems-schedule-maintenance.md`). The
 /// counter is per-unit, never shared, so one worker's progress cannot excuse
 /// another's stall.
-async fn run_until_idle<T>(idle: std::time::Duration, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>) -> Result<T, tokio::time::error::Elapsed> {
+async fn run_until_idle<T>(
+    idle: std::time::Duration, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut work = std::pin::pin!(work);
     let mut last = progress.load(Relaxed);
@@ -2895,7 +2899,9 @@ impl Database {
         Ok(selected)
     }
 
-    pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation, progress: Arc<std::sync::atomic::AtomicU64>) -> Result<bool> {
+    pub(crate) async fn run_coordinator_compaction_once(
+        &self, operation: crate::maintenance_coordinator::Operation, progress: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
         // The rewrite permit BEFORE the claim, never inside `stage_hot_bin`.
         //
@@ -3014,7 +3020,14 @@ impl Database {
         }
         let runtime = self.coordinator_runtime_env();
         let outcome = self
-            .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit, progress: Some(progress) })
+            .stage_hot_bin(
+                &table_ref,
+                &key.source,
+                schema,
+                &key.project_id,
+                files,
+                HotStageOptions { pass, runtime_env: Some(runtime), light_permit, progress: Some(progress) },
+            )
             .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
@@ -5732,7 +5745,14 @@ impl Database {
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
         match self
-            .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None })
+            .stage_hot_bin(
+                table_ref,
+                table_name,
+                schema,
+                &project_id,
+                files.clone(),
+                HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None },
+            )
             .await?
         {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
@@ -5990,7 +6010,14 @@ impl Database {
                     let _in_flight = (pass == TailPass::Repair).then(|| in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(
                         left,
-                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None }),
+                        self.stage_hot_bin(
+                            table_ref,
+                            table_name,
+                            schema,
+                            &project_id,
+                            files,
+                            HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None },
+                        ),
                     )
                     .await
                     {
@@ -6120,9 +6147,12 @@ impl Database {
         // and the divisor that turns staging duration into observed R2 throughput.
         let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
         // Batch size from THIS bin's measured row width, not a fleet constant.
-        let batch_size =
-            batch_rows_for(estimated_decoded_bytes(bytes_in), targets.iter().filter_map(add_row_count).sum(), self.config.maintenance.timefusion_maintenance_batch_target_bytes)
-                .to_string();
+        let batch_size = batch_rows_for(
+            estimated_decoded_bytes(bytes_in),
+            targets.iter().filter_map(add_row_count).sum(),
+            self.config.maintenance.timefusion_maintenance_batch_target_bytes,
+        )
+        .to_string();
         // Emitted BEFORE the rewrite, because the interesting bins are the ones
         // that never reach `wave_bin_staged`. A timed-out bin used to report
         // only "exceeded the Ns left in the tick budget" — no size, no file

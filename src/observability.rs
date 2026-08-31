@@ -61,10 +61,7 @@ pub fn count_maintenance_retry(operation: &str, reason: &str) {
 }
 
 pub fn maintenance_retry_rows() -> Vec<(String, u64)> {
-    MAINTENANCE_RETRIES
-        .get()
-        .map(|map| map.iter().map(|entry| (format!("retry.{}", entry.key()), entry.value().load(Relaxed))).collect())
-        .unwrap_or_default()
+    MAINTENANCE_RETRIES.get().map(|map| map.iter().map(|entry| (format!("retry.{}", entry.key()), entry.value().load(Relaxed))).collect()).unwrap_or_default()
 }
 
 use opentelemetry::{
