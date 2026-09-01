@@ -5946,18 +5946,29 @@ impl Database {
         // Each is a whole-date key-only scan sharing the pass deadline with the
         // dirty-bin probes, and a group reached with no budget left returns
         // without probing — so this bounds work per pass without risking the
-        // tick. Prod 2026-09-01 ran 16 grants with `dedup_timed_out_total` = 0.
-        const CERTIFY_PROBES_PER_PASS: usize = 16;
+        // tick. Prod 2026-09-01 ran 16 grants with `dedup_timed_out_total` = 0
+        // and no `cert_refused_*`, so the ceiling is raised on measured headroom;
+        // the decline memo below is what keeps the extra budget going to NEW
+        // candidates instead of re-proving dup-bearing dates.
+        const CERTIFY_PROBES_PER_PASS: usize = 64;
         let today = Utc::now().date_naive();
         let mut by_project: HashMap<String, Vec<String>> = Default::default();
         for back in 1..=CERTIFY_WINDOW_DAYS {
             let date = (today - chrono::Duration::days(back)).to_string();
             for (project, files) in Self::partition_files_by_pid(table, &format!("date={date}")).into_iter().flatten() {
+                if files.is_empty() {
+                    continue;
+                }
+                let key = (project.clone(), table_name.to_string(), date.clone());
                 // Stale entries ARE re-probed: staleness means per-file evidence
                 // outlived its fingerprint, not that the date is dirty.
-                if !files.is_empty()
-                    && self.dedup_clean_fp.get(&(project.clone(), table_name.to_string(), date.clone())).is_none_or(|entry| entry.value().stale)
-                {
+                let uncertified = self.dedup_clean_fp.get(&key).is_none_or(|entry| entry.value().stale);
+                // A date already probed dirty at THIS exact file set cannot become
+                // clean without a commit, and a commit moves the fingerprint.
+                // Re-probing it is pure waste, and at 64 probes a pass it would be
+                // most of the budget.
+                let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| *entry.value() == partition_file_fp(files));
+                if uncertified && !known_dirty {
                     by_project.entry(project).or_default().push(date.clone());
                 }
             }
@@ -6088,6 +6099,14 @@ impl Database {
                             Ok(None) => {}
                             Err(error) => warn!(project, table_name, date, %error, event = "dedup_batch_probe_certify_failed"),
                         }
+                    } else if !dup_bins.is_empty() && !pre.is_empty() {
+                        // Memoise the DECLINE against the file set that produced
+                        // it. This date cannot become clean without a commit, and a
+                        // commit moves the fingerprint, so re-probing it before then
+                        // is pure waste — at 64 probes a pass it would crowd out
+                        // every candidate that has never been examined.
+                        self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), partition_file_fp(pre.clone()));
+                        metrics::counter!(scan_metric_names::CERT_PROBE_DECLINED).increment(1);
                     }
                     cleared
                 }

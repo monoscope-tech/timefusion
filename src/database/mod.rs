@@ -343,6 +343,13 @@ pub mod scan_metric_names {
         // separates "nothing is being certified" from "the containment test
         // rejects everything", which are the same observation without it.
         CERT_SLICE_FILES_PROVED = "timefusion.scan.cert_slice_files_proved" as scan.cert_slice_files_proved;
+        // A certification probe that found duplicates, memoised against the file
+        // set so it is not re-probed until a commit moves the fingerprint.
+        // Read alongside `cert_granted_total`: granted + declined is how many
+        // candidates the pass actually examined, and a declined that keeps
+        // climbing at a FLAT granted means the window is genuinely dup-bearing
+        // rather than the producer being starved.
+        CERT_PROBE_DECLINED = "timefusion.scan.cert_probe_declined" as scan.cert_probe_declined;
         CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
         // Why a CERTIFIED file still could not skip. Two very different
         // refusals: one uncertified file with no statistics blocks the entire
@@ -2657,6 +2664,18 @@ pub struct Database {
     /// current snapshot provably reads no Delta duplicates, so `DedupExec` can
     /// be skipped. Any commit changes the file set → mismatch → dedup stays on.
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>>,
+    /// (project, table, date) → file-set fingerprint at which a certification
+    /// probe found duplicates. The NEGATIVE of `dedup_clean_fp`, and it exists
+    /// purely for throughput: a dup-bearing date is never certified, so without a
+    /// memo it stays a candidate and is re-probed on every pass forever. At a low
+    /// rate that is invisible; at a high one it spends the whole budget
+    /// re-proving what is already known.
+    ///
+    /// Keyed by fingerprint, so a commit that changes the partition makes it a
+    /// candidate again — the same invalidation rule certification itself uses.
+    /// Deliberately NOT persisted: it is a cache, and losing it on restart costs
+    /// one redundant probe rather than correctness.
+    dedup_probe_declined: Arc<dashmap::DashMap<(String, String, String), u64>>,
     /// Serializes `dedup_clean_fp` snapshots with their shared atomic temp path.
     dedup_certification_persist_lock: Arc<std::sync::Mutex<()>>,
     /// Last time slice-derived certification evidence was written, as
@@ -3483,6 +3502,7 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp,
+            dedup_probe_declined: Arc::new(dashmap::DashMap::new()),
             dedup_certification_persist_lock: Arc::new(std::sync::Mutex::new(())),
             dedup_certification_persist_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             dedup_slice_coverage,
@@ -19575,6 +19595,47 @@ mod tests {
             !db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans").iter().any(|(_, date)| *date == today),
             "today is never a certification candidate"
         );
+        Ok(())
+    }
+
+    /// A date probed dirty is not re-probed until a commit moves its fingerprint.
+    ///
+    /// A dup-bearing date is never certified, so it stays a candidate forever. At
+    /// 4 probes a pass that is invisible; at 64 it is most of the budget, and the
+    /// candidates that have never been examined never get reached. The memo is
+    /// keyed by file-set fingerprint because that is exactly what a commit changes
+    /// — the same invalidation rule certification itself uses.
+    #[tokio::test]
+    async fn a_date_probed_dirty_is_not_reprobed_until_its_files_change() -> Result<()> {
+        let cfg = create_test_config(&format!("certify-memo-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
+        let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        // A genuine duplicate: same dedup key twice, so the probe must decline.
+        for observed in ["first", "second"] {
+            let batch = json_to_batch(vec![test_span_ts("dup", observed, &project, base)])?;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await?;
+        }
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
+
+        let want = (project.clone(), day.to_string());
+        let candidate = async || db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans").contains(&want);
+        assert!(candidate().await, "an unexamined dup-bearing date is a candidate");
+
+        // The decline the probe would record.
+        let files = {
+            let guard = table.read().await;
+            Database::partition_files_by_pid(&guard, &format!("date={day}"))?.remove(&key.0).unwrap_or_default()
+        };
+        db.dedup_probe_declined.insert(key.clone(), partition_file_fp(files));
+        assert!(!candidate().await, "and is skipped once declined at that exact file set");
+
+        // A commit moves the fingerprint, so it must be examined again — otherwise
+        // a date that was cleaned up would stay permanently unprovable.
+        db.dedup_probe_declined.insert(key, partition_file_fp(vec!["some-other-file.parquet".to_owned()]));
+        assert!(candidate().await, "a changed file set makes it a candidate again");
         Ok(())
     }
 
