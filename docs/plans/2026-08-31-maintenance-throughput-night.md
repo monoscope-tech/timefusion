@@ -320,7 +320,7 @@ argument for pricing a batch in BYTES:
   change belong in the same deploy: the batch change alone, at today's pool,
   would have been neutral-to-worse.
 
-## What shipped
+## What shipped — deploy 1 of 2 (`fb2e4528`)
 
 | # | change | knob | why |
 |---|---|---|---|
@@ -441,6 +441,41 @@ completions.
 **Dedup still times out at 300 s** (`retry.Dedup.worker_error = 6`). Expected:
 its deadline was not raised and it does not report progress, so the liveness
 clock does not cover it. That is the next lane.
+
+## Deploy 2 of 2: the liveness signal was in the wrong place
+
+Deploy 1 fixed repair's *cost* and then hit its own limit: seven
+`operation=Repair timeout_seconds=3600` kills against units that were **working**.
+The clock was right; the signal was not. Progress was reported only from the
+write loop, and `ORDER BY` is a blocking operator — a repair unit emits its first
+row only after the whole input is downloaded, decoded and spilled, and on the
+fleet's largest files that silent stretch exceeds an hour. Same treadmill, one
+order of magnitude further out.
+
+The dedup rewrite has the identical shape and worse: its SQL is a `ROW_NUMBER()`
+window **plus** a final `ORDER BY`, two blocking operators between the scan and
+the write loop. That is the likely reason dedup units time out at 300 s while
+working — the population the write-loop bump can never see.
+
+| # | change | why |
+|---|---|---|
+| F | `PlanProgress` polls the physical plan's own `output_rows` every 15 s while held | the scan feeding a blocking sort now counts as progress, which is the window the write loop cannot see |
+| G | The repair/packing rewrite and the dedup rewrite both watch their plans | both sit behind blocking operators |
+| H | Progress reporting moved to a **task-local** | the reporter is four calls below the measurer on three paths; this also deleted the explicit threading deploy 1 carried, so there is one mechanism |
+
+### Reading deploy 2's boot, so the expected does not look broken
+
+- **`maintenance_repair_attempts_reset` will be ABSENT.** The one-shot cursor was
+  spent on deploy 1 (`reset=767`). Correct, not a missing migration.
+- The ~7 repair units killed at the 3600 s wall have re-accumulated `attempts`
+  and some are re-quarantined behind hour-scale backoff floors. **No v2
+  migration**: under `PlanProgress` they survive their next claim, and 7 units
+  through ~2 quarantine slots is hours, not days. It self-heals.
+- **Dedup completions ABOVE 300 s are the success signal**, not a regression:
+  `maintenance_unit_slow` reporting `operation=Dedup elapsed_secs > 300` means a
+  working unit was allowed to finish instead of being killed and re-run.
+- The night now has three measurement windows, split by the two deploys. Do not
+  compare across them without saying which is which.
 
 ### Open items — evidence gathered tonight, work not done
 

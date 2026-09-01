@@ -1596,12 +1596,24 @@ impl Database {
                                     "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn \
                                      FROM {scan_name} WHERE {rows_filter}) WHERE __tf_rn = 1{order_by}"
                                 );
-                                let mut stream = ctx.sql(&sql).await?.execute_stream().await?;
+                                // A window function and a final ORDER BY: two blocking
+                                // operators between the scan and the write loop, so the
+                                // loop's own progress bump cannot see most of the unit.
+                                // See `PlanProgress`.
+                                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                                let _progress = crate::database::maintain::PlanProgress::watch(Arc::clone(&plan));
+                                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
                                 let mut shard_after = 0usize;
                                 let mut decoded_bytes = 0usize;
                                 while let Some(batch) = stream.next().await {
                                     let batch = cast_variant_columns_to_binary(batch?)?;
                                     shard_after = shard_after.saturating_add(batch.num_rows());
+                                    // Dedup was the lane still dying to its deadline while it
+                                    // was working: 8 timeouts in the first 11 minutes after the
+                                    // 2026-09-01 deploy, because nothing on this path reported
+                                    // progress and `run_until_idle` could not tell it apart from
+                                    // a stall.
+                                    crate::database::maintain::note_unit_progress(batch.num_rows());
                                     decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
                                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
