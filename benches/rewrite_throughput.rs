@@ -222,11 +222,7 @@ async fn probe_shards(path: &str, pool_mb: usize, bytes: u64, spill: &std::path:
     println!("\n{:<20} {:>8} {:>12} {:>10}", "probe variant", "secs", "MB/s in", "result");
     for shards in [1usize, 2, 4, 6] {
         let runtime = runtime(pool_mb * 1024 * 1024, spill);
-        let state = datafusion::execution::SessionStateBuilder::new()
-            .with_config(session("8192", 1))
-            .with_runtime_env(runtime)
-            .with_default_features()
-            .build();
+        let state = datafusion::execution::SessionStateBuilder::new().with_config(session("8192", 1)).with_runtime_env(runtime).with_default_features().build();
         let ctx = SessionContext::new_with_state(state);
         if ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.is_err() {
             println!("{:<20} {:>8}", format!("{shards} shard(s)"), "REGISTER-FAILED");
@@ -242,9 +238,7 @@ async fn probe_shards(path: &str, pool_mb: usize, bytes: u64, spill: &std::path:
                 1 => String::new(),
                 _ => format!(" WHERE abs(length(CAST(\"id\" AS VARCHAR))) % {shards} = {shard}"),
             };
-            let sql = format!(
-                "SELECT count(*) FROM (SELECT \"timestamp\", count(*) AS c FROM bin{filter} GROUP BY \"timestamp\", \"id\") AS g WHERE c > 1"
-            );
+            let sql = format!("SELECT count(*) FROM (SELECT \"timestamp\", count(*) AS c FROM bin{filter} GROUP BY \"timestamp\", \"id\") AS g WHERE c > 1");
             match ctx.sql(&sql).await {
                 Ok(df) => {
                     if let Err(error) = df.collect().await {
