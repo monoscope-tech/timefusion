@@ -406,6 +406,24 @@ First ~11 minutes of unit outcomes: BaseRollup 12 Complete, Dedup 7 Complete /
 `processed_bytes_total` is ~19 MB/s against the old build's ~5.8 MB/s — early,
 noisy, and the number to re-read after a quiet window.
 
+### Ground truth, ~45 minutes in: both wedged files are GONE
+
+Compared against the pre-deploy `get_add_actions` snapshot, the live Delta table
+has **retired 122 files / 3.60 GB**, and the two largest are:
+
+```
+2337.8 MB  2026-05-31  __HIVE_DEFAULT_PARTITION__   <- the table's LARGEST file
+1148.2 MB  2026-05-30  87576849                     <- the attempts=100 file
+```
+
+The 2.3 GB one staged in **1,150 s**. Under the old build it had two ways to
+fail and took both: the 900 s deadline killed it outright, and slicing would
+have cut its 28 GB decoded into ~28 full re-reads of an unprunable, uncached
+file. It is now rewritten, sorted, and committed.
+
+Every `maintenance_coordinator_unit_timed_out` in the window is **Dedup**. Zero
+for Repair.
+
 **Dedup still times out at 300 s** (`retry.Dedup.worker_error = 6`). Expected:
 its deadline was not raised and it does not report progress, so the liveness
 clock does not cover it. That is the next lane.
