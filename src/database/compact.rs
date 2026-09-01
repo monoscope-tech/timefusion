@@ -1018,7 +1018,7 @@ impl Database {
              (SELECT \"timestamp\", count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {filter} GROUP BY {keys_csv}) AS g \
              WHERE c > 1 GROUP BY 1 ORDER BY 1"
         );
-        ctx.sql(&probe).await?.collect().await?.into_iter().try_fold(Vec::new(), |mut starts, batch| {
+        crate::database::maintain::collect_watched(ctx, &probe).await?.into_iter().try_fold(Vec::new(), |mut starts, batch| {
             let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
             let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
             starts.extend(col.iter().flatten().filter_map(|value| {
@@ -1084,7 +1084,7 @@ impl Database {
     /// `column(0)` isn't an `Int64Array`; callers layer their own
     /// exactly-one-row / non-negative validation on top where needed.
     async fn scalar_i64(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<Option<i64>> {
-        let batches = ctx.sql(sql).await?.collect().await?;
+        let batches = crate::database::maintain::collect_watched(ctx, sql).await?;
         Ok(batches
             .first()
             .filter(|b| b.num_rows() > 0)
@@ -1321,7 +1321,7 @@ impl Database {
             // 1. Which files hold the chunk's rows — ground truth from the
             // scan itself, no per-file stats parsing.
             let files_sql = format!("SELECT DISTINCT \"{DEDUP_FILE_COL}\" FROM {scan_name} WHERE {chunk_filter}");
-            let file_ids = read_string_column(ctx.sql(&files_sql).await?.collect().await?)?;
+            let file_ids = read_string_column(crate::database::maintain::collect_watched(&ctx, &files_sql).await?)?;
             if file_ids.is_empty() {
                 // Probe saw dupes but this snapshot has no rows for the chunk
                 // (concurrent rewrite) — nothing verified, don't certify clean.
@@ -1641,8 +1641,11 @@ impl Database {
                                 }
                                 (shard_before, shard_after)
                             } else {
-                                let batches: Vec<RecordBatch> =
-                                    ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|batch| drop_batch_column(batch, DEDUP_FILE_COL)).collect();
+                                let batches: Vec<RecordBatch> = crate::database::maintain::collect_watched(ctx, &rows_sql)
+                                    .await?
+                                    .into_iter()
+                                    .map(|batch| drop_batch_column(batch, DEDUP_FILE_COL))
+                                    .collect();
                                 let shard_before = batches.iter().map(RecordBatch::num_rows).sum();
                                 // K is driven entirely by `est_decoded_bytes`, and every 2x of
                                 // over-estimate is a whole extra pass over the data. Neither

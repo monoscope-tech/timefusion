@@ -512,6 +512,49 @@ working — the population the write-loop bump can never see.
 - The night now has three measurement windows, split by the two deploys. Do not
   compare across them without saying which is which.
 
+### Two corrections to numbers I quoted earlier tonight
+
+**1. `processed_bytes_total` is NOT fleet throughput.** It is credited at three
+sites (`maintain.rs:1841, 2951, 3214`) — dedup, rollup, compaction — but with
+each unit's `estimated_decoded_bytes`, and **derived rollups carry a zero
+estimate** (the journal's `est_decoded MB p50` for `derived_rollup` is 0). On
+deploy 2 the counter sat frozen at 11,500,437,856 while **185 units completed**.
+So the "5.8 → 16.1 MB/s" figure is a like-for-like comparison of the same
+counter across builds — real, but it measures the compaction/dedup path, not
+maintenance as a whole. **Use completions per hour for fleet throughput.**
+
+**2. Completions per hour, per lane** (old build over 5h vs deploy 2 over 45m):
+
+| lane | old build | deploy 2 |
+|---|---|---|
+| DerivedRollup | 21/h | **155/h** (7.4x) |
+| BaseRollup | 121/h | 69/h |
+| Dedup | 38/h | 17/h complete, 15/h still timing out |
+| Repair | **0** | 5/h **Complete** (not just requeued) |
+| HotPacking | 3/h | **0 — not claimed at all** |
+
+Repair units now reach `Complete`, which means the partition has no debt left —
+not merely that a bin landed.
+
+### HotPacking, finally attributed
+
+The open item from the baseline (14 completions vs 472 retries) is answered by
+the new retry histogram plus the funnel log, and the answer is that **HotPacking
+is not failing — it is not being claimed.** Zero HotPacking units ran in 45
+minutes with `pending_hot_packing = 17`, and there are no `retry.HotPacking.*`
+rows at all. The funnel says why:
+
+```
+3 operation=HotPacking      refusal="outranked_by:00000000:2026-09-01:00000000:2026-09-01:files=66"
+12 operation=SealedConsolidation refusal="outranked_by:__HIVE_D:2026-05-31:28f62f01:2026-08-29:files=305"
+```
+
+Note the HotPacking line: the most-indebted unclaimed cell is outranked **by
+itself** (same project, same date on both sides). That is a ranking bug, not a
+priority decision, and it is the next thing to chase. SealedConsolidation's
+refusal is honest by contrast — it loses to a May repair cell, which is the
+slot competition that should resolve as the repair backlog drains.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not

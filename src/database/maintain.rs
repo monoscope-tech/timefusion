@@ -245,6 +245,24 @@ mod liveness_clock_tests {
         assert!(progress.load(Relaxed) > 0, "the plan's own row counters must reach the clock the unit is judged by");
     }
 
+    /// `collect()` reports nothing until it returns, so the probe that dominates
+    /// a dedup unit's time has to be watched too — prod 2026-09-01 kept timing
+    /// dedup out at 300 s after the REWRITE was watched, because the units that
+    /// die never reach the rewrite. This pins the substitution's correctness;
+    /// the liveness behaviour itself is `plan_rows_reach_the_liveness_counter`,
+    /// because a query fast enough for a unit test never spans a watcher tick.
+    #[tokio::test]
+    async fn a_watched_collect_returns_what_sql_collect_returns() {
+        use datafusion::prelude::SessionContext;
+        const SQL: &str = "SELECT a, count(*) AS c FROM (SELECT 1 AS a UNION ALL SELECT 1 UNION ALL SELECT 2) GROUP BY a ORDER BY a";
+        let ctx = SessionContext::new();
+        let watched = super::collect_watched(&ctx, SQL).await.expect("watched");
+        let plain = ctx.sql(SQL).await.expect("sql").collect().await.expect("plain");
+        let rows = |batches: &[arrow::array::RecordBatch]| batches.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(rows(&watched), rows(&plain));
+        assert_eq!(format!("{watched:?}"), format!("{plain:?}"), "watching a plan must not change what it returns");
+    }
+
     /// And the watcher must not outlive its guard, or an abandoned unit keeps
     /// reporting progress forever.
     #[tokio::test(start_paused = true)]
@@ -383,6 +401,21 @@ impl Drop for PlanProgress {
             handle.abort();
         }
     }
+}
+
+/// Run `sql` to completion with the unit's liveness clock watching the plan.
+///
+/// Every blocking query in a maintenance unit must go through this, not
+/// `ctx.sql(..).collect()`: a `collect()` reports nothing until it returns, so a
+/// unit spending its whole deadline in an aggregate — the duplicate probe is a
+/// `GROUP BY` over a whole partition, measured at 235 s on a whale — is
+/// indistinguishable from a stalled one. Prod 2026-09-01: dedup kept timing out
+/// at 300 s after the rewrite path was watched, because the units that die
+/// never reach the rewrite.
+pub(crate) async fn collect_watched(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<Vec<arrow::array::RecordBatch>> {
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let _progress = PlanProgress::watch(Arc::clone(&plan));
+    Ok(datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?)
 }
 
 /// Rows every operator in `plan` has produced so far.
