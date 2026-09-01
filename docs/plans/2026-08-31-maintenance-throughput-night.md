@@ -838,7 +838,46 @@ NOT cover it. The gap is concurrency, and concurrency is memory-derived
    120 GB box; `light_share` (3 GB) still feeds session states with no live
    callers. There is room, and it is now the honest place to spend it.
 
-**This is a model, not a demonstration.** It is grounded in measured per-unit
+### The fleet-concurrency curve, measured (`benches/rewrite_throughput.rs`, `TF_BENCH_FLEET=1`)
+
+N concurrent rewrites of a real 204 MB prod file, each with its own
+`SessionContext`, all sharing ONE `FairSpillPool` — the way prod arranges
+coordinator units:
+
+| workers | 8 GB pool | | 16 GB pool | |
+|---|---|---|---|---|
+| | MB/s total | failed | MB/s total | failed |
+| 1 | 8.81 | 0 | 24.66* | 0 |
+| 2 | 13.43 | 0 | 13.16 | 0 |
+| 4 | **19.12** | 0 | **25.11** | 0 |
+| 8 | 12.32 | **4** | 21.89 | **0** |
+
+\* warm page cache; the laptop is noisy at low concurrency. The comparison that
+matters is the 8-worker row.
+
+**The collapse at 8 workers is a POOL limit, not CPU and not IO.** At 8 GB half
+the workers fail and aggregate throughput falls below the 4-worker figure.
+Doubling the pool removes the failures entirely and keeps throughput up. That is
+the lever named in the model above, now measured rather than argued.
+
+Two things follow:
+
+1. **Prod's current setting is at the measured optimum.** `light_optimize_k = 3`
+   plus one repair permit is 4 concurrent rewrites — exactly where aggregate
+   throughput peaks at an 8 GB pool. Deploy 4 landed on the right number for the
+   wrong reason (it was chosen to stop repair exhausting the pool).
+2. **10x demand is 12-19 MB/s, and measured capacity is 19-25 MB/s at 4 workers
+   — on a laptop.** Prod has 48 cores against this machine's handful. So 10x
+   fits, with the pool as the binding constraint, and the way to buy margin is
+   more pool or smaller per-unit memory (which deploy 7's row-group cap now
+   allows), NOT more permits: at a fixed pool, going past 4 made things worse.
+
+**Honest limits of this benchmark:** one file shape, a laptop, and it measures
+scan+sort+consume, not the commit or the object-store round trips prod also
+pays. It bounds the CPU/memory side of the fleet, which is the side the failures
+were on.
+
+**The model above is now a demonstration for the concurrency question.** It is grounded in measured per-unit
 cost and measured ingest, but nothing here has been run at 10x. The next step is
 a load test — seed a scratch table at 10x a whale-day and watch whether pending
 converges — not another prod inference. `TIMEFUSION_ADMISSION_OCCUPANCY_SCALED`

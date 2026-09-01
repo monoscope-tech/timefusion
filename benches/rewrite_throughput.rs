@@ -120,6 +120,11 @@ async fn main() {
         let _ = std::io::stdout().flush();
     };
 
+    if std::env::var("TF_BENCH_FLEET").is_ok() {
+        fleet(&path, pool_mb, bytes, spill.path()).await;
+        return;
+    }
+
     run("scan only".to_owned(), "8192", 1, 1, false).await;
     for batch in ["256", "2048", "8192"] {
         for partitions in [1usize, 8] {
@@ -127,4 +132,61 @@ async fn main() {
         }
     }
     run("PROD: b256 p1 x13 slices".to_owned(), "256", 1, 13, true).await;
+}
+
+/// Does the rewrite fleet SCALE with concurrency, and what pool does 10x demand?
+///
+/// The per-unit numbers above say what one rewrite costs. They do not say what
+/// the fleet can sustain, which is the question 10x actually asks: concurrency
+/// is capped by `light_optimize_k = coordinator_share / PER_SORT_BUDGET_BYTES`,
+/// so the thing to measure is aggregate throughput against pool size and
+/// concurrency — including where it stops scaling and where it starts failing.
+///
+/// Each worker gets its own `SessionContext` over the same file and its own
+/// slice of one SHARED pool, which is how prod is arranged: N coordinator units
+/// on one `FairSpillPool`.
+///
+/// ```bash
+/// TF_BENCH_FLEET=1 TF_BENCH_PARQUET=… TF_BENCH_POOL_MB=8192 cargo bench --bench rewrite_throughput
+/// ```
+async fn fleet(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) {
+    println!(
+        "
+{:<22} {:>8} {:>12} {:>12} {:>9}",
+        "concurrency", "secs", "MB/s total", "MB/s each", "failed"
+    );
+    for workers in [1usize, 2, 4, 8] {
+        // ONE pool for all of them, sized as prod sizes the coordinator's.
+        let shared = runtime(pool_mb * 1024 * 1024, spill);
+        let started = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..workers {
+            let (path, runtime) = (path.to_owned(), Arc::clone(&shared));
+            set.spawn(async move { one_rewrite(&path, runtime).await });
+        }
+        let mut failed = 0usize;
+        while let Some(result) = set.join_next().await {
+            if !matches!(result, Ok(Ok(()))) {
+                failed += 1;
+            }
+        }
+        let secs = started.elapsed().as_secs_f64();
+        let moved = bytes as f64 / 1e6 * (workers - failed) as f64;
+        println!("{:<22} {secs:>8.1} {:>12.2} {:>12.2} {failed:>9}", format!("{workers} workers"), moved / secs, moved / secs / workers as f64);
+    }
+}
+
+/// One unit's worth of work: the same scan+sort+consume the staging loop drives.
+async fn one_rewrite(path: &str, runtime: Arc<RuntimeEnv>) -> Result<(), String> {
+    use datafusion::execution::SessionStateBuilder;
+    // 2048 rows is what `batch_rows_for` picks for an ordinary otel row at the
+    // 8 MB target; the whale's wide rows land lower, which is the point of it.
+    let state = SessionStateBuilder::new().with_config(session("2048", 1)).with_runtime_env(runtime).with_default_features().build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.map_err(|e| e.to_string())?;
+    let mut stream = ctx.sql(&format!("SELECT * FROM bin{ORDER_BY}")).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;
+    while let Some(batch) = stream.next().await {
+        batch.map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
