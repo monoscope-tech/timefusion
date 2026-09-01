@@ -1048,6 +1048,45 @@ flipped it under load. Shipping it into a busy system found both defects in five
 minutes, at the cost of ~40 minutes of degraded maintenance on a backlog that
 was already draining.
 
+## The clean measurement: 25 minutes, one process, deploy 11
+
+The first uninterrupted same-process window of the night (every earlier attempt
+was cut by a deploy or read frozen gauges):
+
+| lane | pending | slope |
+|---|---|---|
+| dedup | 2,935 → 2,810 | **−5.00/min** |
+| base_rollup | 401 → 367 | −1.36/min |
+| derived_rollup | 41 → 36 | −0.20/min |
+| hot_packing | 19 → 14 | −0.20/min |
+| repair | 362 → 362 | flat |
+| sealed_consolidation | 188 → 192 | **+0.16/min** |
+
+Retries per minute — the admission storm is fully gone (it peaked at ~7,000/min):
+
+```
+BaseRollup.resource_admission          +7.2/min
+Dedup.resource_admission               +4.3/min
+Repair.compaction_incomplete           +4.2/min
+HotPacking.compaction_debt_remaining   +3.2/min   (success requeue)
+Dedup.worker_error                     +1.7/min
+BaseRollup.worker_error                +1.2/min
+```
+
+**Four of six lanes draining, one flat, one slightly growing.** The honest
+reading:
+
+- **Dedup at −5/min** clears its remaining 2,810 in ~9 hours. Wall-clock.
+- **Repair flat at 362** is expected, not stuck: its remaining units are the slow
+  whole-file rewrites, deliberately serialised on one permit so they cannot
+  exhaust the pool. Faster needs the row-group fix to shrink what a repair unit
+  holds, then more repair concurrency.
+- **SealedConsolidation +0.16/min is the one lane still losing**, slowly. It is
+  the lane with a single permit shared with HotPacking and the lowest cycle
+  weight. First candidate for the per-class pool work.
+- `charged_pct` 30 → 63 over the window. Well under the brake, but the only
+  number here trending the wrong way; worth a look if it keeps climbing.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
