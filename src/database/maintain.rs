@@ -246,41 +246,43 @@ mod liveness_clock_tests {
     }
 
     /// The pruning instrument is only worth reading if its metric NAMES are the
-    /// ones DataFusion publishes. A rename would make every scan report
+    /// ones DataFusion publishes — a rename would make every scan report
     /// "nothing pruned", which is indistinguishable from the finding it exists
-    /// to detect — so pin the names against a real parquet scan.
+    /// to detect. So pin them against a real two-file parquet scan.
     #[tokio::test]
     async fn the_pruning_metric_names_are_the_ones_datafusion_publishes() {
+        use arrow::array::Int64Array;
         use datafusion::prelude::{ParquetReadOptions, SessionContext};
         let dir = tempfile::tempdir().expect("tempdir");
-        let ctx = SessionContext::new();
-        // Two files, disjoint on `a` — the same shape as a dedup probe pointed at
-        // a partition whose files are time-disjoint, which is the case the log
-        // has to be able to distinguish.
-        for (name, range) in [("a.parquet", (1, 500)), ("b.parquet", (1000, 1500))] {
-            ctx.sql(&format!("COPY (SELECT * FROM generate_series({}, {}) AS t(a)) TO '{}'", range.0, range.1, dir.path().join(name).display()))
-                .await
-                .expect("copy")
-                .collect()
-                .await
-                .expect("write");
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false)]));
+        // Two files, disjoint on `a` — the shape of a dedup probe pointed at a
+        // partition whose files are time-disjoint.
+        for (name, lo) in [("a.parquet", 1i64), ("b.parquet", 1000)] {
+            let batch =
+                arrow::array::RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from((lo..lo + 500).collect::<Vec<_>>()))]).expect("batch");
+            let file = std::fs::File::create(dir.path().join(name)).expect("create");
+            let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
         }
+        let ctx = SessionContext::new();
         ctx.register_parquet("t", dir.path().to_str().expect("utf8"), ParquetReadOptions::default()).await.expect("register");
-        let scanned = async |sql: &str| {
+        async fn scanned(ctx: &SessionContext, sql: &str) -> (u64, u64) {
             let plan = ctx.sql(sql).await.expect("sql").create_physical_plan().await.expect("physical");
             datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("collect");
             (super::plan_metric_sum(plan.as_ref(), "bytes_scanned"), super::plan_metric_sum(plan.as_ref(), "files_processed"))
-        };
-        let (whole, whole_files) = scanned("SELECT sum(a) FROM t").await;
-        let (sliced, sliced_files) = scanned("SELECT sum(a) FROM t WHERE a < 100").await;
+        }
+        let (whole, whole_files) = scanned(&ctx, "SELECT sum(a) FROM t").await;
+        let (sliced, sliced_files) = scanned(&ctx, "SELECT sum(a) FROM t WHERE a < 100").await;
         // The disjoint file is dropped during PLANNING, so it never reaches a
         // `*_pruned_*` counter — the cost shows up here or nowhere.
         assert!(whole > 0 && sliced > 0, "the cost metric must be populated, got {whole} and {sliced}");
         assert!(sliced < whole, "a predicate excluding one of two files must scan fewer bytes: {sliced} vs {whole}");
-        // And the trap: `files_processed` is reported PER PARTITION, so summing
-        // it over the tree grows with repartitioning — the narrower scan reports
-        // MORE. Only `bytes_scanned` survives being summed.
-        assert!(sliced_files > whole_files, "files_processed is per-partition and must not be used as a cost: {sliced_files} vs {whole_files}");
+        // And the trap: `files_processed` is reported PER PARTITION, so summed
+        // over the tree it never falls when a scan narrows — it reported 10
+        // against the full scan's 2 on a ten-partition fixture. Only
+        // `bytes_scanned` survives being summed.
+        assert!(sliced_files >= whole_files, "files_processed is per-partition and must not be read as a cost: {sliced_files} vs {whole_files}");
     }
 
     /// `collect()` reports nothing until it returns, so the probe that dominates
@@ -363,6 +365,15 @@ mod batch_rows_tests {
         // No rows measured (missing statistics) is not a licence to guess big.
         assert_eq!(batch_rows_for(1_000_000_000, 0, TARGET), 256, "an unmeasurable bin keeps the old constant");
     }
+}
+
+/// How long a unit waits after the pool turned it away for being busy.
+///
+/// Backs off without splitting: the unit is the right size, the pool simply had
+/// no room this instant. Capped so a lane cannot go quiet for long once the
+/// pool drains.
+fn admission_backoff(attempts: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64 << attempts.min(6))
 }
 
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
@@ -1895,7 +1906,19 @@ impl Database {
         // if the request is honest.
         let request = Resources { cpu: 1, decoded_bytes: estimated_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
-            retry("resource_admission".to_owned(), std::time::Duration::from_secs(1))?;
+            // TRANSIENT, and deliberately not `resource_admission`. That reason
+            // is a capacity failure, which means `retry_or_split` SPLITS the
+            // unit — correct when admission's ceiling was a static
+            // `MAX_DECODED_BYTES` ("the estimate exceeds what admission can ever
+            // grant"), and wrong now that the ceiling scales with pool
+            // occupancy. The request is clamped to `MAX_DECODED_BYTES`, so a
+            // refusal can only mean "the pool is busy right now".
+            //
+            // Splitting on it multiplied the queue instead of shedding work:
+            // prod 2026-09-01 logged 230,015 `resource_admission` retries in 33
+            // minutes with `pending_dedup` climbing 2,857 -> 3,533, because each
+            // refusal split a unit into shards that were each refused in turn.
+            self.retry_task(&key, "admission_busy".to_owned(), admission_backoff(task.attempts))?;
             return Ok(true);
         };
         let probe_hash_shards = usize::try_from(estimated_bytes.div_ceil(MAX_DECODED_BYTES).clamp(1, DEDUP_BUCKET_COUNT)).unwrap_or(1);
@@ -3221,7 +3244,8 @@ impl Database {
         // occupancy-scaled ceiling refuses everything on a busy pool.
         let request = Resources { cpu: 1, decoded_bytes: task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
-            retry("resource_admission".to_owned(), 1)?;
+            // Transient — see the dedup site.
+            self.retry_task(&key, "admission_busy".to_owned(), admission_backoff(task.attempts))?;
             return Ok(true);
         };
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
