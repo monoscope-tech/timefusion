@@ -45,23 +45,52 @@ pub fn maintenance_retry_reason() -> String {
 /// so the fleet-level histogram was the only thing missing.
 static MAINTENANCE_RETRIES: OnceLock<dashmap::DashMap<String, AtomicU64>> = OnceLock::new();
 
-/// Bounded on purpose: a reason can carry error text (`"dedup: Not enough
-/// memory ..."`), so the key is its head and the map stops accepting new keys
-/// once it is full rather than growing with distinct error strings.
-pub fn count_maintenance_retry(operation: &str, reason: &str) {
-    const MAX_REASONS: usize = 128;
-    let head = reason.split([':', '(']).next().unwrap_or(reason).trim();
-    let map = MAINTENANCE_RETRIES.get_or_init(dashmap::DashMap::new);
-    let key = format!("{operation}.{head}");
+/// Work actually done per `(operation, metric)` — the counterpart to the retry
+/// histogram above, and the metric deploy 12 could not be judged on.
+///
+/// Comparing deploy 11 to 12 on 2026-09-01 meant comparing UNIT counts, which
+/// said the queue drained 2.7x faster before the fix. It had not: 249 of
+/// deploy 11's 288 "finishes" were zero-second claim-and-refuse cycles. Units
+/// per minute measures churn as readily as work, so the fleet needs a rate
+/// whose numerator is work (`rows_dropped`) and whose denominator is capacity
+/// (`worker_secs`).
+static MAINTENANCE_WORK: OnceLock<dashmap::DashMap<String, AtomicU64>> = OnceLock::new();
+
+/// Bounded on purpose: a retry reason can carry error text (`"dedup: Not enough
+/// memory ..."`), so the map stops accepting new keys once it is full rather
+/// than growing with distinct error strings.
+fn add_bounded(map: &OnceLock<dashmap::DashMap<String, AtomicU64>>, key: String, amount: u64) {
+    const MAX_KEYS: usize = 128;
+    let map = map.get_or_init(dashmap::DashMap::new);
     if let Some(count) = map.get(&key) {
-        count.fetch_add(1, Relaxed);
-    } else if map.len() < MAX_REASONS {
-        map.entry(key).or_default().fetch_add(1, Relaxed);
+        count.fetch_add(amount, Relaxed);
+    } else if map.len() < MAX_KEYS {
+        map.entry(key).or_default().fetch_add(amount, Relaxed);
     }
 }
 
+fn counter_rows(map: &OnceLock<dashmap::DashMap<String, AtomicU64>>, prefix: &str) -> Vec<(String, u64)> {
+    map.get().map(|map| map.iter().map(|entry| (format!("{prefix}.{}", entry.key()), entry.value().load(Relaxed))).collect()).unwrap_or_default()
+}
+
+pub fn count_maintenance_retry(operation: &str, reason: &str) {
+    add_bounded(&MAINTENANCE_RETRIES, format!("{operation}.{}", reason.split([':', '(']).next().unwrap_or(reason).trim()), 1);
+}
+
+/// `rows_dropped` is exact and post-commit; `worker_secs`/`killed_secs` are wall
+/// time a worker held for this operation. `progress_rows` is the liveness
+/// counter's tally — summed over every operator in the plan tree, so it is a
+/// same-shape trend proxy, NOT a count of rows of work.
+pub fn count_maintenance_work(operation: &str, metric: &str, amount: u64) {
+    add_bounded(&MAINTENANCE_WORK, format!("{operation}.{metric}"), amount);
+}
+
 pub fn maintenance_retry_rows() -> Vec<(String, u64)> {
-    MAINTENANCE_RETRIES.get().map(|map| map.iter().map(|entry| (format!("retry.{}", entry.key()), entry.value().load(Relaxed))).collect()).unwrap_or_default()
+    counter_rows(&MAINTENANCE_RETRIES, "retry")
+}
+
+pub fn maintenance_work_rows() -> Vec<(String, u64)> {
+    counter_rows(&MAINTENANCE_WORK, "work")
 }
 
 use opentelemetry::{
@@ -1602,6 +1631,20 @@ mod tests {
     };
 
     use super::*;
+
+    /// The two maps share one bounded adder, so a key collision between them
+    /// would silently mix retry counts into work counts.
+    #[test]
+    fn work_and_retry_counters_accumulate_under_their_own_prefixes() {
+        count_maintenance_work("Dedup", "rows_dropped", 7);
+        count_maintenance_work("Dedup", "rows_dropped", 5);
+        count_maintenance_retry("Dedup", "worker_error: out of memory (pool)");
+        let work = maintenance_work_rows();
+        assert!(work.contains(&("work.Dedup.rows_dropped".to_owned(), 12)), "amounts must SUM, not count events: {work:?}");
+        // The retry key is the reason's head, and lives in the other map.
+        assert!(maintenance_retry_rows().contains(&("retry.Dedup.worker_error".to_owned(), 1)));
+        assert!(work.iter().all(|(key, _)| !key.starts_with("work.Dedup.worker_error")), "a retry must not land in the work map: {work:?}");
+    }
 
     /// Regression guard for the 2026-07-06 OOM: a cell holding a huge value
     /// (like an INSERT…unnest bind array) must preview as a bounded prefix,

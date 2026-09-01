@@ -3432,6 +3432,11 @@ impl Database {
             let completed = match run_until_idle(timeout, Arc::clone(&progress), work).await {
                 Ok(result) => {
                     let elapsed = started.elapsed();
+                    // Before `result?`: a unit that errors after 800s spent that
+                    // capacity just as surely as one that succeeded.
+                    let op = format!("{operation:?}");
+                    crate::observability::count_maintenance_work(&op, "worker_secs", elapsed.as_secs());
+                    crate::observability::count_maintenance_work(&op, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
                     // Only the slow tail: a unit finishing well inside its
                     // deadline says nothing, and this runs on every claim.
                     if elapsed.as_secs_f64() > timeout.as_secs_f64() / 4.0 {
@@ -3451,6 +3456,12 @@ impl Database {
                     // claimed unit is durably requeued and all resource tokens
                     // are released before another project gets a turn.
                     warn!(?operation, timeout_seconds = timeout.as_secs(), event = "maintenance_coordinator_unit_timed_out");
+                    // `killed_secs` is a strict subset of `worker_secs`: the
+                    // share of the fleet's capacity that produced nothing.
+                    let op = format!("{operation:?}");
+                    crate::observability::count_maintenance_work(&op, "worker_secs", started.elapsed().as_secs());
+                    crate::observability::count_maintenance_work(&op, "killed_secs", started.elapsed().as_secs());
+                    crate::observability::count_maintenance_work(&op, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
                     return Ok(true);
                 }
             };

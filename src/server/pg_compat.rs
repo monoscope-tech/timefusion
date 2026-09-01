@@ -974,6 +974,7 @@ impl StatsTableProvider {
         // process has actually seen, rather than a hand-kept list that a new
         // reason silently misses.
         maintenance.extend(crate::observability::maintenance_retry_rows().into_iter().map(|(key, value)| ("maintenance", key, value.to_string())));
+        maintenance.extend(crate::observability::maintenance_work_rows().into_iter().map(|(key, value)| ("maintenance", key, value.to_string())));
 
         let plan_cache = crate::read::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();

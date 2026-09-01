@@ -942,6 +942,11 @@ impl Database {
         let markers = vec![format!("date={date}/")];
         let result = self.commit_wave(table_ref, table_name, &markers, true, units, 0).await;
         let dropped = wave_dropped_rows(&result.landed);
+        // Landed-only, so this counts committed duplicates and nothing else —
+        // and it is recorded here rather than at the coordinator because the
+        // incomplete branch there discards `dropped` while its bins are already
+        // committed work.
+        crate::observability::count_maintenance_work("Dedup", "rows_dropped", dropped);
         for bin in &result.landed {
             if let Some(d) = &bin.dedup {
                 info!("dedup rewrite: table={} chunk=[{}] dropped={} (before={} after={})", table_name, d.label, d.dropped(), d.before, d.after);
