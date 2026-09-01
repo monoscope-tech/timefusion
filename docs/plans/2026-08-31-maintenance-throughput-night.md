@@ -623,6 +623,68 @@ another guess: the question to answer first is whether the timing-out units are
 a small set of very large partitions (in which case unit sizing is the lever) or
 a broad tail (in which case per-unit cost is).
 
+## Dedup answered: a broad tail of slivers, each paying a WHOLE-PARTITION scan
+
+The question I posed — "a few very large partitions, or a broad tail?" — has a
+third answer, and it is the same defect as Repair's.
+
+Journal, 5,028 active dedup units:
+
+| slice width | units |
+|---|---|
+| 10 min | 1,717 |
+| **1 min** | **1,542** |
+| 1 day | 569 |
+| 5 min | 423 |
+| 11 min | 288 |
+| 3 min | 115 |
+
+**~4,000 of 5,028 are sub-15-minute slivers.** And their input footprints:
+**p50 = 10 files, p90 = 76, max = 433.** A one-minute slice reading 76 files is
+reading the whole partition, not the minute.
+
+The prod log agrees. Every timed-out dedup unit in a 25-minute window:
+
+```
+project=98fdd4f3  slice=…300000000  ran_secs=299  input_files=1
+project=be87ebc1  slice=…300000000  ran_secs=299  input_files=1
+project=87576849  slice=…280000000  ran_secs=599  input_files=6
+project=2a39bd83  slice=…600000000  ran_secs=299  input_files=1
+```
+
+A unit over **one file** burning 300 s is not a data-volume problem. And note
+the two at `ran_secs=599/600` — those got a **second** idle window, which is the
+new liveness clock working: they were making progress, so they were not killed
+at 300 s.
+
+**The cost of a dedup unit is its PARTITION, not its slice.** `dedup_probe_ctx`
+builds its provider over `dedup_partition_paths(project, date)` — every file of
+the day — and then filters by slice. On the live frontier those files overlap in
+time, so nothing prunes: a 1-minute unit scans the day. With ~288 slivers per
+project-day that is quadratic.
+
+**This is exactly the Repair defect, in a second lane.** `split_time_task`'s own
+comment already says it: "a slice reads at least one row group of every file it
+still overlaps, so below some width the cost stops falling and only the model
+keeps shrinking." Repair now declines to bisect for that reason. Dedup does not,
+and the earlier journal showed **3,602 units superseded by
+`split_into_smaller_slices`** — the machine that manufactured these 4,000
+slivers. Each failure bisects, each child costs what the parent cost, and the
+queue grows without the work shrinking.
+
+**The fix, in order:** (1) stop bisecting dedup below the width where cost stops
+falling — the same decline Repair got, gated on the measured footprint rather
+than the modelled one; (2) coarsen the existing sliver debris back up
+(`coarsen_to_width_reporting` already exists and already handles Dedup, so the
+question is why it is not collapsing these — `is_live_frontier` excludes today,
+which is right for freshness but is where 1,984 of the slivers are); (3) only
+then look at per-unit cost.
+
+Not attempted tonight: it is a scheduling-policy change to the lane with the
+largest queue, at the end of a night that already shipped four deploys, and it
+deserves the same failing-test-first treatment the others got rather than a
+5 a.m. guess.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
