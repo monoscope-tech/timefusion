@@ -1542,14 +1542,42 @@ impl TaskJournal {
         // so that is a sound ceiling on any price however it was computed. It
         // only ever removes double-counting — it never argues a big partition is
         // small.
-        for ((_table, source, project_id, _op, bucket), price) in groups.iter_mut() {
+        let mut priced_by_partition: HashSet<(String, String, String, Operation, i64)> = HashSet::new();
+        for ((table, source, project_id, op, bucket), price) in groups.iter_mut() {
             let Some(date) = chrono::DateTime::from_timestamp_micros(*bucket).map(|time| time.date_naive().to_string()) else { continue };
             if let Some(ceiling) = partition_bytes(project_id, source, &date) {
                 price.cap_at(ceiling);
+                // Dedup ONLY. The argument below applies to any partition-scoped
+                // cost, but the escape hatch does not: a fused over-budget unit
+                // is only safe where the runner honours `hash_shard`, and dedup
+                // is the path where it demonstrably does (`dedup_shard_count`
+                // and the probe's `hash_bucket` filter). Widening this to the
+                // rollup lanes needs that check first.
+                if *op == Operation::Dedup {
+                    priced_by_partition.insert((table.clone(), source.clone(), project_id.clone(), *op, *bucket));
+                }
             }
         }
         groups.retain(|group, price| {
-            let fits = price.bytes() <= MAX_DECODED_BYTES;
+            // A group priced against its PARTITION may exceed the decode budget
+            // and still be worth fusing, because its members do not avoid that
+            // cost by staying apart — they each pay it. A dedup or rollup slice
+            // reads at least one row group of every file it overlaps, and on a
+            // sealed partition the files span the day, so 144 ten-minute units
+            // are 144 scans of exactly what one day-wide unit would scan once.
+            //
+            // Refusing on `MAX_DECODED_BYTES` therefore preserved the shape it
+            // was meant to prevent. Prod 2026-09-01, every coarsening pass:
+            // `candidates=7452 fused=0 over_budget=6967` — the queue's ~4,000
+            // sub-15-minute dedup slivers were re-evaluated and re-refused every
+            // 60 seconds while `pending_dedup` sat at 5,000.
+            //
+            // The budget is enforced where it can still be honoured: the claim's
+            // preflight measures the fused unit and `byte_bounded_units` shards
+            // it BY KEY, which is k scans instead of 144. Without a partition
+            // ceiling (no storage access — every unit test) the old rule stands,
+            // because then the price really is a sum over possibly-disjoint files.
+            let fits = price.bytes() <= MAX_DECODED_BYTES || priced_by_partition.contains(group);
             report.priced_by_footprint += usize::from(fits && price.summed_bytes > MAX_DECODED_BYTES);
             if !fits {
                 report.over_budget += members.get(group).copied().unwrap_or(0);
@@ -6424,6 +6452,46 @@ mod tests {
         assert_eq!(fresh.reset_repair_attempts(), None, "nothing to forgive, nothing spent");
         fresh.upsert(task("p", 0, DAY_MICROS, Operation::Repair));
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
+    }
+
+    /// Fusion must not refuse a group priced against its PARTITION just because
+    /// the partition is bigger than one unit's decode budget: the members do not
+    /// avoid that cost by staying apart, they each pay it. Prod 2026-09-01, every
+    /// coarsening pass: `candidates=7452 fused=0 over_budget=6967`.
+    #[test]
+    fn a_partition_priced_group_fuses_even_when_the_partition_is_large() {
+        const DAY: i64 = 86_400_000_000;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // A day shredded into ten-minute slices, each modelled at a fraction of
+        // a partition that is far bigger than MAX_DECODED_BYTES.
+        for slot in 0..24 {
+            let start = DAY + slot * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::Dedup).key, 0, MAX_DECODED_BYTES / 2, 0);
+        }
+        let big_partition = MAX_DECODED_BYTES * 20;
+
+        // The exemption is dedup's alone until the rollup runner is shown to
+        // honour `hash_shard` — see `the_partition_ceiling_does_not_fuse_a_genuinely_oversized_day`.
+        let mut rollup = TaskJournal::load(tempfile::tempdir().expect("dir").path()).expect("journal");
+        for slot in 0..24 {
+            let start = DAY + slot * NORMAL_SLICE_MICROS;
+            rollup.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, MAX_DECODED_BYTES / 2, 0);
+        }
+        assert_eq!(rollup.coarsen_sealed_slices_capped(10 * DAY, &|_, _, _| Some(big_partition)).fused, 0, "rollup keeps the old rule");
+
+        // Without storage access the old rule stands — the price is a sum over
+        // files that might not overlap.
+        let mut blind = TaskJournal::load(tempfile::tempdir().expect("dir").path()).expect("journal");
+        for slot in 0..24 {
+            let start = DAY + slot * NORMAL_SLICE_MICROS;
+            blind.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::Dedup).key, 0, MAX_DECODED_BYTES / 2, 0);
+        }
+        assert_eq!(blind.coarsen_sealed_slices_capped(10 * DAY, &|_, _, _| None).fused, 0, "a sum over unknown files must still be refused");
+
+        let report = journal.coarsen_sealed_slices_capped(10 * DAY, &|_, _, _| Some(big_partition));
+        assert!(report.fused > 0, "a group known to share one partition must fuse: {report:?}");
+        assert_eq!(report.over_budget, 0, "and must not be counted against the decode budget it cannot honour");
     }
 
     /// Bisecting a dedup unit below the width where it stops shedding FILES
