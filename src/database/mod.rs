@@ -2748,6 +2748,13 @@ pub struct Database {
     /// long dedup drain can't starve hot compaction (disjoint partitions, so
     /// serializing them is pure loss). Sized to the light pool's own K.
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// ONE concurrent repair rewrite. A repair bin is a whole file — prod's
+    /// worst is 2.3 GB compressed, ~28 GB decoded — so two of them on the same
+    /// coordinator pool is the `Not enough memory to continue external sort`
+    /// that appeared the moment the liveness clock let them live long enough to
+    /// overlap (prod 2026-09-01). Hygiene bins keep `light_rewrite_sem`: they
+    /// are small, many, and the thing that must not be starved.
+    repair_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Caps coordinator workers in debt work (dedup, packing, consolidation,
     /// repair), reserving the rest for rollup. Bounds occupancy, not memory:
     /// debt units hold a worker for minutes and would otherwise starve cheap
@@ -3469,6 +3476,7 @@ impl Database {
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
+            repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             // Three quarters to debt: a quarter always free for the rollup
             // chain, but not less — ungoverned file counts are their own outage.
             maintenance_debt_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs * 3 / 4).max(1))),
@@ -19503,6 +19511,20 @@ mod tests {
 
     /// Dedup yields to persistence: an unhealthy flush path skips the pass
     /// whole, leaving the queue intact for a later tick.
+    /// Repair must not queue on the hygiene permits, and must not run two at
+    /// once. Prod 2026-09-01: as soon as the liveness clock let repair units
+    /// live tens of minutes, they overlapped each other and the hygiene bins on
+    /// one 8 GB pool and staging failed with `Not enough memory to continue
+    /// external sort`.
+    #[tokio::test]
+    async fn repair_serialises_on_its_own_permit() -> Result<()> {
+        let cfg = create_test_config(&format!("repair-permit-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        assert_eq!(db.repair_rewrite_sem.available_permits(), 1, "two whole-file rewrites at once is a pool exhaustion");
+        assert!(db.light_rewrite_sem.available_permits() >= 1, "and repair must not spend a hygiene permit it would then starve");
+        Ok(())
+    }
+
     #[serial]
     #[tokio::test]
     async fn dirty_dedup_drain_yields_to_unhealthy_flush() -> Result<()> {

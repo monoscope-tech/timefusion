@@ -6289,6 +6289,12 @@ impl Database {
         let permit_wait = std::time::Instant::now();
         let _light_permit = match light_permit {
             Some(permit) => permit,
+            // Repair queues on its OWN one-permit semaphore: its bins are whole
+            // files, so two at once is a pool exhaustion, and it must not spend
+            // one of the hygiene permits it would then starve.
+            None if pass == TailPass::Repair => {
+                Arc::clone(&self.repair_rewrite_sem).acquire_owned().await.map_err(|e| anyhow::anyhow!("repair rewrite semaphore closed: {e}"))?
+            }
             None => Arc::clone(&self.light_rewrite_sem).acquire_owned().await.map_err(|e| anyhow::anyhow!("light rewrite semaphore closed: {e}"))?,
         };
         let permit_wait_ms = permit_wait.elapsed().as_millis() as u64;
