@@ -1602,6 +1602,12 @@ impl Database {
                                 while let Some(batch) = stream.next().await {
                                     let batch = cast_variant_columns_to_binary(batch?)?;
                                     shard_after = shard_after.saturating_add(batch.num_rows());
+                                    // Dedup was the lane still dying to its deadline while it
+                                    // was working: 8 timeouts in the first 11 minutes after the
+                                    // 2026-09-01 deploy, because nothing on this path reported
+                                    // progress and `run_until_idle` could not tell it apart from
+                                    // a stall.
+                                    crate::database::maintain::note_unit_progress(batch.num_rows());
                                     decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
                                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;

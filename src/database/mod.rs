@@ -6408,10 +6408,6 @@ struct HotStageOptions {
     /// `docs/plans/2026-08-25-the-900s-is-a-queue-not-a-rewrite.md`. Ownership
     /// is moved in so "the caller holds it" cannot be asserted falsely.
     light_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    /// Rows written so far, for the caller's liveness clock — see
-    /// [`crate::database::maintain`]'s `run_until_idle`. `None` for callers that
-    /// spend a tick budget rather than a deadline.
-    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 struct CompactionDebtFile {
@@ -17753,7 +17749,7 @@ mod tests {
         // Every light-rewrite permit taken, exactly as prod's steady state.
         let held = Arc::clone(&db.light_rewrite_sem).acquire_many_owned(db.light_rewrite_sem.available_permits() as u32).await?;
 
-        let claimed = db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?;
+        let claimed = db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?;
         let (state, attempts) = {
             let journal = db.maintenance_tasks.lock().unwrap();
             (journal.state(&key), journal.tasks().find(|task| task.key == key).map(|task| task.attempts))
@@ -17764,10 +17760,7 @@ mod tests {
 
         // And with a permit free, the same turn does claim it.
         drop(held);
-        assert!(
-            db.run_coordinator_compaction_once(Operation::SealedConsolidation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?,
-            "the refusal must be the permit, not the queue being empty"
-        );
+        assert!(db.run_coordinator_compaction_once(Operation::SealedConsolidation).await?, "the refusal must be the permit, not the queue being empty");
         Ok(())
     }
 

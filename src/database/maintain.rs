@@ -201,6 +201,29 @@ mod liveness_clock_tests {
         assert_eq!(result.ok(), Some("committed"), "100s of steady progress must survive a 30s idle window");
     }
 
+    /// The reporting side, on the path that has no parameter to thread: a write
+    /// loop deep inside the unit keeps the clock alive through `note_unit_progress`.
+    #[tokio::test(start_paused = true)]
+    async fn a_deep_write_loop_keeps_its_unit_alive() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let work = async {
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                // Four calls deep in the real thing; the point is that it needs
+                // no handle.
+                super::note_unit_progress(1_000);
+            }
+            "committed"
+        };
+        assert_eq!(super::run_until_idle(std::time::Duration::from_secs(30), Arc::clone(&progress), work).await.ok(), Some("committed"));
+        assert_eq!(progress.load(Relaxed), 5_000, "the task-local reached the counter the clock reads");
+    }
+
+    #[test]
+    fn note_unit_progress_outside_a_unit_is_a_no_op() {
+        super::note_unit_progress(1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn work_that_writes_nothing_is_given_up_on() {
         let progress = Arc::new(AtomicU64::new(0));
@@ -253,6 +276,24 @@ pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
 }
 
+tokio::task_local! {
+    /// Rows the maintenance unit running on this task has written.
+    ///
+    /// A task-local rather than a parameter because the thing that must report
+    /// progress — the innermost write loop — is four calls below the thing that
+    /// measures it, on three different paths (compaction staging, dedup shard
+    /// rewrites, rollup publication). Threading an `Arc` through all of them
+    /// meant a signature change per path and, for dedup, dropping `Copy` from
+    /// `DedupExecutionLimits`.
+    static UNIT_PROGRESS: Arc<std::sync::atomic::AtomicU64>;
+}
+
+/// Report that the current maintenance unit wrote `rows`. A no-op outside a
+/// unit, which is what the cron paths and tests want.
+pub(crate) fn note_unit_progress(rows: usize) {
+    let _ = UNIT_PROGRESS.try_with(|progress| progress.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed));
+}
+
 /// Run `work`, giving up only after `idle` passes with **no progress**.
 ///
 /// A wall clock on a maintenance unit is a LIVENESS check, not a budget. Killing
@@ -275,7 +316,7 @@ async fn run_until_idle<T>(
     // dispatch future and this frame sits inside an already-deep async stack:
     // holding it inline overflowed the worker stack in a debug build
     // (`a_partly_covered_window_unions_the_rollup_with_raw...`, SIGABRT).
-    let mut work = Box::pin(work);
+    let mut work = Box::pin(UNIT_PROGRESS.scope(Arc::clone(&progress), work));
     let mut last = progress.load(Relaxed);
     loop {
         match tokio::time::timeout(idle, &mut work).await {
@@ -1781,7 +1822,7 @@ impl Database {
                 self.run_coordinator_rollup_once(operation).await?;
             }
             _ => {
-                self.run_coordinator_compaction_once(operation, Arc::new(std::sync::atomic::AtomicU64::new(0))).await?;
+                self.run_coordinator_compaction_once(operation).await?;
             }
         }
         let wall = started.elapsed();
@@ -2903,9 +2944,7 @@ impl Database {
         Ok(selected)
     }
 
-    pub(crate) async fn run_coordinator_compaction_once(
-        &self, operation: crate::maintenance_coordinator::Operation, progress: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Result<bool> {
+    pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
         // The rewrite permit BEFORE the claim, never inside `stage_hot_bin`.
         //
@@ -3024,14 +3063,7 @@ impl Database {
         }
         let runtime = self.coordinator_runtime_env();
         let outcome = self
-            .stage_hot_bin(
-                &table_ref,
-                &key.source,
-                schema,
-                &key.project_id,
-                files,
-                HotStageOptions { pass, runtime_env: Some(runtime), light_permit, progress: Some(progress) },
-            )
+            .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
             .await;
         let completed = match outcome {
             Ok(BinOutcome::Staged(unit)) => {
@@ -3229,9 +3261,7 @@ impl Database {
                 match operation {
                     Operation::Dedup => self.run_coordinator_dedup_once().await,
                     Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await,
-                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => {
-                        self.run_coordinator_compaction_once(operation, Arc::clone(&progress)).await
-                    }
+                    Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await,
                 }
             };
             // A unit's DURATION is the number every deadline decision needs and
@@ -5749,14 +5779,7 @@ impl Database {
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
         match self
-            .stage_hot_bin(
-                table_ref,
-                table_name,
-                schema,
-                &project_id,
-                files.clone(),
-                HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None },
-            )
+            .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None })
             .await?
         {
             BinOutcome::Staged(_) => Ok(Some((project_id, files))),
@@ -6014,14 +6037,7 @@ impl Database {
                     let _in_flight = (pass == TailPass::Repair).then(|| in_flight_guard(&crate::observability::maintenance_stats().repair_bins_in_flight));
                     let staged = match tokio::time::timeout(
                         left,
-                        self.stage_hot_bin(
-                            table_ref,
-                            table_name,
-                            schema,
-                            &project_id,
-                            files,
-                            HotStageOptions { pass, runtime_env: None, light_permit: None, progress: None },
-                        ),
+                        self.stage_hot_bin(table_ref, table_name, schema, &project_id, files, HotStageOptions { pass, runtime_env: None, light_permit: None }),
                     )
                     .await
                     {
@@ -6095,7 +6111,7 @@ impl Database {
         options: HotStageOptions,
     ) -> Result<BinOutcome<StagedBin>> {
         use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
-        let HotStageOptions { pass, runtime_env, light_permit, progress } = options;
+        let HotStageOptions { pass, runtime_env, light_permit } = options;
         // One read-lock, one table clone per bin: the pinned scan snapshot and
         // the writer's staging table both derive from it (a second clone per
         // bin was pure waste — K bins x up to 12 waves per tick).
@@ -6347,9 +6363,7 @@ impl Database {
                     rows_staged += batch.num_rows();
                     // The unit is alive as long as this moves; `run_until_idle`
                     // reads it instead of a fixed budget.
-                    if let Some(progress) = &progress {
-                        progress.fetch_add(batch.num_rows() as u64, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    note_unit_progress(batch.num_rows());
                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
                     // Cut the file at the ceiling instead of buffering the whole bin
