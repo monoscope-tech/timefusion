@@ -6643,19 +6643,33 @@ impl Database {
             // cycle moves that worker to dedup or rollup, which is the same
             // work-conserving argument the pre-claim gate above makes for
             // HotPacking and SealedConsolidation.
-            None if pass == TailPass::Repair => match Arc::clone(&self.repair_rewrite_sem).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        table_name,
-                        project_id,
-                        event = "repair_rewrite_permit_busy",
-                        "another repair rewrite holds the permit; requeueing rather than parking a worker"
-                    );
-                    return Ok(BinOutcome::Retry);
+            None if pass == TailPass::Repair => {
+                // Priced in decoded MiB, CLAMPED to the whole budget. The clamp
+                // is what preserves the old safety property: prod's worst bin is
+                // ~28 GB decoded, far over budget, so it still takes everything
+                // and runs alone. Bins below the budget now share it, which is
+                // the only thing that changes — a count of 1 priced that worst
+                // case onto all 358 pending units and held repair to ~2/hour.
+                let budget_mib = self.config.derived.repair_rewrite_budget_mib();
+                let want_mib = u32::try_from(estimated_decoded_bytes(targets.iter().map(|a| a.size).sum::<i64>()) / (1024 * 1024))
+                    .unwrap_or(u32::MAX)
+                    .clamp(1, u32::try_from(budget_mib).unwrap_or(u32::MAX));
+                match Arc::clone(&self.repair_rewrite_sem).try_acquire_many_owned(want_mib) {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            table_name,
+                            project_id,
+                            want_mib,
+                            budget_mib,
+                            event = "repair_rewrite_permit_busy",
+                            "other repair rewrites hold the byte budget; requeueing rather than parking a worker"
+                        );
+                        return Ok(BinOutcome::Retry);
+                    }
                 }
-            },
+            }
             None => Arc::clone(&self.light_rewrite_sem).acquire_owned().await.map_err(|e| anyhow::anyhow!("light rewrite semaphore closed: {e}"))?,
         };
         let permit_wait_ms = permit_wait.elapsed().as_millis() as u64;

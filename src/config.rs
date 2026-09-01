@@ -407,6 +407,32 @@ impl DerivedBudget {
         }
     }
 
+    /// The decoded-bytes budget shared by concurrent repair rewrites.
+    ///
+    /// Exactly the one `COORDINATOR_PER_SORT_BUDGET_BYTES` that
+    /// `light_optimize_k` already holds back for repair — this only changes how
+    /// it is SPENT. A single count-of-1 permit prices the worst case onto every
+    /// unit: prod's worst repair bin is 2.3 GB compressed (~28 GB decoded), two
+    /// of which exhausted the pool on 2026-09-01, so the permit was set to 1 and
+    /// every small bin inherited that limit. At ~20-50 min per rewrite that is
+    /// ~2 units/hour against `pending_repair = 358` — 173 `repair_rewrite_permit_busy`
+    /// events in 40 minutes, a queue flat by arithmetic.
+    ///
+    /// Sizing in bytes with a CLAMPED request keeps the property the count was
+    /// protecting — a bin larger than the budget takes all of it and still runs
+    /// alone — while letting small bins share. It can only ADD concurrency, and
+    /// never for two large bins.
+    pub fn repair_rewrite_budget_bytes(&self) -> usize {
+        COORDINATOR_PER_SORT_BUDGET_BYTES
+    }
+
+    /// The same budget in whole MiB, which is the unit the repair semaphore
+    /// counts in — a permit per MiB keeps the numbers small enough for
+    /// `Semaphore`'s permit ceiling while staying finer than any real bin.
+    pub fn repair_rewrite_budget_mib(&self) -> usize {
+        (self.repair_rewrite_budget_bytes() / MIB).max(1)
+    }
+
     /// What heavy and light divide, once the coordinator has taken its share.
     fn maintenance_split_bytes(&self) -> usize {
         self.maintenance_pool_bytes - self.coordinator_share_bytes()

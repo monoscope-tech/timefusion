@@ -2760,12 +2760,21 @@ pub struct Database {
     /// long dedup drain can't starve hot compaction (disjoint partitions, so
     /// serializing them is pure loss). Sized to the light pool's own K.
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
-    /// ONE concurrent repair rewrite. A repair bin is a whole file — prod's
-    /// worst is 2.3 GB compressed, ~28 GB decoded — so two of them on the same
-    /// coordinator pool is the `Not enough memory to continue external sort`
-    /// that appeared the moment the liveness clock let them live long enough to
-    /// overlap (prod 2026-09-01). Hygiene bins keep `light_rewrite_sem`: they
-    /// are small, many, and the thing that must not be starved.
+    /// Repair's decoded-BYTE budget, one permit per MiB — not a count of
+    /// rewrites.
+    ///
+    /// A repair bin is a whole file and prod's worst is 2.3 GB compressed
+    /// (~28 GB decoded), so two of THOSE on one coordinator pool is the `Not
+    /// enough memory to continue external sort` that appeared the moment the
+    /// liveness clock let them overlap (prod 2026-09-01). The fix then was a
+    /// single permit, which priced that worst case onto every bin: ~2
+    /// units/hour against 358 pending, and 173 `repair_rewrite_permit_busy`
+    /// events in 40 minutes.
+    ///
+    /// A clamped byte request keeps the property exactly — a bin bigger than the
+    /// budget takes all of it and runs alone — while small bins share. Hygiene
+    /// bins keep `light_rewrite_sem`: they are small, many, and the thing that
+    /// must not be starved.
     repair_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Caps coordinator workers in debt work (dedup, packing, consolidation,
     /// repair), reserving the rest for rollup. Bounds occupancy, not memory:
@@ -3498,7 +3507,7 @@ impl Database {
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
-            repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.repair_rewrite_budget_mib())),
             // Three quarters to debt: a quarter always free for the rollup
             // chain, but not less — ungoverned file counts are their own outage.
             maintenance_debt_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs * 3 / 4).max(1))),
@@ -19754,8 +19763,26 @@ mod tests {
     async fn repair_serialises_on_its_own_permit() -> Result<()> {
         let cfg = create_test_config(&format!("repair-permit-{}", uuid::Uuid::new_v4().simple()));
         let db = Database::with_config(cfg).await?;
-        assert_eq!(db.repair_rewrite_sem.available_permits(), 1, "two whole-file rewrites at once is a pool exhaustion");
+        let budget = db.config.derived.repair_rewrite_budget_mib();
+        assert_eq!(db.repair_rewrite_sem.available_permits(), budget, "repair's budget is decoded MiB, not a count of rewrites");
         assert!(db.light_rewrite_sem.available_permits() >= 1, "and repair must not spend a hygiene permit it would then starve");
+
+        // The property the old count-of-1 protected, restated: a bin bigger than
+        // the whole budget still runs alone, because its request is CLAMPED to
+        // the budget and therefore takes all of it. Prod's worst is ~28 GB
+        // decoded against a 1.25 GB budget.
+        let huge = u32::try_from(budget).expect("budget fits u32");
+        let held = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(huge).expect("an oversized bin takes the whole budget");
+        assert!(
+            Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(1).is_err(),
+            "nothing may overlap a bin that filled the budget — this is what the count of 1 was for"
+        );
+        drop(held);
+        // And two small bins DO overlap, which is the entire point.
+        let small = u32::try_from(budget / 4).expect("quarter fits u32").max(1);
+        let a = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(small).expect("first small bin");
+        assert!(Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(small).is_ok(), "two small repair bins must share the budget");
+        drop(a);
         Ok(())
     }
 
