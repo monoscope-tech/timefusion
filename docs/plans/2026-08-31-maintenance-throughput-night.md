@@ -745,6 +745,27 @@ This one is prospective, not corrective: it bounds what maintenance WRITES from
 here on. Existing files keep their layout until something rewrites them, which
 is what the repair and consolidation lanes now do.
 
+## Steady state at the end of the night
+
+Deploy 6, 41 minutes in — every queue falling, every lane claiming:
+
+```
+pending_dedup           5,049 -> 2,737     (grew all night before this)
+pending_repair            432 -> 386       (flat all night before this)
+pending_base_rollup       649 -> 524
+pending_derived_rollup    159 ->  73
+retry.Dedup.worker_error    2 in 41 min    (~3/h, against ~124/h at baseline)
+retry.Repair.worker_error   absent
+compaction_permits_unavailable  0
+charged_pct                21%
+```
+
+And the shape of the retries is the tell: `HotPacking 8`, `Repair 4`,
+`SealedConsolidation 1`, all `compaction_debt_remaining` — the **success**
+requeue, a lane that landed a bin and found more debt in the partition. At the
+baseline the same column was `worker_error` on every repair unit and 618 dedup
+timeouts.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
