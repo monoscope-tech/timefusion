@@ -1641,7 +1641,7 @@ impl Database {
                                 }
                                 (shard_before, shard_after)
                             } else {
-                                let batches: Vec<RecordBatch> = crate::database::maintain::collect_watched(&ctx, &rows_sql)
+                                let batches: Vec<RecordBatch> = crate::database::maintain::collect_watched(ctx, &rows_sql)
                                     .await?
                                     .into_iter()
                                     .map(|batch| drop_batch_column(batch, DEDUP_FILE_COL))
