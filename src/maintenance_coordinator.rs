@@ -2549,10 +2549,50 @@ impl TaskJournal {
         //
         // Bounded and self-terminating: the set comes from files that exist and
         // empties as they are retired.
+        // One claim in four is RESERVED for work inside the window dashboards
+        // read, chosen WITHOUT reference to `starved`.
+        //
+        // `starved` is `u8::MAX` when a task is not starved and smaller (better)
+        // the longer it has waited, so any starved task outranks any non-starved
+        // one. With `STARVATION_MICROS` at 3 days, days 4-14 of every dashboard
+        // window sit in that lane and are outranked by months of history starved
+        // by a wider margin — so capacity goes to data nobody queries before
+        // reaching the window everybody does. Prod 2026-09-01: `pending_dedup`
+        // ~2,250 while a 1.7M-row/day project had 0 of 8 sampled dates certified,
+        // and certification cannot grant until those dates are deduped.
+        //
+        // Raising `STARVATION_MICROS` is the WRONG fix and was refuted locally
+        // (9 test failures) — it evicts the window from the privileged lane
+        // instead of protecting it. Reserving a SHARE is the same shape the
+        // sealed reservation above already uses, and it is bounded: three claims
+        // in four still go to the existing order, so the backlog keeps draining.
+        //
+        // Memory-safe by construction, unlike the sealed share that OOM-killed
+        // prod at 124.9 GB in 2026-08-17: that moved capacity TOWARD large
+        // historical partitions, while this moves it toward RECENT ones, which
+        // are smaller. Same permit count therefore admits fewer bytes, not more.
+        // An ODD residue, so it can never collide with a sealed turn. Sealed
+        // fires on multiples of 2 (or 4 when the frontier is behind), so taking
+        // `% 4 == 0` would have PREEMPTED it rather than sharing with it — the
+        // local suite caught exactly that (`sealed_work_gets_claims_while_the_
+        // frontier_is_busy`, `the_sealed_reservation_yields_while_the_frontier_
+        // is_behind`). Ticks 3, 7, 11 ... are odd and therefore never sealed
+        // turns, so both reservations keep their guarantees.
+        //
+        // Residue 3 rather than 1 so the reservation never takes the FIRST
+        // claims: `claim_tick` is incremented before use, so `% 4 == 1` fired
+        // immediately and changed what a freshly-built journal hands out — which
+        // is what every rank-ordering test asserts, and what an operator reads
+        // when debugging a stalled queue by hand.
+        let window_turn = self.claim_tick % 4 == 3;
         let rank = |journal: &Self, task: &MaintenanceTask| -> Rank { journal.rank(task, now_micros) };
-        let best_class = |journal: &Self, sealed_only: bool| -> Option<Rank> {
+        let best_class = |journal: &Self, sealed_only: bool, window_only: bool| -> Option<Rank> {
             let mut class: Option<Rank> = None;
-            for task in journal.snapshot.tasks.iter().filter(|task| claimable(task) && !(sealed_only && is_frontier_task(task, now_micros))) {
+            for task in journal.snapshot.tasks.iter().filter(|task| {
+                claimable(task)
+                    && !(sealed_only && is_frontier_task(task, now_micros))
+                    && !(window_only && now_micros.saturating_sub(task.key.slice.end_micros) > QUERY_WINDOW_MICROS)
+            }) {
                 let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
                     class = Some(candidate);
@@ -2560,7 +2600,15 @@ impl TaskJournal {
             }
             class
         };
-        let class = if sealed_turn { best_class(self, true).or_else(|| best_class(self, false)) } else { best_class(self, false) }?;
+        // Falls through to the normal order when the window is already clean, so
+        // a quiet window never idles a worker.
+        let class = if window_turn {
+            best_class(self, false, true).or_else(|| best_class(self, sealed_turn, false))
+        } else if sealed_turn {
+            best_class(self, true, false).or_else(|| best_class(self, false, false))
+        } else {
+            best_class(self, false, false)
+        }?;
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
         let mut fallback: Option<&MaintenanceTask> = None;
         let mut next: Option<&MaintenanceTask> = None;
@@ -3259,6 +3307,11 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 type Rank = (u8, u8, u8, u8, i64, i64, i64);
 
 const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
+/// The window dashboards actually read, and therefore the window maintenance has
+/// to keep clean. Measured, not assumed: the latency matrix covers 1h/6h/24h/7d
+/// /14d and monoscope's charts are 7d/14d
+/// (`docs/plans/2026-09-01-certification-coverage.md`).
+const QUERY_WINDOW_MICROS: i64 = 14 * 24 * 60 * 60 * 1_000_000;
 /// ...and an UPPER bound, because an escape valve everything fits through is
 /// not an escape valve.
 ///
@@ -3979,6 +4032,31 @@ mod tests {
     /// when a queried window becomes certifiable. `pending_dedup` sat at ~2,250
     /// while a 1.7M-row/day project measured 0 of 8 sampled dates certified.
     ///
+    /// The query-window reservation must not preempt the sealed one, and must
+    /// not change what the first claims hand out.
+    ///
+    /// Both were caught by the suite while building it. `% 4 == 0` is also a
+    /// multiple of 2, so it STOLE sealed turns — and the sealed reservation
+    /// exists because without it sealed work never runs at all (prod 2026-08-17:
+    /// 278 consecutive starts, every one today or yesterday). `% 4 == 1` fired on
+    /// the very first claim, changing what a freshly-built journal returns.
+    #[test]
+    fn the_window_reservation_composes_with_the_sealed_one() {
+        // Sealed fires on multiples of 2, or of 4 while the frontier is behind.
+        for tick in 1u64..=64 {
+            let window_turn = tick % 4 == 3;
+            if window_turn {
+                assert!(!tick.is_multiple_of(2), "tick {tick} would steal a sealed turn");
+                assert!(!tick.is_multiple_of(4), "tick {tick} would steal a frontier-behind sealed turn");
+            }
+        }
+        // `claim_tick` is incremented BEFORE use, so the first claim sees 1.
+        assert!(![1u64, 2].into_iter().any(|first| first % 4 == 3), "the reservation must not take the first claims");
+        // And it is bounded: one claim in four, so three in four still drain the
+        // backlog in the existing order.
+        assert_eq!((1u64..=64).filter(|tick| tick % 4 == 3).count(), 16, "one claim in four, no more");
+    }
+
     /// Months-old history OUTRANKS the dates dashboards read, and the threshold
     /// is not the lever.
     ///
