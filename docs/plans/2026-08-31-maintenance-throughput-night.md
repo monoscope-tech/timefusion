@@ -766,6 +766,39 @@ requeue, a lane that landed a bin and found more debt in the partition. At the
 baseline the same column was `worker_error` on every repair unit and 618 dedup
 timeouts.
 
+## Are the lanes keeping up? Two different questions
+
+Measured on deploy 7 over a 10-minute same-process window:
+
+| lane | pending | slope |
+|---|---|---|
+| dedup | 2,833 → 2,788 | **−4.4/min** |
+| base_rollup | 576 → 577 | flat |
+| derived_rollup | 82 → 83 | flat |
+| repair | 386 → 386 | flat |
+| sealed_consolidation | 186 → 186 | flat |
+| hot_packing | 18 → 18 | flat |
+
+**Keeping up with the live stream: yes.** No lane's queue is growing. At the
+baseline every one of them was, and `oldest_task_age_seconds` rose 1:1 with wall
+clock because nothing retired. Flat means completions ≈ arrivals, which is the
+definition of keeping up.
+
+**Draining the legacy backlog: partly.** Dedup is falling at ~4.4/min (its
+remaining 2,788 is ~10 hours at that rate). Repair is flat at 386 — its units
+mostly footer-exonerate in seconds, and the ones that need a rewrite are now
+deliberately serialised on one permit, so that backlog drains slowly and safely
+rather than by exhausting the pool. That is the trade taken in deploy 4 and it
+is the right one; a faster repair drain means raising its concurrency once the
+row-group fix has shrunk what a repair unit has to hold.
+
+**Not yet demonstrated: 10x.** Everything measured tonight is at current volume.
+The mechanism intended for 10x — the occupancy-scaled admission ceiling — is
+committed but **off** (`TIMEFUSION_ADMISSION_OCCUPANCY_SCALED`), because turning
+it on while a legacy backlog drains would slow that drain. It should be enabled
+once these queues are flat at a low number, and the honest next step after that
+is a load test, not another prod inference.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
