@@ -461,7 +461,20 @@ impl DerivedBudget {
     /// hot projects to compact. Degrades to 1 on small boxes instead of
     /// starving/OOMing (2026-07-23 incident was 2 sorts in a 6 GiB slice).
     pub fn light_optimize_k(&self, hot_project_count: usize) -> usize {
-        let mem_bound = self.light_share_bytes() / PER_SORT_BUDGET_BYTES;
+        // Priced against the pool these units ACTUALLY allocate from. Every live
+        // caller of the permit is a coordinator unit, and `stage_hot_bin` on
+        // that path takes `coordinator_runtime_env()`; the light share feeds
+        // `light_optimize_session_state`, whose only callers sit under
+        // `optimize_table_light` — which has none.
+        //
+        // Deriving it from the light share was a latent coupling that fired the
+        // moment that share moved: raising the coordinator's cap shrank light
+        // from ~7.6 GB to 3 GB, which took this from 3 to 1, and HotPacking —
+        // which must take the permit BEFORE it claims — stopped being claimed
+        // at all (prod 2026-09-01: zero HotPacking units in 45 minutes with 17
+        // pending, and `compaction_permits_unavailable` 23 on a 35-minute-old
+        // process against 9 over 5.8h before).
+        let mem_bound = self.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES;
         let cpu_bound = self.cores / 4;
         mem_bound.min(cpu_bound).min(hot_project_count).max(1)
     }
@@ -2912,6 +2925,18 @@ mod tests {
         }
     }
 
+    /// The hot-packing permit must be priced against the pool its units allocate
+    /// from, or it moves whenever an unrelated share does. Prod 2026-09-01:
+    /// raising the coordinator's cap shrank the light share, which silently took
+    /// K from 3 to 1 and stopped HotPacking being claimed at all.
+    #[test]
+    fn the_packing_permit_follows_the_coordinator_pool_not_the_light_share() {
+        let prod = DerivedBudget::from_limits(80 * GIB, 48);
+        assert_eq!(prod.light_optimize_k(11), prod.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES, "the memory term is the coordinator's pool");
+        assert!(prod.light_optimize_k(11) > 1, "one permit shared by HotPacking and SealedConsolidation starves packing");
+        assert!(prod.light_optimize_k(11) < prod.cores / 4, "and the CPU term is not what binds on a big box");
+    }
+
     // Small box (16 GiB / 4 cores): degrades to K=1, nothing underflows/zeroes.
     #[test]
     fn derived_budget_small_box_degrades_to_k1() {
@@ -2920,6 +2945,7 @@ mod tests {
             tiny.query_pool_bytes() + tiny.buffer_max_bytes() + tiny.foyer_memory_bytes() + tiny.writer_reserve_bytes() + tiny.maintenance_pool_bytes();
         assert!(tiny_sum <= 8 * GIB, "8 GiB box over-committed: {tiny_sum}");
         let b = DerivedBudget::from_limits(16 * GIB, 4);
+        // cores/4 = 1 pins it here whatever the memory term says.
         assert_eq!(b.light_optimize_k(11), 1);
         assert!(b.maintenance_pool_bytes() >= GIB);
         assert!(b.light_share_bytes() > 0);
