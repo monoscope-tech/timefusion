@@ -201,13 +201,19 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     // One uncertified file without statistics has an unknown span, which
     // overlaps everything, so nothing in the scan can skip.
     if uncertified.iter().any(Option::is_none) {
+        metrics::counter!(crate::database::scan_metric_names::CERT_SKIP_BLOCKED_NO_STATS).increment(1);
         return HashSet::new();
     }
-    certified
+    let (skippable, blocked): (Vec<_>, Vec<_>) = certified
         .into_iter()
-        .filter(|(_, span)| span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi)))
-        .map(|(path, _)| path)
-        .collect()
+        .partition(|(_, span)| span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi)));
+    // Counted separately because they mean opposite things: overlap says
+    // certification is too SPARSE (a certified file still has an uncertified
+    // neighbour, so contiguous runs are what pay), while the no-stats return
+    // above says one file poisoned the whole scan regardless of coverage.
+    metrics::counter!(crate::database::scan_metric_names::CERT_SKIP_BLOCKED_OVERLAP).increment(blocked.len() as u64);
+    metrics::counter!(crate::database::scan_metric_names::CERT_SKIP_FILES).increment(skippable.len() as u64);
+    skippable.into_iter().map(|(path, _)| path).collect()
 }
 
 /// `ORDERING_VIOLATIONS` is counted inside `DedupExec`, which is single-partition

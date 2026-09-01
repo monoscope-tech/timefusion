@@ -210,8 +210,30 @@ contention, so green meant nothing there.
    A count of 1 is the same mistake as a deadline-as-budget: it prices the
    worst case onto every unit.
 
-   Ship it ALONE, after deploy 17 is verified, and size the budget from the
-   decoded-bytes estimate the admission path already computes.
+   **SHIPPED as deploy 18, and it is a NO-OP — which is the real finding.** The
+   permit now counts decoded MiB, and the refusal log carries `want_mib`. Prod
+   answered immediately: **42 of 42 refusals are `want_mib=1280
+   budget_mib=1280`.** Every repair bin's decoded size exceeds the whole 1.25 GB
+   budget, so each clamps to all of it and still runs alone. Raising the budget
+   does not help either, because the clamp scales with it — with all bins over
+   budget, no byte-based sharing is possible at any budget.
+
+   **What that exposes is bigger than repair scheduling: the reservation is a
+   fiction.** `light_optimize_k` holds back one `COORDINATOR_PER_SORT_BUDGET_BYTES`
+   (1.25 GB) for repair, and then a repair rewrite decodes 12-28 GB inside it,
+   because these rewrites' Arrow is pool-invisible (the comment on
+   `light_rewrite_sem` says so). We reserve 1.25 GB and run a 12 GB job in it.
+   That is why two overlapping rewrites OOMed, and why a count of 1 was the only
+   thing that worked.
+
+   **So the lever is not permits at all — it is the unit.** Repair throughput
+   needs the rewrite to be bounded by a budget it actually respects (streaming /
+   spilling within the pool, or splitting the file's rewrite by row group), not
+   a whole-file sort priced at 10x its reservation. Until then repair is ~2
+   units/hour by construction and `pending_repair = 358` will not move.
+
+   The byte budget is kept: it is behaviourally identical to the count of 1 for
+   today's bins, and `want_mib` is the instrument that made this legible.
 5. **Do not reallocate dedup's share** until 1-3 land: if certification starts
    working, the same worker-seconds buy a read-path win instead of nothing.
 

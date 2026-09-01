@@ -344,6 +344,14 @@ pub mod scan_metric_names {
         // rejects everything", which are the same observation without it.
         CERT_SLICE_FILES_PROVED = "timefusion.scan.cert_slice_files_proved" as scan.cert_slice_files_proved;
         CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
+        // Why a CERTIFIED file still could not skip. Two very different
+        // refusals: one uncertified file with no statistics blocks the entire
+        // scan, whereas overlap blocks only the files it touches. Prod
+        // 2026-09-01 had 506 files certified and `dedup_skipped` = 0, and
+        // without this split those are the same observation.
+        CERT_SKIP_BLOCKED_NO_STATS = "timefusion.scan.cert_skip_blocked_no_stats" as scan.cert_skip_blocked_no_stats;
+        CERT_SKIP_BLOCKED_OVERLAP = "timefusion.scan.cert_skip_blocked_overlap" as scan.cert_skip_blocked_overlap;
+        CERT_SKIP_FILES = "timefusion.scan.cert_skip_files" as scan.cert_skip_files;
         // Why `record_certification` refused, split by the failing conjunct.
         CERT_REFUSED_DROPPED = "timefusion.scan.cert_refused_dropped" as scan.cert_refused_dropped;
         CERT_REFUSED_INCOMPLETE = "timefusion.scan.cert_refused_incomplete" as scan.cert_refused_incomplete;
