@@ -155,7 +155,10 @@ async fn fleet(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) 
 {:<22} {:>8} {:>12} {:>12} {:>9}",
         "concurrency", "secs", "MB/s total", "MB/s each", "failed"
     );
-    for workers in [1usize, 2, 4, 8] {
+    // 3, 5, 6 included deliberately: prod runs 4 and the 8-worker rung FAILS at
+    // an 8 GB pool, so the usable ceiling is somewhere in between and that is the
+    // number a permit change has to be justified against.
+    for workers in [1usize, 2, 4, 5, 6, 8] {
         // ONE pool for all of them, sized as prod sizes the coordinator's.
         let shared = runtime(pool_mb * 1024 * 1024, spill);
         let started = Instant::now();
