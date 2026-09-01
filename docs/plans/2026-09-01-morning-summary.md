@@ -122,12 +122,44 @@ contention, so green meant nothing there.
    with it on and off over a churning partition — the flag's own doc comment
    demands exactly that, and its failure mode is a silent over-count on every
    dashboard tile. This is the step that should move 14 d latency.
-3. **Find where dedup's seconds actually go.** `maintenance_scan_pruning` says
-   probes scan little (0.43 GB across 29 scans, max 103 MB), so it is NOT an
-   unpruned whole-day scan. The instrument does not cover the rewrite path, and
-   `dedup_probe_ctx` builds a provider over every file of the partition BEFORE
-   any query runs — invisible to any scan metric. Attribute it from logs first:
-   unit `ran_secs` vs summed probe `elapsed_ms` vs `wave_bin_staged.staging_ms`.
+3. **Cut the probe's repeated whole-partition scans — this is the biggest
+   measured lever, and it reverses my earlier reading.** A 15-minute
+   post-restart sample said scans were small (0.43 GB over 29 scans) and I called
+   the probe-cost hypothesis refuted. On a **warm** fleet, 45 minutes says the
+   opposite:
+
+   ```
+   462 scans   58.88 GB scanned   11,821 s of scan time
+   93 scans >= 5s account for 99% of that time and 51.5 GB
+   ```
+
+   The top of the distribution is the finding:
+
+   | scanned | time | note |
+   |---|---|---|
+   | 9,408 MB | 1,454 s | and the SAME 9,408 MB again at 1,410 s |
+   | 3,434 MB | 90-118 s | the same 3,434 MB **six times** — 20.6 GB, ~640 s |
+
+   **The repetition is the shard re-read.** `probe_hash_shards` runs the probe
+   once per shard and each pass re-reads the selected files — the code says so
+   ("Each pass may reread the selected files, but no pass can accumulate the
+   whale's full key cardinality in memory"). So a 3.4 GB partition is read six
+   times to answer one question, and 11,821 s of scan time in 45 minutes is
+   ~27% of a 16-worker fleet's capacity spent inside scans alone, against dedup's
+   87% share.
+
+   The sharding is a deliberate memory-for-IO trade made when the coordinator
+   pool was 4.2 GB. It is now 10 GB, and DataFusion can spill a grouped
+   aggregate — so the trade should be re-derived, not assumed. **Do not change
+   it blind:** the failure mode is the OOM class this codebase has fought all
+   month. Measure single-pass-with-spill against N-shard re-read on the local
+   bench first.
+
+   **Instrument gap to close first:** `maintenance_scan_pruning` carries no
+   operation label, so these totals cannot be split between dedup probes and
+   rollup builds with certainty. The 6x-identical-bytes pattern is
+   probe-sharding's signature, but add the label before quoting these as
+   dedup-only.
 4. **Repair is running and retiring nothing** — 1,059 worker-seconds for zero
    queue movement, `compaction_incomplete` 23 → 126. Not diagnosed.
 5. **Do not reallocate dedup's share** until 1-3 land: if certification starts
@@ -143,5 +175,9 @@ contention, so green meant nothing there.
   != 0`, i.e. the query's bucket width against the tier's grain. Mostly benign
   per-candidate noise. The actionable misses are `filter_not_eligible` (994),
   `stale_coverage` (309), `not_built` (203) against 199 hits.
-- The probe-reads-the-whole-day hypothesis is **refuted for probes**,
-  provisionally — thin sample, and the instrument cannot see rewrite scans.
+- The probe-reads-the-whole-day hypothesis: I called it **refuted** on a
+  15-minute post-restart sample (29 scans, 0.43 GB), then a warm 45-minute window
+  (462 scans, 58.9 GB, 11,821 s) **supported it** — with the added finding that
+  the same partition is re-read once per hash shard. The lesson is the one this
+  night keeps teaching: a sample taken from a just-restarted process measures the
+  restart, not the system. Wait for warm.
