@@ -117,8 +117,19 @@ pub const MAX_OPERATION_DEADLINE_SECS: u64 = operation_deadline_secs(Operation::
 
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
-        // Dedup may use an unpooled collecting path; keep its exposure shorter.
-        Operation::Dedup => 5 * 60,
+        // Dedup's 300s was chosen when this was a BUDGET on total time. Under
+        // idle semantics it is the wrong number, and prod 2026-09-01 measured
+        // the cost: of 288 dedup units finishing in 25 minutes, 249 ran 0s
+        // (claim-and-refuse churn) and **33 burned the full 300s and were
+        // killed** — 9,900 worker-seconds, ~6.6 of 16 workers producing nothing.
+        //
+        // Those 33 made NO progress in 300s, which for dedup means the probe
+        // (`GROUP BY` over a whole partition) had not yet emitted a row. Units
+        // that do get a second window finish: the same log shows completions at
+        // 599s, 600s and 887s. 900s covers them, and matches every other
+        // non-repair operation — the exposure argument the old comment made is
+        // now carried by `run_until_idle`, which only fires on ZERO progress.
+        Operation::Dedup => 15 * 60,
         Operation::Repair => 60 * 60,
         Operation::HotPacking | Operation::SealedConsolidation | Operation::BaseRollup | Operation::DerivedRollup => 15 * 60,
     }
@@ -6575,6 +6586,20 @@ mod tests {
         // Other operations keep the old floor: their cost model is different.
         let rollup = task("p", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup);
         assert_eq!(byte_bounded_units(&rollup, over_budget).len(), 2, "only dedup's cost is partition-scoped");
+    }
+
+    /// Dedup's window was 300s from when the clock was a budget on TOTAL time.
+    /// Under idle semantics that killed working units: prod 2026-09-01, 33 of
+    /// 288 dedup units in 25 minutes burned the full 300s and were killed —
+    /// 9,900 worker-seconds — while units granted a second window finished at
+    /// 599s, 600s and 887s.
+    #[test]
+    fn only_repair_gets_a_window_longer_than_the_fleet_default() {
+        for operation in [Operation::Dedup, Operation::HotPacking, Operation::SealedConsolidation, Operation::BaseRollup, Operation::DerivedRollup] {
+            assert_eq!(operation_deadline_secs(operation), 15 * 60, "{operation:?} shares the fleet default");
+        }
+        assert_eq!(operation_deadline_secs(Operation::Repair), 60 * 60, "repair alone is longer: ORDER BY is blocking on a whole file");
+        assert!(operation_deadline_secs(Operation::Repair) <= MAX_OPERATION_DEADLINE_SECS);
     }
 
     /// A Repair unit rewrites ONE whole file, so halving its slice halves
