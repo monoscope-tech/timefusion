@@ -4761,12 +4761,104 @@ impl Database {
         self.persist_slice_coverage();
         if !covered {
             metrics::counter!(scan_metric_names::CERT_SLICE_PARTIAL).increment(1);
+            // The day is not proved, but the SLICE is — and that is a real,
+            // durable fact about the files whose whole span lies inside it.
+            // Banking it is what makes the per-FILE skip reachable at all:
+            // whole-day coverage under an unchanged fingerprint never happens on
+            // a live table (`cert_granted_total` = 0 since 2026-08-20), so
+            // without this every consumer of `Certification` is dead code.
+            self.certify_files_within_slice(table_ref, table_name, project_id, date, (start, end)).await;
             return Ok(None);
         }
         metrics::counter!(scan_metric_names::CERT_SLICE_DAY_COVERED).increment(1);
         self.dedup_slice_coverage.remove(&key);
         self.persist_slice_coverage();
         self.record_certification(table_ref, table_name, project_id, date, &post, (0, true)).await
+    }
+
+    /// Bank the files a clean slice proved, as evidence for the per-FILE skip.
+    ///
+    /// A clean pass over `[start, end)` proves that every row in the partition
+    /// whose `timestamp` falls in that window is unique — a statement about ROWS
+    /// IN A TIME RANGE. It upgrades to a statement about a FILE only when the
+    /// file's entire span lies inside the slice; a file crossing the boundary
+    /// holds rows the pass never looked at. That containment test is the whole
+    /// soundness argument, and it is why the caller cannot simply keep its
+    /// `post` file list the way the day rule does.
+    ///
+    /// Two further conditions, both fail-closed:
+    /// - **`timestamp` must be a dedup key.** The upgrade works because a
+    ///   duplicate group shares one exact timestamp, so no group straddles the
+    ///   boundary. Without it a row inside the window could have a duplicate at
+    ///   a different timestamp in a file that does not overlap this one, and
+    ///   read-time isolation would not catch it.
+    /// - **A file with no statistics is never certified**, since its span cannot
+    ///   be shown to be contained.
+    ///
+    /// Entries written here are `stale`: they may vouch for the files they name
+    /// and may NEVER grant the whole-partition skip, which is a claim about a
+    /// day that no slice can support.
+    async fn certify_files_within_slice(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, (start, end): (i64, i64),
+    ) {
+        if !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") {
+            return;
+        }
+        let spans = {
+            let table = table_ref.read().await;
+            match Self::partition_file_spans(&table, &format!("date={date}")) {
+                Ok(spans) => spans,
+                Err(_) => return,
+            }
+        };
+        let (proved, unproven): (Vec<_>, Vec<_>) = spans.into_iter().partition(|(_, span)| span.is_some_and(|(min, max)| min >= start && max < end));
+        metrics::counter!(scan_metric_names::CERT_SLICE_FILES_UNPROVEN).increment(unproven.len() as u64);
+        if proved.is_empty() {
+            return;
+        }
+        metrics::counter!(scan_metric_names::CERT_SLICE_FILES_PROVED).increment(proved.len() as u64);
+        let key = (project_id.to_string(), table_name.to_string(), date.to_string());
+        // Never DOWNGRADE: a live whole-day grant outranks anything a slice can
+        // say, so it is left exactly as it is.
+        // Bound in a `let`, NOT inlined as the scrutinee: a DashMap `Ref`
+        // temporary in a match scrutinee lives until the end of the MATCH, and
+        // every arm below writes to the same shard — a self-deadlock, the same
+        // one documented at `dedup_window_clean`.
+        let existing = self.dedup_clean_fp.get(&key).map(|entry| entry.value().stale);
+        match existing {
+            Some(false) => return,
+            Some(true) => self.dedup_clean_fp.alter(&key, |_, mut live| {
+                let mut files: Vec<String> = live.files.to_vec();
+                files.extend(proved.iter().map(|(rel, _)| rel.clone()));
+                files.sort_unstable();
+                files.dedup();
+                live.files = Arc::from(files);
+                live
+            }),
+            None => {
+                let files: Arc<[String]> = Arc::from(proved.into_iter().map(|(rel, _)| rel).collect::<Vec<_>>());
+                self.dedup_clean_fp.insert(key, Certification { fp: 0, since: std::time::Instant::now(), files, stale: true });
+            }
+        }
+        self.persist_certifications_debounced();
+    }
+
+    /// Write slice evidence at most once a minute.
+    ///
+    /// Durability is required — the journal marks a slice Complete forever, so
+    /// evidence lost to a restart is never re-proved (the bug already fixed once
+    /// for slice COVERAGE) — but every clean slice re-serializing the whole
+    /// ledger is the `persist_dirty_bins` write-amplification in a new place.
+    /// A minute bounds the loss to the slices proved inside it.
+    fn persist_certifications_debounced(&self) {
+        const FLOOR_MICROS: i64 = 60 * 1_000_000;
+        let now = crate::support::now_micros();
+        let last = self.dedup_certification_persist_at.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < FLOOR_MICROS {
+            return;
+        }
+        self.dedup_certification_persist_at.store(now, std::sync::atomic::Ordering::Relaxed);
+        self.persist_certifications();
     }
 
     /// Apply the certification rule to one finished dedup pass and record the verdict.
@@ -4819,8 +4911,33 @@ impl Database {
             _ => scan_metric_names::CERT_REFUSED_FP_MOVED,
         })
         .increment(1);
-        if let Some((_, prev)) = self.dedup_clean_fp.remove(&key) {
-            self.scan_metrics.record_cert_dwell(prev.since);
+        // Keep-and-mark-stale when the entry carries per-file evidence; only a
+        // certification with nothing to vouch for is removed.
+        //
+        // Removing unconditionally recreated "success destroys the evidence" one
+        // level down: the first pass finding duplicates ANYWHERE in the partition
+        // erased every file a clean slice had proved, and on the live frontier
+        // dirty passes are routine. Keeping it is sound because a duplicate group
+        // touching a certified file forces that file's rewrite, and a path that
+        // is no longer live already drops out of `certified_files_in_partition`.
+        // Same rule as above: bind first, or the arms deadlock against the Ref.
+        let existing = self.dedup_clean_fp.get(&key).map(|entry| (entry.value().files.is_empty(), entry.value().stale, entry.value().since));
+        match existing {
+            Some((false, was_stale, since)) => {
+                self.dedup_clean_fp.alter(&key, |_, mut live| {
+                    live.stale = true;
+                    live
+                });
+                if !was_stale {
+                    self.scan_metrics.record_cert_dwell(since);
+                }
+            }
+            Some((true, _, _)) => {
+                if let Some((_, prev)) = self.dedup_clean_fp.remove(&key) {
+                    self.scan_metrics.record_cert_dwell(prev.since);
+                }
+            }
+            None => {}
         }
         Ok(None)
     }
@@ -4889,7 +5006,10 @@ impl Database {
             // stale arm below removes from the same shard — a self-deadlock.
             let certified = self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().clone());
             match certified {
-                Some(cert) if cert.fp == partition_file_fp(files) => {
+                // `!cert.stale` is required, not decorative: a slice-derived
+                // certification proves one time window, never the day, and its
+                // fingerprint can still match the live partition.
+                Some(cert) if !cert.stale && cert.fp == partition_file_fp(files) => {
                     certified_any = true;
                     certified_dates.insert(date.to_string());
                     continue;
@@ -5347,6 +5467,7 @@ impl Database {
                     fp: cert.fp,
                     granted_unix_ms: now_ms.saturating_sub(cert.since.elapsed().as_millis() as u64),
                     files: cert.files.to_vec(),
+                    stale: cert.stale,
                 }
             })
             .collect();

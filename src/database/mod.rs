@@ -339,6 +339,11 @@ pub mod scan_metric_names {
         CERT_SLICE_DIRTY = "timefusion.scan.cert_slice_dirty" as scan.cert_slice_dirty;
         CERT_SLICE_PARTIAL = "timefusion.scan.cert_slice_partial" as scan.cert_slice_partial;
         CERT_SLICE_DAY_COVERED = "timefusion.scan.cert_slice_day_covered" as scan.cert_slice_day_covered;
+        // Files a clean SLICE proved, and files it could not: the second is what
+        // separates "nothing is being certified" from "the containment test
+        // rejects everything", which are the same observation without it.
+        CERT_SLICE_FILES_PROVED = "timefusion.scan.cert_slice_files_proved" as scan.cert_slice_files_proved;
+        CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
         // Why `record_certification` refused, split by the failing conjunct.
         CERT_REFUSED_DROPPED = "timefusion.scan.cert_refused_dropped" as scan.cert_refused_dropped;
         CERT_REFUSED_INCOMPLETE = "timefusion.scan.cert_refused_incomplete" as scan.cert_refused_incomplete;
@@ -2646,6 +2651,13 @@ pub struct Database {
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), Certification>>,
     /// Serializes `dedup_clean_fp` snapshots with their shared atomic temp path.
     dedup_certification_persist_lock: Arc<std::sync::Mutex<()>>,
+    /// Last time slice-derived certification evidence was written, as
+    /// `now_micros`. Slice evidence accrues on EVERY clean slice, and
+    /// `store_sidecar` re-serializes the whole ledger each call — its own
+    /// comment calls that "a multi-MB `to_vec` on a runtime worker at
+    /// maintenance frequency". Whole-day grants still persist immediately; only
+    /// the high-frequency producer is debounced.
+    dedup_certification_persist_at: Arc<std::sync::atomic::AtomicI64>,
     /// Clean-slice coverage accumulating toward a `dedup_clean_fp` entry.
     /// See `SliceCoverage` and `record_clean_slice`.
     dedup_slice_coverage: Arc<dashmap::DashMap<(String, String, String), SliceCoverage>>,
@@ -3335,7 +3347,7 @@ impl Database {
                 let since = crate::storage::age_since(entry.granted_unix_ms).and_then(|age| now.checked_sub(age)).unwrap_or(now);
                 dedup_clean_fp.insert(
                     (entry.project_id, entry.table_name, entry.date),
-                    Certification { fp: entry.fp, since, files: Arc::from(entry.files), stale: false },
+                    Certification { fp: entry.fp, since, files: Arc::from(entry.files), stale: entry.stale },
                 );
             }
             info!(loaded = dedup_clean_fp.len(), event = "dedup_certifications_loaded");
@@ -3455,6 +3467,7 @@ impl Database {
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp,
             dedup_certification_persist_lock: Arc::new(std::sync::Mutex::new(())),
+            dedup_certification_persist_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             dedup_slice_coverage,
             rollup_source_epochs,
             rollup_coverage: Arc::new(dashmap::DashMap::new()),
@@ -12376,11 +12389,78 @@ mod tests {
 
     /// Clean NARROW dedup units must accumulate into certification.
     ///
+    /// Does this certification grant the WHOLE-PARTITION dedup skip?
+    ///
+    /// Not the same as "an entry exists": a clean SLICE banks per-file evidence
+    /// as a `stale` entry, which may vouch for the files it names and can never
+    /// grant a day-wide skip. Tests about the day must ask this, not `contains_key`.
+    fn grants_whole_partition(db: &Database, key: &(String, String, String)) -> bool {
+        db.dedup_clean_fp.get(key).is_some_and(|entry| !entry.value().stale)
+    }
+
     /// Prod never produces surviving day-wide units: `coarsen_to_width` caps units at
     /// `MAX_DECODED_BYTES` (≈6h for otel_logs_and_spans) and true day-wide units die at the
     /// coordinator's Dedup deadline — so `cert_granted_total` stayed 0 forever (2026-08-20).
     /// Certification is a property of the partition, not the unit shape: clean slices whose
     /// union covers the UTC day over an unmoved file set prove what one day-wide pass does.
+    /// A clean slice certifies ONLY the files whose whole span it covered.
+    ///
+    /// The proof is about rows in a time range; a file crossing the boundary
+    /// holds rows the pass never looked at, so certifying it would let the read
+    /// path skip `DedupExec` over unexamined data.
+    #[tokio::test]
+    #[serial]
+    async fn a_clean_slice_certifies_only_the_files_it_wholly_covered() -> Result<()> {
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let db = Database::with_config(create_test_config("slice-containment")).await?;
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        let date = day.date_naive();
+        let day_start = midnight_micros(date);
+        let half = day_start + DAY_MICROS / 2;
+        // One file inside the first half, one outside it.
+        insert_a_span(&db, &project, "inside", day_start + 3_600_000_000).await?;
+        insert_a_span(&db, &project, "outside", half + 3_600_000_000).await?;
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+
+        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "the first-half unit must run");
+        let cert = db.dedup_clean_fp.get(&key).map(|entry| entry.value().clone());
+        let files = cert.as_ref().map_or(0, |cert| cert.files.len());
+        assert!(files <= 1, "a slice must not certify the file lying outside it; certified {files} files");
+        assert!(cert.is_none_or(|cert| cert.stale), "slice-derived evidence must never grant the whole-partition skip");
+        Ok(())
+    }
+
+    /// And that evidence must not claim more after a restart than before it.
+    ///
+    /// The persisted store restored every certification as `stale: false`, and
+    /// prod restarts on every deploy — so a proof about ten minutes would come
+    /// back indistinguishable from a proof about a day.
+    #[tokio::test]
+    #[serial]
+    async fn slice_evidence_stays_stale_across_a_restart() -> Result<()> {
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let cfg = create_test_config("slice-stale-restart");
+        let db = Database::with_config(cfg.clone()).await?;
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        let date = day.date_naive();
+        let day_start = midnight_micros(date);
+        insert_a_span(&db, &project, "only", day_start + 3_600_000_000).await?;
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+
+        assert!(run_dedup_slice(&db, &project, day_start, day_start + DAY_MICROS / 2).await?, "the half-day unit must run");
+        let banked = db.dedup_clean_fp.get(&key).is_some();
+        drop(db);
+
+        let db = Database::with_config(cfg).await?;
+        assert!(!grants_whole_partition(&db, &key), "a restored slice certification must still be stale");
+        if banked {
+            assert!(db.dedup_clean_fp.contains_key(&key), "and its file evidence must survive the restart");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial]
     async fn clean_slice_units_accumulate_to_certify_the_partition() -> Result<()> {
@@ -12395,7 +12475,7 @@ mod tests {
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
 
         assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
-        assert!(!db.dedup_clean_fp.contains_key(&key), "half a day proves nothing on its own");
+        assert!(!grants_whole_partition(&db, &key), "half a day proves nothing about the DAY on its own");
         assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run");
         assert!(db.dedup_clean_fp.contains_key(&key), "two clean halves cover the day and must certify the partition");
         Ok(())
@@ -12422,7 +12502,7 @@ mod tests {
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
 
         assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
-        assert!(!db.dedup_clean_fp.contains_key(&key));
+        assert!(!grants_whole_partition(&db, &key));
         drop(db); // the restart: coverage evidence must not die with the process
 
         let db = Database::with_config(cfg).await?;
@@ -12457,7 +12537,7 @@ mod tests {
         // A new file lands in the partition: the fp the first slice was proved under is dead.
         insert_a_span(&db, &project, "late", day.timestamp_micros() + 1).await?;
         assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run");
-        assert!(!db.dedup_clean_fp.contains_key(&key), "a moved file set voids the first slice's evidence — no certification");
+        assert!(!grants_whole_partition(&db, &key), "a moved file set voids the first slice's evidence — no whole-partition certification");
         Ok(())
     }
 

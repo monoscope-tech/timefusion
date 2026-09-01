@@ -3497,6 +3497,17 @@ pub struct StoredCertification {
     /// whole-partition skip through `fp`.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Whether the certification may still grant the WHOLE-PARTITION skip, or
+    /// only vouch for the files it names.
+    ///
+    /// Load-bearing across restarts: slice-derived certifications are stale by
+    /// construction (they proved one time window, never a day), and prod
+    /// restarts on every deploy. Restoring them as non-stale would let a proof
+    /// about ten minutes satisfy a day-wide skip. `default` = false so stores
+    /// written before this field keep their old meaning: they only ever held
+    /// whole-day grants.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// Wall-clock ms since the epoch, now.
