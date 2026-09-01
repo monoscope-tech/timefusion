@@ -156,18 +156,31 @@ contention, so green meant nothing there.
    ~27% of a 16-worker fleet's capacity spent inside scans alone, against dedup's
    87% share.
 
-   The sharding is a deliberate memory-for-IO trade made when the coordinator
-   pool was 4.2 GB. It is now 10 GB, and DataFusion can spill a grouped
-   aggregate — so the trade should be re-derived, not assumed. **Do not change
-   it blind:** the failure mode is the OOM class this codebase has fought all
-   month. Measure single-pass-with-spill against N-shard re-read on the local
-   bench first.
+   **The local bench refutes the shard-re-read reading, and reattributes the
+   cost.** `TF_BENCH_PROBE=1` on the same 1,148 MB prod file, 1 GB pool:
 
-   **Instrument gap to close first:** `maintenance_scan_pruning` carries no
-   operation label, so these totals cannot be split between dedup probes and
-   rollup builds with certainty. The 6x-identical-bytes pattern is
-   probe-sharding's signature, but add the label before quoting these as
-   dedup-only.
+   | passes | secs |
+   |---|---|
+   | 1 shard | 0.2 |
+   | 2 shards | 0.3 |
+   | 4 shards | 0.4 |
+   | 6 shards | 0.6 |
+
+   Six passes cost 0.6 s, not minutes — because **the probe reads only its dedup
+   key columns** (`timestamp`, `id`), and parquet prunes the rest. The same file
+   costs ~43 s to scan in full (the `scan only` variant). So a key-only probe is
+   ~200x cheaper than a full read, sharding it is nearly free, and **the GB-scale
+   90-1,450 s scans in prod are almost certainly NOT probes** — they are
+   all-column reads: the dedup chunk REWRITES (which re-read their files per
+   chunk) or rollup source scans.
+
+   **So the next step is attribution, not optimisation.** `maintenance_scan_pruning`
+   carries no operation label — the gap I flagged when I published those totals,
+   and the reason I twice drew the wrong conclusion from them (first "probes are
+   cheap" on a cold sample, then "probes are the cost" on a warm one). Add
+   `operation` and `phase` to that log line, then re-read. Changing the shard
+   count on this evidence would be optimising something that costs 0.6 s.
+
 4. **Repair is running and retiring nothing** — 1,059 worker-seconds for zero
    queue movement, `compaction_incomplete` 23 → 126. Not diagnosed.
 5. **Do not reallocate dedup's share** until 1-3 land: if certification starts
