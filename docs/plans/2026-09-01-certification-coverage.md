@@ -181,3 +181,48 @@ After the sweep covers one busy project's full 14-day window: re-run the latency
 matrix on that project, confirm the plan no longer contains `DedupExec`, and
 confirm the 42–47 s point moves. That measurement is what the whole chain exists
 for — anything short of it is a counter moving, not a query getting faster.
+
+## Deploy 25 result: the main table cannot be certified at ANY granularity yet
+
+With `run_certification_pass` finally reaching `otel_logs_and_spans`:
+
+| counter | value | meaning |
+| --- | --- | --- |
+| `cert_granted_total` | **0** | not one whole-date grant |
+| `cert_probe_declined` | 68 | every probe found duplicates |
+| `cert_skip_blocked_overlap` | 7,611 | per-file path blocked too |
+| `cert_skip_files` | 0 | nothing skippable |
+
+**This corrects the headline claim I made earlier tonight.** I argued dedup is "a
+proof, not a removal" because it drops 0.0008% of rows. But a partition needs only
+ONE duplicate to be uncertifiable, so a tiny global rate spread thinly makes EVERY
+partition dirty. Duplicates here are **sparse but ubiquitous** — the worst case for
+certification, and the reason the auxiliary tables (genuinely clean) granted 437
+while the main table grants nothing.
+
+Both granularities are therefore closed:
+
+- **Whole-date** — 0/68. Needs a partition with zero duplicates; there are none.
+- **Per-file** — 7,611 overlap blocks, 0 skippable. A certified file may only skip
+  if no uncertified file overlaps it in time, and on a dup-bearing date its
+  neighbours are always uncertified.
+
+### What this means for the plan
+
+The read-path lever is **gated on the write path**, not on certification
+scheduling. `DedupExec` cannot leave a plan for `otel_logs_and_spans` until the
+duplicates are physically removed — which is the 2,290-task `pending_dedup`
+backlog. Certification is not an alternative to draining it; it is what *becomes
+available* once drained, and it will then hold the gain cheaply.
+
+So maintenance throughput is the binding constraint after all, which is where the
+night started. The certification work is not wasted — it is live, correct, proven
+on real queries (`dedup_skipped_per_date` 0 -> 6 on auxiliary/clean partitions),
+and it is the mechanism that converts a drained backlog into query latency. But it
+cannot lead.
+
+**Next, in order:**
+1. Drain `pending_dedup` for the busiest projects' recent dates specifically —
+   dedup ordering currently ranks by age, not by which dates queries read.
+2. Re-run the certification probe on those dates; they should then grant.
+3. Only then does the latency matrix move.
