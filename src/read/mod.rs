@@ -204,9 +204,8 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
         metrics::counter!(crate::database::scan_metric_names::CERT_SKIP_BLOCKED_NO_STATS).increment(1);
         return HashSet::new();
     }
-    let (skippable, blocked): (Vec<_>, Vec<_>) = certified
-        .into_iter()
-        .partition(|(_, span)| span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi)));
+    let (skippable, blocked): (Vec<_>, Vec<_>) =
+        certified.into_iter().partition(|(_, span)| span.is_some_and(|(lo, hi)| uncertified.iter().flatten().all(|(flo, fhi)| *fhi < lo || *flo > hi)));
     // Counted separately because they mean opposite things: overlap says
     // certification is too SPARSE (a certified file still has an uncertified
     // neighbour, so contiguous runs are what pay), while the no-stats return
