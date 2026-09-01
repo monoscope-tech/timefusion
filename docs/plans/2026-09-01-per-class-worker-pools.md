@@ -104,10 +104,46 @@ still needs the claim to be non-blocking.
 1. **Keep the claim path non-blocking.** As of `0876b07f` it is: the only
    remaining `acquire().await` is unreachable from the coordinator. The rule to
    hold is that no new one may be added — a pool design depends on it.
-2. **Add a per-class pool to the worker spawn** in `mod.rs:4697`: instead of
-   `coordinator_job_workers` identical tasks looping over `operation_cycle()`,
+2. **Add a per-class pool to the worker spawn** in `mod.rs:4731`: instead of
+   `coordinator_job_workers` identical tasks each rotating `operation_cycle()`,
    spawn per class with its own count. `claim_coordinator_task(operation)` is
    already per-operation, so the claim path needs no change.
+
+   **The cycle is already a weighted round-robin, so the weights map directly.**
+   `CYCLE_BALANCED` is 10 slots: Dedup 3, BaseRollup 3, DerivedRollup 1,
+   HotPacking 1, SealedConsolidation 1, Repair 1. Over 16 workers that is:
+
+   | pool | workers | from |
+   |---|---|---|
+   | Dedup | 5 | 3/10 of 16 |
+   | BaseRollup | 5 | 3/10 of 16 |
+   | DerivedRollup | 2 | 1/10, rounded up |
+   | HotPacking | 1 | 1/10 |
+   | SealedConsolidation | 1 | 1/10 |
+   | Repair | 1 | 1/10, and it matches `repair_rewrite_sem`'s single permit exactly |
+
+   Note the last row: repair's pool size and its rewrite permit become the same
+   number, which is the whole point — the permit disappears.
+
+   **The one real design question is `CYCLE_COVERAGE_SHORT`.** The cycle is not
+   static: when `rollup_median_contiguous_days` is below goal the fleet
+   reweights toward the rollup chain, because six of ten balanced slots go to
+   work that cannot move the metric governing 14d/30d query latency (measured
+   2026-08-18). Fixed pools cannot do that. Three options, in preference order:
+
+   1. **Resizable pools** — workers hold a per-class token from a `Semaphore`
+      whose permits are adjusted when coverage state flips. Keeps the dynamic
+      behaviour; the token is taken BEFORE the claim, so the invariant holds.
+   2. **Two static shapes** — a balanced set and a coverage-short set, switched
+      by draining and respawning. Simple, but a respawn mid-unit is exactly the
+      abandonment this whole night was about.
+   3. **Give up the reweighting** — measure first whether it still earns its
+      keep now that rollup completes at ~480/h instead of 121/h. It was added
+      when the rollup chain was starved; that may no longer be true.
+
+   Option 1 is the same mechanism as today's gates, but applied to a *class*
+   rather than a *resource* — and a class token can always be honoured by
+   simply not claiming, which is why it does not reintroduce parking.
 3. **Delete the gates as their pools land**, one at a time, each with the
    incident it was added for named in the commit — `maintenance_debt_slots` and
    `maintenance_derived_reserve` are reserve mechanisms that a rollup pool makes
