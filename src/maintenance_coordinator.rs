@@ -6492,6 +6492,18 @@ mod tests {
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
     }
 
+    /// A busy pool is not an oversized unit. `resource_admission` is classed as
+    /// a capacity failure, so `retry_or_split` SPLITS on it — right when
+    /// admission's ceiling was a static `MAX_DECODED_BYTES`, wrong once it
+    /// scales with occupancy. Prod 2026-09-01: 230,015 such retries in 33
+    /// minutes with `pending_dedup` climbing 2,857 -> 3,533, because every
+    /// refusal split a unit into shards that were each refused in turn.
+    #[test]
+    fn a_busy_pool_refusal_must_not_be_classed_as_a_capacity_failure() {
+        assert!(is_capacity_failure("resource_admission"), "a static over-budget estimate still splits");
+        assert!(!is_capacity_failure("admission_busy"), "but a transient busy pool must back off, not multiply the queue");
+    }
+
     /// The ceiling is only meaningful if the REQUEST is honest. Prod
     /// 2026-09-01, five minutes after the ceiling shipped: 1,339
     /// `resource_admission` retries in one window, because every caller asked

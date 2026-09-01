@@ -327,6 +327,15 @@ mod batch_rows_tests {
     }
 }
 
+/// How long a unit waits after the pool turned it away for being busy.
+///
+/// Backs off without splitting: the unit is the right size, the pool simply had
+/// no room this instant. Capped so a lane cannot go quiet for long once the
+/// pool drains.
+fn admission_backoff(attempts: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64 << attempts.min(6))
+}
+
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
 pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
@@ -1810,7 +1819,19 @@ impl Database {
         // if the request is honest.
         let request = Resources { cpu: 1, decoded_bytes: estimated_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
-            retry("resource_admission".to_owned(), std::time::Duration::from_secs(1))?;
+            // TRANSIENT, and deliberately not `resource_admission`. That reason
+            // is a capacity failure, which means `retry_or_split` SPLITS the
+            // unit — correct when admission's ceiling was a static
+            // `MAX_DECODED_BYTES` ("the estimate exceeds what admission can ever
+            // grant"), and wrong now that the ceiling scales with pool
+            // occupancy. The request is clamped to `MAX_DECODED_BYTES`, so a
+            // refusal can only mean "the pool is busy right now".
+            //
+            // Splitting on it multiplied the queue instead of shedding work:
+            // prod 2026-09-01 logged 230,015 `resource_admission` retries in 33
+            // minutes with `pending_dedup` climbing 2,857 -> 3,533, because each
+            // refusal split a unit into shards that were each refused in turn.
+            self.retry_task(&key, "admission_busy".to_owned(), admission_backoff(task.attempts))?;
             return Ok(true);
         };
         let probe_hash_shards = usize::try_from(estimated_bytes.div_ceil(MAX_DECODED_BYTES).clamp(1, DEDUP_BUCKET_COUNT)).unwrap_or(1);
@@ -3136,7 +3157,8 @@ impl Database {
         // occupancy-scaled ceiling refuses everything on a busy pool.
         let request = Resources { cpu: 1, decoded_bytes: task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
-            retry("resource_admission".to_owned(), 1)?;
+            // Transient — see the dedup site.
+            self.retry_task(&key, "admission_busy".to_owned(), admission_backoff(task.attempts))?;
             return Ok(true);
         };
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
