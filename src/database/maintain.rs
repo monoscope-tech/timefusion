@@ -6145,6 +6145,19 @@ impl Database {
                         // every candidate that has never been examined.
                         self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), partition_file_fp(pre.clone()));
                         metrics::counter!(scan_metric_names::CERT_PROBE_DECLINED).increment(1);
+                        // HOW dirty, not just that it is dirty — this decides the
+                        // removal mechanism and cannot be measured from outside,
+                        // because a psql probe reads through `DedupExec` and sees
+                        // duplicates already collapsed. A date whose dups sit in
+                        // 1-3 of its 144 bins wants surgical bin-scoped removal
+                        // (minutes per date); one with dozens wants a full-date
+                        // unit (hours per project) and ordering matters far more.
+                        //
+                        // Prod 2026-09-01: whole-date certification granted 0 of 68
+                        // on otel_logs_and_spans, so every candidate date is dirty
+                        // SOMEWHERE — the open question is the spread.
+                        metrics::counter!(scan_metric_names::CERT_DECLINED_DIRTY_BINS).increment(dup_bins.len() as u64);
+                        info!(project, table_name, date, dirty_bins = dup_bins.len(), event = "dedup_certify_declined");
                     }
                     cleared
                 }

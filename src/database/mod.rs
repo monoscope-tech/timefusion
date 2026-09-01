@@ -350,6 +350,13 @@ pub mod scan_metric_names {
         // climbing at a FLAT granted means the window is genuinely dup-bearing
         // rather than the producer being starved.
         CERT_PROBE_DECLINED = "timefusion.scan.cert_probe_declined" as scan.cert_probe_declined;
+        // Summed dirty BINS across declined dates. `cert_declined_dirty_bins /
+        // cert_probe_declined` is the mean dirty bins per dirty date, out of 144.
+        // A low ratio means duplicates are CONCENTRATED and bin-scoped removal
+        // cleans a date in minutes; a high one means they are spread and the
+        // full-date unit is unavoidable. Nothing outside the process can measure
+        // this — a psql probe reads through `DedupExec` and sees them collapsed.
+        CERT_DECLINED_DIRTY_BINS = "timefusion.scan.cert_declined_dirty_bins" as scan.cert_declined_dirty_bins;
         CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
         // Why a CERTIFIED file still could not skip. Two very different
         // refusals: one uncertified file with no statistics blocks the entire

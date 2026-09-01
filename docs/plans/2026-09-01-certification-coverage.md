@@ -226,3 +226,56 @@ cannot lead.
    dedup ordering currently ranks by age, not by which dates queries read.
 2. Re-run the certification probe on those dates; they should then grant.
 3. Only then does the latency matrix move.
+
+## The pivot: removal is the binding constraint, and the mechanism hinges on ONE number
+
+Deploy 25 closed certification as a leading strategy. The work now is draining
+duplicates so dates *become* certifiable. Certification then converts a drained
+backlog into query latency cheaply — it holds the gain, it cannot create it.
+
+### Why the discriminator cannot be measured from outside
+
+I tried to count physical duplicates with psql:
+
+```sql
+SELECT count(*) FROM (SELECT timestamp, id FROM otel_logs_and_spans
+  WHERE project_id=... AND timestamp >= ... GROUP BY timestamp, id HAVING count(*) > 1)
+```
+
+It returned 1,730 dup groups (all inside ONE hour) on one date and **0** on three
+others — while the in-process probe declines every date. The query is unreliable
+because **the read path applies `DedupExec` (bounded mode) and collapses
+duplicates before the aggregate sees them**. Only the maintenance probe observes
+physical rows.
+
+So the number is instrumented instead: `cert_declined_dirty_bins /
+cert_probe_declined` = mean dirty bins per dirty date, out of 144.
+
+### The decision it drives
+
+- **Low ratio (1-3 of 144)** — duplicates are CONCENTRATED. A date is cleanable
+  with surgical bin-scoped rewrites in minutes, and a busy project's 14-day window
+  could drain in one night. This makes ordering almost irrelevant and makes the
+  whole-date unit the bug.
+- **High ratio (dozens)** — duplicates are SPREAD. The full-date unit is
+  unavoidable at ~21 min each, and the lever is ordering: dedup currently ranks by
+  AGE, so it works the oldest backlog while queries read the newest dates. A
+  scoped boost (dedup tasks inside the top-K-by-file-count projects' last-14-day
+  window jump the queue) beats a global re-rank.
+
+Do not build either until the ratio is read.
+
+### Deploy discipline from here
+
+Units average ~21 min and die to process exit; ~8 restarts tonight each killed
+in-flight dedup work. This instrument is the LAST deploy of the session. After it,
+the most valuable thing for `pending_dedup` is to stop deploying and let the fleet
+run quiet.
+
+### For the morning, not for tonight
+
+A 0.0004% duplicate rate that still touches every partition smells like **client
+retries landing in separate files**. The durable 100x fix is preventing them at
+ingest — a dedup-key check within the MemBuffer's 10-minute bucket — so new dates
+are born certifiable and neither the rewrite nor the probe is needed for them.
+That is a design discussion with the user, not a 1 AM build.
