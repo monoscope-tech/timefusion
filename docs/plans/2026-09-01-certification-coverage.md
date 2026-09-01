@@ -347,3 +347,48 @@ and morning is to stop deploying.**
 4. Separately, the durable 100x fix: prevent duplicates at ingest via a dedup-key
    check inside the MemBuffer's 10-minute bucket, so new dates are born
    certifiable and need neither rewrite nor probe. Design discussion first.
+
+## The ordering defect, measured — and the obvious fix REFUTED locally
+
+`months_old_history_outranks_the_dates_dashboards_read` (in
+`maintenance_coordinator.rs`) pins it as a passing test:
+
+- `STARVATION_MICROS` is 3 days, so of a 14-day dashboard window only days 1-3
+  escape the starved lane.
+- Starved work drains OLDEST-first, so day 90 outranks day 4 and day 10.
+- Capacity goes to data nobody queries before reaching the window everybody does.
+  Prod 2026-09-01: `pending_dedup` ~2,250 with a 1.7M-row/day project at 0 of 8
+  sampled dates certified.
+
+### Refuted: raising the threshold
+
+Raising `STARVATION_MICROS` 3d -> 15d, so the measured 7d/14d windows order
+newest-first, **is wrong and makes it worse**. `starved` is `u8::MAX` when NOT
+starved and smaller-is-better as it ages, so **any starved task outranks any
+non-starved task**. Raising the threshold EVICTS the window from the privileged
+lane rather than protecting it.
+
+The local suite caught it in minutes: **9 failures**, including my own new test
+plus `damage_outranks_work_inside_the_starvation_window`,
+`sealed_work_ages_out_of_starvation_without_becoming_oldest_first` and
+`the_starvation_window_demotes_the_biggest_debt_when_it_is_young` — eight
+invariants that constant is load-bearing for. Reverted, and recorded at the
+constant so it is not retried.
+
+### The actual lever: bound the starved lane's SHARE, not its threshold
+
+`claim_next` already does exactly this for sealed work — a `claim_tick` counter
+reserves one claim in two, halved to one in four while the frontier is behind. The
+same shape applies: reserve a fraction of claims for tasks whose slice falls
+INSIDE the query window, chosen without reference to `starved`, so history cannot
+monopolise the queue while remaining able to drain.
+
+**Do not implement this blind.** That reservation share is the single most
+dangerous dial in the file: raising the sealed share to 3-in-4 OOM-killed prod at
+**124.9 GB anon RSS** (2026-08-17), because sealed partitions are far larger than
+frontier slices and the same permit count then admits far more bytes. A third lane
+changes the same fan-in envelope.
+
+Ladder, per CLAUDE.md: `timefusion sim <journal>` first — it is IO-free and
+replays a real prod queue on virtual time, so it answers "does the window drain
+without starving the tail" in seconds. Then `run-unit`, then staging, then prod.

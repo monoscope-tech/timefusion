@@ -3239,6 +3239,22 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// frontier, plus the last two sealed days) ordered newest-first for freshness,
 /// and treats everything behind it as backlog to be drained oldest-first for
 /// contiguity.
+///
+/// 2026-09-01, REFUTED CHANGE — do not repeat it. Raising this to 15 days, to put
+/// the measured 7d/14d dashboard windows back in newest-first order, is WRONG and
+/// makes the problem worse. `starved` is `u8::MAX` for NON-starved work and
+/// smaller (better) the longer something has waited, so **any starved task
+/// outranks any non-starved task**. Raising the threshold does not protect the
+/// window — it EVICTS the window from the privileged lane, so it loses to old
+/// history by more. The local suite caught it: 9 failures, including
+/// `damage_outranks_work_inside_the_starvation_window` and
+/// `sealed_work_ages_out_of_starvation_without_becoming_oldest_first`.
+///
+/// The real defect is still real (see
+/// `docs/plans/2026-09-01-certification-coverage.md`): months-old history
+/// outranks the dates dashboards read. But the lever is NOT this threshold — it
+/// is bounding how much of the claim budget the starved lane may take, the way
+/// `claim_next` already reserves one claim in two for sealed work.
 /// The claim-order tuple `claim_next` minimises: see `TaskJournal::rank`.
 type Rank = (u8, u8, u8, u8, i64, i64, i64);
 
@@ -3947,6 +3963,57 @@ mod tests {
         let child = journal.tasks().find(|task| task.key != key && task.key.project_id == "split").expect("a split child");
         assert!(child.key.slice.width() < end - start, "the child really is narrower: {}", child.key.slice.width());
         assert_eq!(scheduling_class(child, now).2, peer_width, "a split child must rank at its PARENT's width, not its own {}", child.key.slice.width());
+    }
+
+    /// THE DASHBOARD-WINDOW ORDERING DEFECT, pinned as a measurement.
+    ///
+    /// `STARVATION_MICROS` is 3 days and starved work drains OLDEST-first, so of
+    /// the 14 days a dashboard reads, only days 1-3 stay newest-first. Days 4-14
+    /// are all "starved" and join the oldest-first backlog lane, where they
+    /// compete with MONTHS of history that is starved by a wider margin and
+    /// therefore outranks them.
+    ///
+    /// Prod 2026-09-01 is why this matters: certification cannot grant on
+    /// `otel_logs_and_spans` until duplicates are physically removed (0.0004% of
+    /// rows but spread over ~50 of 144 bins per date), so dedup order decides
+    /// when a queried window becomes certifiable. `pending_dedup` sat at ~2,250
+    /// while a 1.7M-row/day project measured 0 of 8 sampled dates certified.
+    ///
+    /// Months-old history OUTRANKS the dates dashboards read, and the threshold
+    /// is not the lever.
+    ///
+    /// `STARVATION_MICROS` is 3 days and starved work drains oldest-first, so of
+    /// the 14 days a dashboard reads only days 1-3 escape the starved lane — and
+    /// `starved` is `u8::MAX` when NOT starved, so those three lose to everything
+    /// in it. Prod 2026-09-01: `pending_dedup` ~2,250 while a 1.7M-row/day project
+    /// had 0 of 8 sampled dates certified.
+    ///
+    /// Raising the threshold is REFUTED (see `STARVATION_MICROS`): it evicts the
+    /// window from the privileged lane and it loses by more. This pins the real
+    /// shape so a future fix — bounding the starved lane's share of claims, as
+    /// `claim_next` already does for sealed work — has a baseline to move.
+    #[test]
+    fn months_old_history_outranks_the_dates_dashboards_read() {
+        const DAY: i64 = 24 * 60 * 60 * 1_000_000;
+        let now = 400 * DAY;
+        let rank = |days_ago: i64| {
+            let end = now - days_ago * DAY;
+            scheduling_class(&task("p", end - DAY, end, Operation::Dedup), now)
+        };
+        let (day2, day4, day10, day90) = (rank(2), rank(4), rank(10), rank(90));
+
+        // Only the first three days of a 14-day window escape the starved lane.
+        assert_eq!(day2.1, u8::MAX, "day 2 is inside the 3d floor, so it is NOT starved");
+        assert!(day4.1 < u8::MAX, "day 4 already IS starved");
+        assert!(day10.1 < u8::MAX, "and so is day 10");
+
+        // `starved` is compared before every other term, and smaller wins — so
+        // the further past the horizon, the better the rank.
+        assert!(day90 < day4, "months-old history outranks a date the dashboard reads");
+        assert!(day90 < day10, "and outranks the middle of the window");
+        // And the unstarved days lose to ALL of it: u8::MAX is the worst value,
+        // which is why raising the threshold cannot be the fix.
+        assert!(day4 < day2, "an in-window starved date still outranks an unstarved newer one");
     }
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
