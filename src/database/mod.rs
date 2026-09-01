@@ -19565,6 +19565,32 @@ mod tests {
 
     /// Dedup yields to persistence: an unhealthy flush path skips the pass
     /// whole, leaving the queue intact for a later tick.
+    /// The flush path fills a dirty-bin queue that nothing drains for
+    /// rollup-declared tables — the dedup cron skips exactly those. Prod
+    /// 2026-09-01: 41,676 entries, `dirty_bin_eligible_total` at 0 all night,
+    /// and the whole sidecar rewritten on every enqueue.
+    #[serial]
+    #[tokio::test]
+    async fn undrainable_dirty_bins_are_retired_not_left_to_grow() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-retire-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
+
+        // Coordinator-owned (declares rollups) and a table the cron still serves.
+        let date = chrono::DateTime::from_timestamp_micros(old).expect("timestamp").date_naive().to_string();
+        let bin = old.div_euclid(10 * 60 * 1_000_000);
+        db.enqueue_dirty_bin(&project, "otel_logs_and_spans", &date, bin);
+        db.enqueue_dirty_bin(&project, "__cron_owned_table__", &date, bin);
+        assert_eq!(db.dedup_dirty_bins.len(), 2);
+
+        assert_eq!(db.retire_undrainable_dirty_bins(), 1, "only the queue with no consumer is dropped");
+        let survivors: Vec<String> = db.dedup_dirty_bins.iter().map(|entry| entry.key().1.clone()).collect();
+        assert_eq!(survivors, vec!["__cron_owned_table__".to_owned()], "the cron's own queue must be untouched");
+        assert_eq!(db.retire_undrainable_dirty_bins(), 0, "and a second pass finds nothing");
+        Ok(())
+    }
+
     /// Repair must not queue on the hygiene permits, and must not run two at
     /// once. Prod 2026-09-01: as soon as the liveness clock let repair units
     /// live tens of minutes, they overlapped each other and the hygiene bins on

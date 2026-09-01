@@ -753,6 +753,22 @@ impl Database {
                 warn!(retired, event = "maintenance_undeclared_tier_tasks_retired", "queued work for a tier no longer declared");
             }
         }
+        // Dirty bins nothing will ever drain, dropped where they are noticed
+        // rather than where they are made.
+        //
+        // The dedup cron skips every rollup-declared source as "owned by durable
+        // coordinator tasks" (`mod.rs`, reverting 954d516), and both tables that
+        // produce dirty bins declare rollups. So the flush path has been filling
+        // a queue with no consumer: 41,676 entries on 2026-09-01 and growing
+        // ~100/hour, with `dirty_bin_eligible_total` at 0 all night — while
+        // `persist_dirty_bins` rewrote the whole sidecar on every enqueue.
+        //
+        // Retired HERE, not suppressed at `enqueue_dirty_bin`: the queue is the
+        // flush path's honest record of what changed, and six tests correctly
+        // assert it produces one. What is wrong is that nobody consumes it, and
+        // the fix for unconsumed durable work is to retire it — the same shape
+        // as `retire_undeclared_tiers` directly above.
+        self.retire_undrainable_dirty_bins();
         // Why the biggest debt in the fleet is not being worked on.
         //
         // `planned=N` alone cannot distinguish "nothing needs doing" from "the
@@ -5224,6 +5240,27 @@ impl Database {
         bins.sort_by(|a, b| (&a.table_name, &a.project_id, &a.date, a.bin).cmp(&(&b.table_name, &b.project_id, &b.date, b.bin)));
         crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::DIRTY_BINS, &bins);
         crate::observability::maintenance_stats().dirty_bin_queue_depth.store(bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drop queued dirty bins for tables whose dedup the coordinator owns, since
+    /// the cron that drains this queue skips exactly those tables. Returns the
+    /// number retired. See the call site for why this is the consumer's job.
+    pub(crate) fn retire_undrainable_dirty_bins(&self) -> usize {
+        let undrainable: Vec<DirtyBinKey> = self
+            .dedup_dirty_bins
+            .iter()
+            .filter(|entry| get_schema(&entry.key().1).is_some_and(|schema| !schema.rollups.is_empty()))
+            .map(|entry| entry.key().clone())
+            .collect();
+        if undrainable.is_empty() {
+            return 0;
+        }
+        for key in &undrainable {
+            self.dedup_dirty_bins.remove(key);
+        }
+        self.persist_dirty_bins();
+        warn!(retired = undrainable.len(), event = "dirty_bins_retired_undrainable", "dropped dirty bins for tables the dedup cron does not serve");
+        undrainable.len()
     }
 
     pub(crate) fn enqueue_dirty_bin(&self, project_id: &str, table_name: &str, date: &str, bin: i64) {
