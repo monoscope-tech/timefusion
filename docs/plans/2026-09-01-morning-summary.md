@@ -181,8 +181,28 @@ contention, so green meant nothing there.
    `operation` and `phase` to that log line, then re-read. Changing the shard
    count on this evidence would be optimising something that costs 0.6 s.
 
-4. **Repair is running and retiring nothing** — 1,059 worker-seconds for zero
-   queue movement, `compaction_incomplete` 23 → 126. Not diagnosed.
+4. **Repair is permit-starved, and the permit is sized against a pool that has
+   since doubled.** DIAGNOSED. 1,059 worker-seconds for zero queue movement and
+   `compaction_incomplete` 23 → 126 is not failure — it is **173
+   `repair_rewrite_permit_busy` events in 40 minutes**: units claim, cannot get
+   the single `repair_rewrite_sem` permit, hand the worker back (correctly — that
+   is the 2026-09-01 anti-parking fix) and retry every 30 s.
+
+   One permit x ~20-50 min per whole-file rewrite is **~2 units/hour**, against
+   `pending_repair = 358`. That is ~179 hours to drain, i.e. the queue is flat by
+   arithmetic, not by fault.
+
+   The permit was set to 1 when the coordinator pool was 4.2 GB. It is now
+   ~10 GB, and `benches/rewrite_throughput.rs` measures **six** concurrent
+   whole-file sorts of a 1.1 GB file at a 10 GB pool running clean (94 MB/s
+   aggregate, zero failures) — the exact shape of a repair rewrite. So 1 is very
+   conservative.
+
+   **Recommendation: raise to 2 and watch, not higher.** Repair rewrites are the
+   longest units in the fleet and the permit also exists so one of them cannot
+   starve every other lane; doubling is the smallest step that tests the
+   arithmetic. Ship it ALONE, after deploy 17 is verified — repair's peak
+   transient heap is the OOM class this codebase has fought all month.
 5. **Do not reallocate dedup's share** until 1-3 land: if certification starts
    working, the same worker-seconds buy a read-path win instead of nothing.
 
