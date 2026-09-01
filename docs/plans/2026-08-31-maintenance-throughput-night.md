@@ -381,6 +381,35 @@ and is not touched by this branch. `ordering_pushdown::one_unsorted_file_…`
 failed once under full-suite load and passed 4/4 in isolation, and passes with
 either new knob reverted — a load flake, not a regression.
 
+## Deployed: `fb2e4528`, and the wedged file is gone
+
+First evidence from the new build (image `fb2e452`, container `v5sf7cbcoy5n`):
+
+```
+maintenance_repair_attempts_reset reset=767              <- the migration ran
+budget tree ... coordinator_share_gb=8 heavy_share_gb=4 light_share_gb=3
+repair_bin_sliced occurrences: 0                          <- slicing is off
+wave_bin_staged  selected_files=1 bytes_in=1148230580 staging_ms=410023
+retry.Repair.compaction_debt_remaining = 1                <- a SUCCESS requeue
+retry.Repair.worker_error              = 0
+```
+
+**`bytes_in=1148230580` is `big1148.parquet`** — the file that never once
+reached `wave_bin_staged` in 100 attempts. It staged in **410 s** and committed.
+410 s against the 39 s measured locally is the OVH download of an uncached
+1.1 GB file plus a loaded box; it is comfortably inside the new idle window and
+would have been killed at 900 s under the old one.
+
+First ~11 minutes of unit outcomes: BaseRollup 12 Complete, Dedup 7 Complete /
+8 timed out / 3 Superseded, DerivedRollup 1 Complete / 3 Retry
+(`base_tier_incomplete`), Repair 1 Retry (`compaction_debt_remaining`).
+`processed_bytes_total` is ~19 MB/s against the old build's ~5.8 MB/s — early,
+noisy, and the number to re-read after a quiet window.
+
+**Dedup still times out at 300 s** (`retry.Dedup.worker_error = 6`). Expected:
+its deadline was not raised and it does not report progress, so the liveness
+clock does not cover it. That is the next lane.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
