@@ -125,6 +125,11 @@ async fn main() {
         return;
     }
 
+    if std::env::var("TF_BENCH_PROBE").is_ok() {
+        probe_shards(&path, pool_mb, bytes, spill.path()).await;
+        return;
+    }
+
     run("scan only".to_owned(), "8192", 1, 1, false).await;
     for batch in ["256", "2048", "8192"] {
         for partitions in [1usize, 8] {
@@ -192,4 +197,70 @@ async fn one_rewrite(path: &str, runtime: Arc<RuntimeEnv>) -> Result<(), String>
         batch.map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// What do the dedup probe's hash SHARDS cost?
+///
+/// `stage_dedup_partition_range` runs the duplicate probe once per shard, and
+/// each pass re-reads the selected files — the shard predicate is a hash over
+/// the dedup keys, so nothing prunes. Prod 2026-09-01 shows the consequence
+/// directly in `maintenance_scan_pruning`: the same 3,433.7 MB scanned SIX
+/// times (90-118 s each, ~640 s total) and the same 9,408 MB scanned twice at
+/// ~1,450 s. Across 45 warm minutes, 462 scans read 58.88 GB in 11,821 s.
+///
+/// Sharding is a deliberate memory-for-IO trade, made when the coordinator pool
+/// was 4.2 GB: one pass must hold the partition's whole dedup-key cardinality,
+/// N passes hold 1/N of it. The pool is now ~10 GB and DataFusion spills
+/// grouped aggregates, so the trade is worth re-deriving rather than assuming —
+/// which is what this measures: wall time for N passes vs one, at a given pool.
+///
+/// ```bash
+/// TF_BENCH_PROBE=1 TF_BENCH_PARQUET=… TF_BENCH_POOL_MB=1024 cargo bench --bench rewrite_throughput
+/// ```
+async fn probe_shards(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) {
+    use std::io::Write;
+    println!("\n{:<20} {:>8} {:>12} {:>10}", "probe variant", "secs", "MB/s in", "result");
+    for shards in [1usize, 2, 4, 6] {
+        let runtime = runtime(pool_mb * 1024 * 1024, spill);
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_config(session("8192", 1))
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        if ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.is_err() {
+            println!("{:<20} {:>8}", format!("{shards} shard(s)"), "REGISTER-FAILED");
+            continue;
+        }
+        let started = Instant::now();
+        let mut failed = None;
+        for shard in 0..shards {
+            // A non-pruning predicate, exactly like the real hash-bucket one:
+            // every pass still decodes every row. The hash itself is a crate UDF
+            // and irrelevant to the IO this measures.
+            let filter = match shards {
+                1 => String::new(),
+                _ => format!(" WHERE abs(length(CAST(\"id\" AS VARCHAR))) % {shards} = {shard}"),
+            };
+            let sql = format!(
+                "SELECT count(*) FROM (SELECT \"timestamp\", count(*) AS c FROM bin{filter} GROUP BY \"timestamp\", \"id\") AS g WHERE c > 1"
+            );
+            match ctx.sql(&sql).await {
+                Ok(df) => {
+                    if let Err(error) = df.collect().await {
+                        failed = Some(error.to_string());
+                        break;
+                    }
+                }
+                Err(error) => {
+                    failed = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let secs = started.elapsed().as_secs_f64();
+        let outcome = failed.map_or_else(|| "ok".to_owned(), |error| error.chars().take(46).collect());
+        println!("{:<20} {secs:>8.1} {:>12.2} {outcome:>10}", format!("{shards} shard(s)"), bytes as f64 / 1e6 / secs);
+        let _ = std::io::stdout().flush();
+    }
 }

@@ -111,8 +111,19 @@ contention, so green meant nothing there.
 
 ## What I would do next, in order
 
-1. **Verify deploy 16 in prod: watch `cert_slice_files_proved`.**
-   Expect a modest number: a ten-minute slice can only certify files whose whole
+1. **DONE — deploy 16 verified in prod.** `cert_slice_files_proved = 526`,
+   non-zero for the first time in the system's history, with `dedup_skipped`
+   still 0 (read flag off, so nothing about query results moved). **But
+   `cert_slice_files_unproven = 20,423`, so only 2.5% of files are being
+   certified** — the containment test rejects the rest because a ten-minute
+   slice cannot contain a file that spans longer.
+
+   **That ratio is the next lever, now quantified: the slice width must exceed
+   the file span, or evidence accrues at 2.5% of what the same scan could
+   prove.** Hot-packed files span hours, so the clean passes that would certify
+   them are the coarsened ones. Cheap experiment before any code: raise the
+   dedup coarsening floor for CLEAN partitions only, and watch the proved:unproven
+   ratio move. Expect a modest number: a ten-minute slice can only certify files whose whole
    span fits in ten minutes. The ratio against `cert_slice_files_unproven` says
    which slice widths would pay.
 2. **Then flip `timefusion_read_dedup_skip_per_file`** after diffing `count(*)`
