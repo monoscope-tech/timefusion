@@ -14820,6 +14820,29 @@ mod tests {
     /// under-reports the finished row group. The derived row cap is what actually bounds row groups,
     /// and it must land far below parquet's own default.
     #[test]
+    fn row_group_row_count_binds_far_below_the_parquet_default() {
+        const PARQUET_DEFAULT: usize = 1024 * 1024;
+        let otel = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
+        let rows = super::row_group_row_count(otel, 128 * 1024 * 1024, None);
+        assert!(rows < PARQUET_DEFAULT / 4, "otel row groups must shrink at least 4x, got {rows}");
+        // The BYTE target is what binds now, not the row floor: honouring a
+        // 32,768-row floor here would have emitted ~150 MB groups against a
+        // 128 MB target, and at the whale's real row width the same floor is a
+        // 2 GB group. The floor still protects genuinely narrow tables, where
+        // the byte target allows far more rows than it.
+        let modelled_row_bytes = 128 * 1024 * 1024 / rows;
+        assert!(rows * modelled_row_bytes <= 128 * 1024 * 1024, "the group must not exceed the byte target, got {rows} rows");
+        let narrow = crate::schema::get_schema("otel_metrics").expect("metrics schema");
+        assert!(super::row_group_row_count(narrow, 128 * 1024 * 1024, None) >= 32_768, "a narrow table still gets the floor");
+
+        // Monotonic in the operator-facing byte target, so raising the target
+        // raises the value that actually binds.
+        assert!(super::row_group_row_count(otel, 256 * 1024 * 1024, None) > rows);
+        // ...and it can never exceed the default it replaces, whatever the
+        // target — a huge target must not silently restore 1M-row row groups.
+        assert_eq!(super::row_group_row_count(otel, usize::MAX / 2, None), PARQUET_DEFAULT);
+    }
+
     /// A row group is the indivisible unit of a scan, so its DECODED size is
     /// what matters — and the per-type model that sized it is 14x off for the
     /// widest tenant. Prod 2026-09-01, one 204 MB file: every row group held
@@ -14839,21 +14862,6 @@ mod tests {
         assert!(super::row_group_row_count(otel, TARGET, Some(100)) >= modelled, "a narrow row must not be penalised by the model");
         // No measurement keeps the old behaviour exactly.
         assert_eq!(super::row_group_row_count(otel, TARGET, Some(0)), modelled, "an unusable measurement falls back to the model");
-    }
-
-    fn row_group_row_count_binds_far_below_the_parquet_default() {
-        const PARQUET_DEFAULT: usize = 1024 * 1024;
-        let otel = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
-        let rows = super::row_group_row_count(otel, 128 * 1024 * 1024, None);
-        assert!(rows < PARQUET_DEFAULT / 4, "otel row groups must shrink at least 4x, got {rows}");
-        assert!(rows >= 32_768, "floor keeps footer overhead from dominating, got {rows}");
-
-        // Monotonic in the operator-facing byte target, so raising the target
-        // raises the value that actually binds.
-        assert!(super::row_group_row_count(otel, 256 * 1024 * 1024, None) > rows);
-        // ...and it can never exceed the default it replaces, whatever the
-        // target — a huge target must not silently restore 1M-row row groups.
-        assert_eq!(super::row_group_row_count(otel, usize::MAX / 2, None), PARQUET_DEFAULT);
     }
 
     /// The repair sort runs 16 partitions, so its unspillable merge is 8x the
