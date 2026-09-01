@@ -406,6 +406,38 @@ First ~11 minutes of unit outcomes: BaseRollup 12 Complete, Dedup 7 Complete /
 `processed_bytes_total` is ~19 MB/s against the old build's ~5.8 MB/s — early,
 noisy, and the number to re-read after a quiet window.
 
+### Ground truth, ~45 minutes in: both wedged files are GONE
+
+Compared against the pre-deploy `get_add_actions` snapshot, the live Delta table
+has **retired 122 files / 3.60 GB**, and the two largest are:
+
+```
+2337.8 MB  2026-05-31  __HIVE_DEFAULT_PARTITION__   <- the table's LARGEST file
+1148.2 MB  2026-05-30  87576849                     <- the attempts=100 file
+```
+
+The 2.3 GB one staged in **1,150 s**. Under the old build it had two ways to
+fail and took both: the 900 s deadline killed it outright, and slicing would
+have cut its 28 GB decoded into ~28 full re-reads of an unprunable, uncached
+file. It is now rewritten, sorted, and committed.
+
+Every `maintenance_coordinator_unit_timed_out` in the window is **Dedup**. Zero
+for Repair.
+
+And the liveness clock keeps earning it. `maintenance_unit_slow` over the first
+hour reports three Repair units at **3031 s, 2679 s and 1562 s — all of which
+COMPLETED.** Every one would have been killed by the old 900 s deadline, and
+each kill would have discarded uncommitted work and re-queued the identical
+slice. (These are *elapsed* times; the rule is idleness, so a unit writing rows
+continuously never approaches the 3600 s window.) The same log shows completing
+Dedup units at 91 s and 149 s — the dedup timeouts are a different, heavier
+population, not a general slowness.
+
+Dedup timeout rate: 13 in the first ~58 minutes ≈ 13/hour, against the old
+build's 618 over 5 hours ≈ 124/hour. **~9x fewer**, from the batch and pool
+changes alone — but `pending_dedup` still grows, so arrivals still exceed
+completions.
+
 **Dedup still times out at 300 s** (`retry.Dedup.worker_error = 6`). Expected:
 its deadline was not raised and it does not report progress, so the liveness
 clock does not cover it. That is the next lane.
@@ -422,9 +454,15 @@ clock does not cover it. That is the next lane.
   adding to it at ~100/hour and `persist_dirty_bins` rewrites the entire
   40k-entry sidecar on **every** enqueue. The coordinator's Dedup units do the
   real work; this queue is vestigial for those tables. The fix is to stop
-  enqueuing for coordinator-owned tables (check `DedupRangeOptions.dirty_key`
-  first — `run_coordinator_dedup_once` passes `None`, but confirm no other
-  reader).
+  enqueuing for coordinator-owned tables. **Attempted and reverted: the producer
+  is the wrong seam.** Gating `enqueue_dirty_bin` on the same predicate the cron
+  uses broke six tests that correctly assert the write path's behaviour — the
+  queue is the flush's honest record of what changed, and the write path should
+  keep producing it. The defect is that nothing CONSUMES it for
+  coordinator-owned tables, so the fix belongs at the consumer end: either drain
+  it (the cron's comment explains why that is dangerous — one admitted bin holds
+  `maintenance_job_sem` for its 3600s stage deadline), or retire those bins
+  explicitly, the way `retire_undeclared_tiers` retires work for a deleted tier.
 - **HotPacking's 14 completions vs 472 retries is still unattributed.** Note
   that `retry("compaction_debt_remaining")` is a *success* requeue, not a
   failure, so some large share of those 472 is progress. The new
