@@ -279,3 +279,15 @@ retries landing in separate files**. The durable 100x fix is preventing them at
 ingest — a dedup-key check within the MemBuffer's 10-minute bucket — so new dates
 are born certifiable and neither the rewrite nor the probe is needed for them.
 That is a design discussion with the user, not a 1 AM build.
+
+### The concentrated case needs NO new machinery
+
+`stage_dedup_partition_range` already takes `DedupRangeOptions { slice:
+Option<TimeSlice>, .. }` — bin/slice-scoped rewrites are supported today. So if
+`cert_declined_dirty_bins / cert_probe_declined` comes back low, the fix is
+scheduling (hand the unit a narrow slice around the dirty bins the probe already
+identified), not a new code path. The probe returns exactly those bin ids and
+currently discards them after the decline.
+
+That makes the concentrated case a small, low-risk change — which is the main
+reason the ratio is worth one deploy to measure.
