@@ -19506,6 +19506,42 @@ mod tests {
         Ok(())
     }
 
+    /// A batch probe that finds no duplicates CERTIFIES the date it proved.
+    ///
+    /// The probe already GROUP BYs the dedup keys over the whole (project, date);
+    /// an empty result is the same predicate a zero-drop rewrite establishes, at
+    /// key-only cost. Prod 2026-09-01 measured `dedup_denied_never_certified` at
+    /// 164 of 177 eligible scans because certification only ever accrued as a
+    /// side effect of 21-minute rewrites on an age-ordered backlog, while queries
+    /// read recent dates — so the verdict was computed and thrown away.
+    #[tokio::test]
+    async fn a_clean_batch_probe_certifies_the_whole_date() -> Result<()> {
+        let cfg = create_test_config(&format!("batchprobe-certify-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
+        let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        const TEN_MIN: i64 = 10 * 60 * 1_000_000;
+        let row = |id: &str, ts: i64| json_to_batch(vec![test_span_ts(id, "only", &project, ts)]);
+        // Two bins, no duplicate anywhere on the date.
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean1", base)?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean2", base - TEN_MIN)?], true, None).await?;
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
+        assert!(db.dedup_clean_fp.get(&key).is_none(), "nothing is certified before the probe runs");
+
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+
+        let cert = db.dedup_clean_fp.get(&key).map(|entry| entry.value().clone()).expect("a clean probe certifies the date it proved");
+        assert!(!cert.stale, "a whole-date grant is live evidence, not the stale per-file kind a partial slice banks");
+        assert!(!cert.files.is_empty(), "and it names the files it proved, so the per-file skip stays reachable");
+        // The grant is what removes DedupExec: certified files union ABOVE it, so
+        // a partial grant only routes files around the operator.
+        assert!(db.dedup_window_clean(&*table.read().await, &project, "otel_logs_and_spans", (base - TEN_MIN, base + TEN_MIN)).granted());
+        Ok(())
+    }
+
     /// The probe phase's deadline is shared by every group, not re-granted per group.
     ///
     /// A per-probe `Duration` ran in waves of `rewrite_permits`, so many groups could take

@@ -5975,6 +5975,15 @@ impl Database {
             for bin in &bins {
                 self.dedup_dirty_bins.remove(&(project.clone(), table_name.to_string(), date.clone(), *bin));
             }
+            // Captured BEFORE the probe so `record_certification`'s fingerprint
+            // compare can still reject the grant if a commit lands while it runs.
+            // Reading the file set afterwards would compare the new set against
+            // itself and agree unconditionally — the compare is the whole
+            // soundness argument, so it has to straddle the probe.
+            let pre = {
+                let table = table.read().await;
+                Self::partition_files_by_pid(&table, &format!("date={date}")).ok().and_then(|mut by_pid| by_pid.remove(&project)).unwrap_or_default()
+            };
             match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
                 Ok(Ok(dup_bins)) => {
                     let stats = crate::observability::maintenance_stats();
@@ -5982,6 +5991,37 @@ impl Database {
                     stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
                     stats.dirty_bin_batch_probe_clean.fetch_add(cleared.len() as u64, Relaxed);
                     info!(project, table_name, date, queued = bins.len(), clean = cleared.len(), event = "dedup_batch_probe");
+                    // A probe that finds NO duplicate-bearing bin has proved the
+                    // whole partition duplicate-free: it GROUP BYs the dedup keys
+                    // over the entire (project, date) and returns every bin whose
+                    // group count exceeds one. That is the SAME predicate a
+                    // zero-drop rewrite establishes, at key-only cost and writing
+                    // nothing — so it goes through `record_certification` rather
+                    // than a second rule that could drift from it.
+                    //
+                    // This is the coverage lever. Certification had only ever
+                    // accrued as a side effect of ~21-minute rewrites working an
+                    // age-ordered backlog, while queries read recent dates, so
+                    // prod 2026-09-01 measured `dedup_denied_never_certified` at
+                    // 164 of 177 eligible scans and `cert_granted_total` had been
+                    // 0 since 2026-08-20. The batch probe is already ordered
+                    // recent-first, so its verdict lands where reads are.
+                    //
+                    // Dedup is a PROOF, not a removal: the same window scanned
+                    // 454,596,841 rows to drop 3,782 (0.0008%) for 96.5% of all
+                    // maintenance worker time.
+                    if dup_bins.is_empty()
+                        && let Ok(parsed) = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                    {
+                        match self.record_certification(table, table_name, &project, parsed, &pre, (0, true)).await {
+                            // Debounced, not direct: up to BATCH_PROBE_GROUPS
+                            // grants land per pass and `store_sidecar`
+                            // re-serializes the whole ledger each time.
+                            Ok(Some(_)) => self.persist_certifications_debounced(),
+                            Ok(None) => {}
+                            Err(error) => warn!(project, table_name, date, %error, event = "dedup_batch_probe_certify_failed"),
+                        }
+                    }
                     cleared
                 }
                 Ok(Err(error)) => {
