@@ -1094,6 +1094,52 @@ reading:
 - `charged_pct` 30 → 63 over the window. Well under the brake, but the only
   number here trending the wrong way; worth a look if it keeps climbing.
 
+## Deploy 12 (dedup idle window 300s → 900s): mixed, and worth stating precisely
+
+Same 25-minute window shape as deploy 11's, so the two are comparable.
+
+**What it was meant to fix, fixed:**
+
+| dedup, per 25 min | deploy 11 | deploy 12 |
+|---|---|---|
+| units killed at the deadline | **36** | **4** (9x fewer) |
+| `retry.Dedup.worker_error` | +1.7/min | +0.2/min |
+| units finishing in 0s (churn) | 249 | ~28 |
+| total units finishing | 288 | 62 |
+| **units Complete** | **75** | **30** |
+
+**And the pending slope got WORSE, not better:**
+
+| lane | deploy 11 | deploy 12 |
+|---|---|---|
+| dedup | −5.00/min | **−1.84/min** |
+| base_rollup | −1.36/min | −0.44/min |
+| sealed | +0.16/min | **0.00/min** |
+| hot_packing | −0.20/min | +0.08/min |
+
+**These are consistent, and the honest reading is that unit counts are the wrong
+metric.** Deploy 11's 288 finishes were dominated by 249 zero-second
+claim-and-refuse cycles — churn, not work. Deploy 12's 62 finishes are units
+that actually run: the `ran_secs` distribution is 596s, 899s x4, 1007s, 1012s,
+1017s, 1061s. (Those past 900 are units the liveness clock granted a second
+window because they were making progress — the mechanism working as designed.)
+
+So a unit that used to be killed at 300s having done nothing now occupies a
+worker for ~1000s and finishes. Fewer units retire per minute; each retirement
+is real. **Whether that is a net win on debt retired cannot be settled from unit
+counts, and I am not going to claim it from a 25-minute window.** The metric that
+would settle it is rows deduped per worker-hour, which nothing currently
+publishes.
+
+**What is unambiguous:** 32 fewer units per 25 minutes are killed after burning
+their full deadline, which was ~9,900 worker-seconds of pure waste. That waste is
+gone whatever the queue slope does.
+
+**The follow-up this earns:** publish work-done, not units-done. `dropped` rows
+already come back from `dedup_partition_range_limited`; summing them into a
+counter would make the next version of this question answerable in one query
+instead of a log-scrape and an argument.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
