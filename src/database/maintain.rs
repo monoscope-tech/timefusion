@@ -6302,7 +6302,12 @@ impl Database {
         // Bytes read into this rewrite — free here (the Adds are already mapped)
         // and the divisor that turns staging duration into observed R2 throughput.
         let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
-        // Batch size from THIS bin's measured row width, not a fleet constant.
+        // THIS bin's measured row width — feeds both the scan batch size and the
+        // output's row-group cap.
+        let measured_bytes_per_row = {
+            let rows: u64 = targets.iter().filter_map(add_row_count).sum();
+            estimated_decoded_bytes(bytes_in).checked_div(rows).filter(|width| *width > 0)
+        };
         let batch_size = batch_rows_for(
             estimated_decoded_bytes(bytes_in),
             targets.iter().filter_map(add_row_count).sum(),
@@ -6465,7 +6470,12 @@ impl Database {
             // to be a separate "intermediate" level justified by a nightly
             // consolidate/recompress that would re-tier it — those crons were
             // deleted with the tier, so this output is now what a reader gets.
-            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
+            // The rewrite has already measured this bin's row width for
+            // `batch_rows_for`; the writer gets it too, so its row groups are
+            // capped by decoded bytes instead of by a model that is 14x off for
+            // the widest tenant.
+            let writer_properties =
+                self.create_writer_properties_measured(schema, self.config.parquet.timefusion_zstd_compression_level, sorted, measured_bytes_per_row);
             let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                 .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
                 .with_writer_properties(writer_properties);

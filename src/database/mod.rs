@@ -3111,7 +3111,16 @@ impl Database {
     /// `declare_sorted` is `true` only for paths that sort rows by the schema's sort keys
     /// (flush, dedup); optimize/compact pass `false`.
     fn create_writer_properties(&self, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
-        build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted)
+        build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted, None)
+    }
+
+    /// Writer properties for a rewrite that has MEASURED its input's row width,
+    /// so row groups are capped by decoded bytes rather than by a per-type
+    /// model that is 14x off for the widest tenant. See `row_group_row_count`.
+    pub(crate) fn create_writer_properties_measured(
+        &self, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool, bytes_per_row: Option<u64>,
+    ) -> WriterProperties {
+        build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted, bytes_per_row)
     }
 
     /// WriterProperties for DML rewrite paths.
@@ -8559,7 +8568,7 @@ fn consolidate_optimize_type(schema: &crate::schema::TableSchema, allow_sort: bo
 /// Rows per row group are derived from the configured byte target and the schema's estimated row
 /// width. Parquet's byte cap under-reports the finished row group, so the row cap is the binding
 /// lever.
-fn row_group_row_count(schema: &crate::schema::TableSchema, target_bytes: usize) -> usize {
+fn row_group_row_count(schema: &crate::schema::TableSchema, target_bytes: usize, measured_bytes_per_row: Option<u64>) -> usize {
     /// Encoded-but-uncompressed bytes a value of this type costs. Variable-width
     /// types are the telemetry payload (body/attributes/resource), so they
     /// dominate; the constants are deliberately rough and only need to put the
@@ -8576,15 +8585,30 @@ fn row_group_row_count(schema: &crate::schema::TableSchema, target_bytes: usize)
             _ => 48,
         }
     }
-    let row_bytes: usize = schema.fields.iter().map(|f| width(&f.data_type)).sum::<usize>().max(1);
-    // Floor keeps footer/dictionary overhead from dominating on narrow tables;
-    // ceiling is parquet's own default, so this can only ever make row groups
-    // SMALLER than the behaviour it replaces.
-    (target_bytes / row_bytes).clamp(32_768, 1_048_576)
+    // MEASURED width wins over the modelled one. The model is a per-type
+    // constant table, and on the whale tenant it calls an otel row ~4.5 KB when
+    // the real thing is ~63 KB decoded — 14x. Row groups are then capped by ROW
+    // COUNT alone (`set_max_row_group_bytes` does not bind in parquet-rs), so
+    // equal-row groups came out anywhere from 37 MB to **819 MB** decoded in one
+    // file (prod 2026-09-01, `date=2026-08-30`). An 819 MB row group is the
+    // indivisible unit of a scan, for readers and rewrites alike.
+    let row_bytes: usize = measured_bytes_per_row
+        .and_then(|width| usize::try_from(width).ok())
+        .filter(|width| *width > 0)
+        .unwrap_or_else(|| schema.fields.iter().map(|f| width(&f.data_type)).sum::<usize>())
+        .max(1);
+    // The floor keeps footer/dictionary overhead from dominating on NARROW
+    // tables — it must not survive when honouring it would blow the byte target
+    // it exists inside. At the whale's measured 63 KB/row a 32,768-row floor is
+    // a 2 GB row group, which is the hazard, not the protection.
+    const MIN_ROWS: usize = 32_768;
+    const MAX_ROWS: usize = 1_048_576;
+    let by_bytes = (target_bytes / row_bytes).max(1);
+    by_bytes.clamp(MIN_ROWS.min(by_bytes), MAX_ROWS)
 }
 
 fn build_writer_properties(
-    parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool,
+    parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema::TableSchema, zstd_level: i32, declare_sorted: bool, measured_bytes_per_row: Option<u64>,
 ) -> WriterProperties {
     use deltalake::datafusion::parquet::{
         basic::{Compression, Encoding, ZstdLevel},
@@ -8616,7 +8640,7 @@ fn build_writer_properties(
         .set_max_row_group_bytes(Some(max_row_group_size))
         // Exact companion to the byte cap above, which does not bind — see
         // `row_group_row_count`.
-        .set_max_row_group_row_count(Some(row_group_row_count(schema, max_row_group_size)))
+        .set_max_row_group_row_count(Some(row_group_row_count(schema, max_row_group_size, measured_bytes_per_row)))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(8388608)
         // Page-level stats only where they prune (the declared sort keys, set
@@ -11518,7 +11542,7 @@ mod writer_properties_tests {
     #[test]
     fn compression_level_drives_zstd() {
         for level in [3, 9, 15, 19] {
-            let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level, true);
+            let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level, true, None);
             assert_eq!(p.compression(&ColumnPath::from("anything")), Compression::ZSTD(ZstdLevel::try_new(level).unwrap()));
         }
     }
@@ -11527,7 +11551,7 @@ mod writer_properties_tests {
     fn row_group_size_is_a_byte_limit() {
         let mut c = cfg();
         c.timefusion_max_row_group_size = 128 * 1024 * 1024;
-        let p = build_writer_properties(&c, &schema_with(vec![], vec![]), 3, true);
+        let p = build_writer_properties(&c, &schema_with(vec![], vec![]), 3, true, None);
         assert_eq!(p.max_row_group_bytes(), Some(c.timefusion_max_row_group_size));
     }
 
@@ -11552,13 +11576,13 @@ mod writer_properties_tests {
 
     #[test]
     fn invalid_zstd_level_falls_back() {
-        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 999, true);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 999, true, None);
         assert_eq!(p.compression(&ColumnPath::from("x")), Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()));
     }
 
     #[test]
     fn footer_kv_metadata_carries_tier() {
-        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 15, true);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 15, true, None);
         let kv = p.key_value_metadata().expect("KV metadata present");
         let tier = kv.iter().find(|k| k.key == COMPRESSION_TIER_KEY).expect("tier key present");
         assert_eq!(tier.value.as_deref(), Some("15"));
@@ -11600,7 +11624,7 @@ mod writer_properties_tests {
     fn bloom_opt_in_only_for_flagged_columns() {
         let mut f1 = field("id", "Utf8");
         f1.bloom_filter = true;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![f1, field("body", "Utf8")], vec![]), 3, true);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![f1, field("body", "Utf8")], vec![]), 3, true, None);
         assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_some(), "flagged column has bloom");
         assert!(p.bloom_filter_properties(&ColumnPath::from("body")).is_none(), "unflagged column has no bloom");
     }
@@ -11611,7 +11635,7 @@ mod writer_properties_tests {
         f.bloom_filter = true;
         let mut c = cfg();
         c.timefusion_bloom_filter_disabled = true;
-        let p = build_writer_properties(&c, &schema_with(vec![f], vec![]), 3, true);
+        let p = build_writer_properties(&c, &schema_with(vec![f], vec![]), 3, true, None);
         assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_none());
     }
 
@@ -11619,14 +11643,14 @@ mod writer_properties_tests {
     fn dictionary_opt_out_disables_dict() {
         let mut f = field("stacktrace", "Utf8");
         f.dictionary = Some(false);
-        let p = build_writer_properties(&cfg(), &schema_with(vec![f], vec![]), 3, true);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![f], vec![]), 3, true, None);
         assert!(!p.dictionary_enabled(&ColumnPath::from("stacktrace")));
     }
 
     #[test]
     fn sort_key_utf8_uses_delta_byte_array_and_no_dict() {
         use deltalake::datafusion::parquet::basic::Encoding;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![field("id", "Utf8")], vec!["id"]), 3, true);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![field("id", "Utf8")], vec!["id"]), 3, true, None);
         assert_eq!(p.encoding(&ColumnPath::from("id")), Some(Encoding::DELTA_BYTE_ARRAY));
         assert!(!p.dictionary_enabled(&ColumnPath::from("id")));
     }
@@ -11634,7 +11658,7 @@ mod writer_properties_tests {
     #[test]
     fn timestamp_and_int_use_delta_binary_packed() {
         use deltalake::datafusion::parquet::basic::Encoding;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![field("ts", "Timestamp(Nanosecond, None)"), field("n", "Int64")], vec![]), 3, true);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![field("ts", "Timestamp(Nanosecond, None)"), field("n", "Int64")], vec![]), 3, true, None);
         assert_eq!(p.encoding(&ColumnPath::from("ts")), Some(Encoding::DELTA_BINARY_PACKED));
         assert!(!p.dictionary_enabled(&ColumnPath::from("ts")));
         assert_eq!(p.encoding(&ColumnPath::from("n")), Some(Encoding::DELTA_BINARY_PACKED));
@@ -11650,6 +11674,7 @@ mod writer_properties_tests {
             &schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("body", "Utf8")], vec!["timestamp"]),
             3,
             true,
+            None,
         );
         assert_eq!(p.statistics_enabled(&ColumnPath::from("timestamp")), EnabledStatistics::Page);
         assert_eq!(p.statistics_enabled(&ColumnPath::from("body")), EnabledStatistics::Chunk);
@@ -11683,8 +11708,8 @@ mod writer_properties_tests {
     #[test]
     fn sorting_columns_declared_only_when_sorted() {
         let s = schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("id", "Utf8")], vec!["timestamp", "id"]);
-        let sorted = build_writer_properties(&cfg(), &s, 3, true);
-        let unsorted = build_writer_properties(&cfg(), &s, 3, false);
+        let sorted = build_writer_properties(&cfg(), &s, 3, true, None);
+        let unsorted = build_writer_properties(&cfg(), &s, 3, false, None);
         assert!(sorted.sorting_columns().is_some(), "flush/dedup path declares the sort order");
         assert!(unsorted.sorting_columns().is_none(), "optimize/compact path declares no order");
     }
@@ -14795,19 +14820,40 @@ mod tests {
     /// under-reports the finished row group. The derived row cap is what actually bounds row groups,
     /// and it must land far below parquet's own default.
     #[test]
+    /// A row group is the indivisible unit of a scan, so its DECODED size is
+    /// what matters — and the per-type model that sized it is 14x off for the
+    /// widest tenant. Prod 2026-09-01, one 204 MB file: every row group held
+    /// exactly 32,768 rows and they ranged from 37 MB to **819 MB** decoded.
+    #[test]
+    fn a_measured_row_width_caps_the_row_group_by_bytes() {
+        const TARGET: usize = 128 * 1024 * 1024;
+        let otel = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
+        let modelled = super::row_group_row_count(otel, TARGET, None);
+
+        // The whale's real width: 63 KB decoded per row.
+        let measured = super::row_group_row_count(otel, TARGET, Some(63_000));
+        assert!(measured < modelled, "a wider-than-modelled row must yield FEWER rows per group: {measured} vs {modelled}");
+        assert!(measured as u64 * 63_000 <= TARGET as u64 * 2, "and the group must land near the byte target, not 6x over it");
+
+        // A narrow row is allowed more rows, still bounded by the floor/ceiling.
+        assert!(super::row_group_row_count(otel, TARGET, Some(100)) >= modelled, "a narrow row must not be penalised by the model");
+        // No measurement keeps the old behaviour exactly.
+        assert_eq!(super::row_group_row_count(otel, TARGET, Some(0)), modelled, "an unusable measurement falls back to the model");
+    }
+
     fn row_group_row_count_binds_far_below_the_parquet_default() {
         const PARQUET_DEFAULT: usize = 1024 * 1024;
         let otel = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
-        let rows = super::row_group_row_count(otel, 128 * 1024 * 1024);
+        let rows = super::row_group_row_count(otel, 128 * 1024 * 1024, None);
         assert!(rows < PARQUET_DEFAULT / 4, "otel row groups must shrink at least 4x, got {rows}");
         assert!(rows >= 32_768, "floor keeps footer overhead from dominating, got {rows}");
 
         // Monotonic in the operator-facing byte target, so raising the target
         // raises the value that actually binds.
-        assert!(super::row_group_row_count(otel, 256 * 1024 * 1024) > rows);
+        assert!(super::row_group_row_count(otel, 256 * 1024 * 1024, None) > rows);
         // ...and it can never exceed the default it replaces, whatever the
         // target — a huge target must not silently restore 1M-row row groups.
-        assert_eq!(super::row_group_row_count(otel, usize::MAX / 2), PARQUET_DEFAULT);
+        assert_eq!(super::row_group_row_count(otel, usize::MAX / 2, None), PARQUET_DEFAULT);
     }
 
     /// The repair sort runs 16 partitions, so its unspillable merge is 8x the
