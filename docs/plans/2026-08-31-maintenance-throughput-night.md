@@ -728,6 +728,23 @@ With that, the two halves are in place: the bisection floor (deploy 5) stops the
 slivers being manufactured, and partition-priced fusion (deploy 6) retires the
 ones already queued.
 
+### Deploy 7 (`c4110174`): row groups sized by measured bytes
+
+The last write-side item from finding 6. A row group is the indivisible unit of
+a scan, and ours were capped by row COUNT using a per-type width model that is
+14x off for the whale — so one 204 MB file held row groups from 37 MB to 819 MB
+decoded, every one of them exactly 32,768 rows.
+
+The rewrite paths already measure their input's row width for `batch_rows_for`;
+the writer now gets it too. And the 32,768-row floor — which exists so footer
+and dictionary overhead cannot dominate a NARROW table — now yields when
+honouring it would blow the byte target it lives inside. At 63 KB/row that floor
+*was* a 2 GB row group.
+
+This one is prospective, not corrective: it bounds what maintenance WRITES from
+here on. Existing files keep their layout until something rewrites them, which
+is what the repair and consolidation lanes now do.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
