@@ -922,6 +922,34 @@ cache-served, so the number to measure next is hit-rate-by-bytes on
 currently dominates. Foyer has 600 GB of disk and is serving 8% of bytes; that
 is the headroom.
 
+### The 92% is NOT the cache failing — it is uncacheable traffic, by design
+
+Resolved from the code rather than guessed. Two facts:
+
+- `insert_main_value` (storage.rs:1481) returns early for any path outside
+  `cache_recent_days`, so an old file is **read from the inner store and never
+  admitted**.
+- `record_miss_with_fetch` (storage.rs:358) bumps `misses` on *any* inner fetch,
+  cacheable or not.
+
+So an out-of-window file is **counted as a miss every time and can never become
+a hit.** The 92%-by-bytes figure therefore includes traffic that is uncacheable
+on purpose — the May/June repair backlog, which is exactly what the fleet has
+been chewing through all night.
+
+**This corrects the previous section in the optimistic direction.** The
+0.94-3.52 MB/s per worker is the **legacy backlog-drain rate on deliberately
+uncached files**, not the steady-state rate. Steady-state 10x traffic works on
+recent data, which IS cache-eligible, so prod's steady-state capacity is higher
+than that measurement — and the "capacity barely meets 10x demand" conclusion
+was drawn from the worst workload the system will ever run.
+
+**What is still not measured**, and is the one number worth taking next: staging
+throughput on *recent* bins under the current build, once the legacy drain stops
+dominating the sample. Until then the steady-state figure is bounded below by
+0.94-3.52 MB/s and above by the laptop's 8.81-24.66 MB/s, and the truth is
+somewhere between — closer to the top for cache-served reads.
+
 **Caveat on the small-bin sample:** only 4 bins staged in a 90-minute window,
 because most units now are footer exonerations and rollups, which never reach
 `wave_bin_staged`. The per-worker range above is from big bins; the recent-data
