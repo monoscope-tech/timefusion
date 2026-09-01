@@ -347,10 +347,15 @@ pub(crate) fn note_unit_progress(rows: usize) {
 /// Every `ExecutionPlan` collects `output_rows`; summed over the tree it moves
 /// while the scan feeds the sort, which is exactly the window the write loop
 /// cannot see.
-struct PlanProgress(Option<tokio::task::JoinHandle<()>>);
+///
+/// Load-bearing subtlety: those counters only move while the plan is being
+/// DRIVEN. That holds end-to-end because the caller polls the output stream
+/// immediately and polling a blocking operator is what drives its children — but
+/// a watcher held over a plan nobody polls reports nothing, correctly.
+pub(crate) struct PlanProgress(Option<tokio::task::JoinHandle<()>>);
 
 impl PlanProgress {
-    fn watch(plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Self {
+    pub(crate) fn watch(plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Self {
         /// Long enough to cost nothing against an hour-scale window, short
         /// enough that a stalled plan is still detected inside it.
         const TICK: std::time::Duration = std::time::Duration::from_secs(15);

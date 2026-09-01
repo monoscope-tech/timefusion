@@ -1596,7 +1596,13 @@ impl Database {
                                     "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn \
                                      FROM {scan_name} WHERE {rows_filter}) WHERE __tf_rn = 1{order_by}"
                                 );
-                                let mut stream = ctx.sql(&sql).await?.execute_stream().await?;
+                                // A window function and a final ORDER BY: two blocking
+                                // operators between the scan and the write loop, so the
+                                // loop's own progress bump cannot see most of the unit.
+                                // See `PlanProgress`.
+                                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                                let _progress = crate::database::maintain::PlanProgress::watch(Arc::clone(&plan));
+                                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
                                 let mut shard_after = 0usize;
                                 let mut decoded_bytes = 0usize;
                                 while let Some(batch) = stream.next().await {
