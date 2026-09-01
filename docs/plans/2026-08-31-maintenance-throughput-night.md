@@ -555,6 +555,42 @@ priority decision, and it is the next thing to chase. SealedConsolidation's
 refusal is honest by contrast — it loses to a May repair cell, which is the
 slot competition that should resolve as the repair backlog drains.
 
+## Deploy 3 and 4: what fixing the clock exposed underneath
+
+Each fix moved the binding constraint, and the next one showed up immediately.
+Worth recording as a sequence, because the last two were caused BY the earlier
+ones — a fix that lets work run longer changes the memory arithmetic.
+
+**Deploy 3 (`a62bdc38`)** — the dedup probe, and the permit I broke:
+- Dedup kept timing out after the REWRITE was watched, because the units that
+  die never reach the rewrite: 7 rewrites committed in 40 min while 9 units were
+  killed. They die in the **probe**, a `GROUP BY` over a whole partition whose
+  own comment records 235 s on a whale. `collect()` reports nothing until it
+  returns, so every blocking query now goes through `collect_watched`.
+  Result: dedup completions went to **14 Complete / 4 timed out (78%)**, against
+  13% at the baseline.
+- `light_optimize_k` derived its memory term from `light_share_bytes`, but every
+  live caller of the permit is a coordinator unit allocating from the
+  *coordinator* pool. Raising that pool in deploy 1 shrank light 7.6 → 3 GB,
+  silently taking K from 3 to **1**, and HotPacking takes the permit *before* it
+  claims — so it stopped being claimed at all. That is the real answer to the
+  baseline's "14 completions vs 472 retries": **HotPacking was never failing, it
+  was never claimed.**
+
+**Deploy 4 (pending)** — the memory arithmetic the liveness clock changed:
+- `Not enough memory to continue external sort` started appearing on repair
+  staging. Cause: units that used to be killed at their deadline now live for
+  tens of minutes, so they **overlap** each other and the hygiene bins on one
+  8 GB pool. K=4 made it worse.
+- Repair now takes a dedicated **one-permit** semaphore (a repair bin is a whole
+  file — the worst is 2.3 GB compressed, ~28 GB decoded), and `light_optimize_k`
+  reserves one sort budget for the repair lane, which draws on the same pool and
+  was never counted.
+
+**The lesson worth keeping:** every one of these was an accounting error that
+only became visible once something else stopped failing first. A deadline that
+kills work hides the memory model that work would have exercised.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
