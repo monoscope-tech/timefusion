@@ -6481,6 +6481,21 @@ mod tests {
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
     }
 
+    /// The ceiling is only meaningful if the REQUEST is honest. Prod
+    /// 2026-09-01, five minutes after the ceiling shipped: 1,339
+    /// `resource_admission` retries in one window, because every caller asked
+    /// for `MAX_DECODED_BYTES` regardless of its unit's real size, so a busy
+    /// pool refused all of them and every lane hot-looped on a 1-second requeue.
+    #[test]
+    fn a_small_unit_is_admitted_by_a_pool_that_refuses_a_large_one() {
+        const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
+        // Three quarters full.
+        let ceiling = super::occupancy_scaled_ceiling(CAPACITY / 4, CAPACITY);
+        assert!(ceiling < MAX_DECODED_BYTES, "a busy pool must refuse a max-size unit");
+        assert!(ceiling >= MAX_DECODED_BYTES / 16, "and still admit a small one");
+        assert!(MAX_DECODED_BYTES / 16 <= ceiling, "a hygiene-sized unit must fit under the ceiling of a busy pool, or the fleet hot-loops on admission");
+    }
+
     /// ClickHouse's rule: a busy pool admits only small work, so an oversized
     /// unit is never admitted into a position where it would have to be killed.
     /// Off by default — a shape for 10x load, not a throughput win today.

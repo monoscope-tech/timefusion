@@ -1801,8 +1801,15 @@ impl Database {
                 return Ok(true);
             }
         }
-        let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 })
-        else {
+        // The unit's OWN size, not the fleet maximum. Admission scales its
+        // ceiling by how full the pool is, so a request that always asks for
+        // `MAX_DECODED_BYTES` is refused whenever the pool is busy — which is
+        // always. Prod 2026-09-01, five minutes after that ceiling shipped:
+        // 1,339 `resource_admission` retries, i.e. every lane hot-looping on a
+        // 1-second requeue instead of working. The ceiling is only meaningful
+        // if the request is honest.
+        let request = Resources { cpu: 1, decoded_bytes: estimated_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
+        let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             retry("resource_admission".to_owned(), std::time::Duration::from_secs(1))?;
             return Ok(true);
         };
@@ -3125,8 +3132,10 @@ impl Database {
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
         let retry = |reason: String, seconds: u64| -> Result<()> { self.retry_task(&key, reason, std::time::Duration::from_secs(seconds)) };
-        let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: MAX_DECODED_BYTES, object_reads: 1, object_writes: 1 })
-        else {
+        // See the dedup site: the request must be the unit's own size, or the
+        // occupancy-scaled ceiling refuses everything on a busy pool.
+        let request = Resources { cpu: 1, decoded_bytes: task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES), object_reads: 1, object_writes: 1 };
+        let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             retry("resource_admission".to_owned(), 1)?;
             return Ok(true);
         };
