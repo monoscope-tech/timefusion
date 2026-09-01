@@ -977,6 +977,29 @@ exists so that when the fleet IS saturated it degrades by admitting small work
 rather than by killing large work, which is the failure mode this whole night
 was about.
 
+### Deploy 9: the fleet now runs at the measured optimum
+
+The concurrency curve had a hole between "4 works" and "8 fails". Filling it:
+
+```
+4 workers  29.16 MB/s  0 failed   <- what prod ran
+5 workers  29.31 MB/s  0 failed
+6 workers  33.32 MB/s  0 failed   <- best, +14%
+8 workers  15.07 MB/s  4 FAILED   <- cliff
+```
+
+Six concurrent sorts fit an 8 GiB pool, so the coordinator path's real per-sort
+footprint is ~1.33 GiB — not the 2 GiB it inherited from
+`PER_SORT_BUDGET_BYTES`, which is 2 GiB partly *because a sort could be handed a
+2 GB row group*. Deploy 7 removed that. The constant stays put (it also sizes the
+`HEAVY_REWRITE_PERMITS` envelope, tuned against a real OOM) and the coordinator
+gets its own measured divisor: **1.25 GiB → 5 hygiene permits + 1 repair = 6**,
+one rung below the cliff.
+
+**+14% aggregate rewrite throughput, and it also speeds the legacy drain.** This
+is the first change tonight sized by a measurement taken *before* the change
+rather than by a prod failure taken after it.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
