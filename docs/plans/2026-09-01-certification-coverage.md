@@ -105,6 +105,24 @@ the flush has the batch in memory and a distinct-count over the dedup keys would
 make the grant conditional rather than assumed. Left for after step 2, and it is
 the churning-hot-date case, not the window case.
 
+## Pre-deploy baseline (read immediately before shipping step 1)
+
+| counter | value |
+| --- | --- |
+| `cert_granted_total` | **0** (and 0 since 2026-08-20) |
+| `dedup_skipped` | 0 |
+| `cert_slice_files_proved` | 2,066 |
+| `pending_dedup` | 2,473 |
+| `work.Dedup.progress_rows` | 1,971,371,644 |
+| `work.Dedup.rows_dropped` | 8,081 |
+| `work.Dedup.worker_secs` | 17,782 |
+
+Duplicate rate over the longer window: **0.0004%** — nearly two billion rows
+scanned to remove eight thousand.
+
+`cert_granted_total` is the number the deploy has to move. It has never been
+non-zero, which means `DedupExec` has never once been eliminated from a plan.
+
 ## Success criterion
 
 After the sweep covers one busy project's full 14-day window: re-run the latency
