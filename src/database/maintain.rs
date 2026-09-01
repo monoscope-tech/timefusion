@@ -245,6 +245,44 @@ mod liveness_clock_tests {
         assert!(progress.load(Relaxed) > 0, "the plan's own row counters must reach the clock the unit is judged by");
     }
 
+    /// The pruning instrument is only worth reading if its metric NAMES are the
+    /// ones DataFusion publishes. A rename would make every scan report
+    /// "nothing pruned", which is indistinguishable from the finding it exists
+    /// to detect — so pin the names against a real parquet scan.
+    #[tokio::test]
+    async fn the_pruning_metric_names_are_the_ones_datafusion_publishes() {
+        use datafusion::prelude::{ParquetReadOptions, SessionContext};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = SessionContext::new();
+        // Two files, disjoint on `a` — the same shape as a dedup probe pointed at
+        // a partition whose files are time-disjoint, which is the case the log
+        // has to be able to distinguish.
+        for (name, range) in [("a.parquet", (1, 500)), ("b.parquet", (1000, 1500))] {
+            ctx.sql(&format!("COPY (SELECT * FROM generate_series({}, {}) AS t(a)) TO '{}'", range.0, range.1, dir.path().join(name).display()))
+                .await
+                .expect("copy")
+                .collect()
+                .await
+                .expect("write");
+        }
+        ctx.register_parquet("t", dir.path().to_str().expect("utf8"), ParquetReadOptions::default()).await.expect("register");
+        let scanned = async |sql: &str| {
+            let plan = ctx.sql(sql).await.expect("sql").create_physical_plan().await.expect("physical");
+            datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("collect");
+            (super::plan_metric_sum(plan.as_ref(), "bytes_scanned"), super::plan_metric_sum(plan.as_ref(), "files_processed"))
+        };
+        let (whole, whole_files) = scanned("SELECT sum(a) FROM t").await;
+        let (sliced, sliced_files) = scanned("SELECT sum(a) FROM t WHERE a < 100").await;
+        // The disjoint file is dropped during PLANNING, so it never reaches a
+        // `*_pruned_*` counter — the cost shows up here or nowhere.
+        assert!(whole > 0 && sliced > 0, "the cost metric must be populated, got {whole} and {sliced}");
+        assert!(sliced < whole, "a predicate excluding one of two files must scan fewer bytes: {sliced} vs {whole}");
+        // And the trap: `files_processed` is reported PER PARTITION, so summing
+        // it over the tree grows with repartitioning — the narrower scan reports
+        // MORE. Only `bytes_scanned` survives being summed.
+        assert!(sliced_files > whole_files, "files_processed is per-partition and must not be used as a cost: {sliced_files} vs {whole_files}");
+    }
+
     /// `collect()` reports nothing until it returns, so the probe that dominates
     /// a dedup unit's time has to be watched too — prod 2026-09-01 kept timing
     /// dedup out at 300 s after the REWRITE was watched, because the units that
@@ -415,7 +453,54 @@ impl Drop for PlanProgress {
 pub(crate) async fn collect_watched(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<Vec<arrow::array::RecordBatch>> {
     let plan = ctx.sql(sql).await?.create_physical_plan().await?;
     let _progress = PlanProgress::watch(Arc::clone(&plan));
-    Ok(datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?)
+    let started = std::time::Instant::now();
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+    log_scan_pruning(plan.as_ref(), started.elapsed());
+    Ok(batches)
+}
+
+/// Sum one named metric over every operator in a plan.
+fn plan_metric_sum(plan: &dyn datafusion::physical_plan::ExecutionPlan, name: &str) -> u64 {
+    let own = plan.metrics().map_or(0, |metrics| metrics.sum_by_name(name).map_or(0, |value| value.as_usize() as u64));
+    plan.children().iter().fold(own, |sum, child| sum.saturating_add(plan_metric_sum(child.as_ref(), name)))
+}
+
+/// How much of what a maintenance query COULD have read it actually read.
+///
+/// A dedup unit is a 10-minute slice, but its probe registers a provider over
+/// every file of the whole `(project_id, date)` partition and relies on the
+/// slice predicate to prune the rest. Whether that pruning happens on the live
+/// frontier — where today's partition grows all day — is the difference between
+/// a unit costing its slice and a unit costing the day, and nothing measured it:
+/// prod 2026-09-01 spent 5,396 worker-seconds of Dedup emitting ~300M operator
+/// rows to drop 3,387 duplicates.
+///
+/// **`bytes_scanned` is the answer**, and getting there cost three wrong guesses
+/// that the pinning test caught in turn:
+/// - a file the predicate excludes is dropped during PLANNING, so it never
+///   reaches `files_ranges_pruned_statistics` — that counter stays 0 whether
+///   pruning worked or not, and reading it as "pruning happened" is backwards;
+/// - `row_groups_matched_statistics` does not exist, so there is no two-sided
+///   check available and a rename would hide as a zero;
+/// - `files_processed` is reported PER PARTITION, so summed over a tree it grows
+///   with repartitioning: a scan reading ONE of two files reported 10 against
+///   the full scan's 2.
+///
+/// Only `bytes_scanned` survives being summed, so it is both the guard and the
+/// cost. A scan that read nothing logs nothing.
+fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed: std::time::Duration) {
+    let bytes_scanned = plan_metric_sum(plan, "bytes_scanned");
+    if bytes_scanned == 0 {
+        return;
+    }
+    info!(
+        bytes_scanned,
+        row_groups_pruned = plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
+        output_rows = plan_metric_sum(plan, "output_rows"),
+        elapsed_ms = elapsed.as_millis() as u64,
+        event = "maintenance_scan_pruning",
+        "how much of the registered partition a maintenance query actually opened"
+    );
 }
 
 /// Rows every operator in `plan` has produced so far.

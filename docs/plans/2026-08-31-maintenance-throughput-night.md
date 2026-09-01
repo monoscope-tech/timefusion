@@ -1173,6 +1173,46 @@ comparable across deploys of the same plan shape and nothing more.
 Deploy 13 changes no behaviour, so the window after it is the clean baseline for
 the next behavioural change.
 
+### The baseline it produced — 25 min, one clean process, 12:00–12:25 UTC
+
+| operation | worker_secs | share of recorded | progress_rows | queue move |
+|---|---|---|---|---|
+| **Dedup** | **9,084** | **76%** | 428,303,695 | 2,830 → 2,769 (−2.44/min) |
+| Repair | 1,059 | 9% | 27,632,668 | **360 → 360 (flat)** |
+| HotPacking | 961 | 8% | 23,267,354 | 0 → 14 |
+| BaseRollup | 776 | 7% | 0 | 458 → 367 (−3.64/min) |
+| DerivedRollup | 19 | <1% | 0 | 63 → 47 |
+| SealedConsolidation | 0 | 0% | 0 | 0 → 189 |
+
+**Read `share` as share of RECORDED time, not of capacity.** `worker_secs` lands
+when a unit ENDS, so a 25-minute window under-counts whatever is still running:
+11,899 recorded against 24,000 available (16 workers x 1,500 s). Long units are
+systematically under-represented in a short window, which is the one bias this
+counter has and the reason to read it over hours rather than minutes.
+
+Three things fall straight out, none of which unit counts could express:
+
+1. **Dedup dropped 3,519 rows for 9,084 worker-seconds — 0.39 rows per
+   worker-second, and ~122,000 operator-rows scanned per duplicate removed.** It
+   is three quarters of the recorded fleet. The sampled units are all on the LIVE
+   frontier (`date = 2026-09-01`, ten-minute slices from 10:30–11:40) with
+   `before` counts of 4–16,878 rows: tiny rewrites. So the cost is not the
+   rewrite, and the suspect is the probe — `dedup_probe_ctx` registers a provider
+   over EVERY file of the `(project_id, date)` partition and leans on the slice
+   predicate to prune it back. On today's partition, which grows all day, that is
+   the difference between a unit costing its slice and a unit costing the day.
+   **This is now instrumented rather than assumed** (`maintenance_scan_pruning`,
+   deploy 14): `pruned`/`matched` row-group counts per maintenance scan, with
+   `matched` logged alongside `pruned` so a DataFusion metric rename reads as a
+   rename and not as "nothing pruned".
+2. **Repair burned 1,059 worker-seconds and 27.6M rows for zero queue movement**,
+   with `retry.Repair.compaction_incomplete` going 23 → 126. It is doing work and
+   retiring nothing.
+3. **392 `resource_admission` refusals in 25 minutes** (BaseRollup 169, Dedup 150,
+   SealedConsolidation 29, HotPacking 14) — and that reason is classed as a
+   capacity failure, so every one of them SPLITS a unit. This is the exact class
+   deploy 14 reclassifies, and it now has a measured before.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
