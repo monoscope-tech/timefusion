@@ -1140,6 +1140,39 @@ already come back from `dedup_partition_range_limited`; summing them into a
 counter would make the next version of this question answerable in one query
 instead of a log-scrape and an argument.
 
+### Deploy 13 (`9ccd87ce`) — that instrument, shipped
+
+`timefusion_stats` now carries, per operation:
+
+| key | meaning |
+|---|---|
+| `work.<Op>.worker_secs` | wall seconds workers held for this operation |
+| `work.<Op>.killed_secs` | strict subset of the above burned by units killed at the idle deadline |
+| `work.<Op>.progress_rows` | the liveness tally — see the caveat below |
+| `work.Dedup.rows_dropped` | duplicates actually committed away — **exact** |
+
+Two placement decisions matter:
+
+- **`worker_secs` is recorded before `result?`.** A unit that errors after 800s
+  spent that capacity exactly as a successful one did; recorded after the `?` it
+  would vanish, and the fleet would look more efficient the more it failed.
+- **`rows_dropped` is recorded at the wave commit, not the coordinator call
+  site.** It therefore covers the cron sweep and `run-unit` too, and — more
+  importantly — the coordinator's `Ok((_, false))` incomplete branch discards
+  `dropped` while those landed bins are already committed. Counting only the
+  success branch would have rebuilt the same wrong-number problem the instrument
+  exists to fix. Landed-only also keeps it post-commit
+  (`tf_retired_counter_fired_before_commit_2026-08-22`).
+
+**`progress_rows` is a proxy, not a row count.** `plan_output_rows` sums
+`output_rows` over every operator in the plan tree, so the tally is inflated by
+plan depth and blended with explicit `note_unit_progress` calls. It is
+comparable across deploys of the same plan shape and nothing more.
+`rows_dropped / worker_secs` is the settling metric.
+
+Deploy 13 changes no behaviour, so the window after it is the clean baseline for
+the next behavioural change.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
