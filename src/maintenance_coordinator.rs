@@ -570,7 +570,25 @@ pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u
         task.estimated_decoded_bytes = observed_or_estimated_bytes;
         return vec![task];
     }
-    if task.key.slice.width() > MIN_SLICE_MICROS {
+    // Time-bisection stops at the width where a slice stops shedding FILES, not
+    // at the narrowest slice the journal can express.
+    //
+    // A dedup unit's cost is its PARTITION: `dedup_probe_ctx` builds its
+    // provider over every file of the (project, date) and then filters by
+    // slice, and on the live frontier those files overlap in time so nothing
+    // prunes. Prod 2026-09-01 measured the consequence — 4,000 of 5,028 active
+    // dedup units were sub-15-minute slivers with a p50 of 10 input files and a
+    // p90 of **76**, and units over a SINGLE file were burning the whole 300s
+    // deadline. Every one of those was manufactured by bisection: 3,602 units
+    // superseded as `split_into_smaller_slices`, each child costing what its
+    // parent cost.
+    //
+    // Below this floor the answer is to shard by KEY, which does shed work,
+    // rather than to halve time ten more times and pay the same scan each way.
+    // Repair declines to bisect at all for the same reason (its cost is a
+    // file); this is the same argument one level weaker.
+    let bisect_floor = if task.key.operation == Operation::Dedup { NORMAL_SLICE_MICROS } else { MIN_SLICE_MICROS };
+    if task.key.slice.width() > bisect_floor {
         let midpoint = task.key.slice.start_micros.saturating_add(task.key.slice.width() / 2);
         let midpoint = (midpoint / MIN_SLICE_MICROS) * MIN_SLICE_MICROS;
         if midpoint > task.key.slice.start_micros && midpoint < task.key.slice.end_micros {
@@ -3939,8 +3957,11 @@ mod tests {
     /// made `split_sheds_enough` unreachable; the next level is minted only
     /// after its own preflight has measured it.
     #[test]
-    fn halves_a_whale_once_and_hash_shards_one_minute() {
-        let input = task("whale", 0, NORMAL_SLICE_MICROS, Operation::Dedup);
+    fn halves_a_whale_once_and_hash_shards_at_the_floor() {
+        // A 10-minute slice is Dedup's floor now (see `byte_bounded_units`), so
+        // the halving property is asserted on an operation that still bisects
+        // there. The property under test is "one level per call", not the floor.
+        let input = task("whale", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup);
         let units = byte_bounded_units(&input, 10 * MAX_DECODED_BYTES);
         assert_eq!(units.len(), 2, "one level per measurement, not a subtree");
         assert_eq!(units.iter().map(|unit| unit.estimated_decoded_bytes).sum::<u64>(), 10 * MAX_DECODED_BYTES, "the halves must price the whole parent");
@@ -6403,6 +6424,29 @@ mod tests {
         assert_eq!(fresh.reset_repair_attempts(), None, "nothing to forgive, nothing spent");
         fresh.upsert(task("p", 0, DAY_MICROS, Operation::Repair));
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
+    }
+
+    /// Bisecting a dedup unit below the width where it stops shedding FILES
+    /// manufactures slivers that each pay the same whole-partition scan. Prod
+    /// 2026-09-01: 4,000 of 5,028 active dedup units were sub-15-minute slices
+    /// with a p90 of 76 input files, all of them made by `split_into_smaller_slices`.
+    #[test]
+    fn a_dedup_unit_shards_by_key_instead_of_slivering_time() {
+        let over_budget = MAX_DECODED_BYTES * 4;
+        let ten_minutes = task("p", 0, NORMAL_SLICE_MICROS, Operation::Dedup);
+        let children = byte_bounded_units(&ten_minutes, over_budget);
+        assert!(children.iter().all(|child| child.hash_shards > 1), "at the floor, dedup sheds work by KEY, not by halving time again");
+        assert!(children.iter().all(|child| child.key.slice.width() == NORMAL_SLICE_MICROS), "and the slice must not narrow further");
+
+        // Above the floor it still bisects — the floor is a floor, not a ban.
+        let hour = task("p", 0, 60 * 60 * 1_000_000, Operation::Dedup);
+        let halves = byte_bounded_units(&hour, over_budget);
+        assert_eq!(halves.len(), 2, "an hour-wide unit still halves");
+        assert!(halves.iter().all(|child| child.hash_shards <= 1));
+
+        // Other operations keep the old floor: their cost model is different.
+        let rollup = task("p", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup);
+        assert_eq!(byte_bounded_units(&rollup, over_budget).len(), 2, "only dedup's cost is partition-scoped");
     }
 
     /// A Repair unit rewrites ONE whole file, so halving its slice halves
