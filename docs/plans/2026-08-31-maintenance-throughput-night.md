@@ -591,6 +591,38 @@ ones — a fix that lets work run longer changes the memory arithmetic.
 only became visible once something else stopped failing first. A deadline that
 kills work hides the memory model that work would have exercised.
 
+### Deploy 4 result: all four lanes running, dedup still the holdout
+
+11 minutes after `7ed4d7b4`:
+
+```
+compaction_permits_unavailable   0      (was 27)
+retry.HotPacking.compaction_debt_remaining  3   <- HotPacking RUNNING, and the
+                                                   retries are the success kind
+retry.Repair.compaction          absent (was 9) <- the memory errors are gone
+pending_repair                   401    (from a flat 432 all night)
+```
+
+Unit outcomes in 14 minutes: BaseRollup **112 Complete** (≈480/h against a
+121/h baseline), DerivedRollup 27, Repair **6 Complete**, SealedConsolidation 4,
+HotPacking 4 — the first HotPacking units to run at all tonight.
+
+| lane | baseline | now |
+|---|---|---|
+| Repair | 0 completions in 5.8h | ~30/h reaching `Complete`; 10.11 GB of legacy debt retired |
+| BaseRollup | 121/h | ~480/h |
+| HotPacking | not claimed | claimed, committing, permits never unavailable |
+| SealedConsolidation | 448/5.8h, then starved by repair | running again |
+| **Dedup** | 13% completion | ~20-78% depending on window — **still the holdout** |
+
+**Dedup is the one lane that still does not keep up.** `pending_dedup` is
+5,032 → 5,106 over the window. The probe watcher fixed the units that were dying
+mid-probe, and completion share improved a lot, but arrivals still exceed
+completions. That is the next lane and it needs its own investigation, not
+another guess: the question to answer first is whether the timing-out units are
+a small set of very large partitions (in which case unit sizing is the lever) or
+a broad tail (in which case per-unit cost is).
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
