@@ -442,6 +442,22 @@ completions.
 its deadline was not raised and it does not report progress, so the liveness
 clock does not cover it. That is the next lane.
 
+### Repair is draining months of debt: 10.11 GB retired in ~2h
+
+Delta-snapshot diff against the pre-deploy baseline, ~2 hours in — **127 files /
+10.11 GB retired, of which 10.00 GB is seven files over 100 MB**:
+
+```
+2337.8 MB  2026-05-31      1183.6 MB  2026-06-08      1148.2 MB  2026-05-30
+2251.2 MB  2026-05-31      1163.6 MB  2026-06-09      1145.5 MB  2026-05-30
+```
+
+These are the biggest and oldest files in the table. Every one was
+unrewritable under the old build — too large for the 900 s deadline, and
+slicing would have turned each into a dozen-plus full re-reads of an unprunable,
+uncached file. The lane went from **zero completions in 5.8 hours** to **10 GB of
+legacy sortedness debt retired in two.**
+
 ### Deploy 1's quiet-window readout (1h53m, `uptime_seconds = 6771`)
 
 | metric | before (old build, 5.8h) | deploy 1 (1h53m) |
