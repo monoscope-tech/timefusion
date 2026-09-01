@@ -442,6 +442,25 @@ completions.
 its deadline was not raised and it does not report progress, so the liveness
 clock does not cover it. That is the next lane.
 
+### Deploy 1's quiet-window readout (1h53m, `uptime_seconds = 6771`)
+
+| metric | before (old build, 5.8h) | deploy 1 (1h53m) |
+|---|---|---|
+| `processed_bytes_total` rate | 5.8 MB/s | **16.1 MB/s** (2.8x) |
+| Repair `worker_error` | every unit (432/432) | 7 |
+| Dedup `worker_error` rate | ~124/hour | ~15/hour (**8x fewer**) |
+| `pending_repair` | 432, flat all night | **426** — first decrease |
+| files retired vs the baseline | — | 122 files / 3.60 GB, incl. both wedged giants |
+
+What is NOT better, and is the thing to watch: `pending_base_rollup` went
+314 → 596 and `pending_derived_rollup` 36 → 159 over the same window. Repair
+units that now run for 25-50 minutes instead of dying at 15 hold a worker for
+that whole time, and the rollup lanes are what gave up the slots. That is a
+reasonable trade while a finite repair backlog drains, and it is NOT reasonable
+as a steady state — if rollup pending is still climbing after the repair backlog
+clears, the answer is a reserved slot for the lanes that gate dashboards (SILK's
+floor for flush + L0→L1, prior-art rule 7), not a shorter repair deadline.
+
 ## Deploy 2 of 2: the liveness signal was in the wrong place
 
 Deploy 1 fixed repair's *cost* and then hit its own limit: seven
