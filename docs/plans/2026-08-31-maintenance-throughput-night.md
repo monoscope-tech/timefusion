@@ -685,6 +685,29 @@ largest queue, at the end of a night that already shipped four deploys, and it
 deserves the same failing-test-first treatment the others got rather than a
 5 a.m. guess.
 
+### Deploy 5 (`403a3ae8`) result
+
+10 minutes in, with the dedup bisection floor live:
+
+```
+retry.Dedup.worker_error        absent      <- first zero all night
+compaction_permits_unavailable  0
+pending_base_rollup             560 -> 487
+pending_derived_rollup          76
+pending_repair                  398   (from a flat 432)
+pending_sealed_consolidation    186
+charged_pct                     49
+```
+
+Outcomes in 12 minutes: BaseRollup **88 Complete** (≈440/h), DerivedRollup 6,
+Repair 1 Complete, SealedConsolidation 1, HotPacking 2 (`compaction_debt_remaining`,
+the success kind), Dedup 1 Complete / 3 timed out.
+
+`pending_dedup` is 5,065 — flat rather than falling. The sliver floor stops the
+queue being *manufactured*; it does not retire the ~4,000 slivers already in it.
+That is what the coarsening step (item 2 of the dedup plan above) is for, and it
+is the first thing to do next.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
