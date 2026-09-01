@@ -877,7 +877,55 @@ scan+sort+consume, not the commit or the object-store round trips prod also
 pays. It bounds the CPU/memory side of the fleet, which is the side the failures
 were on.
 
-**The model above is now a demonstration for the concurrency question.** It is grounded in measured per-unit
+**The model above is now a demonstration for the concurrency question.**
+
+### And the piece the laptop CANNOT show: prod is object-store-read-bound
+
+Two prod measurements close the gap between the bench and reality.
+
+**Commit is free.** Pairing `wave_bin_staged` with `wave_commit_enter` →
+`wave_committed` on the live build:
+
+| staging | commit |
+|---|---|
+| 9,628 ms | 123 ms |
+| 13,193 ms | 897 ms |
+| 78,295 ms | 87 ms |
+| 395,810 ms | 219 ms |
+
+Commit is 0.02-1.3% of a unit. The bench's omission of it is immaterial — the
+object-store cost that matters is the READS, and those are inside staging.
+
+**Reads are where prod diverges from the laptop, badly.** Foyer:
+
+```
+hits 99,225   misses 33,131          -> 75% by COUNT
+bytes_served 47.5 GB   inner_bytes_read 553.9 GB   -> 8% by BYTES
+```
+
+**92% of read bytes come from OVH, not the cache.** Large sequential reads of
+big files all miss, so a good hit *count* hides a bad hit *volume*. That is why
+one prod worker sustains **0.94-3.52 MB/s** on large bins where the laptop does
+8.81-24.66 MB/s off local disk — the same code, ~9x apart, entirely on read
+latency.
+
+**So the corrected 10x answer:** prod aggregate is ~4-14 MB/s (4 permits x
+0.94-3.52), and 10x demand is 12-19 MB/s. **The top of our capacity meets the
+bottom of 10x demand.** The binding constraint is neither CPU nor pool — it is
+object-store read throughput, and the lever is cache coverage, not concurrency.
+
+That reframes the next piece of work. `cache_recent_days = 35` deliberately
+excludes the May/June repair backlog, which is correct for a finite backlog and
+wrong as a steady-state model: at 10x the working set is recent and SHOULD be
+cache-served, so the number to measure next is hit-rate-by-bytes on
+*today's* partitions specifically, not the fleet average that the legacy drain
+currently dominates. Foyer has 600 GB of disk and is serving 8% of bytes; that
+is the headroom.
+
+**Caveat on the small-bin sample:** only 4 bins staged in a 90-minute window,
+because most units now are footer exonerations and rollups, which never reach
+`wave_bin_staged`. The per-worker range above is from big bins; the recent-data
+steady state is not separately measured yet and is the open question. It is grounded in measured per-unit
 cost and measured ingest, but nothing here has been run at 10x. The next step is
 a load test — seed a scratch table at 10x a whale-day and watch whether pending
 converges — not another prod inference. `TIMEFUSION_ADMISSION_OCCUPANCY_SCALED`
