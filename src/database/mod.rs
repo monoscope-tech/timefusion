@@ -19542,6 +19542,42 @@ mod tests {
         Ok(())
     }
 
+    /// A sealed date with NO queued dirty bins still gets certified.
+    ///
+    /// The batch probe only ever visited groups with queued bins, and
+    /// `dedup_dirty_bins_for_table` returned early on an empty queue — so a date
+    /// that had been fully processed was unreachable by any probe and could never
+    /// be proved. 13 of any 14-day window are sealed, and a scan only sheds
+    /// `DedupExec` when EVERY date it reads is granted, so those unreachable dates
+    /// were the whole gap between evidence existing and a query getting faster.
+    #[tokio::test]
+    async fn a_sealed_date_with_no_queued_bins_is_still_certified() -> Result<()> {
+        let cfg = create_test_config(&format!("certify-sealed-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
+        let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("solo", "only", &project, base)])?], true, None).await?;
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+
+        // THE precondition: nothing is queued, so the old code returned early.
+        db.dedup_dirty_bins.clear();
+        let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
+        assert!(db.dedup_clean_fp.get(&key).is_none(), "and nothing is certified yet");
+
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+
+        assert!(db.dedup_clean_fp.get(&key).is_some_and(|entry| !entry.value().stale), "an empty queue must not stop a sealed date from being proved");
+        // Today is excluded on purpose: a live partition gains files under ingest,
+        // so its fingerprint moves and the grant is refused by construction.
+        let today = Utc::now().date_naive().to_string();
+        assert!(
+            !db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans").iter().any(|(_, date)| *date == today),
+            "today is never a certification candidate"
+        );
+        Ok(())
+    }
+
     /// The probe phase's deadline is shared by every group, not re-granted per group.
     ///
     /// A per-probe `Duration` ran in waves of `rewrite_permits`, so many groups could take
@@ -19566,7 +19602,7 @@ mod tests {
         let queued_before = db.dedup_dirty_bins.len();
         assert_eq!(queued_before, 2, "both bins are queued to begin with");
 
-        let out = db.batch_probe_classify(&table, "otel_logs_and_spans", ready, std::time::Instant::now()).await;
+        let out = db.batch_probe_classify(&table, "otel_logs_and_spans", ready, Vec::new(), std::time::Instant::now()).await;
 
         assert_eq!(db.dedup_dirty_bins.len(), queued_before, "an exhausted phase budget must not dequeue bins it never probed");
         assert_eq!(out.len(), queued_before, "and every bin still fails OPEN to the per-bin staging path");

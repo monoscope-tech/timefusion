@@ -123,6 +123,37 @@ scanned to remove eight thousand.
 `cert_granted_total` is the number the deploy has to move. It has never been
 non-zero, which means `DedupExec` has never once been eliminated from a plan.
 
+## Deploy 21 result: a null, and the null names the real hook
+
+`cert_granted_total` stayed **0** after step 1 shipped. The refusal counters say
+the grant was never *attempted*: `cert_refused_fp_moved`, `_empty` and
+`_incomplete` are all 0, and the 2 `_dropped` cannot come from the new call site,
+which passes `dropped = 0` as a literal.
+
+My first explanation — "the probe ran and always found a duplicate somewhere in
+144 bins" — was **wrong**, and the counters refuted it:
+
+| counter | value |
+| --- | --- |
+| `dirty_bin_batch_probe_clean_total` | 0 |
+| `dirty_bin_processed_total` | 0 |
+| `dirty_bin_queue_depth` | 6 |
+| `pending_dedup` | 2,427 |
+
+**The batch probe never executed.** A probe group needs ≥2 queued bins in one
+`(project, date)`; with six bins spread across the fleet, no group forms, and
+`dedup_dirty_bins_for_table` then returned early on the empty queue.
+
+So the dirty-bin queue was the wrong hook entirely. It is nearly empty while the
+coordinator's `pending_dedup` sits at 2,427 — **they are different queues**, and I
+had been reasoning about certification as though draining one implied the other.
+Step 1 was necessary but could never fire alone.
+
+Step 2 does not depend on the queue: it enumerates candidate dates from the Delta
+snapshot. Its host runs unconditionally (`timefusion_dirty_bin_dedup_enabled`
+defaults true), which is the check that stops it repeating the repair fix's silent
+no-op.
+
 ## Success criterion
 
 After the sweep covers one busy project's full 14-day window: re-run the latency

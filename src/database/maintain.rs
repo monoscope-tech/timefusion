@@ -5712,7 +5712,16 @@ impl Database {
                 event = "dedup_bins_deferred_cold"
             );
         }
-        if ready.is_empty() {
+        // NOT an early return on an empty queue any more. The certification
+        // probes below exist precisely for dates nothing enqueues, so returning
+        // here when the drain has no work is what kept sealed dates — 13 of any
+        // 14-day window — permanently unproved.
+        let has_timestamp_key = schema.dedup_keys.iter().any(|k| k == "timestamp");
+        let certify_only = match has_timestamp_key {
+            true => self.uncertified_window_dates(&*table.read().await, table_name),
+            false => Vec::new(),
+        };
+        if ready.is_empty() && certify_only.is_empty() {
             return Ok(());
         }
         // Phase 3 (2026-08-05): BATCH the probes. Every flushed bin is
@@ -5722,7 +5731,7 @@ impl Database {
         // every queued bin of a (project, date) at once; only dup-bearing
         // bins continue into per-bin staging. Probe failure or timeout fails
         // OPEN to the per-bin path.
-        let mut ready = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
+        let mut ready = if has_timestamp_key {
             // Bound the probe phase by what is LEFT of the PASS, not just by the
             // per-probe ceiling: a whole-date probe over a fragmented whale
             // partition can run for the ceiling's full hour, and the phase logs
@@ -5741,7 +5750,7 @@ impl Database {
             // `checked_add`: `stage_deadline` is `Duration::MAX` wherever the
             // caller means "no per-probe ceiling", and that overflows an Instant.
             let probe_deadline = std::time::Instant::now().checked_add(stage_deadline).map_or(pass_deadline, |ceiling| pass_deadline.min(ceiling));
-            self.batch_probe_classify(table, table_name, ready, probe_deadline).await
+            self.batch_probe_classify(table, table_name, ready, certify_only, probe_deadline).await
         } else {
             ready
         };
@@ -5918,6 +5927,46 @@ impl Database {
         Ok(())
     }
 
+    /// `(project, date)` pairs inside the read window that hold files but carry no
+    /// live certification — the dates a dirty-bin-driven probe can never reach.
+    ///
+    /// The batch probe only visits groups with QUEUED bins, so a sealed date that
+    /// was fully processed is invisible to it. Since a scan only sheds `DedupExec`
+    /// when every date it reads is granted, and 13 of any 14-day window are sealed,
+    /// those dates are the whole difference between evidence existing and a query
+    /// getting faster. Prod 2026-09-01: `dedup_denied_never_certified` was 164 of
+    /// 177 eligible scans.
+    ///
+    /// TODAY is deliberately excluded. A live partition gains files under ingest,
+    /// so its fingerprint moves and `record_certification` refuses by construction
+    /// — probing it would spend the budget to be told no.
+    pub(crate) fn uncertified_window_dates(&self, table: &DeltaTable, table_name: &str) -> Vec<(String, String)> {
+        // Matches the dashboard windows the latency matrix is measured over.
+        const CERTIFY_WINDOW_DAYS: i64 = 14;
+        // Small on purpose: each is a whole-date key-only scan, and the pass
+        // shares one deadline with the dirty-bin probes, which retire queued work
+        // and must not be crowded out by speculative certification.
+        const CERTIFY_PROBES_PER_PASS: usize = 4;
+        let today = Utc::now().date_naive();
+        (1..=CERTIFY_WINDOW_DAYS)
+            .map(|back| (today - chrono::Duration::days(back)).to_string())
+            .flat_map(|date| {
+                Self::partition_files_by_pid(table, &format!("date={date}"))
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, files)| !files.is_empty())
+                    .map(move |(project, _)| (project, date.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|(project, date)| {
+                // Stale entries ARE re-probed: staleness means the per-file
+                // evidence outlived its fingerprint, not that the date is dirty.
+                self.dedup_clean_fp.get(&(project.clone(), table_name.to_string(), date.clone())).is_none_or(|entry| entry.value().stale)
+            })
+            .take(CERTIFY_PROBES_PER_PASS)
+            .collect()
+    }
+
     /// Runs the batch probe over each (project, date) with ≥2 queued bins and
     /// strips the probe-clean bins out of `ready`, consuming them. Group keys
     /// are dequeued BEFORE the probe so dirtiness enqueued while it runs
@@ -5925,7 +5974,8 @@ impl Database {
     /// singleton keeps the per-bin path — its bin-scoped probe prunes to ten
     /// minutes of files where the whole-date probe scans them all.
     pub(crate) async fn batch_probe_classify(
-        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, deadline: std::time::Instant,
+        &self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, ready: Vec<(String, String, i64)>, certify_only: Vec<(String, String)>,
+        deadline: std::time::Instant,
     ) -> Vec<(String, String, i64)> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut groups: HashMap<(String, String), Vec<i64>> = Default::default();
@@ -5952,6 +6002,13 @@ impl Database {
         // the tiebreak so each provider built still retires the most bins.
         groups.sort_by(|((_, da), a), ((_, db), b)| db.cmp(da).then(b.len().cmp(&a.len())));
         groups.truncate(BATCH_PROBE_GROUPS);
+        // Then the dates NOTHING enqueues. A sealed date that was fully
+        // processed has no dirty bins, so it never becomes a group above and is
+        // never certified — yet 13 of any 14-day window are sealed, and a query
+        // only loses its `DedupExec` when EVERY date it reads is granted. These
+        // carry no bins: they are probed purely for the certification, and the
+        // same closure handles them because an empty bin list clears nothing.
+        groups.extend(certify_only.into_iter().map(|group| (group, Vec::new())));
         // BEFORE the probes, not only after each one. Every other line in this
         // phase is emitted on completion, so a phase that does not complete
         // prints nothing at all — which is how prod 2026-08-12 spent 55 minutes
