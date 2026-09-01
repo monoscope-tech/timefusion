@@ -474,7 +474,14 @@ impl DerivedBudget {
         // at all (prod 2026-09-01: zero HotPacking units in 45 minutes with 17
         // pending, and `compaction_permits_unavailable` 23 on a 35-minute-old
         // process against 9 over 5.8h before).
-        let mem_bound = self.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES;
+        // MINUS one budget, held back for the repair lane. Repair draws on the
+        // same coordinator pool but is NOT counted here — and since the liveness
+        // clock let its units live for tens of minutes instead of dying at their
+        // deadline, they now overlap the hygiene bins instead of being killed
+        // before they could. Prod 2026-09-01: `Not enough memory to continue
+        // external sort` on repair staging as soon as long-running units and
+        // K=4 hygiene bins shared 8 GB sixteen ways.
+        let mem_bound = (self.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES).saturating_sub(1);
         let cpu_bound = self.cores / 4;
         mem_bound.min(cpu_bound).min(hot_project_count).max(1)
     }
@@ -2816,9 +2823,11 @@ mod tests {
         let b = DerivedBudget::from_limits(120 * GIB, 48);
         assert!(b.heavy_share_bytes() as f64 >= b.maintenance_pool_bytes() as f64 * 0.25 - 1.0);
         let k = b.light_optimize_k(11);
-        // 5 with the 30G post-slack pool: fewer concurrent per-project sorts is
-        // the intended trade for not OOMing the box.
-        assert!((4..=11).contains(&k), "K={k} outside the expected 4..=11 range");
+        // The band shifted down by exactly one when the repair lane's sort
+        // budget was reserved out of it (see `light_optimize_k`) — repair draws
+        // on the same coordinator pool and was never counted here.
+        assert!((3..=11).contains(&k), "K={k} outside the expected 3..=11 range");
+        assert_eq!(k + 1, b.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES, "exactly one budget is held back for repair");
         // Envelope (permits x per-sort budget) is the invariant, not the raw
         // permit count — a prior fan-in OOM was about that product, and
         // asserting count alone misses permits raised without paying for them.
@@ -2932,7 +2941,11 @@ mod tests {
     #[test]
     fn the_packing_permit_follows_the_coordinator_pool_not_the_light_share() {
         let prod = DerivedBudget::from_limits(80 * GIB, 48);
-        assert_eq!(prod.light_optimize_k(11), prod.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES, "the memory term is the coordinator's pool");
+        assert_eq!(
+            prod.light_optimize_k(11),
+            prod.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES - 1,
+            "the memory term is the coordinator's pool, less the budget repair draws from it"
+        );
         assert!(prod.light_optimize_k(11) > 1, "one permit shared by HotPacking and SealedConsolidation starves packing");
         assert!(prod.light_optimize_k(11) < prod.cores / 4, "and the CPU term is not what binds on a big box");
     }
