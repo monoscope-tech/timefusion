@@ -23,14 +23,27 @@ maintenance_debt_slots           try_acquire
 maintenance_derived_reserve      try_acquire
 repair_pass_permit               try_acquire
 repair_rewrite_sem               try_acquire   <- added 2026-09-01
-light_rewrite_sem                acquire().await   <- STILL parks a worker
+light_rewrite_sem                acquire().await   <- reachable only from dead code
 ```
+
+(That last one is at `maintain.rs:6360`. Its only callers pass
+`runtime_env: None`, which is `optimize_table_light` and the legacy wave engine
+— and `optimize_table_light` has **no callers**. So it does not park a
+coordinator worker today. It is left alone deliberately: changing inert code is
+churn, and a pool design removes it anyway.)
 
 Eight pre-claim gates, one remaining blocking wait. Each was added after a
 different production incident, and each is the same lesson relearned: *check
 before you claim.* The 2026-09-01 starvation — `tasks_running=16/16`,
 `tasks_pending=3,364`, **zero** completions in 25 minutes, `pending_*` gauges
 frozen byte-identical — happened at the one place that had not yet learned it.
+
+**It is a recurring stall, not a deadlock.** The fleet recovered on its own once
+the repair rewrite holding the permit finished: 20 completions in the following
+six minutes and `pending_repair` resumed falling. So the failure mode is a
+~25-minute fleet-wide stall every time a long repair rewrite overlaps other
+claimed repair units — invisible in the gauges while it lasts, which is what
+makes it worse than its duration suggests.
 
 The deeper cost is that a blocked worker is invisible. It is not idle (so no
 "idle workers" signal fires), not failing (so no error counter moves), and not
@@ -88,9 +101,9 @@ still needs the claim to be non-blocking.
 
 ## Doing it properly
 
-1. **Make every remaining `acquire().await` on the coordinator path a
-   `try_acquire` + requeue** (one left: `light_rewrite_sem` at
-   `maintain.rs:6360`). Cheap, and it makes the current design honest.
+1. **Keep the claim path non-blocking.** As of `0876b07f` it is: the only
+   remaining `acquire().await` is unreachable from the coordinator. The rule to
+   hold is that no new one may be added — a pool design depends on it.
 2. **Add a per-class pool to the worker spawn** in `mod.rs:4697`: instead of
    `coordinator_job_workers` identical tasks looping over `operation_cycle()`,
    spawn per class with its own count. `claim_coordinator_task(operation)` is
