@@ -422,9 +422,15 @@ clock does not cover it. That is the next lane.
   adding to it at ~100/hour and `persist_dirty_bins` rewrites the entire
   40k-entry sidecar on **every** enqueue. The coordinator's Dedup units do the
   real work; this queue is vestigial for those tables. The fix is to stop
-  enqueuing for coordinator-owned tables (check `DedupRangeOptions.dirty_key`
-  first — `run_coordinator_dedup_once` passes `None`, but confirm no other
-  reader).
+  enqueuing for coordinator-owned tables. **Attempted and reverted: the producer
+  is the wrong seam.** Gating `enqueue_dirty_bin` on the same predicate the cron
+  uses broke six tests that correctly assert the write path's behaviour — the
+  queue is the flush's honest record of what changed, and the write path should
+  keep producing it. The defect is that nothing CONSUMES it for
+  coordinator-owned tables, so the fix belongs at the consumer end: either drain
+  it (the cron's comment explains why that is dangerous — one admitted bin holds
+  `maintenance_job_sem` for its 3600s stage deadline), or retire those bins
+  explicitly, the way `retire_undeclared_tiers` retires work for a deleted tier.
 - **HotPacking's 14 completions vs 472 retries is still unattributed.** Note
   that `retry("compaction_debt_remaining")` is a *success* requeue, not a
   failure, so some large share of those 472 is progress. The new
