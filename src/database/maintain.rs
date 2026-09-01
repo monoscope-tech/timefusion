@@ -224,6 +224,44 @@ mod liveness_clock_tests {
         super::note_unit_progress(1);
     }
 
+    /// The hole this closes: `ORDER BY` is blocking, so a unit can be working
+    /// hard and writing nothing. Prod 2026-09-01 killed seven working repair
+    /// units at `timeout_seconds=3600` for exactly that. The signal therefore
+    /// has to come from the plan's own row counters, not from the output.
+    #[tokio::test(start_paused = true)]
+    async fn plan_rows_reach_the_liveness_counter() {
+        use datafusion::prelude::SessionContext;
+        let progress = Arc::new(AtomicU64::new(0));
+        super::UNIT_PROGRESS
+            .scope(Arc::clone(&progress), async {
+                let ctx = SessionContext::new();
+                let plan = ctx.sql("SELECT 1 AS a UNION ALL SELECT 2 ORDER BY a").await.expect("plan").create_physical_plan().await.expect("physical");
+                let _watch = super::PlanProgress::watch(Arc::clone(&plan));
+                datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("collect");
+                // One tick past the watcher's interval.
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            })
+            .await;
+        assert!(progress.load(Relaxed) > 0, "the plan's own row counters must reach the clock the unit is judged by");
+    }
+
+    /// And the watcher must not outlive its guard, or an abandoned unit keeps
+    /// reporting progress forever.
+    #[tokio::test(start_paused = true)]
+    async fn the_plan_watcher_stops_with_its_guard() {
+        use datafusion::prelude::SessionContext;
+        let progress = Arc::new(AtomicU64::new(0));
+        super::UNIT_PROGRESS
+            .scope(Arc::clone(&progress), async {
+                let ctx = SessionContext::new();
+                let plan = ctx.sql("SELECT 1 AS a").await.expect("plan").create_physical_plan().await.expect("physical");
+                drop(super::PlanProgress::watch(plan));
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            })
+            .await;
+        assert_eq!(progress.load(Relaxed), 0, "a dropped watcher reports nothing");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn work_that_writes_nothing_is_given_up_on() {
         let progress = Arc::new(AtomicU64::new(0));
@@ -292,6 +330,60 @@ tokio::task_local! {
 /// unit, which is what the cron paths and tests want.
 pub(crate) fn note_unit_progress(rows: usize) {
     let _ = UNIT_PROGRESS.try_with(|progress| progress.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Keep the current unit's liveness clock alive for as long as its physical plan
+/// is still pulling rows, and stop when the guard drops.
+///
+/// A write loop cannot report progress through a BLOCKING operator. `ORDER BY`
+/// is one: a repair unit emits its first row only after the whole input has been
+/// downloaded, decoded and spilled, and on the fleet's largest files that silent
+/// stretch exceeded an hour — prod 2026-09-01 logged seven
+/// `operation=Repair timeout_seconds=3600` kills against units that were
+/// working, which is the same treadmill the clock exists to end, one order of
+/// magnitude further out.
+///
+/// So the signal comes from the plan's own metrics instead of from the output.
+/// Every `ExecutionPlan` collects `output_rows`; summed over the tree it moves
+/// while the scan feeds the sort, which is exactly the window the write loop
+/// cannot see.
+struct PlanProgress(Option<tokio::task::JoinHandle<()>>);
+
+impl PlanProgress {
+    fn watch(plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Self {
+        /// Long enough to cost nothing against an hour-scale window, short
+        /// enough that a stalled plan is still detected inside it.
+        const TICK: std::time::Duration = std::time::Duration::from_secs(15);
+        let Ok(progress) = UNIT_PROGRESS.try_with(Arc::clone) else {
+            // Not inside a unit (cron paths, tests): nothing to keep alive.
+            return Self(None);
+        };
+        Self(Some(tokio::spawn(async move {
+            let mut last = 0u64;
+            loop {
+                tokio::time::sleep(TICK).await;
+                let rows = plan_output_rows(plan.as_ref());
+                // The counter is monotonic and read as "has it moved", so feed
+                // it the DELTA rather than the total.
+                progress.fetch_add(rows.saturating_sub(last), std::sync::atomic::Ordering::Relaxed);
+                last = rows;
+            }
+        })))
+    }
+}
+
+impl Drop for PlanProgress {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Rows every operator in `plan` has produced so far.
+fn plan_output_rows(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> u64 {
+    let own = plan.metrics().and_then(|metrics| metrics.output_rows()).unwrap_or_default() as u64;
+    plan.children().iter().fold(own, |rows, child| rows.saturating_add(plan_output_rows(child.as_ref())))
 }
 
 /// Run `work`, giving up only after `idle` passes with **no progress**.
@@ -6354,7 +6446,11 @@ impl Database {
             // order, all feeding the SAME writer.
             let passes: Vec<String> = if slices.is_empty() { vec![String::new()] } else { slices };
             for predicate in &passes {
-                let mut stream = ctx.sql(&format!("SELECT * FROM {bin_table}{predicate}{order_by}")).await?.execute_stream().await?;
+                let plan = ctx.sql(&format!("SELECT * FROM {bin_table}{predicate}{order_by}")).await?.create_physical_plan().await?;
+                // Held for the life of the stream: the sort below it can run for
+                // most of the unit without emitting a row.
+                let _progress = PlanProgress::watch(Arc::clone(&plan));
+                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
                 while let Some(batch) = stream.next().await {
                     let batch = cast_variant_columns_to_binary(batch?)?;
                     if batch.num_rows() == 0 {
