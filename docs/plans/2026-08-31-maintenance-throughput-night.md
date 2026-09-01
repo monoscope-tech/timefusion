@@ -708,6 +708,26 @@ queue being *manufactured*; it does not retire the ~4,000 slivers already in it.
 That is what the coarsening step (item 2 of the dedup plan above) is for, and it
 is the first thing to do next.
 
+### Deploy 6 (`f7fd7290`): the dedup queue finally collapses
+
+The coarsening pass, before and after, from the same log line:
+
+```
+before   subsumed=144  fused=0     candidates=7452  blocked=488  over_budget=6964
+after    subsumed=136  fused=2363  candidates=2947  blocked=406  over_budget=178
+```
+
+**2,363 units fused in one pass.** `over_budget` fell from 6,964 to 178 and the
+candidate set from 7,452 to 2,947 — the pass had been re-evaluating and
+re-refusing the same slivers every 60 seconds all night.
+
+`pending_dedup`: **5,049 → 2,808**, a 44% drop, on a queue that grew all night
+and never once fell.
+
+With that, the two halves are in place: the bisection floor (deploy 5) stops the
+slivers being manufactured, and partition-priced fusion (deploy 6) retires the
+ones already queued.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
