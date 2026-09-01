@@ -799,6 +799,53 @@ it on while a legacy backlog drains would slow that drain. It should be enabled
 once these queues are flat at a low number, and the honest next step after that
 is a load test, not another prod inference.
 
+## A capacity model for 10x, from measurements rather than assertion
+
+**Demand.** Measured on the live process: 4,081,606 rows in 3,135 s =
+**1,302 rows/s**, and `flush_freed_bytes_total` 14.26 GB over the same window =
+**4.55 MB/s of decoded Arrow** landing in Delta. At prod's ~12x compression that
+is ~0.38 MB/s compressed written.
+
+Maintenance does not touch each byte once. Dedup scans the partition, hygiene
+rewrites the small files, repair rewrites the unsorted ones, rollups aggregate.
+Call it **3-5 passes**, so the fleet must sustain **~14-23 MB/s decoded**
+(~1.2-1.9 MB/s compressed) to keep up at today's volume.
+
+**Capacity.** Measured over 45 minutes on the current build, on the large legacy
+bins the fleet is now chewing through:
+
+```
+staged bins 5   total_in 2,217 MB   busy 2,359 s
+aggregate  0.94 MB/s compressed per busy worker
+median bin 350 MB in 148 s = 2.36 MB/s
+```
+
+Concurrency is 3 hygiene permits + 1 repair permit, so **~4-9 MB/s compressed
+aggregate**. Against a 1.2-1.9 MB/s demand that is roughly **2-7x headroom at
+current volume** — which matches what the queues are doing (flat, with the
+legacy backlog draining).
+
+**At 10x** demand becomes 12-19 MB/s compressed, and 4-9 MB/s of capacity does
+NOT cover it. The gap is concurrency, and concurrency is memory-derived
+(`light_optimize_k = coordinator_share / PER_SORT_BUDGET_BYTES - 1`, currently
+3). Two levers, in order:
+
+1. **Per-unit memory.** `PER_SORT_BUDGET_BYTES` is 2 GB because a rewrite could
+   hold a 2 GB row group. The row-group fix (deploy 7) caps groups at the byte
+   target, so that budget can come down — and every halving doubles the permits
+   the same pool buys.
+2. **Pool size.** The coordinator holds 8 GB of a 16 GB maintenance pool on a
+   120 GB box; `light_share` (3 GB) still feeds session states with no live
+   callers. There is room, and it is now the honest place to spend it.
+
+**This is a model, not a demonstration.** It is grounded in measured per-unit
+cost and measured ingest, but nothing here has been run at 10x. The next step is
+a load test — seed a scratch table at 10x a whale-day and watch whether pending
+converges — not another prod inference. `TIMEFUSION_ADMISSION_OCCUPANCY_SCALED`
+exists so that when the fleet IS saturated it degrades by admitting small work
+rather than by killing large work, which is the failure mode this whole night
+was about.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
