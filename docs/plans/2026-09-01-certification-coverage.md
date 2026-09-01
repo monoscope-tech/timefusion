@@ -154,6 +154,27 @@ snapshot. Its host runs unconditionally (`timefusion_dirty_bin_dedup_enabled`
 defaults true), which is the check that stops it repeating the repair fix's silent
 no-op.
 
+## What to read next, and how to tell the difference
+
+Deploy 22 (`e2400a21`) ships the snapshot-driven producer. The counters
+discriminate three outcomes, and they mean different next moves:
+
+1. **`cert_granted_total` > 0** — the mechanism works. Move to whether whole
+   *windows* get covered, then re-run the latency matrix.
+2. **`cert_granted_total` = 0 but `cert_refused_fp_moved` > 0** — the grant is now
+   being ATTEMPTED and losing a race with concurrent commits. That is progress
+   over deploy 21, and the fix is to certify dates that are genuinely quiescent
+   (older than the maintenance write frontier), not to retry harder.
+3. **Every `cert_*` counter still 0** — the producer still is not reaching prod's
+   data. Stop adding producers. Instrument the candidate enumeration directly
+   (how many dates it returns, and why the rest were filtered) rather than
+   guessing a fourth time.
+
+The discipline that has paid tonight: **a counter that stays zero is not a small
+result, it is a claim that the code never ran** — and `dirty_bin_batch_probe_clean_total`
+proved exactly that after deploy 21, refuting a much more plausible story about
+duplicate-bearing bins.
+
 ## Success criterion
 
 After the sweep covers one busy project's full 14-day window: re-run the latency

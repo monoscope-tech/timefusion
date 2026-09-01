@@ -5943,28 +5943,38 @@ impl Database {
     pub(crate) fn uncertified_window_dates(&self, table: &DeltaTable, table_name: &str) -> Vec<(String, String)> {
         // Matches the dashboard windows the latency matrix is measured over.
         const CERTIFY_WINDOW_DAYS: i64 = 14;
-        // Small on purpose: each is a whole-date key-only scan, and the pass
-        // shares one deadline with the dirty-bin probes, which retire queued work
-        // and must not be crowded out by speculative certification.
-        const CERTIFY_PROBES_PER_PASS: usize = 4;
+        // Each is a whole-date key-only scan sharing the pass deadline with the
+        // dirty-bin probes, and a group reached with no budget left returns
+        // without probing — so this bounds work per pass without risking the
+        // tick. Prod 2026-09-01 ran 16 grants with `dedup_timed_out_total` = 0.
+        const CERTIFY_PROBES_PER_PASS: usize = 16;
         let today = Utc::now().date_naive();
-        (1..=CERTIFY_WINDOW_DAYS)
-            .map(|back| (today - chrono::Duration::days(back)).to_string())
-            .flat_map(|date| {
-                Self::partition_files_by_pid(table, &format!("date={date}"))
-                    .into_iter()
-                    .flatten()
-                    .filter(|(_, files)| !files.is_empty())
-                    .map(move |(project, _)| (project, date.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .filter(|(project, date)| {
-                // Stale entries ARE re-probed: staleness means the per-file
-                // evidence outlived its fingerprint, not that the date is dirty.
-                self.dedup_clean_fp.get(&(project.clone(), table_name.to_string(), date.clone())).is_none_or(|entry| entry.value().stale)
-            })
-            .take(CERTIFY_PROBES_PER_PASS)
-            .collect()
+        let mut by_project: HashMap<String, Vec<String>> = Default::default();
+        for back in 1..=CERTIFY_WINDOW_DAYS {
+            let date = (today - chrono::Duration::days(back)).to_string();
+            for (project, files) in Self::partition_files_by_pid(table, &format!("date={date}")).into_iter().flatten() {
+                // Stale entries ARE re-probed: staleness means per-file evidence
+                // outlived its fingerprint, not that the date is dirty.
+                if !files.is_empty()
+                    && self.dedup_clean_fp.get(&(project.clone(), table_name.to_string(), date.clone())).is_none_or(|entry| entry.value().stale)
+                {
+                    by_project.entry(project).or_default().push(date.clone());
+                }
+            }
+        }
+        // PROJECT-MAJOR, fewest-remaining first — not date-major. A scan only
+        // sheds `DedupExec` when EVERY date in its window is granted, so grants
+        // scattered one-per-project across many projects buy nothing while the
+        // same number concentrated on one project completes a window and moves
+        // that project's queries. Finishing the nearly-done project first
+        // maximises how many projects are query-eligible per pass.
+        //
+        // This is the same scattered-vs-contiguous trap the per-file skip fell
+        // into, one level up: grant COUNT is not the objective, covered WINDOWS
+        // are.
+        let mut projects: Vec<_> = by_project.into_iter().collect();
+        projects.sort_by_key(|(project, dates)| (dates.len(), project.clone()));
+        projects.into_iter().flat_map(|(project, dates)| dates.into_iter().map(move |date| (project.clone(), date))).take(CERTIFY_PROBES_PER_PASS).collect()
     }
 
     /// Runs the batch probe over each (project, date) with ≥2 queued bins and

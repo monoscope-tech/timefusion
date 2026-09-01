@@ -19578,6 +19578,38 @@ mod tests {
         Ok(())
     }
 
+    /// Candidates come out PROJECT-MAJOR, fewest-remaining first.
+    ///
+    /// A scan only sheds `DedupExec` when every date in its window is granted, so
+    /// grants scattered one-per-project across many projects buy nothing while the
+    /// same count concentrated on one project completes a window. Date-major order
+    /// maximises grant COUNT and minimises covered WINDOWS — the same
+    /// scattered-vs-contiguous trap the per-file skip fell into, one level up.
+    #[tokio::test]
+    async fn certification_candidates_finish_one_project_before_starting_another() -> Result<()> {
+        let cfg = create_test_config(&format!("certify-order-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let (near, far) = (format!("near_{}", uuid::Uuid::new_v4().simple()), format!("far_{}", uuid::Uuid::new_v4().simple()));
+        // `near` has one uncertified date, `far` has three. Date-major ordering
+        // would interleave them; project-major must drain `near` first.
+        for (project, days) in [(&near, vec![2i64]), (&far, vec![1, 3, 4])] {
+            for back in days {
+                let ts = (Utc::now() - chrono::Duration::days(back)).date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+                let batch = json_to_batch(vec![test_span_ts(&format!("r{back}"), "only", project, ts)])?;
+                db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
+            }
+        }
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let got = db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans");
+
+        let ours: Vec<&String> = got.iter().map(|(project, _)| project).filter(|p| **p == near || **p == far).collect();
+        let first_far = ours.iter().position(|p| ***p == far);
+        let last_near = ours.iter().rposition(|p| ***p == near);
+        assert!(last_near.is_some() && first_far.is_some(), "both projects have uncertified dates in the window");
+        assert!(last_near < first_far, "the nearly-done project must be finished before the further one is started: {ours:?}");
+        Ok(())
+    }
+
     /// The probe phase's deadline is shared by every group, not re-granted per group.
     ///
     /// A per-probe `Duration` ran in waves of `rewrite_permits`, so many groups could take
