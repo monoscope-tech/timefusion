@@ -1081,9 +1081,16 @@ reading:
   whole-file rewrites, deliberately serialised on one permit so they cannot
   exhaust the pool. Faster needs the row-group fix to shrink what a repair unit
   holds, then more repair concurrency.
-- **SealedConsolidation +0.16/min is the one lane still losing**, slowly. It is
-  the lane with a single permit shared with HotPacking and the lowest cycle
-  weight. First candidate for the per-class pool work.
+- **SealedConsolidation +0.16/min is the one lane still losing** — but NOT
+  because it is starved, which is what I assumed before measuring. Over the same
+  25 minutes it processed **101 units: 38 Complete, 41 Retry, 22 Superseded**,
+  i.e. ~1.5 completions/min. Its funnel shows 17 `outranked_by` refusals, the
+  same as HotPacking's — it is getting slots.
+  **Arrivals simply exceed completions, by about four units per 25 minutes.**
+  At +0.16/min a base of 192 doubles in ~20 hours, so it is a watch item, not an
+  emergency — and the fix is throughput in that lane or fewer minted cells, NOT
+  the per-class pool work. Assuming starvation would have prescribed the wrong
+  change; the funnel counter added earlier tonight is what caught it.
 - `charged_pct` 30 → 63 over the window. Well under the brake, but the only
   number here trending the wrong way; worth a look if it keeps climbing.
 

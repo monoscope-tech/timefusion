@@ -154,3 +154,16 @@ still needs the claim to be non-blocking.
 
 The invariant to hold onto, and the one the current design cannot state:
 **a claimed unit is always runnable.**
+
+## What this work is NOT for
+
+SealedConsolidation was briefly nominated as the first lane to move, on the
+assumption that its slowly-growing queue meant starvation. Measured, it is not:
+101 units processed in 25 minutes (38 Complete, 41 Retry, 22 Superseded) and the
+same 17 `outranked_by` refusals HotPacking sees. It is getting slots; arrivals
+just exceed completions by ~4 units per 25 minutes.
+
+The pool work is for the **starvation and parking class** — a worker blocked on a
+resource it should not have claimed against — not for lanes that are merely
+under-provisioned. Those want throughput or fewer minted cells, and pools would
+not help them.
