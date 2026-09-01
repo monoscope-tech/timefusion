@@ -19762,6 +19762,38 @@ mod tests {
         Ok(())
     }
 
+    /// The deploy-15 outage shape: read a task's `attempts`, then take the
+    /// journal again to retry it. Inlining the read as an ARGUMENT held the
+    /// first guard across the second lock and parked every rollup worker that
+    /// hit an admission refusal; `admission_backoff_for` confines the guard to
+    /// its own body so the sequence completes.
+    ///
+    /// Asserted under a timeout because the regression is a HANG, not a wrong
+    /// value — without one this test would hang the suite instead of failing it.
+    #[tokio::test]
+    async fn reading_attempts_does_not_hold_the_journal_into_the_retry() -> Result<()> {
+        let cfg = create_test_config(&format!("admission-backoff-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let key = crate::maintenance_coordinator::TaskKey {
+            physical_table: "otel_logs_and_spans".to_owned(),
+            source: "otel_logs_and_spans".to_owned(),
+            project_id: "p".to_owned(),
+            slice: crate::maintenance_coordinator::TimeSlice { start_micros: 0, end_micros: 60_000_000 },
+            operation: crate::maintenance_coordinator::Operation::BaseRollup,
+        };
+        let sequence = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let delay = db.admission_backoff_for(&key);
+            // The second acquisition is the one that deadlocked in prod.
+            let attempts = db.journal().attempts(&key);
+            (delay, attempts)
+        })
+        .await;
+        let (delay, attempts) = sequence.expect("reading attempts must release the journal before the retry re-locks it");
+        assert_eq!(attempts, 0, "an unknown key has no attempts yet");
+        assert_eq!(delay, std::time::Duration::from_secs(1), "and backs off from 1s rather than splitting the unit");
+        Ok(())
+    }
+
     /// Repair must not queue on the hygiene permits, and must not run two at
     /// once. Prod 2026-09-01: as soon as the liveness clock let repair units
     /// live tens of minutes, they overlapped each other and the hygiene bins on

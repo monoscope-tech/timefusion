@@ -625,6 +625,21 @@ async fn staged_objects_complete(store: &dyn object_store::ObjectStore, adds: &[
 
 impl Database {
     /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
+    /// The busy-pool backoff for `key`, with the journal guard confined to this
+    /// body so no caller can hold it across `retry_task`.
+    ///
+    /// Deploy 15 inlined `self.journal().attempts(&key)` as an ARGUMENT to
+    /// `retry_task`. A temporary in argument position lives to the end of the
+    /// enclosing statement, so that guard was still held when `retry_task`
+    /// locked the same non-reentrant mutex: every rollup worker that hit an
+    /// admission refusal parked forever, and the tell was zero `work.*` counters
+    /// with `tasks_running=13` (reverted as 106da7ea). Taking the key and
+    /// returning an owned `Duration` makes that shape unwritable at the call
+    /// site — the guard is already dropped when this returns.
+    pub(crate) fn admission_backoff_for(&self, key: &crate::maintenance_coordinator::TaskKey) -> std::time::Duration {
+        admission_backoff(self.journal().attempts(key))
+    }
+
     fn retry_task(&self, key: &crate::maintenance_coordinator::TaskKey, reason: String, delay: std::time::Duration) -> Result<()> {
         let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
         let mut journal = self.journal();
@@ -2536,7 +2551,15 @@ impl Database {
         let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
         let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: per_shard_bytes, object_reads: 1, object_writes: 1 })
         else {
-            retry("resource_admission".to_owned(), std::time::Duration::from_secs(1))?;
+            // Transient, exactly as at the dedup site: the shard count above was
+            // chosen so `per_shard_bytes <= MAX_DECODED_BYTES`, so a refusal here
+            // cannot mean "too big to ever admit" — it means the pool is busy.
+            // Deploy 14 reclassified the other two sites and this one kept
+            // accruing `resource_admission`, which SPLITS the unit: 63 within
+            // three minutes of the restart, and 169 of the 392 measured in the
+            // pre-deploy baseline. It is the largest remaining source.
+            //
+            retry("admission_busy".to_owned(), self.admission_backoff_for(&key))?;
             return Ok(true);
         };
         let mut fingerprint_items = selected.clone();
