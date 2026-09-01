@@ -6273,7 +6273,9 @@ impl Database {
     /// invisible to readers, and failures clean up their own staged files. `Retry` means the bin's
     /// files were rewritten concurrently; the project stays in rotation and the next re-plan serves
     /// a fresh bin. `Converged` means nothing worth staging.
-    async fn stage_hot_bin(
+    /// `pub(crate)` for the starvation regression test in `mod.rs` — the one
+    /// that pins that a busy repair permit hands its worker back.
+    pub(crate) async fn stage_hot_bin(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema::TableSchema, project_id: &str, files: Vec<String>,
         options: HotStageOptions,
     ) -> Result<BinOutcome<StagedBin>> {
@@ -6329,9 +6331,32 @@ impl Database {
             // Repair queues on its OWN one-permit semaphore: its bins are whole
             // files, so two at once is a pool exhaustion, and it must not spend
             // one of the hygiene permits it would then starve.
-            None if pass == TailPass::Repair => {
-                Arc::clone(&self.repair_rewrite_sem).acquire_owned().await.map_err(|e| anyhow::anyhow!("repair rewrite semaphore closed: {e}"))?
-            }
+            //
+            // But it must NOT WAIT on it, because waiting here parks a
+            // coordinator worker for the length of somebody else's 20-50 minute
+            // rewrite. Prod 2026-09-01 reached `tasks_running=16` of 16 with
+            // `tasks_pending=3,364` and **zero** `maintenance_task_finished` in
+            // 25 minutes: every worker was parked on this line, so nothing
+            // finished, the planning pass never ran, and the `pending_*` gauges
+            // froze byte-identical while the fleet looked alive in the logs.
+            //
+            // Giving the worker back is free — the unit is re-queued and the
+            // cycle moves that worker to dedup or rollup, which is the same
+            // work-conserving argument the pre-claim gate above makes for
+            // HotPacking and SealedConsolidation.
+            None if pass == TailPass::Repair => match Arc::clone(&self.repair_rewrite_sem).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        table_name,
+                        project_id,
+                        event = "repair_rewrite_permit_busy",
+                        "another repair rewrite holds the permit; requeueing rather than parking a worker"
+                    );
+                    return Ok(BinOutcome::Retry);
+                }
+            },
             None => Arc::clone(&self.light_rewrite_sem).acquire_owned().await.map_err(|e| anyhow::anyhow!("light rewrite semaphore closed: {e}"))?,
         };
         let permit_wait_ms = permit_wait.elapsed().as_millis() as u64;

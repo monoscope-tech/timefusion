@@ -6415,7 +6415,7 @@ pub(crate) struct DedupRangeOptions {
     limits: Option<DedupExecutionLimits>,
 }
 
-struct HotStageOptions {
+pub(crate) struct HotStageOptions {
     pass: TailPass,
     runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// A `light_rewrite_sem` permit the CALLER already holds. `None` means
@@ -8347,7 +8347,7 @@ async fn discard_bin_parquet(bins: &[StagedBin], live: &HashSet<String>) {
 /// Per-project outcome of one round's staging. `Result<Option<T>>` overloaded `None`: "converged"
 /// (drop for the tick) vs "bin vanished under a concurrent rewrite" (project still has work —
 /// dropping it would silence its compaction for the rest of the tick).
-enum BinOutcome<T> {
+pub(crate) enum BinOutcome<T> {
     /// Bin staged; project stays in the round-robin.
     Staged(T),
     /// Tail converged — nothing left this tick; drop from the rotation.
@@ -19565,6 +19565,39 @@ mod tests {
 
     /// Dedup yields to persistence: an unhealthy flush path skips the pass
     /// whole, leaving the queue intact for a later tick.
+    /// Waiting for the repair permit must not hold a coordinator worker. Prod
+    /// 2026-09-01: `tasks_running=16` of 16 with `tasks_pending=3,364` and ZERO
+    /// completions in 25 minutes — every worker parked on that wait, so nothing
+    /// finished, the planning pass never ran, and the `pending_*` gauges froze
+    /// byte-identical while the logs showed a healthy process.
+    #[tokio::test]
+    async fn a_busy_repair_permit_requeues_instead_of_parking_a_worker() -> Result<()> {
+        let cfg = create_test_config(&format!("repair-park-{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::with_config(cfg).await?;
+        let schema = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").cloned();
+        let Some(table) = table else { return Ok(()) };
+
+        // Hold the only repair permit, as a live rewrite would.
+        let held = Arc::clone(&db.repair_rewrite_sem).try_acquire_owned().expect("the permit starts free");
+
+        let started = std::time::Instant::now();
+        let outcome = db
+            .stage_hot_bin(
+                &table,
+                "otel_logs_and_spans",
+                schema,
+                "p",
+                vec!["nonexistent.parquet".to_owned()],
+                HotStageOptions { pass: TailPass::Repair, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None },
+            )
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "it must return immediately, not wait for the permit");
+        assert!(matches!(outcome, Ok(BinOutcome::Retry)), "and hand the worker back by requeueing");
+        drop(held);
+        Ok(())
+    }
+
     /// The flush path fills a dirty-bin queue that nothing drains for
     /// rollup-declared tables — the dedup cron skips exactly those. Prod
     /// 2026-09-01: 41,676 entries, `dirty_bin_eligible_total` at 0 all night,
