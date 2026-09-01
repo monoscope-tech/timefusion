@@ -2506,14 +2506,7 @@ impl Database {
         let per_shard_bytes = estimated_bytes.div_ceil(hash_shards).max(1);
         let Some(_permit) = self.maintenance_admission.try_acquire(Resources { cpu: 1, decoded_bytes: per_shard_bytes, object_reads: 1, object_writes: 1 })
         else {
-            // Transient, exactly as at the dedup site: the shard count above was
-            // chosen so `per_shard_bytes <= MAX_DECODED_BYTES`, so a refusal here
-            // cannot mean "too big to ever admit" — it means the pool is busy.
-            // Deploy 14 reclassified the other two sites and this one kept
-            // accruing `resource_admission`, which SPLITS the unit: 63 within
-            // three minutes of the restart, and 169 of the 392 measured in the
-            // pre-deploy baseline. It is the largest remaining source.
-            retry("admission_busy".to_owned(), admission_backoff(self.journal().attempts(&key)))?;
+            retry("resource_admission".to_owned(), std::time::Duration::from_secs(1))?;
             return Ok(true);
         };
         let mut fingerprint_items = selected.clone();
