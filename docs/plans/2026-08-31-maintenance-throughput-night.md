@@ -424,6 +424,20 @@ file. It is now rewritten, sorted, and committed.
 Every `maintenance_coordinator_unit_timed_out` in the window is **Dedup**. Zero
 for Repair.
 
+And the liveness clock keeps earning it. `maintenance_unit_slow` over the first
+hour reports three Repair units at **3031 s, 2679 s and 1562 s — all of which
+COMPLETED.** Every one would have been killed by the old 900 s deadline, and
+each kill would have discarded uncommitted work and re-queued the identical
+slice. (These are *elapsed* times; the rule is idleness, so a unit writing rows
+continuously never approaches the 3600 s window.) The same log shows completing
+Dedup units at 91 s and 149 s — the dedup timeouts are a different, heavier
+population, not a general slowness.
+
+Dedup timeout rate: 13 in the first ~58 minutes ≈ 13/hour, against the old
+build's 618 over 5 hours ≈ 124/hour. **~9x fewer**, from the batch and pool
+changes alone — but `pending_dedup` still grows, so arrivals still exceed
+completions.
+
 **Dedup still times out at 300 s** (`retry.Dedup.worker_error = 6`). Expected:
 its deadline was not raised and it does not report progress, so the liveness
 clock does not cover it. That is the next lane.
