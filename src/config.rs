@@ -197,6 +197,29 @@ const HEAVY_REWRITE_PERMITS: usize = 10;
 /// halving keeps the extra concurrency while landing the fan-in envelope near
 /// where it last ran clean (10 x 2 = 20 GiB vs the old 4 x 4 = 16 GiB).
 const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
+/// Per-sort budget for the COORDINATOR rewrite path specifically, measured
+/// rather than inherited.
+///
+/// `PER_SORT_BUDGET_BYTES` is 2 GiB partly because a sort could be handed a
+/// 2 GB row group; capping row groups by measured decoded bytes removed that,
+/// and it also sizes the `HEAVY_REWRITE_PERMITS` envelope that was tuned
+/// against an OOM — so it stays where it is and the coordinator gets its own
+/// number.
+///
+/// 1.25 GiB comes from `benches/rewrite_throughput.rs` (`TF_BENCH_FLEET=1`), N
+/// concurrent rewrites of a real 204 MB prod file sharing one 8 GiB pool:
+///
+/// ```text
+/// 4 workers  29.16 MB/s  0 failed
+/// 5 workers  29.31 MB/s  0 failed
+/// 6 workers  33.32 MB/s  0 failed   <- best
+/// 8 workers  15.07 MB/s  4 FAILED   <- cliff
+/// ```
+///
+/// Six concurrent sorts fit 8 GiB, so the real footprint is ~1.33 GiB, not 2.
+/// At 1.25 GiB `light_optimize_k` yields 5, plus the one repair permit = **6**
+/// — the measured optimum, and one rung below the measured cliff.
+const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
 /// Heavy maintenance's minimum share of the maintenance pool. 0.40, up from
 /// 0.25 — a REBALANCE inside the existing pool (total unchanged), following
 /// the workload: hot-tail packing (light share) converged once unstarved,
@@ -481,7 +504,7 @@ impl DerivedBudget {
         // before they could. Prod 2026-09-01: `Not enough memory to continue
         // external sort` on repair staging as soon as long-running units and
         // K=4 hygiene bins shared 8 GB sixteen ways.
-        let mem_bound = (self.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES).saturating_sub(1);
+        let mem_bound = (self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES).saturating_sub(1);
         let cpu_bound = self.cores / 4;
         mem_bound.min(cpu_bound).min(hot_project_count).max(1)
     }
@@ -2827,7 +2850,7 @@ mod tests {
         // budget was reserved out of it (see `light_optimize_k`) — repair draws
         // on the same coordinator pool and was never counted here.
         assert!((3..=11).contains(&k), "K={k} outside the expected 3..=11 range");
-        assert_eq!(k + 1, b.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES, "exactly one budget is held back for repair");
+        assert_eq!(k + 1, b.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES, "exactly one budget is held back for repair");
         // Envelope (permits x per-sort budget) is the invariant, not the raw
         // permit count — a prior fan-in OOM was about that product, and
         // asserting count alone misses permits raised without paying for them.
@@ -2943,10 +2966,13 @@ mod tests {
         let prod = DerivedBudget::from_limits(80 * GIB, 48);
         assert_eq!(
             prod.light_optimize_k(11),
-            prod.coordinator_share_bytes() / PER_SORT_BUDGET_BYTES - 1,
+            prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES - 1,
             "the memory term is the coordinator's pool, less the budget repair draws from it"
         );
         assert!(prod.light_optimize_k(11) > 1, "one permit shared by HotPacking and SealedConsolidation starves packing");
+        // The bench's measured optimum: k hygiene permits + 1 repair = 6
+        // concurrent rewrites, one rung below the 8-worker cliff.
+        assert_eq!(prod.light_optimize_k(11) + 1, 6, "the fleet must run at the measured optimum, not one rung either side");
         assert!(prod.light_optimize_k(11) < prod.cores / 4, "and the CPU term is not what binds on a big box");
     }
 
