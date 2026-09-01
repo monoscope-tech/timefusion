@@ -5952,7 +5952,7 @@ impl Database {
         // candidates instead of re-proving dup-bearing dates.
         const CERTIFY_PROBES_PER_PASS: usize = 64;
         let today = Utc::now().date_naive();
-        let mut by_project: HashMap<String, Vec<String>> = Default::default();
+        let mut by_project: HashMap<String, (usize, Vec<String>)> = Default::default();
         for back in 1..=CERTIFY_WINDOW_DAYS {
             let date = (today - chrono::Duration::days(back)).to_string();
             for (project, files) in Self::partition_files_by_pid(table, &format!("date={date}")).into_iter().flatten() {
@@ -5967,25 +5967,63 @@ impl Database {
                 // clean without a commit, and a commit moves the fingerprint.
                 // Re-probing it is pure waste, and at 64 probes a pass it would be
                 // most of the budget.
-                let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| *entry.value() == partition_file_fp(files));
+                let (file_count, fp) = (files.len(), partition_file_fp(files));
+                let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| *entry.value() == fp);
                 if uncertified && !known_dirty {
-                    by_project.entry(project).or_default().push(date.clone());
+                    let entry = by_project.entry(project).or_insert_with(|| (0usize, Vec::new()));
+                    entry.0 += file_count;
+                    entry.1.push(date.clone());
                 }
             }
         }
-        // PROJECT-MAJOR, fewest-remaining first — not date-major. A scan only
-        // sheds `DedupExec` when EVERY date in its window is granted, so grants
-        // scattered one-per-project across many projects buy nothing while the
-        // same number concentrated on one project completes a window and moves
-        // that project's queries. Finishing the nearly-done project first
-        // maximises how many projects are query-eligible per pass.
+        // PROJECT-MAJOR — a scan sheds `DedupExec` only when EVERY date in its
+        // window is granted, so grants scattered one-per-project across many
+        // projects buy nothing while the same number concentrated on one project
+        // completes a window and moves that project's queries.
         //
-        // This is the same scattered-vs-contiguous trap the per-file skip fell
-        // into, one level up: grant COUNT is not the objective, covered WINDOWS
-        // are.
+        // BUSIEST FIRST, by file count. The first cut of this sorted by
+        // fewest-remaining-dates, reasoning that finishing a nearly-done project
+        // is cheapest. Prod refuted it: 437 grants certified ~31 QUIET projects
+        // end-to-end while `dcad860a` (1.7M rows/day) measured
+        // `dedup_denied_never_certified` on all 8 sampled dates — a project with
+        // data on more days looks FURTHER from done, so the projects whose 14-day
+        // queries cost 42-60s sorted last and were never reached.
+        //
+        // Cheapest-first optimises the producer's convenience; busiest-first
+        // optimises the query that hurts. File count is the proxy for both scan
+        // cost and query pain, and it is already in hand from the enumeration.
         let mut projects: Vec<_> = by_project.into_iter().collect();
-        projects.sort_by_key(|(project, dates)| (dates.len(), project.clone()));
-        projects.into_iter().flat_map(|(project, dates)| dates.into_iter().map(move |date| (project.clone(), date))).take(CERTIFY_PROBES_PER_PASS).collect()
+        projects.sort_by(|(a_project, (a_files, _)), (b_project, (b_files, _))| b_files.cmp(a_files).then(a_project.cmp(b_project)));
+        projects
+            .into_iter()
+            .flat_map(|(project, (_, dates))| dates.into_iter().map(move |date| (project.clone(), date)))
+            .take(CERTIFY_PROBES_PER_PASS)
+            .collect()
+    }
+
+    /// Certification-only pass: probe uncertified window dates and grant, with no
+    /// dirty-bin drain involved.
+    ///
+    /// This exists because the drain's host cron SKIPS every rollup-declaring
+    /// table (`schema.rollups` non-empty), which is `otel_logs_and_spans` — the
+    /// table every dashboard query reads. Hanging certification off
+    /// `dedup_dirty_bins_for_table` therefore ran it only on small auxiliary
+    /// tables: prod 2026-09-01 plateaued at exactly 437 grants while
+    /// `dedup_denied_never_certified` kept climbing past 1,000 and a 1.7M-row/day
+    /// project measured 0 of 8 sampled dates certified.
+    ///
+    /// Certification is read-only and key-only, so it is safe to run for
+    /// coordinator-owned tables even though their REWRITES are not this cron's
+    /// business.
+    pub(crate) async fn run_certification_pass(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, deadline: std::time::Instant) {
+        if !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") {
+            return;
+        }
+        let candidates = self.uncertified_window_dates(&*table.read().await, table_name);
+        if candidates.is_empty() {
+            return;
+        }
+        self.batch_probe_classify(table, table_name, Vec::new(), candidates, deadline).await;
     }
 
     /// Runs the batch probe over each (project, date) with ≥2 queued bins and

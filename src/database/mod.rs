@@ -4957,6 +4957,14 @@ impl Database {
                         // so one admitted bin can hold maintenance_job_sem for its
                         // 3600s stage deadline and wedge every other job. Staging
                         // must become resumable and the drain needs its own budget first.
+                        // Certification runs for EVERY table, including the
+                        // rollup-declaring ones skipped below. It is a read-only
+                        // key-only probe, not a rewrite, so it is not the drain's
+                        // business — and gating it behind that `continue` meant it
+                        // never ran for `otel_logs_and_spans`, the table every
+                        // dashboard reads. Prod 2026-09-01 plateaued at exactly 437
+                        // grants, all on small auxiliary tables.
+                        db.run_certification_pass(&table, &table_name, sweep_deadline).await;
                         if get_schema(&table_name).is_some_and(|schema| !schema.rollups.is_empty()) {
                             continue;
                         }
@@ -19639,35 +19647,45 @@ mod tests {
         Ok(())
     }
 
-    /// Candidates come out PROJECT-MAJOR, fewest-remaining first.
+    /// Candidates come out PROJECT-MAJOR, BUSIEST first.
     ///
-    /// A scan only sheds `DedupExec` when every date in its window is granted, so
-    /// grants scattered one-per-project across many projects buy nothing while the
-    /// same count concentrated on one project completes a window. Date-major order
-    /// maximises grant COUNT and minimises covered WINDOWS — the same
-    /// scattered-vs-contiguous trap the per-file skip fell into, one level up.
+    /// Project-major because a scan sheds `DedupExec` only when every date in its
+    /// window is granted, so grants scattered one-per-project buy nothing.
+    ///
+    /// Busiest-first because the first cut sorted by fewest-remaining-dates and
+    /// prod refuted it: 437 grants certified ~31 QUIET projects end-to-end while a
+    /// 1.7M-row/day project measured `dedup_denied_never_certified` on all 8
+    /// sampled dates. Having data on more days makes a project look FURTHER from
+    /// done, so exactly the projects whose 14-day queries cost 42-60s sorted last
+    /// and were never reached. Cheapest-first optimises the producer's
+    /// convenience; busiest-first optimises the query that hurts.
     #[tokio::test]
-    async fn certification_candidates_finish_one_project_before_starting_another() -> Result<()> {
+    async fn certification_candidates_start_with_the_busiest_project() -> Result<()> {
         let cfg = create_test_config(&format!("certify-order-{}", uuid::Uuid::new_v4().simple()));
         let db = Database::with_config(cfg).await?;
-        let (near, far) = (format!("near_{}", uuid::Uuid::new_v4().simple()), format!("far_{}", uuid::Uuid::new_v4().simple()));
-        // `near` has one uncertified date, `far` has three. Date-major ordering
-        // would interleave them; project-major must drain `near` first.
-        for (project, days) in [(&near, vec![2i64]), (&far, vec![1, 3, 4])] {
+        let (busy, quiet) = (format!("busy_{}", uuid::Uuid::new_v4().simple()), format!("quiet_{}", uuid::Uuid::new_v4().simple()));
+        // `quiet` has ONE date and so is nearest to done — the old ordering would
+        // have drained it first. `busy` has three dates and more files on each,
+        // and is the one whose queries are slow.
+        for (project, days) in [(&quiet, vec![2i64]), (&busy, vec![1, 3, 4])] {
             for back in days {
                 let ts = (Utc::now() - chrono::Duration::days(back)).date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
-                let batch = json_to_batch(vec![test_span_ts(&format!("r{back}"), "only", project, ts)])?;
-                db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
+                // Two separate inserts on the busy project's dates, so it carries
+                // strictly more FILES — the proxy the ordering sorts on.
+                for row in 0..if *project == busy { 2 } else { 1 } {
+                    let batch = json_to_batch(vec![test_span_ts(&format!("r{back}_{row}"), "only", project, ts + row)])?;
+                    db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
+                }
             }
         }
         let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
         let got = db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans");
 
-        let ours: Vec<&String> = got.iter().map(|(project, _)| project).filter(|p| **p == near || **p == far).collect();
-        let first_far = ours.iter().position(|p| ***p == far);
-        let last_near = ours.iter().rposition(|p| ***p == near);
-        assert!(last_near.is_some() && first_far.is_some(), "both projects have uncertified dates in the window");
-        assert!(last_near < first_far, "the nearly-done project must be finished before the further one is started: {ours:?}");
+        let ours: Vec<&String> = got.iter().map(|(project, _)| project).filter(|p| **p == busy || **p == quiet).collect();
+        let first_quiet = ours.iter().position(|p| ***p == quiet);
+        let last_busy = ours.iter().rposition(|p| ***p == busy);
+        assert!(last_busy.is_some() && first_quiet.is_some(), "both projects have uncertified dates in the window");
+        assert!(last_busy < first_quiet, "the BUSIEST project must be finished before a quiet one is started: {ours:?}");
         Ok(())
     }
 
