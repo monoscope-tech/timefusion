@@ -1001,6 +1001,53 @@ one rung below the cliff.
 is the first change tonight sized by a measurement taken *before* the change
 rather than by a prod failure taken after it.
 
+## The occupancy-ceiling experiment: what it cost and what it taught
+
+Shipped always-on at the user's direction ("we must limit number of envs we
+expose... one ideal path/architecture... merge it into master early even when
+the maintenance is still ongoing, so we can measure if it helps"). It broke
+admission within five minutes, and the measurement was worth it.
+
+**What broke.** The ceiling scales what a pool admits by how full it is. Every
+caller asked for `MAX_DECODED_BYTES` regardless of its unit's real size, so a
+busy pool — which is always — refused all of them:
+
+```
+5 min in:    retry.Dedup.resource_admission  562      (+3 other lanes = 1,339)
+33 min in:   retry.Dedup.resource_admission  230,015  (~7,000/min)
+             pending_dedup 2,857 -> 3,533
+```
+
+**Two independent defects, both pre-existing, both only visible under a dynamic
+ceiling:**
+
+1. **The request was not the unit's size.** A flat `MAX_DECODED_BYTES` is
+   harmless against a static ceiling of exactly `MAX_DECODED_BYTES` and fatal
+   against a dynamic one. Fixed by passing the unit's own estimate
+   (`bd27112d`): `retry.Dedup.resource_admission` fell from ~7,000/min to
+   **~12/min**, a ~580x reduction, and `pending_dedup` began recovering.
+2. **A refusal was classed as a capacity failure, so it SPLIT the unit.** That
+   classification is correct for a static ceiling — its own comment says "the
+   unit's ESTIMATE exceeds what admission can ever grant" — and wrong for a
+   dynamic one, where refusal means "busy right now". Each refusal split a unit
+   into shards that were each refused in turn, which is why the queue GREW.
+   Fixed on branch `fix/admission-busy-is-transient` (`admission_busy`,
+   exponential backoff, no split), gate-green and **held back from deploy**
+   because fix 1 alone resolved the storm and the system had just stabilised.
+
+**The lesson, and it is the night's through-line for the ninth time:** a
+resource decision made with a number that is not the real one. Batch size in
+rows not bytes; slice budgets compressed not decoded; row groups in rows not
+bytes; fusion priced by a model not the partition; admission priced at the
+maximum not the unit. Making the ceiling dynamic did not introduce a bug — it
+*revealed* that the request had never been meaningful.
+
+**Was enabling it by default right?** Yes, and the storm is the evidence.
+Behind an off-by-default flag this would have sat unmeasured until someone
+flipped it under load. Shipping it into a busy system found both defects in five
+minutes, at the cost of ~40 minutes of degraded maintenance on a backlog that
+was already draining.
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
