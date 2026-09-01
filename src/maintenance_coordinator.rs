@@ -3549,6 +3549,30 @@ struct AdmissionState {
 #[derive(Clone, Debug)]
 pub struct AdmissionController(Arc<Mutex<AdmissionState>>);
 
+/// The largest single unit a pool at this occupancy will admit.
+///
+/// ClickHouse's rule, and the most transferable idea in the prior-art survey
+/// (`docs/plans/2026-08-31-how-other-systems-schedule-maintenance.md`, rule 2):
+/// scale the size cap by how much of the pool is free, so a busy pool admits
+/// only SMALL work. Its documented rationale is ours exactly — *"to allow small
+/// merges to process, not filling the pool with long running merges"* — and it
+/// subsumes a deadline, because an oversized unit is never admitted into a
+/// position where it would have to be killed.
+///
+/// Linear rather than ClickHouse's geometric interpolation: monotone, trivially
+/// explainable, and the floor is what actually matters (a busy pool must still
+/// admit the small hygiene bins that keep file counts down).
+///
+/// Always on, and deliberately not a knob: one admission rule is easier to
+/// reason about than two, and a flag that is never flipped is a second
+/// architecture nobody tests.
+fn occupancy_scaled_ceiling(available: u64, capacity: u64) -> u64 {
+    /// A busy pool must still admit work this small, or hygiene starves.
+    const FLOOR: u64 = MAX_DECODED_BYTES / 16;
+    let scaled = (u128::from(MAX_DECODED_BYTES) * u128::from(available) / u128::from(capacity.max(1))) as u64;
+    scaled.clamp(FLOOR, MAX_DECODED_BYTES)
+}
+
 impl AdmissionController {
     pub fn new(cpu: u32, cgroup_memory_bytes: u64, object_reads: u32, object_writes: u32) -> Self {
         // At most 75% is trackable maintenance decode. The remainder is an
@@ -3563,6 +3587,9 @@ impl AdmissionController {
             return None;
         }
         let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if request.decoded_bytes > occupancy_scaled_ceiling(state.available.decoded_bytes, state.capacity.decoded_bytes) {
+            return None;
+        }
         if !request.fits(state.available) {
             return None;
         }
@@ -6452,6 +6479,24 @@ mod tests {
         assert_eq!(fresh.reset_repair_attempts(), None, "nothing to forgive, nothing spent");
         fresh.upsert(task("p", 0, DAY_MICROS, Operation::Repair));
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
+    }
+
+    /// ClickHouse's rule: a busy pool admits only small work, so an oversized
+    /// unit is never admitted into a position where it would have to be killed.
+    /// Off by default — a shape for 10x load, not a throughput win today.
+    #[test]
+    fn the_admission_ceiling_shrinks_as_the_pool_fills() {
+        const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
+        assert_eq!(super::occupancy_scaled_ceiling(CAPACITY, CAPACITY), MAX_DECODED_BYTES, "an idle pool admits the largest unit");
+        assert!(super::occupancy_scaled_ceiling(CAPACITY / 4, CAPACITY) < MAX_DECODED_BYTES, "a three-quarters-full pool admits less");
+        assert!(
+            super::occupancy_scaled_ceiling(0, CAPACITY) >= MAX_DECODED_BYTES / 16,
+            "but a full pool must still admit the small hygiene bins, or file counts run away"
+        );
+        assert!(
+            super::occupancy_scaled_ceiling(CAPACITY / 2, CAPACITY) > super::occupancy_scaled_ceiling(CAPACITY / 4, CAPACITY),
+            "and the ceiling must be monotone in free space"
+        );
     }
 
     /// Fusion must not refuse a group priced against its PARTITION just because
