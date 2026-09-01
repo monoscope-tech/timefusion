@@ -192,17 +192,26 @@ contention, so green meant nothing there.
    `pending_repair = 358`. That is ~179 hours to drain, i.e. the queue is flat by
    arithmetic, not by fault.
 
-   The permit was set to 1 when the coordinator pool was 4.2 GB. It is now
-   ~10 GB, and `benches/rewrite_throughput.rs` measures **six** concurrent
-   whole-file sorts of a 1.1 GB file at a 10 GB pool running clean (94 MB/s
-   aggregate, zero failures) — the exact shape of a repair rewrite. So 1 is very
-   conservative.
+   **Do NOT simply raise the permit — I nearly recommended that and the code's
+   own history refutes it.** My first reading was that
+   `benches/rewrite_throughput.rs` runs six concurrent whole-file sorts of a
+   1.1 GB file at a 10 GB pool with zero failures, so 1 permit is conservative.
+   But the permit's comment records why it is 1: **prod's worst repair bin is
+   2.3 GB compressed, ~28 GB decoded**, and two overlapping repair rewrites
+   produced `Not enough memory to continue external sort` on 2026-09-01 — the
+   moment the liveness clock let them live long enough to overlap. Two worst-case
+   bins is ~56 GB decoded against a ~10 GB pool. My bench file is ~13 GB decoded,
+   less than half one worst-case bin, so it does not measure this case at all.
 
-   **Recommendation: raise to 2 and watch, not higher.** Repair rewrites are the
-   longest units in the fleet and the permit also exists so one of them cannot
-   starve every other lane; doubling is the smallest step that tests the
-   arithmetic. Ship it ALONE, after deploy 17 is verified — repair's peak
-   transient heap is the OOM class this codebase has fought all month.
+   **The right fix is to size the permit in BYTES, not in units** — the rule
+   every system in the prior-art survey follows, and the one this repo already
+   applies in `maintenance_admission`. A byte budget lets several small repair
+   bins overlap (which is most of the 358) while a 28 GB bin still runs alone.
+   A count of 1 is the same mistake as a deadline-as-budget: it prices the
+   worst case onto every unit.
+
+   Ship it ALONE, after deploy 17 is verified, and size the budget from the
+   decoded-bytes estimate the admission path already computes.
 5. **Do not reallocate dedup's share** until 1-3 land: if certification starts
    working, the same worker-seconds buy a read-path win instead of nothing.
 
