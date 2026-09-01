@@ -21,7 +21,8 @@ levers; 100x is not, and needs a capacity decision rather than a patch.
 | 12 | dedup gets the fleet idle window (300 s → 900 s) | units killed at deadline 36 → 4 per 25 min |
 | 13 | **work-done counters** (`work.<Op>.{worker_secs,killed_secs,progress_rows}`, `work.Dedup.rows_dropped`) | made every number below possible |
 | 14 | `admission_busy` is transient, not a capacity failure | `resource_admission` refusals no longer split units |
-| — | `maintenance_scan_pruning` (`bytes_scanned` per maintenance query) | refuted my own probe-cost hypothesis |
+| — | `maintenance_scan_pruning` (`bytes_scanned` per maintenance query) | found the probe re-reads a partition once per hash shard (item 3 below) |
+| 16 | **slice certification** — a clean slice certifies the files whose whole span it covered | the first thing that can make `cert_granted_total` non-zero; producer only, read flag OFF |
 
 **Reverted:** deploy 15 (`d8d9d357`). See the incident below.
 
@@ -74,9 +75,10 @@ maintenance lane trips the second, and the scheduler never probes a whole day fo
 the third. Both consumers — per-date and per-file — read the day-level grant, so
 the finer one cannot rescue an empty producer.
 
-The fix is written and tested but **not pushed** (see below): let a clean slice
-certify the files whose whole span it covered, as `stale` per-file evidence.
-Producer only, read flag stays OFF, so query results cannot move.
+**Shipped as deploy 16** (`8a9b0fe6`): a clean slice now certifies the files
+whose whole span it covered, as `stale` per-file evidence. Producer only, read
+flag stays OFF, so no query result can move. Watch `cert_slice_files_proved`
+against `cert_slice_files_unproven`.
 
 ## The incident, in full
 
@@ -104,17 +106,12 @@ contention, so green meant nothing there.
 
 ## Held, not pushed
 
-- **Slice certification** — implemented, 3 green full-suite runs, plus two new
-  soundness tests (boundary-straddling file not certified; slice evidence stays
-  stale across a restart). Held because the suite has shown 1-2 parallelism
-  flakes per run and I will not push a certification change on an ambiguous
-  signal after tonight's incident.
 - **Rollup admission re-land** — the same reclassification via
   `retry_admission_busy`, to go out ALONE, after the above is verified in prod.
 
 ## What I would do next, in order
 
-1. **Ship slice certification (producer only), watch `cert_slice_files_proved`.**
+1. **Verify deploy 16 in prod: watch `cert_slice_files_proved`.**
    Expect a modest number: a ten-minute slice can only certify files whose whole
    span fits in ten minutes. The ratio against `cert_slice_files_unproven` says
    which slice widths would pay.
