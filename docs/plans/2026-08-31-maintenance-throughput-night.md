@@ -1213,6 +1213,53 @@ Three things fall straight out, none of which unit counts could express:
    capacity failure, so every one of them SPLITS a unit. This is the exact class
    deploy 14 reclassifies, and it now has a measured before.
 
+### Dedup has TWO value channels, and one of them is delivering exactly zero
+
+`rows_dropped / worker_secs` is the right metric for comparing two deploys on the
+same work mix — that is what it was built for and it stands. It is the **wrong**
+metric for deciding how much of the fleet dedup deserves, because removing rows
+is only half of what a dedup pass is for:
+
+- **(a) Certification.** A certified `(project, table, date)` lets the read path
+  drop `DedupExec` from the plan entirely — the code at the dedup call site calls
+  it "the single largest term left in 30d query latency".
+- **(b) Rows removed.** Until a partition is certified, every query pays
+  merge-on-read over whatever duplicates are still in place.
+
+Channel (a), measured on the same process:
+
+```
+dedup_eligible                  9,296     scans that COULD have skipped DedupExec
+dedup_skipped                       0     scans that did
+dedup_denied_never_certified    8,767     (100.0% of denials)
+cert_granted_total                  0
+cert_slice_partial                106     slices banked toward a day
+cert_slice_day_covered              0     days ever completed
+```
+
+**Dedup is 76% of the maintenance fleet and has granted zero certifications, so
+zero of 9,296 eligible scans skipped merge-on-read.** Every denial is
+`never_certified` — not a moved fingerprint, not an incomplete pass. 106 clean
+slices were banked and no UTC day was ever completed, which is
+`tf_cert_works_contiguity_blocks_2026-08-22` measured end-to-end for the first
+time, with its read-side consequence attached: a day needs its slices to union to
+full coverage over ONE unmoved file fingerprint, and every other maintenance lane
+rewrites files under it.
+
+Channel (b) in the same window: 3,519 rows, against ~1,302 rows/s ingest — a
+**0.18% duplicate rate on the live frontier over one 25-minute window**. That is
+not a fleet truth: the 2,737 backlog units are a different population, and the
+code notes the crash-loop era made "EVERY project probe-positive", so historical
+partitions may be duplicate-dense.
+
+**What NOT to conclude from this tonight:** that dedup should be given less of
+the fleet. If deploy 14's `maintenance_scan_pruning` shows probes reading the
+whole day for a ten-minute slice, then fixing the probe makes the *same* 76% do
+roughly an order of magnitude more slices — which is also the only thing that
+makes day coverage, and therefore certification, reachable. Reallocation is the
+answer only if probes turn out to be cheap. **The pruning number decides which
+problem this is; the capacity split should not move before it lands.**
+
 ### Open items — evidence gathered tonight, work not done
 
 - **The dirty-bin queue is dead, and still being written to.** ANSWERED, not
