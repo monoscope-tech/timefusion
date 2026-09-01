@@ -329,7 +329,17 @@ run_pg_smoke() {
     cargo run --locked --quiet --bin timefusion >"$log" 2>&1 &
   pid=$!
   # shellcheck disable=SC2317
-  cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$data_dir"; }
+  # Guarded, and always returns 0. `cleanup` is a GLOBAL name (bash functions are
+  # not scoped) while `pid`/`data_dir` are locals of this function, so a RETURN
+  # trap firing anywhere they are unset makes `set -u` abort — which failed the
+  # whole check on 2026-09-01 AFTER every smoke assertion had already passed,
+  # reporting "line 332: pid: unbound variable" as the only symptom.
+  cleanup() {
+    local running="${pid:-}" dir="${data_dir:-}"
+    [ -n "$running" ] && { kill "$running" 2>/dev/null || true; wait "$running" 2>/dev/null || true; }
+    [ -n "$dir" ] && rm -rf "$dir"
+    return 0
+  }
   trap cleanup RETURN
   for _ in $(seq 1 60); do
     if docker run --rm --network host -e PGPASSWORD=postgres postgres:18.4 \
