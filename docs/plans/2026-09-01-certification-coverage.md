@@ -291,3 +291,59 @@ currently discards them after the decline.
 
 That makes the concentrated case a small, low-risk change — which is the main
 reason the ratio is worth one deploy to measure.
+
+## The ratio came back: duplicates are SPREAD (26.6 of 144 bins)
+
+Deploy 26, after ~15 min on `otel_logs_and_spans`:
+
+| counter | value |
+| --- | --- |
+| `cert_probe_declined` | 14 |
+| `cert_declined_dirty_bins` | 373 |
+| **mean dirty bins per dirty date** | **26.6 of 144 (18%)** |
+| `cert_granted_total` | 4 (non-zero — some dates ARE clean) |
+
+**The first sample read 1 decline / 1 dirty bin and looked decisively
+"concentrated".** Acting on it would have built bin-scoped scheduling for a
+workload that does not have that shape. Sample size, not reasoning, caught it —
+the same lesson as every other refutation tonight, and worth more than the result.
+
+### Which branch this selects
+
+The **spread** branch. Slice-scoping 26 scattered bins is not a narrow slice, and
+worse, it does not save proportional work: `stage_dedup_chunk` re-reads every file
+the chunk touches (`partition_filter`), and files span bins — so rewriting 18% of
+the bins can still touch most of the date's files. The whole-date unit is
+approximately the right unit after all.
+
+**So the lever is ORDERING, not unit size.** Dedup currently ranks by AGE
+(`starved`, 3-31d), so it works the oldest backlog while queries read the newest
+dates. The change is a scoped boost: dedup tasks whose (project, date) falls in
+the top-K-by-file-count projects' last-14-day window jump the queue. Prefer that
+to a global re-rank — `claim_next` has a history of incidents
+(`hole_rank` stall, `starved` demoting the biggest cells, SUPERSEDED vetoes).
+
+### Why this is NOT being shipped tonight
+
+Dedup rewrites DELETE ROWS. It is the one area where a wrong change costs data
+rather than latency, and CLAUDE.md mandates `sim` -> `run-unit` -> staging for
+scheduler changes precisely here. Five hypotheses were refuted tonight; shipping
+an ordering change at 02:00 on one counter reading, unsupervised, trades a bounded
+upside against an irreversible downside.
+
+Equally: ~8 restarts tonight each killed in-flight ~21-minute dedup units. With
+the diagnosis complete, **the highest-value action for `pending_dedup` between now
+and morning is to stop deploying.**
+
+### Morning checklist
+
+1. `timefusion sim <journal>` with the scoped boost; confirm the newest-date
+   dedup units actually get claimed sooner without starving the tail.
+2. `timefusion run-unit --op Dedup` on a busy project's recent date to price one
+   unit, so drain time is predicted rather than discovered.
+3. Then ship the boost alone, and verify: a deduped date should certify within one
+   cron cycle (the rewrite moves the fp, which invalidates the decline memo and
+   triggers an automatic re-probe).
+4. Separately, the durable 100x fix: prevent duplicates at ingest via a dedup-key
+   check inside the MemBuffer's 10-minute bucket, so new dates are born
+   certifiable and need neither rewrite nor probe. Design discussion first.
