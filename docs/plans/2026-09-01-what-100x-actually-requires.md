@@ -66,9 +66,9 @@ times ~2x per-unit efficiency — enough for 10x, not for 100x.
 ## What this means, concretely
 
 - **10x: proceed.** The levers are pool size and per-unit memory, both already
-  identified, both measured. Turn on `TIMEFUSION_ADMISSION_OCCUPANCY_SCALED`
-  first so saturation degrades by admitting small work rather than by killing
-  large work — the failure mode that cost the whole 2026-08-31 night.
+  identified, both measured. The occupancy-scaled admission ceiling is now
+  always on, so saturation degrades by admitting small work rather than by
+  killing large work — the failure mode that cost the whole 2026-08-31 night.
 - **100x: do not sell it as a tuning change.** It needs either (a) that tenant
   on its own host — which the multi-tenant storage model already supports via
   custom project tables at their own S3 path — or (b) relaxing the

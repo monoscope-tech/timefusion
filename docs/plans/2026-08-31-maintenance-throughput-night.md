@@ -794,10 +794,11 @@ row-group fix has shrunk what a repair unit has to hold.
 
 **Not yet demonstrated: 10x.** Everything measured tonight is at current volume.
 The mechanism intended for 10x — the occupancy-scaled admission ceiling — is
-committed but **off** (`TIMEFUSION_ADMISSION_OCCUPANCY_SCALED`), because turning
-it on while a legacy backlog drains would slow that drain. It should be enabled
-once these queues are flat at a low number, and the honest next step after that
-is a load test, not another prod inference.
+is now **always on and not a knob**. It was written behind a flag and the flag
+was removed on the same day, deliberately: one admission rule is easier to reason
+about than two, and a flag nobody flips is a second architecture nobody tests.
+Shipping it while the backlog drains is also the only way to measure whether it
+helps.
 
 ## A capacity model for 10x, from measurements rather than assertion
 
@@ -972,10 +973,10 @@ because most units now are footer exonerations and rollups, which never reach
 steady state is not separately measured yet and is the open question. It is grounded in measured per-unit
 cost and measured ingest, but nothing here has been run at 10x. The next step is
 a load test — seed a scratch table at 10x a whale-day and watch whether pending
-converges — not another prod inference. `TIMEFUSION_ADMISSION_OCCUPANCY_SCALED`
-exists so that when the fleet IS saturated it degrades by admitting small work
-rather than by killing large work, which is the failure mode this whole night
-was about.
+converges — not another prod inference. The occupancy-scaled admission ceiling
+is always on so that when the fleet IS saturated it degrades by admitting small
+work rather than by killing large work, which is the failure mode this whole
+night was about.
 
 ### Deploy 9: the fleet now runs at the measured optimum
 
