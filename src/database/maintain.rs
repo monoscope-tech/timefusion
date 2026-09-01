@@ -245,6 +245,24 @@ mod liveness_clock_tests {
         assert!(progress.load(Relaxed) > 0, "the plan's own row counters must reach the clock the unit is judged by");
     }
 
+    /// A maintenance query must be able to say WHICH operation paid for it.
+    ///
+    /// The label lives in a task-local set at the dispatch site, so a query four
+    /// calls down reports it without any signature carrying it. Outside a unit
+    /// (cron paths, tests) it must read as "none" rather than panicking.
+    #[tokio::test]
+    async fn a_maintenance_query_reports_the_operation_that_ran_it() {
+        assert_eq!(super::UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"), "none", "outside a unit there is no operation");
+        super::UNIT_OPERATION
+            .scope("Dedup", async {
+                assert_eq!(super::UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"), "Dedup");
+                // And it must survive an await point, since every real query has one.
+                tokio::task::yield_now().await;
+                assert_eq!(super::UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"), "Dedup");
+            })
+            .await;
+    }
+
     /// The pruning instrument is only worth reading if its metric NAMES are the
     /// ones DataFusion publishes — a rename would make every scan report
     /// "nothing pruned", which is indistinguishable from the finding it exists
@@ -391,6 +409,17 @@ tokio::task_local! {
     /// meant a signature change per path and, for dedup, dropping `Copy` from
     /// `DedupExecutionLimits`.
     static UNIT_PROGRESS: Arc<std::sync::atomic::AtomicU64>;
+
+    /// Which operation the current unit is, for attributing what its queries
+    /// cost. Set at the one dispatch site, alongside the progress counter.
+    ///
+    /// `maintenance_scan_pruning` published `bytes_scanned` with no way to say
+    /// WHOSE bytes: on 2026-09-01 the same totals were read first as "probes are
+    /// cheap" (cold sample) and then as "probes are the whole cost" (warm), and
+    /// only a local bench settled that a key-only probe is ~200x cheaper than a
+    /// full-column read — so the GB-scale scans belong to some other phase. An
+    /// unattributed cost invites whichever story is being told.
+    static UNIT_OPERATION: &'static str;
 }
 
 /// Report that the current maintenance unit wrote `rows`. A no-op outside a
@@ -505,6 +534,7 @@ fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed
         return;
     }
     info!(
+        operation = UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"),
         bytes_scanned,
         row_groups_pruned = plan_metric_sum(plan, "row_groups_pruned_statistics") + plan_metric_sum(plan, "row_groups_pruned_bloom_filter"),
         output_rows = plan_metric_sum(plan, "output_rows"),
@@ -3521,13 +3551,24 @@ impl Database {
             // What the unit has written so far. The deadline below fires only
             // when this stops moving — see `run_until_idle`.
             let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let work = async {
+            // Scoped here, at the one place the operation is known, so every
+            // query a unit runs can be attributed without threading a label
+            // through three rewrite paths.
+            let label: &'static str = match operation {
+                Operation::Dedup => "Dedup",
+                Operation::BaseRollup => "BaseRollup",
+                Operation::DerivedRollup => "DerivedRollup",
+                Operation::HotPacking => "HotPacking",
+                Operation::SealedConsolidation => "SealedConsolidation",
+                Operation::Repair => "Repair",
+            };
+            let work = UNIT_OPERATION.scope(label, async {
                 match operation {
                     Operation::Dedup => self.run_coordinator_dedup_once().await,
                     Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_once(operation).await,
                     Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => self.run_coordinator_compaction_once(operation).await,
                 }
-            };
+            });
             // A unit's DURATION is the number every deadline decision needs and
             // none of them has. Raising a deadline only helps if the units that
             // miss it would finish in the longer window; if they would not, the
@@ -4746,14 +4787,21 @@ impl Database {
         // Bind `covered` in its own block: the RefMut must drop before the
         // remove/await below (same DashMap-shard self-deadlock documented at
         // `dedup_window_clean`).
-        let covered = {
+        // `intervals` is the ACCUMULATED clean coverage, not just this slice: a
+        // file spanning three hours is proved once the eighteen ten-minute
+        // slices covering it have each come back clean. Every interval here was
+        // proved under the same `fp` — the entry is reset wholesale when the
+        // fingerprint moves — so the union is exactly as sound as one slice, and
+        // testing against a single slice left 97.5% of files unproven
+        // (`cert_slice_files_proved` 526 vs `unproven` 20,423, prod 2026-09-01).
+        let (covered, intervals) = {
             let mut entry = self.dedup_slice_coverage.entry(key.clone()).or_insert_with(|| SliceCoverage { fp, intervals: Vec::new() });
             if entry.fp != fp {
                 *entry = SliceCoverage { fp, intervals: vec![(start, end)] };
             } else {
                 merge_clean_interval(&mut entry.intervals, (start, end));
             }
-            entry.intervals.iter().any(|&(s, e)| s <= day_start && e >= day_end)
+            (entry.intervals.iter().any(|&(s, e)| s <= day_start && e >= day_end), entry.intervals.clone())
         };
         // Write-through on every mutation: the journal durably marks this slice
         // Complete (it will never re-run), so its evidence must be equally
@@ -4767,7 +4815,7 @@ impl Database {
             // whole-day coverage under an unchanged fingerprint never happens on
             // a live table (`cert_granted_total` = 0 since 2026-08-20), so
             // without this every consumer of `Certification` is dead code.
-            self.certify_files_within_slice(table_ref, table_name, project_id, date, (start, end)).await;
+            self.certify_files_within_slice(table_ref, table_name, project_id, date, &intervals).await;
             return Ok(None);
         }
         metrics::counter!(scan_metric_names::CERT_SLICE_DAY_COVERED).increment(1);
@@ -4799,7 +4847,7 @@ impl Database {
     /// and may NEVER grant the whole-partition skip, which is a claim about a
     /// day that no slice can support.
     async fn certify_files_within_slice(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, (start, end): (i64, i64),
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, intervals: &[(i64, i64)],
     ) {
         if !schema_or_default(table_name).dedup_keys.iter().any(|key| key == "timestamp") {
             return;
@@ -4811,7 +4859,8 @@ impl Database {
                 Err(_) => return,
             }
         };
-        let (proved, unproven): (Vec<_>, Vec<_>) = spans.into_iter().partition(|(_, span)| span.is_some_and(|(min, max)| min >= start && max < end));
+        let contained = |span: crate::read::FileSpan| span.is_some_and(|(min, max)| intervals.iter().any(|&(start, end)| min >= start && max < end));
+        let (proved, unproven): (Vec<_>, Vec<_>) = spans.into_iter().partition(|(_, span)| contained(*span));
         metrics::counter!(scan_metric_names::CERT_SLICE_FILES_UNPROVEN).increment(unproven.len() as u64);
         if proved.is_empty() {
             return;

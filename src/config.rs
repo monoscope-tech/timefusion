@@ -2271,11 +2271,21 @@ pub struct MaintenanceConfig {
     /// missing-statistics span, an empty certified set, and inclusive-bound
     /// touching.
     ///
-    /// **Default OFF.** The failure mode is a silent over-count on every
-    /// dashboard tile, and unlike the per-date skip this one has no prod
-    /// exposure yet. Turn on only after diffing `count(*)` with it on and off
-    /// over a CHURNING partition.
-    #[serde(default)]
+    /// **Default ON since 2026-09-01.** It was off while nothing could produce
+    /// per-file evidence: `cert_granted_total` had been 0 since 2026-08-20, so
+    /// 0 of 9,296 eligible scans skipped `DedupExec` and the flag guarded a code
+    /// path that could never fire. Slice certification now produces that
+    /// evidence, and `DedupExec` is the largest remaining term in multi-day
+    /// query latency (14 d charts measured at 42.8 s WARM vs 1.0 s at 24 h), so
+    /// the skip is the point of the whole mechanism rather than an experiment.
+    ///
+    /// Soundness does not rest on this flag: `read::skippable_certified_files`
+    /// fails closed on a missing-statistics span, an empty certified set and
+    /// inclusive-bound touching, and the producer only certifies a file whose
+    /// whole span lies inside proved-clean intervals. Keep it as an emergency
+    /// kill switch — set `=false` if `count(*)` ever disagrees with the raw
+    /// answer — the same role `TIMEFUSION_PLAN_CACHE_TIME_FNS` plays.
+    #[serde_inline_default(true)]
     pub timefusion_read_dedup_skip_per_file: bool,
     /// Dedup-as-you-compact experiment (docs/plans/2026-08-20-dedup-and-sort
     /// strategy §3): the on-demand compaction path (`compact_date`, i.e. pgwire

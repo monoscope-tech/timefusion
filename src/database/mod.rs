@@ -12403,6 +12403,47 @@ mod tests {
     /// coordinator's Dedup deadline — so `cert_granted_total` stayed 0 forever (2026-08-20).
     /// Certification is a property of the partition, not the unit shape: clean slices whose
     /// union covers the UTC day over an unmoved file set prove what one day-wide pass does.
+    /// With the per-file skip ON, a partition holding duplicates must still
+    /// count them once.
+    ///
+    /// This is the assertion the flag's default rests on: its failure mode is a
+    /// silent over-count on every dashboard tile, so the answer with certified
+    /// files present must equal the answer without. Duplicates land in a file
+    /// the clean slice never proved, so the skip must route it through
+    /// `DedupExec` while the proved files bypass it.
+    #[tokio::test]
+    #[serial]
+    async fn the_per_file_skip_never_over_counts_a_duplicated_partition() -> Result<()> {
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let db = Database::with_config(create_test_config("perfile-nocount")).await?;
+        assert!(db.config.maintenance.timefusion_read_dedup_skip_per_file, "this pins the SHIPPED default, not a test-only override");
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        let date = day.date_naive();
+        let day_start = midnight_micros(date);
+        // Clean rows early in the day, then a duplicate pair later.
+        insert_a_span(&db, &project, "clean", day_start + 3_600_000_000).await?;
+        let dup_ts = day_start + DAY_MICROS / 2 + 3_600_000_000;
+        insert_a_span(&db, &project, "dup", dup_ts).await?;
+        insert_a_span(&db, &project, "dup", dup_ts).await?;
+
+        let count = async |db: &Database| -> Result<i64> {
+            let sql = format!("SELECT COUNT(*)::BIGINT FROM otel_logs_and_spans WHERE project_id = '{project}'");
+            let batches = db.query_delta_only(&sql).await?;
+            Ok(batches
+                .iter()
+                .filter(|b| b.num_rows() > 0)
+                .filter_map(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|c| c.value(0)))
+                .next()
+                .unwrap_or(0))
+        };
+        let before = count(&db).await?;
+        // Prove the early half clean, which certifies the files inside it.
+        assert!(run_dedup_slice(&db, &project, day_start, day_start + DAY_MICROS / 2).await?, "the clean half-day unit must run");
+        assert_eq!(count(&db).await?, before, "certifying clean files must not change the answer for the duplicated ones");
+        Ok(())
+    }
+
     /// A clean slice certifies ONLY the files whose whole span it covered.
     ///
     /// The proof is about rows in a time range; a file crossing the boundary
