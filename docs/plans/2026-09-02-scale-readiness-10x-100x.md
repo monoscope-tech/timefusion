@@ -1267,3 +1267,45 @@ and the JSON is rewritten periodically.
 **For anyone repeating this:** `load_sandboxed` copies **both** files, so a
 faithful replay needs the `.wal` too — `docker cp` it alongside the `.json`.
 Fetching only the JSON gives a coherent but potentially hours-old queue.
+
+## MEASUREMENT CAVEAT 2: the sim's `pending` counts SUPERSEDED tasks
+
+Fetching both journal files (`.json` + `.wal`) and replaying them gives a live
+view, and it exposes an interpretation error running through the sim sections
+above.
+
+The sim reports `pending_start: 21,544` for snapshot 1. The journal's own state
+counts for that snapshot are:
+
+```
+superseded 19,159 + pending 1,248 + retry 1,121 + running 16 = 21,544
+```
+
+**Exactly the sim's number.** So `pending` in the sim report means *all
+non-complete tasks*, and **~89% of it is superseded bookkeeping, not work.**
+
+Confirmed against the live replay (both files, `--no-mint`, 6 virtual minutes):
+
+```
+pending: 21,367 -> 1,968 | executions: 134
+```
+
+19,399 tasks disappeared in six virtual minutes on 134 executions — they were
+never work; they were retired as superseded/subsumed. The actionable queue is
+**~2,000**, which matches counting `pending + retry` directly (2,222).
+
+**What this corrects:**
+
+- The flow-problem section's headline — "21,544 → 16,431, so 21,088 executions
+  lost ground" — was counting superseded records. The *actionable* backlog is an
+  order of magnitude smaller than that framing implies, which makes "the queue
+  grows" a much weaker statement than it appeared.
+- It reinforces, rather than undermines, the finding that replaced it: the real
+  problem was never queue *size*. It is that **specific units never execute** —
+  the ~2,000 actionable tasks, half of them older than 48 hours, with 312 repair
+  units bouncing off a byte budget they cannot fit.
+
+**Rule:** in this codebase "pending" means different things in different places.
+`timefusion_stats`' `pending_dedup`, the sim's `pending_start`, and
+`state == Pending` in the journal are three different populations. Say which one
+you mean, and check the arithmetic against the state counts before quoting it.
