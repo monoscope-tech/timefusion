@@ -1470,3 +1470,41 @@ maintained goes unmaintained indefinitely. **The risk at 10x is not falling
 behind; it is that the unrunnable fraction grows with file size**, because every
 constant here is a fixed byte budget and files only get bigger with a larger
 tenant.
+
+### Verified: unit size DOES scale with tenant size — so the unrunnable fraction grows
+
+The claim that "the unrunnable fraction grows with file size" needed checking,
+because compaction targets 256 MiB *regardless* of tenant — a bigger tenant
+might simply produce more files of the same size. It does not. Whale vs everyone
+else, from the journal:
+
+| operation | whale median | others median | ratio | whale max | others max |
+| --- | --- | --- | --- | --- | --- |
+| **dedup** | 0.50 G | 0.25 G | **2.0x** | **1,150 G** | 3.9 G |
+| **repair** | 0.25 G | 0.01 G | **23.8x** | **1,044 G** | 39.2 G |
+| base_rollup | 0.37 G | 0.29 G | 1.26x | 45.9 G | 1.5 G |
+
+**Every lane's units are larger for the larger tenant**, at the median as well as
+the tail — dedup 2x, repair 23.8x, and at the extreme the whale's largest dedup
+unit is **295x** the largest anyone else produces.
+
+Two mechanisms, and they compound:
+
+1. **Slice-scoped work grows directly.** A dedup unit covers a time slice of a
+   partition, so more data per slice means a bigger unit. Nothing caps it.
+2. **Even whole-file work grows.** Repair is one file, and file size is capped by
+   the 256 MiB compaction target — yet the whale's repair median is 23.8x. Small
+   tenants never accumulate enough to reach the target, so their files stay tiny
+   and comfortably inside every budget; the whale's files sit *at* the target,
+   which is precisely the size that does not fit (256 x 12 = 3,072 MiB vs a
+   1,280 MiB budget).
+
+**This is the 100x-customer risk stated exactly:** the budgets are fixed byte
+counts, and a larger tenant produces larger units in every lane, so a larger
+share of its work falls permanently outside them. It is also why 83.8% of all
+oversized units already belong to one tenant. We are not extrapolating — the
+effect is measurable at today's scale, on today's whale.
+
+**The corollary is reassuring about throughput and unforgiving about budgets:**
+adding capacity does not help, because the excluded work is excluded by a
+comparison against a constant, not by a shortage of workers.
