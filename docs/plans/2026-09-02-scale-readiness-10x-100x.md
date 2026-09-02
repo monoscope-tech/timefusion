@@ -1413,3 +1413,45 @@ a starvation problem shows a decaying one against a queue that does not shrink.
 It is one process and two points, so it is corroboration rather than proof — but
 it is the first same-process throughput reading of the night that was not
 invalidated by a restart, and it points the same way as everything else.
+
+## Prior art for the starvation: everyone else SHRINKS THE UNIT; we refuse it
+
+The user's standing instruction is to check how other systems solved a problem
+before we invent an answer. For "a maintenance unit does not fit its budget",
+two independent systems converge on the same strategy, and **it is not ours.**
+
+| system | what it does when a unit will not fit |
+| --- | --- |
+| **Cassandra** | *"the available disk space is checked against the estimated compaction output size, and if the available disk space is not enough then **largest SSTables are dropped from the input list** to reduce storage space needed"* |
+| **ClickHouse** | caps merge output at selection (`max_bytes_to_merge_at_max_space_in_pool`) and **scales that cap DOWN as free pool slots run out** (`number_of_free_entries_in_pool_to_lower_max_size_of_merge`) |
+| **TimeFusion (today)** | **refuses the unit and requeues it, unchanged, forever** |
+
+Both prior-art systems **adapt the work to the budget**. Neither has a state
+where a unit is permanently unrunnable, because neither ever presents the
+scheduler with a take-it-or-leave-it unit: Cassandra removes inputs until it
+fits; ClickHouse never selects one that would not.
+
+**We are the outlier, and the 310 stuck repair units are the direct consequence.**
+Our repair unit is atomic by construction — one whole file, `.take(1)` — so when
+it exceeds the byte budget there is no smaller version to fall back to, and the
+only behaviour left is the one we observe: bounce, requeue, repeat.
+
+**What this suggests, beyond raising the constant.** Raising
+`repair_rewrite_budget_bytes` (Decision 1) fixes today's numbers, but it leaves
+the structural property intact: the next file larger than the new budget starves
+exactly the same way, and the whale's files are already 1,150 GiB at the maximum.
+The prior art says the durable fix is that a unit which does not fit should be
+made smaller rather than refused — for repair that means rewriting a file in
+row-group ranges rather than whole, which is a real design change and not a
+constant.
+
+So the honest framing for the morning is two-tier:
+
+1. **Now:** raise the budget so correctly-sized files stop starving (derivable,
+   cheap, Decision 1).
+2. **Structural:** give maintenance a way to shrink a unit to its budget, which
+   is what both comparable systems do and what would make the 100x whale safe.
+
+Sources: [Cassandra compaction docs](https://cassandra.apache.org/doc/4.1/cassandra/operating/compaction/index.html),
+[DataStax: configuring compaction](https://docs.datastax.com/en/cassandra-oss/3.0/cassandra/operations/opsConfigureCompaction.html),
+[ClickHouse#16838](https://github.com/ClickHouse/ClickHouse/issues/16838).
