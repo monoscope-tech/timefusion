@@ -2,7 +2,10 @@
 
 Everything is pushed to master and green (suite **1323/1323**, e2e **61/61**).
 Prod is healthy on my build. **Nothing risky was shipped.** Three decisions are
-waiting for you, ranked by risk.
+waiting for you. **They are one problem in three places:** every stuck lane is a
+unit that does not fit a budget it must pass through, and three budgets are
+calibrated below real unit sizes — admission 512 MiB, per-sort slice 510 MB,
+repair 1,280 MiB.
 
 The full evidence chain, including the wrong turns, is in
 `2026-09-02-scale-readiness-10x-100x.md` and
@@ -10,45 +13,43 @@ The full evidence chain, including the wrong turns, is in
 
 ---
 
-## Decision 1 — Repair verifies ONE file per attempt (lowest risk, biggest waste)
+## Decision 1 — Repair is serialized by a byte budget smaller than one bin
 
-**197 repair units, bulk-enqueued on 2026-08-16, have been claimed ~3,409 times
-a day for 17 days and have never completed.**
+**197 repair units, bulk-enqueued 2026-08-16, are claimed ~3,409 times a day and
+have never completed in 17 days.** Three hours of prod logs say why:
 
-Repair picks a file on the *absence* of a sort tag — only a suspicion. The unit
-then reads the footer, finds the file already sorted, records it, and requeues.
-Candidate selection is:
+| event | count |
+| --- | --- |
+| **`repair_rewrite_permit_busy`** | **243** (≈81/hour) |
+| `light_optimize_tail_selected` | **0** |
 
-```rust
-candidates.filter(|add| !self.repair_verified_sorted.contains(&add.path)).take(1)
+Repair rewrites are gated by a byte-priced semaphore whose budget is
+`COORDINATOR_PER_SORT_BUDGET_BYTES` = **1,280 MiB**. Prod logs the request:
+
+```
+want_mib=1280   budget_mib=1280   event="repair_rewrite_permit_busy"
 ```
 
-`.take(1)` — **one file verified per claim.**
+**Every observed unit asks for the entire budget** — its decoded size is at or
+above 1.25 GiB, and the request is clamped to the budget. So repair is
+**serialized**: one 40+ minute rewrite at a time while every other unit bounces.
 
-Three independent quantities agree, which is why I trust the mechanism:
+The design intent was the opposite, and the code comment says so: *"Bins below
+the budget now share it … a count of 1 … held repair to ~2/hour."* **In
+production no bin is below the budget, so the intended sharing never happens**
+and repair sits in the state that change was written to escape.
 
-| | |
-| --- | --- |
-| measured claim rate (two journal snapshots, 4.4h apart) | **142/hour ≈ 3,409/day**; 100% of the cohort gained attempts |
-| elapsed x rate | 17 days x 3,409 = **57,953 files** |
-| `repair_verified_sorted.txt` on the prod host | **12.76 MB ≈ 58,000 paths** |
+- **Fix shape:** either raise `repair_rewrite_budget_bytes` above a real bin's
+  decoded size, or size repair bins below the budget.
+- **Risk:** a memory budget on the rewrite path — related to Decision 2, and
+  best decided with it.
+- **Status:** not implemented.
 
-These units are *small* (median 0.25 GiB), so no memory constant affects them —
-they are admitted, they run, they simply yield one file each. **80% belong to
-the whale**, so this grows with exactly the tenant profile the 100x customer
-question is about.
-
-The code comment predicts the outcome in as many words: *"could take days to
-reach the file that actually poisons its scans — while looking busy the whole
-time."*
-
-- **Fix shape:** verify the whole candidate set per attempt instead of `take(1)`.
-  The footer reads are independent and already cached.
-- **Risk:** touches no memory constant and no durability path.
-- **Status:** not implemented. It wants a reproducing test first — a repair task
-  whose candidates are all pre-verified never completes.
-
----
+**A data problem worth fixing on its own:** these tasks' stored
+`estimated_decoded_bytes` median is **0.25 GiB** while runtime pricing of the
+same work asks for **≥1.25 GiB** — a ~5x disagreement. Estimates were bulk-cleared
+once before as "measured with a broken ruler"; admission and coarsening both
+make decisions on that stored number.
 
 ## Decision 2 — Admission ceiling and the per-sort slice (must move together)
 
