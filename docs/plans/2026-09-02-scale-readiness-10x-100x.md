@@ -144,9 +144,16 @@ limit is upstream of it, in how large a unit is allowed to be in the first place
 
 ## Honest limits of this measurement
 
-- `--scale` models "each unit costs F times more". Real 100x traffic also means
-  more units, more streams, and more projects; `--streams` models that arrival
-  side separately and is not varied here.
+- **The ARRIVAL axis is untested, and that is a real gap.** `--scale` models
+  "each unit costs F times more" — 10x the data per customer. It does NOT model
+  10x the *customers*. `--streams` exists for exactly that ("260 streams at 130
+  projects"), but it is **inert for `synth:whale`**: stream minting is gated on
+  `cfg.mint_frontier`, and the synthetic queue forces that to `false`. Verified
+  empirically — 26, 130, 260 and 1300 streams all produce identical output
+  (389 executions, 813 → 0, lag 0s). So *"10x keeps up"* is proven for
+  data-per-unit growth and **unproven for customer-count growth**, which is the
+  axis the goal actually names ("more concurrent customers and users"). Closing
+  it needs a real journal, because minting derives its streams from one.
 - The sim is IO-free: it models scheduling, deadlines, splitting and coarsening,
   not object-store latency. It answers "does the policy keep up", not "how many
   milliseconds".
