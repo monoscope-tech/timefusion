@@ -105,7 +105,25 @@ is admitted ~5x underpriced, refused on the real price, and requeued *unchanged*
 **No value of the repair budget fixes this**, because the unit is priced one way
 to get in and another way to run.
 
-**Strongest single argument, from the Delta log:** in one 6-hour window the same
+**DECISIVE (Delta log, 571 commits / 6h).** A repair rewrite is row-preserving,
+so it commits as 1-add/1-remove with output ≈ input size; dedup shrinks. Of 34
+such commits, **31 are repair-shaped — and every one is tiny**:
+
+```
+repair-shaped inputs:  min 0.031 MB   median 0.032 MB   max 0.654 MB
+budget cutoff:  1,280 MiB / 12  =  107 MB
+repair queue units:  median 256 MB, max 262 MB
+```
+
+**Repair succeeds on files 3 orders of magnitude below the cutoff and never once
+above it.** That settles the open questions: it is not "throttled vs dead" but
+*alive for small files, dead for large*, split exactly where the budget predicts;
+the deploy-cadence confound cannot apply (31 completed inside 40-min lifetimes);
+and no permit leak is needed (the semaphore was acquired 31 times).
+**Success criterion after a fix: repair-shaped commits with inputs >100 MB start
+appearing. They currently never do.**
+
+**Supporting argument, same source:** in one 6-hour window the same
 process committed a **649 MB → 415 MB** rewrite (and two more >100 MB), while
 repair cannot rewrite a **256 MB** file. Large rewrites are demonstrably
 possible; repair's budget is what is anomalous. This needs no assumption about

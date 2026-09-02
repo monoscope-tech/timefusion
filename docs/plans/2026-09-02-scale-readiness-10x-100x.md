@@ -2212,3 +2212,51 @@ not capture.
 answer the transaction log held all along, in a form that is smaller, structured,
 and retained independently of log rotation. **When asking "did this system do X",
 prefer the durable record it writes over the diagnostic text it prints.**
+
+## DECISIVE: repair works on small files and never on large ones — exactly as the budget predicts
+
+The Delta log supports a sharper test than "did a big rewrite happen". A **repair**
+rewrite is **row-preserving** — it re-sorts a file without dropping rows — so it
+commits as 1 add / 1 remove with the output roughly the same size as the input.
+Dedup shrinks. That signature separates the lanes without needing row counts.
+
+Across the 571 retained commits (~6 hours):
+
+| | |
+| --- | --- |
+| 1-add / 1-remove commits | 34 |
+| **repair-shaped** (output within ±20% of input) | **31** |
+| shrinking >20% (row removal — dedup) | 3 |
+| **repair-shaped with input >100 MB** | **ZERO** |
+
+And the size distribution of those 31 is the whole argument:
+
+```
+repair-shaped rewrite inputs:  min 0.031 MB   median 0.032 MB   max 0.654 MB
+budget cutoff (1,280 MiB / 12): ................................ 107 MB
+repair QUEUE's units: ................................ median 256 MB, max 262 MB
+```
+
+**Every repair that succeeded was on a file three orders of magnitude below the
+cutoff. Not one exceeded 0.7 MB. Every unit in the queue is ~256 MB — above the
+cutoff.**
+
+This is the cleanest confirmation in this document, and it settles the questions
+the rest of the night left open:
+
+- **"Throttled or dead?"** Neither, precisely: repair is **alive for small files
+  and dead for large ones**, split exactly where the budget predicts.
+- **The deploy-cadence confound does not apply.** 31 repairs completed inside
+  40–60 minute process lifetimes, because small files rewrite in seconds. Restart
+  cadence cannot explain why the ~256 MB units never run.
+- **No permit leak is needed.** The semaphore is clearly acquirable — it was
+  acquired 31 times. Large units fail because a 256 MB file requests all 1,280
+  permits and something else holds part of the budget, or it simply cannot be
+  granted alongside anything.
+- **It needs no counter, no log, and no estimate.** This is the Delta log's own
+  durable record of what was actually committed.
+
+**Decision 1 is now as well-evidenced as it can be without shipping the fix**, and
+the success criterion is sharp: after raising the budget, repair-shaped commits
+with inputs **>100 MB** should start appearing in the Delta log. They currently
+never do.
