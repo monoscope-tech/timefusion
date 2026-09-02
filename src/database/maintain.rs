@@ -6170,7 +6170,7 @@ impl Database {
                     Vec::new()
                 }
                 Err(_) => {
-                    crate::observability::maintenance_stats().dedup_bin_stage_timeouts.fetch_add(1, Relaxed);
+                    crate::observability::maintenance_stats().dedup_probe_timeouts.fetch_add(1, Relaxed);
                     warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
                     Vec::new()
                 }

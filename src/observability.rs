@@ -1365,6 +1365,18 @@ atomic_stats! {
         /// 6.5h stall, skips=77). Repeated hits are the same bin retrying —
         /// an oversized bin that can't finish inside the deadline, not noise.
         dedup_bin_stage_timeouts as "dedup_bin_stage_timeouts_total",
+        /// Batch PROBES that did not get a slice of the phase budget. A very
+        /// different event from the staging deadline above, and it used to
+        /// share that counter — which made the number uninterpretable and
+        /// twice produced a wrong conclusion (2026-09-02: a reading of "80% of
+        /// dedup work times out" was in fact 114 probe timeouts and ZERO
+        /// staging timeouts). The probe is the ~200x-cheaper proof that a
+        /// partition is already duplicate-free; a timeout only means this tick
+        /// ran out of budget before reaching that group, so its bins take the
+        /// expensive path instead. Expected to be nonzero while a group
+        /// backlog drains (observed 61 -> 7 groups/phase over an hour) and to
+        /// fall to zero once it has.
+        dedup_probe_timeouts as "dedup_probe_timeouts_total",
         /// Wave (dedup / light-optimize) commits that STOOD DOWN rather than queue
         /// on a per-table commit lock a flush was already waiting for — the flush
         /// starvation of prod 2026-07-30, where durability waited >600s behind

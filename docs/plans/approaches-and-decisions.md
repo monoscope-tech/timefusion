@@ -1001,3 +1001,49 @@ queue that grows into one that drains, without making a single unit faster.**
 created no replay duplicates itself. The instrument is behaving; the value it
 reports on an UNCLEAN boot is the one that matters, and prod has not had one
 since it shipped.
+
+## 2026-09-02 — CORRECTION: those were not dedup timeouts at all
+
+The 90 "stage timeouts" in the quiet-process measurement above were **114 batch
+PROBE timeouts and ZERO staging timeouts**. Prod logs, last 60 minutes:
+
+```
+114  dedup_batch_probe          (success)
+114  dedup_batch_probe_timeout
+  0  "staging exceeded the … deadline"
+```
+
+`dedup_bin_stage_timeouts_total` was incremented from **two different sites**
+that mean opposite things:
+
+- a per-bin **staging** deadline — a 40-minute whole-file rewrite blew its
+  budget, the thing worth alarming on; and
+- a **batch probe** that did not get a slice of the phase budget — the
+  ~200x-cheaper proof that a partition is already duplicate-free.
+
+One counter, two meanings, and the expensive one is at **zero**. This produced
+a wrong conclusion twice tonight (`840fd945`, then again above), which is the
+same failure as `tf_prefilter_label_hid_four_refusals`: **one label hiding two
+populations.** Split into `dedup_probe_timeouts_total`.
+
+### And the probe timeouts are a draining backlog, not a pathology
+
+Groups probed per 5-minute phase, same hour, budget a constant 239s:
+
+```
+61 → 45 → 21 → 11 → 7 → 7
+```
+
+Each phase probes recent-first and shares one budget across all groups, so the
+tail of a large group list times out and retries next tick. That list is
+shrinking by ~90% over an hour. Timeouts are the *cost of the tail*, and they
+should fall to zero as it drains — the new counter is what will show it.
+
+**So: dedup's expensive path is healthy.** The throughput problem is not that
+dedup work times out. It is the queue arithmetic recorded above (~33 commits/hr
+against a backlog that grows), which is what the landed-batch skip addresses by
+removing self-inflicted input rather than by making units faster.
+
+**The generalisable rule, again:** before drawing a conclusion from a counter,
+grep every site that increments it. Two sites, two meanings, and the number
+means nothing.
