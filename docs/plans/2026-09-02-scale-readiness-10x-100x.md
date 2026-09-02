@@ -414,3 +414,57 @@ stating: arrival pressure wants units fused *larger*, while the per-sort budget
 wants them *smaller*. Resolving it is the same "size the unit deliberately"
 change — a fused unit has to be sized to the budget, not abandoned when it
 would exceed it.
+
+## Root cause of the flow problem: the fusion ceiling is 1.62x the median unit
+
+Chasing the coarsening numbers to the bottom. First, a correction to the obvious
+reading: `blocked` (80.7%) is mostly **benign** — it means a Pending/Retry unit
+at or wider than the fusion width already covers that bucket, so fusion is
+unnecessary there. (The old superseded-blocks-everything trap is genuinely fixed;
+`TaskState::Superseded => false` with a long comment explaining why.)
+
+The signal is what happens to candidates that *could* fuse:
+
+| | count | share of unblocked |
+| --- | --- | --- |
+| unblocked candidates | 22,132 | — |
+| **refused over budget** | 22,074 | **99.7%** |
+| actually fused | 58 | 0.3% |
+
+**99.7% of everything that could fuse is refused on size.** Why becomes obvious
+next to the real unit sizes — `MAX_DECODED_BYTES` is a hard constant of
+**512 MiB**, and the median unit in the journal is **316 MiB**:
+
+| how many median-ish units fit under the 512 MiB ceiling | share of units small enough |
+| --- | --- |
+| 1 | 82.8% |
+| **2** | **21.5%** |
+| 3 | 4.4% |
+| 12 | 4.0% |
+| 144 | 2.7% |
+
+- The ceiling is **1.62x the median unit**.
+- **17.2% of units already exceed it alone** — they can never fuse with anything.
+- Coarsening exists so that "one unit does one scan where 144 slices each did the
+  same scan". Only **2.7%** of units are small enough for 144 of them to fit.
+
+**Coarsening — the only mechanism that reduces unit COUNT — is structurally
+disabled at current unit sizes.** That is the flow problem's root: nothing
+consolidates the arriving invalidations, so unit count tracks arrival rate
+forever.
+
+### The design tension this exposes, which someone should decide deliberately
+
+Note what 512 MiB is close to: the **510 MB** per-sort slice (4.98 GiB heavy
+share / 10 permits). Whether or not that was intentional, it is the right frame —
+a fused unit must fit a sort slice. Which puts two of tonight's findings in
+direct opposition:
+
+- **Backlog drain wants MORE permits.** 50x only drains at 20 workers (4/4 seeds).
+- **Flow/arrival wants BIGGER slices, i.e. FEWER permits.** More permits ⇒
+  smaller slice ⇒ lower fusion ceiling ⇒ less consolidation ⇒ more units.
+
+More concurrency and more consolidation are bought with the same memory, in
+opposite directions. That is a genuine tradeoff, not an oversight, and it is the
+thing to decide deliberately rather than by leaving one constant at 512 MiB. The
+sim can price both sides before anything ships.
