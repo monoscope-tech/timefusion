@@ -150,6 +150,11 @@ async fn main() {
         return;
     }
 
+    if std::env::var("TF_BENCH_SLICE").is_ok() {
+        slice_floor(&path, bytes, spill.path()).await;
+        return;
+    }
+
     run("scan only".to_owned(), "8192", 1, 1, Shape::Scan).await;
     for batch in ["256", "2048", "8192"] {
         for partitions in [1usize, 8] {
@@ -183,6 +188,50 @@ async fn main() {
 /// on one `FairSpillPool`.
 ///
 /// ```bash
+/// The smallest per-job pool slice a dedup rewrite actually completes in.
+///
+/// Sizes `COORDINATOR_JOB_POOL_BYTES`, which prod currently derives as
+/// `coordinator_share / jobs` = 8 GiB / 16 = **512 MiB — exactly the decoded
+/// bytes a unit is admitted for**, leaving nothing for merge buffers or the
+/// spill reservation. The journal shows the consequence directly: dedup units
+/// retrying with `Not enough memory to continue external sort ... Additional
+/// allocation failed for ExternalSorter[0]`.
+///
+/// The number this prints is the RATIO — minimum viable pool divided by the
+/// decoded bytes the budget prices the same work at
+/// (`compressed x DECODED_BYTES_PER_COMPRESSED`). A ratio above 1 means the
+/// per-job slice must exceed the admission ceiling, and by how much. That is
+/// the second half of the admission/sort-slice pair; widening admission without
+/// it converts a starving queue into a failing one.
+///
+/// ```bash
+/// TF_BENCH_SLICE=1 TF_BENCH_PARQUET=… cargo bench --bench rewrite_throughput
+/// ```
+async fn slice_floor(path: &str, bytes: u64, spill: &std::path::Path) {
+    /// The ratio every sort budget in the crate is denominated by
+    /// (`database::maintain::DECODED_BYTES_PER_COMPRESSED`).
+    const DECODED_PER_COMPRESSED: f64 = 12.0;
+    let decoded_mb = bytes as f64 / 1e6 * DECODED_PER_COMPRESSED;
+    println!("\ndecoded ~{decoded_mb:.0} MB at {DECODED_PER_COMPRESSED:.0}x — the size every budget prices this work at");
+    println!("{:<12} {:>8} {:>11} {:>9}  {}", "pool MB", "secs", "rows", "pool/dec", "outcome");
+    // Descending: the first failure is the floor, and everything below it is
+    // known-bad, so a failed rung does not end the sweep — a pool can fail for
+    // reasons other than size and that must be visible, not inferred.
+    for pool_mb in [4096usize, 3072, 2048, 1536, 1024, 768, 512, 384, 256] {
+        use std::io::Write;
+        let ratio = pool_mb as f64 / decoded_mb;
+        // `Sort` is the dedup rewrite's shape since 2026-09-02 (one sort in
+        // schema order + RunCollapse), batch 2048 as `maintenance_batch_size`
+        // sets for the Server profile.
+        let line = match pass(path, "2048", 1, 1, Shape::Sort, pool_mb * 1024 * 1024, spill).await {
+            Ok((secs, rows)) => format!("{pool_mb:<12} {secs:>8.1} {rows:>11} {ratio:>9.2}  ok"),
+            Err(error) => format!("{pool_mb:<12} {:>8} {:>11} {ratio:>9.2}  {}", "FAIL", "-", error.lines().next().unwrap_or("")),
+        };
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// TF_BENCH_FLEET=1 TF_BENCH_PARQUET=… TF_BENCH_POOL_MB=8192 cargo bench --bench rewrite_throughput
 /// ```
 async fn fleet(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) {
