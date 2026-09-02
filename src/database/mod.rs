@@ -17960,39 +17960,28 @@ mod tests {
         let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string();
         println!("--- maintenance scan plan:\n{rendered}");
 
-        // What it does TODAY, on a file TimeFusion itself just wrote with all
-        // five sorting columns in its footer (verified with pyarrow on a real
-        // prod file too): the scan declares
-        //   output_ordering=[timestamp DESC, id ASC, level ASC, status_code ASC]
-        // — `resource___service___name` is MISSING, though it is projected and
-        // second in `sorting_columns`. The declared ordering therefore does not
-        // satisfy the schema sort, so the SortExec stays.
+        // Before the leaf-index fix in `TableSchema::sorting_columns` this scan
+        // declared `[timestamp, id, level, status_code]` — service DROPPED,
+        // though projected and second in `sorting_columns` — so the ordering did
+        // not satisfy the schema sort and a full `SortExec` stayed. That claim
+        // was also FALSE, not merely short: data sorted by
+        // (timestamp, service, id) is not sorted by (timestamp, id), because
+        // within one timestamp ids do not ascend across services.
         //
-        // Two consequences, and they point opposite ways:
-        //  - the sort cannot become a SortPreservingMerge until this is fixed,
-        //    which is the whole remaining cost of a dedup rewrite; and
-        //  - the claim is FALSE, not merely short. Data sorted by
-        //    (timestamp, service, id) is not sorted by (timestamp, id): within
-        //    one timestamp, ids do not ascend across services. Anything that
-        //    trusts it — a merge, or bounded dedup on more than the lead
-        //    column — gets wrong answers. TF is safe today only because it
-        //    consumes the lead column alone.
-        //
-        // PROD is worse than this test: the `dedup_plan_shape` instrument reports
-        // `sorts=1 merges=0 collapse=true ordered_scan=false` — real scans declare
-        // NO ordering at all, so the pushdown is not merely incomplete there, it
-        // is dead. This test holds the one-file, all-conforming case, which is
-        // the best case, and even that drops a column.
-        //
-        // Asserted as the CURRENT state so a fix announces itself here.
+        // With the fix the ordering is complete and the sort disappears
+        // ENTIRELY — not downgraded to a merge, removed. That is the whole
+        // remaining cost of a dedup rewrite (the bench put the sort at 81% of
+        // one), so this assertion is guarding the win, not a detail.
         let declared = rendered.split("output_ordering=[").nth(1).and_then(|rest| rest.split(']').next()).unwrap_or("").to_owned();
-        assert!(!declared.is_empty(), "the scan declared no ordering at all, which is a different and worse failure:\n{rendered}");
-        assert!(
-            !declared.contains("resource___service___name"),
-            "the declared ordering now carries the service column — the footer mapping was fixed. Drop this assertion and revisit \
-             SortPreservingMerge for the dedup rewrite, which is its whole remaining cost. declared=[{declared}]"
-        );
-        assert!(rendered.contains("SortExec"), "the sort must survive while the declared ordering is incomplete:\n{rendered}");
+        for column in &schema.sorting_columns {
+            assert!(
+                declared.contains(column.name.as_str()),
+                "`{}` is missing from the declared ordering, so the footer index no longer resolves to the column it names — \
+                 the rewrite is paying a full sort again. declared=[{declared}]",
+                column.name
+            );
+        }
+        assert!(!rendered.contains("SortExec"), "the declared ordering satisfies the schema sort, so nothing should sort:\n{rendered}");
         Ok(())
     }
 

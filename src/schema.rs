@@ -575,16 +575,42 @@ impl TableSchema {
         // the raw fields-list index over-counts by every partition column that
         // precedes a sort key (e.g. `date` at field 0), so the footer points at
         // the wrong column and the sort-order pushdown silently never fires.
+        // ...and a LEAF is not a FIELD. A Variant/struct column occupies as many
+        // parquet leaves as it has children, so counting fields under-shoots for
+        // every sort key that follows one. On a real prod file (97 leaves, 90
+        // fields) `resource___service___name` was recorded as leaf 76 — which is
+        // `attributes___user___email`. The reader then cannot find that name in
+        // the scan's schema, drops the entry, and the file advertises
+        // `[timestamp, id, level, status_code]`: an ordering the data does not
+        // have (within one timestamp, ids do not ascend across services). It
+        // also blocks the `SortPreservingMerge` that would remove the dedup
+        // rewrite's last sort. `timestamp` was correct only because nothing
+        // nested precedes it.
         let partition_set = self.partition_set();
-        let data_cols: Vec<&str> = self.fields.iter().map(|f| f.name.as_str()).filter(|n| !partition_set.contains(n)).collect();
+        let leaves = |data_type: &arrow_schema::DataType| -> usize {
+            fn count(data_type: &arrow_schema::DataType) -> usize {
+                use arrow_schema::DataType::*;
+                match data_type {
+                    Struct(fields) => fields.iter().map(|f| count(f.data_type())).sum(),
+                    List(f) | LargeList(f) | FixedSizeList(f, _) | ListView(f) | LargeListView(f) => count(f.data_type()),
+                    Map(entries, _) => count(entries.data_type()),
+                    RunEndEncoded(_, values) => count(values.data_type()),
+                    _ => 1,
+                }
+            }
+            count(data_type)
+        };
+        let Ok(fields) = self.fields() else { return Vec::new() };
+        let mut leaf_of: HashMap<&str, i32> = HashMap::new();
+        let mut next = 0usize;
+        for (declared, field) in self.fields.iter().zip(&fields).filter(|(d, _)| !partition_set.contains(d.name.as_str())) {
+            leaf_of.insert(declared.name.as_str(), next as i32);
+            next += leaves(field.data_type());
+        }
         self.sorting_columns
             .iter()
             .filter_map(|col| {
-                data_cols.iter().position(|n| *n == col.name).map(|idx| SortingColumn {
-                    column_idx: idx as i32,
-                    descending: col.descending,
-                    nulls_first: col.nulls_first,
-                })
+                leaf_of.get(col.name.as_str()).map(|idx| SortingColumn { column_idx: *idx, descending: col.descending, nulls_first: col.nulls_first })
             })
             .collect()
     }
@@ -1039,5 +1065,53 @@ mod tests {
         let fields = schema.fields().expect("metrics fields parse");
         assert!(matches!(fields.iter().find(|f| f.name() == "value").map(|f| f.data_type()), Some(ArrowDataType::Float64)));
         assert!(matches!(fields.iter().find(|f| f.name() == "hist_bucket_counts").map(|f| f.data_type()), Some(ArrowDataType::List(_))));
+    }
+
+    /// A footer `SortingColumn.column_idx` indexes parquet LEAVES, and a
+    /// Variant/struct column is several leaves. Counting fields instead made
+    /// every sort key after the first nested column point at an unrelated
+    /// column: on a real prod file (97 leaves, 90 fields)
+    /// `resource___service___name` was recorded as leaf 76, which is
+    /// `attributes___user___email`. The reader could not find that name in the
+    /// scan schema, dropped the entry, and the file advertised
+    /// `[timestamp, id, level, status_code]` — an ordering the data does not
+    /// have.
+    ///
+    /// Resolving each recorded index back through the same leaf order is what
+    /// makes this checkable at all; asserting a hardcoded number would just
+    /// re-encode the bug.
+    #[test]
+    fn footer_sort_indices_resolve_to_the_columns_they_name() {
+        fn leaf_paths(name: &str, data_type: &ArrowDataType, out: &mut Vec<String>) {
+            match data_type {
+                ArrowDataType::Struct(fields) => fields.iter().for_each(|f| leaf_paths(f.name(), f.data_type(), out)),
+                ArrowDataType::List(f) | ArrowDataType::LargeList(f) | ArrowDataType::FixedSizeList(f, _) => leaf_paths(name, f.data_type(), out),
+                ArrowDataType::Map(entries, _) => leaf_paths(name, entries.data_type(), out),
+                _ => out.push(name.to_owned()),
+            }
+        }
+        for table in ["otel_logs_and_spans", "otel_metrics"] {
+            let schema = get_schema(table).expect("shipped schema");
+            let partitions = schema.partition_set();
+            let fields = schema.fields().expect("arrow fields");
+            let mut leaves = Vec::new();
+            for (declared, field) in schema.fields.iter().zip(&fields).filter(|(d, _)| !partitions.contains(d.name.as_str())) {
+                leaf_paths(&declared.name, field.data_type(), &mut leaves);
+            }
+            let recorded = schema.sorting_columns();
+            assert_eq!(recorded.len(), schema.sorting_columns.len(), "{table}: every declared sorting column must be recorded");
+            for (column, sorting) in schema.sorting_columns.iter().zip(&recorded) {
+                let idx = usize::try_from(sorting.column_idx).expect("non-negative leaf index");
+                assert_eq!(
+                    leaves.get(idx).map(String::as_str),
+                    Some(column.name.as_str()),
+                    "{table}: `{}` was recorded as leaf {idx}, which is `{:?}` ({} leaves total)",
+                    column.name,
+                    leaves.get(idx),
+                    leaves.len()
+                );
+            }
+            assert!(leaves.len() >= fields.len(), "{table}: leaves cannot be fewer than fields, or this test is measuring nothing");
+        }
     }
 }
