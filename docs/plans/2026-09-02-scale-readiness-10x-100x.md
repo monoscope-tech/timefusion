@@ -689,3 +689,63 @@ So the recommendation stands and strengthens, with the mechanism corrected:
    is the 100x-customer question arriving early.
 3. Unit sizing at planning time addresses both, and is the same change the 100x
    sim work pointed at from the other direction.
+
+## The admission band is mis-calibrated against real unit sizes — and it is the same constant
+
+`occupancy_scaled_ceiling` (borrowed deliberately from ClickHouse, rule 2 of the
+prior-art survey) is:
+
+```
+ceiling = MAX_DECODED_BYTES x (available / capacity),  clamped to
+          [MAX_DECODED_BYTES/16, MAX_DECODED_BYTES]  =  [32 MiB, 512 MiB]
+```
+
+Set that band against the real queue's unit sizes:
+
+| operation | queued | NEVER admissible (>512 MiB) | refused on a busy pool (>32 MiB) |
+| --- | --- | --- | --- |
+| `base_rollup` | 164 | **57.9%** | 100% |
+| `dedup` | 620 | 10.0% | 94.0% |
+| `repair` | 328 | 0.0% | **100%** |
+| `derived_rollup` | 5 | 0.0% | 100% |
+| **all queued** | 1,117 | **14.1%** | **96.7%** |
+
+- **14.1% of queued work can never be admitted at ANY occupancy.** That is the
+  `resource_admission` population — permanently starved by construction.
+- **96.7% is refused whenever the pool is busy.** The floor exists so "a busy
+  pool must still admit work this small, or hygiene starves" — but it is
+  **32 MiB against a median unit of 316 MiB**, so the floor admits almost
+  nothing real. With the pool rarely idle, that is the `admission_busy`
+  population.
+
+**The whole scaling band sits below the working set.** The ceiling is 1.6x the
+median unit and the floor is one tenth of it, so occupancy scaling spends its
+entire range in territory where almost no real unit fits.
+
+### IMPORTANT correction to this document's own earlier refutation
+
+Earlier I raised `MAX_DECODED_BYTES` 512 MiB → 4 GiB, measured a 0.7% change,
+and concluded the constant was not the lever. **That conclusion was scoped too
+broadly.** The sim's module documentation states plainly:
+
+> *"Memory admission and intra-call operation order are outside the model."*
+
+So that experiment measured the **fusion** effect only. `MAX_DECODED_BYTES` also
+sets the admission band, and raising it 8x would move that band from
+`[32 MiB, 512 MiB]` to `[256 MiB, 4 GiB]` — taking never-admissible from 14.1%
+toward ~0 and lifting the busy-pool floor from one tenth of the median unit to
+close to it. **The sim cannot show that effect, and did not.**
+
+So the honest status of the leading candidate:
+
+- raising `MAX_DECODED_BYTES` does little for **fusion** — measured, 0.7%
+- its effect on **admission starvation** is **unmeasured and potentially large**
+- and the two uses are the *same constant*, which is itself worth questioning:
+  the largest unit worth FUSING and the largest unit admission can GRANT are
+  different questions that happen to share a number
+
+**Next measurement, and it cannot be the sim:** an admission-aware test — either
+a unit test over `occupancy_scaled_ceiling` against the real journal's size
+distribution (cheap, offline, no deploy), or `run-unit` against seeded local
+storage. That is the one experiment that would confirm or kill the leading
+candidate, and it is where I would start.
