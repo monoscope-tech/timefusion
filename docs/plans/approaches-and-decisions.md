@@ -379,6 +379,20 @@ after the deploy.**
 not theoretical, which is why the run collapse now pins a single ordered stream
 explicitly (`8efa0952`) instead of trusting `execute_stream`.
 
+**It converges as a STEP, not a ramp — do not read a flat line as failure.**
+`derive_common_ordering` picks the ordering **the most files agree on**
+(`max_by_key(count)`) and isolates the rest into their own unordered scan. So
+while old-footer files outnumber new ones in a `(project, date)` partition, the
+claim goes to the OLD, wrong ordering and the correctly-footered files are the
+ones set aside. A partition flips only when new footers become the MAJORITY
+there — which one full rewrite of that partition accomplishes in a single commit,
+since a rewrite replaces many files at once.
+
+Practical reading: expect `ordered_scan=true` to sit near zero, then jump
+per-partition. `light_optimize` commits far more bins than dedup does (27 vs 9 in
+one sample) and writes footers through the same path, so it is likely the faster
+converter of the two.
+
 Early and not yet claimable — young process — `dedup_bin_stage_timeouts_total` is
 **0 at 4 commits**, against **20 at 9 commits** on the previous build.
 
