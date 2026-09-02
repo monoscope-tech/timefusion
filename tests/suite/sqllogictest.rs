@@ -27,7 +27,14 @@ mod sqllogictest_tests {
     impl fmt::Display for TestError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                TestError::Postgres(e) => write!(f, "Postgres error: {}", e),
+                // tokio_postgres's own Display is the bare string "db error",
+                // which tells you nothing about WHY a statement was refused.
+                // The SQLSTATE and server message are the whole point when the
+                // thing under test is pgwire compatibility.
+                TestError::Postgres(e) => match e.as_db_error() {
+                    Some(db) => write!(f, "Postgres error [{}]: {}", db.code().code(), db.message()),
+                    None => write!(f, "Postgres error: {e}"),
+                },
                 TestError::Other(s) => write!(f, "Error: {}", s),
             }
         }
