@@ -90,6 +90,15 @@ the *ordinary* bin is also over budget.
 
 - **Fix is derivable, not guessed:** to let `N` repair rewrites share, the budget
   must be ≥ `N x 256 MiB x 12` — **3,072 MiB for one**, 6,144 for two.
+- **⚠ Do NOT do it by raising `COORDINATOR_PER_SORT_BUDGET_BYTES`.**
+  `repair_rewrite_budget_bytes()` returns that shared constant, and it is also
+  the **divisor for `light_optimize_k`** — raising it to 3 GiB cuts hot-tail
+  packing concurrency by **2.4x**. The code records that exact outage five days
+  ago in the opposite direction: K went 3 → 1 and *"HotPacking stopped being
+  claimed at all — zero units in 45 minutes with 17 pending."* **Give repair its
+  own constant**; the function is already separate and merely returns the shared
+  value. Re-check `light_optimize_k` afterwards, since its assertion encodes the
+  one-budget holdback for repair.
 - **Judgement required:** only how much memory repair may hold, given admission
   (Decision 2) draws on the same pool.
 - **Status:** not implemented, but **there is a reproducing test on branch
