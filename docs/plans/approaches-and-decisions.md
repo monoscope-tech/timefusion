@@ -318,3 +318,17 @@ Trace from `rollup_hits_hybrid`/`rollup_hits_full` back to whatever ordering
 precondition the derived-table route checks. If routing can be decoupled from the
 advertised ordering — or if the rewrite provider can declare an ordering without
 changing what files advertise — the 5.4x is reachable without touching reads.
+
+### Narrowing: the route CHECK has no ordering precondition
+
+`src/rollup.rs` (where `rollup_hits_hybrid`/`_full` are recorded) contains no
+sort- or ordering-based decline condition. So the sort-order coupling is NOT in
+the routing predicate.
+
+That redirects the search: with dedup-key-leading files, the rollup BUILD or its
+COVERAGE most likely produces different content/extent, and the query then finds
+nothing to route to. Look at the build and coverage path first, not the route
+check — the opposite of where the failing assertion points.
+
+(`rollup_hits_*` are also incremented in `src/dml.rs` and
+`src/database/maintain.rs`; `src/observability.rs:840` is the sink.)
