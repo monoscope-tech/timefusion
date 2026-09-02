@@ -243,7 +243,12 @@ async fn fleet(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) 
     // 3, 5, 6 included deliberately: prod runs 4 and the 8-worker rung FAILS at
     // an 8 GB pool, so the usable ceiling is somewhere in between and that is the
     // number a permit change has to be justified against.
-    for workers in [1usize, 2, 4, 5, 6, 8] {
+    // 10/12/16 included because `coordinator_jobs` reaches **16** on the prod
+    // box while this ladder stopped at 8 — so the rung prod actually runs was
+    // never measured. `pool / jobs` is NOT the share a worker gets: one worker
+    // sorts this file in a 512 MB pool (see `slice_floor`), yet 8 sharing 8 GB
+    // — 1 GB nominal each — fail. Only the ladder answers what a job count costs.
+    for workers in [1usize, 2, 4, 5, 6, 8, 10, 12, 16] {
         // ONE pool for all of them, sized as prod sizes the coordinator's.
         let shared = runtime(pool_mb * 1024 * 1024, spill);
         let started = Instant::now();
