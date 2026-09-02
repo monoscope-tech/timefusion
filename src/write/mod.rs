@@ -370,9 +370,22 @@ pub type DeltaWriteCallback =
 ///   differs for content that is identical.
 /// - **Addition, not XOR.** XOR cancels in pairs, so two identical batches
 ///   would digest the same as no batches at all — a skip of a real write.
-/// - **256-bit, not a 64-bit fast hash.** A collision here declines a write that
-///   should have happened, which is silent data loss. This runs once per flush,
-///   so the cost is irrelevant next to the parquet encode it guards.
+/// - **256-bit and cryptographic, not a 64-bit fast hash.** A collision here
+///   declines a write that should have happened, which is silent data loss.
+///
+/// **Cost, measured — the `landed_digest` bench in `dedup_benchmarks`, release,
+/// 200k rows:** 17.3 ms (1.29 GiB/s) against 20.5 ms for the parquet encode
+/// this avoids, so **0.84x the work it guards**.
+///
+/// That bench exists because the first estimate was taken in a debug build,
+/// where SHA-256 runs far under its release speed and made the digest look 5x
+/// the encode. Decomposing it showed the hash was 83% of the total, and moving
+/// from SHA-256 to blake3 (already in the lock file, SIMD, same 256 bits) cut
+/// the whole digest by **72%**. The Arrow passes are the remainder.
+///
+/// Steady state is cheaper still: the CHECK short-circuits on the identity set
+/// being empty, which without a dirty boot it is, so it costs a map lookup.
+/// Only the RECORD is paid per flush commit while the feature is on.
 ///
 /// The bytes hashed are the batch's **IPC round-trip fixed point**, not its
 /// current encoding. Measured, not assumed: a client-supplied batch and the
@@ -402,8 +415,7 @@ pub(crate) fn landed_identity_applies(table_name: &str) -> bool {
     crate::schema::get_schema(table_name).is_some_and(|s| !s.dedup_keys.is_empty())
 }
 
-pub(crate) fn landed_digest(batches: &[RecordBatch]) -> Option<[u8; 32]> {
-    use sha2::{Digest, Sha256};
+pub fn landed_digest(batches: &[RecordBatch]) -> Option<[u8; 32]> {
     if batches.iter().all(|b| b.num_rows() == 0) {
         return None;
     }
@@ -413,7 +425,8 @@ pub(crate) fn landed_digest(batches: &[RecordBatch]) -> Option<[u8; 32]> {
             .ok()
             .map(crate::write::mem_buffer::compact_batch)
             .and_then(|b| crate::write::wal::serialize_record_batch(&b).ok())?;
-        let digest = Sha256::digest(canonical);
+        let digest = blake3::hash(&canonical);
+        let digest = digest.as_bytes();
         let mut carry = 0u16;
         for i in (0..32).rev() {
             let sum = acc[i] as u16 + digest[i] as u16 + carry;

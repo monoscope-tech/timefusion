@@ -205,6 +205,36 @@ fn bench_flush_dedup(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cost of the landed-batch identity that lets a flush decline rows Delta
+/// already holds (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`),
+/// against the parquet encode it guards. Exists because the first estimate was
+/// taken in a DEBUG build, where SHA-256 runs ~30x under its release speed and
+/// the digest looked 5x more expensive than the encode. The flag's cost is
+/// this ratio; measure it here, not in a test binary.
+fn bench_landed_digest(c: &mut Criterion) {
+    let mut group = c.benchmark_group("landed_digest");
+    for &rows in &[20_000usize, 200_000] {
+        let batches = make_batches(rows, rows, false);
+        let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+        group.throughput(Throughput::Bytes(bytes as u64));
+        group.bench_function(BenchmarkId::new("digest", rows), |b| {
+            b.iter(|| std::hint::black_box(timefusion::write::landed_digest(&batches)))
+        });
+        group.bench_function(BenchmarkId::new("parquet_encode", rows), |b| {
+            b.iter(|| {
+                let mut sink = Vec::new();
+                let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(&mut sink, batches[0].schema(), None).unwrap();
+                for batch in &batches {
+                    w.write(batch).unwrap();
+                }
+                w.close().unwrap();
+                std::hint::black_box(sink.len())
+            })
+        });
+    }
+    group.finish();
+}
+
 fn maybe_report(c: &mut Criterion) {
     if std::env::var("DEDUP_MEM_REPORT").is_ok() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();
@@ -212,6 +242,7 @@ fn maybe_report(c: &mut Criterion) {
     }
     bench_dedup(c);
     bench_flush_dedup(c);
+    bench_landed_digest(c);
 }
 
 criterion_group!(benches, maybe_report);

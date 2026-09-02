@@ -250,3 +250,35 @@ than it sounds: real Delta, real object storage, and the duplicate produced the
 way prod produces it (a commit that lands while its cursor advance is lost).
 Turning the flag on in prod is a judgement call for a human, and the failure
 direction if it is wrong is a duplicate, not a loss.
+
+## The cost, measured — and the claim that had to be withdrawn first
+
+The original design note asserted the digest's cost was "irrelevant next to the
+parquet encode it guards." That was an assertion, not a measurement, and it was
+wrong. The measured sequence:
+
+| | digest | parquet encode | ratio |
+| --- | --- | --- | --- |
+| debug build (first look) | 39.6 ms | 7.6 ms | **5.2x** |
+| release, SHA-256, 200k rows | 62.1 ms (369 MiB/s) | 20.5 ms (1.09 GiB/s) | **3.0x** |
+| release, blake3, 200k rows | **17.3 ms (1.29 GiB/s)** | 20.5 ms | **0.84x** |
+
+Three things worth keeping:
+
+1. **The debug ratio was meaningless and nearly caused the wrong fix.** SHA-256
+   runs far under its release speed unoptimized, so the debug number (5.2x)
+   overstated a real 3.0x. Decomposing rather than trusting the total is what
+   showed the hash was **83%** of the digest and the three Arrow passes only 17%.
+2. **blake3 cut the whole digest by 72%** — same 256 bits, SIMD, and already in
+   `Cargo.lock` as a transitive dependency, so it costs nothing to adopt.
+3. **The digest is now cheaper than the work it avoids** (0.84x), which is what
+   the original claim asserted without evidence. It is now a bench
+   (`landed_digest` in `dedup_benchmarks`), so a future change that makes it
+   expensive again shows up as a regression rather than as a surprise in prod.
+
+Steady state is cheaper than any of these: the check short-circuits on an empty
+identity set, which without a dirty boot it always is.
+
+**A digest-format change needs no version gate.** A stale digest simply never
+matches, and a non-match flushes — the safe direction — so old records age out
+of the window harmlessly.

@@ -8453,6 +8453,7 @@ dependencies = [
  "aws-types",
  "base64",
  "bincode 2.0.1",
+ "blake3",
  "bon",
  "buoyant_kernel 0.22.0",
  "bytes",
