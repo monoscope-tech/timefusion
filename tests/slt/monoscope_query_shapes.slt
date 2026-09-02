@@ -1,0 +1,526 @@
+# The monoscope compatibility contract, executable.
+#
+# `docs/monoscope-query-shapes.md` is the prose inventory of what our only
+# client actually asks this server. It was a hand-made snapshot and it drifted:
+# it still carried a `Utf8View` OR workaround for months after `e0bf291` fixed
+# the underlying bug, so monoscope kept paying for a defect that no longer
+# existed. This file is that document made executable.
+#
+# The rule when you change this server: if a shape below stops planning, you
+# have broken monoscope — find out before it reaches production, not three
+# weeks later. If you FIX something a shape works around, the `statement error`
+# case pinning it will start failing, which is the signal to go delete the
+# workaround in the client.
+#
+# Section numbers track `docs/monoscope-query-shapes.md`. Spellings are copied
+# from the monoscope tree verbatim, including casts that look redundant — they
+# are what the client emits, and a shape benchmarked against tidier SQL
+# measures a system nobody runs.
+
+# ---------------------------------------------------------------------------
+# Fixture. Two 5-minute buckets, three rows each.
+# ---------------------------------------------------------------------------
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date, name, kind,
+    resource___service___name, status_code, level, duration,
+    context___trace_id, context___span_id, parent_id,
+    attributes___http___request___method, attributes___url___path,
+    attributes___http___response___status_code, attributes___db___system___name,
+    attributes___user___id, attributes___session___id,
+    message_size_bytes, summary, body, attributes
+) VALUES
+    ('mono_shapes', TIMESTAMP '2026-01-15T10:00:00Z', 'ms_1', ARRAY['h1']::VARCHAR[], DATE '2026-01-15',
+     'GET /users', 'server', 'api', 'OK', 'INFO', 100000000,
+     't1', 's1', NULL, 'GET', '/users', 200, NULL, 'u1', 'sess1', 512,
+     ARRAY['ok'], '{"message":"served"}', '{"http":{"route":"/users"},"user":{"tier":"pro"}}'),
+    ('mono_shapes', TIMESTAMP '2026-01-15T10:01:00Z', 'ms_2', ARRAY['h2']::VARCHAR[], DATE '2026-01-15',
+     'GET /users', 'server', 'api', 'ERROR', 'ERROR', 500000000,
+     't2', 's2', NULL, 'GET', '/users', 500, NULL, 'u1', 'sess1', 640,
+     ARRAY['boom'], '{"message":"failed"}', '{"http":{"route":"/users"},"user":{"tier":"pro"}}'),
+    ('mono_shapes', TIMESTAMP '2026-01-15T10:02:00Z', 'ms_3', ARRAY['h3']::VARCHAR[], DATE '2026-01-15',
+     'POST /orders', 'client', 'api', 'OK', 'INFO', 20000000,
+     't1', 's3', 's1', 'POST', '/orders', 201, NULL, 'u2', 'sess2', 256,
+     ARRAY['ok'], '{"message":"queued"}', '{"http":{"route":"/orders"},"user":{"tier":"free"}}'),
+    ('mono_shapes', TIMESTAMP '2026-01-15T10:06:00Z', 'ms_4', ARRAY['h4']::VARCHAR[], DATE '2026-01-15',
+     'GET /', 'server', 'web', 'OK', 'WARN', 300000000,
+     't3', 's4', NULL, 'GET', '/', 200, NULL, 'u3', 'sess3', 128,
+     ARRAY['slow'], '{"message":"rendered"}', '{"http":{"route":"/"},"user":{"tier":"free"}}'),
+    ('mono_shapes', TIMESTAMP '2026-01-15T10:07:00Z', 'ms_5', ARRAY['h5']::VARCHAR[], DATE '2026-01-15',
+     'GET /', 'server', 'web', 'OK', 'INFO', 150000000,
+     't3', 's5', NULL, 'GET', '/', 200, NULL, 'u3', 'sess3', 320,
+     ARRAY['ok'], '{"message":"rendered"}', '{"http":{"route":"/"},"user":{"tier":"free"}}'),
+    ('mono_shapes', TIMESTAMP '2026-01-15T10:08:00Z', 'ms_6', ARRAY['h6']::VARCHAR[], DATE '2026-01-15',
+     'SELECT users', 'client', 'db-proxy', 'OK', 'INFO', 5000000,
+     't2', 's6', 's2', NULL, NULL, NULL, 'postgresql', 'u2', 'sess2', 64,
+     ARRAY['ok'], '{"message":"query"}', '{"db":{"system":"postgresql"}}')
+
+# ---------------------------------------------------------------------------
+# §1. Throughput — the most common shape in the product.
+#
+# The bucket is SELECTed as an epoch integer and GROUPed BY bare: the two
+# spellings must resolve to the same expression or every chart double-counts.
+# ---------------------------------------------------------------------------
+
+query IR
+SELECT extract(epoch from time_bucket('5 minutes', timestamp))::integer, count(*)::float
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY time_bucket('5 minutes', timestamp)
+ORDER BY time_bucket('5 minutes', timestamp)
+----
+1768471200
+3
+1768471500
+3
+
+# ---------------------------------------------------------------------------
+# §2. Throughput split by a dimension.
+#
+# Grouped dimensions arrive wrapped in COALESCE(<dim>, 'null') — DataFusion
+# rewrites that to a CASE before any optimizer rule sees it, and the rollup
+# matcher has a dedicated arm for it (`rollup.rs`, the COALESCE group-by).
+# ---------------------------------------------------------------------------
+
+query TR
+SELECT COALESCE(resource___service___name, 'null'), count(*)::float
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY COALESCE(resource___service___name, 'null')
+ORDER BY 1
+----
+api
+3
+db-proxy
+1
+web
+2
+
+# ---------------------------------------------------------------------------
+# §3a. One percentile per bucket. t-digest, so assert a range.
+# ---------------------------------------------------------------------------
+
+query B
+SELECT COALESCE(approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE PRECISION))), 0)::float / 1000000
+       BETWEEN 400 AND 501
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND duration IS NOT NULL
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+----
+true
+
+# §3b. Multi-quantile: the digest is built once per bucket and read N times
+# through a CROSS JOIN over a VALUES list.
+
+query TB
+SELECT q.quantile, COALESCE(approx_percentile(q.percentile, b.digest), 0)::float > 0
+FROM (
+  SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer AS timeB,
+         percentile_agg(CAST(duration AS DOUBLE PRECISION)) AS digest
+  FROM otel_logs_and_spans
+  WHERE project_id = 'mono_shapes'
+    AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+  GROUP BY timeB HAVING COUNT(*) > 0
+) b
+CROSS JOIN (VALUES (0.5,'p50'),(0.9,'p90')) AS q(percentile, quantile)
+ORDER BY q.quantile
+----
+p50
+true
+p90
+true
+
+# §3c. PERCENTILE_CONT WITHIN GROUP. The sessions header depends on this
+# (`LogQueries.hs`), README advertises it, and nothing exercised it before.
+# It routes to no rollup by design — exact percentiles are not decomposable.
+
+query R
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration)
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+----
+125000000
+
+# ---------------------------------------------------------------------------
+# §4. Error rate. Two definitions of "error" are in use across the product;
+# this is the wider one, and it is what the rollup tier declares.
+# ---------------------------------------------------------------------------
+
+query R
+SELECT ROUND((COUNT(*) FILTER (WHERE status_code = 'ERROR'
+              OR COALESCE(attributes___http___response___status_code, 0) >= 500)::float
+              * 100.0 / count(*)::float)::numeric, 2)::float
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+----
+16.67
+
+# ---------------------------------------------------------------------------
+# §5. Distinct counts. The sketch/accessor split is not cosmetic: monoscope
+# emits `distinct_count(approx_count_distinct(x))` on BOTH backends because
+# Timescale Toolkit's approx_count_distinct returns a hyperloglog, so casting
+# it directly to float is a type error there.
+# ---------------------------------------------------------------------------
+
+query R
+SELECT distinct_count(approx_count_distinct(resource___service___name))::float
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+----
+3
+
+# ---------------------------------------------------------------------------
+# §6. Top-K tables — the apdex/throughput/error-rate/p95 table under most
+# dashboards. ORDER BY spells the aggregate out rather than using an ordinal.
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT resource___service___name AS service_name,
+       ROUND(SUM(CASE WHEN duration <= 500000000 THEN 1.0
+                      WHEN duration <= 2000000000 THEN 0.5 ELSE 0 END)
+             / GREATEST(1, COUNT(*))::numeric, 2)::text AS apdex,
+       ROUND((COUNT(*) FILTER (WHERE status_code = 'ERROR'
+              OR COALESCE(attributes___http___response___status_code, 0) >= 500) * 100.0
+              / GREATEST(1, COUNT(*))::numeric), 2)::text AS error_rate
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND resource___service___name IS NOT NULL
+  AND kind = 'server' AND duration IS NOT NULL
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY resource___service___name
+ORDER BY COUNT(*) DESC, resource___service___name
+----
+web
+1.00
+0.00
+api
+1.00
+50.00
+
+# §6b. Two-stage CTE: top-N first, then aggregate, to bound GROUP BY
+# cardinality. The join key is a concatenation, not a column.
+
+query TI
+WITH top_endpoints AS (
+  SELECT attributes___http___request___method || ' ' || attributes___url___path AS endpoint,
+         COUNT(*) AS total_count
+  FROM otel_logs_and_spans
+  WHERE project_id = 'mono_shapes' AND attributes___url___path IS NOT NULL
+    AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+  GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 10)
+SELECT endpoint, total_count FROM top_endpoints ORDER BY total_count DESC, endpoint
+----
+GET /
+2
+GET /users
+2
+POST /orders
+1
+
+# ---------------------------------------------------------------------------
+# §7. Facets — one query per field for the filter sidebar. Note the schema
+# qualifier and the ::uuid / ::timestamptz casts: FacetsFallback emits these.
+# ---------------------------------------------------------------------------
+
+query TI
+SELECT ("resource___service___name")::text, COUNT(*)::bigint
+FROM public.otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp >= TIMESTAMP '2026-01-15T09:00:00Z'::timestamptz
+  AND timestamp < TIMESTAMP '2026-01-15T11:00:00Z'::timestamptz
+  AND ("resource___service___name") IS NOT NULL
+GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 50
+----
+api
+3
+web
+2
+db-proxy
+1
+
+# ---------------------------------------------------------------------------
+# §8. Log-explorer list page — TopK, no aggregation. Cursor pagination
+# rewrites the window rather than using OFFSET.
+# ---------------------------------------------------------------------------
+
+query T
+SELECT id FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+ORDER BY timestamp DESC LIMIT 3
+----
+ms_6
+ms_5
+ms_4
+
+# §8b. The cursor form: older-than.
+
+query T
+SELECT id FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND timestamp <= TIMESTAMP '2026-01-15T10:02:00Z'
+  AND timestamp >= TIMESTAMP '2026-01-15T09:00:00Z'
+ORDER BY timestamp DESC LIMIT 2
+----
+ms_3
+ms_2
+
+# ---------------------------------------------------------------------------
+# §9. Point lookups. `timestamp = ` plus `id = ` is the log-item detail panel,
+# and it is the shape that 500'd on 2026-08-15 when unordered merge-on-read
+# dedup blew its per-query limit.
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT id, name FROM otel_logs_and_spans
+WHERE timestamp = TIMESTAMP '2026-01-15T10:00:00Z' AND project_id = 'mono_shapes' AND id = 'ms_1'
+LIMIT 1
+----
+ms_1
+GET /users
+
+# §9b. Trace fetch — all spans of one trace in a narrow window.
+
+query T
+SELECT id FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:55:00Z' AND TIMESTAMP '2026-01-15T10:05:00Z'
+  AND context___trace_id = 't1'
+ORDER BY id
+----
+ms_1
+ms_3
+
+# ---------------------------------------------------------------------------
+# §10. Variable pickers — SELECT DISTINCT, run on every dashboard load.
+# ---------------------------------------------------------------------------
+
+query T
+SELECT DISTINCT resource___service___name FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND resource___service___name IS NOT NULL
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+ORDER BY 1 LIMIT 100
+----
+api
+db-proxy
+web
+
+# §10b. The cross-project discovery query the service-graph rollup runs. No
+# project_id filter — this is the one shape that legitimately scans all
+# tenants, and `kind IN (…)` is deliberate (see §11).
+
+query B
+SELECT count(*) > 0 FROM (
+  SELECT DISTINCT project_id FROM otel_logs_and_spans
+  WHERE timestamp >= TIMESTAMP '2026-01-15T09:00:00Z'
+    AND timestamp < TIMESTAMP '2026-01-15T11:00:00Z'
+    AND kind IN ('server','client','producer','consumer')
+) t
+----
+true
+
+# ---------------------------------------------------------------------------
+# §11. Service graph — the self-join, the heaviest shape in the product.
+#
+# Every projected column is aliased (knd/stc/dur/nm) because DataFusion cannot
+# resolve `c.kind`/`p.kind` when both sides carry the unqualified base-table
+# name. Do not "tidy" an alias away: that is a plan failure, not a style nit.
+# ---------------------------------------------------------------------------
+
+query TTI
+WITH sp AS (
+  SELECT context___trace_id tid, context___span_id sid, parent_id par,
+         resource___service___name svc, kind knd, status_code stc, duration dur, name nm
+  FROM otel_logs_and_spans
+  WHERE project_id = 'mono_shapes'
+    AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+    AND kind IN ('server','client','producer','consumer')
+)
+SELECT p.svc AS parent_svc, c.svc AS child_svc, COUNT(*)::bigint
+FROM sp c JOIN sp p ON c.tid = p.tid AND c.par = p.sid
+GROUP BY p.svc, c.svc
+ORDER BY COUNT(*) DESC, parent_svc, child_svc
+----
+api
+api
+1
+api
+db-proxy
+1
+
+# §11b. `kind IN (…)` vs an OR-of-equalities. monoscope still spells this as
+# IN because of the tantivy id-prefilter bug fixed in e0bf291 — the OR form
+# must now agree with the IN form. If this ever disagrees, the prefilter has
+# regressed and every service-graph edge is undercounted again.
+
+query B
+SELECT (SELECT count(*) FROM otel_logs_and_spans
+        WHERE project_id = 'mono_shapes' AND kind IN ('server','client'))
+     = (SELECT count(*) FROM otel_logs_and_spans
+        WHERE project_id = 'mono_shapes' AND (kind = 'server' OR kind = 'client'))
+----
+true
+
+# ---------------------------------------------------------------------------
+# §12. Scalar stats — single value, no bucket. Note the OR-of-equalities on
+# `name`, which is a tantivy-indexed column: same prefilter path as §11b.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*)::bigint FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND (kind = 'server' OR name = 'apitoolkit-http-span' OR name = 'monoscope.http')
+  AND duration IS NOT NULL
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+----
+4
+
+# §12b. Usage metering. This is what the plans charge for, so an under-count
+# here is a revenue defect.
+
+query IR
+SELECT count(*)::bigint, COALESCE(SUM(message_size_bytes), 0)::float
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp > TIMESTAMP '2026-01-15T09:00:00Z' AND timestamp <= TIMESTAMP '2026-01-15T11:00:00Z'
+----
+6
+1920
+
+# ---------------------------------------------------------------------------
+# §13. Window functions — "% of total" columns and the total-rows companion.
+# ---------------------------------------------------------------------------
+
+query TR
+SELECT resource___service___name,
+       ROUND((COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ())::numeric, 1)::float AS pct
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY resource___service___name
+ORDER BY 2 DESC, 1
+----
+api
+50
+web
+33.3
+db-proxy
+16.7
+
+# ---------------------------------------------------------------------------
+# §14. The compatibility surface that exists for one named caller each.
+# Every one of these was a production incident; a plain regression test here
+# is cheaper than rediscovering them.
+# ---------------------------------------------------------------------------
+
+# `jsonb_build_array(sub.*)` — the row-extraction wrapper the log explorer
+# wraps every user query in. Needs WildcardFnArgExpander.
+
+query B
+SELECT jsonb_build_array(sub.*) IS NOT NULL FROM (
+  SELECT id, name FROM otel_logs_and_spans
+  WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+) sub
+----
+true
+
+# `row_to_json(t)` over a derived alias — rejected at PARSE time by DataFusion,
+# so it needs the AST-level RowToJsonRecord rewrite.
+
+query B
+SELECT row_to_json(t) IS NOT NULL FROM (
+  SELECT id FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+) t
+----
+true
+
+# `->>` on a Variant column. monoscope emits PG's JSONB accessors; the
+# VariantAwareExprPlanner turns them into variant_get.
+
+query T
+SELECT attributes->'http'->>'route' FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+/users
+
+# `jsonb_path_query_first(...) #>> '{}'` — the exception-field read. The empty
+# path arm is load-bearing: the function existing is not enough on its own.
+
+query T
+SELECT jsonb_path_query_first(attributes, '$.user.tier') #>> '{}'
+FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+pro
+
+# `COALESCE(<array column>, '{}')`. This 500'd every TF-routed span lookup
+# until PgCoalesceUdf + PgArrayLiteralRewriter landed. monoscope still carries
+# a "do not use this" caveat in otelSpanColsSql; this pins that it is safe.
+
+query B
+SELECT array_length(COALESCE(hashes, '{}'), 1) = 1
+FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+true
+
+# `&&` array overlap. DataFusion's NestedFunctionPlanner rewrites @> and <@
+# but not &&, which errored as "Unsupported binary operator: PGOverlap".
+
+query B
+SELECT hashes && ARRAY['h1','nope']::VARCHAR[]
+FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+true
+
+# `substring(x FROM 'regex')` — an operator reading widget access logs out of
+# `body` lost a whole query to `substr(Utf8View, Utf8)` type inference.
+
+query T
+SELECT substring(name FROM '^[A-Z]+')
+FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+GET
+
+# `hash_bucket` — replaced `substr(md5(…),1,2)`, which was 5.71% of all CPU.
+
+query B
+SELECT hash_bucket(id, 16) BETWEEN 0 AND 15
+FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+true
+
+# `date` must come back as timestamptz-compatible. DataFusion's
+# date::timestamptz used to drop the tz, yielding wire OID 1114 where the
+# client decoder wanted 1184 — that crashed every TF-routed span lookup.
+
+query B
+SELECT timestamp AS date IS NOT NULL
+FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+true
+
+# ---------------------------------------------------------------------------
+# §15. Deliberate refusals. These are pinned so that FIXING one is visible:
+# the test starts failing, and that is the signal to go delete the client-side
+# workaround it forced.
+# ---------------------------------------------------------------------------
+
+# time_bucket with a month/year width. A month is 28-31 days, so folding it to
+# a fixed width would silently mis-bucket every row. TimescaleDB refuses this
+# form for the same reason. monoscope's KQL rejects bin() month/year up front.
+statement error
+SELECT time_bucket('1 month', timestamp) FROM otel_logs_and_spans WHERE project_id = 'mono_shapes'
+
+# mode() — absent, so monoscope groups by (pattern, bucket, level, service) and
+# re-aggregates in Haskell under a LIMIT 20000 that can silently truncate a
+# high-cardinality project. Implementing this deletes that fan-out.
+statement error
+SELECT mode() WITHIN GROUP (ORDER BY level) FROM otel_logs_and_spans WHERE project_id = 'mono_shapes'
+
+# EXPLAIN (ANALYZE) with parentheses is a parse error; the un-parenthesised
+# form is what works. Pinned because it is a documented benchmarking trap.
+statement error
+EXPLAIN (ANALYZE) SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'mono_shapes'

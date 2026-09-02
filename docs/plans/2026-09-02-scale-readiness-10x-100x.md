@@ -229,3 +229,71 @@ VLDB 2021](https://vldb.org/pvldb/vol14/p241-luo.pdf)).
    become immortal.
 
 None of this is needed below 50x, and none of it was built tonight.
+
+## The real prod journal: the tail IS the workload
+
+The synthetic runs above are rollup-shaped. The real journal (78,741 tasks,
+63.8 MB, `docker cp`'d read-only from the running container) says something the
+synthetic queue could not, and it is the most important number of the night.
+
+**Queue composition** — 17 projects:
+
+| operation | tasks | share |
+| --- | --- | --- |
+| `base_rollup` | 44,088 | 56% |
+| `dedup` | 22,329 | 28% |
+| `derived_rollup` | 9,493 | 12% |
+| `repair` | 2,831 | 4% |
+
+States: 57,197 complete, **19,159 superseded (24%)**, 1,248 pending, 1,121 retry.
+
+Note the reconciliation: dedup is only 28% of tasks but ~96% of worker *time*,
+so a dedup unit is roughly an order of magnitude costlier than a rollup unit.
+
+### Unit size is heavy-tailed to an extreme degree
+
+`estimated_decoded_bytes`, straight from the journal:
+
+| operation | median | p90 | p99 | max |
+| --- | --- | --- | --- | --- |
+| `base_rollup` | 0.35G | 1.33G | 8.19G | 45.9G |
+| `dedup` | 0.30G | 1.36G | **22.7G** | **1150G** |
+| `derived_rollup` | 0.25G | 0.50G | 0.50G | 15.1G |
+| `repair` | 0.10G | 3.33G | 15.7G | **1044G** |
+
+A dedup unit's median is 0.30 GiB and its maximum is **1.1 TiB — a ~3,800x
+spread**, with p99 at 76x the median.
+
+### The number that matters
+
+Against the real budget — each concurrent heavy sort gets a **510 MB** slice of
+the 4.98 GiB heavy share, and `PER_SORT_BUDGET_BYTES` is **2 GiB**:
+
+| operation | units over the 510 MB slice | units over the 2 GiB budget | share of that op's BYTES in those units |
+| --- | --- | --- | --- |
+| `base_rollup` | 17.0% | 6.9% | 49.7% |
+| `dedup` | 27.6% | 6.0% | **76.9%** |
+| `derived_rollup` | 0.9% | 0.6% | 13.8% |
+| `repair` | 21.9% | 15.5% | **95.3%** |
+
+> **6.4% of all units exceed the 2 GiB per-sort budget, and those units carry
+> 67.1% of all queued bytes.**
+
+Two thirds of the maintenance workload sits in units that individually do not
+fit the budget they run against. That reframes everything above:
+
+- It explains why adding workers fails at 100x — the tail units still do not
+  fit, so the ~51% timeout rate is invariant to concurrency.
+- **It means unit sizing is not a 100x concern. It is a TODAY concern.** The
+  ClickHouse-style cap (size the unit before selecting it; shrink the cap as the
+  pool fills) is addressing the majority of our current bytes, not a
+  hypothetical future.
+- It also explains the 24% superseded rate: work planned against a tail unit has
+  a long window in which to be invalidated.
+
+The cheapest expression of this is the one prior art already gives us: refuse to
+*select* a unit whose estimated bytes exceed what a sort slice can absorb, and
+split it at planning time instead of discovering it at the deadline. The
+estimate is already in the journal — `estimated_decoded_bytes` is what every row
+of the tables above was computed from, so the input for the decision exists and
+is simply not used as a selection bound.

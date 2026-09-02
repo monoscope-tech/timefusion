@@ -475,6 +475,7 @@ mod sqllogictest_tests {
         integration,
         json_functions,
         merge_on_read,
+        monoscope_query_shapes,
         partition_pruning_test,
         pg_catalog,
         percentile_functions,
