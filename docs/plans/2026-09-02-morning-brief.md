@@ -112,9 +112,13 @@ ClickHouse **caps merge size at selection and scales the cap down as the pool
 fills**. Both adapt the work to the budget, so neither has a state where a unit
 is permanently unrunnable. We refuse and requeue unchanged — which is the 310
 stuck units. Raising the budget fixes today's numbers but leaves the structural
-property intact, and the whale's largest file is already 1,150 GiB. **Two-tier:
-raise the budget now; give maintenance a way to shrink a unit to its budget
-before onboarding a 100x tenant.**
+property intact, and the whale's largest file is already 1,150 GiB. **But shrinking is not available here either**, which simplifies rather than
+complicates: `TARGET_ROW_GROUP_BYTES` is 128 MiB, so **one row group decodes to
+1,536 MiB — already 20% over the 1,280 MiB budget**, and a target-sized file
+holds only 2 of them. The indivisible read unit is over budget, so there is no
+smaller unit to fall back to. **The budget must be raised; shrinking only has a
+move to make above 1,536 MiB.** Minimums: 1,536 MiB for one row group, 3,072 MiB
+for one whole file.
 
 **Confirmed against LIVE state**, not the (hours-stale) checkpoint: replaying
 both journal files gives **310 repair tasks in Retry right now**, against 311
