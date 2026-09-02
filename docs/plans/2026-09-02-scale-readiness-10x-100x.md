@@ -1144,3 +1144,52 @@ practice.
 decisions to reason about, because it needs no new measurement — the numbers are
 constants in the source. The judgement required is only how much memory repair
 may hold, given that admission (Decision 2) draws on the same pool.
+
+### Confirmed from three directions, and the stale-estimate nuance
+
+The journal settles both halves. All **312** queued repair tasks share ONE
+creation stamp (2026-08-16T11:09:57) and their estimates cluster tightly:
+
+```
+312 tasks   median 256 MiB   max 262 MiB
+```
+
+**256 MiB is exactly `COORDINATOR_HOT_TARGET_BYTES`** — the compaction target, in
+*compressed* bytes. Two things follow, and they are independent:
+
+**1. Each repair unit is exactly one target-sized file.** The tight clustering
+proves it. So its real decoded cost is `256 x 12 = 3,072 MiB` against a
+**1,280 MiB** budget — the 2.4x over-budget arithmetic above, now confirmed by
+production data rather than derived from constants alone.
+
+**2. The stored estimates are missing the x12** — they are compressed bytes in a
+field named `estimated_decoded_bytes`. But this is **stale data, not a live
+planner bug**: today's planner computes it correctly —
+
+```rust
+let estimate = suspects.iter().fold(0u64, |b, f| b.saturating_add(estimated_decoded_bytes(f.size)));
+```
+
+so this cohort was stamped before that path (or by another one). It matters
+anyway, because **admission decides on the stored number**: 256 MiB passes the
+512 MiB ceiling comfortably, while the work it authorises costs 3,072 MiB. That
+is precisely how a unit gets admitted and then bounces forever.
+
+There is precedent for exactly this class — `clear_stale_estimates` exists
+because earlier estimates "were all measured with a broken ruler" and a
+correction that only applies to NEW measurements cannot repair a durable queue
+full of old ones. **This cohort appears to have escaped that migration**, which
+is worth checking on its own: a one-off re-estimate would at least make
+admission's decision honest.
+
+**Final state of Decision 1 — verified three ways:**
+
+| direction | evidence |
+| --- | --- |
+| source constants | 256 MiB x 12 = 3,072 MiB vs a 1,280 MiB budget |
+| prod logs | `want_mib=1280 budget_mib=1280`, 243 bounces in 3h |
+| journal data | 312 units, median 256 MiB, one creation stamp |
+
+The budget must exceed one target-sized file's decoded size, because a repair
+unit is one file and cannot be split. Everything else — `take(1)`, the estimate
+gap, the admission mismatch — sits downstream of that single inequality.
