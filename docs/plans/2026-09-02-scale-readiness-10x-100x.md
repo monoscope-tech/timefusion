@@ -1097,3 +1097,50 @@ order), so "split the unit" may not be expressible for repair the way it is for
 a time-sliced dedup unit. If so, option 1 is the real fix and option 2 is not
 available — that distinction needs a read of the repair rewrite before anyone
 commits to a direction.
+
+### RESOLVED: repair is serialized BY CONSTRUCTION — three constants that cannot all be true
+
+The open question above ("can a repair unit be split?") has a definite answer:
+**no — a repair unit is exactly one file** (`coordinator_compaction_files`
+returns `.take(1)` for Repair), so there is nothing to split. Which makes the
+rest pure arithmetic:
+
+| constant | value | location |
+| --- | --- | --- |
+| `COORDINATOR_HOT_TARGET_BYTES` / `COORDINATOR_SEALED_TARGET_BYTES` | **256 MiB** compressed | `database/mod.rs:1378-1379` |
+| `DECODED_BYTES_PER_COMPRESSED` | **x12** | `database/maintain.rs:150` |
+| repair budget = `COORDINATOR_PER_SORT_BUDGET_BYTES` | **1,280 MiB** decoded | `config.rs:222` |
+
+```
+one target-sized file = 256 MiB x 12 = 3,072 MiB decoded
+repair budget                        = 1,280 MiB
+                                     -> 2.4x OVER BUDGET
+```
+
+**A file that compaction produced exactly as intended is 2.4x the entire repair
+byte budget.** A file fits only if it is under **107 MiB** compressed — i.e. only
+files that compaction would consider *too small*. So:
+
+- every repair unit clamps to the whole semaphore,
+- repair runs strictly one rewrite at a time,
+- the "bins below the budget share it" case the byte-pricing change was written
+  for **cannot occur for any correctly-sized file**,
+- and no re-measurement or splitting can help, because the unit is one file.
+
+This is not a tuning miss, it is three constants in three files that cannot all
+be satisfied at once. The fix is derivable rather than guessed: to let `N` repair
+rewrites share, the budget must be at least
+`N x target_file_bytes x DECODED_BYTES_PER_COMPRESSED` — **3,072 MiB for one**,
+6,144 MiB for two.
+
+**Which also explains the code comment** that priced this as acceptable —
+*"prod's worst bin is ~28 GB decoded, far over budget, so it still takes
+everything and runs alone. Bins below the budget now share it"* — the author was
+reasoning about a pathological 28 GB bin, and did not notice that the ORDINARY
+bin is also over budget, by 2.4x. The change was correct in intent and inert in
+practice.
+
+**Recommended framing for the morning:** this is the cheapest of the three
+decisions to reason about, because it needs no new measurement — the numbers are
+constants in the source. The judgement required is only how much memory repair
+may hold, given that admission (Decision 2) draws on the same pool.
