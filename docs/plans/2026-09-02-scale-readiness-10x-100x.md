@@ -976,3 +976,71 @@ verifying the whole candidate set per attempt instead of `take(1)` converts
 ~3,400 claims/day of one-file grinding into a small number of passes. Had claims
 been scarce (my original misreading), `take(1)` would have been secondary and
 the real fix would have been upstream in claim scheduling.
+
+## CORRECTION #3: it is not `take(1)` — repair bins price at the ENTIRE byte budget
+
+I was about to write a test for the `take(1)` hypothesis. Checking which `Retry`
+branch actually fires in prod killed it first. Three hours of logs:
+
+| event | count |
+| --- | --- |
+| **`repair_rewrite_permit_busy`** | **243** (≈81/hour) |
+| `light_optimize_tail_selected` | **0** |
+| `light_optimize_bin_vanished` | 0 |
+| `resumed_bin_committed_early` | 0 |
+
+**The already-sorted path is never reached.** Repair units do not get far enough
+to verify a footer, so `take(1)` — however wasteful in principle — is not the
+operative mechanism. Had I written that fix, it would have changed nothing.
+
+**What actually happens.** Repair rewrites are gated by a byte-priced semaphore:
+
+```rust
+let budget_mib = self.config.derived.repair_rewrite_budget_mib();   // 1,280 MiB
+let want_mib = decoded(targets).clamp(1, budget_mib);
+match self.repair_rewrite_sem.try_acquire_many_owned(want_mib) { ... }
+```
+
+`repair_rewrite_budget_bytes` is exactly `COORDINATOR_PER_SORT_BUDGET_BYTES`
+= `5 GiB / 4` = **1.25 GiB = 1,280 MiB**. And prod logs the request:
+
+```
+want_mib=1280  budget_mib=1280   event="repair_rewrite_permit_busy"
+```
+
+**Every observed repair unit asks for the entire budget.** Its real decoded size
+is at or above 1.25 GiB, so the clamp pins it to the whole semaphore — which
+means **repair is serialized: one rewrite at a time, each 40+ minutes, and every
+other repair unit bounces.** 243 bounces in three hours.
+
+**The design intent was the opposite**, and the comment says so:
+
+> *"Bins below the budget now share it, which is the only thing that changes — a
+> count of 1 priced that worst case onto all 358 pending units and held repair to
+> ~2/hour."*
+
+The move from count-pricing to byte-pricing was meant to let small bins share the
+budget. **In production no bin is below the budget, so the sharing never
+happens** and repair sits in the same serialized state the change was written to
+escape.
+
+**One more discrepancy worth noting:** these tasks' stored
+`estimated_decoded_bytes` is a median of **0.25 GiB**, while runtime pricing of
+the same work asks for **≥1.25 GiB** — a ~5x disagreement between the journal's
+estimate and what the rewrite actually prices. Estimates were bulk-cleared once
+before because they "were all measured with a broken ruler"
+(`clear_stale_estimates`); this looks like the same class of problem and it
+matters, because admission and coarsening both make decisions on the stored
+number.
+
+**Revised Decision 1.** Not `take(1)`. Either:
+
+- raise `repair_rewrite_budget_bytes` above a real bin's decoded size so the
+  intended sharing can occur, or
+- size repair bins below the budget — the same unit-sizing theme as everything
+  else tonight.
+
+Both are the same shape as Decision 2, which is now the strongest signal of the
+night: **every stuck lane is a unit that does not fit the budget it must pass
+through**, and the budgets are calibrated well below real unit sizes in three
+independent places (admission 512 MiB, per-sort slice 510 MB, repair 1,280 MiB).
