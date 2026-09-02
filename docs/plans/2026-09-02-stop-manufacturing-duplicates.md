@@ -237,8 +237,16 @@ case `settle_flushed_group` documents as benign.
 
 ## Status
 
-Implemented, tested, **not deployed.** `TIMEFUSION_LANDED_SKIP_ENABLED=false`
-by default. The rollout above stands: staging first (restarts are free there and
-the skip only fires on an unclean restart, which cannot be induced on the
-read-only prod host), then prod confirms passively via `wal.landed_skips`
-against `wal.replay_rows`.
+Implemented, tested, pushed; **the flag is off**, so prod behaviour is
+unchanged (`TIMEFUSION_LANDED_SKIP_ENABLED=false`).
+
+**The staging step in the rollout above is not available:** `docker service ls`
+on the CapRover host shows no `timefusion-staging` service, so the ladder's
+step 3 does not exist yet (as `approaches-and-decisions.md` anticipated —
+building it is Phase 0 of the architecture plan).
+
+That leaves the e2e seam test as the validation of record, which is stronger
+than it sounds: real Delta, real object storage, and the duplicate produced the
+way prod produces it (a commit that lands while its cursor advance is lost).
+Turning the flag on in prod is a judgement call for a human, and the failure
+direction if it is wrong is a duplicate, not a loss.
