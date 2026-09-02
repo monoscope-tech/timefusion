@@ -1422,7 +1422,8 @@ impl Database {
             if self.config.buffer.landed_skip_enabled()
                 && let Some(layer) = layer
             {
-                let digests: Vec<crate::write::LandedDigest> = commits.iter().flat_map(|ci| parse_landed_digests_from_json(&ci.info, &project_id, &table_name)).collect();
+                let digests: Vec<crate::write::LandedDigest> =
+                    commits.iter().flat_map(|ci| parse_landed_digests_from_json(&ci.info, &project_id, &table_name)).collect();
                 if !digests.is_empty() {
                     info!("Loaded {} landed-batch identities for {}.{}", digests.len(), project_id, table_name);
                     layer.note_landed_digests(&project_id, &table_name, digests);

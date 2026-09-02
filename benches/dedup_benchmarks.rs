@@ -227,9 +227,7 @@ fn bench_landed_digest(c: &mut Criterion) {
         let batches = make_batches(rows, rows, false);
         let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
         group.throughput(Throughput::Bytes(bytes as u64));
-        group.bench_function(BenchmarkId::new("digest", rows), |b| {
-            b.iter(|| std::hint::black_box(timefusion::write::landed_digest(&batches)))
-        });
+        group.bench_function(BenchmarkId::new("digest", rows), |b| b.iter(|| std::hint::black_box(timefusion::write::landed_digest(&batches))));
         // The FLOOR: the Arrow round-trip alone, no hash. Tells us how much of
         // the digest any hash choice can possibly remove.
         group.bench_function(BenchmarkId::new("canonicalize_only", rows), |b| {
