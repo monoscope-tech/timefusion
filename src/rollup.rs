@@ -2937,6 +2937,24 @@ mod tests {
         crate::schema::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
     }
 
+    /// The two SQL arms `First` adds. Neither is reachable from the matcher
+    /// tests -- those stop at `MissingMeasure` because no spec declares a
+    /// `first` measure yet -- so without this they are generated code nothing
+    /// ever generates.
+    #[test]
+    fn first_picks_the_value_by_its_companion_on_both_legs() {
+        let columns = ["landing_url".to_owned(), "landing_at".to_owned()];
+        assert_eq!(
+            Merge::First.partial_states(&columns),
+            vec!["first_value(landing_url ORDER BY landing_at NULLS LAST)".to_owned(), "MIN(landing_at)".to_owned()],
+            "the rollup leg picks the value BY the companion and minimises the companion itself"
+        );
+        let states = ["__s0_0".to_owned(), "__s0_1".to_owned()];
+        assert_eq!(Merge::First.sql(&states), "first_value(__s0_0 ORDER BY __s0_1 NULLS LAST)");
+        // The union's outer merge consumes exactly what the legs project.
+        assert_eq!(Merge::First.arity(), columns.len());
+    }
+
     /// A `first` measure and its companion, as the sessions rollup would
     /// declare them: the first non-empty landing URL of a session.
     fn first_spec() -> RollupSpec {

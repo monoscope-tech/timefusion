@@ -67,7 +67,10 @@ pub struct RollupSpec {
 pub struct RollupMeasure {
     /// Column name in the rollup table.
     pub name: String,
-    /// `count` | `sum` | `min` | `max`.
+    /// `count` | `sum` | `min` | `max` | `tdigest` | `hll` | `first`.
+    ///
+    /// `first` additionally requires a companion `{agg: min, column: timestamp}`
+    /// measure carrying the same filter — see `validate`.
     pub agg: String,
     /// Source column to aggregate. Omitted for `count`.
     #[serde(default)]

@@ -442,6 +442,10 @@ reports `XX000`, which is the gap made visible.
 
 It ships **inert**: no production spec declares a `first` measure, because the
 sessions rollup needs `session_key` promoted at ingest first — a coordinated
-TimeFusion + monoscope schema migration, and the user's call. The measure, its
-companion convention, the build, the tier-to-tier derive and the matcher gate
-are all in place and tested behind that one decision.
+TimeFusion + monoscope schema migration, and the user's call.
+
+Be precise about what "tested" covers. The validation invariant, the build, the
+tier-to-tier derive, the matcher's order-by gate and both SQL-generation arms
+are pinned — but at **SQL-string level**. The hybrid rollup/raw union actually
+*executing* a `first` measure cannot run until a spec declares one, so that
+path arrives with the sessions rollup and should be measured then, not assumed.
