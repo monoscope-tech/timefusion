@@ -105,29 +105,28 @@ is admitted ~5x underpriced, refused on the real price, and requeued *unchanged*
 **No value of the repair budget fixes this**, because the unit is priced one way
 to get in and another way to run.
 
-**DECISIVE (Delta log, 571 commits / 6h).** A repair rewrite is row-preserving,
-so it commits as 1-add/1-remove with output ≈ input size; dedup shrinks. Of 34
-such commits, **31 are repair-shaped — and every one is tiny**:
+**CORRECTED — repair is SERIALIZED, not dead.** (An earlier version of this
+brief said "zero repair rewrites". That was my filter's artifact, not a fact:
+I required commits to have exactly 1 add AND 1 remove, but a large repair splits
+its output to the 256 MB target, so it commits 1 remove → 2 adds and was
+excluded.)
+
+Delta log, 571 commits / 6h — **7 large single-file rewrites**, inputs up to
+**958 MB**, two of them row-preserving (ratio 1.07 and 1.09, the repair
+signature):
 
 ```
-repair-shaped inputs:  min 0.031 MB   median 0.032 MB   max 0.654 MB
-budget cutoff:  1,280 MiB / 12  =  107 MB
-repair queue units:  median 256 MB, max 262 MB
+observed large rewrites:  1.17/hour
+serialization ceiling:    60 min / 40 min per rewrite = 1.50/hour   (0.78 of it)
+310 queued units:         ~11 days to drain, uninterrupted
 ```
 
-**Repair succeeds on files 3 orders of magnitude below the cutoff and never once
-above it.** That settles the open questions: it is not "throttled vs dead" but
-*alive for small files, dead for large*, split exactly where the budget predicts;
-the deploy-cadence confound cannot apply (31 completed inside 40-min lifetimes);
-and no permit leak is needed (the semaphore was acquired 31 times).
-**Success criterion after a fix: repair-shaped commits with inputs >100 MB start
-appearing. They currently never do.**
-
-**Supporting argument, same source:** in one 6-hour window the same
-process committed a **649 MB → 415 MB** rewrite (and two more >100 MB), while
-repair cannot rewrite a **256 MB** file. Large rewrites are demonstrably
-possible; repair's budget is what is anomalous. This needs no assumption about
-deploy cadence, permit leaks, or service-log coverage.
+**So the defect is throughput, not death.** The clamp works as documented — an
+over-budget bin takes the whole semaphore and runs alone — and the 177
+`repair_rewrite_permit_busy` events are other units bouncing off a semaphore one
+big rewrite is holding. The fix multiplies throughput; it does not resurrect a
+dead lane, and the urgency is correspondingly lower than the raw evidence volume
+suggests.
 
 **⚠ CHECK THIS FIRST — it may make the budget change a no-op.** The semaphore's
 capacity IS the budget (1,280 permits) and every real unit requests **all of
@@ -232,7 +231,7 @@ stronger: the lane is fully stalled.)*
 | source constants | 256 MiB x 12 = 3,072 MiB vs a 1,280 MiB budget |
 | prod logs | `want_mib=1280 budget_mib=1280`, 243 bounces in 3h |
 | journal data | 312 units, median **256 MiB**, one creation stamp |
-| prod behaviour | **0 repair rewrites staged in 12h** vs 177 semaphore bounces |
+| prod behaviour | **1.17 large rewrites/hour** (Delta log) vs a 1.50/hour serialization ceiling; 177 semaphore bounces |
 
 **Secondary (worth its own fix):** those stored estimates are **compressed**
 bytes in a field named `estimated_decoded_bytes` — missing the x12. It is stale
