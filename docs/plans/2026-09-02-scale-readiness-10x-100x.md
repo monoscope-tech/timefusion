@@ -1969,3 +1969,41 @@ document:
 
 > **The stalled repair lane costs a stable ~4.4% of dedup scans, running
 > unbounded instead of bounded, permanently, and it can only grow.**
+
+## Implementation note: make the repair budget CONFIGURABLE, not just separate
+
+Decision 1 needs repair to stop sharing `COORDINATOR_PER_SORT_BUDGET_BYTES` (which
+also divides `light_optimize_k`). There is a better version of that change than
+simply adding a second constant.
+
+**A local repair harness already exists** — `tests/e2e/repair_resume.rs`, with a
+`footerless_partition()` helper that builds exactly the scenario repair targets.
+So the fix is locally validatable in principle. In practice it is not, because
+reproducing the semaphore bounce needs a file whose *decoded* size exceeds the
+1,280 MiB budget — about **107 MB compressed**, an impractical test fixture.
+
+**Making `repair_rewrite_budget_bytes` a CONFIG value rather than a `const`
+solves both problems at once:**
+
+1. It decouples repair from `COORDINATOR_PER_SORT_BUDGET_BYTES`, which is the
+   required fix and avoids the `light_optimize_k` outage documented for
+   2026-09-01.
+2. It makes the failure **testable at test scale** — an e2e test can set the
+   budget to a few MB, feed it an ordinary small file, and assert the unit
+   bounces with `repair_rewrite_permit_busy` rather than completing. That test
+   would have caught this defect when the byte-pricing change shipped.
+3. It gives prod a **kill switch** in the same shape as
+   `TIMEFUSION_REPAIR_RESUME_ENABLED`, so the value can be tuned without a
+   deploy — which matters because the right value depends on
+   `COORDINATOR_HOT_TARGET_BYTES` and could drift if the compaction target moves.
+
+The repo's own convention supports this: every other memory-shaping quantity that
+has burned prod is env-overridable (`TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY`,
+`TIMEFUSION_LIGHT_OPTIMIZE_CONCURRENCY`, `TIMEFUSION_REPAIR_RESUME_ENABLED`). The
+repair rewrite budget is such a quantity and is currently a bare `const` reached
+through a function that looks configurable but is not.
+
+**Suggested shape:** `timefusion_repair_rewrite_budget_mib`, defaulting to
+`COORDINATOR_HOT_TARGET_BYTES x DECODED_BYTES_PER_COMPRESSED / MIB` (3,072) so
+the default is *derived from the constants it must satisfy* rather than typed in
+— which keeps it correct if the compaction target changes later.
