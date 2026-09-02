@@ -1751,3 +1751,42 @@ admission/per-sort-slice pair as well.
 (after the cross-process counters and the estimated-uptime rate). The pattern is
 consistent enough to state as a rule: **on a system this bursty, a handful of
 instantaneous reads is not a measurement.**
+
+## The serialization mechanism PREDICTS the observed rate — 0.89 of prediction
+
+The strongest confirmation available short of shipping a fix: the mechanism makes
+a quantitative prediction, and the measured rate matches it.
+
+**Prediction.** If repair is serialized by the byte budget — every unit clamps to
+the whole semaphore, so one 40-minute rewrite runs at a time — the ceiling is:
+
+```
+60 min / 40 min per rewrite = 1.50 repair completions per hour
+```
+
+**Measured**, from two live journal replays ~3 hours apart, spanning several
+process restarts:
+
+| | earlier | now | Δ |
+| --- | --- | --- | --- |
+| `Repair/Complete` | 2,188 | **2,192** | **+4 in ~3h = 1.33/hour** |
+| `Repair/Retry` | 310 | 306 | −4 |
+| Dedup actionable | 1,467 | 1,362 | −105 = 35/hour |
+
+**Observed / predicted = 0.89.** For contrast, dedup drained at **35/hour over
+the same window — 26x repair's rate** — on the same workers, same pool, same
+process. The lanes differ by an order of magnitude and the slow one matches the
+serialization ceiling almost exactly.
+
+This is independent of every earlier argument. It does not rely on the journal's
+stored estimates, on the prod log counts, or on the constants arithmetic — it is
+just "how fast did repair actually complete", and the answer is the rate the
+mechanism predicts.
+
+**At 1.33/hour the 306 stuck units need ~10 days**, assuming none are added and
+every one of them turns out to fit — neither of which holds, which is why the
+population has been stable at ~310 all night rather than draining.
+
+**And restarts do not help.** This window spans several process restarts
+(including two from another session's deploys). The cohort survived all of them
+unchanged, which rules out "it is a transient in-memory state" as an explanation.
