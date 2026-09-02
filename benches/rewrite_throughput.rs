@@ -34,6 +34,26 @@ use futures::StreamExt;
 /// `schemas/otel_logs_and_spans.yaml`'s `sorting_columns`, as the rewrite spells them.
 const ORDER_BY: &str = " ORDER BY \"timestamp\" DESC NULLS FIRST, \"resource___service___name\" ASC NULLS LAST, \"id\" ASC NULLS LAST, \"level\" ASC NULLS LAST, \"status_code\" ASC NULLS LAST";
 
+/// The three rewrite shapes this bench prices.
+#[derive(Clone, Copy)]
+enum Shape {
+    Scan,
+    Sort,
+    Window,
+}
+
+impl Shape {
+    fn sql(self, filter: &str) -> String {
+        match self {
+            Self::Scan => format!("SELECT * FROM bin{filter}"),
+            Self::Sort => format!("SELECT * FROM bin{filter}{ORDER_BY}"),
+            Self::Window => format!(
+                "SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY \"timestamp\", \"resource___service___name\", \"id\" ORDER BY \"updated_at\" DESC NULLS LAST) AS __tf_rn FROM bin{filter}) WHERE __tf_rn = 1{ORDER_BY}"
+            ),
+        }
+    }
+}
+
 fn runtime(pool_bytes: usize, spill: &std::path::Path) -> Arc<RuntimeEnv> {
     let top = std::num::NonZeroUsize::new(5).expect("5 is non-zero");
     let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_bytes), top));
@@ -61,7 +81,7 @@ fn session(batch: &str, partitions: usize) -> SessionConfig {
 /// One measured rewrite. `slices > 1` reproduces `repair_bin_sliced`: N
 /// event-time windows, each a separate full pass over the same file.
 async fn pass(
-    path: &str, batch: &str, partitions: usize, slices: usize, sorted: bool, pool_bytes: usize, spill: &std::path::Path,
+    path: &str, batch: &str, partitions: usize, slices: usize, shape: Shape, pool_bytes: usize, spill: &std::path::Path,
 ) -> Result<(f64, u64), String> {
     use datafusion::execution::SessionStateBuilder;
     let state = SessionStateBuilder::new().with_config(session(batch, partitions)).with_runtime_env(runtime(pool_bytes, spill)).with_default_features().build();
@@ -87,7 +107,7 @@ async fn pass(
                 " WHERE timestamp >= arrow_cast({lo}, 'Timestamp(Microsecond, Some(\"UTC\"))') AND timestamp < arrow_cast({hi}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
             )
         };
-        let sql = format!("SELECT * FROM bin{filter}{}", if sorted { ORDER_BY } else { "" });
+        let sql = shape.sql(&filter);
         let mut stream = ctx.sql(&sql).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;
         while let Some(batch) = stream.next().await {
             rows += batch.map_err(|e| e.to_string())?.num_rows() as u64;
@@ -110,9 +130,9 @@ async fn main() {
 
     // Each row is flushed as it completes: a variant that hangs or OOMs must not
     // take the rows already measured with it.
-    let run = async |label: String, batch: &str, partitions: usize, slices: usize, sorted: bool| {
+    let run = async |label: String, batch: &str, partitions: usize, slices: usize, shape: Shape| {
         use std::io::Write;
-        let line = match pass(&path, batch, partitions, slices, sorted, pool_mb * 1024 * 1024, spill.path()).await {
+        let line = match pass(&path, batch, partitions, slices, shape, pool_mb * 1024 * 1024, spill.path()).await {
             Ok((secs, rows)) => format!("{label:<26} {secs:>8.1} {rows:>11} {:>10.2}", bytes as f64 / 1e6 / secs),
             Err(error) => format!("{label:<26} {:>8} {error}", "FAILED"),
         };
@@ -130,13 +150,24 @@ async fn main() {
         return;
     }
 
-    run("scan only".to_owned(), "8192", 1, 1, false).await;
+    run("scan only".to_owned(), "8192", 1, 1, Shape::Scan).await;
     for batch in ["256", "2048", "8192"] {
         for partitions in [1usize, 8] {
-            run(format!("sort b{batch} p{partitions}"), batch, partitions, 1, true).await;
+            run(format!("sort b{batch} p{partitions}"), batch, partitions, 1, Shape::Sort).await;
         }
     }
-    run("PROD: b256 p1 x13 slices".to_owned(), "256", 1, 13, true).await;
+    run("PROD: b256 p1 x13 slices".to_owned(), "256", 1, 13, Shape::Sort).await;
+    // The dedup rewrite's own two shapes. `Window` is what shipped until
+    // 2026-09-02: `ROW_NUMBER() OVER (PARTITION BY dedup_keys)` plus the output
+    // `ORDER BY`, which plans TWO full external sorts because the window
+    // normalizes its partition ordering to ASC. `Sort` is the replacement —
+    // one sort in schema order, with the keep-greatest done as a one-pass
+    // collapse of adjacent runs (`RunCollapse`), which the widened dedup key
+    // makes valid. The gap between these two rows is the change.
+    for (batch, partitions) in [("256", 1usize), ("2048", 1), ("2048", 8)] {
+        run(format!("dedup WINDOW b{batch} p{partitions}"), batch, partitions, 1, Shape::Window).await;
+        run(format!("dedup COLLAPSE b{batch} p{partitions}"), batch, partitions, 1, Shape::Sort).await;
+    }
 }
 
 /// Does the rewrite fleet SCALE with concurrency, and what pool does 10x demand?

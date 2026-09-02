@@ -3,6 +3,84 @@
 Newest first. One entry per decision that changed direction, with what refuted it.
 Detail lives in the dated plan files; this is the index.
 
+## 2026-09-02 — widen the dedup key to the sort prefix (the inversion that worked)
+
+**The user's idea, and it is the right one:** the failed experiment reordered
+`sorting_columns` to match `dedup_keys` and broke rollup routing. Do it the other
+way — widen `dedup_keys` to `(timestamp, resource___service___name, id)`, which is
+already the leading run of `sorting_columns`. Reads are untouched, so the routing
+failure mode does not apply. This is the ClickHouse ReplacingMergeTree arrangement
+(the `ORDER BY` carries the FULL dedup key so merges stream).
+
+### Correctness, measured before writing any code
+
+Widening only loses collapsing power if two rows share `(timestamp, id)` but
+differ on service. On 2.75M rows of three real prod bins — including one holding
+**104,949 duplicate rows across 19 services** — the dup-group count is IDENTICAL
+under both keys: `LOST=0`. It holds by construction too: a client retry carries
+the same payload, and a merge-on-read version only ever mutates `hashes` (the one
+`mutable: true` column). Where the keys genuinely differ, today's narrow key is
+COLLAPSING TWO DISTINCT SPANS — widening fixes that, it does not risk it.
+
+### The trap: the YAML change on its own is worth NOTHING
+
+Measured, not assumed. The rewrite plans **2 `SortExec` either way**:
+
+```
+Sort#2 (ts DESC, svc, id, level, status)   <- the output ORDER BY
+  Filter (__tf_rn = 1)
+    BoundedWindowAggExec  mode=Sorted
+      Sort#1 (ts ASC, svc, id, updated_at DESC)   <- the window's own requirement
+```
+
+Two planner facts, both dead ends — do not re-derive them:
+
+1. **A window normalizes its PARTITION BY requirement to ASC** and takes no
+   direction hint from the outer sort or from its own `ORDER BY`. So the window's
+   sort can never double as the DESC output sort.
+2. **A subquery `ORDER BY` without `LIMIT` is semantically void and DataFusion
+   deletes it** — which is why an inner `ORDER BY … DESC` vanished and why
+   `prefer_existing_sort` did nothing (there was no existing sort left to prefer).
+   An ordering is only real to the planner when a SOURCE declares it.
+
+Every SQL formulation was tried. One sort is reachable only in ASC, which would
+make the footer's DESC claim a lie — the 2026-08-07 under-count bug class.
+
+### What actually ships: one sort, and the collapse done by hand
+
+`RunCollapse` (`src/database/compact.rs`): sort ONCE in schema order, then keep
+the greatest tiebreak per RUN of equal keys in a single order-preserving pass,
+holding back only the trailing run (the one that can continue into the next
+batch). No window, no second sort. Valid exactly when `dedup_keys_lead_the_sort`
+— which is what the user's YAML change created. Tombstones retained; ties keep
+the first row, matching `ROW_NUMBER() … DESC NULLS LAST` + `__tf_rn = 1`.
+
+Gated: any schema whose keys do not lead its sort keeps the window path.
+
+### Two bugs the widening flushed out
+
+- **The logical-count index was keyed on `(timestamp, id)` while dedup was not** —
+  it would have UNDER-counted. Its key tail is now the full dedup key
+  (`KeyTail`), and `FORMAT_VERSION` is bumped to `"2"` so a cached `"1"` file
+  cannot be appended to with wider keys.
+- **`create_memory_exec` declared its ordering with PROJECTED column indices**,
+  but `try_with_sort_information` validates them against the source's ORIGINAL
+  schema. It passed only while the claim was one column whose index happened to
+  coincide. A second column made it fail — silently dropping the claim and
+  regrowing a **blocking `SortExec` over the mem leg of every top-K dashboard
+  query**. Fixed; the leg now declares `[ts DESC, service ASC, id ASC]` where it
+  previously declared `[ts DESC]`, so this is a read-path improvement that was
+  sitting there unnoticed.
+
+### Still open
+
+- `narrow_provider` declaring footer ordering (gated on EVERY selected file
+  advertising `sorting_columns` — one unordered branch erases the leg's ordering)
+  would turn the remaining sort into a `SortPreservingMerge`. That is the
+  zero-sort endgame.
+- Preventing duplicates at ingest, in the MemBuffer's 10-minute bucket. Still the
+  only item that scales to 100x on its own.
+
 ## 2026-09-01/02 — maintenance capacity night
 
 **Goal:** make dedup/sorting/hotpacking/rollups keep up, toward 10x and a

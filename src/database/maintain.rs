@@ -5164,7 +5164,7 @@ impl Database {
         Ok(context
             .table("__logical_count_overlay")
             .await?
-            .select_columns(&[columns.timestamp, columns.id, columns.tiebreak, columns.deleted])?
+            .select_columns(&[&[columns.timestamp], columns.keys, &[columns.tiebreak, columns.deleted]].concat())?
             .collect()
             .await?)
     }
@@ -5212,10 +5212,11 @@ impl Database {
         }
 
         let declared = get_schema(&key.table_name).ok_or_else(|| anyhow::anyhow!("logical-count table is not registered"))?;
-        anyhow::ensure!(declared.dedup_keys == ["timestamp", "id"], "logical-count currently requires dedup keys [timestamp,id]");
+        let keys = crate::read::logical_count_keys(declared)
+            .ok_or_else(|| anyhow::anyhow!("logical-count requires dedup keys leading with `timestamp`, got {:?}", declared.dedup_keys))?;
         let tiebreak = declared.dedup_tiebreak.as_deref().ok_or_else(|| anyhow::anyhow!("logical-count table has no dedup tiebreak"))?;
         let deleted = declared.tombstone_column.as_deref().ok_or_else(|| anyhow::anyhow!("logical-count table has no tombstone column"))?;
-        let columns = crate::read::LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak, deleted };
+        let columns = crate::read::LogicalCountColumns { timestamp: "timestamp", keys: &keys, tiebreak, deleted };
         let mut index = crate::read::LogicalCountIndex::new();
 
         if !files.is_empty() {
@@ -5225,7 +5226,10 @@ impl Database {
             let context =
                 SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()));
             context.register_table("__logical_count_src", provider)?;
-            let frame = context.table("__logical_count_src").await?.select_columns(&[columns.timestamp, columns.id, columns.tiebreak, columns.deleted])?;
+            let frame = context
+                .table("__logical_count_src")
+                .await?
+                .select_columns(&[&[columns.timestamp], columns.keys, &[columns.tiebreak, columns.deleted]].concat())?;
             let mut stream = frame.execute_stream().await?;
             loop {
                 let batch = tokio::select! {

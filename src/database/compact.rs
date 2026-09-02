@@ -1597,35 +1597,62 @@ impl Database {
                                     .as_ref()
                                     .map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", crate::rollup::quoted(field)));
                                 let order_by = schema_order_by_clause(schema);
-                                let sql = format!(
-                                    "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn \
-                                     FROM {scan_name} WHERE {rows_filter}) WHERE __tf_rn = 1{order_by}"
-                                );
+                                // Keys leading the sort make the window redundant: sort ONCE in
+                                // schema order and collapse adjacent runs (`RunCollapse`). The
+                                // window plan pays two full external sorts — its partition
+                                // ordering is normalized to ASC, so it can never double as the
+                                // DESC output sort.
+                                let streaming_collapse = dedup_keys_lead_the_sort(schema) && !order_by.is_empty();
+                                let sql = if streaming_collapse {
+                                    format!("SELECT {columns} FROM {scan_name} WHERE {rows_filter}{order_by}")
+                                } else {
+                                    format!(
+                                        "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn \
+                                         FROM {scan_name} WHERE {rows_filter}) WHERE __tf_rn = 1{order_by}"
+                                    )
+                                };
                                 // A window function and a final ORDER BY: two blocking
                                 // operators between the scan and the write loop, so the
                                 // loop's own progress bump cannot see most of the unit.
                                 // See `PlanProgress`.
                                 let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
                                 let _progress = crate::database::maintain::PlanProgress::watch(Arc::clone(&plan));
+                                let mut collapse = streaming_collapse
+                                    .then(|| RunCollapse::new(&plan.schema(), &schema.dedup_keys, schema.dedup_tiebreak.as_deref()))
+                                    .transpose()?;
                                 let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
                                 let mut shard_after = 0usize;
                                 let mut decoded_bytes = 0usize;
-                                while let Some(batch) = stream.next().await {
-                                    let batch = cast_variant_columns_to_binary(batch?)?;
-                                    shard_after = shard_after.saturating_add(batch.num_rows());
-                                    // Dedup was the lane still dying to its deadline while it
-                                    // was working: 8 timeouts in the first 11 minutes after the
-                                    // 2026-09-01 deploy, because nothing on this path reported
-                                    // progress and `run_until_idle` could not tell it apart from
-                                    // a stall.
-                                    crate::database::maintain::note_unit_progress(batch.num_rows());
-                                    decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
-                                    let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
-                                    writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
-                                    if writer.buffer_len() >= max_file_bytes {
-                                        adds.extend(
-                                            writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add),
-                                        );
+                                let mut drained = false;
+                                while !drained {
+                                    // The run still open at end-of-stream is the last thing
+                                    // written: it takes the same path as every other batch.
+                                    let batches = match stream.next().await {
+                                        Some(batch) => match &mut collapse {
+                                            Some(collapse) => collapse.push(cast_variant_columns_to_binary(batch?)?)?,
+                                            None => vec![cast_variant_columns_to_binary(batch?)?],
+                                        },
+                                        None => {
+                                            drained = true;
+                                            collapse.as_mut().and_then(RunCollapse::finish).into_iter().collect()
+                                        }
+                                    };
+                                    for batch in batches {
+                                        shard_after = shard_after.saturating_add(batch.num_rows());
+                                        // Dedup was the lane still dying to its deadline while it
+                                        // was working: 8 timeouts in the first 11 minutes after the
+                                        // 2026-09-01 deploy, because nothing on this path reported
+                                        // progress and `run_until_idle` could not tell it apart from
+                                        // a stall.
+                                        crate::database::maintain::note_unit_progress(batch.num_rows());
+                                        decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
+                                        let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
+                                        writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
+                                        if writer.buffer_len() >= max_file_bytes {
+                                            adds.extend(
+                                                writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add),
+                                            );
+                                        }
                                     }
                                 }
                                 // The coordinator takes this streaming branch, so the
@@ -1791,6 +1818,130 @@ impl Database {
     }
 }
 
+/// Whether every dedup key is a leading `sorting_columns` entry, in order.
+///
+/// This is the ClickHouse ReplacingMergeTree invariant (`ORDER BY` carries the
+/// full dedup key so merges stream). When it holds, a stream in schema order
+/// has all versions of a key adjacent and `RunCollapse` can keep-greatest in
+/// one pass — replacing the `ROW_NUMBER() OVER (PARTITION BY keys)` plan, which
+/// costs TWO full external sorts because the window normalizes its partition
+/// ordering to ASC and can therefore never produce the DESC output order
+/// (measured 2026-09-02: 2 `SortExec` under every SQL formulation tried).
+pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> bool {
+    !schema.dedup_keys.is_empty()
+        && schema.sorting_columns.len() >= schema.dedup_keys.len()
+        && schema.dedup_keys.iter().zip(&schema.sorting_columns).all(|(key, sort)| *key == sort.name)
+}
+
+/// Keep-greatest over a stream already sorted by the schema's sort key.
+///
+/// Runs of equal dedup keys are contiguous (see `dedup_keys_lead_the_sort`), so
+/// one row per key is chosen in a single pass, order-preserving, with only the
+/// TRAILING run held back — it is the only one that can continue into the next
+/// batch. Ties keep the first row, matching the window's
+/// `ORDER BY tiebreak DESC NULLS LAST` + `__tf_rn = 1`. Tombstones are retained
+/// (dropping one silently resurrects the row).
+/// The run of equal keys currently in flight. `winner: None` means the carried
+/// row from the previous batch still holds it.
+struct OpenRun {
+    key: Vec<u8>,
+    winner: Option<u32>,
+    best: Option<Vec<u8>>,
+}
+
+pub(crate) struct RunCollapse {
+    keys: datafusion::arrow::row::RowConverter,
+    tiebreak: Option<(usize, datafusion::arrow::row::RowConverter)>,
+    key_idxs: Vec<usize>,
+    /// The winning row of the run still in flight, as its own compact batch.
+    carry: Option<(RecordBatch, Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl RunCollapse {
+    pub(crate) fn new(schema: &arrow_schema::Schema, keys: &[String], tiebreak: Option<&str>) -> Result<Self> {
+        use datafusion::arrow::row::{RowConverter, SortField};
+        let index = |name: &str| schema.index_of(name).map_err(|_| anyhow::anyhow!("run collapse column `{name}` missing from rewrite output"));
+        let key_idxs = keys.iter().map(|key| index(key)).collect::<Result<Vec<_>>>()?;
+        let field = |idx: usize| SortField::new(schema.field(idx).data_type().clone());
+        Ok(Self {
+            keys: RowConverter::new(key_idxs.iter().map(|idx| field(*idx)).collect())?,
+            // Default `SortField` is ASC/nulls-first, so a byte compare of the
+            // encoded tiebreak IS its value order and a NULL version ranks below
+            // every stamped one.
+            tiebreak: tiebreak.map(|name| index(name).and_then(|idx| Ok((idx, RowConverter::new(vec![field(idx)])?)))).transpose()?,
+            key_idxs,
+            carry: None,
+        })
+    }
+
+    /// One compact row of `batch`, detached from its buffers so a held-back run
+    /// cannot pin the whole batch.
+    fn row(batch: &RecordBatch, row: usize) -> Result<RecordBatch> {
+        let indices = datafusion::arrow::array::UInt32Array::from(vec![u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?]);
+        Ok(RecordBatch::try_new(
+            batch.schema(),
+            batch.columns().iter().map(|column| datafusion::arrow::compute::take(column, &indices, None)).collect::<std::result::Result<Vec<_>, _>>()?,
+        )?)
+    }
+
+    pub(crate) fn push(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+        let key_rows = self.keys.convert_columns(&self.key_idxs.iter().map(|idx| Arc::clone(batch.column(*idx))).collect::<Vec<_>>())?;
+        let tiebreak_rows = self.tiebreak.as_ref().map(|(idx, converter)| converter.convert_columns(&[Arc::clone(batch.column(*idx))])).transpose()?;
+        let tiebreak_at = |row: usize| tiebreak_rows.as_ref().map(|rows| rows.row(row).as_ref().to_vec());
+
+        let mut out = Vec::new();
+        let mut winners: Vec<u32> = Vec::new();
+        // The winner of the run in flight: either the carried row or an index
+        // into this batch.
+        let mut current = self.carry.as_ref().map(|(_, key, tiebreak)| OpenRun { key: key.clone(), winner: None, best: tiebreak.clone() });
+        for row in 0..batch.num_rows() {
+            let key = key_rows.row(row).as_ref().to_vec();
+            let tiebreak = tiebreak_at(row);
+            match &mut current {
+                Some(open) if open.key == key => {
+                    // Strictly greater only: ties keep the earlier row.
+                    if tiebreak > open.best {
+                        open.winner = Some(u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?);
+                        open.best = tiebreak;
+                    }
+                }
+                _ => {
+                    match current.take() {
+                        // A closed run whose winner is the carry emits it first:
+                        // it sorts before every row of this batch.
+                        Some(OpenRun { winner: None, .. }) => out.extend(self.carry.take().map(|(row, _, _)| row)),
+                        Some(OpenRun { winner: Some(index), .. }) => winners.push(index),
+                        None => {}
+                    }
+                    let winner = Some(u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?);
+                    current = Some(OpenRun { key, winner, best: tiebreak });
+                }
+            }
+        }
+        // Whatever is still open becomes the new carry.
+        self.carry = match current {
+            Some(OpenRun { key, winner: Some(index), best }) => Some((Self::row(&batch, index as usize)?, key, best)),
+            Some(OpenRun { winner: None, .. }) => self.carry.take(),
+            None => None,
+        };
+        if !winners.is_empty() {
+            let indices = datafusion::arrow::array::UInt32Array::from(winners);
+            out.push(RecordBatch::try_new(
+                batch.schema(),
+                batch.columns().iter().map(|column| datafusion::arrow::compute::take(column, &indices, None)).collect::<std::result::Result<Vec<_>, _>>()?,
+            )?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn finish(&mut self) -> Option<RecordBatch> {
+        self.carry.take().map(|(row, _, _)| row)
+    }
+}
+
 #[cfg(test)]
 mod immutable_audit_tests {
     use super::*;
@@ -1882,5 +2033,106 @@ mod immutable_audit_tests {
         let count = Database::scalar_i64(&ctx, &sql).await.expect("audit runs").expect("one row");
 
         assert_eq!(count, 2, "`a` differs outright and `b` goes null -> error; `c` agrees and `d` is null throughout ({sql})");
+    }
+
+    /// The whole streaming-collapse rewrite rests on this one property, and it
+    /// lives in a YAML file anyone can reorder. `service` sat BETWEEN the dedup
+    /// keys until 2026-09-02, which is exactly the arrangement that forces the
+    /// two-sort window plan.
+    #[test]
+    fn the_shipped_dedup_keys_lead_the_shipped_sort() {
+        assert!(dedup_keys_lead_the_sort(logs_schema()), "otel dedup keys must be the leading sorting_columns, or the rewrite silently reverts to the window");
+        let mut misaligned = logs_schema().clone();
+        misaligned.dedup_keys = vec!["timestamp".to_owned(), "id".to_owned()];
+        assert!(!dedup_keys_lead_the_sort(&misaligned), "keys with `service` wedged between them are NOT a prefix");
+    }
+
+    /// The differential gate on a path that DELETES rows: the one-pass collapse
+    /// must agree with the `ROW_NUMBER()` window it replaces, row for row and in
+    /// order, on data built to break it — several versions per key, a tombstone,
+    /// a NULL service, a NULL tiebreak, tied tiebreaks, and (via `batch_size 1`)
+    /// every run straddling a batch boundary, which is the case the carried
+    /// trailing run exists for.
+    #[tokio::test]
+    async fn the_streaming_collapse_agrees_with_the_window_it_replaces() {
+        use datafusion::arrow::array::{StringArray, TimestampMicrosecondArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let mut schema = logs_schema().clone();
+        let kept = ["timestamp", "resource___service___name", "id", "level", "updated_at"];
+        schema.fields.retain(|field| kept.contains(&field.name.as_str()));
+        schema.sorting_columns.retain(|column| kept.contains(&column.name.as_str()));
+        assert!(dedup_keys_lead_the_sort(&schema), "the trimmed schema keeps the property under test");
+
+        let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let arrow = Arc::new(Schema::new(vec![
+            Field::new("timestamp", ts.clone(), true),
+            Field::new("resource___service___name", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("updated_at", ts, true),
+        ]));
+        //         ts   service      id    level     updated_at
+        let rows = [
+            (10, Some("api"), "a", "info", Some(1)), // three versions of one key,
+            (10, Some("api"), "a", "warn", Some(3)), // greatest wins
+            (10, Some("api"), "a", "error", Some(2)),
+            (10, Some("api"), "b", "info", None),    // a lone NULL-stamped row survives
+            (10, Some("web"), "a", "info", Some(9)), // same (ts,id), OTHER service: distinct
+            (20, None, "c", "info", Some(1)),        // NULL service is its own key
+            (20, None, "c", "info", Some(1)),        // ...and ties keep one row
+            (30, Some("api"), "d", "info", Some(5)), // tombstone-shaped: retained either way
+        ];
+        let batch = RecordBatch::try_new(
+            arrow,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.0).collect::<Vec<_>>()).with_timezone("UTC")),
+                Arc::new(StringArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
+                Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.4).collect::<Vec<_>>()).with_timezone("UTC")),
+            ],
+        )
+        .expect("batch");
+
+        let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
+        let keys = schema.dedup_keys.iter().map(|key| crate::rollup::quoted(key)).collect::<Vec<_>>().join(", ");
+        let order_by = schema_order_by_clause(&schema);
+        let run = |sql: String| {
+            let batch = batch.clone();
+            async move {
+                // One row per batch: every run straddles a boundary.
+                let ctx = datafusion::prelude::SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_batch_size(1));
+                ctx.register_batch("scan", batch).expect("register");
+                ctx.sql(&sql).await.expect("plan").collect().await.expect("run")
+            }
+        };
+        let render = |batches: Vec<RecordBatch>| {
+            datafusion::arrow::util::pretty::pretty_format_batches(&batches.into_iter().filter(|b| b.num_rows() > 0).collect::<Vec<_>>())
+                .expect("render")
+                .to_string()
+        };
+
+        let windowed = render(
+            run(format!(
+                "SELECT {columns} FROM (SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY \"updated_at\" DESC NULLS LAST) AS __tf_rn FROM scan) WHERE __tf_rn = 1{order_by}"
+            ))
+            .await,
+        );
+
+        let sorted = run(format!("SELECT {columns} FROM scan{order_by}")).await;
+        let mut collapse = RunCollapse::new(&sorted[0].schema(), &schema.dedup_keys, schema.dedup_tiebreak.as_deref()).expect("collapse");
+        let mut collapsed: Vec<RecordBatch> = sorted
+            .into_iter()
+            .try_fold(Vec::new(), |mut out, batch| -> Result<Vec<RecordBatch>> {
+                out.extend(collapse.push(batch)?);
+                Ok(out)
+            })
+            .expect("collapse stream");
+        collapsed.extend(collapse.finish());
+
+        assert_eq!(render(collapsed), windowed, "the one-pass collapse must reproduce the window's rows exactly");
+        assert!(windowed.contains("web"), "the fixture must actually exercise two services sharing (timestamp, id)");
     }
 }

@@ -2365,10 +2365,16 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
     count_result(plan, total)
 }
 
+/// The dedup keys after `timestamp`. `None` when the key does not lead with
+/// `timestamp`: the index buckets winners by timestamp, so a key that does not
+/// start there cannot be grouped by it.
+pub fn logical_count_keys(schema: &crate::schema::TableSchema) -> Option<Vec<&str>> {
+    let (first, rest) = schema.dedup_keys.split_first()?;
+    (first == "timestamp" && !rest.is_empty()).then(|| rest.iter().map(String::as_str).collect())
+}
+
 async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &crate::schema::TableSchema) -> Option<u64> {
-    if schema.dedup_keys != ["timestamp", "id"] {
-        return None;
-    }
+    let keys = logical_count_keys(schema)?;
     let tiebreak = schema.dedup_tiebreak.as_deref()?;
     let deleted = schema.tombstone_column.as_deref()?;
     let hi = q.hi.checked_add(1)?;
@@ -2431,7 +2437,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         return None;
     }
 
-    let columns = crate::read::LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak, deleted };
+    let columns = crate::read::LogicalCountColumns { timestamp: "timestamp", keys: &keys, tiebreak, deleted };
     // Keep the synchronous append delta small. The full rebuild is already
     // single-flight; a large gap falls back to authoritative DedupExec until
     // the new base is ready instead of moving that scan onto every query.
@@ -2545,7 +2551,10 @@ use arrow::{
 };
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
 
-const FORMAT_VERSION: &str = "1";
+// "2": the key tail became the FULL dedup key (see `KeyTail`). A "1" file
+// encodes `id` alone, so appending "2" keys to it would count one logical row
+// per (timestamp, id) and one per (timestamp, service, id) in the same index.
+const FORMAT_VERSION: &str = "2";
 const META_VERSION: &str = "tf.logical_count.version";
 const META_FINGERPRINT: &str = "tf.logical_count.fingerprint";
 const META_FILES: &str = "tf.logical_count.files";
@@ -2595,7 +2604,10 @@ pub struct LogicalCountIndex {
 #[derive(Debug, Clone, Copy)]
 pub struct LogicalCountColumns<'a> {
     pub timestamp: &'a str,
-    pub id: &'a str,
+    /// The dedup keys after `timestamp`, in schema order. More than one is the
+    /// normal case since `otel_logs_and_spans` widened its key to match its
+    /// sort prefix; the index groups by the FULL key, or it would under-count.
+    pub keys: &'a [&'a str],
     pub tiebreak: &'a str,
     pub deleted: &'a str,
 }
@@ -2800,11 +2812,46 @@ impl LogicalCountCache {
     }
 }
 
+/// Separator and NULL marker for a multi-column key tail. Both are control
+/// characters no identifier or service name can contain, so distinct tuples
+/// cannot collide and a NULL segment stays distinguishable from an empty one.
+const KEY_SEP: char = '\u{1f}';
+const KEY_NULL: char = '\u{0}';
+
+/// The index key is `timestamp_be || tail`, where `tail` is the remaining
+/// dedup keys joined by [`KEY_SEP`]. The tail is opaque bytes to the packed
+/// form, so widening `dedup_keys` needs no layout change — only a
+/// `FORMAT_VERSION` bump, because a cached index encodes a shorter tail and
+/// mixing widths would over-count.
 fn key(timestamp: i64, id: &str) -> Box<[u8]> {
     let mut out = Vec::with_capacity(8 + id.len());
     out.extend_from_slice(&timestamp.to_be_bytes());
     out.extend_from_slice(id.as_bytes());
     out.into_boxed_slice()
+}
+
+/// The non-timestamp dedup-key columns of one batch, resolved once per batch.
+struct KeyTail<'a>(Vec<StringValues<'a>>);
+
+impl<'a> KeyTail<'a> {
+    fn new(batch: &'a RecordBatch, names: &[&str]) -> Result<Self> {
+        names.iter().map(|name| StringValues::new(batch, name)).collect::<Result<Vec<_>>>().map(Self)
+    }
+
+    /// Encode row `row` into `out`, reusing its allocation across rows.
+    fn encode<'o>(&self, row: usize, out: &'o mut String) -> &'o str {
+        out.clear();
+        for (i, column) in self.0.iter().enumerate() {
+            if i > 0 {
+                out.push(KEY_SEP);
+            }
+            match column.value(row) {
+                Some(value) => out.push_str(value),
+                None => out.push(KEY_NULL),
+            }
+        }
+        out
+    }
 }
 
 fn packed_id<'a>(ids: &'a [u8], winner: &PackedWinner) -> &'a [u8] {
@@ -2891,7 +2938,7 @@ impl LogicalCountIndex {
     /// `timestamp`, `id`, version tiebreak, tombstone marker.
     pub fn apply_batch(&mut self, batch: &RecordBatch, columns: LogicalCountColumns<'_>) -> Result<usize> {
         let timestamps = timestamp_values(batch, columns.timestamp)?;
-        let ids = StringValues::new(batch, columns.id)?;
+        let tail = KeyTail::new(batch, columns.keys)?;
         let tiebreaks = timestamp_values(batch, columns.tiebreak)?;
         let deleted = batch
             .column_by_name(columns.deleted)
@@ -2900,17 +2947,18 @@ impl LogicalCountIndex {
             .downcast_ref::<BooleanArray>()
             .with_context(|| format!("logical-count {} is not Boolean", columns.deleted))?;
         let mut changed = 0;
+        let mut buffer = String::new();
         for row in 0..batch.num_rows() {
             // A bounded timestamp predicate never matches NULL, so such a row
-            // contributes to no count index. ID is a declared dedup key and
-            // must not be silently discarded if corrupt input violates it.
+            // contributes to no count index. A NULL in any other key encodes as
+            // a distinct segment rather than erroring: it can only split a
+            // group, never merge two.
             if timestamps.is_null(row) {
                 continue;
             }
-            let id = ids.value(row).with_context(|| format!("logical-count {} is NULL at row {row}", columns.id))?;
             let tiebreak = (!tiebreaks.is_null(row)).then(|| tiebreaks.value(row));
             let is_deleted = !deleted.is_null(row) && deleted.value(row);
-            changed += usize::from(self.apply(timestamps.value(row), id, tiebreak, is_deleted));
+            changed += usize::from(self.apply(timestamps.value(row), tail.encode(row, &mut buffer), tiebreak, is_deleted));
         }
         Ok(changed)
     }
@@ -2941,7 +2989,8 @@ impl LogicalCountIndex {
         for (batches, authoritative) in [(authoritative_batches, true), (delta_batches, false)] {
             for batch in batches {
                 let timestamps = timestamp_values(batch, columns.timestamp)?;
-                let ids = StringValues::new(batch, columns.id)?;
+                let tail = KeyTail::new(batch, columns.keys)?;
+                let mut buffer = String::new();
                 let tiebreaks = timestamp_values(batch, columns.tiebreak)?;
                 let deleted = batch
                     .column_by_name(columns.deleted)
@@ -2954,7 +3003,7 @@ impl LogicalCountIndex {
                         continue;
                     }
                     let timestamp = timestamps.value(row);
-                    let id = ids.value(row).with_context(|| format!("logical-count overlay {} is NULL at row {row}", columns.id))?;
+                    let id = tail.encode(row, &mut buffer);
                     let encoded = key(timestamp, id);
                     let candidate =
                         Winner { tiebreak: (!tiebreaks.is_null(row)).then(|| tiebreaks.value(row)), deleted: !deleted.is_null(row) && deleted.value(row) };
@@ -3353,7 +3402,7 @@ mod logical_count_index_tests {
 
     #[test]
     fn narrow_batches_build_and_overlay_unflushed_versions_exactly() {
-        let columns = LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak: "updated_at", deleted: "deleted" };
+        let columns = LogicalCountColumns { timestamp: "timestamp", keys: &["id"], tiebreak: "updated_at", deleted: "deleted" };
         let mut index = LogicalCountIndex::new();
         index.apply_batch(&versions(&[(10, "a", Some(1), Some(false)), (20, "b", Some(1), None), (30, "gone", Some(2), Some(true))]), columns).unwrap();
         assert_eq!(index.count(0, 100), 2);
@@ -3374,7 +3423,7 @@ mod logical_count_index_tests {
 
     #[test]
     fn covered_overlay_replaces_delta_rows_like_the_union_scan() {
-        let columns = LogicalCountColumns { timestamp: "timestamp", id: "id", tiebreak: "updated_at", deleted: "deleted" };
+        let columns = LogicalCountColumns { timestamp: "timestamp", keys: &["id"], tiebreak: "updated_at", deleted: "deleted" };
         let mut index = LogicalCountIndex::new();
         index.apply(10, "old", Some(1), false);
         index.apply(20, "newer-delta", Some(5), false);

@@ -8986,11 +8986,18 @@ impl ProjectRoutingTable {
         let mem_source =
             MemorySourceConfig::try_new(partitions, self.schema.clone(), projection.cloned()).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let out = match projection {
-            Some(p) => Arc::new(self.schema.project(p)?),
-            None => self.schema.clone(),
-        };
-        Ok(Arc::new(DataSourceExec::new(Arc::new(Self::declare_ordering(mem_source, sorted, &self.table_name, &out)))))
+        // The UNPROJECTED schema on purpose: `try_with_sort_information`
+        // validates each sort column's (name, index) against the source's
+        // ORIGINAL schema and maps it through the projection itself. Indices
+        // taken from the projected schema pass only when they happen to
+        // coincide — declaring a 3-column ordering on a projection that moves
+        // `resource___service___name` to index 2 failed with "not found in the
+        // original schema", silently dropping the claim and regrowing a
+        // blocking `SortExec` over the mem leg (2026-09-02, found by widening
+        // the dedup keys, which is what first put a second column in the
+        // claim). `sort_partition` sorts by the same unprojected schema, so the
+        // two agree on how far the leading run reaches.
+        Ok(Arc::new(DataSourceExec::new(Arc::new(Self::declare_ordering(mem_source, sorted, &self.table_name, &self.schema)))))
     }
 
     /// Attach the table's declared ordering to an in-memory source. Failure to
@@ -17455,7 +17462,11 @@ mod tests {
         let (optimize_type, declare_sorted) = consolidate_optimize_type(schema, true);
         let OptimizeType::SortByDedup(cols, dedup) = optimize_type else { panic!("expected SortByDedup") };
         assert_eq!(cols[0].column, "timestamp");
-        assert_eq!(dedup.columns, vec!["timestamp", "id"]);
+        assert_eq!(
+            dedup.columns,
+            vec!["timestamp", "resource___service___name", "id"],
+            "the opportunistic dedup keys ARE the schema keys, which now lead the sort"
+        );
         let tb = dedup.tiebreak.expect("tiebreak from schema");
         assert!(tb.column == "updated_at" && tb.descending);
         assert!(declare_sorted);
