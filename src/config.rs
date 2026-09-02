@@ -126,6 +126,10 @@ pub(crate) fn detect_cores() -> usize {
 #[derive(Debug, Clone, Copy)]
 pub struct DerivedBudget {
     pub memory_limit_bytes: usize,
+    /// `TIMEFUSION_REPAIR_REWRITE_BUDGET_MIB` — see `repair_rewrite_budget_bytes`.
+    /// `None` keeps the historical value; set it to raise repair off the shared
+    /// per-sort budget without touching `light_optimize_k`.
+    pub repair_rewrite_budget_mib_override: Option<usize>,
     pub cores: usize,
     query_pool_bytes: usize,
     ingest_buffer_bytes: usize,
@@ -220,6 +224,13 @@ const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// At 1.25 GiB `light_optimize_k` yields 5, plus the one repair permit = **6**
 /// — the measured optimum, and one rung below the measured cliff.
 const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
+
+/// `TIMEFUSION_REPAIR_REWRITE_BUDGET_MIB`, if set and parseable. Read here
+/// rather than through the serde config because `DerivedBudget` is built before
+/// it — the same reason `TIMEFUSION_MEMORY_BUDGET_GB` is read directly.
+fn repair_budget_override() -> Option<usize> {
+    std::env::var("TIMEFUSION_REPAIR_REWRITE_BUDGET_MIB").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|mib| *mib > 0)
+}
 /// Heavy maintenance's minimum share of the maintenance pool. 0.40, up from
 /// 0.25 — a REBALANCE inside the existing pool (total unchanged), following
 /// the workload: hot-tail packing (light share) converged once unstarved,
@@ -281,6 +292,7 @@ impl DerivedBudget {
             let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
             return Self {
                 memory_limit_bytes,
+                repair_rewrite_budget_mib_override: repair_budget_override(),
                 cores,
                 query_pool_bytes,
                 ingest_buffer_bytes,
@@ -311,7 +323,17 @@ impl DerivedBudget {
         let untracked_slack_bytes = (memory_limit_bytes as f64 * UNTRACKED_SLACK_FRACTION) as usize;
         let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes + untracked_slack_bytes;
         let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
-        Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes, profile }
+        Self {
+            memory_limit_bytes,
+            repair_rewrite_budget_mib_override: repair_budget_override(),
+            cores,
+            query_pool_bytes,
+            ingest_buffer_bytes,
+            foyer_memory_bytes,
+            writer_reserve_bytes,
+            maintenance_pool_bytes,
+            profile,
+        }
     }
 
     /// Detect the real container limits and derive the tree. The only env input
@@ -422,8 +444,31 @@ impl DerivedBudget {
     /// protecting — a bin larger than the budget takes all of it and still runs
     /// alone — while letting small bins share. It can only ADD concurrency, and
     /// never for two large bins.
+    /// **Now its own value, not `COORDINATOR_PER_SORT_BUDGET_BYTES`.** Sharing
+    /// that constant coupled this budget to `light_optimize_k`, which divides by
+    /// it — so raising repair's budget would have cut hot-tail packing's
+    /// concurrency, the exact shape of the 2026-09-01 outage where K fell 3 → 1
+    /// and HotPacking stopped being claimed entirely.
+    ///
+    /// **The DEFAULT is deliberately unchanged** (`COORDINATOR_PER_SORT_BUDGET_BYTES`),
+    /// so this commit changes no behaviour. It exists to make the value
+    /// separable, tunable without a deploy, and testable at test scale — an e2e
+    /// test can set a few MB and assert `repair_rewrite_permit_busy` on an
+    /// ordinary file, which no fixture could do while the budget was a 1,280 MiB
+    /// const (reproducing the bounce needed a ~107 MB compressed file).
+    ///
+    /// **It is known to be too small.** A repair unit is exactly ONE file
+    /// (`coordinator_compaction_files` takes 1 for Repair) and cannot be split,
+    /// so it must fit `COORDINATOR_HOT_TARGET_BYTES x DECODED_BYTES_PER_COMPRESSED`
+    /// = 256 MiB x 12 = **3,072 MiB**. At 1,280 MiB every correctly-sized file
+    /// clamps to the whole semaphore and repair serializes — prod 2026-09-02:
+    /// 177 `repair_rewrite_permit_busy` in 3h, **zero repair rewrites staged in
+    /// 12h**, 310 units queued. Raising it is a memory judgement (repair and
+    /// packing draw on the same coordinator share), which is why the default is
+    /// left alone here and `repair_budget_must_fit_one_target_sized_file` still
+    /// fails until someone chooses the number.
     pub fn repair_rewrite_budget_bytes(&self) -> usize {
-        COORDINATOR_PER_SORT_BUDGET_BYTES
+        self.repair_rewrite_budget_mib_override.map_or(COORDINATOR_PER_SORT_BUDGET_BYTES, |mib| mib.saturating_mul(MIB))
     }
 
     /// The same budget in whole MiB, which is the unit the repair semaphore
@@ -2945,6 +2990,29 @@ mod tests {
             (WIDEST_BATCH_BYTES + UNSPILLABLE_MERGE_FLOOR_BYTES) / 1024 / 1024,
         );
         assert_eq!(b.optimize_merge_tasks(), 2);
+    }
+
+    /// The override is the whole point of making this a value rather than a
+    /// const: it is what lets an e2e test shrink the budget to a few MB and
+    /// reproduce `repair_rewrite_permit_busy` on an ordinary small file, which
+    /// no fixture could do at 1,280 MiB (it needed a ~107 MB compressed file).
+    ///
+    /// Set on the struct, not via `set_var` — env is process-global and under
+    /// nextest's process-per-test model that silently stops meaning what you
+    /// think while still looking correct.
+    #[test]
+    fn repair_budget_override_replaces_the_shared_per_sort_budget() {
+        let mut b = AppConfig::default().derived;
+        assert_eq!(b.repair_rewrite_budget_bytes(), COORDINATOR_PER_SORT_BUDGET_BYTES, "default must be unchanged");
+
+        b.repair_rewrite_budget_mib_override = Some(4);
+        assert_eq!(b.repair_rewrite_budget_mib(), 4, "an override must reach the semaphore's MiB unit");
+        assert_ne!(b.repair_rewrite_budget_bytes(), COORDINATOR_PER_SORT_BUDGET_BYTES, "and must no longer track the shared constant");
+
+        // The decoupling itself: moving repair's budget must not move the
+        // divisor `light_optimize_k` uses, which is the 2026-09-01 coupling.
+        let k_before = AppConfig::default().derived.light_optimize_k(11);
+        assert_eq!(b.light_optimize_k(11), k_before, "repair's budget must not change hot-tail packing concurrency");
     }
 
     /// REPRODUCES the 2026-09-02 repair starvation: the repair rewrite budget is
