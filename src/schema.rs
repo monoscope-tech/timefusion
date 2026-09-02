@@ -935,30 +935,6 @@ mod tests {
         assert!(spec.validate(source).unwrap_err().to_string().contains("unsupported aggregate"));
     }
 
-    // Regression: parquet `SortingColumn.column_idx` must index the non-partition
-    // (physical parquet) columns, not the raw fields list. `date` is a partition
-    // at field index 0, so the raw index over-counts by 1 and the footer points
-    // at the wrong column — which made `ordering_from_parquet_metadata` resolve
-    // nothing and the timestamp-ordering pushdown silently never fire.
-    #[test]
-    fn sorting_columns_index_excludes_partitions() {
-        let schema = get_schema("otel_logs_and_spans").expect("otel schema registered");
-        let scs = schema.sorting_columns();
-        // Build the expected physical (non-partition) column order.
-        let partition_set = schema.partition_set();
-        let data_cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).filter(|n| !partition_set.contains(n)).collect();
-        // timestamp is the lead sort key and the first physical column → index 0.
-        assert_eq!(data_cols[0], "timestamp");
-        let ts = scs.first().expect("at least one sorting column");
-        assert_eq!(ts.column_idx, 0, "timestamp must map to physical parquet column 0, got {}", ts.column_idx);
-        assert!(ts.descending, "timestamp is sorted newest-first (DESC)");
-        // Every declared sort column resolves to its non-partition position.
-        for (sc, def) in scs.iter().zip(&schema.sorting_columns) {
-            let want = data_cols.iter().position(|n| *n == def.name).unwrap() as i32;
-            assert_eq!(sc.column_idx, want, "sort col `{}` column_idx mismatch", def.name);
-        }
-    }
-
     /// The tombstone column must be nullable Boolean (NULL = live, so no
     /// backfill) and named by the schema — nothing hard-codes it. Exercised on
     /// `mor_versioned`, the from-scratch fixture. (It was once the ONLY table
@@ -1112,6 +1088,14 @@ mod tests {
                 );
             }
             assert!(leaves.len() >= fields.len(), "{table}: leaves cannot be fewer than fields, or this test is measuring nothing");
+            // Partition columns live in the path, not in the file, so they must
+            // not consume a leaf. `timestamp` at leaf 0 is what proves `date`
+            // (declared first) was excluded — the older regression this
+            // subsumes, which caught the same class of bug one layer up.
+            assert_eq!(leaves.first().map(String::as_str), Some("timestamp"), "{table}: the lead sort key must be leaf 0");
+            for partition in &schema.partitions {
+                assert!(!leaves.contains(partition), "{table}: partition `{partition}` must not occupy a parquet leaf");
+            }
         }
     }
 }

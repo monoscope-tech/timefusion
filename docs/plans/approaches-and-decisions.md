@@ -281,6 +281,70 @@ DataFusion bug does not gate phase 2 because the rewrite projects every column.
 That reasoning was right and the conclusion was wrong — the column is projected
 and still dropped. The bug gates phase 2 after all.
 
+### ROOT CAUSE, and it is ours: a footer sort index is a LEAF, not a field
+
+`SortingColumn.column_idx` indexes parquet **leaves**. A Variant/struct column
+occupies as many leaves as it has children, so counting FIELDS under-shoots for
+every sort key that follows one. `TableSchema::sorting_columns()` counted fields.
+
+Proved against a real prod file (`recent204.parquet`, 97 leaves / 90 fields) by
+resolving each recorded index through the parquet leaf schema:
+
+```
+idx=  0  leaf='timestamp'                     ← meant timestamp                 OK
+idx= 76  leaf='attributes___user___email'     ← meant resource___service___name  WRONG
+idx=  2  leaf='id'                            OK
+idx=  9  leaf='level'                         OK
+idx=  7  leaf='status_code'                   OK
+```
+
+`timestamp` survived only because nothing nested precedes it. So **every file
+TimeFusion has ever written carries a sort claim naming the wrong column**, and
+the reader — which resolves the leaf's NAME — cannot find it in the scan schema,
+drops the entry, and advertises `[timestamp, id, level, status_code]`. That is
+not a short claim, it is a false one.
+
+**The fix removes the sort outright.** With leaf indices the scan declares all
+five columns and DataFusion satisfies the `ORDER BY` from the files themselves:
+
+```
+ProjectionExec
+  DeltaScanExec
+    DataSourceExec: … output_ordering=[timestamp DESC, resource___service___name ASC,
+                                       id ASC, level ASC, status_code ASC]
+```
+
+No `SortExec`. Not downgraded to a merge — **gone**. With `RunCollapse` needing
+only adjacency, which that ordering guarantees, a dedup rewrite over conforming
+files becomes a streaming pass. The bench put the sort at 81% of a rewrite
+(scan-only 2.2 s vs 11.6 s for the prod shape).
+
+Caveats to carry into the morning:
+- **Old files keep their wrong footers.** The win phases in as rewrites replace
+  them — and every dedup/compaction rewrite now writes a correct one.
+- The DataFusion `filter_map` (skip instead of truncate) is still there and still
+  wrong; it is what converted our bad index into a silently shortened ordering
+  rather than an error. Worth fixing upstream so the next such bug is loud.
+- The test resolves each recorded index back through the same leaf order instead
+  of asserting a hardcoded number, which would only re-encode the bug.
+
+**The metric this must move:** `dedup_bin_stage_timeouts_total`. On `e4414b2`
+prod logged **20 stage timeouts against 9 commits** in ~15 minutes — every
+timeout is a bin that failed to stage inside its deadline and gets retried, i.e.
+work done twice. The remaining sort is what those deadlines are spent on, so
+removing it should collapse that ratio. Watch it against
+`dedup_bins_committed_total`, not on its own.
+
+**Mixed old/new files are safe by construction, but watch `dedup_failed_total`.**
+Old files declare an ordering naming `attributes___user___email`; new ones name
+`resource___service___name`. `derive_common_ordering` only claims an ordering for
+files that AGREE, so the two generations cannot be merged under one claim — the
+minority scans separately, unordered. And if that reasoning is wrong, the failure
+is caught rather than silent: a `SortPreservingMerge` fed a false ordering would
+leave equal keys non-adjacent, `RunCollapse` would emit more rows than
+`expected_logical_rows` predicts, and the unit is REJECTED before any Remove
+action commits. Fail-closed, visible as `dedup_failed_total` climbing.
+
 ### Still open
 
 - `narrow_provider` declaring footer ordering (gated on EVERY selected file
