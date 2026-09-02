@@ -5,7 +5,7 @@
 //! output to the generated target schema. Read routing lives here as well, but
 //! is deliberately conservative: an unsupported query must use raw data.
 
-use crate::schema::RollupSpec;
+use crate::schema::{RollupMeasure, RollupSpec};
 
 /// Why a query cannot use a rollup. Variant names ARE the `rollup_misses`
 /// telemetry labels (snake_case); the two `serialize` overrides are historical
@@ -208,6 +208,42 @@ pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, pro
 /// source rows that have not changed since, so re-aggregating them would produce
 /// the same numbers at the cost of scanning the raw partition again — which is
 /// the entire expense this exists to avoid.
+/// One measure's projection in a rollup build, as `<expression> AS <name>`.
+///
+/// `derived` selects the tier-to-tier merge (folding the base tier's stored
+/// states) over the build-from-raw aggregate. Both spellings lived inline in
+/// two callers and had to stay in step; this repo has already lost a caveat
+/// that way ("that caveat used to be recorded on only one of the copies of
+/// this query, which is how it would have been lost").
+///
+/// A derived merge deliberately re-reads no filter: the base tier already
+/// applied it when the state was built, and applying it twice over an
+/// aggregated column is not the same predicate.
+fn measure_projection(measure: &RollupMeasure, derived: bool) -> anyhow::Result<String> {
+    if derived {
+        let expression = match measure.agg.as_str() {
+            "min" => format!("MIN({})", measure.name),
+            "max" => format!("MAX({})", measure.name),
+            "tdigest" => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
+            "hll" => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
+            _ => format!("SUM({})", measure.name),
+        };
+        return Ok(format!("{expression} AS {}", measure.name));
+    }
+    let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
+        ("count", None) => "COUNT(*)".to_string(),
+        ("count", Some(column)) => format!("COUNT({column})"),
+        ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+        ("hll", Some(column)) => format!("hll_agg({column})"),
+        (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
+        (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
+    };
+    Ok(match &measure.filter {
+        Some(filter) => format!("{expression} FILTER (WHERE {filter}) AS {}", measure.name),
+        None => format!("{expression} AS {}", measure.name),
+    })
+}
+
 pub(crate) fn build_partition_sql_ranges(
     spec: &RollupSpec, source: &str, from: &str, target: &str, project_id: &str, date: &str, ranges: &[(i64, i64)],
 ) -> anyhow::Result<String> {
@@ -217,30 +253,7 @@ pub(crate) fn build_partition_sql_ranges(
     let measures = spec
         .measures
         .iter()
-        .map(|measure| {
-            if derived {
-                let expression = match measure.agg.as_str() {
-                    "min" => format!("MIN({})", measure.name),
-                    "max" => format!("MAX({})", measure.name),
-                    "tdigest" => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
-                    "hll" => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
-                    _ => format!("SUM({})", measure.name),
-                };
-                return Ok(format!("{expression} AS {}", measure.name));
-            }
-            let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
-                ("count", None) => "COUNT(*)".to_string(),
-                ("count", Some(column)) => format!("COUNT({column})"),
-                ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
-                ("hll", Some(column)) => format!("hll_agg({column})"),
-                (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
-                (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
-            };
-            Ok(match &measure.filter {
-                Some(filter) => format!("{expression} FILTER (WHERE {filter}) AS {}", measure.name),
-                None => format!("{expression} AS {}", measure.name),
-            })
-        })
+        .map(|measure| measure_projection(measure, derived))
         .collect::<anyhow::Result<Vec<_>>>()?
         .join(", ");
     let source = from;
@@ -281,30 +294,7 @@ pub(crate) fn build_cohort_sql_range_mode(
     let measures = spec
         .measures
         .iter()
-        .map(|measure| {
-            if derived {
-                let expression = match measure.agg.as_str() {
-                    "min" => format!("MIN({})", measure.name),
-                    "max" => format!("MAX({})", measure.name),
-                    "tdigest" => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
-                    "hll" => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
-                    _ => format!("SUM({})", measure.name),
-                };
-                return Ok(format!("{expression} AS {}", measure.name));
-            }
-            let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
-                ("count", None) => "COUNT(*)".to_string(),
-                ("count", Some(column)) => format!("COUNT({column})"),
-                ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
-                ("hll", Some(column)) => format!("hll_agg({column})"),
-                (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
-                (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
-            };
-            Ok(match &measure.filter {
-                Some(filter) => format!("{expression} FILTER (WHERE {filter}) AS {}", measure.name),
-                None => format!("{expression} AS {}", measure.name),
-            })
-        })
+        .map(|measure| measure_projection(measure, derived))
         .collect::<anyhow::Result<Vec<_>>>()?
         .join(", ");
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };

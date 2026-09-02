@@ -364,3 +364,53 @@ has to be a property of the unit, not of the fleet — because a second, larger
 whale multiplies the population that already accounts for two thirds of our
 bytes. Onboarding 100x volume without it would land entirely in the failure mode
 we can already measure.
+
+## CORRECTION: on the real journal we do not keep up at 1x — and it is a FLOW problem
+
+Everything above this section used `synth:whale`. Running the **real journal**
+changes the headline, and the earlier "10x keeps up" claim must be read narrowly.
+
+24 virtual hours, 10 workers, real journal (21,544 pending at start):
+
+| run | pending after 24h | executions | frontier lag max |
+| --- | --- | --- | --- |
+| `--no-mint` (no new arrivals) | 21,544 → **18** | 1,594 | 84,543s |
+| default (ongoing ingest modelled) | 21,544 → **16,431** | 21,088 | 84,789s |
+
+**The standing backlog is not the problem.** Without new arrivals it drains to
+essentially zero using only 1,594 executions. With arrivals modelled, **21,088
+executions — 13x more work done — still ends further behind than it started.**
+
+That is a flow problem, not a stock problem, and it explains the prod
+observation that `pending_dedup` never durably shrinks. It also explains why
+`synth:whale` was so optimistic: `synth:whale` forces `mint_frontier = false`,
+so it models a backlog with *no ongoing ingest at all*. Every scale number
+earlier in this document is therefore a **backlog-drain** measurement, not a
+keep-up measurement. They are still valid for what they measure — how unit cost
+and concurrency interact — but "10x keeps up" means *"a 10x-costlier backlog
+still drains"*, NOT *"we keep up with 10x the traffic"*.
+
+The honest current-state answer to "are we breaking a sweat at 1x": **on the
+real queue with ingest modelled, yes.**
+
+### And coarsening — the mechanism that would help — is blocked 81% of the time
+
+Identical in both runs, so it is not an artifact of the arrival model:
+
+```
+coarsen: candidates 114,802  blocked 92,670 (80.7%)  over_budget 22,074 (19.2%)
+         subsumed 978        fused 58
+```
+
+Only **58 fusions out of 114,802 candidates.** Coarsening is what turns many
+small arriving invalidations into one efficient unit — exactly what a flow
+problem needs — and it is refused for four fifths of candidates, with a further
+fifth refused on budget. That budget refusal is the same size ceiling this
+document has been circling: units that *should* be fused cannot be, because the
+fused result would not fit.
+
+**This is the sharpest open lead of the night.** The tension is real and worth
+stating: arrival pressure wants units fused *larger*, while the per-sort budget
+wants them *smaller*. Resolving it is the same "size the unit deliberately"
+change — a fused unit has to be sized to the budget, not abandoned when it
+would exceed it.

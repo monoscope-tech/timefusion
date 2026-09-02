@@ -539,3 +539,33 @@ ORDER BY 1
 sess1 /users /users
 sess2 /orders NULL
 sess3 / /
+
+# The filtered form: monoscope wants the first NON-EMPTY value, so the whole
+# design of a `first` rollup measure leans on FILTER working here. Note also
+# that first_value does NOT skip nulls on its own — sess2's last_url above is
+# NULL because the last row genuinely has none.
+query TTT
+SELECT attributes___session___id AS sess,
+       first_value(attributes___url___path ORDER BY timestamp)
+         FILTER (WHERE attributes___url___path IS NOT NULL AND attributes___url___path <> '') AS first_nonempty,
+       MIN(timestamp)
+         FILTER (WHERE attributes___url___path IS NOT NULL AND attributes___url___path <> '')::text AS companion_ts
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND attributes___session___id IS NOT NULL
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY attributes___session___id
+ORDER BY 1
+----
+sess1 /users 2026-01-15T10:00:00Z
+sess2 /orders 2026-01-15T10:02:00Z
+sess3 / 2026-01-15T10:06:00Z
+
+# Ordering by the companion with NULLS LAST is what keeps an empty leading
+# bucket from poisoning a merge.
+query T
+SELECT first_value(v ORDER BY t NULLS LAST) FROM (
+  SELECT NULL::text AS v, NULL::timestamp AS t
+  UNION ALL SELECT 'real', TIMESTAMP '2026-01-15T10:00:00Z'
+) x
+----
+real
