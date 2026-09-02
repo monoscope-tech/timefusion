@@ -749,3 +749,61 @@ a unit test over `occupancy_scaled_ceiling` against the real journal's size
 distribution (cheap, offline, no deploy), or `run-unit` against seeded local
 storage. That is the one experiment that would confirm or kill the leading
 candidate, and it is where I would start.
+
+## Pricing the candidate offline: what raising the admission band would buy, and whether it is safe
+
+The admission-aware measurement I said was needed does not require the sim or a
+deploy — the band is a closed-form function and the journal has the sizes.
+
+**What it buys.** Share of the queued backlog admissible at a given pool
+occupancy:
+
+| `MAX_DECODED_BYTES` | band | 100% free | 50% free | 25% free | 10% free | never-admissible |
+| --- | --- | --- | --- | --- | --- | --- |
+| **512 MiB (today)** | [32M, 512M] | 86% | **33%** | **7%** | 3% | 14.1% |
+| 1 GiB | [64M, 1G] | 88% | 86% | 33% | 6% | 11.9% |
+| **2 GiB** | [128M, 2G] | 90% | 88% | **86%** | 14% | 10.5% |
+| 4 GiB | [256M, 4G] | 91% | 90% | 88% | 57% | 9.5% |
+
+Today's band is the outlier: **at half occupancy only a third of the queue can
+be admitted, and at 25% free only 7%.** That is a self-sustaining stall — the
+queue cannot drain while the pool is busy, and the pool stays busy because the
+queue cannot drain. 2 GiB holds 86% admissible down to 25% free.
+
+**Whether it is safe.** Admission capacity is `memory_limit x 3/4` =
+**60 GiB** of decoded bytes (80 GiB budget). The worst case is every permit
+holding a maximum-size unit:
+
+| `MAX_DECODED_BYTES` | % of capacity, one unit | worst case (x10 permits) |
+| --- | --- | --- |
+| 512 MiB (today) | 0.8% | 5 GiB = **8%** of capacity |
+| **2 GiB** | 3.3% | 20 GiB = **33%** |
+| 4 GiB | 6.7% | 40 GiB = 67% |
+| 6 GiB | 10.0% | 60 GiB = 100% — too far |
+
+**Today's ceiling lets a single unit use under 1% of the pool it is being
+admitted into**, and the whole fleet at full occupancy uses 8% of the decode
+capacity that exists. That is not a safety margin, it is a mis-calibration: the
+guard is so tight it starves the thing it protects.
+
+### The recommendation, with its evidence
+
+**Raise `MAX_DECODED_BYTES` from 512 MiB to 2 GiB.** It is one constant.
+
+- Admissibility at 25% free pool: **7% → 86%**
+- Never-admissible share: 14.1% → 10.5%
+- Worst-case memory: 8% → **33%** of the 60 GiB decode capacity — still a 3x margin
+- Fusion effect: measured, negligible (0.7%) — this change is about admission
+
+**Caveats, stated honestly:**
+
+1. The same constant governs fusion and admission. Those are different questions
+   ("largest unit worth fusing" vs "largest unit admission can grant") and
+   splitting them is the cleaner change; raising the shared value is the smaller
+   one.
+2. `PER_SORT_BUDGET_BYTES` (2 GiB) and the 510 MB per-sort slice are a separate
+   budget. A unit admitted at 2 GiB decoded still sorts inside its slice and
+   spills — which is normal — but the interaction deserves a look before shipping.
+3. This is an offline calculation over a journal snapshot, not a live
+   experiment. It is strong enough to justify the change and not strong enough
+   to skip a canary.
