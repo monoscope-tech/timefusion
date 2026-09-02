@@ -110,6 +110,26 @@ change, but it is gated on the pool-usage instrument
   two target-sized rewrites (3,072 MiB each) must both acquire. The
   oversized-bin-runs-alone property is unchanged and still asserted.
 
+## Baseline, taken before the deploy
+
+Image `ca3c413`, process uptime **174 min** at the time of reading — quiet
+enough for the cumulative counters to mean something (uptime computed from
+`boot_micros`, not estimated).
+
+```
+maintenance.pending_repair                  302
+maintenance.pending_dedup                  1304
+maintenance.compaction_permits_unavailable  276   (over 174 min = 1.59/min)
+maintenance.repair_bins_in_flight             0
+maintenance.repair_sorted_at_write_total    935
+scan.dedup_full_set_pct                     8.7
+```
+
+Note `dedup_full_set_pct` reads **8.7%**, up from the 4.4% measured earlier
+today. It is a file property, not process state, so this is the unsorted
+population growing while repair cannot drain it — the cost this change exists to
+stop. It is also the cleanest single number to judge the deploy by.
+
 ## What to watch after deploy
 
 Two hours of quiet before any number means anything.
