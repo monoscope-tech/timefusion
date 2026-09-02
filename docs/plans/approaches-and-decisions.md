@@ -360,6 +360,28 @@ leave equal keys non-adjacent, `RunCollapse` would emit more rows than
 `expected_logical_rows` predicts, and the unit is REJECTED before any Remove
 action commits. Fail-closed, visible as `dedup_failed_total` climbing.
 
+### First 100 units after the leaf-index fix
+
+```
+ 68  sorts=1 merges=0 collapse=true ordered_scan=false
+ 31  sorts=1 merges=1 collapse=true ordered_scan=false
+  1  sorts=1 merges=0 collapse=true ordered_scan=true     <- the first one
+```
+
+Exactly the predicted shape: the win phases in with new files. The single
+`ordered_scan=true` unit still sorts because on a mixed partition the claim goes
+to whichever generation conforms, and an old-footer set names the wrong column,
+so it cannot satisfy the schema sort. **The number to watch is the
+`ordered_scan=true` share, and then `sorts=0` on partitions written entirely
+after the deploy.**
+
+`merges=1` on 31 of 100 also settles something: the multi-partition case is real,
+not theoretical, which is why the run collapse now pins a single ordered stream
+explicitly (`8efa0952`) instead of trusting `execute_stream`.
+
+Early and not yet claimable — young process — `dedup_bin_stage_timeouts_total` is
+**0 at 4 commits**, against **20 at 9 commits** on the previous build.
+
 ### Still open
 
 - `narrow_provider` declaring footer ordering (gated on EVERY selected file
