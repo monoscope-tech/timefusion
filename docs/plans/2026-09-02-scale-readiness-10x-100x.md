@@ -78,6 +78,13 @@ does not converge.
 - The sim is IO-free: it models scheduling, deadlines, splitting and coarsening,
   not object-store latency. It answers "does the policy keep up", not "how many
   milliseconds".
+- **Every completion in these runs is `BaseRollup`.** `synth:whale` is a
+  rollup-shaped queue, so this measures the ROLLUP path's scale behaviour, not
+  dedup or hot-tail packing. Those two were measured separately against prod
+  tonight (see `approaches-and-decisions.md`: dedup's expensive path has zero
+  staging timeouts, and its cheap probe backlog is draining 61 -> 7 groups per
+  phase). A real prod journal would exercise all ops in one run and is the
+  obvious next input.
 - `synth:whale` is a reproducible synthetic queue, not tonight's prod journal —
   the prod journal lives in object storage, not on the CapRover host's disk, so
   it could not be fetched under the read-only constraint.
