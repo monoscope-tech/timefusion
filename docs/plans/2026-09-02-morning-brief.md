@@ -25,6 +25,27 @@ The full evidence chain, including the wrong turns, is in
 
 ---
 
+## Decision 0 — Ship the instrument first (branch `maintenance-pool-stats`)
+
+`timefusion_stats` reports query-pool **usage** and the maintenance/coordinator
+pool **sizes** — but **not their usage**. Every decision below moves a
+maintenance memory limit, and none can currently be verified against the pool it
+moves: after shipping one, there is no way to see whether maintenance ended up
+closer to or further from its ceiling.
+
+Branch **`maintenance-pool-stats`** adds `maintenance_pool_used_bytes/_pct` and
+`coordinator_pool_used_bytes/_pct` — two closures over existing `RuntimeEnv`
+memory pools plus four stats rows, read-only, no behaviour change. Lint clean,
+tests pass.
+
+It also settles the memory-source question below with numbers instead of an
+argument: if maintenance runs near its ceiling while query reads 0%, the
+rebalance makes its own case.
+
+*Ship this before the three decisions.* "Ship the instrument before the fix" is
+what made `dedup_plan_shape` answer its question on the first prod unit and made
+`wal.replay_rows` price a restart.
+
 ## Decision 1 — Repair is serialized by a byte budget smaller than one bin
 
 **197 repair units, bulk-enqueued 2026-08-16, are claimed ~3,409 times a day and
