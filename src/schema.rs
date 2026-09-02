@@ -102,6 +102,21 @@ impl RollupSpec {
         (n > 0).then(|| n.checked_mul(mult)).flatten()
     }
 
+    /// The declared `min(timestamp)` measure that says WHICH row a `first`
+    /// measure's value came from — without it "earliest" is not recoverable
+    /// from the stored value alone, so the coarse tier could not merge.
+    ///
+    /// Resolved by convention rather than by a new field, exactly as `avg`
+    /// resolves to a sum/count pair. The filter must match too: "earliest row
+    /// in the bucket" and "earliest row MATCHING the filter" are different
+    /// rows, and it is the second one whose value was stored.
+    ///
+    /// `validate` refuses a spec without one, so the builder may treat `None`
+    /// here as "never validated".
+    pub(crate) fn first_companion(&self, measure: &RollupMeasure) -> Option<&RollupMeasure> {
+        self.measures.iter().find(|c| c.agg == "min" && c.column.as_deref() == Some("timestamp") && c.filter == measure.filter)
+    }
+
     fn validate(&self, source: &TableSchema) -> anyhow::Result<()> {
         const IDENTITY_FIELDS: [&str; 7] = ["project_id", "timestamp", "date", "id", "updated_at", "deleted", "rollup_generation"];
         let field = |name: &str| source.fields.iter().find(|f| f.name == name);
@@ -173,28 +188,14 @@ impl RollupSpec {
                 self.table_name(&source.table_name),
                 measure.agg
             );
-            // A `first` measure stores the earliest value in the bucket, which is
-            // only re-aggregable if something says WHICH row it came from. That
-            // something is an ordinary companion measure — `min` over
-            // `timestamp` carrying the SAME filter — resolved by convention
-            // rather than by a new field, exactly as `avg` resolves to a
-            // sum/count pair. Requiring it here means a spec that cannot be
-            // merged is rejected at load instead of silently building a tier
-            // whose coarse buckets are wrong.
-            //
-            // The filter has to match because "earliest row in the bucket" and
-            // "earliest row MATCHING the filter" are different rows, and it is
-            // the second one whose value was stored.
-            if measure.agg == "first" {
-                anyhow::ensure!(
-                    self.measures
-                        .iter()
-                        .any(|c| c.agg == "min" && c.column.as_deref() == Some("timestamp") && c.filter == measure.filter),
-                    "rollup {}: `first` measure `{}` needs a companion `{{agg: min, column: timestamp}}` measure carrying the same filter",
-                    self.table_name(&source.table_name),
-                    measure.name
-                );
-            }
+            // Refused at load rather than building a tier whose coarse buckets
+            // are wrong — see `first_companion` for why the pair is needed.
+            anyhow::ensure!(
+                measure.agg != "first" || self.first_companion(measure).is_some(),
+                "rollup {}: `first` measure `{}` needs a companion `{{agg: min, column: timestamp}}` measure carrying the same filter",
+                self.table_name(&source.table_name),
+                measure.name
+            );
             match (&measure.agg[..], measure.column.as_deref()) {
                 ("count", None) => {}
                 ("count", Some(column)) | ("sum" | "min" | "max" | "hll" | "first", Some(column)) => {
@@ -947,10 +948,7 @@ mod tests {
         // rows, and it is the second one whose value was stored -- so a
         // companion carrying a different filter cannot order this measure.
         let filter = "attributes___url___path <> ''";
-        assert!(
-            spec(vec![landing(Some(filter)), companion("at", None)]).validate(source).is_err(),
-            "the companion's filter must match the measure's"
-        );
+        assert!(spec(vec![landing(Some(filter)), companion("at", None)]).validate(source).is_err(), "the companion's filter must match the measure's");
         assert!(spec(vec![landing(Some(filter)), companion("at", Some(filter))]).validate(source).is_ok());
 
         // The stored value keeps the source column's own type -- it IS a value

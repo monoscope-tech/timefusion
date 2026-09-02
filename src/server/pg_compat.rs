@@ -169,19 +169,11 @@ impl SchemaProvider for PgCatalogOverlay {
     }
 }
 
-/// The cap this statement actually runs under.
-///
-/// `max_statement_secs` is the ceiling for a session that never says otherwise.
-/// A client could only ever lower it, which is the right default for
-/// interactive traffic and wrong for batch work: monoscope splits a billing
-/// cycle into one-day slices and pays 60 sequential round trips, purely because
-/// one aggregate over a high-volume project cannot finish inside 60s.
-///
-/// `batch_statement_secs` is how far a session may RAISE it by asking --
-/// `SET statement_timeout = '300s'` -- and nothing raises implicitly. A session
-/// that says nothing still gets `max_statement_secs`, and a session that asks
-/// for less still gets less. At the default of 0 this is exactly the old
-/// `min(client, server)`.
+/// The cap this statement actually runs under: `min(client, ceiling)`, where a
+/// session may raise the ceiling from `max_statement_secs` to
+/// `batch_statement_secs` only by ASKING for a longer timeout. Nothing raises
+/// implicitly, so a session that says nothing keeps the interactive cap. At
+/// `batch_statement_secs = 0` this is exactly `min(client, server)`.
 ///
 /// Deliberately not per-role: there is one pgwire credential
 /// (`CoreConfig::pgwire_user`), shared by the server, the background jobs and

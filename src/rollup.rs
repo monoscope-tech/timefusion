@@ -219,19 +219,6 @@ pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, pro
 /// A derived merge deliberately re-reads no filter: the base tier already
 /// applied it when the state was built, and applying it twice over an
 /// aggregated column is not the same predicate.
-/// The declared `min(timestamp)` measure that says which row a `first`
-/// measure's value came from. Matched on the filter as well as the aggregate,
-/// because "earliest row" and "earliest row matching the filter" differ.
-/// `RollupSpec::validate` rejects a spec without one, so a missing companion
-/// here means the spec was never validated.
-fn first_companion(spec: &RollupSpec, measure: &RollupMeasure) -> anyhow::Result<String> {
-    spec.measures
-        .iter()
-        .find(|c| c.agg == "min" && c.column.as_deref() == Some("timestamp") && c.filter == measure.filter)
-        .map(|c| c.name.clone())
-        .ok_or_else(|| anyhow::anyhow!("`first` measure `{}` has no companion min(timestamp) measure", measure.name))
-}
-
 fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool) -> anyhow::Result<String> {
     if derived {
         let expression = match measure.agg.as_str() {
@@ -245,7 +232,13 @@ fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool)
             // pick that NULL and poison the coarse bucket. `NULLS LAST` puts
             // those buckets after every real one, so they win only when there is
             // nothing else -- which is the correct answer.
-            "first" => format!("first_value({} ORDER BY {} NULLS LAST)", measure.name, first_companion(spec, measure)?),
+            "first" => format!(
+                "first_value({} ORDER BY {} NULLS LAST)",
+                measure.name,
+                spec.first_companion(measure)
+                    .ok_or_else(|| anyhow::anyhow!("`first` measure `{}` has no companion min(timestamp) measure", measure.name))?
+                    .name
+            ),
             _ => format!("SUM({})", measure.name),
         };
         return Ok(format!("{expression} AS {}", measure.name));
@@ -2626,10 +2619,9 @@ async fn route_with_spec(
             // applied to either leg, which is only sound for aggregates that
             // skip nulls over the guarded column -- and `first_value` does not:
             // it returns the earliest row's value even when that value is NULL.
-            "first_value" if null_guard.is_none() => (
-                Merge::First,
-                measure("first", column.as_deref()).zip(measure("min", Some("timestamp"))).map(|(first, at)| vec![first, at]),
-            ),
+            "first_value" if null_guard.is_none() => {
+                (Merge::First, measure("first", column.as_deref()).zip(measure("min", Some("timestamp"))).map(|(first, at)| vec![first, at]))
+            }
             _ => return Err(MissReason::NonDecomposableAggregate),
         };
         let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
@@ -2977,10 +2969,7 @@ mod tests {
     #[test]
     fn a_first_measure_builds_value_and_companion_over_the_same_rows() {
         let sql = build_partition_sql(&first_spec(), SOURCE, "p", "2026-01-15").expect("builds");
-        assert!(
-            sql.contains("first_value(attributes___url___path ORDER BY timestamp) FILTER (WHERE attributes___url___path <> '') AS landing_url"),
-            "{sql}"
-        );
+        assert!(sql.contains("first_value(attributes___url___path ORDER BY timestamp) FILTER (WHERE attributes___url___path <> '') AS landing_url"), "{sql}");
         assert!(sql.contains("MIN(timestamp) FILTER (WHERE attributes___url___path <> '') AS landing_at"), "{sql}");
     }
 
@@ -3033,10 +3022,7 @@ mod tests {
             "ordering by timestamp must pass the gate and decline only for want of a measure"
         );
         for refused in ["duration", "timestamp DESC"] {
-            assert!(
-                matches!(route(refused).await, Err(MissReason::NonDecomposableAggregate)),
-                "`ORDER BY {refused}` must still be refused outright"
-            );
+            assert!(matches!(route(refused).await, Err(MissReason::NonDecomposableAggregate)), "`ORDER BY {refused}` must still be refused outright");
         }
     }
 
