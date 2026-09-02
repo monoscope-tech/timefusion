@@ -91,6 +91,33 @@ limit is upstream of it, in how large a unit is allowed to be in the first place
    OOM restarts that manufacture duplicates
    (`2026-09-02-stop-manufacturing-duplicates.md`) — the memory work and the
    throughput work are one problem, and this is the measurement that shows it.
+   **The 50x change is concrete, and it costs no extra memory.** The binding
+   constraint is not the cgroup — heavy sorts run inside `heavy_share_bytes()`
+   (~4.98 GiB on prod), and each concurrent sort needs a slice ≥ **182 MB**
+   (a 150 MB widest indivisible otel batch + `ExternalSorterMerge`'s 32 MB
+   unspillable floor) or it *fails* instead of spilling. That sets a hard
+   ceiling on permits, independent of the cgroup:
+
+   | permits | per-sort slice of the 4.98 GiB heavy share | vs the 182 MB floor |
+   | --- | --- | --- |
+   | 10 (today) | 510 MB | OK |
+   | 20 | 255 MB | OK |
+   | 28 | 182 MB | exactly at the floor |
+   | 32 | 159 MB | **fails — a sort cannot spill below its floor** |
+
+   So **permits can double to 20 — which is exactly what the 50x sim needs — by
+   re-slicing the pool we already have**, not by buying memory. `config.rs` has
+   a test pinning the fan-in envelope (`permits × PER_SORT_BUDGET_BYTES`) at
+   exactly 20 GiB and demanding that any change "state the memory headroom that
+   pays for it": halving `PER_SORT_BUDGET_BYTES` from 2 GiB to 1 GiB alongside
+   the permit doubling keeps that envelope unchanged. `PER_SORT_BUDGET_BYTES` is
+   a spill *threshold*, not a reservation, which is why this is a re-slice rather
+   than an allocation.
+
+   **Not done tonight**: it is the OOM path, the envelope is deliberately
+   guarded, and at 1x–10x nothing needs it. It is a proposal with arithmetic
+   attached, for a human to weigh.
+
 3. **100x needs units to be SIZED, not split after they fail.** More workers
    cannot fix a unit that cannot finish. The lever is unit *width* chosen up
    front from a cost estimate, so a unit fits its budget by construction —
