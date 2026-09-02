@@ -117,3 +117,30 @@ Sources:
 - https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree
 - https://docs.peerdb.io/bestpractices/clickhouse_datamodeling
 - https://queryplane.com/blog/clickhouse-partition-by-order-by-primary-key-guide/
+
+### And why option 1 could NOT be shipped blind (11th refutation)
+
+`schemas/otel_logs_and_spans.yaml` documents what position 2 is for:
+
+> Point lookups on `id`/`trace_id`/`span_id` are served by bloom filters +
+> tantivy, and **`service_name` by the secondary sort column**.
+
+So `resource___service___name` sitting at position 2 is LOAD-BEARING for
+service-filtered pruning — one of the most common filters in an observability
+product. Moving `id` ahead of it trades a dedup win for a read regression on those
+queries. My earlier reading ("bloom filters and tantivy cover it") was wrong: that
+clause covers `id`/`trace_id`/`span_id`, not service.
+
+**This is a real trade, not an oversight to fix.** It needs numbers on both sides:
+
+1. Dedup gain: how much of a `run-unit --op Dedup` is the `SortExec` (the sort
+   OOMs a 1 GB pool on one 204 MB bin, so the ceiling is high).
+2. Read loss: re-run the latency matrix with a service-filtered shape, which the
+   existing matrix does not currently isolate.
+
+ClickHouse's own resolution suggests a third option worth pricing first: keep the
+sort dedup-key-leading AND recover service pruning from an index rather than the
+sort (bloom/tantivy already exist for other columns; a service bloom is cheap).
+That would get both, and is why their design separates sort key from index.
+
+Not shippable overnight in any variant: every path changes what queries read.
