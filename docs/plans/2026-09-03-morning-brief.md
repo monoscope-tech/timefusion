@@ -240,11 +240,45 @@ work class 0 and sealed work a worse class, and smaller tuples run first, so
 while frontier work keeps arriving sealed work waits. That is the already-known
 [sealed backlog does not drain] problem, not the admission boundary.
 
-**I am deliberately stopping the diagnosis here rather than guessing the exact
-rank term.** The next step is to run `most_indebted_unclaimed` (it exists
-precisely to answer "planned and never claimed") against one of these keys — but
-note it selects by `input.files`, and these have no input, so it may not even see
-them. That is itself a lead.
+### ROOT CAUSE FOUND: they are inside the [3 d, 31 d] starvation BAND, where `starved` ties
+
+My first guess was class starvation — sealed work losing to frontier forever.
+**The journal refutes that**: 350 day-wide dedup units HAVE completed, **312 of
+them at exactly MAX**, the identical signature to the stuck cohort. So this shape
+of unit runs fine. The discriminator is the slice's AGE:
+
+| | slice dates | age | outcome |
+|---|---|---|---|
+| **completed** day-wide, =MAX (350) | **Jul 18–25** | ~40–47 d | **run and complete** |
+| **stuck** day-wide, =MAX (297) | **Aug 16–19** | ~15–18 d | never claimed |
+
+And the constants explain it exactly (`maintenance_coordinator.rs`):
+
+```rust
+const STARVATION_MICROS: i64         =  3 * DAY;   // floor
+const STARVATION_HORIZON_MICROS: i64 = 31 * DAY;   // horizon
+```
+
+with the documented semantics: *"below the floor is worst, the whole
+[floor, horizon] band TIES, and each further DAY past the horizon is one step
+better."*
+
+So **`starved` does not discriminate at all inside [3 d, 31 d]** — every unit in
+the band carries the same value, the tie falls through to terms where fresh
+frontier work wins, and a sealed day-wide unit only becomes competitive once it
+ages **past 31 days**. July's units cleared because they are beyond the horizon.
+August 16–19 is *inside* the band, so it waits — and by this model it will start
+running around **Sep 16–19**, purely by ageing out.
+
+That is a ~2-week dead zone for exactly the work certification depends on, and it
+sits just past `QUERY_WINDOW_MICROS` (14 d), the window dashboards actually read.
+
+**Not fixed tonight, deliberately.** Ranking changes in this system have caused
+repeated outages (a width ordering starved narrow repair units; `-width`
+reversed starved the opposite end; K collapsing froze HotPacking), and the
+existing comments record that *"raising `STARVATION_MICROS` is the WRONG fix and
+was refuted locally."* This wants a waking human and a simulation run
+(`timefusion sim`) before any tuple change. It is the highest-value open item.
 
 **What this means for the three shipped changes:** all three remain correct and
 tested; none of them is retracted. But change 3's *benefit* is now unproven — it
