@@ -1578,3 +1578,46 @@ This is also the shape to watch after any of the three decisions ships: if a
 budget change works, `pending_dedup` should fall materially below ~1,400 rather
 than oscillating around it, because ~900 of that residue is the never-admissible
 population.
+
+## Where the memory for the budget fixes could come from: the query pool reads 0%
+
+Decisions 1 and 2 both raise a memory budget, and both then owe an answer to
+"paid for out of what?" — `budget.slack_mb` is **0**, so the committed budget has
+no headroom. The pool breakdown suggests where to look:
+
+| pool | MB | share of 61,440 MB committed |
+| --- | --- | --- |
+| `mem_buffer_hard` | 21,484 | 35% |
+| **`maintenance_pool`** | 16,964 | 28% |
+| **`query_pool`** | **16,384** | **27%** |
+| foyer + tantivy + df_metadata | 6,608 | 11% |
+| **`slack`** | **0** | — |
+
+**`query_pool_pct` read 0 across five consecutive samples**, while pgwire was
+serving ~5.3 queries/second (38,553 queries in 122 minutes) with a p50 latency of
+349 ms — so roughly 1.8 queries should be in flight at any instant. The query
+pool is the same size as the entire maintenance pool and shows no measured use.
+
+**Read this carefully, because it is easy to over-claim:**
+
+- These are DataFusion memory **pools** — reservation ceilings, not allocations.
+  A 16 GiB pool at 0% is not 16 GiB of wasted RSS.
+- But the partition is **static**. Query's 16,384 MB is unavailable to
+  maintenance even when queries are not using it, and `slack_mb = 0` means
+  nothing else can be borrowed either.
+- Five samples is a thin basis. A query-load spike could need that pool, and the
+  right measurement is a distribution over hours, not five points.
+- `plan_cache.hit_pct` is **100.0%** (37,223 hits / 18 misses), which plausibly
+  explains the low pool pressure: almost nothing is being planned, and cached
+  plans over small recent windows may never reserve.
+
+**Why it matters for the morning:** the three budget fixes need memory, and the
+obvious sources are all committed. If the query pool genuinely runs near zero at
+this workload, **rebalancing it toward maintenance is a cheaper answer than
+raising the cgroup** — and it directly funds the repair budget (needs +1,792 MB
+to reach 3,072) and the admission/sort-slice pair.
+
+**Do not act on five samples.** The measurement to take is `query_pool_pct` and
+`query_pool_used_bytes` sampled over a full dashboard-load cycle, including
+whatever the heaviest report does. That is a cheap, read-only, one-hour job and
+it converts "there might be memory over there" into a number.
