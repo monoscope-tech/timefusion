@@ -26,6 +26,33 @@ Prod is running my build and healthy. **One decision is left for you.**
 
 Detail: `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`.
 
+## CORRECTION you should read first
+
+Late in the night I got the **real prod journal** into the sim (the synthetic
+queue could not stand in for it), and it overturns the headline I had written
+from synthetic runs.
+
+`synth:whale` forces `mint_frontier = false` — it models a backlog with **no
+ongoing ingest at all**. On the real journal, 24 virtual hours, 10 workers:
+
+| run | pending after 24h | executions |
+| --- | --- | --- |
+| no new arrivals (`--no-mint`) | 21,544 → **18** | 1,594 |
+| ongoing ingest modelled | 21,544 → **16,431** | 21,088 |
+
+**The standing backlog is not our problem** — it drains to nothing in 1,594
+executions. **The arrival rate is.** With ingest modelled, 13x more work done
+still ends further behind than it started.
+
+So: **"10x keeps up" was too generous.** It means "a 10x-costlier *backlog*
+still drains", not "we keep up with 10x the traffic". The honest answer to *are
+we breaking a sweat at today's load* is, on the real queue with ingest
+modelled, **yes**.
+
+The scale-vs-concurrency findings below remain valid for what they measure —
+how unit cost and worker count interact on a backlog — and the 100x diagnosis
+(units too big, ~51% timeout rate invariant to concurrency) is unaffected.
+
 ## Scale readiness — measured, not asserted
 
 `timefusion sim synth:whale`, 24h virtual, prod's pinned 10 workers, 4 seeds:
