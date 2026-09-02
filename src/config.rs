@@ -220,6 +220,25 @@ const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// At 1.25 GiB `light_optimize_k` yields 5, plus the one repair permit = **6**
 /// — the measured optimum, and one rung below the measured cliff.
 const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
+/// Concurrent target-sized repair rewrites the repair budget must hold.
+///
+/// A repair unit is exactly ONE file (`coordinator_compaction_files` takes 1
+/// for Repair), so unlike every other lane it cannot be split to fit a budget —
+/// the budget must fit IT. The prior-art survey's rule 1 is that a compaction
+/// size cap is a MULTIPLE of the target file size, read from metadata: RocksDB
+/// `max_compaction_bytes = 25 x target_file_size_base`, IOx `max_compact_size`
+/// = 3x target, Iceberg `max-file-group-size-bytes`. Ours was **0.42x** the
+/// target once decoded, so no correctly-sized file ever fit and every unit's
+/// request clamped to the whole semaphore — repair serialized to ~1.2 rewrites
+/// an hour with 310 units queued (see `repair_budget_must_fit_one_target_sized_file`).
+///
+/// 2, not more, because what the 8 GiB coordinator pool is proven to hold is
+/// SIX concurrent sorts (`benches/rewrite_throughput.rs`, cliff at 8). The
+/// split moves from 5 light + 1 repair to 4 light + 2 repair — same envelope,
+/// still two rungs below the measured cliff — so this buys repair throughput
+/// without widening total concurrency. Raise it only alongside a bench that
+/// moves the cliff.
+const REPAIR_REWRITE_TARGET_FILES: usize = 2;
 /// Heavy maintenance's minimum share of the maintenance pool. 0.40, up from
 /// 0.25 — a REBALANCE inside the existing pool (total unchanged), following
 /// the workload: hot-tail packing (light share) converged once unstarved,
@@ -422,8 +441,20 @@ impl DerivedBudget {
     /// protecting — a bin larger than the budget takes all of it and still runs
     /// alone — while letting small bins share. It can only ADD concurrency, and
     /// never for two large bins.
+    ///
+    /// Its OWN constant, no longer `COORDINATOR_PER_SORT_BUDGET_BYTES`. Sharing
+    /// that one made the two numbers move together, and the other one is
+    /// `light_optimize_k`'s divisor: raising it to fix repair would have cut
+    /// hot-tail packing concurrency 2.4x, which is the 2026-09-01 outage in the
+    /// opposite direction (K 3 -> 1, zero HotPacking units claimed in 45 minutes
+    /// with 17 pending). Repair's holdback in `light_optimize_k` is what keeps
+    /// the two in step now.
+    ///
+    /// Derived from the target file size rather than written as a byte count, so
+    /// a change to what compaction produces cannot silently make repair
+    /// unrunnable again — which is exactly how it broke.
     pub fn repair_rewrite_budget_bytes(&self) -> usize {
-        COORDINATOR_PER_SORT_BUDGET_BYTES
+        REPAIR_REWRITE_TARGET_FILES * (crate::database::COORDINATOR_HOT_TARGET_BYTES as usize) * (crate::database::DECODED_BYTES_PER_COMPRESSED as usize)
     }
 
     /// The same budget in whole MiB, which is the unit the repair semaphore
@@ -523,14 +554,18 @@ impl DerivedBudget {
         // at all (prod 2026-09-01: zero HotPacking units in 45 minutes with 17
         // pending, and `compaction_permits_unavailable` 23 on a 35-minute-old
         // process against 9 over 5.8h before).
-        // MINUS one budget, held back for the repair lane. Repair draws on the
+        // MINUS the repair lane's holdback — now TWO budgets, because
+        // `repair_rewrite_budget_bytes` holds two target-sized files rather than
+        // a fraction of one. The total stays at the bench's measured optimum of
+        // six concurrent sorts; only the split moves (5 light + 1 repair ->
+        // 4 light + 2 repair). Repair draws on the
         // same coordinator pool but is NOT counted here — and since the liveness
         // clock let its units live for tens of minutes instead of dying at their
         // deadline, they now overlap the hygiene bins instead of being killed
         // before they could. Prod 2026-09-01: `Not enough memory to continue
         // external sort` on repair staging as soon as long-running units and
         // K=4 hygiene bins shared 8 GB sixteen ways.
-        let mem_bound = (self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES).saturating_sub(1);
+        let mem_bound = (self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES).saturating_sub(REPAIR_REWRITE_TARGET_FILES);
         let cpu_bound = self.cores / 4;
         mem_bound.min(cpu_bound).min(hot_project_count).max(1)
     }
@@ -2909,7 +2944,11 @@ mod tests {
         // budget was reserved out of it (see `light_optimize_k`) — repair draws
         // on the same coordinator pool and was never counted here.
         assert!((3..=11).contains(&k), "K={k} outside the expected 3..=11 range");
-        assert_eq!(k + 1, b.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES, "exactly one budget is held back for repair");
+        assert_eq!(
+            k + REPAIR_REWRITE_TARGET_FILES,
+            b.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES,
+            "exactly the repair lane's holdback is reserved out of light's share"
+        );
         // Envelope (permits x per-sort budget) is the invariant, not the raw
         // permit count — a prior fan-in OOM was about that product, and
         // asserting count alone misses permits raised without paying for them.
@@ -3062,13 +3101,17 @@ mod tests {
         let prod = DerivedBudget::from_limits(80 * GIB, 48);
         assert_eq!(
             prod.light_optimize_k(11),
-            prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES - 1,
-            "the memory term is the coordinator's pool, less the budget repair draws from it"
+            prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES - REPAIR_REWRITE_TARGET_FILES,
+            "the memory term is the coordinator's pool, less the budgets repair draws from it"
         );
         assert!(prod.light_optimize_k(11) > 1, "one permit shared by HotPacking and SealedConsolidation starves packing");
         // The bench's measured optimum: k hygiene permits + 1 repair = 6
         // concurrent rewrites, one rung below the 8-worker cliff.
-        assert_eq!(prod.light_optimize_k(11) + 1, 6, "the fleet must run at the measured optimum, not one rung either side");
+        assert_eq!(
+            prod.light_optimize_k(11) + REPAIR_REWRITE_TARGET_FILES,
+            6,
+            "the fleet must run at the measured optimum, not one rung either side — the light/repair SPLIT may move, the total may not"
+        );
         assert!(prod.light_optimize_k(11) < prod.cores / 4, "and the CPU term is not what binds on a big box");
     }
 

@@ -55,6 +55,10 @@ mod compact;
 mod maintain;
 mod write;
 
+/// The decode ratio every sort budget is denominated in — re-exported so
+/// `config` can DERIVE the repair budget from it rather than hand-copy a 12.
+pub(crate) use maintain::DECODED_BYTES_PER_COMPRESSED;
+
 /// Delta tables shared by default projects and partitioned by `project_id`.
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
@@ -1375,7 +1379,7 @@ fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Oper
 /// target 512 MiB even though the coordinator's five-minute deadline could not
 /// land that unit in production. Keeping both tiers at 256 MiB makes each
 /// rewrite deadline-safe and still satisfies the final sealed-file bound.
-const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+pub(crate) const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 const COORDINATOR_SEALED_TARGET_BYTES: i64 = 256 * 1024 * 1024;
 
 /// Rows one compaction bin may cover, alongside the byte budget.
@@ -20235,6 +20239,19 @@ mod tests {
         let a = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(small).expect("first small bin");
         assert!(Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(small).is_ok(), "two small repair bins must share the budget");
         drop(a);
+
+        // The case that was NEVER small: a repair unit is one whole file, and
+        // compaction deliberately produces `COORDINATOR_HOT_TARGET_BYTES`-sized
+        // ones. Priced exactly as the permit site prices it. Two must share, or
+        // repair serializes on its ordinary input — the 2026-09-02 starvation,
+        // where `want_mib=1280 budget_mib=1280` logged 243 times in three hours.
+        let target_sized = u32::try_from(maintain::estimated_decoded_bytes(COORDINATOR_HOT_TARGET_BYTES) / (1024 * 1024)).expect("fits u32");
+        let first = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(target_sized).expect("a target-sized file must fit the budget at all");
+        assert!(
+            Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(target_sized).is_ok(),
+            "two target-sized repair rewrites must share the budget ({target_sized} MiB each of {budget} MiB)"
+        );
+        drop(first);
         Ok(())
     }
 
