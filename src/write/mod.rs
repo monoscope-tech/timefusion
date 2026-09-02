@@ -3752,10 +3752,10 @@ mod tests {
         let (a, b) = (batch("a"), batch("b"));
 
         assert_eq!(landed_digest(&[a.clone(), b.clone()]), landed_digest(&[b.clone(), a.clone()]));
-        assert_ne!(landed_digest(&[a.clone()]), landed_digest(&[b.clone()]));
+        assert_ne!(landed_digest(std::slice::from_ref(&a)), landed_digest(std::slice::from_ref(&b)));
         // The XOR trap: two copies must not collapse to "nothing".
         assert_ne!(landed_digest(&[a.clone(), a.clone()]), None);
-        assert_ne!(landed_digest(&[a.clone(), a.clone()]), landed_digest(&[a.clone()]));
+        assert_ne!(landed_digest(&[a.clone(), a.clone()]), landed_digest(std::slice::from_ref(&a)));
         // No identity for an empty set — nothing to skip.
         assert_eq!(landed_digest(&[]), None);
     }

@@ -965,3 +965,39 @@ check — the opposite of where the failing assertion points.
 
 (`rollup_hits_*` are also incremented in `src/dml.rs` and
 `src/database/maintain.rs`; `src/observability.rs:840` is the sink.)
+
+## 2026-09-02 — the quiet-process measurement, and what it says
+
+42 minutes, ONE process, no deploys — the shape the earlier numbers lacked
+(`f57240fb`: I was the confounder, seven deploys against ~20-minute units).
+
+| 7-min interval | dedup commits | stage timeouts | pending_dedup |
+| --- | --- | --- | --- |
+| 10:27 → 10:34 | +6 | +20 | 1749 → 1729 |
+| 10:34 → 10:41 | +5 | +10 | → 1714 |
+| 10:41 → 10:48 | +3 | +10 | → 1712 |
+| 10:48 → 10:55 | +2 | +20 | → 1708 |
+| 10:55 → 11:02 | +2 | +10 | → 1791 |
+| 11:02 → 11:09 | +5 | +20 | → 1788 |
+
+**The climbing-timeouts alarm is retired.** On one process the timeout RATE is
+flat — ~14 per 7 minutes throughout, not accelerating. `840fd945` suspected the
+footer fix was making it worse via `regroup_for_declared_ordering`; this says
+otherwise, and the kill switch recorded there is not needed. What made it look
+like acceleration was comparing cumulative counters across processes of
+different ages, which `d426ac42` already withdrew.
+
+**What the numbers do say is worse, and it is the point of tonight's work:**
+23 dedup bins committed in 42 minutes (~33/hr) while `pending_dedup` went
+1749 → 1788. **The queue GREW.** At that rate the standing backlog is ~54 hours
+of work that is never fully paid off, which is the same "cannot shrink" finding
+as `tf_queue_cannot_shrink_2026-08-23`, now measured cleanly.
+
+Set against the 58%-self-inflicted finding, the arithmetic is the whole argument
+for the landed-batch skip: **removing our own duplicates from the input turns a
+queue that grows into one that drains, without making a single unit faster.**
+
+`replay_rows = 0` for all 42 minutes — this process booted cleanly, so it
+created no replay duplicates itself. The instrument is behaving; the value it
+reports on an UNCLEAN boot is the one that matters, and prod has not had one
+since it shipped.
