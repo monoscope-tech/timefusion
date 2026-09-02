@@ -155,6 +155,11 @@ async fn main() {
         return;
     }
 
+    if std::env::var("TF_BENCH_PRODSHAPE").is_ok() {
+        prod_shape(&path, pool_mb, bytes, spill.path()).await;
+        return;
+    }
+
     run("scan only".to_owned(), "8192", 1, 1, Shape::Scan).await;
     for batch in ["256", "2048", "8192"] {
         for partitions in [1usize, 8] {
@@ -188,6 +193,87 @@ async fn main() {
 /// on one `FairSpillPool`.
 ///
 /// ```bash
+/// Does PROD's actual coordinator shape survive? The `fleet` ladder cannot say.
+///
+/// `fleet` hands every worker the WHOLE file, so at 8 workers it drives
+/// `8 x 2,451 MB = 19.6 GB` of decoded work through an 8 GiB pool. A real
+/// coordinator job is admitted for at most `MAX_DECODED_BYTES` = 512 MiB, so
+/// prod's 16 jobs drive `16 x 512 MiB = 8 GB` through that same pool — **2.4x
+/// lighter per byte of pool** than the rung that failed. Quoting fleet's
+/// 8-worker failure as evidence about prod compares two different workloads.
+///
+/// This runs the honest shape: `workers` concurrent sorts, each over ONE
+/// `1/WINDOWS` time-window of the file (~490 MB decoded), sharing one pool.
+/// Pass criterion is `failed == 0`. The 6-worker fleet rung passed at 1.8x
+/// decoded-work-to-pool; this shape is 1.0x, so a clean result corroborates
+/// rather than surprises.
+async fn prod_shape(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) {
+    /// Windows the file is cut into; each worker takes one. Five puts a worker's
+    /// share near the 512 MiB admission ceiling for this file.
+    const WINDOWS: i64 = 5;
+    let workers: usize = std::env::var("TF_BENCH_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let shared = runtime(pool_mb * 1024 * 1024, spill);
+    // One probe context reads the bounds; the workers then filter without
+    // re-deriving them (and without each paying a min/max pass).
+    let (min, max) = {
+        use datafusion::execution::SessionStateBuilder;
+        let state = SessionStateBuilder::new().with_config(session("2048", 1)).with_runtime_env(Arc::clone(&shared)).with_default_features().build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.expect("register");
+        let batches = ctx.sql("SELECT min(timestamp), max(timestamp) FROM bin").await.expect("bounds").collect().await.expect("collect");
+        let at = |i: usize| {
+            use arrow::array::Array;
+            batches[0].column(i).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>().map(|a| a.value(0)).unwrap_or_default()
+        };
+        (at(0), at(1))
+    };
+    let width = (max - min + 1).max(1) / WINDOWS + 1;
+    let per_worker_mb = bytes as f64 / 1e6 * 12.0 / WINDOWS as f64;
+    println!("\n{workers} workers x ~{per_worker_mb:.0} MB decoded each = {:.1} GB through a {pool_mb} MB pool", per_worker_mb * workers as f64 / 1000.0);
+    let started = Instant::now();
+    let mut set = tokio::task::JoinSet::new();
+    for worker in 0..workers {
+        let (path, runtime) = (path.to_owned(), Arc::clone(&shared));
+        let (lo, hi) = (min + width * (worker as i64 % WINDOWS), min + width * (worker as i64 % WINDOWS + 1));
+        set.spawn(async move { one_window(&path, runtime, lo, hi).await });
+    }
+    let (mut failed, mut first) = (0usize, None);
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                failed += 1;
+                first.get_or_insert(error);
+            }
+            Err(error) => {
+                failed += 1;
+                first.get_or_insert(error.to_string());
+            }
+        }
+    }
+    println!("secs {:.1}   failed {failed} of {workers}", started.elapsed().as_secs_f64());
+    match first {
+        Some(error) => println!("VERDICT: FAIL — {}", error.lines().next().unwrap_or("")),
+        None => println!("VERDICT: PASS — prod's job count survives its own admitted load"),
+    }
+}
+
+/// One worker's window. Same shape as `one_rewrite`, bounded to a time range.
+async fn one_window(path: &str, runtime: Arc<RuntimeEnv>, lo: i64, hi: i64) -> Result<(), String> {
+    use datafusion::execution::SessionStateBuilder;
+    let state = SessionStateBuilder::new().with_config(session("2048", 1)).with_runtime_env(runtime).with_default_features().build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.map_err(|e| e.to_string())?;
+    let filter = format!(
+        " WHERE timestamp >= arrow_cast({lo}, 'Timestamp(Microsecond, Some(\"UTC\"))') AND timestamp < arrow_cast({hi}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
+    );
+    let mut stream = ctx.sql(&Shape::Sort.sql(&filter)).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;
+    while let Some(batch) = stream.next().await {
+        batch.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// The smallest per-job pool slice a dedup rewrite actually completes in.
 ///
 /// Sizes `COORDINATOR_JOB_POOL_BYTES`, which prod currently derives as

@@ -3653,7 +3653,27 @@ pub struct AdmissionController(Arc<Mutex<AdmissionState>>);
 fn occupancy_scaled_ceiling(available: u64, capacity: u64) -> u64 {
     /// A busy pool must still admit work this small, or hygiene starves.
     const FLOOR: u64 = MAX_DECODED_BYTES / 16;
-    let scaled = (u128::from(MAX_DECODED_BYTES) * u128::from(available) / u128::from(capacity.max(1))) as u64;
+    /// Free fraction at which the FULL cap is granted, as a divisor: 2 = half
+    /// free. ClickHouse grants its whole 150 GB merge cap at **8 free pool
+    /// entries of 16** — half free, not idle — and that detail is the whole
+    /// rule. Ours reached `MAX_DECODED_BYTES` only at `available == capacity`
+    /// exactly, which no working pool ever is, so every unit priced at exactly
+    /// `MAX_DECODED_BYTES` was refused forever. That is precisely what the
+    /// splitter produces (`byte_bounded_units` halves until a unit FITS the
+    /// constant) and what both admission sites clamp their request to, so the
+    /// gate excluded the design's own intended shape: reserve the maximum, then
+    /// hash-shard internally. Prod 2026-09-02 carried 365 dedup units at a
+    /// median of exactly 512.0 MiB, median age 14.6 days.
+    ///
+    /// Honest about the practical effect: at prod's ratios — at most
+    /// `coordinator_jobs x MAX_DECODED_BYTES` = 8 GiB reserved against a 60 GiB
+    /// capacity — this ceiling is now INERT until the pool is half reserved. It
+    /// is a backstop for a genuinely full pool, not a live throttle, and that is
+    /// the right division of labour: the job count already bounds the
+    /// monopolization the ceiling was written to stop, and it bounds it by
+    /// construction rather than by a race.
+    const FULL_CAP_AT_FREE_FRACTION: u128 = 2;
+    let scaled = (u128::from(MAX_DECODED_BYTES) * FULL_CAP_AT_FREE_FRACTION * u128::from(available) / u128::from(capacity.max(1))) as u64;
     scaled.clamp(FLOOR, MAX_DECODED_BYTES)
 }
 
@@ -6666,6 +6686,38 @@ mod tests {
         assert!(ceiling < MAX_DECODED_BYTES, "a busy pool must refuse a max-size unit");
         assert!(ceiling >= MAX_DECODED_BYTES / 16, "and still admit a small one");
         assert!(MAX_DECODED_BYTES / 16 <= ceiling, "a hygiene-sized unit must fit under the ceiling of a busy pool, or the fleet hot-loops on admission");
+    }
+
+    /// REPRODUCES the 2026-09-02 lockout: a unit priced at exactly
+    /// `MAX_DECODED_BYTES` must be admissible into a pool that is merely BUSY,
+    /// not idle.
+    ///
+    /// `byte_bounded_units` splits until a unit fits `MAX_DECODED_BYTES`, so its
+    /// output piles up AT that constant, and both admission sites clamp their
+    /// request to it — deliberately, because an oversized unit is meant to
+    /// reserve the maximum and then hash-shard ITSELF internally
+    /// (`split_time_task` declines to shard in the journal for exactly that
+    /// reason). But `MAX * available / capacity` is strictly less than `MAX`
+    /// whenever one byte is reserved, so the request the design intends as
+    /// "reserve the maximum and self-shard" was the one request the gate could
+    /// never grant.
+    ///
+    /// Prod 2026-09-02: 365 dedup units at a median of exactly 512.0 MiB, a
+    /// median age of 14.6 days, all `hash_shards = 1`; plus 94 base_rollup units
+    /// pinned at the 1-minute minimum slice width estimating 7.5 GiB each, hot
+    /// looping to 715 attempts on `admission_busy`.
+    ///
+    /// FAILS before the ceiling reaches `MAX` at a healthy free fraction.
+    #[test]
+    fn a_max_sized_unit_is_admitted_by_a_busy_pool_not_only_an_idle_one() {
+        const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
+        // One single unit reserved — the least busy a working pool can be.
+        let ceiling = super::occupancy_scaled_ceiling(CAPACITY - MAX_DECODED_BYTES, CAPACITY);
+        assert!(
+            ceiling >= MAX_DECODED_BYTES,
+            "a pool with ONE unit reserved refused a max-sized request (ceiling {ceiling} < {MAX_DECODED_BYTES}); \
+             every unit the splitter produces is priced at exactly that, so they can only ever run on a perfectly empty pool"
+        );
     }
 
     /// ClickHouse's rule: a busy pool admits only small work, so an oversized
