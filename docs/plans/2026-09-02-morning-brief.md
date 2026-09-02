@@ -69,6 +69,25 @@ window** (restart-insensitive), not on cumulative counters. For the same reason
 I did not read `pending_dedup` 1647 → 1538 as draining: those are two different
 processes.
 
+## The strongest number of the night, from the real prod journal
+
+I fetched the actual maintenance journal (78,741 tasks) read-only from the
+running container, which the synthetic runs could not stand in for.
+
+> **6.4% of units exceed the 2 GiB per-sort budget, and those units carry
+> 67.1% of all queued bytes.** (repair: 95.3% of its bytes; dedup: 76.9%.)
+
+Unit size is heavy-tailed to an extreme: a dedup unit's median is 0.30 GiB and
+its maximum is **1.1 TiB**. Each concurrent heavy sort gets a 510 MB slice.
+
+**This reframes the 100x work as a TODAY problem.** Two thirds of the current
+maintenance workload sits in units that individually do not fit the budget they
+run against — which explains why adding workers cannot help (the ~51% timeout
+rate is invariant to concurrency), and plausibly the 24% superseded rate too.
+The fix is the prior art above: bound unit size at SELECTION time using
+`estimated_decoded_bytes`, which the journal already carries and which nothing
+currently uses as a bound.
+
 ## What shipped tonight
 
 | area | change |
