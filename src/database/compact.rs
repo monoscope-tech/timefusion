@@ -1616,6 +1616,25 @@ impl Database {
                                 // loop's own progress bump cannot see most of the unit.
                                 // See `PlanProgress`.
                                 let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                                // Whether the ONE remaining sort survived. With the window gone
+                                // the rewrite's whole cost is this sort, and the delta-rs fork
+                                // already declares footer ordering on conforming files — so a
+                                // scan whose files all carry an honest `sorting_columns` should
+                                // plan a `SortPreservingMergeExec` and no `SortExec` at all.
+                                // Nothing reported which one prod actually gets, and the answer
+                                // decides whether there is a second 5x here or none.
+                                if shard == 0 {
+                                    let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string();
+                                    info!(
+                                        table = %table_name,
+                                        sorts = rendered.matches("SortExec").count(),
+                                        merges = rendered.matches("SortPreservingMergeExec").count(),
+                                        collapse = streaming_collapse,
+                                        ordered_scan = rendered.contains("output_ordering="),
+                                        event = "dedup_plan_shape",
+                                        "does the rewrite still pay a sort, or does the footer ordering carry it"
+                                    );
+                                }
                                 let _progress = crate::database::maintain::PlanProgress::watch(Arc::clone(&plan));
                                 let mut collapse = streaming_collapse
                                     .then(|| RunCollapse::new(&plan.schema(), &schema.dedup_keys, schema.dedup_tiebreak.as_deref()))
