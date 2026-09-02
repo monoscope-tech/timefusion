@@ -159,22 +159,23 @@ universally broken — 2,188 have completed — which fits the arithmetic exactl
 files under ~107 MiB compressed fit the budget and finish; target-sized 256 MiB
 files never can.
 
-**The mechanism PREDICTS the observed rate.** Serialized = one 40-minute rewrite
-at a time = **1.50 completions/hour**. Measured across two live journal replays
-~3h apart (spanning several restarts): `Repair/Complete` 2,188 → 2,192 =
-**1.33/hour — 0.89 of prediction**. Dedup drained at **35/hour over the same
-window, 26x repair**, on the same workers and pool. *(The 40-minute figure is
-documented in the code, not measured by me — so this is a consistency check
-against a stated duration, not a fully independent derivation.)*
+**Repair is doing NOTHING, not working slowly.** Over 12 hours of prod logs,
+**every** bin that reached the rewrite (staging) phase was ≤30 MB — and a repair
+unit is a **256 MB** file. **Not one repair rewrite staged**, against **177
+`repair_rewrite_permit_busy` bounces**. The `Repair/Complete` increments I first
+read as progress were units retiring through the already-sorted/verification
+path, not rewrites. *(This retracts an earlier "0.89x of predicted rate" claim of
+mine — it counted completions that were not rewrites. The corrected finding is
+stronger: the lane is fully stalled.)*
 
-**Verified four independent ways:**
+**Verified three independent ways:**
 
 | direction | evidence |
 | --- | --- |
 | source constants | 256 MiB x 12 = 3,072 MiB vs a 1,280 MiB budget |
 | prod logs | `want_mib=1280 budget_mib=1280`, 243 bounces in 3h |
 | journal data | 312 units, median **256 MiB**, one creation stamp |
-| observed rate | 1.33 completions/hour vs 1.50 predicted by serialization (**0.89x**) |
+| prod behaviour | **0 repair rewrites staged in 12h** vs 177 semaphore bounces |
 
 **Secondary (worth its own fix):** those stored estimates are **compressed**
 bytes in a field named `estimated_decoded_bytes` — missing the x12. It is stale
