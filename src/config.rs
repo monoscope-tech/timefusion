@@ -1384,6 +1384,13 @@ pub struct BufferConfig {
     /// a writer that committed after the last snapshot was written.
     #[serde_inline_default(8)]
     pub timefusion_delta_scan_depth: usize,
+    /// Decline a flush whose batch set is provably already committed (the
+    /// duplicates WAL replay manufactures after an unclean exit — see
+    /// `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`). Off until
+    /// staging proves it: the skip only fires after an unclean restart, which
+    /// cannot be induced on the read-only prod host.
+    #[serde_inline_default(false)]
+    pub timefusion_landed_skip_enabled: bool,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
@@ -1441,6 +1448,10 @@ impl BufferConfig {
     pub fn delta_scan_concurrency(&self) -> usize {
         self.timefusion_delta_scan_concurrency.max(1)
     }
+    pub fn landed_skip_enabled(&self) -> bool {
+        self.timefusion_landed_skip_enabled
+    }
+
     pub fn delta_scan_depth(&self) -> usize {
         self.timefusion_delta_scan_depth.max(1)
     }

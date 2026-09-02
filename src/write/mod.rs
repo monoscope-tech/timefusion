@@ -351,6 +351,56 @@ pub type DeltaWatermark = Vec<Option<walrus_rust::WalPosition>>;
 pub type DeltaWriteCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, DeltaWatermark) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> + Send + Sync>;
 
+/// Identity of a set of batches, used to decline a flush whose rows are
+/// provably already committed — the duplicates WAL replay manufactures after an
+/// unclean exit (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
+///
+/// SHA-256 per batch over its Arrow IPC bytes, combined by **wrapping 256-bit
+/// addition**. Three properties, each load-bearing:
+///
+/// - **Commutative**, so the digest is immune to batch ORDER. This is required,
+///   not a nicety: the original arrives interleaved across concurrent
+///   connections while replay reads shard-by-shard, so the order genuinely
+///   differs for content that is identical.
+/// - **Addition, not XOR.** XOR cancels in pairs, so two identical batches
+///   would digest the same as no batches at all — a skip of a real write.
+/// - **256-bit, not a 64-bit fast hash.** A collision here declines a write that
+///   should have happened, which is silent data loss. This runs once per flush,
+///   so the cost is irrelevant next to the parquet encode it guards.
+///
+/// The bytes hashed are the batch's **IPC round-trip fixed point**, not its
+/// current encoding. Measured, not assumed: a client-supplied batch and the
+/// same batch rebuilt from the WAL serialize to DIFFERENT bytes (28168 vs
+/// 26888 on a one-row otel span — the client's arrays carry slack the
+/// round-trip drops), while a second round-trip is byte-stable. Replayed
+/// batches are already at that fixed point; hashing it puts both paths on the
+/// same footing, and `a_replayed_bucket_reflushes_to_the_same_digest` fails
+/// without it.
+///
+/// `None` for an empty set (nothing to skip) and on any serialization failure —
+/// both mean "no identity", which declines the skip and flushes normally.
+pub(crate) fn landed_digest(batches: &[RecordBatch]) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if batches.iter().all(|b| b.num_rows() == 0) {
+        return None;
+    }
+    batches.iter().try_fold([0u8; 32], |mut acc, batch| {
+        let once = crate::write::wal::serialize_record_batch(batch).ok()?;
+        let canonical = crate::write::wal::deserialize_record_batch(&once)
+            .ok()
+            .map(crate::write::mem_buffer::compact_batch)
+            .and_then(|b| crate::write::wal::serialize_record_batch(&b).ok())?;
+        let digest = Sha256::digest(canonical);
+        let mut carry = 0u16;
+        for i in (0..32).rev() {
+            let sum = acc[i] as u16 + digest[i] as u16 + carry;
+            acc[i] = sum as u8;
+            carry = sum >> 8;
+        }
+        Some(acc)
+    })
+}
+
 /// One (project, table) group of a single flush tick, handed to the coalescing
 /// writer so all of them can share ONE Delta commit per physical table.
 pub struct FlushUnit {
@@ -3593,6 +3643,30 @@ mod tests {
     use super::*;
     use crate::support::test_helpers::{json_to_batch, test_span};
 
+    /// The three properties `landed_digest` is built on, each of which is a way
+    /// the skip could silently drop a real write if it were wrong.
+    ///
+    /// ORDER-INDEPENDENCE is the one the feature needs: the original flush sees
+    /// batches interleaved across concurrent connections, replay sees them
+    /// shard-by-shard, so identical content arrives in a different order.
+    ///
+    /// NO CANCELLATION is why the combiner is addition and not XOR — under XOR
+    /// a pair of identical batches digests to zero, indistinguishable from an
+    /// empty flush, and the skip would decline a write that must happen.
+    #[test]
+    fn landed_digest_is_order_independent_and_never_cancels() {
+        let batch = |id: &str| json_to_batch(vec![test_span(id, "span", "proj")]).unwrap();
+        let (a, b) = (batch("a"), batch("b"));
+
+        assert_eq!(landed_digest(&[a.clone(), b.clone()]), landed_digest(&[b.clone(), a.clone()]));
+        assert_ne!(landed_digest(&[a.clone()]), landed_digest(&[b.clone()]));
+        // The XOR trap: two copies must not collapse to "nothing".
+        assert_ne!(landed_digest(&[a.clone(), a.clone()]), None);
+        assert_ne!(landed_digest(&[a.clone(), a.clone()]), landed_digest(&[a.clone()]));
+        // No identity for an empty set — nothing to skip.
+        assert_eq!(landed_digest(&[]), None);
+    }
+
     /// The compaction brake must read the flush BACKLOG, not the WAL directory
     /// size. Prod 2026-07-29: on-disk WAL sat ~30GB (ingest rate × trim
     /// retention) against a 12GiB threshold, so the old signal was permanently
@@ -4144,6 +4218,69 @@ mod tests {
         assert!(stats.entries_replayed > 0, "aged un-flushed WAL entries were dropped instead of replayed");
         let rows: usize = layer.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 3, "acked rows lost: aged WAL entries were consumed without replay");
+    }
+
+    /// THE load-bearing assumption of the landed-batch skip
+    /// (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`): a bucket
+    /// rebuilt from the WAL must re-flush to the SAME digest as the original,
+    /// or the skip can never fire and the feature is inert.
+    ///
+    /// It is not obvious that it holds — replay reads shard-by-shard while the
+    /// original arrived as separate `insert` calls — which is exactly why
+    /// `landed_digest` combines per-batch hashes commutatively.
+    ///
+    /// Models the real producer: the commit LANDS (the callback sees the
+    /// batches and we digest them) but the process dies before the cursor
+    /// advances, so the entries are still in the WAL for the next boot.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_bucket_reflushes_to_the_same_digest() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("ld{test_id}"), format!("ld{test_id}"));
+
+        // Capture what the flush hands the writer, then fail the commit: rows
+        // stay in MemBuffer + WAL and the cursor never advances — the
+        // crash-after-commit-before-advance shape that manufactures duplicates.
+        let flush_and_digest = |layer: &mut BufferedWriteLayer| {
+            let seen: Arc<std::sync::Mutex<Vec<RecordBatch>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            layer.delta_write_callback = Some(Arc::new(move |_p, _t, batches: Vec<RecordBatch>, _w| {
+                sink.lock().unwrap().extend(batches);
+                Box::pin(async { Err(anyhow!("commit landed but this process never learned it")) })
+            }));
+            seen
+        };
+
+        let ts = crate::support::now_micros();
+        let rows = |ids: [&str; 2]| ids.into_iter().map(|id| crate::support::test_helpers::test_span_ts(id, "s", &project, ts)).collect::<Vec<_>>();
+
+        let original = {
+            let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+            let seen = flush_and_digest(&mut layer);
+            let layer = Arc::new(layer);
+            // Several separate inserts, so the bucket holds multiple batches
+            // and their ORDER is something replay could plausibly change.
+            for pair in [["a", "b"], ["c", "d"], ["e", "f"]] {
+                layer.insert(&project, &table, vec![crate::support::test_helpers::json_to_batch(rows(pair)).unwrap()]).await.unwrap();
+            }
+            let _ = layer.flush_all_now().await;
+            let batches = seen.lock().unwrap().clone();
+            assert!(!batches.is_empty(), "the flush never reached the writer — the test proves nothing");
+            landed_digest(&batches).expect("original flush must have an identity")
+        };
+
+        // Next boot: same WAL, nothing was drained, everything replays.
+        let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
+        let seen = flush_and_digest(&mut layer);
+        let layer = Arc::new(layer);
+        let stats = layer.recover_from_wal().await.unwrap();
+        assert!(stats.entries_replayed > 0, "nothing replayed — the test proves nothing");
+        let _ = layer.flush_all_now().await;
+        let replayed = landed_digest(&seen.lock().unwrap().clone()).expect("replayed flush must have an identity");
+
+        assert_eq!(original, replayed, "a replayed bucket must re-flush to the same identity, or the landed-batch skip can never fire");
     }
 
     /// Regression: prod 2026-07-08 OOM crash loop. WAL replay loaded the whole
