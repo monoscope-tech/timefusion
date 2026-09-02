@@ -153,3 +153,55 @@ cargo build
 ./target/debug/timefusion sim synth:whale --hours 24 --scale 10 --workers 10
 ./target/debug/timefusion sim synth:whale --hours 24 --scale 100 --workers 160
 ```
+
+## Prior art for the 100x lever: nobody splits after failure
+
+Our 100x failure is that a unit is too big to finish, times out, splits, and
+retries — and adding workers makes it *worse* because more oversized units run
+concurrently. That is a solved problem, and the solution is the opposite of what
+we do: **cap the unit size before selecting it, and shrink the cap as the pool
+fills.**
+
+**ClickHouse MergeTree** has exactly these knobs:
+
+| ClickHouse setting | what it does | our equivalent |
+| --- | --- | --- |
+| `max_bytes_to_merge_at_max_space_in_pool` (default 150 GB) | hard ceiling on the output size of any background merge — **a merge that would exceed it is never selected** | we have no size ceiling on unit selection; we discover the problem via a 900s deadline |
+| `number_of_free_entries_in_pool_to_lower_max_size_of_merge` | **as free pool slots run out, the maximum merge size is scaled DOWN** | we hold unit size constant and raise concurrency, which is what our 100x runs show failing |
+| `max_bytes_to_merge_at_min_space_in_pool` | a much smaller ceiling when resources are scarce | — |
+
+The second row is the important one. It is the direct answer to the measurement
+above: under pressure ClickHouse makes units **smaller**, not more numerous. Our
+100x runs are the empirical demonstration of why — 40 → 160 workers moved
+pending 139 → 44 while timeouts rose 2036 → 2758.
+
+ClickHouse also treats "take available memory into account when selecting parts
+to merge" as an open/handled concern rather than an afterthought
+([ClickHouse#16838](https://github.com/ClickHouse/ClickHouse/issues/16838)), and
+has a documented failure mode where a part grown beyond
+`max_bytes_to_merge_at_max_space_in_pool` becomes effectively unmergeable
+([#80681](https://github.com/ClickHouse/ClickHouse/issues/80681)) — worth
+knowing before we add a cap, because a cap without a way to handle
+already-oversized units creates immortal units. We have met that shape before
+(`tf_optimize_stripped_tags_make_files_immortal`).
+
+The LSM literature frames the same choice as compaction *granularity* and *data
+movement policy* being first-class design dimensions rather than constants
+([Sarkar et al., *Constructing and Analyzing the LSM Compaction Design Space*,
+VLDB 2021](http://vldb.org/pvldb/vol14/p2216-sarkar.pdf)), and compaction memory
+is normally budgeted explicitly alongside the memtable rather than hoped for
+([Luo & Carey, *Adaptive Memory Management in LSM-based Storage Systems*,
+VLDB 2021](https://vldb.org/pvldb/vol14/p241-luo.pdf)).
+
+**What this suggests for us, concretely:**
+
+1. Give unit selection a **byte ceiling**, so a unit is sized to fit its budget
+   rather than discovering the budget by timing out. The byte preflight the sim
+   already exercises is the natural place — today it can refuse a unit; this
+   would let it *size* one.
+2. Make that ceiling a **function of free permits**, so the system degrades to
+   smaller units under load instead of to more timeouts.
+3. Keep an escape hatch for units already larger than the ceiling, or they
+   become immortal.
+
+None of this is needed below 50x, and none of it was built tonight.
