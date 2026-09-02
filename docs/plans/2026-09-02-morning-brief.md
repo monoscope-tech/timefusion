@@ -26,7 +26,7 @@ The sections are numbered by how I found them; this is how I would act on them:
 | --- | --- |
 | **1st — Decision 0** (pool instrument) | Without it, no budget change below can be verified after shipping. Two read-only rows, branch ready. |
 | **2nd — Decision 2** (admission + sort slice) | The only one evidenced as a **priority**, not just a defect: dedup is ~96% of maintenance time, **58.7% of it can never be admitted**, and 245 of what does enter fails its sort. 1,362 actionable units affected. |
-| **3rd — Decision 1** (repair budget) | Evidenced as a **defect** beyond doubt (0 rewrites in 12h, 177 bounces, four converging lines) but **unevidenced as a priority** — nothing measures what the stalled lane costs on the read path. Cheap and derivable, so it may still be worth doing first on effort grounds; just do not confuse the volume of evidence with urgency. |
+| **2nd= — Decision 1** (repair budget) | 0 rewrites in 12h, 177 bounces. I first ranked this lower for lacking a cost metric — **that was wrong**: `UnsortedFallback`'s own docs state that ONE unsorted file *"voids the declared ordering for every scan touching that partition, dropping DedupExec to its unbounded full-set seen-set… the cost is permanent"*, and prod has previously reached **55% of active files unsorted**. The damage is partition-wide, permanent, and **memory-shaped on the read path** — so it also feeds the OOM restarts Decision 3 insures against. Cheap and derivable. |
 | **4th — Decision 3** (landed-skip flag) | Insurance against OOM-driven restarts. `replay_rows` was 0 on every restart tonight, so it is currently inert — its value rises as the memory ceiling bites, i.e. after the above. |
 
 A second instrumentation gap is worth fixing alongside Decision 0: **nothing

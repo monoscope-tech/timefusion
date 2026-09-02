@@ -1828,3 +1828,41 @@ an ordering because a file it selected lacks the sort tag.
 That is a cheap addition of the same shape as Decision 0, and it converts
 "repair is starved" into "repair being starved costs N sorts per hour". Without
 it, Decision 1 is well-evidenced as a *defect* and unevidenced as a *priority*.
+
+### CORRECTION to my own ranking: the cost of unrepaired files IS documented, and it is severe
+
+I ranked Decision 1 third on the grounds that repair is "evidenced as a defect,
+unevidenced as a priority" — nothing counts what the stalled lane costs. That was
+right about the *counter* and wrong about the *evidence*. The cost is written
+down in `UnsortedFallback`'s own documentation:
+
+> *"An unsorted file declares no `sorting_columns` footer, and the reader's
+> `derive_common_ordering` is **all-or-nothing** — ONE of them voids the declared
+> ordering for **every scan touching that partition**, dropping `DedupExec` to
+> its unbounded `full-set` seen-set. Nothing ever re-sorts a converged file, so
+> the cost is permanent. Prod reached **1,263 of 2,290 active files unsorted
+> (55%, 20 projects)**; the median one was 712 MB."*
+
+Three things follow, and they raise Decision 1's priority:
+
+1. **The damage is per-PARTITION, not per-file.** A single unsorted file voids
+   the declared ordering for every scan over its partition. 310 suspect files
+   could therefore poison far more than 310 files' worth of reads.
+2. **The failure mode is memory, on the READ path.** Losing the declared ordering
+   drops `DedupExec` to an unbounded seen-set — which connects the stalled repair
+   lane directly to query-side memory pressure, and thus to the OOM restarts that
+   manufacture duplicates (Decision 3). The three decisions are more coupled than
+   I had them.
+3. **"Nothing ever re-sorts a converged file"** — except repair, which is the lane
+   doing zero rewrites. Repair is the *only* mechanism that undoes this, and it is
+   stalled.
+
+**Revised ranking:** Decision 1 moves up. It is not merely a defect with unknown
+cost; its cost is documented as permanent, partition-wide, and memory-shaped. The
+missing counter would *quantify* it, not establish it.
+
+**What I got wrong and why it is worth recording:** I treated "no metric" as "no
+evidence" and nearly deprioritised a documented, permanent, partition-wide read
+regression on that basis. **The absence of a counter is not the absence of a
+cost** — and in a codebase this heavily commented, the cost may already be
+written down next to the code that causes it.
