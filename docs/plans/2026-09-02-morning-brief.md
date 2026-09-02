@@ -55,13 +55,33 @@ is admitted ~5x underpriced, refused on the real price, and requeued *unchanged*
 **No value of the repair budget fixes this**, because the unit is priced one way
 to get in and another way to run.
 
-- **Fix shape (cheapest first):** (1) price admission on the same number the
-  semaphore uses; (2) re-measure/split repair the way dedup does. Raising the
-  budget alone treats the symptom.
-- **Caveat:** repair rewrites WHOLE FILES by design, so "split the unit" may not
-  be expressible for it — which would make (1) the real fix. Needs a read of the
-  repair rewrite before committing.
-- **Status:** not implemented.
+**RESOLVED — it is three constants that cannot all be true.** A repair unit is
+exactly one file (`.take(1)`), so it cannot be split. Then:
+
+| constant | value | where |
+| --- | --- | --- |
+| `COORDINATOR_HOT_TARGET_BYTES` | **256 MiB** compressed | `database/mod.rs:1378` |
+| `DECODED_BYTES_PER_COMPRESSED` | **x12** | `maintain.rs:150` |
+| repair budget | **1,280 MiB** decoded | `config.rs:222` |
+
+```
+one target-sized file = 256 MiB x 12 = 3,072 MiB  ->  2.4x the whole budget
+```
+
+**A file that compaction produced exactly as intended cannot fit the repair
+budget.** Only files under 107 MiB compressed fit — i.e. ones compaction
+considers too small. So repair is serialized **by construction**, and the "bins
+below the budget share it" case the byte-pricing change was written for cannot
+occur for any correctly-sized file. It was correct in intent and inert in
+practice: the comment reasoned about a pathological 28 GB bin and missed that
+the *ordinary* bin is also over budget.
+
+- **Fix is derivable, not guessed:** to let `N` repair rewrites share, the budget
+  must be ≥ `N x 256 MiB x 12` — **3,072 MiB for one**, 6,144 for two.
+- **Judgement required:** only how much memory repair may hold, given admission
+  (Decision 2) draws on the same pool.
+- **Status:** not implemented. Needs no new measurement — the numbers are
+  constants in the source.
 
 **A data problem worth fixing on its own:** these tasks' stored
 `estimated_decoded_bytes` median is **0.25 GiB** while runtime pricing of the
