@@ -80,8 +80,22 @@ the *ordinary* bin is also over budget.
   must be ≥ `N x 256 MiB x 12` — **3,072 MiB for one**, 6,144 for two.
 - **Judgement required:** only how much memory repair may hold, given admission
   (Decision 2) draws on the same pool.
-- **Status:** not implemented. Needs no new measurement — the numbers are
-  constants in the source.
+- **Status:** not implemented. Needs no new measurement.
+
+**Verified three independent ways:**
+
+| direction | evidence |
+| --- | --- |
+| source constants | 256 MiB x 12 = 3,072 MiB vs a 1,280 MiB budget |
+| prod logs | `want_mib=1280 budget_mib=1280`, 243 bounces in 3h |
+| journal data | 312 units, median **256 MiB**, one creation stamp |
+
+**Secondary (worth its own fix):** those stored estimates are **compressed**
+bytes in a field named `estimated_decoded_bytes` — missing the x12. It is stale
+data, not a live planner bug (today's planner applies the multiplier correctly),
+but **admission decides on the stored number**: 256 MiB clears the 512 MiB
+ceiling while the work it authorises costs 3,072 MiB. `clear_stale_estimates`
+exists for exactly this class; this cohort appears to have escaped it.
 
 **A data problem worth fixing on its own:** these tasks' stored
 `estimated_decoded_bytes` median is **0.25 GiB** while runtime pricing of the
