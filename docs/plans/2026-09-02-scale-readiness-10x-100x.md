@@ -2083,3 +2083,51 @@ the budget is not the bug and raising it fixes nothing. If it reads less than
 **That check should precede Decision 1.** Raising a budget that is never fully
 available would be a change with no effect — and would look, from the queue, like
 the fix simply did not work.
+
+## CONFOUND in my own headline evidence: tonight was abnormally deploy-heavy
+
+The permit-leak hypothesis above is weak on Rust semantics — an
+`OwnedSemaphorePermit` releases on drop, so a genuine leak needs `mem::forget`
+or a cycle. There is a simpler explanation, and it undercuts part of my own
+strongest claim.
+
+**Restart history tonight** (`docker service ps`): ~40 min ago, ~1 hour ago,
+4 hours ago, 4 hours ago — **a restart roughly every 40–60 minutes**, driven by
+another session deploying to master repeatedly.
+
+**A repair rewrite takes 40+ minutes** (documented, and consistent with the
+"one 40-minute rewrite" comment). So tonight a repair rewrite essentially
+*could not* complete: it needs more uninterrupted time than the process was
+given. That alone produces "zero repair rewrites staged", with or without a
+budget problem.
+
+**So "zero rewrites in 12h" conflates two causes**, and I stated it as evidence
+for one:
+
+1. **the byte budget** — every unit clamps to the whole semaphore, so they
+   serialize (well-evidenced: 177 bounces, the constants arithmetic), and
+2. **restart cadence** — a serialized 40-minute rewrite cannot finish inside a
+   40–60 minute process lifetime (this night specifically).
+
+This is the repo's own documented failure mode
+(`tf_units_die_to_restarts`, `tf_deploy_cadence_starves_dedup`: "units average
+~21 min and die to PROCESS EXIT"), and I walked into it while measuring.
+
+**What survives unqualified:**
+
+- The constants arithmetic (256 MiB x 12 = 3,072 vs 1,280) — pure source, no
+  runtime dependence.
+- The 177 `repair_rewrite_permit_busy` bounces in 3 hours — those are refusals
+  to *start*, unaffected by whether a started rewrite would have survived.
+- The 310-unit queue persisting across restarts.
+
+**What is now uncertain:** how much of "repair never completes" is the budget
+versus the deploy cadence. **The clean measurement is a quiet window** — several
+hours with no deploys — which is exactly what
+`tf_prod_counters_need_a_quiet_process` says to require, and exactly what tonight
+did not have.
+
+**Practical consequence for Decision 1:** do not judge the fix by "did repair
+start completing" on a day with hourly deploys. Judge it by
+`repair_rewrite_permit_busy` falling and `wave_bin_staged` appearing for
+256 MB-class inputs, measured over a quiet window.
