@@ -160,6 +160,40 @@ Both are committed and re-runnable.
 - **`scan.dedup_full_set_pct`** — a file property, restart-proof. Was 8.7% at
   the start of the night.
 
+## NEW — an unexamined DataFusion default is capping every maintenance spill at 100 GB
+
+Found while watching the deploy, and it is the most 100x-relevant thing tonight.
+
+```
+WARN maintenance-worker: Light optimize staging failed for project=87576849…
+  Resources exhausted: The used disk space during the spilling process has
+  exceeded the allowable limit of 100.0 GB
+```
+
+`build_spill_runtime_env` (`database/write.rs:50`) constructs
+`DiskManagerBuilder::default()`. **100 GB is DataFusion's own default
+`max_temp_directory_size`; we never chose it.** So every maintenance spill —
+dedup, rollup, packing, repair — is bounded by a number nobody in this codebase
+picked, and the whale project is already hitting it on the light-optimize path.
+
+Prod has room: the data volume is **1.8 T with 504 G available**. A 100 GB cap
+against 504 GB free is not a safety margin, it is an accident.
+
+**Why it matters for the 100x question specifically.** This is the same failure
+shape as every other finding tonight — a fixed ceiling that a bigger tenant
+crosses sooner — except this one is *not even ours*. It also fails in the most
+expensive possible way: the spill limit is reached after the sort has already
+done its scan and merge work, so the unit burns its full cost and then throws
+the result away.
+
+**Morning decision.** `DiskManagerBuilder::with_max_temp_directory_size(...)`,
+sized from the volume rather than inherited. Not shipped tonight: it is a
+behaviour change, the admission fix landed three minutes before I found it, and
+stacking them would make neither attributable. Also note the local irony — my own
+benching filled this laptop's disk to 100% tonight and faked a memory failure, so
+whatever number is chosen should be derived from free space with headroom, not
+set to "large".
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
