@@ -194,7 +194,6 @@ use datafusion_postgres::{
 };
 use futures::{Sink, StreamExt, TryStreamExt, stream};
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use tracing::{Instrument, error, field::Empty, info, instrument, warn};
 
 use crate::{
@@ -973,8 +972,12 @@ fn query_template(query: &str) -> String {
     if query.chars().count() <= MAX_CHARS { query } else { query.chars().take(MAX_CHARS).chain(['.'; 3]).collect() }
 }
 
+/// Identity of a normalized query, for tracing and metrics only — never
+/// persisted and never a security boundary, so it uses the same XXH3 as the
+/// rest of the codebase rather than a cryptographic hash. (It was SHA-256,
+/// which bought nothing here and cost a full digest on every query.)
 fn query_fingerprint(query: &str) -> String {
-    format!("{:x}", Sha256::digest(normalized_query(query).as_bytes()))
+    format!("{:032x}", twox_hash::XxHash3_128::oneshot(normalized_query(query).as_bytes()))
 }
 
 /// Classify `query` and stamp the standard query/db tracing fields onto `span`.

@@ -3281,6 +3281,9 @@ const FORMAT_VERSION: u32 = 1;
 /// tables (active ones rewrite theirs every flush).
 pub const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// FROZEN HASH: this names a FILE on disk, so changing the hasher orphans
+/// every existing snapshot sidecar (a cold-start cost, not corruption, but a
+/// real one). Not part of the XXH3 sweep for that reason.
 fn path_for(dir: &std::path::Path, table_url: &str) -> std::path::PathBuf {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut h = DefaultHasher::new();

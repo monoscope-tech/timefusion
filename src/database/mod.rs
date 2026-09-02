@@ -2005,6 +2005,11 @@ const DEDUP_SCAN_NAME: &str = "__dedup_src";
 
 /// Order-insensitive fingerprint of a partition's live file set (read-side
 /// dedup skip): sorted-uris hash, so any add/remove/rewrite changes it.
+///
+/// FROZEN HASH: this value is PERSISTED in the certification sidecar as the
+/// proof of which file set was proved clean, so changing the hasher silently
+/// invalidates every certification and resets hard-won coverage to zero. Not
+/// part of the XXH3 sweep.
 fn partition_file_fp(mut files: Vec<String>) -> u64 {
     use std::hash::{Hash, Hasher};
     files.sort();

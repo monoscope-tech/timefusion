@@ -322,6 +322,9 @@ pub(crate) fn build_cohort_sql_range_mode(
     ))
 }
 
+/// FROZEN HASH: this IS the persisted bucket id in rollup slices, so changing
+/// the hasher orphans every rollup ever written — the same failure as changing
+/// a spec name. Not part of the XXH3 sweep.
 fn generated_bucket_id(bucket: i64, grain: i64, generation: &str, dimensions: &[datafusion::scalar::ScalarValue]) -> String {
     use std::hash::{Hash, Hasher};
 

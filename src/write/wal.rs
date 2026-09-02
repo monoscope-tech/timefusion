@@ -428,7 +428,7 @@ impl WalManager {
     /// poisoned lock carries no invalid state and is safe to recover.
     fn append_lock(&self, walrus_key: &str) -> std::sync::MutexGuard<'_, ()> {
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = twox_hash::XxHash3_64::default();
         walrus_key.hash(&mut h);
         let idx = (h.finish() as usize) % self.append_locks.len();
         self.append_locks[idx].lock().unwrap_or_else(|e| e.into_inner())

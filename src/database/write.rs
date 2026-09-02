@@ -1339,8 +1339,8 @@ impl Database {
     /// Stable per-table offset into the reconcile cycle so tables committing in
     /// lockstep don't all hit their `% reconcile_n == 0` boundary together.
     fn reconcile_offset(project_id: &str, table_name: &str, reconcile_n: u64) -> u64 {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut h = DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        let mut h = twox_hash::XxHash3_64::default();
         (project_id, table_name).hash(&mut h);
         h.finish() % reconcile_n
     }

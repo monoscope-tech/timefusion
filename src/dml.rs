@@ -2451,7 +2451,7 @@ struct PendingGroup {
 /// one MERGE: join keys, assignment exprs, residual predicate conjuncts
 /// (order-insensitive), and the source schema.
 fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Expr)], residual: &[Expr], schema: &SchemaRef) -> u64 {
-    let mut h = std::hash::DefaultHasher::new();
+    let mut h = twox_hash::XxHash3_64::default();
     join_keys.hash(&mut h);
     for (c, e) in assignments {
         (c, e.to_string()).hash(&mut h);
@@ -2592,7 +2592,7 @@ fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGr
         },
     );
 
-    let mut h = std::hash::DefaultHasher::new();
+    let mut h = twox_hash::XxHash3_64::default();
     shape_fp.hash(&mut h);
     projects.hash(&mut h);
     let key = GroupKey { project_id: rep_key.project_id.clone(), table_name: table_name.to_string(), fingerprint: h.finish() };

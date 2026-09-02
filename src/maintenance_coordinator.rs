@@ -456,6 +456,10 @@ pub struct InputFootprint {
 impl InputFootprint {
     /// Fingerprint a selected file set. Order-independent (a snapshot's file
     /// order is not stable), so two units over the same files agree.
+    ///
+    /// FROZEN HASH: persisted in the task journal, so a change makes every
+    /// in-flight unit's footprint stop matching its own journal entry. Not part
+    /// of the XXH3 sweep.
     pub fn new<I: IntoIterator<Item = S>, S: AsRef<str>>(paths: I, whole_file_bytes: u64) -> Self {
         use std::hash::{Hash, Hasher};
         let (fp, files) = paths.into_iter().fold((0u64, 0u32), |(acc, count), path| {
