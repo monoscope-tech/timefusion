@@ -271,6 +271,23 @@ experiment in miniature today.
 
 ---
 
+## Where the memory comes from (open, cheap to close)
+
+Decisions 1 and 2 both raise a memory budget, and `budget.slack_mb` is **0** —
+nothing is spare. But `query_pool` is **16,384 MB, 27% of the committed budget,
+and read 0% across five samples** while pgwire served ~5.3 queries/sec
+(`plan_cache.hit_pct` is 100.0%, which plausibly explains the low pressure).
+
+These are reservation ceilings, not allocations, so 0% is not wasted RSS — but
+the partition is **static**, so that 16 GB is unavailable to maintenance
+regardless of query load.
+
+**Five samples is too thin to act on.** The follow-up is cheap and read-only:
+sample `query_pool_pct` across a full dashboard-load cycle. If it runs near zero,
+rebalancing toward maintenance funds the repair budget (needs **+1,792 MB** to
+reach 3,072) without touching the cgroup — which is otherwise the awkward part of
+both decisions.
+
 ## What shipped
 
 | area | change |
