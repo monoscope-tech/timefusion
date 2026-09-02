@@ -299,7 +299,7 @@ async fn slice_floor(path: &str, bytes: u64, spill: &std::path::Path) {
     const DECODED_PER_COMPRESSED: f64 = 12.0;
     let decoded_mb = bytes as f64 / 1e6 * DECODED_PER_COMPRESSED;
     println!("\ndecoded ~{decoded_mb:.0} MB at {DECODED_PER_COMPRESSED:.0}x — the size every budget prices this work at");
-    println!("{:<12} {:>8} {:>11} {:>9}  {}", "pool MB", "secs", "rows", "pool/dec", "outcome");
+    println!("{:<12} {:>8} {:>11} {:>9}  outcome", "pool MB", "secs", "rows", "pool/dec");
     // Descending: the first failure is the floor, and everything below it is
     // known-bad, so a failed rung does not end the sweep — a pool can fail for
     // reasons other than size and that must be visible, not inferred.
