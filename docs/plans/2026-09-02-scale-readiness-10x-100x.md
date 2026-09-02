@@ -516,3 +516,67 @@ table — the restart-driven re-invalidation the sim models explicitly (~13 task
 per stream per restart), and the self-inflicted duplicate work in
 `2026-09-02-stop-manufacturing-duplicates.md`. Both reduce arrivals rather than
 trying to consolidate them after the fact.
+
+## The arrival side, quantified: maintenance scales with STREAMS, not bytes
+
+Having ruled out the fusion ceiling, the arrival side is where the flow problem
+lives. Its model is simple and structural (`mint_stream`, `MINT_INTERVAL_MICROS`):
+
+> **Every 10 minutes, every stream mints 2 invalidations** (base + derived
+> rollup).
+
+The journal has **124 distinct `(source, project)` streams**. So the nominal
+mint rate is:
+
+```
+124 streams x 2 tasks x 144 ten-minute windows = 35,712 tasks/day
+```
+
+Against that, the sim's 24 hours did **21,088 executions** and moved pending
+only 21,544 → 16,431 — a drop of 5,113. So roughly **16,000 tasks of new work
+were absorbed during the run** (the gap between nominal 35,712 and observed
+~16,000 is subsumption and invalidation-merging doing their job: 975 subsumed,
+plus `invalidate` extending an existing task instead of creating one).
+
+**The important property is the shape, not the exact number:**
+
+> Maintenance arrival is **linear in stream count and independent of data
+> volume.** A stream ingesting one row per 10 minutes mints exactly as many
+> tasks as the whale.
+
+That is the direct answer to "more concurrent customers and users":
+
+| | maintenance tasks/day (nominal) |
+| --- | --- |
+| today, 124 streams | 35,712 |
+| 10x customers | **357,120** |
+
+Note this is a *different* axis from everything earlier in this document.
+`--scale` models bytes-per-unit — 10x the data from the *same* customers. Stream
+growth multiplies the unit COUNT instead, and unit count is precisely what
+coarsening was supposed to control and provably cannot (previous section).
+
+So the two scaling axes decompose cleanly:
+
+- **the whale determines per-unit COST** (6.4% of units, 67.1% of bytes)
+- **stream count determines unit COUNT** (2 per stream per 10 minutes)
+- the flow problem is `count x cost > capacity`, and **only the count side grows
+  with customers**
+
+### Which makes mint granularity the lever the data actually points at
+
+`MINT_INTERVAL_MICROS` is `NORMAL_SLICE_MICROS` = **10 minutes**. It is a
+constant, and it multiplies the arrival rate directly: minting hourly instead
+would cut nominal arrivals **6x** (35,712 → 5,952/day), which is below the
+measured execution rate rather than above it.
+
+That is not a free change and should not be made casually — coarser
+invalidation means rollups refresh less often, i.e. dashboard staleness, and
+`NORMAL_SLICE_MICROS` is load-bearing elsewhere (it is also `SUBSUME_WIDTHS[0]`).
+But it is the first lever found tonight that acts on the quantity that actually
+outruns capacity, and unlike the fusion ceiling it has not been refuted — it
+should be priced in the sim before anything else.
+
+**Restart cadence is NOT a significant contributor**, tested: restarts every 24h
+gave pending 16,264 vs 16,320 with none — within noise. The ~13-tasks-per-stream
+re-invalidation a restart causes is real but small next to 144 mint cycles a day.
