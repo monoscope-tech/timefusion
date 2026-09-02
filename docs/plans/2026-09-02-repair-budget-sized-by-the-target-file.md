@@ -85,6 +85,25 @@ starvation zone — and ~8.3 GiB of true demand against an 8 GiB share.
 Expected: ~1.2 -> ~3 large rewrites/hour, 310 units in ~4.3 days instead of ~11.
 Raise it again only alongside a bench that moves the cliff.
 
+**How much this actually buys depends on the queue's size distribution, and that
+is the honest uncertainty here.** 24h of retained staging logs show 17 staged
+bins, only **2** of repair class (>100 MB), with inputs of 584 MB and 899 MB
+compressed. Those decode to ~7 GB and ~10.8 GB — still over the new 6,144 MiB
+budget, so they will keep clamping to the whole semaphore and running alone.
+That is correct behaviour, not a miss: they are larger than anything compaction
+produces today, so the clamp is doing exactly the job it was written for.
+
+What changes is the ORDINARY case — a file at the 256 MiB target, which is what
+compaction has been producing and therefore what the queue fills with going
+forward. Two of those now share. So the speedup is real but its size is a
+measurement, not a prediction; the Delta-log rate after two quiet hours is what
+settles it.
+
+Note also the staging durations: 142s and 460s for those two large bins, not the
+~40 minutes the serialization arithmetic assumed. Staging is only part of a unit
+(the commit is separate), but it means the 1.50/hour "ceiling" is a loose bound
+and the post-deploy rate could exceed it.
+
 ## What was deliberately NOT changed
 
 **The 12x pricing.** The same bench implies a true footprint of ~1.33 GiB for a
