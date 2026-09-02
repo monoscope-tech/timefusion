@@ -973,10 +973,18 @@ mod tests {
             assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)), "{name}.deleted must be nullable Boolean");
             assert!(matches!(schema.field_def("updated_at"), Some((ArrowDataType::Timestamp(..), true))), "{name}.updated_at must be a nullable timestamp");
 
-            // ORDER is the load-bearing part: `migrate-columns` APPENDED these,
-            // so they must be the final two fields, updated_at then deleted.
-            let tail: Vec<&str> = schema.fields.iter().rev().take(2).map(|f| f.name.as_str()).collect();
-            assert_eq!(tail, vec!["deleted", "updated_at"], "{name}: the migrated columns must be the LAST two fields, in migration order (7d68f01)");
+            // ORDER is the load-bearing part: `migrate-columns` APPENDS, so
+            // every migrated column sits after every pre-existing one, in the
+            // order storage was widened. The merge-on-read pair went first
+            // (2026-08-02); a later migration appends after them, never between
+            // — inserting one mid-list is 7d68f01 again.
+            let migrated: &[&str] = match name {
+                // `attributes___http___route`, migrated 2026-09-02.
+                "otel_logs_and_spans" => &["updated_at", "deleted", "attributes___http___route"],
+                _ => &["updated_at", "deleted"],
+            };
+            let tail: Vec<&str> = schema.fields.iter().rev().take(migrated.len()).map(|f| f.name.as_str()).rev().collect();
+            assert_eq!(tail, migrated, "{name}: migrated columns must be the LAST fields, in migration order (7d68f01)");
         }
         // The tiebreak MUST be the TF-owned column, not the client's:
         // `insert_coerce::stamp_version` OVERWRITES whatever this names, so

@@ -400,6 +400,19 @@ fields:
   - name: deleted
     data_type: Boolean
     nullable: true
+  # The route a framework's router matched the request against — the only
+  # HTTP identity that is declared rather than inferred, which is why monoscope
+  # groups endpoints on it. It lived in the `attributes` blob, so every query
+  # touching it paid a JSON extraction; promoted for the same reason
+  # `attributes___url___path` is.
+  #
+  # Appended LAST, after `deleted`, because `migrate-columns` widened the stored
+  # Delta schema to 93 columns by appending it there — see the note above on
+  # 7d68f01. Storage was migrated before this line existed; a deploy carrying
+  # this file without that migration is the outage that note describes.
+  - name: attributes___http___route
+    data_type: Utf8
+    nullable: true
 
 # Continuous-aggregate rollups derived from this table. The rollup's own table
 # (`otel_logs_and_spans_rollup_dashboard_1m_v3`) is SYNTHESIZED from this spec plus the field
