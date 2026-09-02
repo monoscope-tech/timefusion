@@ -106,6 +106,16 @@ the *ordinary* bin is also over budget.
   decision that interacts with admission (same pool), so the test makes the
   defect executable without pre-empting the judgement.
 
+**Prior art says we are the outlier.** For "a unit does not fit its budget",
+Cassandra **drops the largest SSTables from the input list** until it fits;
+ClickHouse **caps merge size at selection and scales the cap down as the pool
+fills**. Both adapt the work to the budget, so neither has a state where a unit
+is permanently unrunnable. We refuse and requeue unchanged — which is the 310
+stuck units. Raising the budget fixes today's numbers but leaves the structural
+property intact, and the whale's largest file is already 1,150 GiB. **Two-tier:
+raise the budget now; give maintenance a way to shrink a unit to its budget
+before onboarding a 100x tenant.**
+
 **Confirmed against LIVE state**, not the (hours-stale) checkpoint: replaying
 both journal files gives **310 repair tasks in Retry right now**, against 311
 survivors in the checkpoint — not draining, not a snapshot artifact. The
