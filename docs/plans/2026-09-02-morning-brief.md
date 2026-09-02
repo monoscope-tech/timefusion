@@ -159,13 +159,22 @@ universally broken — 2,188 have completed — which fits the arithmetic exactl
 files under ~107 MiB compressed fit the budget and finish; target-sized 256 MiB
 files never can.
 
-**Verified three independent ways:**
+**The mechanism PREDICTS the observed rate.** Serialized = one 40-minute rewrite
+at a time = **1.50 completions/hour**. Measured across two live journal replays
+~3h apart (spanning several restarts): `Repair/Complete` 2,188 → 2,192 =
+**1.33/hour — 0.89 of prediction**. Dedup drained at **35/hour over the same
+window, 26x repair**, on the same workers and pool. *(The 40-minute figure is
+documented in the code, not measured by me — so this is a consistency check
+against a stated duration, not a fully independent derivation.)*
+
+**Verified four independent ways:**
 
 | direction | evidence |
 | --- | --- |
 | source constants | 256 MiB x 12 = 3,072 MiB vs a 1,280 MiB budget |
 | prod logs | `want_mib=1280 budget_mib=1280`, 243 bounces in 3h |
 | journal data | 312 units, median **256 MiB**, one creation stamp |
+| observed rate | 1.33 completions/hour vs 1.50 predicted by serialization (**0.89x**) |
 
 **Secondary (worth its own fix):** those stored estimates are **compressed**
 bytes in a field named `estimated_decoded_bytes` — missing the x12. It is stale
