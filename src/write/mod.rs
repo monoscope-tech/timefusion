@@ -385,6 +385,23 @@ pub type DeltaWriteCallback =
 ///
 /// `None` for an empty set (nothing to skip) and on any serialization failure —
 /// both mean "no identity", which declines the skip and flushes normally.
+/// Whether "identical content" is safe to read as "already durable" for this
+/// table — it is only so when the table declares `dedup_keys`.
+///
+/// `prepare_flush` documents that an empty key list is a PASS-THROUGH: for an
+/// append-only table with no keys, two byte-identical batches are two distinct
+/// facts, and a client that legitimately re-sends one would have the second
+/// silently dropped. That is acked-write loss, which is the one outcome this
+/// path may never produce — so the identity is simply not defined for such a
+/// table, and neither the record nor the check is taken.
+/// Multiple of `delta_scan_depth` bounding the in-process landed-identity set
+/// per topic. Only duplicates are at stake if it is too small.
+const LANDED_WINDOW_COMMITS: usize = 4;
+
+pub(crate) fn landed_identity_applies(table_name: &str) -> bool {
+    crate::schema::get_schema(table_name).is_some_and(|s| !s.dedup_keys.is_empty())
+}
+
 pub(crate) fn landed_digest(batches: &[RecordBatch]) -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
     if batches.iter().all(|b| b.num_rows() == 0) {
@@ -1325,7 +1342,18 @@ impl BufferedWriteLayer {
         if digests.peek().is_none() {
             return;
         }
-        self.landed_digests.entry((project_id.to_string(), table_name.to_string())).or_default().extend(digests);
+        let mut known = self.landed_digests.entry((project_id.to_string(), table_name.to_string())).or_default();
+        known.extend(digests);
+        // Bounded like ClickHouse's `replicated_deduplication_window`: the boot
+        // load is already capped by `delta_scan_depth`, but this process keeps
+        // adding its own commits for its lifetime. Past the cap the set is
+        // cleared rather than trimmed — a HashSet has no recency order to
+        // evict by, and dropping identities only ever costs a duplicate.
+        let cap = self.config.buffer.delta_scan_depth().saturating_mul(LANDED_WINDOW_COMMITS);
+        if known.len() > cap {
+            debug!("landed-identity window full for {}.{} ({} > {}) — clearing", project_id, table_name, known.len(), cap);
+            known.clear();
+        }
     }
 
     /// Whether this batch set is provably already in Delta.
@@ -1336,7 +1364,7 @@ impl BufferedWriteLayer {
     /// recorded**, and even then the caller must treat the rows as committed
     /// rather than as droppable, since that is exactly what they are.
     fn already_landed(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> bool {
-        if !self.config.buffer.landed_skip_enabled() {
+        if !self.config.buffer.landed_skip_enabled() || !landed_identity_applies(table_name) {
             return false;
         }
         // Cheap guard first: the digest costs an IPC round-trip, and in steady
@@ -2864,7 +2892,7 @@ impl BufferedWriteLayer {
         // in-process re-flush of the identical set (the abandoned-commit
         // window in `flush_bucket`, a requeued group) is then declined too,
         // not only duplicates left behind by a previous boot.
-        if self.config.buffer.landed_skip_enabled() {
+        if self.config.buffer.landed_skip_enabled() && landed_identity_applies(&bucket.table_name) {
             self.note_landed_digests(&bucket.project_id, &bucket.table_name, landed_digest(&batches));
         }
         if self.recovery_active.load(Ordering::Relaxed) {
@@ -4393,7 +4421,9 @@ mod tests {
         cfg.buffer.timefusion_landed_skip_enabled = true;
         let cfg = Arc::new(cfg);
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let (project, table) = (format!("lk{test_id}"), format!("lk{test_id}"));
+        // A table that declares `dedup_keys` — identity is only defined there.
+        // The keyless case is the last assertion of this test.
+        let (project, table) = (format!("lk{test_id}"), "otel_logs_and_spans".to_string());
 
         let writes = Arc::new(AtomicU64::new(0));
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
@@ -4438,6 +4468,19 @@ mod tests {
         layer.flush_all_now().await.unwrap();
         assert_eq!(writes.load(Ordering::Relaxed), 1, "a bucket whose content changed must still be written — a DML must never be swallowed by the skip");
         assert_eq!(layer.snapshot_stats().landed_skips_total, 1, "the changed bucket must not count as a skip");
+
+        // A table with NO dedup_keys: `prepare_flush` passes duplicates
+        // through, so two byte-identical batches are two distinct facts and
+        // declining the second would be acked-write loss. Identity is not
+        // defined there, so even an exact digest match must still write.
+        let keyless = format!("kl{test_id}");
+        assert!(!landed_identity_applies(&keyless), "a schema-less table must not have a landed identity");
+        let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span_ts("a", "s", &project, ts)]).unwrap();
+        layer.insert(&project, &keyless, vec![batch]).await.unwrap();
+        let staged = layer.mem_buffer.query(&project, &keyless, &[]).unwrap();
+        layer.note_landed_digests(&project, &keyless, landed_digest(&staged));
+        layer.flush_all_now().await.unwrap();
+        assert_eq!(writes.load(Ordering::Relaxed), 2, "a keyless table's duplicate rows are DISTINCT DATA — declining them would lose acked writes");
     }
 
     /// Regression: prod 2026-07-08 OOM crash loop. WAL replay loaded the whole

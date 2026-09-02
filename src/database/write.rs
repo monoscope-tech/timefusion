@@ -646,7 +646,9 @@ impl Database {
         // coerces or sorts — because that is exactly what the flush side hashes
         // when it checks. Only the flush path (`watermark.is_some()`) records
         // one: an inbound write is not something replay can duplicate.
-        let landed = (self.config.buffer.landed_skip_enabled() && watermark.is_some()).then(|| crate::write::landed_digest(&batches)).flatten();
+        let landed = (self.config.buffer.landed_skip_enabled() && watermark.is_some() && crate::write::landed_identity_applies(&table_name))
+            .then(|| crate::write::landed_digest(&batches))
+            .flatten();
 
         let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted } =
             self.prepare_staged_write(&project_id, &table_name, batches).await?;
@@ -1021,6 +1023,7 @@ impl Database {
                     let digests: Vec<(String, String, [u8; 32])> = if self.config.buffer.landed_skip_enabled() {
                         indices
                             .iter()
+                            .filter(|i| crate::write::landed_identity_applies(&units[**i].table_name))
                             .filter_map(|i| crate::write::landed_digest(&units[*i].batches).map(|d| (units[*i].project_id.clone(), units[*i].table_name.clone(), d)))
                             .collect()
                     } else {
