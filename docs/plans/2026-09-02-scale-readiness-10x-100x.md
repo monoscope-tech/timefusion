@@ -1389,3 +1389,27 @@ clearest evidence in this document that they are one change, not two.
 
 **Age:** median 22.4h, p90 386h, **44% older than 48 hours** — so this is not a
 transient backlog either.
+
+## A same-process observation that fits the starvation story
+
+Prod ran ~2 hours with no restart, so this is a valid same-process comparison
+(the trap that invalidated most of tonight's earlier counter readings):
+
+| | at 75 min | at ~120 min |
+| --- | --- | --- |
+| `dedup_bins_committed_total` | 47 | 56 |
+| implied rate | 37.6/hour | **12/hour over the last 45 min** |
+| `pending_dedup` | 1,434 | 1,458 |
+
+`dedup_failed_total` 0, `dedup_bin_stage_timeouts_total` 0, 33,817 queries
+served — nothing is erroring.
+
+**The dedup commit rate falls by ~3x while pending slowly rises.** That is the
+signature the starvation diagnosis predicts: a fresh process drains the work it
+CAN run first, and what remains is increasingly the population that cannot be
+admitted or cannot fit its sort. A throughput problem would show a steady rate;
+a starvation problem shows a decaying one against a queue that does not shrink.
+
+It is one process and two points, so it is corroboration rather than proof — but
+it is the first same-process throughput reading of the night that was not
+invalidated by a restart, and it points the same way as everything else.
