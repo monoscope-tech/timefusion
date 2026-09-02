@@ -64,6 +64,18 @@ admitted into, and all 10 permits at maximum size use **8%** of capacity. At
 > the OOM path, while the landed-skip flag is off. Two constants, real
 > interaction, wants a canary and someone awake.
 
+**There is a SECOND, separate defect, and it is the lowest-risk fix of the
+night.** The largest stuck population is not admission at all: all **197
+`compaction_incomplete` tasks are REPAIR**, median age **412 hours (17.2 days)**,
+attempts median 14 and **max 875**, **80% whale**. They are *small* (median
+0.25 GiB), so they fit the current ceiling — they are admitted, they run, and
+they never finish. Repair selects candidates with **`.take(1)`**: one file per
+attempt, each attempt clearing one false "unsorted" suspicion. The code comment
+predicts exactly this ("could take days… while looking busy the whole time") —
+it is taking weeks, and `repair_verified_sorted.txt` is 12.76 MB (~100k paths)
+and still growing. Verifying the whole candidate set per attempt touches **no
+memory constant**, which makes it the safest of the three candidates.
+
 **Confirmed against live code, not just a snapshot.** I re-fetched the journal
 4.4 hours later: of the 1,168 tasks stuck >48h, **1,144 (98%) were still
 queued**, only 24 drained, and **359 had their attempts incremented** — they are
