@@ -56,9 +56,18 @@ decoded bytes. Today a single unit may use **under 1%** of the pool it is being
 admitted into, and all 10 permits at maximum size use **8%** of capacity. At
 2 GiB the worst case is 33% — still a 3x margin.
 
-> **Recommendation: `MAX_DECODED_BYTES` 512 MiB → 2 GiB.** One constant.
-> Offline-priced, safety-checked, canary-worthy — not something I would ship
-> unattended.
+> **Recommendation: raise the admission ceiling AND the per-sort slice
+> together — or neither.** Admission governs what may ENTER; the sort slice
+> governs what can FINISH. Today they disagree: admission permits 512 MiB while
+> every sized sort failure in the journal is at or below that, median 256 MiB.
+> Raising admission alone would convert starved units into sort-failing units on
+> the OOM path, while the landed-skip flag is off. Two constants, real
+> interaction, wants a canary and someone awake.
+
+**Confirmed against live code, not just a snapshot.** I re-fetched the journal
+4.4 hours later: of the 1,168 tasks stuck >48h, **1,144 (98%) were still
+queued**, only 24 drained, and **359 had their attempts incremented** — they are
+being picked up and refused right now, on the binary running in prod.
 
 Caveat I want on the record: the sim **cannot** test this (*"Memory admission
 ... outside the model"*), so an earlier experiment of mine measured only the
