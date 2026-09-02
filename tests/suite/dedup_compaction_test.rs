@@ -2762,7 +2762,42 @@ async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()
     };
     let before = hits();
     let routed = ctx.sql(&query).await?.collect().await?;
-    assert!(hits() > before, "a derived table only re-qualifies; the chart under it must route");
+    // A bare bool cannot say WHY, and this assertion has been read as a verdict
+    // on unrelated changes more than once. The miss reasons are already counted
+    // per query; report the ones that moved, so a failure names the mechanism
+    // (build never ran vs coverage incomplete vs shape unsupported) instead of
+    // sending the next reader to bisect the tree.
+    let reasons = || {
+        let s = timefusion::observability::maintenance_stats();
+        [
+            ("TOTAL", &s.rollup_misses_total),
+            ("not_built", &s.rollup_miss_not_built),
+            ("stale_coverage", &s.rollup_miss_stale_coverage),
+            ("incomplete_coverage", &s.rollup_miss_incomplete_coverage),
+            ("unsupported_shape", &s.rollup_miss_unsupported),
+            ("unwalkable_source", &s.rollup_miss_unwalkable_source),
+            ("filter_not_eligible", &s.rollup_miss_filter_not_eligible),
+            ("missing_measure", &s.rollup_miss_missing_measure),
+            ("unknown_group_by", &s.rollup_miss_unknown_group_by),
+            ("missing_project", &s.rollup_miss_missing_project),
+            ("unaligned_bucket", &s.rollup_miss_unaligned_bucket),
+            ("tiny_interior", &s.rollup_miss_tiny_interior),
+            ("too_many_branches", &s.rollup_miss_too_many_branches),
+            ("unknown_filter", &s.rollup_miss_unknown_filter),
+            ("measure_not_stored", &s.rollup_miss_measure_not_stored),
+            ("unbounded_time", &s.rollup_miss_unbounded_time),
+            ("non_decomposable", &s.rollup_miss_non_decomposable),
+            ("rewrite_schema_mismatch", &s.rollup_miss_rewrite_schema_mismatch),
+        ]
+        .iter()
+        .filter_map(|(name, counter)| {
+            let n = counter.load(std::sync::atomic::Ordering::Relaxed);
+            (n > 0).then(|| format!("{name}={n}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+    };
+    assert!(hits() > before, "a derived table only re-qualifies; the chart under it must route. misses: [{}]", reasons());
 
     let rows = |batches: &[datafusion::arrow::array::RecordBatch]| {
         batches
