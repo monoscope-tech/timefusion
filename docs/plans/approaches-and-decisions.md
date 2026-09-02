@@ -216,3 +216,38 @@ Not landed in this session only because it is a physical-layout change that
 deserves a full suite run and a before/after on the latency matrix, and the
 session is out of budget to do that properly. The EVIDENCE no longer blocks it —
 this is now a scheduling question, not an open risk.
+
+### The layout change is UNRESOLVED, not refuted — my inference was wrong
+
+Sequence, recorded exactly:
+
+1. Full suite BEFORE the sort-order change: **1314/1314 green**.
+2. Sort-order change applied (`timestamp, id` leading): **1314/1315**, with
+   `a_chart_under_a_derived_table_routes_and_agrees_with_raw` failing
+   ("a derived table only re-qualifies; the chart under it must route").
+3. Re-ran that test IN ISOLATION with the change: failed. I concluded the change
+   broke rollup routing, and reverted.
+4. Re-ran it in isolation with the change REVERTED (clean tree): **still fails.**
+
+So the test fails in isolation independent of the change — it depends on state
+other tests in the suite establish. **It was never evidence about the sort order,
+and my conclusion in step 3 was wrong.**
+
+**Status of the layout change: UNKNOWN.** The single suite failure in step 2 may
+have been this same isolation/ordering artefact surfacing under parallelism, or a
+real regression. One run cannot distinguish them.
+
+**To resolve** (do this before touching the layout again):
+1. Re-run the FULL suite 2-3x with the change applied. If the failure recurs
+   consistently, it is real; if not, it is the artefact.
+2. Fix or characterise the test's isolation dependency either way — a test that
+   fails alone is a broken instrument, and it cost a wrong conclusion here.
+
+**Also corrected: the "read cost is ~zero" measurement was confounded.** The
+schema comment (lines 34-38) says `service_name` at position 2 buys **page-level**
+pruning within row groups. My timing test used a project with 1-3 services where a
+service filter selects 99.6% of rows — there was nothing to prune, so the
+experiment could not detect the cost it was meant to measure. Re-measure on
+`87576849` (19 services) or synthetically, at the page level, not by wall clock.
+
+Tree left at the known-good state (original ordering, suite green at 1314/1314).
