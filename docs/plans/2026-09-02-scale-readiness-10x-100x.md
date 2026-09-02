@@ -2131,3 +2131,37 @@ did not have.
 start completing" on a day with hourly deploys. Judge it by
 `repair_rewrite_permit_busy` falling and `wave_bin_staged` appearing for
 256 MB-class inputs, measured over a quiet window.
+
+### The one question that would settle Decision 1, and how to ask it
+
+Given the deploy-cadence confound, the decisive question is narrow:
+
+> **Has repair EVER staged a rewrite of a 256 MB-class file?**
+
+- **If yes** (in some quieter window), repair works when given uninterrupted
+  time, and tonight's zero is substantially the restart cadence. The budget still
+  serializes it — 177 bounces are real — but the urgency drops, because the lane
+  is throttled rather than dead.
+- **If no, ever**, the budget is decisive: no correctly-sized file has ever been
+  repaired, which is a much stronger statement than "none in 12 hours" and would
+  put Decision 1 first outright.
+
+**The command** (I could not complete it interactively — `docker service logs`
+over 24h is slow enough to time out a foreground call):
+
+```bash
+ssh ubuntu@captain.s.past3.tech \
+  'docker service logs srv-captain--timefusion --since 24h 2>&1 | grep wave_bin_staged' \
+  | sed 's/\x1b\[[0-9;]*m//g' \
+  | grep -oE 'bytes_in=[0-9]+' | cut -d= -f2 | sort -n | tail -5
+```
+
+Any value above ~100,000,000 (100 MB) is a repair-class rewrite that actually
+staged. In the 12-hour window I *did* scan, the largest was **30.2 MB** and the
+count was 17 — all hot-tail packing.
+
+**Why this is the right question rather than more analysis:** every other line of
+evidence for Decision 1 is about what *cannot* happen (the arithmetic, the
+refusals). This is the only one that asks what *has* happened, and it is the one
+that separates "throttled" from "dead" — which is precisely the distinction the
+deploy-cadence confound introduced and that I could not resolve tonight.
