@@ -194,6 +194,62 @@ benching filled this laptop's disk to 100% tonight and faked a memory failure, s
 whatever number is chosen should be derived from free space with headroom, not
 set to "large".
 
+## CORRECTION — the 512-MiB cohort is NOT admission-blocked. It is never CLAIMED.
+
+**This retracts the headline of change 3's motivation.** The admission boundary
+was real — the reproducing test fails on master and passes with the fix, and
+that defect is worth fixing — but **it is not what is holding the 297 units I
+used as its evidence.**
+
+Fresh journal pulled 8.5 h after the first one, same cohort keyed by
+(project, source, slice, op):
+
+| | 17:07 | 01:41 |
+|---|---|---|
+| dedup live | 1,552 | 1,320 (**−232**, healthy work IS flowing) |
+| >= MAX | 365 | 363 |
+| **exactly 512 MiB** | 297 | **297 — identical** |
+| **max age** | 412.0 h | **416.9 h** (+4.9 h — they aged, they did not run) |
+
+And the decisive diagnostic, over those 8.5 hours and three restarts:
+
+```
+exactly-512 cohort: 297 before, 297 after, 297 SAME KEYS
+attempts delta:  min 0   median 0   max 0      zero-delta 297/297
+state: all Pending    retry_reason: all none    not_due: 0 of 297
+```
+
+**Zero attempts change on every single one.** A unit that reached admission and
+was refused would increment `attempts` (`retry_task` does) or move to Retry.
+These do neither. They are **due and never selected** — the blocker is in
+claiming/ranking, upstream of the gate I fixed.
+
+What distinguishes them from the 666 dedup units that DO move:
+
+| | stuck (attempts=0) | moving (attempts>0) |
+|---|---|---|
+| slice width | **all exactly 1,440 min (day-wide)** | median 720, range 5–1,440 |
+| slice date | **Aug 16–19** (~2 weeks old) | mostly Sep 1–2 |
+| `input` footprint | **0 of 104** | 424 of 666 |
+
+An estimate of *exactly* `MAX_DECODED_BYTES` is the signature of
+`coarsen_sealed_slices_capped`, which fuses "the widest whose summed estimate
+fits MAX" — so these are **fused day-wide SEALED units sitting exactly at the
+coarsening cap, carrying no input footprint.** `scheduling_class` gives frontier
+work class 0 and sealed work a worse class, and smaller tuples run first, so
+while frontier work keeps arriving sealed work waits. That is the already-known
+[sealed backlog does not drain] problem, not the admission boundary.
+
+**I am deliberately stopping the diagnosis here rather than guessing the exact
+rank term.** The next step is to run `most_indebted_unclaimed` (it exists
+precisely to answer "planned and never claimed") against one of these keys — but
+note it selects by `input.files`, and these have no input, so it may not even see
+them. That is itself a lead.
+
+**What this means for the three shipped changes:** all three remain correct and
+tested; none of them is retracted. But change 3's *benefit* is now unproven — it
+fixes a real gate defect that these particular units never reach.
+
 ## First 22 minutes on the admission fix (`d683f78`) — no abort signal
 
 Sampled 50 times over 21 minutes. Too short to call, but nothing is going wrong:
