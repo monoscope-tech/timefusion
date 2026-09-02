@@ -515,3 +515,27 @@ SELECT mode() WITHIN GROUP (ORDER BY level) FROM otel_logs_and_spans WHERE proje
 # form is what works. Pinned because it is a documented benchmarking trap.
 statement error
 EXPLAIN (ANALYZE) SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'mono_shapes'
+
+# ---------------------------------------------------------------------------
+# §16. Sessions: the first-observed triplet.
+#
+# monoscope spells this `(ARRAY_AGG(x ORDER BY ts) FILTER (...))[1]` because
+# its comment says FIRST_VALUE "is a window function and errors without OVER on
+# both" backends. That measured 7.0s on TimeFusion, building three full arrays
+# per session group to read element 1. DataFusion 54 registers first_value as a
+# real UDAF, so the aggregate form is pinned here.
+# ---------------------------------------------------------------------------
+
+query TTT
+SELECT attributes___session___id AS sess,
+       first_value(attributes___url___path ORDER BY timestamp) AS landing_url,
+       last_value(attributes___url___path ORDER BY timestamp) AS last_url
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes' AND attributes___session___id IS NOT NULL
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY attributes___session___id
+ORDER BY 1
+----
+sess1 /users /users
+sess2 /orders NULL
+sess3 / /

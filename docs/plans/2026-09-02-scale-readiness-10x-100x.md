@@ -329,3 +329,38 @@ away, and it is size-correlated.
 **Taken together:** one in five tasks is split after claim, the tail is what gets
 superseded, and 6.4% of units carry 67.1% of the bytes. Sizing units at
 selection time addresses all three at once.
+
+## The heavy tail IS a single tenant — which is the 100x customer question in miniature
+
+Maintenance work is not spread across the 17 projects. **One project is 83.4% of
+all queued bytes** (35.3 TiB of 42.3) while being only 33% of tasks; the top 3
+are 88.9%.
+
+| population | n | median | p90 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| the whale | 22,302 | 0.37G | 1.85G | 12.2G | **1150G** |
+| everyone else | 16,441 | 0.25G | 0.50G | 5.19G | 39.2G |
+
+| population | units > 2 GiB | share of that group's bytes they hold |
+| --- | --- | --- |
+| the whale | **9.3%** | **73.9%** |
+| everyone else | 2.4% | 32.7% |
+
+- **83.8% of ALL oversized units belong to the whale.**
+- **61.7% of the ENTIRE queue's bytes are whale units that individually exceed
+  the per-sort budget.**
+- The whale's worst-case unit is **29x** everyone else's worst case (1150G vs
+  39.2G).
+
+This is the most decision-relevant finding for the "customer with 100x our total
+volume" question, because **we are already running the experiment at small
+scale.** One tenant already generates five sixths of the oversized units, and it
+is exactly that population which cannot fit a sort slice, gets split after
+claim, and is preferentially superseded.
+
+The implication is not "we cannot take the customer". It is that the thing to
+fix first is **per-tenant unit sizing** — the budget a unit is selected against
+has to be a property of the unit, not of the fleet — because a second, larger
+whale multiplies the population that already accounts for two thirds of our
+bytes. Onboarding 100x volume without it would land entirely in the failure mode
+we can already measure.
