@@ -2165,3 +2165,50 @@ evidence for Decision 1 is about what *cannot* happen (the arithmetic, the
 refusals). This is the only one that asks what *has* happened, and it is the one
 that separates "throttled" from "dead" — which is precisely the distinction the
 deploy-cadence confound introduced and that I could not resolve tonight.
+
+## The Delta log answers it better than the service log: LARGE rewrites do happen
+
+Service logs cannot be scanned past ~12h (the volume times out any interactive
+call). The **Delta transaction log** answers the same question far more cheaply
+and it is the better instrument: a rewrite leaves a commit whether or not
+anything logged it.
+
+571 commit JSONs are retained (~6 hours, 15:35–21:40). Scanning all of them:
+
+| | |
+| --- | --- |
+| operations | WRITE 482, OPTIMIZE 87, VACUUM 2 |
+| **largest single Add** | **505.9 MB** |
+| large 1-add/1-remove rewrites (>100 MB) | **3** |
+| their shapes | 318 → 181 MB, 649 → 415 MB, 584 → 153 MB |
+
+**Large rewrites are happening.** The system committed a **649 MB** input rewrite
+in this window. So "a big rewrite cannot complete" is false as a general claim —
+which is important, because it means repair's failure is **specific to repair's
+own budget**, not a capacity limit of the process, the pool, or the object store.
+
+**Which lane produced them?** Almost certainly dedup, not repair:
+
+- They **shrink by 43–74%**, and repair is row-preserving (it re-sorts a file, it
+  does not drop rows), so a 74% reduction is not a re-sort.
+- Dedup rewrites go through `stage_dedup_chunk`, **not** `stage_hot_bin`, so they
+  never log `wave_bin_staged` — which reconciles this with the service-log
+  evidence rather than contradicting it.
+
+**Hedge, stated because I cannot close it:** `remove` entries carry no
+`numRecords`, so I cannot compare input and output row counts and *prove* these
+were dedup. The size argument is strong for the 74% case and merely suggestive
+for the 43% one.
+
+**What this does to Decision 1.** It strengthens it in the way that matters:
+the same process, with the same memory, successfully rewrote a **649 MB** file
+for dedup while repair cannot rewrite a **256 MB** one. That is not a resource
+limit — it is repair's own 1,280 MiB budget being anomalously small next to the
+heavy pool dedup draws on. **The comparison is the argument**, and it needs no
+assumption about deploy cadence, permit leaks, or what the service log did or did
+not capture.
+
+**Method note:** I spent considerable effort trying to scan service logs for an
+answer the transaction log held all along, in a form that is smaller, structured,
+and retained independently of log rotation. **When asking "did this system do X",
+prefer the durable record it writes over the diagnostic text it prints.**

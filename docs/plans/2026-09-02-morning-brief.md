@@ -105,6 +105,12 @@ is admitted ~5x underpriced, refused on the real price, and requeued *unchanged*
 **No value of the repair budget fixes this**, because the unit is priced one way
 to get in and another way to run.
 
+**Strongest single argument, from the Delta log:** in one 6-hour window the same
+process committed a **649 MB → 415 MB** rewrite (and two more >100 MB), while
+repair cannot rewrite a **256 MB** file. Large rewrites are demonstrably
+possible; repair's budget is what is anomalous. This needs no assumption about
+deploy cadence, permit leaks, or service-log coverage.
+
 **⚠ CHECK THIS FIRST — it may make the budget change a no-op.** The semaphore's
 capacity IS the budget (1,280 permits) and every real unit requests **all of
 them**, so the acquire succeeds only if **every** permit is free. One permit held
