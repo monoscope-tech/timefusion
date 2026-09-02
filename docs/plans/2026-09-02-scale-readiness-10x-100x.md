@@ -580,3 +580,48 @@ should be priced in the sim before anything else.
 **Restart cadence is NOT a significant contributor**, tested: restarts every 24h
 gave pending 16,264 vs 16,320 with none — within noise. The ~13-tasks-per-stream
 re-invalidation a restart causes is real but small next to 144 mint cycles a day.
+
+## CORRECTION #2: the sim's arrival model is ~6x prod's real one
+
+The previous section derived the arrival rate from the sim's `mint_stream`
+model — every stream, every 10 minutes. **Prod does not work that way.**
+Invalidation happens on actual writes (`invalidate_rollup_batches` on the
+inbound path), so a stream with no traffic in a window costs nothing.
+
+Measured from the journal's own `created_unix_ms`, over its 408-hour span:
+
+| | tasks/day |
+| --- | --- |
+| sim nominal model (124 streams x 2 x 144) | 35,712 |
+| **real prod arrival** | **5,782** (241/hour, min 211 / max 279 over 24 buckets) |
+
+And **only 21 of the 124 streams created any work in the last 24 hours.** The
+other 103 are idle, and the sim mints for all of them.
+
+**This undermines the "we do not keep up at 1x" conclusion**, which was drawn
+from a run whose arrival rate is ~6x reality. Against the sim's own measured
+throughput of 21,088 executions/24h (879/hour), the real arrival rate of
+241/hour has substantial headroom — roughly **3.6x**.
+
+So the honest current state is: **the earlier flow-problem finding is an
+artifact of the sim's uniform minting, not a proven property of production.**
+What survives is narrower and still useful:
+
+- The `--no-mint` control (backlog drains to 18 in 1,594 executions) stands —
+  the standing backlog genuinely is not the constraint.
+- Arrival being **linear in ACTIVE stream count** stands as a shape. What
+  changes is the coefficient: today only 21 streams are active, not 124, so
+  today's arrival is ~1/6 of what the model assumed.
+- The mint-granularity lever is **not needed** at the real arrival rate, and
+  proposing it would have been solving a problem prod does not have.
+
+**The right next measurement** is the sim with a realistic arrival model:
+`--streams 21` mints 21 x 2 x 144 = 6,048/day, within 5% of the measured 5,782.
+That is the run that answers "do we keep up at 1x", and by extension what 10x
+customers (210 active streams) actually costs.
+
+**Method note, twice-learned tonight:** `synth:whale` models zero arrivals and
+flattered us; the real-journal default models 6x too many and alarmed us. Both
+times the fix was to check the model against production data rather than to
+trust the number it printed. Any keep-up claim needs its arrival rate validated
+against `created_unix_ms` first.
