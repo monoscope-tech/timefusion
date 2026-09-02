@@ -625,3 +625,67 @@ flattered us; the real-journal default models 6x too many and alarmed us. Both
 times the fix was to check the model against production data rather than to
 trust the number it printed. Any keep-up claim needs its arrival rate validated
 against `created_unix_ms` first.
+
+## What the real queue is actually doing: not flow, not backlog — STARVATION
+
+Both sim-derived stories were wrong in different directions. The journal
+answers the question directly, and this is the finding that matters.
+
+**The queue is small but STUCK.** 2,369 tasks queued (pending + retry):
+
+| | |
+| --- | --- |
+| median age | **34.8 hours** |
+| older than 48h | **49%** |
+| p90 / p99 / max age | **407.6h — the entire journal span** |
+| younger than 1h | 10% |
+| composition | dedup 1,708 (72%), repair 328, base_rollup 297, derived 36 |
+
+A cohort has been queued for ~17 days and never run. At the real arrival rate
+(241/h) this queue is under 10 hours of work, so it is **not** a capacity
+problem — the work simply never executes.
+
+### The stuck cohort is defined by ADMISSION REFUSAL
+
+| | stuck (>48h, n=1,168) | fresh (<6h, n=331) |
+| --- | --- | --- |
+| top retry reasons | **`resource_admission` 272, `admission_busy` 169** | memory 41, worker_error 25 |
+| never claimed (0 attempts) | **355** | — |
+| whale share | **46%** | 14% |
+| repair tasks | **328 — every repair task in the journal** | 0 |
+
+`resource_admission` is documented in `maintenance_coordinator.rs` as *"the
+unit's ESTIMATE exceeds what admission can ever grant, so it fails identically
+every pass"*, with the prod history attached: *"a 1.1TB-estimate day-wide Repair
+looped at its 1s admission-retry delay for DAYS (prod 2026-08-21, attempts
+140-211): never claimed a worker, never timed out, so neither abandon_running's
+split nor its backoff floor ever fired."*
+
+**The largest unit in this journal is 1,150 GiB. That exact shape is still
+present, and 328 of 328 repair tasks are starved.**
+
+### This validates unit sizing — by a mechanism I had not identified
+
+Everything earlier in this document argued units are too big for their budget,
+and inferred the cost was *timeouts at 100x*. The real cost is worse and it is
+being paid **today**: a unit whose estimate exceeds the admission ceiling is
+**never admitted at all**. It does not time out. It does not fail. It waits
+forever, and 46% of that population is the whale.
+
+So the recommendation stands and strengthens, with the mechanism corrected:
+
+- **not** "raise `MAX_DECODED_BYTES`" — measured, buys 0.7%
+- **not** "coarsen mint granularity" — the arrival rate is 6x lower than the sim modelled and is not the constraint
+- **yes**: bound unit size at PLANNING time so no unit is ever created that
+  admission cannot grant. The permanently-starved population is exactly the
+  units that exceed what admission can ever give them, and today nothing
+  prevents such a unit from being created.
+
+### Ranked by evidence, for the morning
+
+1. **Starving units (production-verified, today).** 1,168 tasks >48h old, 328 of
+   them every repair task in the system, driven by `resource_admission`.
+2. **The whale is over-represented 3x** in that population (46% vs 14%), which
+   is the 100x-customer question arriving early.
+3. Unit sizing at planning time addresses both, and is the same change the 100x
+   sim work pointed at from the other direction.
