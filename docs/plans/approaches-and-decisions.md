@@ -30,6 +30,84 @@ the footer fix). `pending_dedup` fell ~2,500 → 1,767 across the session.
 below; its memory/FPP/horizon tradeoffs are the user's call) and the DataFusion
 `filter_map` fix (a read-path correctness change needing its own latency matrix).
 
+## 2026-09-02 — WE MANUFACTURE THE DUPLICATES. 58% of them are our own replay.
+
+The strategically important finding of the night, and it reframes the whole 10x
+question. Dedup is ~96% of maintenance worker time. **A majority of its input is
+rows TimeFusion re-inserted into itself.**
+
+### The evidence
+
+Decomposing the 101,563 duplicate groups in a real 204 MB prod bin
+(`recent204.parquet`, 1,639,811 rows) by `updated_at`:
+
+| shape | groups | what it is |
+| --- | --- | --- |
+| every copy shares one `updated_at` | **58,965 (58%)** | one stamping event |
+| copies differ in `updated_at` | 42,598 (42%) | merge-on-read enrichment versions |
+
+`updated_at` is TF-OWNED and stamped at write time (`insert_coerce::stamp_version`),
+so two copies written by DIFFERENT inserts necessarily carry different stamps.
+One stamp means one stamping event.
+
+And all 58,965 of those groups are **byte-identical in every sampled column** —
+including `hashes`, the one column enrichment mutates, and `deleted`. Not a
+version. An exact re-insert.
+
+### The mechanism, already written down in the code
+
+`settle_flushed_group` (`src/write/mod.rs`):
+
+> *"A failed advance is benign: the cursor stays behind and the next boot
+> re-replays rows that are already in Delta — dedup_keys (write-side) and
+> DedupExec (read-side) collapse them."*
+
+That is correct for DURABILITY and it is the entire dedup workload's source. It
+also compounds with the thing we already know kills maintenance: restarts. More
+restarts → more replayed rows → more duplicates → more dedup → less maintenance
+throughput → and the deploy cadence never lets it drain
+(`tf_deploy_cadence_starves_dedup`, `tf_units_die_to_restarts`).
+
+### Why this is THE 100x lever
+
+Everything else tonight made dedup *cheaper per unit*: 2.4x from `RunCollapse`,
+and the sort disappearing once footers converge. This makes **more than half the
+work not exist**. A 100x customer does not need us to remove their duplicates
+faster; it needs us to stop generating our own.
+
+### What was NOT done, and why
+
+Nothing. This is a DURABILITY path — the area with the worst incident history in
+this repo (`tf_acked_loss_recovery_cutoff`, `tf_two_live_loss_bugs`) — and
+"replay fewer rows" is one wrong assumption away from acked-write loss. It is not
+a change to make while the person who owns the risk is asleep.
+
+What shipped instead is the measurement that was missing: `wal.replay_rows` in
+`timefusion_stats` (`f74f3429`). `recovered_rows` was already computed at replay
+and thrown away, so nothing could compare a restart's cost against the dedup work
+it creates. Now a restart can be priced.
+
+### The design question for the morning
+
+Make replay IDEMPOTENT rather than smaller — never skip on a guess:
+
+- **Durable flush watermark per `(project, table, bucket)`.** Replay skips an
+  entry only when the bucket is provably committed. The information exists at
+  flush time; the failure is that a lost cursor advance loses it. A tiny separate
+  durable record survives what the cursor does not.
+- **Prior art:** ClickHouse deduplicates INSERTS by block hash over a window
+  bounded by BOTH count (`replicated_deduplication_window`) and time
+  (`..._seconds`), and lets a client override with an explicit
+  `insert_deduplication_token`. The lesson for us is the granularity: they hash
+  the BLOCK, not the row — one hash per batch. Our replay duplicates are
+  whole-batch re-inserts, so a batch-identity check is the cheap equivalent and
+  needs no per-row filter at all.
+- This also supersedes the per-row Bloom design sketched below: that was aimed at
+  client retries, and client retries are not where our duplicates come from.
+
+Sources: <https://clickhouse.com/docs/guides/developer/deduplicating-inserts-on-retries>,
+<https://kb.altinity.com/altinity-kb-schema-design/insert_deduplication/>
+
 ## 2026-09-02 — widen the dedup key to the sort prefix (the inversion that worked)
 
 **The user's idea, and it is the right one:** the failed experiment reordered
