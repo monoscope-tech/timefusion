@@ -139,8 +139,14 @@ the *ordinary* bin is also over budget.
   one-budget holdback for repair.
 - **Judgement required:** only how much memory repair may hold, given admission
   (Decision 2) draws on the same pool.
-- **Status:** not implemented, but **there is a reproducing test on branch
-  `repair-budget-repro`** (`config::tests::repair_budget_must_fit_one_target_sized_file`).
+- **Status:** branch **`repair-budget-repro`** now carries BOTH the reproducing
+  test AND the mechanism — repair has its own budget value with a
+  `TIMEFUSION_REPAIR_REWRITE_BUDGET_MIB` override, decoupled from
+  `COORDINATOR_PER_SORT_BUDGET_BYTES` (a test asserts `light_optimize_k` is
+  unaffected). **The default is unchanged, so it changes no behaviour** — only
+  the *value* is left for you, because repair and packing share the coordinator
+  pool. Lint clean; the repro test still fails until the number is chosen.
+- Previously: **a reproducing test on branch `repair-budget-repro`** (`config::tests::repair_budget_must_fit_one_target_sized_file`).
   It fails today with the whole diagnosis in its message:
 
   ```
