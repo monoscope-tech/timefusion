@@ -821,6 +821,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 ///
 ///   timefusion migrate-columns --table otel_logs_and_spans \
 ///       --add updated_at:timestamp --add deleted:boolean [--dry-run]
+///   timefusion migrate-columns --table otel_logs_and_spans \
+///       --add attributes___http___route:text
 async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut table = "otel_logs_and_spans".to_string();
     let mut adds: Vec<(String, String)> = Vec::new();
@@ -832,7 +834,7 @@ async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> 
             "--dry-run" => dry_run = true,
             "--add" => {
                 let spec = it.next().context("--add needs NAME:TYPE")?;
-                let (n, t) = spec.split_once(':').context("--add expects NAME:TYPE (timestamp|boolean|bigint|double|binary)")?;
+                let (n, t) = spec.split_once(':').context("--add expects NAME:TYPE (timestamp|boolean|bigint|double|binary|text)")?;
                 adds.push((n.to_string(), t.to_string()));
             }
             other => anyhow::bail!("unknown argument: {other} (usage: timefusion migrate-columns --table T --add NAME:TYPE [--add ...] [--dry-run])"),

@@ -1623,6 +1623,23 @@ async fn migrate_add_columns_widens_the_stored_schema_and_is_idempotent() -> Res
     assert_eq!(widened.stored_after, widened.stored_before + 3);
     assert!(db.migrate_add_columns(TABLE, &measures, false).await?.added.is_empty(), "measure migration must be idempotent too");
 
+    // A promoted ATTRIBUTE must be migratable for the same reason, and it is
+    // the ordinary case rather than the exotic one: every promoted OTel
+    // attribute that is not a count or a timestamp is Utf8. Without `text` the
+    // documented order could be followed for a rollup measure and not for
+    // `attributes___http___route`.
+    let attrs = vec![("a_route".to_string(), "text".to_string()), ("a_alias".to_string(), "string".to_string())];
+    let widened_attrs = db.migrate_add_columns(TABLE, &attrs, false).await?;
+    assert_eq!(widened_attrs.added.len(), 2, "a Utf8 attribute column must be migratable, got {:?}", widened_attrs.added);
+    assert!(db.migrate_add_columns(TABLE, &attrs, false).await?.added.is_empty(), "attribute migration must be idempotent too");
+    {
+        let t = db.get_or_create_unified_table(TABLE).await?;
+        let guard = t.read().await;
+        let stored = guard.snapshot()?.schema();
+        let f = stored.field("a_route").expect("migrated column is in the stored schema");
+        assert!(format!("{:?}", f.data_type()).contains("String"), "a_route must land as a string, got {:?}", f.data_type());
+    }
+
     // An unknown type must still be refused rather than guessed at.
     assert!(db.migrate_add_columns(TABLE, &[("m_bad".to_string(), "decimal".to_string())], true).await.is_err());
 

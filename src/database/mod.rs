@@ -9931,7 +9931,15 @@ impl Database {
                 "bigint" => Ok(Field::new(n, DataType::Int64, true)),
                 "double" => Ok(Field::new(n, DataType::Float64, true)),
                 "binary" => Ok(Field::new(n, DataType::Binary, true)),
-                other => anyhow::bail!("unsupported column type '{other}' (expected timestamp|boolean|bigint|double|binary)"),
+                // The type most attribute columns actually are. Every promoted
+                // OTel attribute that is not a count or a timestamp is Utf8 —
+                // `attributes___url___path`, `___server___address`,
+                // `___db___query___text` — so leaving it out meant the rule
+                // above ("widen storage first, only then declare it in YAML")
+                // could not be followed for the ordinary case, only for
+                // measures. `http.route` was the one that surfaced it.
+                "text" | "string" => Ok(Field::new(n, DataType::Utf8, true)),
+                other => anyhow::bail!("unsupported column type '{other}' (expected timestamp|boolean|bigint|double|binary|text)"),
             })
             .collect::<Result<Vec<_>>>()?;
         // AFTER the type mapping, so a dry run rejects a typo instead of
