@@ -5521,8 +5521,15 @@ impl Database {
                     // decision is actually about; only their SIZES were visible.
                     .with_maintenance_pools(
                         {
+                            // `heavy_pool_bytes`, NOT `maintenance_pool_bytes`: this
+                            // env's pool is built with the heavy share (30% of the
+                            // maintenance pool), so reporting the whole pool as the
+                            // denominator would make a SATURATED pool read ~30% and
+                            // invite exactly the "it's idle, widen the ceiling"
+                            // conclusion this row exists to prevent. The denominator
+                            // must be the pool the numerator is reserved from.
                             let env = self.maintenance_runtime_env();
-                            let size = self.config.derived.maintenance_pool_bytes();
+                            let size = self.heavy_pool_bytes();
                             Arc::new(move || (env.memory_pool.reserved(), size))
                         },
                         {

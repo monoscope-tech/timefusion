@@ -1443,6 +1443,38 @@ mod stats_table_tests {
         assert!(rows.contains(&("foyer".into(), "cache_dir".into(), "/cache".into())));
     }
 
+    /// The pool rows must EXIST and divide by the size they were given.
+    ///
+    /// Both halves have bitten: an unwired closure reads `(0, 0)` and is
+    /// indistinguishable from an idle pool, and the maintenance row's
+    /// denominator was initially the whole maintenance pool while its numerator
+    /// is reserved from the heavy share — which would have made a saturated pool
+    /// report 30% and argued for widening the very ceiling that was saturating.
+    ///
+    /// `with_scan_metrics` is REQUIRED, not incidental: the whole `memory`
+    /// component is emitted inside the scan-metrics branch, so an unwired scan
+    /// hides every pool row too.
+    #[test]
+    fn exposes_maintenance_and_coordinator_pool_usage() {
+        let rows = snapshot_rows(
+            &StatsTableProvider::new(None)
+                .with_scan_metrics(Arc::new(ScanMetrics::default()))
+                .with_maintenance_pools(Arc::new(|| (25, 100)), Arc::new(|| (3, 4))),
+        );
+        for key in ["maintenance_pool_used_bytes", "maintenance_pool_pct", "coordinator_pool_used_bytes", "coordinator_pool_pct"] {
+            assert_has(&rows, "memory", key);
+        }
+        assert!(rows.contains(&("memory".into(), "maintenance_pool_pct".into(), "25".into())), "pct must divide used by the size it was handed");
+        assert!(rows.contains(&("memory".into(), "coordinator_pool_pct".into(), "75".into())));
+    }
+
+    /// An unwired pool must not divide by zero — it reports 0, like the query pool.
+    #[test]
+    fn unwired_pool_rows_are_zero_rather_than_a_panic() {
+        let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
+        assert!(rows.contains(&("memory".into(), "maintenance_pool_pct".into(), "0".into())));
+    }
+
     #[test]
     fn exposes_logical_count_residency_and_build_activity() {
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_logical_count(Arc::new(|| (3, 42, 100, 1))));
