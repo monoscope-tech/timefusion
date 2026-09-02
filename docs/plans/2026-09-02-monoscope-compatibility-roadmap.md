@@ -336,3 +336,112 @@ compatibility items because nothing feeds them in.
 
 Tier 4 and the rest of Tier 2 have no urgency attached and should be picked up
 opportunistically when adjacent code is already open.
+
+---
+
+# Implementation log — 2026-09-02 night
+
+Branch `tf-monoscope-compat`. **Not pushed, not deployed.**
+
+## Shipped
+
+| commit | what |
+|---|---|
+| `7522172b` | harness: floats, CTEs and error detail were all unassertable |
+| `ea8491dd` | the contract suite (§5), plus two stale doc claims corrected |
+| `f7b50cb9` | `first` as a decomposable rollup measure (Tier 3.1) |
+| `6a107961` | a session may raise its statement timeout by asking (Tier 1.3) |
+| `39a3dc35` | pin the float-cast fix beside the truncation bug |
+| monoscope `e2f917c29` | the "% of Total" column was truncating to whole numbers |
+
+Full library suite green (1104 tests), full slt suite green (17 files).
+
+## The contract suite proved its own argument immediately
+
+Three defects in the sqllogictest harness, each of which had silently disabled
+a whole class of assertion:
+
+- `is_query` was `starts_with("select")`, so any CTE went to `execute()` and
+  came back as a row count. **No CTE over a data table was testable at all** —
+  which is monoscope's two-stage top-N dashboard shape.
+- the float8 arm decoded only as `f64`, so every `::float` column — which is
+  what monoscope's KQL lowering appends to nearly every aggregate — read back
+  as `error:float`.
+- `tokio_postgres::Error`'s Display is the bare string `db error`, discarding
+  the SQLSTATE and server message.
+
+**This is the answer to the question at the top of this document.** TF's
+backlog carried no compatibility items partly because the tests that would have
+surfaced them could not express the assertions.
+
+## Two new divergences found, pinned not fixed
+
+Both in `monoscope_query_shapes.slt` §13, with the mechanism deliberately
+NOT claimed:
+
+1. **`COUNT(*) * 100.0` renders `300`, not `300.0`.** The fraction is gone
+   before any division, so "% of total" columns truncate. Scalar float
+   arithmetic is exact (`200.0/6` → `33.333333333333336`), so it is specific to
+   an Int64 aggregate against a float literal. **Client-side fix shipped**
+   (monoscope `e2f917c29`); the engine-side fix is unowned.
+2. **`x::float` resolves to Float32 and narrows.** In Postgres `float` IS
+   `double precision`. monoscope appends `::float` to nearly every aggregate it
+   emits, so every chart value crosses the wire at float32 precision.
+
+Also recorded: `ROUND(<numeric>, n)::text` does not carry scale.
+
+**Discriminating check for both: do they reproduce on stock DataFusion 54?**
+That decides fork-patch versus upstream report. Not run.
+
+## Tier 0.2 — historical footers: INVESTIGATED, deliberately not built
+
+`5a445001` fixed the write side (`SortingColumn.column_idx` indexes parquet
+leaves, not fields, so every sort key after a Variant column under-shot). Its
+own message says **"Old files keep their wrong footers; the win phases in as
+rewrites replace them."**
+
+The reader still consumes those footers. `detect_bound`
+(`src/read/mod.rs:394`) enables bounded dedup "iff the input's leading sort
+column is a dedup key of an i64-backed type", read from the advertised
+ordering — which for every pre-fix file is a claim the data does not satisfy.
+
+**Not implemented, and I would not implement it unattended.** The conservative
+guard (distrust footers below a version stamp, fall to full-set) lands directly
+on the path that 500'd prod on 2026-08-15, when unordered merge-on-read dedup
+blew its 2048 MiB per-query limit — and `bounded_dedup_enabled` defaults ON
+precisely because "full-set has no LIMIT early termination"
+(`src/read/mod.rs:1379`). Trading a latent wrong-answer for a fleet-wide
+latency regression is not a call to make overnight.
+
+**What the decision needs, and neither is available locally:** how much of the
+live population still carries pre-`5a445001` footers, and whether compaction
+closes that window on its own. If it does, this needs nothing but time.
+
+Until it is closed, monoscope's `checkReadConsistency` double-query and the
+15–60 min `deltaOverlapSeconds` chart re-read must stay. They are the
+compensating control.
+
+## Tier 2.2 — SQLSTATE codes: scope multiplier, writeup only
+
+The error text monoscope string-matches is produced in
+`apitoolkit/datafusion-postgres` @ `timefusion-df54` — a **separate repository**
+pinned at `Cargo.toml:258`. Real SQLSTATEs (`42703` with the column name and
+position, `42601` for parse errors) mean a change there, a push, and a pin
+bump, so it is not a TimeFusion-only change and did not fit tonight.
+
+Worth doing: it retires three independent error-string parsers in monoscope
+(`Utils.hs:889`, `Log.hs:748`, `Charts.hs:362`) **and** the boot-time
+schema-introspection subsystem that exists only because a bad column fails the
+whole query opaquely (`Config.hs:580`, `Parser/Expr.hs:757`).
+
+The harness now surfaces `Postgres error [XX000]: …`, so the work is at least
+observable from the test suite — every refusal in the contract suite currently
+reports `XX000`, which is the gap made visible.
+
+## What `first` still needs before it does anything
+
+It ships **inert**: no production spec declares a `first` measure, because the
+sessions rollup needs `session_key` promoted at ingest first — a coordinated
+TimeFusion + monoscope schema migration, and the user's call. The measure, its
+companion convention, the build, the tier-to-tier derive and the matcher gate
+are all in place and tested behind that one decision.
