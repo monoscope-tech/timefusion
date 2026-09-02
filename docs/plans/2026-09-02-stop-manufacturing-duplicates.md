@@ -178,6 +178,7 @@ Determinism inputs checked while designing:
 | `landed_digests_never_advance_a_cursor` | the invariant: a commit carrying only digests advances nothing |
 | `landed_digests_roundtrip_and_stay_scoped_to_their_topic` | on-disk format, per-tenant scoping, and the `with_metadata` clobber trap |
 | `landed_digest_is_order_independent_and_never_cancels` | commutativity, and the XOR trap |
+| `replayed_rows_that_delta_already_holds_are_not_written_again` (e2e) | **the seam** — real Delta, real object storage, the whole chain |
 
 The DML case is worth stating as a property rather than an example: the skip is
 **content**-keyed, so anything that changes what the bucket would write —
@@ -195,3 +196,49 @@ where restarts are free, and prod confirms passively by
 **Do not deploy into the open measurement window.** The stage-timeout concern
 from earlier tonight (`840fd945`) is still unresolved and a deploy resets the
 only process that can answer it.
+
+## What the end-to-end test found that nothing else could
+
+Three defects, each of which alone made the feature completely inert while
+every unit test still passed. All three lived in seams between components that
+were individually correct.
+
+1. **The identity was hashed in the wrong encoding.** A client batch and the
+   same batch rebuilt from the WAL serialize to different bytes; the round-trip
+   is a fixed point after one pass. Caught by the determinism test, before any
+   wiring existed. See above.
+2. **The install found no layer.** `bootstrap()` attaches the buffered layer to
+   `Database` with `with_buffered_layer` *after* it calls
+   `derive_wal_cursors_from_delta`, so `self.buffered_layer()` inside the derive
+   was always `None`. The layer is now passed in explicitly rather than reached
+   for through `self`.
+3. **The scan that loads identities does not run on a clean boot.**
+   `skip_delta_scan` short-circuits the whole Delta history scan when the cursor
+   snapshot is clean or the local WAL is fully consumed. This is correct — a
+   boot with nothing to replay manufactures no duplicates and needs no
+   identities — but it means the feature is, by construction, **only ever active
+   on a dirty boot.** Worth stating plainly, because it also bounds the cost: a
+   clean deploy pays nothing.
+
+## A property that fell out, and it is a good one
+
+A client **cannot spoof a landed identity.** `otel_logs_and_spans` is
+`version_append`, so `stamp_version` overwrites `updated_at` on every *inbound*
+write — a client re-sending byte-identical rows gets a new stamp, so different
+content, so no match, so its write proceeds. Only WAL replay preserves the
+durable stamp (`observe_stamp`). The skip therefore fires on replay duplicates
+and is structurally unable to fire on a client retry, which is the exact
+targeting we wanted and did not have to build.
+
+The corollary shaped the test: the duplicate cannot be produced over pgwire at
+all. `set_drop_cursor_advance_for_test` produces it the way prod does — a Delta
+commit that lands while the cursor advance that should follow it is lost, the
+case `settle_flushed_group` documents as benign.
+
+## Status
+
+Implemented, tested, **not deployed.** `TIMEFUSION_LANDED_SKIP_ENABLED=false`
+by default. The rollout above stands: staging first (restarts are free there and
+the skip only fires on an unclean restart, which cannot be induced on the
+read-only prod host), then prod confirms passively via `wal.landed_skips`
+against `wal.replay_rows`.
