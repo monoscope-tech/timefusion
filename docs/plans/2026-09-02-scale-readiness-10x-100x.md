@@ -1554,3 +1554,27 @@ means fewer simultaneous packing sorts *in practice* even if `K` is unchanged.
 `light_optimize_k` checked at the new value, because that assertion
 (`k + 1 == coordinator_share / PER_SORT_BUDGET`) is what encodes the one-budget
 holdback for repair.
+
+### Final measured readings (all denominators computed, not estimated)
+
+Replacing the retracted decay claim with the full measured series — same process,
+no restart, uptime taken from `boot_micros` each time:
+
+| uptime | `dedup_bins_committed_total` | window rate | `pending_dedup` |
+| --- | --- | --- | --- |
+| 75 min | 47 | — | 1,434 |
+| 115 min | 80 | 49.5/hour | 1,434 |
+| 122 min | 87 | ~60/hour | **1,417** |
+
+`dedup_failed_total` 0, staging timeouts 0, `light_optimize_bins_committed_total`
+61, 38,273 queries served.
+
+**Dedup is keeping pace and the residue is drifting slowly DOWN** (1,434 → 1,417).
+No decay, no growth — which is the corrected version of the reading retracted
+above, and it is consistent with the diagnosis: the runnable work flows, and what
+remains is the bounded set the byte budgets exclude.
+
+This is also the shape to watch after any of the three decisions ships: if a
+budget change works, `pending_dedup` should fall materially below ~1,400 rather
+than oscillating around it, because ~900 of that residue is the never-admissible
+population.
