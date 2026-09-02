@@ -1182,6 +1182,18 @@ pub struct CoreConfig {
     pub pgwire_password: Option<String>,
     #[serde_inline_default(60)]
     pub timefusion_pgwire_max_statement_secs: u64,
+    /// How far a session may RAISE its statement timeout by asking for one, in
+    /// seconds. 0 (the default) means it cannot: the cap stays
+    /// `timefusion_pgwire_max_statement_secs` and behaviour is unchanged.
+    ///
+    /// Exists for batch work that legitimately cannot finish inside the
+    /// interactive cap -- monoscope's usage metering splits a billing cycle
+    /// into 30 day-sized aggregates and pays 60 sequential round trips for
+    /// exactly this reason. Raising is opt-in per session
+    /// (`SET statement_timeout = '300s'`) and never implicit, so a dashboard
+    /// connection that says nothing is still capped at the interactive value.
+    #[serde_inline_default(0)]
+    pub timefusion_pgwire_batch_statement_secs: u64,
     #[serde(default)]
     pub timefusion_otel_scan_guard: OtelScanGuard,
 }

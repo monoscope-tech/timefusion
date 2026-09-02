@@ -169,14 +169,39 @@ impl SchemaProvider for PgCatalogOverlay {
     }
 }
 
-pub fn effective_statement_timeout(client_timeout: Option<Duration>, max_statement_secs: u64) -> Option<Duration> {
+/// The cap this statement actually runs under.
+///
+/// `max_statement_secs` is the ceiling for a session that never says otherwise.
+/// A client could only ever lower it, which is the right default for
+/// interactive traffic and wrong for batch work: monoscope splits a billing
+/// cycle into one-day slices and pays 60 sequential round trips, purely because
+/// one aggregate over a high-volume project cannot finish inside 60s.
+///
+/// `batch_statement_secs` is how far a session may RAISE it by asking --
+/// `SET statement_timeout = '300s'` -- and nothing raises implicitly. A session
+/// that says nothing still gets `max_statement_secs`, and a session that asks
+/// for less still gets less. At the default of 0 this is exactly the old
+/// `min(client, server)`.
+///
+/// Deliberately not per-role: there is one pgwire credential
+/// (`CoreConfig::pgwire_user`), shared by the server, the background jobs and
+/// every operator, so a role cannot distinguish batch traffic from a dashboard.
+/// Asking is the only signal available, and it is the Postgres-native one.
+pub fn effective_statement_timeout(client_timeout: Option<Duration>, max_statement_secs: u64, batch_statement_secs: u64) -> Option<Duration> {
     let client_timeout = client_timeout.filter(|timeout| !timeout.is_zero());
-    let server_timeout = (max_statement_secs != 0).then(|| Duration::from_secs(max_statement_secs));
+    let ceiling = max_statement_secs.max(if client_timeout.is_some() { batch_statement_secs } else { 0 });
+    let server_timeout = (ceiling != 0).then(|| Duration::from_secs(ceiling));
     match (client_timeout, server_timeout) {
         (Some(client), Some(server)) => Some(client.min(server)),
         (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
         (None, None) => None,
     }
+}
+
+/// The configured batch ceiling, or 0 before the config singleton is
+/// initialised -- which is the safe direction: no raise.
+pub fn batch_statement_secs() -> u64 {
+    crate::config::try_config().map_or(0, |config| config.core.timefusion_pgwire_batch_statement_secs)
 }
 
 pub fn statement_timeout_error() -> PgWireError {
@@ -285,7 +310,7 @@ impl PgCompatibilityHook {
             // runs behind this hook and reads the value `SET search_path` wrote
             // to the client session. A constant here would report `public` back
             // to every client that had switched schema.
-            "statement_timeout" => effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs)
+            "statement_timeout" => effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs, batch_statement_secs())
                 .map_or_else(|| "0".to_string(), |timeout| format!("{}ms", timeout.as_millis())),
             _ => return None,
         };
@@ -621,11 +646,31 @@ mod tests {
 
     #[test]
     fn effective_timeout_uses_the_smaller_nonzero_value() {
-        assert_eq!(effective_statement_timeout(None, 60), Some(Duration::from_secs(60)));
-        assert_eq!(effective_statement_timeout(Some(Duration::ZERO), 60), Some(Duration::from_secs(60)));
-        assert_eq!(effective_statement_timeout(Some(Duration::from_secs(5)), 60), Some(Duration::from_secs(5)));
-        assert_eq!(effective_statement_timeout(Some(Duration::from_secs(120)), 60), Some(Duration::from_secs(60)));
-        assert_eq!(effective_statement_timeout(None, 0), None);
+        let secs = |n| Some(Duration::from_secs(n));
+        // Batch ceiling off: exactly the old min(client, server).
+        assert_eq!(effective_statement_timeout(None, 60, 0), secs(60));
+        assert_eq!(effective_statement_timeout(Some(Duration::ZERO), 60, 0), secs(60));
+        assert_eq!(effective_statement_timeout(secs(5), 60, 0), secs(5));
+        assert_eq!(effective_statement_timeout(secs(120), 60, 0), secs(60));
+        assert_eq!(effective_statement_timeout(None, 0, 0), None);
+    }
+
+    /// A session raises the cap only by ASKING, and never past the configured
+    /// batch ceiling. The silent case is the one that matters: a dashboard
+    /// connection that sets nothing must keep the interactive cap even while
+    /// batch work is allowed, or enabling this would lift the limit on all the
+    /// traffic it was meant to protect.
+    #[test]
+    fn only_a_session_that_asks_may_raise_past_the_interactive_cap() {
+        let secs = |n| Some(Duration::from_secs(n));
+        assert_eq!(effective_statement_timeout(None, 60, 600), secs(60), "silence must not raise anything");
+        assert_eq!(effective_statement_timeout(secs(300), 60, 600), secs(300), "asking within the batch ceiling is granted");
+        assert_eq!(effective_statement_timeout(secs(900), 60, 600), secs(600), "the batch ceiling still bounds the ask");
+        assert_eq!(effective_statement_timeout(secs(5), 60, 600), secs(5), "asking for less still gets less");
+        // A batch ceiling below the interactive cap cannot lower it -- that is
+        // what `max_statement_secs` is for, and a misconfiguration here must not
+        // quietly tighten every query.
+        assert_eq!(effective_statement_timeout(secs(120), 60, 30), secs(60));
     }
 
     #[test]

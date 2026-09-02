@@ -199,7 +199,7 @@ use tracing::{Instrument, error, field::Empty, info, instrument, warn};
 use crate::{
     read::plan_cache::PlanCacheHook,
     server::pg_compat::{
-        DEFAULT_MAX_STATEMENT_SECS, PgCompatibilityHook, TimeFusionServerParameterProvider, effective_statement_timeout, statement_timeout_error,
+        DEFAULT_MAX_STATEMENT_SECS, PgCompatibilityHook, TimeFusionServerParameterProvider, batch_statement_secs, effective_statement_timeout, statement_timeout_error,
     },
 };
 
@@ -1071,7 +1071,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
-        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs).filter(|_| statement_timeout_applies(query));
+        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs, batch_statement_secs()).filter(|_| statement_timeout_applies(query));
         let result =
             run_with_statement_timeout(timeout, <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span))
                 .await
@@ -1194,7 +1194,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         let _giant = giant_stmt_permit(query.len()).await;
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
-        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs).filter(|_| statement_timeout_applies(query));
+        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs, batch_statement_secs()).filter(|_| statement_timeout_applies(query));
         let result = run_with_statement_timeout(
             timeout,
             <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span),
