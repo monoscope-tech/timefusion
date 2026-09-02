@@ -1616,6 +1616,30 @@ impl Database {
                                 // loop's own progress bump cannot see most of the unit.
                                 // See `PlanProgress`.
                                 let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                                // `RunCollapse` collapses ADJACENT runs, so it needs one ordered
+                                // stream. `execute_stream` merges a multi-partition plan with a
+                                // `CoalescePartitionsExec`, which does NOT preserve ordering —
+                                // harmless while the plan always ended in a single-partition
+                                // `SortExec`, but the footer-ordering fix can remove that sort and
+                                // leave a partitioned scan at the root. Equal keys would then
+                                // arrive interleaved, duplicates would survive, and the unit would
+                                // be REJECTED by the `expected_logical_rows` oracle every time —
+                                // a bin that loops forever rather than a wrong answer, which is
+                                // the right failure but an expensive one to diagnose.
+                                //
+                                // A global `ORDER BY` should already force a single-partition
+                                // root, so this is belt-and-braces; make it explicit rather than
+                                // assumed, because the cost of being wrong is a silent stall.
+                                let plan = match (streaming_collapse, plan.properties().output_partitioning().partition_count()) {
+                                    (true, 2..) => {
+                                        let ordering =
+                                            plan.properties().output_ordering().cloned().ok_or_else(|| {
+                                                anyhow::anyhow!("dedup rewrite: partitioned plan with no ordering cannot feed a run collapse")
+                                            })?;
+                                        Arc::new(datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(ordering, plan)) as _
+                                    }
+                                    _ => plan,
+                                };
                                 // Whether the ONE remaining sort survived. With the window gone
                                 // the rewrite's whole cost is this sort, and the delta-rs fork
                                 // already declares footer ordering on conforming files — so a
