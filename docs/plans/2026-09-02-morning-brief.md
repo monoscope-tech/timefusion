@@ -92,7 +92,19 @@ the *ordinary* bin is also over budget.
   must be ≥ `N x 256 MiB x 12` — **3,072 MiB for one**, 6,144 for two.
 - **Judgement required:** only how much memory repair may hold, given admission
   (Decision 2) draws on the same pool.
-- **Status:** not implemented. Needs no new measurement.
+- **Status:** not implemented, but **there is a reproducing test on branch
+  `repair-budget-repro`** (`config::tests::repair_budget_must_fit_one_target_sized_file`).
+  It fails today with the whole diagnosis in its message:
+
+  ```
+  repair budget 1280 MiB cannot hold ONE target-sized file
+  (3072 MiB decoded = 256 MiB x 12), so every repair unit clamps to
+  the whole semaphore and repair serializes
+  ```
+
+  Branch, not master — master deploys to prod. Raising the budget is a memory
+  decision that interacts with admission (same pool), so the test makes the
+  defect executable without pre-empting the judgement.
 
 **Confirmed against LIVE state**, not the (hours-stale) checkpoint: replaying
 both journal files gives **310 repair tasks in Retry right now**, against 311
