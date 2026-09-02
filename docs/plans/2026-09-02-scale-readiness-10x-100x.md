@@ -297,3 +297,35 @@ split it at planning time instead of discovering it at the deadline. The
 estimate is already in the journal — `estimated_decoded_bytes` is what every row
 of the tables above was computed from, so the input for the decision exists and
 is simply not used as a selection bound.
+
+### Production already pays for this, and the journal says so directly
+
+The sim argues that units are discovered-too-big rather than sized. The journal
+proves it happens, without any simulation:
+
+- **25.4%** of all tasks (19,961 of 78,741) carry a `retry_reason`.
+- **80.3% of those retries are `split_into_smaller_slices`** — 16,036 tasks.
+  That is **one in five tasks in the whole journal** claimed, found not to fit,
+  and split. Discovering size after selection is not a theoretical cost; it is
+  the single largest source of retry in production.
+- **338** carry `dedup: Not enough memory to continue external sort` — the
+  per-sort budget failing outright in production, which is the concrete form of
+  the 182 MB unspillable floor analysis above.
+- The rest are small: `migrated_to_aligned_hour_slice` 2,790,
+  `resource_admission` 273, `admission_busy` 171, `worker_error` 159.
+
+And the superseded population is **biased toward big units**:
+
+| population | n | median | mean |
+| --- | --- | --- | --- |
+| superseded | 17,296 | 0.31G | **1.50G** |
+| not superseded | 21,447 | 0.31G | 0.81G |
+
+Identical medians, but the superseded mean is **1.85x** larger — so it is the
+*tail* that gets invalidated before it can run, exactly as expected when a large
+unit sits claimed for a long window. That is 19,159 tasks of planned work thrown
+away, and it is size-correlated.
+
+**Taken together:** one in five tasks is split after claim, the tail is what gets
+superseded, and 6.4% of units carry 67.1% of the bytes. Sizing units at
+selection time addresses all three at once.

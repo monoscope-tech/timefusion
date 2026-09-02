@@ -62,7 +62,13 @@ mod sqllogictest_tests {
             if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
                 println!("Executing SQL: {}", sql);
             }
-            let is_query = sql.to_lowercase().starts_with("select");
+            // `WITH` matters as much as `SELECT`: a CTE routed to `execute()`
+            // returns a row COUNT, never rows, so every CTE assertion silently
+            // compared against an empty result set and no CTE over a data table
+            // was testable at all. monoscope's two-stage top-N dashboards are
+            // exactly that shape.
+            let lowered = sql.to_lowercase();
+            let is_query = ["select", "with", "show", "explain", "values", "table"].iter().any(|kw| lowered.starts_with(kw));
 
             if !is_query {
                 let affected = self.client.execute(sql, &[]).await?;
@@ -179,9 +185,16 @@ mod sqllogictest_tests {
                         .try_get::<_, Option<i64>>(i)
                         .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
                         .unwrap_or_else(|_| "error:int8".to_string()),
+                    // f64 first, then f32: a float4 column is four wire bytes and
+                    // fails an f64 decode outright. Without the fallback every
+                    // `::float` column — which is what monoscope casts nearly
+                    // every chart value to — read back as `error:float`, so no
+                    // float was assertable anywhere in this suite.
                     "float4" | "float8" => row
                         .try_get::<_, Option<f64>>(i)
                         .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
+                        .or_else(|_| row.try_get::<_, Option<f32>>(i).map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string())))
+                        .or_else(|_| row.try_get::<_, Option<String>>(i).map(|v| v.unwrap_or_else(|| "NULL".to_string())))
                         .unwrap_or_else(|_| "error:float".to_string()),
                     // tokio-postgres has no built-in NUMERIC decoder (would require
                     // `with-rust_decimal-1`). Parse via a custom FromSql wrapper.
