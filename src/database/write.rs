@@ -1406,6 +1406,19 @@ impl Database {
 
         let mut total_advanced = 0;
         for (project_id, table_name) in topics {
+            // Same scan, second (independent) reading: the batch-set identities
+            // these commits contain. Feeds ONLY the flush-time decline — never
+            // the cursor advance below, which stays governed by the conservative
+            // watermark. See `LANDED_DIGESTS_KEY`.
+            if self.config.buffer.landed_skip_enabled()
+                && let Some(layer) = self.buffered_layer()
+            {
+                let digests: Vec<[u8; 32]> = commits.iter().flat_map(|ci| parse_landed_digests_from_json(&ci.info, &project_id, &table_name)).collect();
+                if !digests.is_empty() {
+                    info!("Loaded {} landed-batch identities for {}.{}", digests.len(), project_id, table_name);
+                    layer.note_landed_digests(&project_id, &table_name, digests);
+                }
+            }
             let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic(), &project_id, &table_name);
             let advanced = wal.merge_persisted_positions(&project_id, &table_name, &delta_max)?;
             if advanced > 0 {

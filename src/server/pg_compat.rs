@@ -936,6 +936,11 @@ impl StatsTableProvider {
                         // merge-on-read versions. Compare against the dedup drop rate
                         // to price a restart.
                         "replay_rows" => s.wal_replay_rows,
+                        // The other half of that comparison: flushes declined
+                        // because the rows were already in Delta. Rising with
+                        // replay_rows is the feature working.
+                        "landed_skips" => s.landed_skips_total,
+                        "landed_skipped_rows" => s.landed_skipped_rows_total,
                     ],
                     rows!["tantivy"; "recovery_pending_files" => s.tantivy_recovery_pending_files],
                     rows!["wal";

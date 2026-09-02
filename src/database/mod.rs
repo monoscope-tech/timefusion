@@ -1842,19 +1842,28 @@ fn base_commit_properties() -> CommitProperties {
 fn build_watermark_commit_properties(
     watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>, digests: impl IntoIterator<Item = (String, String, [u8; 32])>,
 ) -> CommitProperties {
+    let metadata = flush_commit_metadata(watermarks, digests);
+    if metadata.is_empty() {
+        return base_commit_properties();
+    }
+    base_commit_properties().with_metadata(metadata)
+}
+
+/// The `commitInfo.info` entries a flush commit carries. Split out of
+/// [`build_watermark_commit_properties`] so tests can read back what a commit
+/// would actually record — `CommitProperties::app_metadata` is private.
+fn flush_commit_metadata(
+    watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>, digests: impl IntoIterator<Item = (String, String, [u8; 32])>,
+) -> Vec<(String, serde_json::Value)> {
     let entries = serialize_watermarks_to_json(watermarks);
     let landed = serialize_landed_digests_to_json(digests);
-    let metadata: Vec<(String, serde_json::Value)> = [
+    [
         (!entries.is_empty()).then(|| (WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries))),
         (!landed.is_empty()).then(|| (LANDED_DIGESTS_KEY.to_string(), serde_json::Value::Object(landed))),
     ]
     .into_iter()
     .flatten()
-    .collect();
-    if metadata.is_empty() {
-        return base_commit_properties();
-    }
-    base_commit_properties().with_metadata(metadata)
+    .collect()
 }
 
 /// `CommitProperties` for a compaction/dedup commit (Add + Remove): when
@@ -15638,6 +15647,42 @@ mod tests {
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
         let parsed = parse_watermark_from_json(&info, wm.len(), "p", "t");
         assert_eq!(parsed, wm);
+    }
+
+    /// Landed-batch identities round-trip, are scoped to the topic that wrote
+    /// them (unified-table tenants share one Delta log, so an unscoped identity
+    /// would let one tenant's commit decline another's flush), and survive
+    /// sharing a commit with the watermark — `with_metadata` REPLACES the
+    /// metadata map, so building the two keys separately would drop one.
+    #[test]
+    fn landed_digests_roundtrip_and_stay_scoped_to_their_topic() {
+        let (a, b) = ([7u8; 32], [9u8; 32]);
+        let info: HashMap<String, serde_json::Value> = flush_commit_metadata(
+            [("p".to_string(), "t".to_string(), vec![Some(walrus_rust::WalPosition { block_id: 5, offset: 64 })])],
+            [("p".to_string(), "t".to_string(), a), ("p".to_string(), "t".to_string(), b), ("other".to_string(), "t".to_string(), a)],
+        )
+        .into_iter()
+        .collect();
+
+        assert_eq!(parse_landed_digests_from_json(&info, "p", "t"), vec![a, b]);
+        assert_eq!(parse_landed_digests_from_json(&info, "other", "t"), vec![a]);
+        assert!(parse_landed_digests_from_json(&info, "stranger", "t").is_empty(), "a topic that recorded nothing must match nothing");
+        // The watermark must still be there — the with_metadata clobber trap.
+        assert_eq!(parse_watermark_from_json(&info, 1, "p", "t"), vec![Some(walrus_rust::WalPosition { block_id: 5, offset: 64 })]);
+    }
+
+    /// **The invariant.** A landed-batch identity may only DECLINE a write; it
+    /// must never advance a WAL cursor. The two claims are different kinds:
+    /// the watermark is a RANGE, safe only because it is floored at every live
+    /// hold, while a digest is an IDENTITY with no ordering meaning at all.
+    /// Letting a digest move a cursor would skip un-flushed entries that merely
+    /// sit below a landed one — the acked-write loss the plan documents.
+    #[test]
+    fn landed_digests_never_advance_a_cursor() {
+        let info: HashMap<String, serde_json::Value> = flush_commit_metadata([], [("p".to_string(), "t".to_string(), [3u8; 32])]).into_iter().collect();
+
+        assert_eq!(parse_landed_digests_from_json(&info, "p", "t"), vec![[3u8; 32]], "the identity is recorded");
+        assert_eq!(max_watermark_across_commits([&info], 4, "p", "t"), vec![None; 4], "and it advances NOTHING");
     }
 
     /// Orphaned `datafusion-*` spill dirs are reaped; anything else in the

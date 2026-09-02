@@ -253,6 +253,12 @@ pub struct StatsSnapshot {
     /// merge-on-read one. Nothing reported the volume, so the cost of a restart
     /// could not be compared against the dedup work it creates.
     pub wal_replay_rows: u64,
+    /// Flushes declined because their rows were provably already committed,
+    /// and the rows those flushes would have re-written. Read against
+    /// `replay_rows`: that is the duplicate volume a restart CREATES, this is
+    /// the volume the skip PREVENTS.
+    pub landed_skips_total: u64,
+    pub landed_skipped_rows_total: u64,
     /// True only after startup WAL recovery has returned successfully.
     pub wal_recovery_complete: bool,
     /// Committed Parquet files awaiting post-replay Tantivy indexing.
@@ -665,6 +671,19 @@ pub struct BufferedWriteLayer {
     /// replay ends would publish a partial replayed state.
     deferred_tantivy_files: std::sync::Mutex<Vec<DeferredTantivyFile>>,
     deferred_tantivy_path: std::path::PathBuf,
+    /// Batch-set identities this table's recent commits already contain, per
+    /// (project, table) — loaded at boot from the same Delta history scan that
+    /// derives cursors, and extended in-process as flushes land. A flush whose
+    /// digest is in here writes rows that are provably already durable, so it
+    /// is declined (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
+    ///
+    /// Bounded by the boot scan's `delta_scan_depth` plus this process's own
+    /// commits — the same shape as ClickHouse's
+    /// `replicated_deduplication_window`. Empty means "no proof of anything",
+    /// which costs duplicates, never a loss.
+    landed_digests: dashmap::DashMap<(String, String), std::collections::HashSet<[u8; 32]>>,
+    landed_skips_total: AtomicU64,
+    landed_skipped_rows_total: AtomicU64,
     /// Test-only: bail out of `recover_from_wal` once this many relief drains
     /// have committed + advanced the rewind marker, simulating a crash
     /// mid-replay. `u64::MAX` = disabled.
@@ -806,6 +825,9 @@ impl BufferedWriteLayer {
             wal_replay_rows: AtomicU64::new(0),
             wal_recovery_complete: std::sync::atomic::AtomicBool::new(false),
             recovery_commit_floor: dashmap::DashMap::new(),
+            landed_digests: dashmap::DashMap::new(),
+            landed_skips_total: AtomicU64::new(0),
+            landed_skipped_rows_total: AtomicU64::new(0),
             deferred_tantivy_files: std::sync::Mutex::new(std::fs::read(&deferred_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             deferred_tantivy_path: deferred_path,
             #[cfg(test)]
@@ -1292,6 +1314,40 @@ impl BufferedWriteLayer {
 
         debug!("BufferedWriteLayer insert complete: project={}, table={}", project_id, table_name);
         Ok(())
+    }
+
+    /// Record batch-set identities a table's commits are known to contain.
+    /// Called at boot with what the Delta history scan found, and after each
+    /// flush lands with that flush's own identity (so an in-process re-flush of
+    /// an identical set is declined too).
+    pub fn note_landed_digests(&self, project_id: &str, table_name: &str, digests: impl IntoIterator<Item = [u8; 32]>) {
+        let mut digests = digests.into_iter().peekable();
+        if digests.peek().is_none() {
+            return;
+        }
+        self.landed_digests.entry((project_id.to_string(), table_name.to_string())).or_default().extend(digests);
+    }
+
+    /// Whether this batch set is provably already in Delta.
+    ///
+    /// Returns `false` — flush it — for every uncertainty: feature off, no
+    /// identity computable, no record for the topic. **The only way this
+    /// returns `true` is a full 256-bit match against an identity a commit
+    /// recorded**, and even then the caller must treat the rows as committed
+    /// rather than as droppable, since that is exactly what they are.
+    fn already_landed(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> bool {
+        if !self.config.buffer.landed_skip_enabled() {
+            return false;
+        }
+        // Cheap guard first: the digest costs an IPC round-trip, and in steady
+        // state (no unclean restart) there is nothing recorded to match.
+        let Some(known) = self.landed_digests.get(&(project_id.to_string(), table_name.to_string())) else {
+            return false;
+        };
+        if known.is_empty() {
+            return false;
+        }
+        landed_digest(batches).is_some_and(|d| known.contains(&d))
     }
 
     /// Exposed so startup can run `derive_wal_cursors_from_delta` on the same
@@ -2525,6 +2581,14 @@ impl BufferedWriteLayer {
         let (mut settled, pending): (Vec<(bool, FlushStats)>, Vec<Pending>) =
             groups.into_iter().fold((Vec::new(), Vec::new()), |(mut settled, mut pending), (combined, token)| {
                 match self.prepare_flush(&combined.combined) {
+                    // An already-landed group drops OUT of the shared commit and
+                    // settles as a success on the spot: its rows are in Delta, so
+                    // draining and advancing is exactly right. If every group is
+                    // declined, `pending` is empty and no commit happens at all.
+                    Ok((batches, _)) if self.already_landed(&combined.combined.project_id, &combined.combined.table_name, &batches) => {
+                        self.note_landed_skip(&combined.combined, &batches);
+                        settled.push(self.settle_flushed_group(combined, token, Ok(())));
+                    }
                     Ok((batches, watermark)) => pending.push((combined, token, batches, watermark)),
                     Err(e) => settled.push(self.settle_flushed_group(combined, token, Err(e))),
                 }
@@ -2710,6 +2774,10 @@ impl BufferedWriteLayer {
     /// for durability. We only advance the WAL watermark after this returns successfully.
     async fn flush_bucket(&self, bucket: &FlushableBucket) -> anyhow::Result<()> {
         let (batches, delta_watermark) = self.prepare_flush(bucket)?;
+        if self.already_landed(&bucket.project_id, &bucket.table_name, &batches) {
+            self.note_landed_skip(bucket, &batches);
+            return Ok(());
+        }
         let added_files = if let Some(ref callback) = self.delta_write_callback {
             // Await ensures Delta commit completes before we return.
             let commit = callback(bucket.project_id.clone(), bucket.table_name.clone(), batches.clone(), delta_watermark);
@@ -2761,6 +2829,22 @@ impl BufferedWriteLayer {
         Ok(())
     }
 
+    /// A flush declined because its rows are provably already committed. Skips
+    /// the Delta write AND the tantivy sidecar — the original commit built both
+    /// — and returns Ok, so the caller drains the bucket, releases its holds and
+    /// advances the cursor exactly as a real commit would. That cursor advance
+    /// is the point: it is what stops the next boot from replaying these rows
+    /// again.
+    fn note_landed_skip(&self, bucket: &FlushableBucket, batches: &[RecordBatch]) {
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        self.landed_skips_total.fetch_add(1, Ordering::Relaxed);
+        self.landed_skipped_rows_total.fetch_add(rows as u64, Ordering::Relaxed);
+        info!(
+            "Declined an already-landed flush: project={}, table={}, bucket_id={}, rows={} — these rows are in Delta already (WAL replay re-inserted them)",
+            bucket.project_id, bucket.table_name, bucket.bucket_id, rows
+        );
+    }
+
     /// Post-commit half of a bucket flush: hand the committed rows + the files
     /// this bucket's project added to the tantivy sidecar. `added_files` is
     /// already attributed per project by the writer (files live under the
@@ -2776,6 +2860,13 @@ impl BufferedWriteLayer {
     /// so concurrent uploads can't saturate S3 connections or grow tantivy
     /// writer heap unbounded.
     fn index_flushed_files(&self, bucket: &FlushableBucket, batches: Vec<RecordBatch>, added_files: Vec<String>) {
+        // This commit landed, so its identity joins the live set — an
+        // in-process re-flush of the identical set (the abandoned-commit
+        // window in `flush_bucket`, a requeued group) is then declined too,
+        // not only duplicates left behind by a previous boot.
+        if self.config.buffer.landed_skip_enabled() {
+            self.note_landed_digests(&bucket.project_id, &bucket.table_name, landed_digest(&batches));
+        }
         if self.recovery_active.load(Ordering::Relaxed) {
             self.defer_tantivy_files(&bucket.project_id, &bucket.table_name, added_files);
             crate::observability::record_tantivy_recovery_deferred();
@@ -3421,6 +3512,8 @@ impl BufferedWriteLayer {
             drained: self.is_drained(),
             wal_recovery_duration_ms: self.wal_recovery_duration_ms.load(Ordering::Relaxed),
             wal_replay_rows: self.wal_replay_rows.load(Ordering::Relaxed),
+            landed_skips_total: self.landed_skips_total.load(Ordering::Relaxed),
+            landed_skipped_rows_total: self.landed_skipped_rows_total.load(Ordering::Relaxed),
             wal_recovery_complete: self.wal_recovery_complete.load(Ordering::Relaxed),
             tantivy_recovery_pending_files: self.deferred_tantivy_files.lock().unwrap().len(),
             boot_micros: self.boot_micros,
@@ -4281,6 +4374,70 @@ mod tests {
         let replayed = landed_digest(&seen.lock().unwrap().clone()).expect("replayed flush must have an identity");
 
         assert_eq!(original, replayed, "a replayed bucket must re-flush to the same identity, or the landed-batch skip can never fire");
+    }
+
+    /// The feature doing its job: a boot that knows the identity of what
+    /// already landed declines to write it again, and still drains the bucket
+    /// and advances the cursor — which is what stops the NEXT boot replaying
+    /// the same rows a third time.
+    ///
+    /// And the guard that keeps it honest: a bucket whose content changed
+    /// (here, a DML that retires a row) must NOT be declined. That is the
+    /// hazard the plan's rejected position-set design could not avoid, and the
+    /// reason identity is taken over CONTENT rather than over WAL positions.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_already_landed_batch_set_is_declined_but_a_changed_one_still_flushes() {
+        let dir = tempdir().unwrap();
+        let mut cfg = (*create_test_config(dir.path().to_path_buf())).clone();
+        cfg.buffer.timefusion_landed_skip_enabled = true;
+        let cfg = Arc::new(cfg);
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("lk{test_id}"), format!("lk{test_id}"));
+
+        let writes = Arc::new(AtomicU64::new(0));
+        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        let counted = Arc::clone(&writes);
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _w| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(Vec::new()) })
+        }));
+        let layer = Arc::new(layer);
+
+        let ts = crate::support::now_micros();
+        let batch = crate::support::test_helpers::json_to_batch(vec![
+            crate::support::test_helpers::test_span_ts("a", "s", &project, ts),
+            crate::support::test_helpers::test_span_ts("b", "s", &project, ts),
+        ])
+        .unwrap();
+        layer.insert(&project, &table, vec![batch]).await.unwrap();
+
+        // What a boot would load from Delta: the identity of the batch set the
+        // buffer is holding. Take it the same way the writer does.
+        let staged = layer.mem_buffer.query(&project, &table, &[]).unwrap();
+        let digest = landed_digest(&staged).expect("buffered rows must have an identity");
+        layer.note_landed_digests(&project, &table, [digest]);
+
+        layer.flush_all_now().await.unwrap();
+        assert_eq!(writes.load(Ordering::Relaxed), 0, "a flush whose rows are provably already in Delta must not be written again");
+        assert_eq!(layer.snapshot_stats().landed_skips_total, 1);
+        assert_eq!(layer.snapshot_stats().landed_skipped_rows_total, 2);
+        assert_eq!(layer.snapshot_stats().mem_total_rows, 0, "a declined flush must still DRAIN — otherwise the rows replay forever");
+
+        // Same rows again, then a DML that changes what the bucket holds. The
+        // identity no longer matches, so this one must reach Delta.
+        let batch = crate::support::test_helpers::json_to_batch(vec![
+            crate::support::test_helpers::test_span_ts("a", "s", &project, ts),
+            crate::support::test_helpers::test_span_ts("b", "s", &project, ts),
+        ])
+        .unwrap();
+        layer.insert(&project, &table, vec![batch]).await.unwrap();
+        let deleted = layer.delete(&project, &table, Some(&datafusion::prelude::col("id").eq(datafusion::prelude::lit(datafusion::scalar::ScalarValue::Utf8View(Some("a".into())))))).unwrap();
+        assert_eq!(deleted, 1, "the DML must actually change the bucket, or the assertion below proves nothing");
+
+        layer.flush_all_now().await.unwrap();
+        assert_eq!(writes.load(Ordering::Relaxed), 1, "a bucket whose content changed must still be written — a DML must never be swallowed by the skip");
+        assert_eq!(layer.snapshot_stats().landed_skips_total, 1, "the changed bucket must not count as a skip");
     }
 
     /// Regression: prod 2026-07-08 OOM crash loop. WAL replay loaded the whole
