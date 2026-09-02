@@ -127,6 +127,41 @@ lesson generalises — a test that is order-sensitive can manufacture a clean
 2-for-2 and retire a good idea. Before this test can condemn anything again it
 needs its scheduling dependence fixed or named.
 
+### Live on prod as `a5381a0` — verified, not assumed
+
+~10 minutes into a fresh process:
+
+| metric | value |
+| --- | --- |
+| `dedup_bins_committed_total` / `dedup_waves_committed_total` | **4 / 4** |
+| `dedup_failed_total`, `dedup_timed_out_total`, `dedup_bin_stage_timeouts_total` | **0** |
+| `immutable_column_disagreement_total` | **0** — the widening's premise, live |
+| `pending_dedup` | 1840 (was ~2,500 at session start) |
+
+Like-for-like on process age, the PREVIOUS build read
+`dedup_bins_committed_total = 0` at the same point.
+
+`RunCollapse` is doing the work, across six projects, arithmetic exact:
+
+```
+dcad860a … 07:40-07:50   dropped=37317 (before=160768 after=123451)
+28f62f01 … 07:50-08:00   dropped=25734 (before=85405  after=59671)
+00000000 … 07:50-08:00   dropped=7142  (before=78009  after=70867)
+be87ebc1 … 07:30-07:40   dropped=1889  (before=23641  after=21752)
+```
+
+The `expected_logical_rows` oracle rejects any staged unit whose row count
+disagrees with an independent `COUNT(DISTINCT keys)`, so a collapse bug shows up
+as `dedup_failed_total` climbing or bins looping `Retry` — never as silent row
+loss. It has not fired.
+
+**Note for whoever reads these drop rates:** 23% on a hot bin is NOT the 0.0004%
+measured on sealed dates. Different population — the last 30 minutes carry
+merge-on-read version churn that later collapses. Do not mix the two numbers.
+
+**Kill switch:** revert the one-line `dedup_keys` widening in the YAML. The
+`dedup_keys_lead_the_sort` gate then flips the window path back on by itself.
+
 ### A live correctness bug in DataFusion's footer→ordering mapping
 
 Probing whether phase 2 is reachable turned this up. Real prod footers are
