@@ -142,6 +142,14 @@ At half occupancy only a third of the queue can be admitted. It is
 *over*-guarded: admission capacity is 60 GiB, so today one unit may use **under
 1%** of the pool it enters, and all 10 permits at maximum size use **8%** of it.
 
+**Dedup — the lane that is ~96% of maintenance time — is squeezed from BOTH
+sides.** Of its 1,540 queued tasks (622 priced): median size **512 MiB, exactly
+the ceiling**, and **58.7% exceed it and can never be admitted at any
+occupancy**. Meanwhile the largest failure among tasks that *do* enter is
+`Not enough memory to continue external sort` — **245 tasks**. The
+all-operations figure (14.1% never-admissible) badly understated this for the
+lane that matters most.
+
 **But it cannot be raised alone.** Of the 338 sort-OOM failures (41 in the
 *fresh* cohort, i.e. current behaviour), **every sized one is at or below today's
 512 MiB ceiling, median 256 MiB** — a quarter-GiB unit already exhausts the
@@ -150,6 +158,9 @@ decodes. Raising admission alone converts starved units into sort-failing units
 on the OOM path.
 
 - **Fix shape:** raise the admission ceiling **and** the per-sort slice together.
+  Raising admission alone moves dedup tasks from "cannot enter" to "fails its
+  sort"; raising the slice alone leaves 58.7% unable to enter. **One change, not
+  two.**
 - **Risk:** two constants, OOM path, real interaction. Wants a canary.
 
 ---
