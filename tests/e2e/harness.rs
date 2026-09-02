@@ -56,6 +56,7 @@ pub struct E2eEnvBuilder {
     unordered_leg_sort_max_mb: Option<u64>,
     repair_resume: bool,
     landed_skip: bool,
+    repair_budget_mib: Option<usize>,
     mark_sorted_at_write: bool,
 }
 
@@ -91,6 +92,7 @@ impl Default for E2eEnvBuilder {
             page_row_count_limit: None,
             repair_resume: false,
             landed_skip: false,
+            repair_budget_mib: None,
             mark_sorted_at_write: true,
         }
     }
@@ -136,6 +138,15 @@ impl E2eEnvBuilder {
     /// (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
     pub fn with_landed_skip(mut self) -> Self {
         self.landed_skip = true;
+        self
+    }
+
+    /// Shrink the repair rewrite byte budget so a test-sized file exceeds it.
+    /// Prod's budget is 1,280 MiB and a target-sized file decodes to 3,072 MiB,
+    /// so reproducing the semaphore refusal at real constants would need a
+    /// ~107 MB compressed fixture. This is the knob that makes it testable.
+    pub fn with_repair_budget_mib(mut self, mib: usize) -> Self {
+        self.repair_budget_mib = Some(mib);
         self
     }
     /// Shrink the in-process sort budget (in-memory Arrow bytes) so a test can
@@ -299,6 +310,7 @@ impl E2eEnvBuilder {
             page_row_count_limit: self.page_row_count_limit,
             repair_resume: self.repair_resume,
             landed_skip: self.landed_skip,
+            repair_budget_mib: self.repair_budget_mib,
             mark_sorted_at_write: self.mark_sorted_at_write,
             test_id: &test_id,
         });
@@ -418,6 +430,7 @@ impl E2eEnv {
             page_row_count_limit: self.builder.page_row_count_limit,
             repair_resume: self.builder.repair_resume,
             landed_skip: self.builder.landed_skip,
+            repair_budget_mib: self.builder.repair_budget_mib,
             mark_sorted_at_write: self.builder.mark_sorted_at_write,
             test_id: &self.test_id,
         });
@@ -541,6 +554,7 @@ struct BuildCfgArgs<'a> {
     unordered_leg_sort_max_mb: Option<u64>,
     repair_resume: bool,
     landed_skip: bool,
+    repair_budget_mib: Option<usize>,
     mark_sorted_at_write: bool,
     test_id: &'a str,
 }
@@ -573,6 +587,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;
     cfg.buffer.timefusion_landed_skip_enabled = args.landed_skip;
+    cfg.derived.repair_rewrite_budget_mib_override = args.repair_budget_mib;
     cfg.maintenance.timefusion_repair_mark_sorted_at_write = args.mark_sorted_at_write;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     // A 0% selectivity floor is the off switch for the WHOLE prefilter: any hit
