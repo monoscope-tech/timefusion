@@ -1,5 +1,11 @@
 # What monoscope actually asks TimeFusion
 
+> **This document is now executable: `tests/slt/monoscope_query_shapes.slt`.**
+> Prose drifts — two claims below were stale for months (the `Utf8View` OR
+> workaround, and `EXPLAIN (ANALYZE)`), so monoscope kept paying for defects
+> that no longer existed. Add a shape to the slt file when you add it here, and
+> CI will tell you when a claim stops being true.
+
 2026-08-22. Sourced from the monoscope tree, not from guesswork: the KQL→SQL
 lowering in `shared/src/Pkg/Parser/Stats.hs`, the query builder in
 `src/Pkg/Parser.hs`, the shipped dashboard definitions in
@@ -246,7 +252,12 @@ projecting ~14 columns, self-joined on `c.tid = p.tid AND c.par = p.sid`, with
 Notes from its own comments that are worth respecting when benchmarking:
 
 - `kind IN (…)` rather than an OR-of-equalities, because TimeFusion's
-  `Utf8View` OR predicate returned wrong rows.
+  `Utf8View` OR predicate returned wrong rows. **HISTORICAL — fixed by
+  `e0bf291`.** The cause was not Utf8View: the tantivy id-prefilter intersected
+  per-term id sets, which is sound for `AND` and empty for `OR`, so the scan
+  skipped every file. `IN` may still be the better spelling on speed alone,
+  since `kind` is raw-indexed — but it is no longer a correctness requirement.
+  §11b of `tests/slt/monoscope_query_shapes.slt` asserts the two forms agree.
 - Every projected column is aliased (`knd`, `stc`, `dur`, `nm`) because
   DataFusion cannot resolve `c.kind`/`p.kind` when both sides carry the
   unqualified base-table name.
@@ -301,5 +312,6 @@ As of 2026-08-22, after the routing work:
   (`rollup_hits_hybrid_total` / `rollup_miss_*`). `EXPLAIN` cannot see it: the
   substitution happens in `DmlQueryPlanner`, and EXPLAIN renders the inner plan
   with the default planner.
-- `EXPLAIN ANALYZE` must be spelled without parentheses; `EXPLAIN (ANALYZE) …`
-  is a parse error in TimeFusion.
+- ~~`EXPLAIN ANALYZE` must be spelled without parentheses; `EXPLAIN (ANALYZE) …`
+  is a parse error in TimeFusion.~~ **No longer true** — the parenthesised form
+  plans today (pinned in §15 of the slt suite).

@@ -377,17 +377,51 @@ WHERE project_id = 'mono_shapes'
 # §13. Window functions — "% of total" columns and the total-rows companion.
 # ---------------------------------------------------------------------------
 
-query TTT
+# §13a. Scalar control for §13b below: float literal arithmetic is exact when
+# no aggregate is involved. If this ever changes, the divergence below is not
+# what this file says it is.
+#
+# SECOND DIVERGENCE, visible in columns c and d. In Postgres `float` IS
+# `double precision`, so `x::float` is float8. Here column d — `100.0::float /
+# 6` — returns 16.666666, seven significant digits, while column c does the
+# same division without the cast and returns 16.666666666666668. So `::float`
+# resolves to Float32 and NARROWS the value.
+#
+# This matters more than it looks: monoscope's KQL lowering appends `::float`
+# to nearly every aggregate it emits (`count(*)::float`, `dcountSQL`,
+# `percentileSQL`, `simpleAggSQL`), so every chart value crosses the wire with
+# float32 precision where the client asked for float8.
+query TTTT
+SELECT (200.0 / 6)::text AS a, (2 * 100.0 / 6)::text AS b, (100.0 / 6::bigint)::text AS c, (100.0::float / 6)::text AS d
+FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+----
+33.333333333333336 33.333333333333336 16.666666666666668 16.666666
+
+# §13b. WRONG ANSWER, pinned. `COUNT(*) * 100.0` renders as "300", not
+# "300.0" — the fraction is gone before the division, so the percentage
+# truncates: web is 33 where Postgres gives 33.333…. The scalar control above
+# proves float literals fold correctly on their own (200.0/6 is exact), so
+# this is specific to arithmetic between an Int64 aggregate and a float
+# literal. Casting the operands to ::float avoids it, which is why §4 is
+# correct and §13 is not.
+#
+# Mechanism NOT confirmed — do not assume Int64 vs Decimal from these numbers.
+# The discriminating check for whoever fixes this: does it reproduce on stock
+# DataFusion 54? That decides fork-patch versus upstream report.
+query TTTT
 SELECT resource___service___name,
-       (COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ())::text AS raw_expr,
-       ((COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ())::numeric)::text AS as_numeric
+       (COUNT(*) * 100.0)::text AS mult,
+       (SUM(COUNT(*)) OVER ())::text AS win,
+       (COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ())::text AS div
 FROM otel_logs_and_spans
 WHERE project_id = 'mono_shapes'
   AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
 GROUP BY resource___service___name
 ORDER BY 1
 ----
-PROBE
+api 300 6 50
+db-proxy 100 6 16
+web 200 6 33
 
 query TT
 SELECT resource___service___name,
@@ -399,8 +433,8 @@ GROUP BY resource___service___name
 ORDER BY 2 DESC, 1
 ----
 api 50
-web 33.3
-db-proxy 16.7
+web 33
+db-proxy 16
 
 # ---------------------------------------------------------------------------
 # §14. The compatibility surface that exists for one named caller each.
@@ -422,12 +456,15 @@ true
 # `row_to_json(t)` over a derived alias — rejected at PARSE time by DataFusion,
 # so it needs the AST-level RowToJsonRecord rewrite.
 
-query B
-SELECT row_to_json(t) IS NOT NULL FROM (
+# Bare call only: the rewrite fires when row_to_json IS the projection
+# expression, not when it is nested inside one (`row_to_json(t) IS NOT NULL`
+# still fails to plan). pgAdmin sends the bare form, so that is what is pinned.
+query T
+SELECT row_to_json(t) FROM (
   SELECT id FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
 ) t
 ----
-true
+{"id":"ms_1"}
 
 # `->>` on a Variant column. monoscope emits PG's JSONB accessors; the
 # VariantAwareExprPlanner turns them into variant_get.
@@ -487,11 +524,13 @@ true
 # date::timestamptz used to drop the tz, yielding wire OID 1114 where the
 # client decoder wanted 1184 — that crashed every TF-routed span lookup.
 
-query B
-SELECT timestamp AS date IS NOT NULL
-FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+query I
+SELECT count(*)::bigint FROM (
+  SELECT timestamp AS date FROM otel_logs_and_spans
+  WHERE project_id = 'mono_shapes' AND id = 'ms_1'
+) x
 ----
-true
+1
 
 # ---------------------------------------------------------------------------
 # §15. Deliberate refusals. These are pinned so that FIXING one is visible:
@@ -511,9 +550,11 @@ SELECT time_bucket('1 month', timestamp) FROM otel_logs_and_spans WHERE project_
 statement error
 SELECT mode() WITHIN GROUP (ORDER BY level) FROM otel_logs_and_spans WHERE project_id = 'mono_shapes'
 
-# EXPLAIN (ANALYZE) with parentheses is a parse error; the un-parenthesised
-# form is what works. Pinned because it is a documented benchmarking trap.
-statement error
+# NO LONGER A REFUSAL. `docs/monoscope-query-shapes.md` records
+# `EXPLAIN (ANALYZE) ...` as a parse error and tells you to spell it without
+# parentheses. It plans today. The doc has been corrected; this pins the
+# behaviour so the claim cannot silently drift back.
+statement ok
 EXPLAIN (ANALYZE) SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'mono_shapes'
 
 # ---------------------------------------------------------------------------
