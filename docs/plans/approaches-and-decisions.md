@@ -72,6 +72,42 @@ Gated: any schema whose keys do not lead its sort keeps the window path.
   previously declared `[ts DESC]`, so this is a read-path improvement that was
   sitting there unnoticed.
 
+### Measured: the real 204 MB prod bin, 1 GB pool
+
+| variant | secs | MB/s |
+| --- | --- | --- |
+| dedup WINDOW b256 p1 — what shipped | **47.4** | 4.31 |
+| dedup COLLAPSE b256 p1 | **19.9** | 10.25 |
+| dedup WINDOW b2048 p1 | **OOM** (ExternalSorterMerge, unspillable, 1017.8 MB peak) | — |
+| dedup COLLAPSE b2048 p1 | **13.5** | 15.11 |
+
+**2.4x at prod's exact config** (`batch_size=256, target_partitions=1`), and at
+b2048 the window FAILS while the collapse completes — **3.5x** against the
+window's best working config. The window emits 1,534,862 rows to the collapse
+shape's 1,639,811: exactly the 104,949 duplicates the key probe found, so the two
+shapes are doing the same job.
+
+Caveat stated honestly: the bench prices the PLAN. `RunCollapse` adds an O(n)
+`RowConverter` encode over three short key columns on top of the COLLAPSE row —
+the same encode `dedup_batches` already does, and small against 27.5 s saved.
+
+### Suite verdict, and a master regression it exposed
+
+| tree | result |
+| --- | --- |
+| pre-change (master `5b2f7254`) | 1314/1315 — `a_chart_under_a_derived_table_routes_and_agrees_with_raw` FAILS |
+| with this change | 1316/1317 — the SAME single failure, nothing else |
+
+So that test is **already red on master**, from the concurrent session's two
+schema commits (`attributes___http___route` promoted to a column, migrate-columns
+Utf8) — not from this change. Establishing that took one full suite run on a
+reverted tree, and it was worth it: the same test is what condemned the
+`sorting_columns` reorder, and that verdict still stands (it was measured against
+a genuinely green 1314/1314 baseline, before master regressed).
+
+**Method note:** "the canary is red" is only evidence when you have re-measured
+the baseline THAT DAY. A shared checkout moves under you.
+
 ### Still open
 
 - `narrow_provider` declaring footer ordering (gated on EVERY selected file
