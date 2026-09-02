@@ -224,8 +224,23 @@ manufactures exactly these duplicates.
 
 **Why that reframes 10x:** the risk is *not* falling behind. Throughput scales
 (the sim drains a 10x-costlier backlog fine). The risk is that **the unrunnable
-fraction grows with file size** — every constant in the three decisions below is
-a fixed byte budget, and a larger tenant means larger files.
+fraction grows with tenant size** — every constant in the three decisions below
+is a fixed byte budget.
+
+**Verified, not assumed** (whale vs everyone else, from the journal):
+
+| operation | whale median | others median | ratio |
+| --- | --- | --- | --- |
+| dedup | 0.50 G | 0.25 G | **2.0x** |
+| repair | 0.25 G | 0.01 G | **23.8x** |
+| base_rollup | 0.37 G | 0.29 G | 1.26x |
+
+Larger tenant ⇒ larger units in *every* lane, at the median as well as the tail
+(the whale's biggest dedup unit is **295x** anyone else's). Small tenants never
+reach the 256 MiB compaction target so their files stay comfortably inside every
+budget; the whale's files sit *at* the target — exactly the size that does not
+fit. **Adding capacity cannot help: the exclusion is a comparison against a
+constant, not a worker shortage.**
 
 ## Scale readiness
 
