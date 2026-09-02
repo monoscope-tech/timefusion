@@ -144,3 +144,37 @@ sort (bloom/tantivy already exist for other columns; a service bloom is cheap).
 That would get both, and is why their design separates sort key from index.
 
 Not shippable overnight in any variant: every path changes what queries read.
+
+### The deciding number: the sort is 81% of a dedup rewrite (5.4x ceiling)
+
+`TF_BENCH_PARQUET=<204 MB real prod bin> TF_BENCH_POOL_MB=1024 cargo bench
+--bench rewrite_throughput`:
+
+| variant | secs | MB/s |
+| --- | --- | --- |
+| **scan only** | **2.2** | **94.24** |
+| sort b2048 p1 | 13.2 | 15.49 |
+| sort b256 p1 | 19.4 | 10.54 |
+| sort b256/b2048/b8192 p8, b8192 p1 | **FAILED — external sort OOM at 1 GB** | — |
+| **PROD (b256 p1 x13 slices)** | **11.6** | **17.58** |
+
+**The sort is 9.4 s of prod's 11.6 s — 81% of the unit.** Removing it takes a
+rewrite from 17.58 MB/s to ~94 MB/s: a **5.4x ceiling** on the operation that is
+~96% of maintenance worker time. It also removes the OOM: every `p8` variant and
+`b8192 p1` fail outright at a 1 GB pool, which is the same external-sort failure
+prod has been fighting all month.
+
+So the layout question is worth real money: **~5x on the fleet's dominant cost,
+plus the memory hazard.** That is the 10x-class change; the claim reservation was
+1%.
+
+It still must be paid for on the read side — `service_name` pruning depends on the
+secondary sort position — so the morning sequence is:
+
+1. Service-filtered latency matrix (the read cost, currently unmeasured).
+2. If the read cost is material, price ClickHouse's separation instead: keep the
+   sort dedup-key-leading and serve `service_name` from a bloom index, which the
+   codebase already does for `id`/`trace_id`/`span_id`.
+3. Land whichever wins, then re-run this bench to confirm the sort is gone.
+
+Both sides are now quantified except the read cost, which is one matrix run.
