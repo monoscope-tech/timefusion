@@ -397,17 +397,28 @@ FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
 ----
 33.333333333333336 33.333333333333336 16.666666666666668 16.666666
 
-# §13b. WRONG ANSWER, pinned: web is 33 where Postgres gives 33.333….
+# §13b. Pinned as OBSERVED HERE, and explicitly NOT a production defect.
 #
-# The trigger is the WINDOW aggregate in the divisor, not integer arithmetic in
-# general. §13d below divides a filtered count by a plain `GREATEST(1,
-# COUNT(*))` in the same shape and is exact (16.67), and the scalar control
-# above folds float literals exactly — only `SUM(COUNT(*)) OVER ()` as the
-# divisor truncates. Casting the operands to ::float avoids it (§13c).
+# In this harness a grouped percentage divided by a window aggregate answers 33
+# where Postgres gives 33.333…. The trigger needs a GROUP BY *and* a window
+# aggregate as the divisor: §13d divides a filtered count by a plain
+# `GREATEST(1, COUNT(*))` in the same shape and is exact (16.67), §13e shows
+# the ungrouped multiply keeps its scale, and the §13a scalar control is exact.
 #
-# Mechanism NOT confirmed beyond that. The discriminating check for whoever
-# fixes this: does it reproduce on stock DataFusion 54? That decides
-# fork-patch versus upstream report.
+# It does NOT reproduce on production. Measured 2026-09-02 against prod
+# TimeFusion, both before and after deploying this very commit (process uptime
+# confirmed, so it was this build): the identical grouped+window shape answers
+# 86.1466854992369 at full precision, grouped by a declared rollup dimension
+# and by a non-dimension alike, and `COUNT(*) * 100.0` renders "9087700.0" with
+# its scale where it renders "300" here.
+#
+# So the difference is between THIS harness (`AppConfig::default()`, ephemeral
+# MinIO, six rows) and a production process — not between TimeFusion versions.
+# The mechanism is unknown and is deliberately not guessed at here. Treat this
+# as an open question about the test environment, not as a bug users are
+# hitting: the one dashboard widget in the shape was changed to cast its
+# operands (§13c), which is a no-op on prod and cheap insurance if the
+# environments ever converge.
 query TTTT
 SELECT resource___service___name,
        (COUNT(*) * 100.0)::text AS mult,

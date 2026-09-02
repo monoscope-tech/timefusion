@@ -379,7 +379,13 @@ surfaced them could not express the assertions.
 Both in `monoscope_query_shapes.slt` §13, with the mechanism deliberately
 NOT claimed:
 
-1. **A percentage divided by a WINDOW aggregate truncates.**
+1. **A percentage divided by a WINDOW aggregate truncates — IN THE TEST HARNESS
+   ONLY.** Verified 2026-09-02 against prod, before and after deploying this
+   branch (uptime-confirmed): prod answers at full precision for every shape
+   tried. The finding below stands as an open question about the slt
+   environment, NOT as a production defect. Original note follows.
+
+   1. **A percentage divided by a WINDOW aggregate truncates.**
    `COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ()` answers 33 where Postgres gives
    33.333…. Narrowed: the same shape over a plain `GREATEST(1, COUNT(*))`
    divisor is exact (16.67), and scalar float arithmetic is exact, so the
