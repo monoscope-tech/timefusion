@@ -583,3 +583,28 @@ Verification before shipping: `run-unit --op Dedup` on a busy sealed date, with
 `EXPLAIN ANALYZE` confirming no `SortExec` under the window for footer-sorted
 files, and the dedup output row-for-row identical to the sorted path on a fixture
 containing known duplicates.
+
+### The gate already exists: `is_sorted_run(&add.tags())`
+
+`src/database/compact.rs` already carries a PER-FILE sortedness check
+(`is_sorted_run(&add.tags())`, used by `TailAdd::from_stats` and the recompress
+path, which reports "already at target tier and every footer is sorted"). Its own
+comment states the safe direction: *"An unreadable footer is not evidence of
+sortedness"*.
+
+So the implementation is unblocked and small:
+
+1. In `narrow_provider`, partition the selected files by `is_sorted_run`.
+2. Declare the output ordering ONLY when every selected file passes.
+3. Any file failing, or with an unreadable footer, keeps today's behaviour (the
+   `SortExec`) — fail closed, never declare an order the data may not have.
+4. Verify: `run-unit --op Dedup` on a busy sealed date; `EXPLAIN ANALYZE` shows no
+   `SortExec` under the window for all-sorted file sets; dedup output is
+   row-for-row identical to the sorted path on a fixture with known duplicates.
+
+Left unimplemented deliberately at 04:00 with no remaining context budget to
+validate it. This is the operation that DELETES rows: a wrong ordering declaration
+silently keeps the wrong version, and that is unrecoverable, unlike every other
+change made tonight. The size is established (the sort OOMs a 1 GB pool on one
+204 MB bin), the gate exists, and the verification is written — it should be built
+first thing, carefully, not last thing, tired.
