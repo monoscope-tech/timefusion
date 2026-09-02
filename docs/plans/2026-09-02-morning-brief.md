@@ -215,4 +215,9 @@ experiment in miniature today.
 - **`attempts` is reset, not cumulative.** Reading it as cumulative made a
   plentiful lane look starved.
 - The journal is **not** on the host disk or in S3; it is inside the container at
-  `/app/data/timefusion/.timefusion_meta/maintenance_tasks.json`.
+  `/app/data/timefusion/.timefusion_meta/`.
+- **That JSON is a periodic CHECKPOINT, not live state** — live state is the
+  27.7 MB `maintenance_tasks.wal` beside it. The checkpoint can lag by hours (it
+  was ~2h stale when checked). Cohort *diffs* between two checkpoints are valid;
+  "right now N tasks are queued" is not. `load_sandboxed` copies both files, so a
+  faithful replay needs the `.wal` too.

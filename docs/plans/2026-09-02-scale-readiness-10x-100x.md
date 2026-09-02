@@ -1233,3 +1233,37 @@ unpublishing it would be a second uninvited change to someone else's branch.
 `tf_shared_checkout_git_discipline` memory already states: in a shared checkout,
 never `git add -A`. Stage explicit paths (`git add docs/`), which is what the
 later commits in this session did — and those carried nothing foreign.
+
+## MEASUREMENT CAVEAT: the journal JSON is a periodic checkpoint, not live state
+
+Worth stating precisely, because every journal number in this document depends
+on it. `.timefusion_meta/` holds two files:
+
+| file | size | mtime when checked | role |
+| --- | --- | --- | --- |
+| `maintenance_tasks.wal` | **27.7 MB** | **19:04 — current** | live state, actively appended |
+| `maintenance_tasks.json` | 59.2 MB | 17:07 (15:07 UTC) — **~2h stale** | periodic checkpoint |
+
+**I fetched only the JSON.** A third fetch returned a file byte-identical to the
+second (same SHA-256), which is what first drew attention: the checkpoint had not
+been rewritten in ~2 hours even though the running process had committed 47 dedup
+bins. That is the design working, not a fault — `checkpoint()` appends to the WAL
+and the JSON is rewritten periodically.
+
+**What this does and does not invalidate:**
+
+- **Stands:** the 4.4-hour cohort diff. Snapshots 1 and 2 were two *genuine*
+  checkpoints (different sizes, 63.8 MB → 59.2 MB), so "1,144 of 1,168 stuck
+  tasks still queued, 359 with incremented attempts" is a real comparison
+  between two real points in time.
+- **Stands:** every size/composition statistic — those describe the queue as of
+  a checkpoint, which is what they claim.
+- **Qualified:** any statement of the form "*right now* N tasks are queued". The
+  checkpoint can lag live state by hours, so the true current figure may differ.
+- **Unaffected:** the constants arithmetic (256 MiB x 12 vs 1,280 MiB) and the
+  prod-log evidence (243 `repair_rewrite_permit_busy` in 3h), neither of which
+  comes from the journal.
+
+**For anyone repeating this:** `load_sandboxed` copies **both** files, so a
+faithful replay needs the `.wal` too — `docker cp` it alongside the `.json`.
+Fetching only the JSON gives a coherent but potentially hours-old queue.
