@@ -1377,14 +1377,16 @@ impl BufferedWriteLayer {
             return false;
         }
         // Cheap guard first: the digest costs an IPC round-trip, and in steady
-        // state (no unclean restart) there is nothing recorded to match.
-        let Some(known) = self.landed_digests.get(&(project_id.to_string(), table_name.to_string())) else {
-            return false;
-        };
-        if known.is_empty() {
+        // state (no unclean restart) there is nothing recorded to match. The
+        // guard is dropped before that round-trip — holding a shard's lock
+        // across it would stall every concurrent flush recording its own
+        // identity on the same table.
+        let key = (project_id.to_string(), table_name.to_string());
+        if self.landed_digests.get(&key).is_none_or(|known| known.is_empty()) {
             return false;
         }
-        landed_digest(batches).is_some_and(|d| known.contains(&d))
+        let Some(digest) = landed_digest(batches) else { return false };
+        self.landed_digests.get(&key).is_some_and(|known| known.contains(&digest))
     }
 
     /// Exposed so startup can run `derive_wal_cursors_from_delta` on the same
