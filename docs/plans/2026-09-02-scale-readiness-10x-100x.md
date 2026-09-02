@@ -468,3 +468,51 @@ More concurrency and more consolidation are bought with the same memory, in
 opposite directions. That is a genuine tradeoff, not an oversight, and it is the
 thing to decide deliberately rather than by leaving one constant at 512 MiB. The
 sim can price both sides before anything ships.
+
+## CORRECTION: raising the fusion ceiling does NOT fix the flow problem — measured
+
+The section above concluded the 512 MiB ceiling was the root cause. **I tested it
+rather than recommending it, and it is wrong.** `MAX_DECODED_BYTES` was raised
+512 MiB → 4 GiB (8x), rebuilt, and the real-journal sim re-run identically:
+
+| | 512 MiB (today) | 4 GiB |
+| --- | --- | --- |
+| pending after 24h | 16,431 | **16,320** |
+| over_budget | 22,074 | **5,816** |
+| blocked | 92,670 | **99,063** |
+| fused | 58 | 65 |
+
+The ceiling *was* genuinely binding on budget refusals — they fell **74%**. But
+the candidates it freed did not fuse; they became **blocked** instead
+(+6,393, almost exactly the number that left `over_budget`). Net effect on the
+thing that matters: **0.7%**.
+
+**Why:** once size stops refusing them, they are refused because a Pending/Retry
+unit at or wider than the fusion width already holds the bucket. The binding
+constraint is bucket occupancy and group population, not bytes. The static
+analysis said the same thing and I under-weighted it — the live queue holds only
+**1,117 sized units across 585 (project, source, op, day) groups, ~1.9 per
+group**. Greedy-packing those units by ceiling:
+
+| ceiling | resulting units | reduction |
+| --- | --- | --- |
+| 512 MiB | 979 | 12.4% |
+| 2 GiB | 722 | 35.4% |
+| 16 GiB | 660 | **40.9%** |
+
+Even an *infinite* ceiling saturates near 41%, because you cannot fuse units that
+are not there. A 35–41% unit-count reduction is worth having, but it is not the
+answer to an arrival rate that outruns 21,000 executions a day.
+
+**What this rules out, which is the value of having run it:** "raise
+`MAX_DECODED_BYTES`" is a plausible, cheap-looking, one-constant change that a
+reasonable person would ship on the strength of the 99.7%-refused-on-budget
+number. It buys 0.7%. The 99.7% was real and the inference from it was wrong.
+
+**Where that leaves the flow problem.** The arrival side is now the only
+remaining explanation, and it is where the next work belongs: what *mints* the
+invalidations, and how many are avoidable. Two concrete leads already on the
+table — the restart-driven re-invalidation the sim models explicitly (~13 tasks
+per stream per restart), and the self-inflicted duplicate work in
+`2026-09-02-stop-manufacturing-duplicates.md`. Both reduce arrivals rather than
+trying to consolidate them after the fact.
