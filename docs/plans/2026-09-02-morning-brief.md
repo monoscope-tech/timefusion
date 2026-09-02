@@ -94,6 +94,15 @@ the *ordinary* bin is also over budget.
   (Decision 2) draws on the same pool.
 - **Status:** not implemented. Needs no new measurement.
 
+**Confirmed against LIVE state**, not the (hours-stale) checkpoint: replaying
+both journal files gives **310 repair tasks in Retry right now**, against 311
+survivors in the checkpoint — not draining, not a snapshot artifact. The
+actionable queue across all ops is **2,191**, not the ~21,000 the sim's
+`pending` reports (the rest is superseded bookkeeping). Repair is *not*
+universally broken — 2,188 have completed — which fits the arithmetic exactly:
+files under ~107 MiB compressed fit the budget and finish; target-sized 256 MiB
+files never can.
+
 **Verified three independent ways:**
 
 | direction | evidence |
