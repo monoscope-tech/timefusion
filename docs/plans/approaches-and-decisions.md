@@ -14,6 +14,8 @@ line the user changed in a YAML file.
 | `e4414b2` | `dedup_plan_shape` instrument | answered the next question on its first prod unit |
 | `5a445001` | footer sort index is a parquet LEAF, not a field | the remaining `SortExec` **disappears** once footers converge |
 | `8efa0952` | pin one ordered stream for the collapse | closes the stall that #3 could otherwise cause |
+| `608a385d` | the routing canary names its decline reason | `tiny_interior` — the mechanism, at last |
+| `f74f3429` | `wal.replay_rows` | lets a restart be priced against the dedup work it creates |
 
 Plus two latent bugs the work flushed out — the logical-count index keyed
 narrower than dedup (would under-count `COUNT(*)`), and the mem leg's ordering
@@ -21,6 +23,16 @@ claim using projected instead of original schema indices (regrew a blocking sort
 on every top-K dashboard query) — and one retraction: the rollup-routing canary
 declines on `tiny_interior`, so the verdict it produced against the
 `sorting_columns` reorder is unproven.
+
+**MEASUREMENT WARNING — I became the confounder.** Seven deploys in one night;
+prod uptime at hand-off was 17.6 minutes. A maintenance unit averages ~20 min, so
+a process that never lives that long cannot finish one, and
+`dedup_bin_stage_timeouts_total : dedup_bins_committed_total` moved 20:9 -> 30:4
+across my last two restarts. That is almost certainly MY deploy cadence killing
+in-flight units, not a regression — the exact trap CLAUDE.md records from
+2026-08-18 and `tf_deploy_cadence_starves_dedup` describes. Code deploys stopped
+after `f74f3429`; docs-only pushes do not restart prod. **Do not read any
+throughput number taken before ~2h of quiet.**
 
 **What to check first:** the `ordered_scan=true` share in `dedup_plan_shape`, and
 `dedup_bin_stage_timeouts_total : dedup_bins_committed_total` (was 20:9 before
