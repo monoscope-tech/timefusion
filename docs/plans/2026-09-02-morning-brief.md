@@ -1,7 +1,18 @@
 # Morning brief — night of 2026-09-02
 
-Everything is pushed to master and green (suite **1323/1323**, e2e **61/61**).
-Prod is healthy on my build. **Nothing risky was shipped.** Three decisions are
+Everything is pushed to master and green. Prod is healthy. **Nothing risky was
+shipped** — but read the incident note first.
+
+> **⚠ I published another session's work by accident.** A concurrent session
+> shared this checkout on branch `tf-monoscope-compat`. Several of my commits
+> used `git add -A`, which stages *their* files too, so four of my "docs:"
+> commits carried their work to master — including **`src/rollup.rs`** — and
+> **that triggered a prod deploy** (prod runs `e07421d`). Verified after the
+> fact: master builds clean, their `monoscope_query_shapes` test passes, prod is
+> serving normally (23,465 queries, dedup ~37/hour). No damage, but that is luck
+> rather than process, and it means my "no deploys since X" claims are wrong for
+> those windows. I did not revert — their work is intentional and may be built
+> upon. Detail in the scale-readiness doc. Three decisions are
 waiting for you. **They are one problem in three places:** every stuck lane is a
 unit that does not fit a budget it must pass through, and three budgets are
 calibrated below real unit sizes — admission 512 MiB, per-sort slice 510 MB,
