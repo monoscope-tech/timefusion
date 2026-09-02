@@ -303,11 +303,18 @@ These are reservation ceilings, not allocations, so 0% is not wasted RSS — but
 the partition is **static**, so that 16 GB is unavailable to maintenance
 regardless of query load.
 
-**Five samples is too thin to act on.** The follow-up is cheap and read-only:
-sample `query_pool_pct` across a full dashboard-load cycle. If it runs near zero,
-rebalancing toward maintenance funds the repair budget (needs **+1,792 MB** to
-reach 3,072) without touching the cgroup — which is otherwise the awkward part of
-both decisions.
+**Measured, 58 samples over ~20 min** (the five-sample reading was wrong — those
+landed in idle gaps): the pool is non-zero **12%** of the time and **peaks at
+1.32 GB = 8.3%** of its 16 GB ceiling.
+
+**So the rebalance is on, and sized:** leaving ~4 GB (3x the observed peak)
+frees roughly **12 GB** — far more than the repair budget needs (**+1,792 MB**)
+and enough for the admission/per-sort-slice pair, without touching the cgroup.
+
+Caveat: one hour, one workload, and the peak under a *heavy report* is
+unmeasured — DataFusion reserves for sorts/joins/aggregates, exactly what such a
+query uses. Reclaim conservatively and watch, which is what Decision 0's
+instrument makes possible.
 
 ## What shipped
 
