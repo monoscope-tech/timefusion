@@ -1866,3 +1866,42 @@ evidence" and nearly deprioritised a documented, permanent, partition-wide read
 regression on that basis. **The absence of a counter is not the absence of a
 cost** — and in a codebase this heavily commented, the cost may already be
 written down next to the code that causes it.
+
+### Bounding today's exposure: ~4.9%, not the documented 55%
+
+Having raised Decision 1 on the strength of the documented cost, the fair next
+question is how much of that cost is actually being paid today. No counter
+reports unsorted active files, but it can be bounded:
+
+| | |
+| --- | --- |
+| unsorted **suspects** (the repair queue) | **310** |
+| active raw files (`scan.tantivy_raw_files_total`) | 6,389 |
+| **upper bound on unsorted fraction** | **4.9%** |
+| documented historical peak | **55%** (1,263 of 2,290) |
+
+And 310 is an *upper* bound: repair's own verification has already proved ~58,000
+paths sorted (`repair_verified_sorted.txt`), so most suspects historically turn
+out fine — the queue is "files whose sort tag is absent", which is a suspicion,
+not a finding.
+
+**This tempers the urgency I just argued for, and both things are true:**
+
+- The exposure today (≤4.9%) is an order of magnitude better than the documented
+  worst case (55%), so this is not an active emergency.
+- But the mechanism is unchanged and permanent: each genuinely-unsorted file
+  voids ordering for its whole partition, nothing else re-sorts a converged file,
+  and repair is doing zero rewrites — so the count can only drift upward from
+  here.
+
+**Net ranking judgement:** Decision 1 belongs above "unevidenced" but below
+"emergency". It is a **permanent, compounding, currently-small** regression whose
+only remedy is stalled. That is a strong argument for fixing it soon and a weak
+one for fixing it first — which puts it alongside Decision 2 rather than ahead of
+it, and makes the read-side counter (to watch the 4.9% move) worth having either
+way.
+
+I have now moved Decision 1 down, up, and back to the middle in the space of an
+hour, each time on new evidence. The record of that is deliberate: the ranking is
+genuinely sensitive to which evidence you have seen, which is exactly why the
+brief states the evidence rather than only the conclusion.
