@@ -1621,3 +1621,43 @@ to reach 3,072) and the admission/sort-slice pair.
 `query_pool_used_bytes` sampled over a full dashboard-load cycle, including
 whatever the heaviest report does. That is a cheap, read-only, one-hour job and
 it converts "there might be memory over there" into a number.
+
+### Ruling out the obvious objection: the query-pool metric IS wired
+
+"`query_pool_pct` reads 0" has two explanations, and one of them would make the
+finding worthless. The reporting line is:
+
+```rust
+let (pool_used, pool_size) = self.query_pool.as_ref().map_or((0, 0), |f| f());
+```
+
+**If the hook were unset it would report `(0, 0)`** — and `query_pool_pct` guards
+on `pool_size > 0`, so an unwired hook produces exactly the same `0` as a genuinely
+idle pool. That is the same class of trap as the counters that misled repeatedly
+tonight, so it needed checking rather than assuming.
+
+It is wired (`database/mod.rs:5511`):
+
+```rust
+.with_query_pool({
+    let env = self.shared_runtime_env();
+    let size = self.config.derived.query_pool_bytes();
+    Arc::new(move || (env.memory_pool.reserved(), size))
+})
+```
+
+So the reported number is a real `MemoryPool::reserved()` against a real 16 GiB
+`query_pool_bytes()`. **The zero is a measurement, not an absence of one.**
+
+Sampling continues (every 20 s): so far every sample is `pct=0`,
+`used_bytes=0`, while `queries_total` advanced 39,168 → 39,643 — **475 queries
+served across the window with zero measured pool reservation.**
+
+**The remaining honest caveat** is what "reserved" covers: DataFusion reserves
+for memory-consuming operators (sorts, joins, grouped aggregates), not for a
+plain scan-and-filter. With `plan_cache.hit_pct` at 100% over mostly recent,
+narrow windows, a workload that genuinely reserves nothing is entirely plausible.
+That does not weaken the conclusion for *this* workload — the pool is
+over-provisioned for what prod actually runs today — but it does mean a
+report-heavy or wide-window workload could change the answer, which is why the
+rebalance should keep a margin rather than take the whole 16 GiB.
