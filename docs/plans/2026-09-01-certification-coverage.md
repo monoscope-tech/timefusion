@@ -608,3 +608,41 @@ silently keeps the wrong version, and that is unrecoverable, unlike every other
 change made tonight. The size is established (the sort OOMs a 1 GB pool on one
 204 MB bin), the gate exists, and the verification is written — it should be built
 first thing, carefully, not last thing, tired.
+
+### REFUTED before building: the file ordering does not match the window's key
+
+`schemas/otel_logs_and_spans.yaml` sorts files:
+
+```
+sorting_columns: timestamp DESC, resource___service___name ASC, id ASC, ...
+```
+
+The rewrite's window needs `PARTITION BY (timestamp, id)` (the dedup keys).
+**`resource___service___name` sits BETWEEN the two dedup keys**, so rows sharing
+`(timestamp, id)` are not adjacent in file order, and the ordering is not
+prefix-compatible with the partition key. DataFusion would insert the `SortExec`
+regardless.
+
+**So "declare the ordering in `narrow_provider`" is a NO-OP as specified.** Do not
+build the four steps above as written — they were correct about the cost and wrong
+about the remedy.
+
+The cost finding stands and is the real one: **the sort OOMs a 1 GB pool on a
+single 204 MB bin**, and it is the dominant term in ~96% of maintenance time.
+
+The remedy has to make the layout and the dedup key agree. Options, in the order
+worth evaluating:
+
+1. **Lead `sorting_columns` with the dedup keys** — `timestamp DESC, id ASC, ...`,
+   moving `service` after `id`. Then files ARE prefix-ordered for the window, the
+   declaration becomes real, and the sort disappears. Cost: changes physical
+   layout, so it needs a read-path check — the comment at
+   `schemas/otel_logs_and_spans.yaml:67` says point lookups already rely on bloom
+   filters and tantivy rather than the sort, which is the argument this is
+   affordable, but it must be measured (`tf_query_latency_matrix_2026-08-22`).
+2. **Dedup on a key the layout already supports**, if a prefix of the existing
+   order is a valid dedup key.
+3. Accept the sort and make it cheaper (batch sizing already gave 39.4s -> 20.3s).
+
+This is why it was not built at 04:00: the four-step version would have shipped a
+no-op into the row-deleting path and looked like progress.
