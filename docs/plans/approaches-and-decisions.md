@@ -34,6 +34,47 @@ in-flight units, not a regression — the exact trap CLAUDE.md records from
 after `f74f3429`; docs-only pushes do not restart prod. **Do not read any
 throughput number taken before ~2h of quiet.**
 
+### OPEN CONCERN — check this FIRST: stage timeouts are climbing
+
+After 24 minutes of quiet (no deploys), so this is not restart churn:
+
+| build | uptime | `dedup_bin_stage_timeouts_total : dedup_bins_committed_total` |
+| --- | --- | --- |
+| `e4414b2` (pre-footer-fix) | ~15 min | 20 : 9 = 2.2 |
+| `4934cb0` (footer fix) | ~25 min | 20 : 6 = 3.3 |
+| `f253ba2` (now) | ~24 min | **40 : 5 = 8.0** |
+
+And `merges=1` is now **7 of 13** units (54%) against 31 of 100 (31%) before.
+
+**Suspected mechanism, and the fork warns about it in its own comment.** More
+files now carry a CORRECT footer, so more scans get an ordering claim;
+`regroup_for_declared_ordering` then splits file groups to keep the claim
+alive, and `MAX_ORDERED_FILE_GROUPS = 512` exists precisely because "a
+SortPreservingMergeExec over that many concurrent parquet streams costs more than
+the ordering claim is worth". During the MIXED-generation phase we may be paying
+the merge without yet getting the sort removed — net negative until footers
+converge.
+
+**Why I did not revert:** `dedup_failed_total = 0`, no errors, queries healthy,
+and `pending_dedup` is flat (~1,760-1,820, down from ~2,500 at session start), so
+there is no user-facing harm — this is maintenance throughput, and the sample is
+13 units. Reverting on 24 minutes of a moving file population would be the same
+mistake as trusting a number taken during a deploy storm.
+
+**Kill switch, in order of preference:**
+1. Wait for convergence — the win only arrives when a partition is all-new
+   footers, and `light_optimize` converts fast.
+2. If it worsens: revert `5a445001` (the leaf-index fix). New files go back to
+   writing the old wrong footer, no scan gains a claim, and the plans return to
+   exactly what `e4414b2` planned. Nothing else depends on it.
+3. `RunCollapse` and the 2.4x are INDEPENDENT of this and should not be reverted
+   with it — they are gated on `dedup_keys_lead_the_sort`, not on footers.
+
+**What would settle it:** the `ordered_scan=true` share against the timeout
+ratio, over hours. If timeouts fall as that share rises, this is a transition
+cost. If they keep climbing while it rises, the regroup/merge is the problem and
+the fix belongs in the fork's grouping heuristic, not here.
+
 **What to check first:** the `ordered_scan=true` share in `dedup_plan_shape`, and
 `dedup_bin_stage_timeouts_total : dedup_bins_committed_total` (was 20:9 before
 the footer fix). `pending_dedup` fell ~2,500 → 1,767 across the session.
