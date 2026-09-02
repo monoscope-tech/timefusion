@@ -1795,3 +1795,36 @@ counter (`Repair/Complete`) and assumed it counted the thing I cared about
 work. **Check what a counter counts before deriving a rate from it** — the same
 mistake as reading `pending` as actionable work, `attempts` as cumulative, and
 five pool samples as a distribution.
+
+### What the stalled repair lane COSTS is not currently measurable
+
+Repair exists so that each file is internally sorted, which is what lets a scan
+declare an ordering and skip a `SortExec` — the same property tonight's earlier
+footer-index fix (`5a445001`) was about. With repair doing zero rewrites, ~310
+suspect files stay unrepaired indefinitely, so the natural question is what that
+costs on the read path.
+
+**It cannot be answered from current instrumentation.** The nearest counters:
+
+| counter | value |
+| --- | --- |
+| `read_dedup.ordering_violations_total` | 0 |
+| `maintenance.flush_sort_unsorted_fallbacks_total` | 0 |
+| `maintenance.repair_sorted_at_write_total` | 3 (young process) |
+
+Nothing reports "a scan paid a sort because a file it read was unsorted", so the
+cost of the dead lane is unquantified. **I am deliberately not inferring damage
+from the absence of a metric** — `ordering_violations_total = 0` is consistent
+both with "no harm" and with "the counter does not measure this".
+
+**This is a second instrumentation gap, and it is the more consequential one.**
+The maintenance-pool gap (Decision 0) blocks *verifying a fix*. This one blocks
+*justifying the work at all*: repair is a lane that has produced nothing for at
+least 12 hours, and there is no measurement that says whether that matters.
+Before spending memory budget on unblocking it, it is worth knowing what it buys
+— which needs a counter on the read side, incremented when a scan cannot declare
+an ordering because a file it selected lacks the sort tag.
+
+That is a cheap addition of the same shape as Decision 0, and it converts
+"repair is starved" into "repair being starved costs N sorts per hour". Without
+it, Decision 1 is well-evidenced as a *defect* and unevidenced as a *priority*.
