@@ -124,8 +124,26 @@ must be treated as UNPROVEN**, not as a refutation.
 It happens not to matter: widening `dedup_keys` reaches the same alignment
 WITHOUT touching physical layout, so the reorder is moot either way. But the
 lesson generalises — a test that is order-sensitive can manufacture a clean
-2-for-2 and retire a good idea. Before this test can condemn anything again it
-needs its scheduling dependence fixed or named.
+2-for-2 and retire a good idea.
+
+**Mechanism, now named (`608a385d`).** The assertion was a bare bool; it now
+reports the miss reasons, and answered immediately: the decline is
+**`tiny_interior`**. `MIN_INTERIOR_BUCKETS = 2` is checked against the CERTIFIED
+INTERIOR, not the query window — so the test fails whenever
+`run_maintenance_units(1024)` certifies less than two grains' worth of its
+window. How much gets certified depends on how many units run and which work the
+coordinator picks: machine load and unit ordering, not the tree. That is the
+whole explanation for "fails alone, passes in suite".
+
+Note the report includes `rollup_misses_total` alongside the per-reason counters.
+Without it there is no way to tell "declined for a reason not in this list" from
+"the router was never consulted" — the first run showed `misses: []`, which
+looked like the latter and was actually the former.
+
+**The real fix** is to assert the PRECONDITION — enough of the window certified —
+before asserting the routing, so a starved maintenance run fails as "setup
+incomplete" instead of as "routing broken". Left for its owner; the diagnosis is
+now in the failure message either way.
 
 ### Live on prod as `a5381a0` — verified, not assumed
 
