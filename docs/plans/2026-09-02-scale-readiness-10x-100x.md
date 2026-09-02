@@ -1309,3 +1309,35 @@ never work; they were retired as superseded/subsumed. The actionable queue is
 `timefusion_stats`' `pending_dedup`, the sim's `pending_start`, and
 `state == Pending` in the journal are three different populations. Say which one
 you mean, and check the arithmetic against the state counts before quoting it.
+
+### Decision 1 confirmed against LIVE state (both journal files replayed)
+
+The checkpoint-staleness caveat above raises the obvious question: is the stuck
+repair cohort an artifact of a 2-hour-old snapshot? **No.** Fetching both
+`.json` and `.wal` and replaying them gives live state:
+
+| operation | Pending | Retry | Complete | Superseded |
+| --- | --- | --- | --- | --- |
+| Dedup | 1,009 | 458 | 15,696 | 5,531 |
+| BaseRollup | 190 | 170 | 36,530 | 7,880 |
+| **Repair** | 0 | **310** | 2,188 | 333 |
+| DerivedRollup | 29 | 25 | 4,169 | 5,385 |
+
+**310 repair tasks are in Retry right now** — against 311 survivors measured in
+the stale checkpoint. The cohort is not a snapshot artifact and is not draining.
+
+Two further things this settles:
+
+- **Actionable queue = 2,191** (Pending + Retry across all ops), against the
+  ~21,000 the sim's `pending` reports. The order-of-magnitude gap is superseded
+  bookkeeping, as the previous section established.
+- **Repair is not universally broken** — 2,188 repair tasks have completed over
+  the journal's life. So the byte budget is passable *sometimes* (when the
+  semaphore happens to be free and the file happens to be small enough). What
+  the 310 share is that they cannot fit, and nothing re-measures or splits them.
+  That is consistent with the constants arithmetic rather than in tension with
+  it: files below ~107 MiB compressed fit and complete; target-sized 256 MiB
+  files never do.
+
+This is the strongest form of the evidence available without shipping a change:
+live state, replayed from the same two files the coordinator itself loads.
