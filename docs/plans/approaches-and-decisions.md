@@ -237,6 +237,50 @@ Worth it because it is the only item that makes dates born certifiable: no
 rewrite, no probe, and dedup stops being 96% of maintenance instead of 2.4x
 cheaper at it.
 
+### Phase 2, answered: the footer-ordering pushdown is DEAD on the maintenance path
+
+Measured, not reasoned. The `dedup_plan_shape` instrument (`e4414b2`), first unit
+on prod:
+
+```
+sorts=1  merges=0  collapse=true  ordered_scan=false
+```
+
+- `collapse=true` — the new path is what runs in prod.
+- `sorts=1` — one sort, down from two. That IS the 2.4x, confirmed live.
+- **`ordered_scan=false`** — the Delta scan declares NO ordering at all.
+
+And the local best case is barely better. `the_maintenance_scan_keeps_the_footer_ordering_it_was_written_with`
+builds one file that TF itself just wrote with all five sorting columns in its
+footer, scans it through `narrow_provider`, and gets:
+
+```
+SortExec: [timestamp DESC, resource___service___name ASC, id ASC, level ASC, status_code ASC]
+  DeltaScanExec
+    DataSourceExec: … output_ordering=[timestamp DESC, id ASC, level ASC, status_code ASC]
+```
+
+`resource___service___name` is **dropped** — though it is projected and second in
+`sorting_columns`. So even the single-conforming-file case cannot satisfy the
+schema sort, and the claim it does make is FALSE, not merely short: data sorted by
+`(timestamp, service, id)` is not sorted by `(timestamp, id)`.
+
+**This is the whole remaining cost of a dedup rewrite.** With the window gone the
+sort is all that is left; making it a `SortPreservingMerge` is the next large
+win, and it is blocked on the ordering declaration in exactly two places:
+
+1. why prod declares nothing at all (conformance? `stats_backed_prefix_len`
+   finding the lead column unbacked? per the 08-22 note, 38/86 of p1's file
+   groups carry no footer at all), and
+2. why a conforming file still drops a middle column — the `filter_map` in
+   `sorting_columns_to_physical_exprs` skips instead of truncating, so an index
+   that fails to resolve silently shifts everything after it.
+
+**Retracting my own correction from earlier in this file:** I wrote that the
+DataFusion bug does not gate phase 2 because the rewrite projects every column.
+That reasoning was right and the conclusion was wrong — the column is projected
+and still dropped. The bug gates phase 2 after all.
+
 ### Still open
 
 - `narrow_provider` declaring footer ordering (gated on EVERY selected file

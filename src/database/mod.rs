@@ -17905,6 +17905,97 @@ mod tests {
         Ok((db, ctx, test_prefix))
     }
 
+    /// Does the ONE remaining sort in a dedup rewrite actually have to run?
+    ///
+    /// With the `ROW_NUMBER()` window gone (see `RunCollapse`), the rewrite's
+    /// whole cost is a single sort in schema order. The delta-rs fork derives a
+    /// scan-wide ordering from parquet footers, so a scan over files that all
+    /// carry an honest `sorting_columns` should satisfy that sort by MERGING
+    /// pre-sorted file groups instead of sorting — turning the last blocking,
+    /// spilling operator in the maintenance path into a streaming one.
+    ///
+    /// This does not assert the win: whether a given file set conforms is a
+    /// property of the data, not of the code. It asserts the PRECONDITION that
+    /// makes the win possible — the narrow maintenance provider must not throw
+    /// the footer ordering away — and prints the plan, because that shape is the
+    /// input to the next decision.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_maintenance_scan_keeps_the_footer_ordering_it_was_written_with() -> Result<()> {
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let project_id = format!("scan_order_{prefix}");
+        let base = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(base).unwrap().date_naive();
+        let rows: Vec<_> = (0..64)
+            .map(|i| {
+                serde_json::json!({
+                    "timestamp": base + i * 1_000_000,
+                    "id": format!("id-{i:03}"),
+                    "name": "n",
+                    "project_id": project_id,
+                    "date": date.to_string(),
+                    "resource___service___name": format!("svc-{}", i % 4),
+                    "summary": [],
+                })
+            })
+            .collect();
+        let batch = json_to_batch_for("otel_logs_and_spans", rows)?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        let table_ref = db.resolve_table(&project_id, "otel_logs_and_spans").await?;
+        let (snapshot, log_store, files) = {
+            let table = table_ref.read().await;
+            let snapshot = Arc::new(table.snapshot()?.snapshot().clone());
+            let files: Vec<String> = snapshot.log_data().iter().map(|f| f.path().to_string()).collect();
+            (snapshot, table.log_store(), files)
+        };
+        assert!(!files.is_empty(), "the insert must have committed a file, or this test proves nothing");
+
+        let provider = Database::narrow_provider(log_store, snapshot, files, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ctx = SessionContext::new();
+        ctx.register_table("scan", provider)?;
+        let schema = get_schema("otel_logs_and_spans").expect("shipped schema");
+        let sql = format!("SELECT \"timestamp\", \"id\", \"resource___service___name\" FROM scan{}", schema_order_by_clause(schema));
+        let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string();
+        println!("--- maintenance scan plan:\n{rendered}");
+
+        // What it does TODAY, on a file TimeFusion itself just wrote with all
+        // five sorting columns in its footer (verified with pyarrow on a real
+        // prod file too): the scan declares
+        //   output_ordering=[timestamp DESC, id ASC, level ASC, status_code ASC]
+        // — `resource___service___name` is MISSING, though it is projected and
+        // second in `sorting_columns`. The declared ordering therefore does not
+        // satisfy the schema sort, so the SortExec stays.
+        //
+        // Two consequences, and they point opposite ways:
+        //  - the sort cannot become a SortPreservingMerge until this is fixed,
+        //    which is the whole remaining cost of a dedup rewrite; and
+        //  - the claim is FALSE, not merely short. Data sorted by
+        //    (timestamp, service, id) is not sorted by (timestamp, id): within
+        //    one timestamp, ids do not ascend across services. Anything that
+        //    trusts it — a merge, or bounded dedup on more than the lead
+        //    column — gets wrong answers. TF is safe today only because it
+        //    consumes the lead column alone.
+        //
+        // PROD is worse than this test: the `dedup_plan_shape` instrument reports
+        // `sorts=1 merges=0 collapse=true ordered_scan=false` — real scans declare
+        // NO ordering at all, so the pushdown is not merely incomplete there, it
+        // is dead. This test holds the one-file, all-conforming case, which is
+        // the best case, and even that drops a column.
+        //
+        // Asserted as the CURRENT state so a fix announces itself here.
+        let declared = rendered.split("output_ordering=[").nth(1).and_then(|rest| rest.split(']').next()).unwrap_or("").to_owned();
+        assert!(!declared.is_empty(), "the scan declared no ordering at all, which is a different and worse failure:\n{rendered}");
+        assert!(
+            !declared.contains("resource___service___name"),
+            "the declared ordering now carries the service column — the footer mapping was fixed. Drop this assertion and revisit \
+             SortPreservingMerge for the dedup rewrite, which is its whole remaining cost. declared=[{declared}]"
+        );
+        assert!(rendered.contains("SortExec"), "the sort must survive while the declared ordering is incomplete:\n{rendered}");
+        Ok(())
+    }
+
     /// The logical-count fast path must cover the full merge-on-read lifecycle:
     /// build an exact snapshot base, resolve a newly appended tombstone as a
     /// narrow overlay, and replace DedupExec in the physical COUNT plan.
