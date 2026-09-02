@@ -1661,3 +1661,51 @@ That does not weaken the conclusion for *this* workload — the pool is
 over-provisioned for what prod actually runs today — but it does mean a
 report-heavy or wide-window workload could change the answer, which is why the
 rebalance should keep a margin rather than take the whole 16 GiB.
+
+## INSTRUMENTATION GAP: we measure the pool that is idle, not the ones under pressure
+
+Trying to run the obvious control for the query-pool finding — "does the
+*maintenance* pool show usage while the query pool reads zero?" — turned up
+something more useful: **that number does not exist.**
+
+`timefusion_stats` exposes:
+
+| exposed | what it is |
+| --- | --- |
+| `budget.query_pool_mb` = 16,384 | query pool SIZE |
+| `memory.query_pool_used_bytes` / `_pct` | query pool USAGE |
+| `budget.maintenance_pool_mb` = 16,964 | maintenance pool SIZE |
+| — | **maintenance pool USAGE: not exposed** |
+| — | **coordinator pool USAGE: not exposed** |
+
+**Every memory decision this document reaches is about maintenance memory** — the
+repair budget, the admission ceiling, the per-sort slice, the permit count — and
+none of them can be checked against how much of the maintenance pool is actually
+in use, because that is the one pool whose usage is not reported.
+
+**It is trivially closable.** The pools exist and are already distinct objects
+(there is a test asserting `maintenance_pool` is not the query pool):
+
+```rust
+// the existing query hook, database/mod.rs:5511
+.with_query_pool({
+    let env = self.shared_runtime_env();
+    Arc::new(move || (env.memory_pool.reserved(), self.config.derived.query_pool_bytes()))
+})
+```
+
+`maintenance_runtime_env().memory_pool` and `coordinator_runtime_env().memory_pool`
+support exactly the same call. Two more rows of the same shape would report them.
+
+**Why this is the first thing to ship, ahead of the three decisions.** Tonight's
+clearest generalisable lesson was *ship the instrument before the fix* — the
+`dedup_plan_shape` instrument answered its question on its first prod unit, and
+`wal.replay_rows` made a restart priceable. The three budget decisions all raise
+a maintenance memory limit, and **after shipping any of them there is currently no
+way to see whether the maintenance pool is now closer to or further from its
+ceiling.** Two rows of instrumentation turn every one of those decisions from
+"change it and watch the queue" into "change it and watch the pool".
+
+It also settles the query-pool rebalance question directly: if maintenance runs
+near its ceiling while query runs at zero, the case for moving budget between
+them is made with two numbers instead of an argument.
