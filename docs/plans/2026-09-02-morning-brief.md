@@ -26,6 +26,45 @@ Prod is running my build and healthy. **One decision is left for you.**
 
 Detail: `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`.
 
+## THE HEADLINE (found last, matters most)
+
+**The maintenance queue is not slow, backlogged, or overloaded. It is STARVING,
+and one mis-calibrated constant explains it.**
+
+From the real prod journal: 2,369 queued tasks, **median age 34.8 hours, 49%
+older than 48 hours**, and a cohort queued for the journal's entire 17-day span
+that never ran. **328 of 328 repair tasks are starved.** At the real arrival
+rate (241/h) that queue is under 10 hours of work — capacity was never the
+constraint.
+
+The stuck cohort is defined by **admission refusal** (`resource_admission` 272,
+`admission_busy` 169, 355 never claimed at all). Admission's ceiling is
+`MAX_DECODED_BYTES x (available/capacity)` clamped to **[32 MiB, 512 MiB]** —
+against a **median unit of 316 MiB**. The entire scaling band sits below the
+working set:
+
+| `MAX_DECODED_BYTES` | 100% free | 50% free | **25% free** | never-admissible |
+| --- | --- | --- | --- | --- |
+| **512 MiB (today)** | 86% | **33%** | **7%** | 14.1% |
+| **2 GiB** | 90% | 88% | **86%** | 10.5% |
+
+At half occupancy only a third of the queue can be admitted; at 25% free, 7%.
+A self-sustaining stall.
+
+**And it is over-guarded, not under-guarded.** Admission capacity is 60 GiB of
+decoded bytes. Today a single unit may use **under 1%** of the pool it is being
+admitted into, and all 10 permits at maximum size use **8%** of capacity. At
+2 GiB the worst case is 33% — still a 3x margin.
+
+> **Recommendation: `MAX_DECODED_BYTES` 512 MiB → 2 GiB.** One constant.
+> Offline-priced, safety-checked, canary-worthy — not something I would ship
+> unattended.
+
+Caveat I want on the record: the sim **cannot** test this (*"Memory admission
+... outside the model"*), so an earlier experiment of mine measured only the
+fusion effect and wrongly looked like a dead end. Detail and full evidence chain
+in `2026-09-02-scale-readiness-10x-100x.md`.
+
 ## CORRECTION you should read first
 
 Late in the night I got the **real prod journal** into the sim (the synthetic
