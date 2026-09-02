@@ -1946,3 +1946,26 @@ named for its *consequence* ("full_set"). **A negative result from a keyword
 search is not evidence of absence** — and this is the second time tonight a
 "missing" thing turned out to be present under a different name (the first being
 the journal, which was inside the container rather than on the host).
+
+### The 4.4% is stable across restarts — so it is a property of the FILES, not the process
+
+Prod restarted again (another session's deploy) and the metric barely moved:
+
+| | before restart | after |
+| --- | --- | --- |
+| `scan.dedup_full_set_pct` | 4.4% | **4.3%** |
+| `scan.dedup_bounded_total` | 408 | 466 |
+| `pending_dedup` | 1,417 | 1,389 |
+
+**A process-state artifact would reset; a file-population property would not.**
+It did not, which is what the mechanism predicts: the unsorted files live on
+object storage and survive every restart, so the share of scans they poison is
+stable. This is the same reasoning that made the repair cohort's survival across
+restarts meaningful, applied to the read side.
+
+Taken with the two independent bounds agreeing (≤4.9% of files, 4.3–4.4% of
+scans), Decision 1's cost is now about as well established as anything in this
+document:
+
+> **The stalled repair lane costs a stable ~4.4% of dedup scans, running
+> unbounded instead of bounded, permanently, and it can only grow.**
