@@ -379,11 +379,14 @@ surfaced them could not express the assertions.
 Both in `monoscope_query_shapes.slt` §13, with the mechanism deliberately
 NOT claimed:
 
-1. **`COUNT(*) * 100.0` renders `300`, not `300.0`.** The fraction is gone
-   before any division, so "% of total" columns truncate. Scalar float
-   arithmetic is exact (`200.0/6` → `33.333333333333336`), so it is specific to
-   an Int64 aggregate against a float literal. **Client-side fix shipped**
-   (monoscope `e2f917c29`); the engine-side fix is unowned.
+1. **A percentage divided by a WINDOW aggregate truncates.**
+   `COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ()` answers 33 where Postgres gives
+   33.333…. Narrowed: the same shape over a plain `GREATEST(1, COUNT(*))`
+   divisor is exact (16.67), and scalar float arithmetic is exact, so the
+   window aggregate in the divisor is the trigger — NOT integer-aggregate
+   arithmetic in general. That is why exactly one dashboard site was affected;
+   the uncast error-rate widgets across `_overview.yaml` are fine.
+   **Client-side fix shipped**; the engine-side fix is unowned.
 2. **`x::float` resolves to Float32 and narrows.** In Postgres `float` IS
    `double precision`. monoscope appends `::float` to nearly every aggregate it
    emits, so every chart value crosses the wire at float32 precision.

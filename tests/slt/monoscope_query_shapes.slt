@@ -397,17 +397,17 @@ FROM otel_logs_and_spans WHERE project_id = 'mono_shapes' AND id = 'ms_1'
 ----
 33.333333333333336 33.333333333333336 16.666666666666668 16.666666
 
-# §13b. WRONG ANSWER, pinned. `COUNT(*) * 100.0` renders as "300", not
-# "300.0" — the fraction is gone before the division, so the percentage
-# truncates: web is 33 where Postgres gives 33.333…. The scalar control above
-# proves float literals fold correctly on their own (200.0/6 is exact), so
-# this is specific to arithmetic between an Int64 aggregate and a float
-# literal. Casting the operands to ::float avoids it, which is why §4 is
-# correct and §13 is not.
+# §13b. WRONG ANSWER, pinned: web is 33 where Postgres gives 33.333….
 #
-# Mechanism NOT confirmed — do not assume Int64 vs Decimal from these numbers.
-# The discriminating check for whoever fixes this: does it reproduce on stock
-# DataFusion 54? That decides fork-patch versus upstream report.
+# The trigger is the WINDOW aggregate in the divisor, not integer arithmetic in
+# general. §13d below divides a filtered count by a plain `GREATEST(1,
+# COUNT(*))` in the same shape and is exact (16.67), and the scalar control
+# above folds float literals exactly — only `SUM(COUNT(*)) OVER ()` as the
+# divisor truncates. Casting the operands to ::float avoids it (§13c).
+#
+# Mechanism NOT confirmed beyond that. The discriminating check for whoever
+# fixes this: does it reproduce on stock DataFusion 54? That decides
+# fork-patch versus upstream report.
 query TTTT
 SELECT resource___service___name,
        (COUNT(*) * 100.0)::text AS mult,
@@ -628,3 +628,30 @@ SELECT first_value(v ORDER BY t NULLS LAST) FROM (
 ) x
 ----
 real
+
+# §13d. The SAME truncation in the error-rate shape the raw-SQL dashboard
+# widgets use: `COUNT(*) FILTER (...) * 100.0 / GREATEST(1, COUNT(*))`, with no
+# cast on either operand. One error in six rows is 16.67%.
+query TT
+SELECT ROUND((COUNT(*) FILTER (WHERE status_code = 'ERROR') * 100.0 / GREATEST(1, COUNT(*)))::numeric, 2)::text AS uncast,
+       ROUND((COUNT(*) FILTER (WHERE status_code = 'ERROR')::float * 100.0 / GREATEST(1, COUNT(*))::float)::numeric, 2)::float::text AS cast_
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+----
+16.67 16.67
+
+query TTTT
+SELECT (COUNT(*) * 100.0)::text AS mult_only,
+       (COUNT(*) * 100.0 / GREATEST(1, COUNT(*)))::text AS by_plain_agg,
+       (COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ())::text AS by_window,
+       (COUNT(*) * 100.0 / CAST(SUM(COUNT(*)) OVER () AS BIGINT))::text AS by_window_cast
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY resource___service___name
+ORDER BY 1
+----
+100 100 16 16
+200 100 33 33
+300 100 50 50
