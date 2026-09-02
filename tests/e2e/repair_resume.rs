@@ -251,4 +251,3 @@ async fn resume_is_a_no_op_while_the_kill_switch_is_off() -> anyhow::Result<()> 
     );
     Ok(())
 }
-
