@@ -260,6 +260,10 @@ experiment in miniature today.
   journal by task key instead.
 - **`attempts` is reset, not cumulative.** Reading it as cumulative made a
   plentiful lane look starved.
+- **Compute elapsed time from `boot_micros`; never eyeball it.** I published a
+  "dedup rate is decaying 3x" reading built on an estimated timestamp. Measured,
+  the rate went UP (37.6 → 49.5/hour) and pending is flat. Retracted — every
+  rate needs its denominator measured.
 - **"pending" means three different things.** `timefusion_stats`'
   `pending_dedup`, the sim's `pending_start`, and journal `state == Pending` are
   three different populations — the sim's includes SUPERSEDED, which is ~89% of
