@@ -1905,3 +1905,44 @@ I have now moved Decision 1 down, up, and back to the middle in the space of an
 hour, each time on new evidence. The record of that is deliberate: the ranking is
 genuinely sensitive to which evidence you have seen, which is exactly why the
 brief states the evidence rather than only the conclusion.
+
+## CORRECTION: the cost IS measured — `dedup_full_set_pct` = 4.4%, and it matches
+
+I wrote that nothing counts what the stalled repair lane costs on the read path,
+and proposed building a counter. **The counter already exists.** I had grepped
+`timefusion_stats` for `%sort%` and `%order%` and concluded there was no
+instrument; the metric is named for its *effect*, not its cause:
+
+| metric | value |
+| --- | --- |
+| **`scan.dedup_full_set_pct`** | **4.4%** |
+| `scan.dedup_bounded_total` | 408 |
+
+`dedup_full_set_pct` is the share of dedup scans that fell back to the
+**unbounded full-set seen-set** — which is precisely the cost `UnsortedFallback`
+describes when a file's missing sort tag voids the declared ordering. It is the
+measurement I said was absent.
+
+**And it corroborates the file-level bound independently:**
+
+| | |
+| --- | --- |
+| unsorted suspects / active files | **≤4.9%** |
+| dedup scans losing the bounded path | **4.4%** |
+
+Two unrelated measurements — one over the file population from the maintenance
+journal, one over scan executions from the read path — agreeing within half a
+percentage point. That is strong evidence the mechanism is exactly as documented:
+unrepaired files void the ordering, and the read path pays for it in proportion.
+
+**So Decision 1's cost is now quantified, not assumed:** the stalled repair lane
+costs **~4.4% of dedup scans** running unbounded instead of bounded. That is the
+number to watch after a fix — it should fall toward zero as repair drains, and it
+is already exposed, so no instrumentation work is needed for this one after all.
+
+**The error is worth recording precisely.** I searched for the metric by the
+vocabulary of its *cause* ("sort", "order") and concluded it did not exist. It is
+named for its *consequence* ("full_set"). **A negative result from a keyword
+search is not evidence of absence** — and this is the second time tonight a
+"missing" thing turned out to be present under a different name (the first being
+the journal, which was inside the container rather than on the host).

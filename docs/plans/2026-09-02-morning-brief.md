@@ -29,9 +29,12 @@ The sections are numbered by how I found them; this is how I would act on them:
 | **2nd= — Decision 1** (repair budget) | 0 rewrites in 12h, 177 bounces. I first ranked this lower for lacking a cost metric — **that was wrong**: `UnsortedFallback`'s own docs state that ONE unsorted file *"voids the declared ordering for every scan touching that partition, dropping DedupExec to its unbounded full-set seen-set… the cost is permanent"*, and prod has previously reached **55% of active files unsorted**. The damage is partition-wide, permanent, and **memory-shaped on the read path** — so it also feeds the OOM restarts Decision 3 insures against. Cheap and derivable. **Exposure today is bounded at ≤4.9%** (310 suspects vs 6,389 active files) against the documented 55% peak — so: permanent and compounding, but not an emergency. |
 | **4th — Decision 3** (landed-skip flag) | Insurance against OOM-driven restarts. `replay_rows` was 0 on every restart tonight, so it is currently inert — its value rises as the memory ceiling bites, i.e. after the above. |
 
-A second instrumentation gap is worth fixing alongside Decision 0: **nothing
-counts a scan that pays a sort because a file lacked its sort tag**, which is
-exactly what would rank Decision 1 properly.
+**Decision 1's cost IS already measured** — I initially reported otherwise, having
+searched for the metric under "sort"/"order" when it is named for its effect:
+**`scan.dedup_full_set_pct` = 4.4%**, the share of dedup scans that fell back to
+the unbounded seen-set. It corroborates the file-level bound (≤4.9% unsorted)
+from a completely independent direction, and it is the number to watch after a
+fix — it should fall toward zero as repair drains.
 
 The full evidence chain, including the wrong turns, is in
 `2026-09-02-scale-readiness-10x-100x.md` and
