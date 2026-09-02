@@ -38,11 +38,18 @@ throughput number taken before ~2h of quiet.**
 
 After 24 minutes of quiet (no deploys), so this is not restart churn:
 
-| build | uptime | `dedup_bin_stage_timeouts_total : dedup_bins_committed_total` |
-| --- | --- | --- |
-| `e4414b2` (pre-footer-fix) | ~15 min | 20 : 9 = 2.2 |
-| `4934cb0` (footer fix) | ~25 min | 20 : 6 = 3.3 |
-| `f253ba2` (now) | ~24 min | **40 : 5 = 8.0** |
+**CORRECTION to my first framing of this.** I originally compared the ratio
+ACROSS builds (2.2 -> 3.3 -> 8.0). That comparison is weak and should not be
+quoted: these counters are cumulative per PROCESS, each reading came from a
+different process at a different age, and the work mix differs by which projects'
+bins the coordinator happened to pick. Cumulative-counter ratios across processes
+are not comparable.
+
+**The observation that does stand** is a SAME-PROCESS rate on `f253ba2`:
+between uptime ~18 min and ~24 min, `dedup_bin_stage_timeouts_total` went
+**20 -> 40 while `dedup_bins_committed_total` went 4 -> 5**. Twenty bin timeouts
+against one commit in five minutes, on one process, is the number worth chasing.
+It is still one process and a small sample.
 
 And `merges=1` is now **7 of 13** units (54%) against 31 of 100 (31%) before.
 
@@ -70,8 +77,14 @@ mistake as trusting a number taken during a deploy storm.
 3. `RunCollapse` and the 2.4x are INDEPENDENT of this and should not be reverted
    with it — they are gated on `dedup_keys_lead_the_sort`, not on footers.
 
+**First reading of the new instrument, and it is the baseline the replay
+hypothesis needs:** on this clean deploy `wal.replay_rows = 0` with
+`recovery_duration_ms = 0`. Clean drains replay NOTHING, so any non-zero value
+will belong to an unclean exit — which is exactly the discriminator described
+above.
+
 **What would settle it:** the `ordered_scan=true` share against the timeout
-ratio, over hours. If timeouts fall as that share rises, this is a transition
+ratio, measured on ONE process over hours. If timeouts fall as that share rises, this is a transition
 cost. If they keep climbing while it rises, the regroup/merge is the problem and
 the fix belongs in the fork's grouping heuristic, not here.
 
