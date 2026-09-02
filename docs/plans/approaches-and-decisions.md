@@ -3,6 +3,33 @@
 Newest first. One entry per decision that changed direction, with what refuted it.
 Detail lives in the dated plan files; this is the index.
 
+## 2026-09-02 — morning summary
+
+Four changes shipped, each measured before and after. The chain started from one
+line the user changed in a YAML file.
+
+| # | change | effect |
+| --- | --- | --- |
+| `a5381a0` | dedup key widened to the sort prefix + `RunCollapse` | **2.4x** per rewrite; the old path OOMs where this completes |
+| `e4414b2` | `dedup_plan_shape` instrument | answered the next question on its first prod unit |
+| `5a445001` | footer sort index is a parquet LEAF, not a field | the remaining `SortExec` **disappears** once footers converge |
+| `8efa0952` | pin one ordered stream for the collapse | closes the stall that #3 could otherwise cause |
+
+Plus two latent bugs the work flushed out — the logical-count index keyed
+narrower than dedup (would under-count `COUNT(*)`), and the mem leg's ordering
+claim using projected instead of original schema indices (regrew a blocking sort
+on every top-K dashboard query) — and one retraction: the rollup-routing canary
+declines on `tiny_interior`, so the verdict it produced against the
+`sorting_columns` reorder is unproven.
+
+**What to check first:** the `ordered_scan=true` share in `dedup_plan_shape`, and
+`dedup_bin_stage_timeouts_total : dedup_bins_committed_total` (was 20:9 before
+the footer fix). `pending_dedup` fell ~2,500 → 1,767 across the session.
+
+**Not done, and deliberately:** the ingest-side duplicate prevention (designed
+below; its memory/FPP/horizon tradeoffs are the user's call) and the DataFusion
+`filter_map` fix (a read-path correctness change needing its own latency matrix).
+
 ## 2026-09-02 — widen the dedup key to the sort prefix (the inversion that worked)
 
 **The user's idea, and it is the right one:** the failed experiment reordered
@@ -407,9 +434,15 @@ there — which one full rewrite of that partition accomplishes in a single comm
 since a rewrite replaces many files at once.
 
 Practical reading: expect `ordered_scan=true` to sit near zero, then jump
-per-partition. `light_optimize` commits far more bins than dedup does (27 vs 9 in
-one sample) and writes footers through the same path, so it is likely the faster
-converter of the two.
+per-partition.
+
+**`light_optimize_tail` is the fast converter, and it is confirmed to be one.**
+It derives `declare_sorted` from `choose_optimize_type(schema, false,
+timefusion_optimize_sort_by)`, and that flag defaults to `true` — so every
+hot-tail bin it commits rewrites files with a CORRECT footer. It committed 28
+bins in ~25 minutes against dedup's 6, so it converts roughly an order of
+magnitude faster than the path that benefits. Worth checking before assuming a
+flat `ordered_scan` means the fix did not land.
 
 Early and not yet claimable — young process — `dedup_bin_stage_timeouts_total` is
 **0 at 4 commits**, against **20 at 9 commits** on the previous build.
