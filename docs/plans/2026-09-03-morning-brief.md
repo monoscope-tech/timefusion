@@ -13,7 +13,7 @@ system itself was designed to produce.**
 
 | # | change | lane | evidence it was needed |
 |---|---|---|---|
-| 1 | repair budget sized by the target file (`2 x 256 MiB x 12`), in its own constant | repair | budget was **0.42x** one target-sized file, so every unit clamped to the whole semaphore; ~1.2 rewrites/hr, 310 queued, ~11 days to drain |
+| 1 | repair budget sized by the target file (`2 x 256 MiB x 12`), in its own constant | repair | budget was **0.42x** one target-sized file, so every unit clamped to the whole semaphore; ~1.2 rewrites/hr, 310 queued, ~11 days to drain — **but see below: measured concurrency gain so far is ZERO** |
 | 2 | maintenance/coordinator pool USAGE exposed, and its denominator corrected | all | pool sizes were visible, usage was not, so no memory decision could be verified after shipping |
 | 3 | admission grants the full cap at **half-free**, not only at a perfectly idle pool | dedup + base_rollup | 365 dedup units at a median of **exactly 512.0 MiB**, median age **14.6 days** |
 
@@ -26,6 +26,60 @@ system itself was designed to produce.**
 | dedup | 1,552 | 22.3 h (p90 386 h) | change 3 targets the stuck tail |
 | base_rollup | 320 | 169 h (7 d) | change 3 targets it |
 | repair | 314 | 412 h (17 d) | change 1 |
+
+## Change 1 UNDER-DELIVERED — the measured gain is zero, and here is why
+
+**This is the top decision for the morning.** The change is live and behaving
+exactly as written (`budget_mib=6144`, and units now report their real size
+instead of every one clamping to 1280). But `repair_rewrite_permit_busy` is
+**1.35/min — identical to the pre-fix baseline** (243 in 3 h before, 88 in 60 min
+after), because no two real units can share the new budget.
+
+The `want_mib` distribution from 60 minutes of live logs (88 events):
+
+| want_mib | count |
+|---|---|
+| 3,176 | 1 |
+| 3,391 | 2 |
+| 3,574 | 10 |
+| 3,725 | 2 |
+| 4,544 | 7 |
+| 5,203 | 1 |
+| **6,144 (clamped, i.e. ≥6,144)** | **65 — 74%** |
+
+**The smallest real unit is 3,176 MiB; two need 6,352 > 6,144.** I sized the
+budget as `2 x COORDINATOR_HOT_TARGET_BYTES x 12` on the reasoning that a repair
+unit is one file and compaction targets 256 MiB files. That is true of files
+compaction *produces*; the files repair is *queued on* are legacy/whale files far
+above the target. So "2 target-sized files" is not two real units — it is barely
+one.
+
+**Do not simply raise `REPAIR_REWRITE_TARGET_FILES` 2 → 4.** Two reasons:
+
+1. **It is not validated at that magnitude.** Two clamped-class units are
+   ≥12.3 GB decoded through the 8.4 GiB coordinator pool *with light sorts
+   alongside*. The measured boundary from the fleet ladder is **1.79x
+   decoded-to-pool passes, 2.39x fails**; that proposal lands in the untested gap
+   where the cliff is. (Tonight's 2-worker PASS was at 2,756 MB per worker — the
+   wrong magnitude to justify it.)
+2. **The constant does double duty.** It is also `light_optimize_k`'s holdback,
+   so 2 → 4 silently takes light K from 4 to 2. K collapsing is the 2026-09-01
+   HotPacking outage class. Zero HotPacking backlog says K=2 is probably fine —
+   but "probably fine, via a side effect of a constant that should not have that
+   job" is the drift-class bug this codebase keeps re-documenting.
+
+**The right fix is to decouple them**, and it is a design change for a waking
+human: the semaphore stays denominated in **decoded bytes** (what admission
+prices), while the pool holdback is priced in **pool bytes** at the measured
+ratio. Tonight's benches give that ratio — a spilling sort needs ~0.16–0.21x its
+decoded size, so the semaphore over-states repair's memory need several-fold.
+This is the recurring theme of the whole investigation: *a budget must be
+denominated in the unit that actually costs.*
+
+Caveat on the table above: 60 minutes of permit-busy events is a **bounce log,
+not the queue** — a held semaphore bounces small units too, so "nothing below
+3,176 in 88 events" is real signal but wants a longer window before it is quoted
+as the queue's distribution.
 
 ## Change 3 in detail — the boundary
 
@@ -71,10 +125,13 @@ Both are committed and re-runnable.
   `occupancy_scaled_ceiling`.
 - **`admission_busy` hot-loops** (attempts in the hundreds — one unit reached
   715) should stop accumulating.
-- **Repair (change 1):** judge from the **Delta log**, not counters — there were
-  three restarts tonight so cumulative counters re-zeroed. Large single-file
-  rewrites per hour vs the **1.17/hr** baseline. Remember the filter trap: a
-  large repair commits **1 remove → 2 adds**, so a 1-add-1-remove filter hides it.
+- **Repair (change 1):** expect **no throughput change** — see the section above.
+  Judge from the **Delta log**, not counters (restarts re-zeroed them). Large
+  single-file rewrites per hour vs the **1.17/hr** baseline; the filter trap is
+  that a large repair commits **1 remove → 2 adds**, so a 1-add-1-remove filter
+  hides it. The change is still correct and worth keeping — units now express
+  their true size instead of every one taking the whole semaphore — it just does
+  not buy concurrency until the budget clears two REAL units.
 - **`scan.dedup_full_set_pct`** — a file property, restart-proof. Was 8.7% at
   the start of the night.
 
