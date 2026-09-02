@@ -127,6 +127,63 @@ lesson generalises — a test that is order-sensitive can manufacture a clean
 2-for-2 and retire a good idea. Before this test can condemn anything again it
 needs its scheduling dependence fixed or named.
 
+### A live correctness bug in DataFusion's footer→ordering mapping
+
+Probing whether phase 2 is reachable turned this up. Real prod footers are
+correct — `recent204.parquet` declares all five sorting columns in order,
+verified with pyarrow. But `sorting_columns_to_physical_exprs`
+(`datafusion/datasource-parquet/src/metadata.rs:798`) maps them with
+**`filter_map`**: a footer sort column that is not in the read schema is
+**skipped and the iteration CONTINUES**.
+
+So a file sorted `(timestamp, service, id, level, status)` read with a projection
+that omits `service` is declared as ordered by **`(timestamp, id)`** — which is
+false. Within one timestamp, ids are not ascending across services. It must
+truncate at the first missing column (`map_while`), not skip it.
+
+Observed live: the top-K plan's Delta scan advertises
+`output_ordering=[timestamp@0 DESC, id@3 ASC NULLS LAST]`. The fork's own layers
+are careful — `stats_backed_prefix_len` uses `take_while` and only ever shortens
+— so the false claim comes from upstream, below them.
+
+Why it has not bitten: TF consumes the LEAD column only (`DedupExec
+bounded[timestamp]`, TopK on `timestamp DESC`), and `dedup_key_idxs` keeps the
+bound in the key precisely so a false ordering can only under-dedup. Anything
+that trusts the full ordering — a `SortPreservingMerge` fed by this claim, which
+is exactly phase 2 — would be wrong.
+
+**So phase 2 is gated on fixing this first**, in the DataFusion fork. NOT done
+tonight: it is a correctness change in the hottest read path, it needs a fork
+bump, and stacking it on an unverified row-deleting deploy is the mistake the
+one-change-per-deploy rule exists for.
+
+### Ingest-side dedup prevention — design, for the morning
+
+The scoped version ("dedup-key check inside the MemBuffer's 10-minute bucket")
+buys almost nothing: `dedup_batches` ALREADY collapses within a bucket at flush.
+The duplicates that reach Delta are cross-flush — late client retries and WAL
+replay overlap — so they land in a DIFFERENT bucket than the row they duplicate.
+
+The real structure is a **recently-flushed-keys filter**: after a bucket flushes,
+retain its `(timestamp, service, id)` digests for the retry horizon (hours, not
+the 70-minute buffer retention), and drop an insert whose key is already present.
+The design decisions are the user's, because they trade memory against
+correctness:
+
+- **Exact vs probabilistic.** A blocked Bloom filter at 1% FPP costs ~1.2 bytes
+  per key; at prod rates that is order-100 MB for a day's keys across tenants. A
+  false positive DROPS A REAL ROW, so a Bloom filter must be a pre-filter in
+  front of an exact check, never the decision.
+- **Horizon.** Too short and retries slip past; too long and it is another 100 GB
+  problem. `probe_dup_bins` can measure the actual retry age distribution — the
+  answer should be measured, not picked.
+- **Where it runs.** In `insert()` it costs latency on the hot path; at flush it
+  costs nothing extra but cannot reject, only collapse.
+
+Worth it because it is the only item that makes dates born certifiable: no
+rewrite, no probe, and dedup stops being 96% of maintenance instead of 2.4x
+cheaper at it.
+
 ### Still open
 
 - `narrow_provider` declaring footer ordering (gated on EVERY selected file
