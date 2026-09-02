@@ -165,14 +165,36 @@ impl RollupSpec {
             anyhow::ensure!(is_ident(&measure.name), "rollup {}: measure `{}` must be an SQL identifier", self.table_name(&source.table_name), measure.name);
             anyhow::ensure!(names.insert(&measure.name), "rollup {}: duplicate or colliding measure `{}`", self.table_name(&source.table_name), measure.name);
             anyhow::ensure!(
-                matches!(measure.agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest" | "hll"),
+                matches!(measure.agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest" | "hll" | "first"),
                 "rollup {}: unsupported aggregate `{}`",
                 self.table_name(&source.table_name),
                 measure.agg
             );
+            // A `first` measure stores the earliest value in the bucket, which is
+            // only re-aggregable if something says WHICH row it came from. That
+            // something is an ordinary companion measure — `min` over
+            // `timestamp` carrying the SAME filter — resolved by convention
+            // rather than by a new field, exactly as `avg` resolves to a
+            // sum/count pair. Requiring it here means a spec that cannot be
+            // merged is rejected at load instead of silently building a tier
+            // whose coarse buckets are wrong.
+            //
+            // The filter has to match because "earliest row in the bucket" and
+            // "earliest row MATCHING the filter" are different rows, and it is
+            // the second one whose value was stored.
+            if measure.agg == "first" {
+                anyhow::ensure!(
+                    self.measures
+                        .iter()
+                        .any(|c| c.agg == "min" && c.column.as_deref() == Some("timestamp") && c.filter == measure.filter),
+                    "rollup {}: `first` measure `{}` needs a companion `{{agg: min, column: timestamp}}` measure carrying the same filter",
+                    self.table_name(&source.table_name),
+                    measure.name
+                );
+            }
             match (&measure.agg[..], measure.column.as_deref()) {
                 ("count", None) => {}
-                ("count", Some(column)) | ("sum" | "min" | "max" | "hll", Some(column)) => {
+                ("count", Some(column)) | ("sum" | "min" | "max" | "hll" | "first", Some(column)) => {
                     anyhow::ensure!(field(column).is_some(), "rollup {}: unknown column `{column}`", self.table_name(&source.table_name));
                 }
                 ("tdigest", Some(column)) => {
@@ -886,6 +908,52 @@ mod tests {
         // measured 2026-08-24, the prefilter it enables costs 8.2s against a
         // 0.28s control on the same rows. See the comment in `synthesize`.
         assert!(rollup.fields.iter().all(|f| f.tantivy.is_none()), "no rollup field may carry a tantivy config");
+    }
+
+    /// A `first` measure is only re-aggregable if something records WHICH row
+    /// its value came from, and that something is the companion `min(timestamp)`
+    /// measure. Without one, the coarse tier would have to guess -- so the spec
+    /// is refused at load rather than building a tier whose buckets are wrong.
+    #[test]
+    fn a_first_measure_is_refused_without_its_companion() {
+        let source = get_schema("otel_logs_and_spans").expect("source schema");
+        let landing = |filter: Option<&str>| RollupMeasure {
+            name: "landing_url".into(),
+            agg: "first".into(),
+            column: Some("attributes___url___path".into()),
+            filter: filter.map(str::to_owned),
+        };
+        let companion = |name: &str, filter: Option<&str>| RollupMeasure {
+            name: name.into(),
+            agg: "min".into(),
+            column: Some("timestamp".into()),
+            filter: filter.map(str::to_owned),
+        };
+        let spec = |measures: Vec<RollupMeasure>| RollupSpec {
+            grain: "1m".into(),
+            name: Some("first_test".into()),
+            dimensions: vec!["kind".into()],
+            measures,
+            derive_from: None,
+        };
+
+        assert!(spec(vec![landing(None)]).validate(source).is_err(), "a `first` measure alone must not validate");
+        assert!(spec(vec![landing(None), companion("at", None)]).validate(source).is_ok(), "the companion makes it valid");
+
+        // "earliest row" and "earliest row MATCHING the filter" are different
+        // rows, and it is the second one whose value was stored -- so a
+        // companion carrying a different filter cannot order this measure.
+        let filter = "attributes___url___path <> ''";
+        assert!(
+            spec(vec![landing(Some(filter)), companion("at", None)]).validate(source).is_err(),
+            "the companion's filter must match the measure's"
+        );
+        assert!(spec(vec![landing(Some(filter)), companion("at", Some(filter))]).validate(source).is_ok());
+
+        // The stored value keeps the source column's own type -- it IS a value
+        // from that column, not a sketch over it.
+        let rollup = spec(vec![landing(None), companion("at", None)]).synthesize(source).expect("valid rollup");
+        assert_eq!(rollup.field_def("landing_url").map(|(ty, _)| ty), Some(ArrowDataType::Utf8View));
     }
 
     #[test]

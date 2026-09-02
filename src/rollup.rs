@@ -219,13 +219,33 @@ pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, pro
 /// A derived merge deliberately re-reads no filter: the base tier already
 /// applied it when the state was built, and applying it twice over an
 /// aggregated column is not the same predicate.
-fn measure_projection(measure: &RollupMeasure, derived: bool) -> anyhow::Result<String> {
+/// The declared `min(timestamp)` measure that says which row a `first`
+/// measure's value came from. Matched on the filter as well as the aggregate,
+/// because "earliest row" and "earliest row matching the filter" differ.
+/// `RollupSpec::validate` rejects a spec without one, so a missing companion
+/// here means the spec was never validated.
+fn first_companion(spec: &RollupSpec, measure: &RollupMeasure) -> anyhow::Result<String> {
+    spec.measures
+        .iter()
+        .find(|c| c.agg == "min" && c.column.as_deref() == Some("timestamp") && c.filter == measure.filter)
+        .map(|c| c.name.clone())
+        .ok_or_else(|| anyhow::anyhow!("`first` measure `{}` has no companion min(timestamp) measure", measure.name))
+}
+
+fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool) -> anyhow::Result<String> {
     if derived {
         let expression = match measure.agg.as_str() {
             "min" => format!("MIN({})", measure.name),
             "max" => format!("MAX({})", measure.name),
             "tdigest" => format!("tdigest_merge(CAST({} AS BYTEA))", measure.name),
             "hll" => format!("hll_merge(CAST({} AS BYTEA))", measure.name),
+            // Order by the COMPANION, never by the base tier's bucket
+            // timestamp: a fine bucket whose filter matched nothing stores a
+            // NULL value AND a NULL companion, and ordering by the bucket would
+            // pick that NULL and poison the coarse bucket. `NULLS LAST` puts
+            // those buckets after every real one, so they win only when there is
+            // nothing else -- which is the correct answer.
+            "first" => format!("first_value({} ORDER BY {} NULLS LAST)", measure.name, first_companion(spec, measure)?),
             _ => format!("SUM({})", measure.name),
         };
         return Ok(format!("{expression} AS {}", measure.name));
@@ -235,6 +255,10 @@ fn measure_projection(measure: &RollupMeasure, derived: bool) -> anyhow::Result<
         ("count", Some(column)) => format!("COUNT({column})"),
         ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
         ("hll", Some(column)) => format!("hll_agg({column})"),
+        // Built from raw, the ordering key is the row's own timestamp. The
+        // FILTER appended below applies to both, so the stored value and the
+        // companion describe the SAME row.
+        ("first", Some(column)) => format!("first_value({column} ORDER BY timestamp)"),
         (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
         (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
     };
@@ -250,7 +274,7 @@ pub(crate) fn build_partition_sql_ranges(
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let derived = from != source;
     let dimensions = spec.dimensions.join(", ");
-    let measures = spec.measures.iter().map(|measure| measure_projection(measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
+    let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
     let source = from;
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = std::iter::once("1".to_string()).chain((2..).take(spec.dimensions.len()).map(|index| index.to_string())).collect::<Vec<_>>().join(", ");
@@ -286,7 +310,7 @@ pub(crate) fn build_cohort_sql_range_mode(
     }
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let dimensions = spec.dimensions.join(", ");
-    let measures = spec.measures.iter().map(|measure| measure_projection(measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
+    let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = std::iter::once("1".to_string())
         .chain(std::iter::once("2".to_string()))
@@ -450,6 +474,11 @@ pub(crate) enum Merge {
     /// state: `distinct_count` reads the number out of it in the projection
     /// above the aggregate, which the rewrite never touches.
     Hll,
+    /// Earliest value in the window. Two states -- the value and the timestamp
+    /// of the row it came from -- because "earliest" is not recoverable from
+    /// the value alone. Associative for the same reason `Min` is: the winner of
+    /// the winners is the winner.
+    First,
 }
 
 impl Merge {
@@ -457,7 +486,7 @@ impl Merge {
     /// average is not a state, so the legs must carry sum and count apart or the
     /// union would average two averages.
     const fn arity(self) -> usize {
-        if matches!(self, Self::Avg) { 2 } else { 1 }
+        if matches!(self, Self::Avg | Self::First) { 2 } else { 1 }
     }
 
     /// The associative operator that folds one state column across legs.
@@ -468,6 +497,20 @@ impl Merge {
             Self::TDigest => "tdigest_merge",
             Self::Hll => "hll_merge",
             _ => "SUM",
+        }
+    }
+
+    /// One partial-state expression per stored column, for the rollup leg.
+    ///
+    /// Every merge but `First` folds each of its state columns with the same
+    /// associative operator, so the default is `partial_op` applied columnwise.
+    /// `First` cannot: its two states are a value and the timestamp that
+    /// selects it, and they need different operators -- the value is picked BY
+    /// the companion, the companion is minimised.
+    fn partial_states(self, columns: &[String]) -> Vec<String> {
+        match (self, columns) {
+            (Self::First, [value, at]) => vec![format!("first_value({value} ORDER BY {at} NULLS LAST)"), format!("MIN({at})")],
+            _ => columns.iter().map(|column| format!("{}({column})", self.partial_op())).collect(),
         }
     }
 
@@ -486,6 +529,10 @@ impl Merge {
             }
             (Self::TDigest, [digest]) => format!("tdigest_merge({digest})"),
             (Self::Hll, [sketch]) => format!("hll_merge({sketch})"),
+            // `NULLS LAST` for the same reason the derive uses it: a leg that
+            // matched nothing contributes a NULL pair, and it must lose to any
+            // leg that matched something.
+            (Self::First, [value, at]) => format!("first_value({value} ORDER BY {at} NULLS LAST)"),
             // `arity()` is the single source of truth for how many states each
             // variant is built with, so this is unreachable by construction.
             _ => unreachable!("merge {self:?} built with {} states", states.len()),
@@ -1291,11 +1338,7 @@ impl RoutedRollup {
             .enumerate()
             .map(|(index, (expression, _))| format!("{expression} AS __g{index}"))
             .chain(self.measures.iter().chain(self.guard.iter()).enumerate().flat_map(|(index, measure)| {
-                let states = if table == self.target {
-                    measure.measures.iter().map(|column| format!("{}({column})", measure.merge.partial_op())).collect::<Vec<_>>()
-                } else {
-                    measure.raw.clone()
-                };
+                let states = if table == self.target { measure.merge.partial_states(&measure.measures) } else { measure.raw.clone() };
                 states.into_iter().enumerate().map(move |(state, sql)| format!("{sql} AS __s{index}_{state}"))
             }))
             .collect::<Vec<_>>()
@@ -2492,7 +2535,18 @@ async fn route_with_spec(
     for (index, expression) in aggregate.aggr_expr.iter().enumerate() {
         let alias = aggregate.schema.field(aggregate.group_expr.len() + index).name().to_string();
         let Expr::AggregateFunction(function) = unaliased(expression) else { return Err(MissReason::NonDecomposableAggregate) };
-        if function.params.distinct || !function.params.order_by.is_empty() {
+        // An ORDER BY inside an aggregate makes it depend on row order, which no
+        // partial state can carry -- with one exception. `first_value(x ORDER BY
+        // timestamp)` orders by the very axis the rollup buckets on, so the
+        // earliest row of the earliest bucket IS the earliest row overall, and a
+        // (value, timestamp) pair merges associatively. Nothing else is relaxed:
+        // ordering by any other column, or DESC, still declines.
+        let ordered_by_timestamp = function.func.name().eq_ignore_ascii_case("first_value")
+            && matches!(
+                function.params.order_by.as_slice(),
+                [sort] if column_name(&sort.expr) == Some("timestamp") && sort.asc
+            );
+        if function.params.distinct || (!function.params.order_by.is_empty() && !ordered_by_timestamp) {
             return Err(MissReason::NonDecomposableAggregate);
         }
         // The promoted conjuncts join the aggregate's own, so a `count(*) FILTER
@@ -2562,6 +2616,20 @@ async fn route_with_spec(
             // approximating it without being asked is what the measure list
             // refuses to do.
             "hll_agg" => (Merge::Hll, measure("hll", column.as_deref()).map(|m| vec![m])),
+            // Resolves to a PAIR, exactly as `avg` resolves to sum/count: the
+            // stored value plus the companion `min(timestamp)` that says which
+            // row it came from. `RollupSpec::validate` guarantees a `first`
+            // measure cannot be declared without its companion, so a spec that
+            // reaches here either resolves both or neither.
+            //
+            // Declines under a null guard. The guard is set aside rather than
+            // applied to either leg, which is only sound for aggregates that
+            // skip nulls over the guarded column -- and `first_value` does not:
+            // it returns the earliest row's value even when that value is NULL.
+            "first_value" if null_guard.is_none() => (
+                Merge::First,
+                measure("first", column.as_deref()).zip(measure("min", Some("timestamp"))).map(|(first, at)| vec![first, at]),
+            ),
             _ => return Err(MissReason::NonDecomposableAggregate),
         };
         let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
@@ -2573,6 +2641,10 @@ async fn route_with_spec(
                 let expression = match (merge, measure.column.as_deref()) {
                     (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
                     (Merge::Hll, Some(column)) => format!("hll_agg({column})"),
+                    // The companion of a `first` pair is an ordinary `min`
+                    // measure, so it renders through the general arm below;
+                    // only the value state needs the ordered spelling.
+                    (Merge::First, Some(column)) if measure.agg == "first" => format!("first_value({column} ORDER BY timestamp)"),
                     (_, None) => "COUNT(*)".to_string(),
                     (_, Some(column)) => format!("{aggregate}({column})"),
                 };
@@ -2863,6 +2935,91 @@ mod tests {
 
     fn spec() -> RollupSpec {
         crate::schema::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
+    }
+
+    /// A `first` measure and its companion, as the sessions rollup would
+    /// declare them: the first non-empty landing URL of a session.
+    fn first_spec() -> RollupSpec {
+        let filter = Some("attributes___url___path <> ''".to_owned());
+        RollupSpec {
+            grain: "1m".into(),
+            name: Some("first_test".into()),
+            dimensions: vec!["kind".into()],
+            measures: vec![
+                RollupMeasure { name: "landing_url".into(), agg: "first".into(), column: Some("attributes___url___path".into()), filter: filter.clone() },
+                RollupMeasure { name: "landing_at".into(), agg: "min".into(), column: Some("timestamp".into()), filter },
+            ],
+            derive_from: None,
+        }
+    }
+
+    /// Built from raw, the value and its companion must be selected by the same
+    /// FILTER, or they describe different rows and the merge picks a value that
+    /// was never first.
+    #[test]
+    fn a_first_measure_builds_value_and_companion_over_the_same_rows() {
+        let sql = build_partition_sql(&first_spec(), SOURCE, "p", "2026-01-15").expect("builds");
+        assert!(
+            sql.contains("first_value(attributes___url___path ORDER BY timestamp) FILTER (WHERE attributes___url___path <> '') AS landing_url"),
+            "{sql}"
+        );
+        assert!(sql.contains("MIN(timestamp) FILTER (WHERE attributes___url___path <> '') AS landing_at"), "{sql}");
+    }
+
+    /// The coarse tier orders by the COMPANION, never by the base tier's bucket
+    /// timestamp.
+    ///
+    /// A fine bucket whose filter matched nothing stores a NULL value and a NULL
+    /// companion. Ordering by the bucket would rank that empty bucket first
+    /// whenever it happens to be the earliest, and the coarse bucket would
+    /// answer NULL while a later bucket held a real value. `NULLS LAST` on the
+    /// companion puts every empty bucket after every real one, so it wins only
+    /// when there is genuinely nothing else.
+    #[test]
+    fn a_derived_first_orders_by_the_companion_with_nulls_last() {
+        let mut coarse = first_spec();
+        coarse.grain = "1h".into();
+        coarse.name = Some("first_test_1h".into());
+        coarse.derive_from = Some("first_test".into());
+        let sql = build_partition_sql_from(&coarse, SOURCE, "src_rollup_first_test", "p", "2026-01-15").expect("builds");
+
+        assert!(sql.contains("first_value(landing_url ORDER BY landing_at NULLS LAST) AS landing_url"), "{sql}");
+        assert!(sql.contains("MIN(landing_at) AS landing_at"), "{sql}");
+        // Ordering by the bucket is the bug this test exists to prevent.
+        assert!(!sql.contains("ORDER BY timestamp"), "a derived first must not order by the base tier's bucket: {sql}");
+    }
+
+    /// `first_value` is the one aggregate allowed to carry an ORDER BY, and only
+    /// when it orders by `timestamp` ascending -- the axis the rollup buckets
+    /// on, which is what makes the earliest row of the earliest bucket the
+    /// earliest row overall.
+    ///
+    /// The assertion is on the miss REASON, not on success: no production spec
+    /// declares a `first` measure yet (the sessions rollup needs `session_key`
+    /// promoted at ingest first), so the accepted spelling gets past the
+    /// order-by gate and stops at `MissingMeasure`. Reaching that reason is
+    /// exactly the proof that the gate let it through.
+    #[tokio::test]
+    async fn only_first_value_ordered_by_timestamp_passes_the_order_by_gate() {
+        let state = session().await;
+        let route = async |order: &str| {
+            let sql = format!(
+                "SELECT first_value(name ORDER BY {order}) FROM {SOURCE} \
+                 WHERE project_id = 'p' AND timestamp >= to_timestamp_micros(1786500000000000) GROUP BY kind"
+            );
+            route_for(&state, &sql).await
+        };
+
+        assert!(
+            matches!(route("timestamp").await, Err(MissReason::MissingMeasure)),
+            "ordering by timestamp must pass the gate and decline only for want of a measure"
+        );
+        for refused in ["duration", "timestamp DESC"] {
+            assert!(
+                matches!(route(refused).await, Err(MissReason::NonDecomposableAggregate)),
+                "`ORDER BY {refused}` must still be refused outright"
+            );
+        }
     }
 
     /// A window with a lower bound and NO upper bound must still route.
