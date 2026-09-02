@@ -807,3 +807,67 @@ guard is so tight it starves the thing it protects.
 3. This is an offline calculation over a journal snapshot, not a live
    experiment. It is strong enough to justify the change and not strong enough
    to skip a canary.
+
+## CONFIRMED ON LIVE CODE: the starvation is current behaviour, not 09-01 residue
+
+The admission machinery churned on 2026-09-01 (occupancy-scaled ceiling, the
+honest-request fix, repair slicing), so the stuck cohort could have been residue
+of bugs already fixed. Checked, two ways.
+
+**The wrong way first, recorded because the method is the lesson.** I grepped
+12h of prod logs for `resource_admission` / `admission_busy` and found **zero**,
+and briefly took that as "not live". It proves nothing: those strings are
+**retry reasons stored on the task, never logged as events** — outside tests the
+coordinator never emits them. *Absence from logs is not absence of the event
+when the event is not logged.*
+
+**The right way: re-fetch the journal and diff the cohort by task key.**
+Snapshot 1 at 12:45, snapshot 2 at 17:07, 4.4 hours apart, same running binary:
+
+| | |
+| --- | --- |
+| queued, snapshot 1 → 2 | 2,369 → 2,222 |
+| of the 1,168 tasks stuck >48h at 12:45 | **1,144 (98%) still queued** at 17:07 |
+| drained in 4.4h | **24** |
+| survivors whose `attempts` INCREMENTED | **359** |
+| survivors by op | dedup 671, repair 311, base_rollup 158 |
+| survivors' current retry reasons | `compaction_incomplete` 194, `admission_busy` 166, `resource_admission` 146 |
+
+**98% of the stuck cohort is still stuck, and 359 of them were actively retried
+and refused during the window.** They are not idle debris; they are being picked
+up and rejected on the current binary, repeatedly. The finding upgrades from
+"true of a journal snapshot" to **confirmed against live code**.
+
+## The counter-signal to the recommendation, quantified
+
+Before raising `MAX_DECODED_BYTES`, note what the journal says about the units
+that already fail their SORT (`dedup: Not enough memory to continue external
+sort`, 338 tasks, 41 of them in the FRESH cohort — i.e. current behaviour):
+
+| bucket | share of sized sort-failures |
+| --- | --- |
+| < 32 MiB (busy floor) | 16.7% |
+| **32 MiB – 512 MiB (today's band)** | **83.3%** |
+| > 512 MiB | 0% |
+
+Median 256 MiB. **Every sized sort failure is at or below today's admission
+ceiling** — units around a quarter of a gigabyte are already exhausting the
+510 MB per-sort slice, because a sort's working set is a multiple of the data it
+decodes.
+
+So raising admission to 2 GiB *alone* risks converting starved units into
+sort-failing units — trading `admission_busy` retries for hard failures on the
+OOM-adjacent path, while the landed-skip flag is OFF (so any OOM-driven unclean
+restart manufactures exactly the duplicates the first half of this night was
+about).
+
+**Revised recommendation, and it is a different ask:**
+
+> Admission and the per-sort slice must be raised **together**, or neither. The
+> admission ceiling governs what may enter; the sort slice governs what can
+> actually finish. Today they disagree — admission permits 512 MiB while the
+> sort slice fails at 256 MiB — and moving only one moves the failure, not the
+> outcome.
+
+That is a two-constant change on the OOM path with a real interaction, not the
+one-liner it looked like an hour ago. It wants a canary and someone awake.
