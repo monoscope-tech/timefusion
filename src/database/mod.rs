@@ -1718,6 +1718,58 @@ fn wal_topic(project_id: &str, table_name: &str) -> String {
     format!("{project_id}:{table_name}")
 }
 
+/// Identities of the batch sets a commit contains, so a later boot can decline
+/// to write rows it can prove are already durable
+/// (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
+///
+/// **This record must NEVER advance a WAL cursor.** Cursor advance stays
+/// governed solely by the conservative `WAL_WATERMARK_KEY`; a digest may only
+/// decline a write. The two are deliberately different kinds of claim — the
+/// watermark is a RANGE (safe only when floored at every live hold), a digest
+/// is an IDENTITY. Letting a digest advance a cursor would reintroduce the
+/// interleaving loss the plan documents. Pinned by
+/// `landed_digests_never_advance_a_cursor`.
+const LANDED_DIGESTS_KEY: &str = "timefusion.landed_digests";
+
+/// `{ "<project>:<table>": ["<hex digest>", …] }` — topic-scoped exactly like
+/// the watermark, since unified-table tenants share one Delta log.
+fn serialize_landed_digests_to_json(entries: impl IntoIterator<Item = (String, String, [u8; 32])>) -> serde_json::Map<String, serde_json::Value> {
+    entries.into_iter().fold(serde_json::Map::new(), |mut map, (project_id, table_name, digest)| {
+        let hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        match map.entry(wal_topic(&project_id, &table_name)).or_insert_with(|| serde_json::Value::Array(Vec::new())) {
+            serde_json::Value::Array(a) => a.push(serde_json::Value::String(hex)),
+            _ => unreachable!("entry initialised as an array"),
+        }
+        map
+    })
+}
+
+/// Inverse of [`serialize_landed_digests_to_json`], for one topic. Malformed
+/// entries are skipped: a digest we cannot read is simply an identity we will
+/// not match, which costs a duplicate, never a loss.
+fn parse_landed_digests_from_json(info: &HashMap<String, serde_json::Value>, project_id: &str, table_name: &str) -> Vec<[u8; 32]> {
+    let Some(list) = info.get(LANDED_DIGESTS_KEY).and_then(|v| v.as_object()).and_then(|m| m.get(&wal_topic(project_id, table_name))).and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| s.len() == 64)
+        .filter_map(|s| {
+            let mut out = [0u8; 32];
+            (0..32).try_fold(&mut out, |acc, i| {
+                acc[i] = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+                Some(acc)
+            })?;
+            Some(out)
+        })
+        .collect()
+}
+
 /// Inverse of `serialize_watermark_to_json`. Out-of-range or malformed shards
 /// are dropped silently — schema-evolution-friendly: future writers can add
 /// fields without breaking older readers.
@@ -1782,12 +1834,27 @@ fn base_commit_properties() -> CommitProperties {
 /// silently skips that commit.
 /// Takes every (project, table, watermark) the commit carries — one entry on
 /// the per-project path, N on a coalesced cross-project commit.
-fn build_watermark_commit_properties(watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>) -> CommitProperties {
+/// `digests` carries the same commit's landed-batch identities (see
+/// [`LANDED_DIGESTS_KEY`]). Both keys are written in ONE `with_metadata` call
+/// because delta-rs's `with_metadata` REPLACES the map rather than extending
+/// it — chaining a second call would silently drop the watermark and break
+/// cursor derivation.
+fn build_watermark_commit_properties(
+    watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>, digests: impl IntoIterator<Item = (String, String, [u8; 32])>,
+) -> CommitProperties {
     let entries = serialize_watermarks_to_json(watermarks);
-    if entries.is_empty() {
+    let landed = serialize_landed_digests_to_json(digests);
+    let metadata: Vec<(String, serde_json::Value)> = [
+        (!entries.is_empty()).then(|| (WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries))),
+        (!landed.is_empty()).then(|| (LANDED_DIGESTS_KEY.to_string(), serde_json::Value::Object(landed))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if metadata.is_empty() {
         return base_commit_properties();
     }
-    base_commit_properties().with_metadata([(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries))])
+    base_commit_properties().with_metadata(metadata)
 }
 
 /// `CommitProperties` for a compaction/dedup commit (Add + Remove): when

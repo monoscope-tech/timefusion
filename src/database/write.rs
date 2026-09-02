@@ -640,11 +640,24 @@ impl Database {
 
         span.record("use_queue", false);
 
+        // Identity of the batch set this commit carries, so a later boot can
+        // decline to re-write it (see `LANDED_DIGESTS_KEY`). Computed on the
+        // batches AS THE FLUSH HANDED THEM OVER — before `prepare_staged_write`
+        // coerces or sorts — because that is exactly what the flush side hashes
+        // when it checks. Only the flush path (`watermark.is_some()`) records
+        // one: an inbound write is not something replay can duplicate.
+        let landed = (self.config.buffer.landed_skip_enabled() && watermark.is_some()).then(|| crate::write::landed_digest(&batches)).flatten();
+
         let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer, sorted } =
             self.prepare_staged_write(&project_id, &table_name, batches).await?;
 
         // Hoist out of the retry loop — the watermark is the same on every attempt.
-        let commit_properties = watermark.map(|w| build_watermark_commit_properties([(project_id.clone(), table_name.clone(), w.clone())]));
+        let commit_properties = watermark.map(|w| {
+            build_watermark_commit_properties(
+                [(project_id.clone(), table_name.clone(), w.clone())],
+                landed.map(|d| (project_id.clone(), table_name.clone(), d)),
+            )
+        });
         // Let the post-commit hook advance the snapshot incrementally — carry
         // the materialized file list forward, append the committed files, drop
         // any removed ones — instead of re-materializing the whole active set.
@@ -1001,7 +1014,19 @@ impl Database {
                     let schema = group[0].1.schema;
                     let adds: Vec<Action> = group.iter().flat_map(|(_, u)| u.adds.iter().cloned()).collect();
                     let watermarks = indices.iter().map(|i| (units[*i].project_id.clone(), units[*i].table_name.clone(), units[*i].watermark.clone()));
-                    let commit_properties = build_watermark_commit_properties(watermarks);
+                    // Per-unit landed identity, on the batches the flush handed
+                    // over (see the single-unit path). Each unit's digest is
+                    // scoped to its own topic, so one tenant's identity can
+                    // never decline another's write.
+                    let digests: Vec<(String, String, [u8; 32])> = if self.config.buffer.landed_skip_enabled() {
+                        indices
+                            .iter()
+                            .filter_map(|i| crate::write::landed_digest(&units[*i].batches).map(|d| (units[*i].project_id.clone(), units[*i].table_name.clone(), d)))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let commit_properties = build_watermark_commit_properties(watermarks, digests);
                     let commit_properties = if self.config.maintenance.timefusion_incremental_snapshot {
                         commit_properties.with_incremental_advance(true)
                     } else {
