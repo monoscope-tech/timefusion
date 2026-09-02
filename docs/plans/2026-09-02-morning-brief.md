@@ -81,9 +81,14 @@ Recorded because the corrections are more useful than the conclusions.
 ## Where I would go next
 
 1. **Your call on the flag.** Everything else about duplicates is inert until it.
-2. **50x = memory headroom per rewrite.** The lever is not the scheduler. The
-   question to answer is how much `block_size × permits` headroom exists at the
-   current cgroup limit, and whether the landed skip's reduction in work moves it.
+2. **50x = a POOL RE-SLICE, and it needs no extra memory.** Worked out
+   tonight: heavy sorts live in `heavy_share_bytes()` (~4.98 GiB), not the
+   cgroup, and each concurrent sort needs ≥182 MB or it fails instead of
+   spilling. That caps permits at ~28 — so doubling 10 → 20 (exactly what the
+   50x sim needs) fits inside the pool we already have, if
+   `PER_SORT_BUDGET_BYTES` is halved 2 GiB → 1 GiB to keep the guarded 20 GiB
+   envelope unchanged. Full arithmetic in the scale-readiness doc. Left undone
+   deliberately: OOM path, deliberately guarded, and nothing below 50x needs it.
 3. **100x = predictive unit sizing.** A byte preflight already exists (the sim
    exercises it); the design question is whether it can *size* a unit rather
    than only refuse one.
