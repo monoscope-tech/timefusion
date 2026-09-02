@@ -250,12 +250,7 @@ pub(crate) fn build_partition_sql_ranges(
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let derived = from != source;
     let dimensions = spec.dimensions.join(", ");
-    let measures = spec
-        .measures
-        .iter()
-        .map(|measure| measure_projection(measure, derived))
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .join(", ");
+    let measures = spec.measures.iter().map(|measure| measure_projection(measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
     let source = from;
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = std::iter::once("1".to_string()).chain((2..).take(spec.dimensions.len()).map(|index| index.to_string())).collect::<Vec<_>>().join(", ");
@@ -291,12 +286,7 @@ pub(crate) fn build_cohort_sql_range_mode(
     }
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let dimensions = spec.dimensions.join(", ");
-    let measures = spec
-        .measures
-        .iter()
-        .map(|measure| measure_projection(measure, derived))
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .join(", ");
+    let measures = spec.measures.iter().map(|measure| measure_projection(measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = std::iter::once("1".to_string())
         .chain(std::iter::once("2".to_string()))
