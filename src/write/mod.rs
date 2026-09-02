@@ -4482,7 +4482,13 @@ mod tests {
         ])
         .unwrap();
         layer.insert(&project, &table, vec![batch]).await.unwrap();
-        let deleted = layer.delete(&project, &table, Some(&datafusion::prelude::col("id").eq(datafusion::prelude::lit(datafusion::scalar::ScalarValue::Utf8View(Some("a".into())))))).unwrap();
+        let deleted = layer
+            .delete(
+                &project,
+                &table,
+                Some(&datafusion::prelude::col("id").eq(datafusion::prelude::lit(datafusion::scalar::ScalarValue::Utf8View(Some("a".into()))))),
+            )
+            .unwrap();
         assert_eq!(deleted, 1, "the DML must actually change the bucket, or the assertion below proves nothing");
 
         layer.flush_all_now().await.unwrap();

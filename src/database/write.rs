@@ -1024,7 +1024,9 @@ impl Database {
                         indices
                             .iter()
                             .filter(|i| crate::write::landed_identity_applies(&units[**i].table_name))
-                            .filter_map(|i| crate::write::landed_digest(&units[*i].batches).map(|d| (units[*i].project_id.clone(), units[*i].table_name.clone(), d)))
+                            .filter_map(|i| {
+                                crate::write::landed_digest(&units[*i].batches).map(|d| (units[*i].project_id.clone(), units[*i].table_name.clone(), d))
+                            })
                             .collect()
                     } else {
                         Vec::new()
@@ -1369,7 +1371,9 @@ impl Database {
     /// finish, so restart does not replay entries already in Delta. Must run before
     /// `recover_from_wal`. Best-effort: failures are logged and skipped, so this cannot make recovery
     /// worse than at-least-once.
-    pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::write::wal::WalManager, layer: Option<&crate::write::BufferedWriteLayer>) -> anyhow::Result<usize> {
+    pub async fn derive_wal_cursors_from_delta(
+        &self, wal: &crate::write::wal::WalManager, layer: Option<&crate::write::BufferedWriteLayer>,
+    ) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
 
         // Group logical WAL topics by physical Delta log. Default-storage

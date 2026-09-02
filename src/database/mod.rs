@@ -1752,7 +1752,8 @@ fn serialize_landed_digests_to_json(entries: impl IntoIterator<Item = (String, S
 /// entries are skipped: a digest we cannot read is simply an identity we will
 /// not match, which costs a duplicate, never a loss.
 fn parse_landed_digests_from_json(info: &HashMap<String, serde_json::Value>, project_id: &str, table_name: &str) -> Vec<[u8; 32]> {
-    let Some(list) = info.get(LANDED_DIGESTS_KEY).and_then(|v| v.as_object()).and_then(|m| m.get(&wal_topic(project_id, table_name))).and_then(|v| v.as_array())
+    let Some(list) =
+        info.get(LANDED_DIGESTS_KEY).and_then(|v| v.as_object()).and_then(|m| m.get(&wal_topic(project_id, table_name))).and_then(|v| v.as_array())
     else {
         return Vec::new();
     };
