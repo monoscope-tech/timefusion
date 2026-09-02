@@ -2007,3 +2007,43 @@ through a function that looks configurable but is not.
 `COORDINATOR_HOT_TARGET_BYTES x DECODED_BYTES_PER_COMPRESSED / MIB` (3,072) so
 the default is *derived from the constants it must satisfy* rather than typed in
 — which keeps it correct if the compaction target changes later.
+
+## Writing the regression test refined the mechanism: refusal needs CONTENTION
+
+Attempting the e2e regression test the configurable budget was supposed to
+enable produced a failure that is more useful than the test:
+
+```
+compaction_permits_unavailable 0 -> 0   (file set untouched)
+```
+
+The reason is the clamp:
+
+```rust
+let want_mib = estimated_decoded_bytes(...).clamp(1, budget_mib);
+```
+
+**A lone repair unit ALWAYS fits.** It clamps its request to the whole budget,
+and when nothing else holds the semaphore the whole budget is free, so it
+acquires. `repair_rewrite_permit_busy` therefore requires a **concurrent**
+rewrite already holding permits — it is a contention signal, not a size signal.
+
+**This sharpens the prod diagnosis rather than contradicting it.** 177 bounces in
+three hours means the semaphore was essentially always held, which is exactly
+what "one 40-minute rewrite at a time" predicts. The bounces are the *other*
+units failing to join a budget that one unit has entirely consumed — the
+serialization, observed from the losing side.
+
+**It also means my e2e test as written proved nothing**, because the harness
+drives repair serially. Shipping a test that passes for the wrong reason is worse
+than shipping none, so only the `with_repair_budget_mib` harness knob landed; the
+test did not. A real one needs two concurrent repair rewrites.
+
+**What is still unresolved, and should be stated plainly:** if a lone unit always
+acquires, some unit should be running a rewrite at any given moment — yet no
+repair rewrite reached `wave_bin_staged` in 12 hours. Either repair units are
+never claimed while the semaphore is free, or repair staging is not reported by
+that event. **I did not resolve which**, and the distinction matters: the first
+is a scheduling defect, the second means my "zero rewrites" evidence is weaker
+than stated. The 310 stuck units and 177 bounces stand either way, but this is
+the loose end I would pull first.
