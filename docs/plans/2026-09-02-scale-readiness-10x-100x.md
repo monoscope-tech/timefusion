@@ -1455,3 +1455,42 @@ So the honest framing for the morning is two-tier:
 Sources: [Cassandra compaction docs](https://cassandra.apache.org/doc/4.1/cassandra/operating/compaction/index.html),
 [DataStax: configuring compaction](https://docs.datastax.com/en/cassandra-oss/3.0/cassandra/operations/opsConfigureCompaction.html),
 [ClickHouse#16838](https://github.com/ClickHouse/ClickHouse/issues/16838).
+
+### CORRECTION to my own prior-art recommendation: shrinking is not available here
+
+I recommended, on Cassandra/ClickHouse precedent, that the durable fix is to
+shrink a unit to its budget — for repair, "rewrite the file in row-group ranges".
+**At these constants that does not work either**, and the arithmetic is short:
+
+```
+TARGET_ROW_GROUP_BYTES        = 128 MiB compressed   (database/mod.rs:3129)
+DECODED_BYTES_PER_COMPRESSED  = 12
+one row group                 = 1,536 MiB decoded
+repair budget                 = 1,280 MiB            -> a SINGLE ROW GROUP is already 20% over
+```
+
+A target-sized file holds just **2 row groups** (`estimated_row_groups` =
+`size / 128 MiB`), so "split by row group" yields two pieces that each still
+exceed the budget. **The indivisible read unit is already over budget**, which
+means there is no shrinking strategy available at these numbers:
+
+| minimum budget to admit… | MiB |
+| --- | --- |
+| one row group | **1,536** |
+| one whole target-sized file | **3,072** |
+| *current* | 1,280 |
+
+**So Decision 1 simplifies rather than expanding: the budget must be raised —
+there is no cheaper structural alternative to fall back on.** Even a perfect
+implementation of the Cassandra/ClickHouse "shrink the input" pattern needs
+≥1,536 MiB before it has any move to make.
+
+That does not retire the prior-art point, it relocates it: shrinking is the
+right *general* mechanism and is what makes an arbitrarily large future file
+safe, but it is not a way to avoid raising this constant now. **Raise the budget
+first; shrinking becomes useful only above 1,536 MiB.**
+
+*(Splitting a file into several independently-sorted files is a third option —
+it would satisfy "each file is internally sorted", which is what repair is for —
+but it multiplies file count and works directly against compaction, so it needs
+its own analysis rather than a footnote.)*
