@@ -242,6 +242,17 @@ pub struct StatsSnapshot {
     pub drained: bool,
     /// Duration of the startup WAL recovery that produced this process.
     pub wal_recovery_duration_ms: u64,
+    /// Rows re-inserted by that replay.
+    ///
+    /// Replay is deliberately not idempotent: `settle_flushed_group` notes that a
+    /// failed cursor advance means "the next boot re-replays rows that are
+    /// already in Delta", and dedup collapses them. That is correct for
+    /// durability and expensive for maintenance — 58,965 of 101,563 duplicate
+    /// groups in a sampled prod file were BYTE-IDENTICAL copies carrying one
+    /// `updated_at` stamp, which is the replay signature and not the
+    /// merge-on-read one. Nothing reported the volume, so the cost of a restart
+    /// could not be compared against the dedup work it creates.
+    pub wal_replay_rows: u64,
     /// True only after startup WAL recovery has returned successfully.
     pub wal_recovery_complete: bool,
     /// Committed Parquet files awaiting post-replay Tantivy indexing.
@@ -586,6 +597,8 @@ pub struct BufferedWriteLayer {
     recovery_active: std::sync::atomic::AtomicBool,
     /// Duration of the completed startup WAL replay, surfaced for deploy alerts.
     wal_recovery_duration_ms: AtomicU64,
+    /// Rows that replay re-inserted, surfaced next to the duplicates they make.
+    wal_replay_rows: AtomicU64,
     /// Set only after `recover_from_wal` returns successfully.
     wal_recovery_complete: std::sync::atomic::AtomicBool,
     /// Per-topic pre-recovery cursor (P0), set once at the start of
@@ -740,6 +753,7 @@ impl BufferedWriteLayer {
             wal_hold_seq: AtomicU64::new(0),
             recovery_active: std::sync::atomic::AtomicBool::new(false),
             wal_recovery_duration_ms: AtomicU64::new(0),
+            wal_replay_rows: AtomicU64::new(0),
             wal_recovery_complete: std::sync::atomic::AtomicBool::new(false),
             recovery_commit_floor: dashmap::DashMap::new(),
             deferred_tantivy_files: std::sync::Mutex::new(std::fs::read(&deferred_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
@@ -1713,6 +1727,7 @@ impl BufferedWriteLayer {
         // via insert-path backpressure.
 
         self.rows_ingested_total.fetch_add(recovered_rows, Ordering::Relaxed);
+        self.wal_replay_rows.store(recovered_rows, Ordering::Relaxed);
 
         let stats = RecoveryStats {
             entries_replayed,
@@ -3355,6 +3370,7 @@ impl BufferedWriteLayer {
             orphan_pin_age_secs: self.oldest_orphan_pin_micros().map(|pin| ((chrono::Utc::now().timestamp_micros() - pin).max(0) / 1_000_000) as u64),
             drained: self.is_drained(),
             wal_recovery_duration_ms: self.wal_recovery_duration_ms.load(Ordering::Relaxed),
+            wal_replay_rows: self.wal_replay_rows.load(Ordering::Relaxed),
             wal_recovery_complete: self.wal_recovery_complete.load(Ordering::Relaxed),
             tantivy_recovery_pending_files: self.deferred_tantivy_files.lock().unwrap().len(),
             boot_micros: self.boot_micros,

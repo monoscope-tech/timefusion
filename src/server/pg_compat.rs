@@ -926,7 +926,17 @@ impl StatsTableProvider {
                         "drained" => s.drained,
                         "boot_micros" => s.boot_micros,
                     ],
-                    rows!["wal"; "recovery_complete" => s.wal_recovery_complete, "recovery_duration_ms" => s.wal_recovery_duration_ms],
+                    rows!["wal";
+                        "recovery_complete" => s.wal_recovery_complete,
+                        "recovery_duration_ms" => s.wal_recovery_duration_ms,
+                        // Rows this boot re-inserted. Replay is not idempotent by
+                        // design, so every restart re-adds rows already in Delta and
+                        // dedup pays to remove them: 58% of the duplicate groups in a
+                        // sampled prod file were byte-identical replay copies, not
+                        // merge-on-read versions. Compare against the dedup drop rate
+                        // to price a restart.
+                        "replay_rows" => s.wal_replay_rows,
+                    ],
                     rows!["tantivy"; "recovery_pending_files" => s.tantivy_recovery_pending_files],
                     rows!["wal";
                         "files" => s.wal_files,
