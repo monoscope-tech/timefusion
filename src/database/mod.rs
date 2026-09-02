@@ -5517,6 +5517,20 @@ impl Database {
                         let size = self.config.derived.query_pool_bytes();
                         Arc::new(move || (env.memory_pool.reserved(), size))
                     })
+                    // The maintenance/coordinator pools are what every budget
+                    // decision is actually about; only their SIZES were visible.
+                    .with_maintenance_pools(
+                        {
+                            let env = self.maintenance_runtime_env();
+                            let size = self.config.derived.maintenance_pool_bytes();
+                            Arc::new(move || (env.memory_pool.reserved(), size))
+                        },
+                        {
+                            let env = self.coordinator_runtime_env();
+                            let size = self.config.derived.coordinator_share_bytes();
+                            Arc::new(move || (env.memory_pool.reserved(), size))
+                        },
+                    )
                     .with_tantivy_search_opt(self.tantivy_search().cloned())
                     .with_bloom_prune_opt(self.bloom_prune().cloned()),
             ),
