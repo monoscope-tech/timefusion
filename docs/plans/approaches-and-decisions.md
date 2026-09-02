@@ -79,3 +79,41 @@ prospective 100x customer.
   always drains, so no reservation ever binds. Use the real journal
   (`docker cp <ctr>:/app/data/timefusion/.timefusion_meta/maintenance_tasks.json`).
 - **A young process reads as fixed.** Check uptime before quoting any counter.
+
+### Prior art (2026-09-02): ClickHouse already solved this, and we did it backwards
+
+**ClickHouse ReplacingMergeTree deduplicates on the `ORDER BY` sorting key — not
+the primary key — and requires `PRIMARY KEY` to be a PREFIX of `ORDER BY`.** The
+whole point is that a merge can then dedup by streaming, with no sort.
+
+Their documented pattern for exactly our tension (dedup key contains identifier
+columns you don't want in the index):
+
+```sql
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, user_id, device_id)  -- FULL dedup key: makes merges streaming
+PRIMARY KEY (tenant_id, user_id)          -- lean sparse index, a prefix of it
+```
+
+**We have it backwards.** TimeFusion sorts files
+`(timestamp, service, id, ...)` and dedups on `(timestamp, id)` — `service` sits
+between the dedup keys, so no merge can stream and every rewrite pays a full
+external sort. That is the cost measured tonight: the sort OOMs a 1 GB pool on one
+204 MB bin and dominates ~96% of maintenance time.
+
+**What this de-risks about option 1.** The objection to leading `sorting_columns`
+with `(timestamp, id)` is that it would hurt reads that prune on `service`.
+ClickHouse's answer is that the SORT key and the INDEX do not have to be the same
+thing — you keep the full dedup key in the sort and serve pruning from a shorter
+index. TimeFusion already has that separation: `schemas/otel_logs_and_spans.yaml:67`
+records that point lookups are served by bloom filters and tantivy, not by the
+sort. So the read-path objection is likely weaker than it looks, and it is
+measurable with the existing latency matrix.
+
+Still needs the matrix re-run before landing — but the design is the industry
+norm, not a novel gamble, and the current layout is the deviation.
+
+Sources:
+- https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree
+- https://docs.peerdb.io/bestpractices/clickhouse_datamodeling
+- https://queryplane.com/blog/clickhouse-partition-by-order-by-primary-key-guide/
