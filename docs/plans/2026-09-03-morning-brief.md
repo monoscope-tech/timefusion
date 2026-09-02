@@ -81,6 +81,31 @@ not the queue** — a held semaphore bounces small units too, so "nothing below
 3,176 in 88 events" is real signal but wants a longer window before it is quoted
 as the queue's distribution.
 
+### Supporting bench, and why it does NOT close the question
+
+Fleet ladder on the 431 MB whale file, one shared 8 GiB pool (disk verified at
+92 GiB free throughout, so unlike the earlier discarded run these failures are
+real):
+
+```
+workers   secs   failed
+ 2         1.8      0
+ 6         8.2      0
+12        18.8      0
+16        21.1      6
+```
+
+Two concurrent sorts of a repair-magnitude file pass with enormous margin. **But
+this ladder cannot be compared to the 204 MB one in decoded-byte terms.** It
+sorts at 265 MB/s against the other file's 10 MB/s — this file has far fewer,
+wider rows, so the `12x compressed` conversion (a prod *average*, not a per-file
+truth) badly over-states its decoded size. Quoting "5.2 GB decoded per worker"
+here would be inventing a number.
+
+So it is supporting evidence that 2-way repair concurrency is not obviously
+dangerous — **not** proof at the clamped class's real magnitude. The honest
+morning experiment is 2 workers at a measured (not estimated) decoded size.
+
 ## Change 3 in detail — the boundary
 
 `byte_bounded_units` splits until a unit **fits** `MAX_DECODED_BYTES`, so its
