@@ -66,6 +66,23 @@ were re-run on four seeds (pending remaining after 24h, from 813):
 4/4: at 50x doubling the workers drains it completely; at 100x **eight times**
 the workers moves pending only ~210 → ~60 and never reaches zero.
 
+### The cleanest proof it is per-unit, not concurrency
+
+If units were merely contending, the per-execution timeout rate would fall as
+workers rise. It does not move at all across an **8x** range:
+
+| workers at 100x | executions | timeouts | timeout rate |
+| --- | --- | --- | --- |
+| 20 | 2006 | 1060 | **52.8%** |
+| 40 | 4051 | 2043 | **50.4%** |
+| 80 | 4694 | 2404 | **51.2%** |
+| 160 | 5178 | 2679 | **51.7%** |
+
+A flat ~51% is the signature of a property of the UNIT (it does not fit its
+deadline), independent of how many run at once. Adding workers just runs more
+coin-flips at the same odds — and at 100x **about half of all executions are
+wasted work**.
+
 ### It is not the split guard
 
 The obvious suspect for "splitting does not converge" is the split guard, so it
