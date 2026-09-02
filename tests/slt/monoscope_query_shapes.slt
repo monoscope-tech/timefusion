@@ -655,3 +655,22 @@ ORDER BY 1
 100 100 16 16
 200 100 33 33
 300 100 50 50
+
+# §13e. The BOUNDARY of the 13b defect, and the reason it costs one widget
+# rather than every percentage in the product. All three of these are decimal
+# divisions in real dashboard widgets (_overview's apdex, error rate and
+# throughput) and all three are exact. `COUNT(*) * 100.0` ungrouped even keeps
+# its scale ("600.0"), where the same expression under a GROUP BY renders
+# "300". So the defect needs a GROUP BY *and* a window aggregate as the divisor
+# together; neither alone reproduces it.
+query TTTT
+SELECT ROUND((SUM(CASE WHEN duration <= 500000000 THEN 1.0 WHEN duration <= 2000000000 THEN 0.5 ELSE 0 END)
+      / GREATEST(1, COUNT(*))::numeric), 2)::text AS apdex,
+   ROUND((COUNT(*) FILTER (WHERE status_code = 'ERROR') * 100.0 / GREATEST(1, COUNT(*)))::numeric, 2)::text AS err_rate,
+   ROUND((COUNT(*)::numeric / GREATEST(1, EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) / 60)), 2)::text AS throughput,
+   (COUNT(*) * 100.0)::text AS mult
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+----
+1.0 16.67 0.75 600.0
