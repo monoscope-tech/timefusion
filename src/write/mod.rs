@@ -699,6 +699,14 @@ pub struct BufferedWriteLayer {
     /// `replicated_deduplication_window`. Empty means "no proof of anything",
     /// which costs duplicates, never a loss.
     landed_digests: dashmap::DashMap<(String, String), std::collections::HashSet<[u8; 32]>>,
+    /// Test hook: drop the post-commit cursor advance, modelling the one
+    /// producer of replay duplicates that a test can otherwise not reach — a
+    /// Delta commit that LANDS while the advance that should follow it is
+    /// lost (process dies between the two, or `release_and_advance` fails,
+    /// which `settle_flushed_group` documents as benign). Everything else
+    /// about the flush proceeds normally, so the next boot replays rows Delta
+    /// already holds. Not `#[cfg(test)]`: the e2e suite links the real crate.
+    test_drop_cursor_advance: std::sync::atomic::AtomicBool,
     landed_skips_total: AtomicU64,
     landed_skipped_rows_total: AtomicU64,
     /// Test-only: bail out of `recover_from_wal` once this many relief drains
@@ -843,6 +851,7 @@ impl BufferedWriteLayer {
             wal_recovery_complete: std::sync::atomic::AtomicBool::new(false),
             recovery_commit_floor: dashmap::DashMap::new(),
             landed_digests: dashmap::DashMap::new(),
+            test_drop_cursor_advance: std::sync::atomic::AtomicBool::new(false),
             landed_skips_total: AtomicU64::new(0),
             landed_skipped_rows_total: AtomicU64::new(0),
             deferred_tantivy_files: std::sync::Mutex::new(std::fs::read(&deferred_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
@@ -2706,7 +2715,11 @@ impl BufferedWriteLayer {
                 // bucket's rows are neither freed nor authoritative in
                 // Delta, and will be counted when its re-flush drains.
                 let drained: Vec<_> = source_buckets.iter().filter(|b| self.mem_buffer.finish_flushed_snapshot(b)).collect();
-                self.release_and_advance(&combined.project_id, &combined.table_name, token);
+                if self.test_drop_cursor_advance.load(Ordering::Relaxed) {
+                    warn!("test hook: dropping the cursor advance after a landed commit for {}.{}", combined.project_id, combined.table_name);
+                } else {
+                    self.release_and_advance(&combined.project_id, &combined.table_name, token);
+                }
                 crate::observability::record_flush(true);
                 let drained_rows: u64 = drained.iter().map(|b| b.row_count as u64).sum();
                 self.rows_flushed_total.fetch_add(drained_rows, Ordering::Relaxed);
@@ -3470,6 +3483,11 @@ impl BufferedWriteLayer {
     /// iteration. Same caveat as `flush_tick_notify`.
     pub fn eviction_tick_notify(&self) -> Arc<Notify> {
         self.eviction_tick_notify.clone()
+    }
+
+    /// See [`Self::test_drop_cursor_advance`].
+    pub fn set_drop_cursor_advance_for_test(&self, on: bool) {
+        self.test_drop_cursor_advance.store(on, Ordering::Relaxed);
     }
 
     /// Test hook: simulates a crash by cancelling background tasks WITHOUT

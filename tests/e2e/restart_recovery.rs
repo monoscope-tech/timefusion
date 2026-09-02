@@ -139,3 +139,71 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     assert!(restart_elapsed < Duration::from_secs(30), "cold-start regression: re-bootstrap took {:?} (in-suite bar <30s; isolated bar ~5s)", restart_elapsed);
     Ok(())
 }
+
+/// **The seam.** Everything else about the landed-batch skip is unit-tested on
+/// one side or the other; this is the only test that runs the whole chain
+/// against real Delta on real object storage:
+///
+/// ```text
+/// flush commit writes timefusion.landed_digests
+///   -> table.history() surfaces it at boot
+///   -> derive_wal_cursors_from_delta parses + installs it into the layer
+///   -> the re-flush of the REPLAYED rows is DECLINED
+/// ```
+///
+/// Two wiring bugs lived in exactly this gap and no unit test could see
+/// them: the layer was attached to `Database` only AFTER the derive call, so
+/// the install silently found no layer; and the derive is skipped altogether
+/// on a boot whose WAL is already consumed.
+///
+/// **Why the duplicate has to be made with a hook.** Re-sending the same rows
+/// over pgwire does NOT reproduce one: `otel_logs_and_spans` is
+/// `version_append`, so `stamp_version` gives every inbound write a fresh
+/// `updated_at` and the content genuinely differs. Only WAL replay preserves
+/// the durable stamp (`observe_stamp`). That is a property worth stating —
+/// **a client cannot spoof a landed identity, because it cannot reproduce the
+/// stamp** — and it is also why the duplicate here is made the way prod makes
+/// it: a commit that LANDS while its cursor advance is lost.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyhow::Result<()> {
+    let mut env = E2eEnv::builder()
+        .with_landed_skip()
+        .with_foyer_disabled()
+        // Every flush here is explicit; no background racing.
+        .with_flush_interval(Duration::from_secs(3600))
+        .with_eviction_interval(Duration::from_secs(3600))
+        .start()
+        .await?;
+    {
+        let client = env.pg_client().await?;
+        for i in 0..5 {
+            insert_at(&client, &format!("ld-{i}"), FROZEN_START_MICROS).await?;
+        }
+        // The commit lands; the advance that should follow it does not.
+        env.buffered_layer().set_drop_cursor_advance_for_test(true);
+        let stats = env.force_flush().await?;
+        assert!(stats.buckets_flushed > 0, "nothing was committed, so there is no landed identity to find: {stats:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    env.restart().await?;
+
+    // The duplicate producer, reproduced: rows already durable in Delta are
+    // back in MemBuffer, queued to be written a second time.
+    let stats = env.snapshot_stats();
+    assert!(stats.wal_replay_rows >= 5, "replay did not re-insert the committed rows, so there is no duplicate to decline: {stats:?}");
+    assert_eq!(stats.landed_skips_total, 0, "a fresh process has skipped nothing yet");
+
+    let after = env.force_flush().await?;
+    let stats = env.snapshot_stats();
+    assert!(
+        stats.landed_skips_total > 0,
+        "the re-write of already-committed rows was NOT declined — the identity did not survive Delta metadata -> boot scan -> skip (flush={after:?}, stats={stats:?})"
+    );
+
+    let client = env.pg_client().await?;
+    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(count, 5, "the declined flush must not have cost any rows");
+    Ok(())
+}

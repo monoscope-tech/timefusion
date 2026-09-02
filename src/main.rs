@@ -592,7 +592,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             cfg.buffer.delta_scan_concurrency()
         );
         let t_delta = std::time::Instant::now();
-        match db.derive_wal_cursors_from_delta(wal_ref).await {
+        match db.derive_wal_cursors_from_delta(wal_ref, Some(buffered_layer.as_ref())).await {
             Ok(0) => info!("Delta-derived cursor: no advancement needed"),
             Ok(n) => info!("Delta-derived cursor: advanced {} shard(s) past Delta watermark", n),
             Err(e) => warn!("Delta-derived cursor derivation failed (continuing with local cursor): {}", e),

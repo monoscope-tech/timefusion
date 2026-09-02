@@ -1369,7 +1369,7 @@ impl Database {
     /// finish, so restart does not replay entries already in Delta. Must run before
     /// `recover_from_wal`. Best-effort: failures are logged and skipped, so this cannot make recovery
     /// worse than at-least-once.
-    pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::write::wal::WalManager) -> anyhow::Result<usize> {
+    pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::write::wal::WalManager, layer: Option<&crate::write::BufferedWriteLayer>) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
 
         // Group logical WAL topics by physical Delta log. Default-storage
@@ -1383,14 +1383,16 @@ impl Database {
             physical.entry((physical_project, table_name.clone())).or_default().push((project_id, table_name));
         }
         let totals: Vec<usize> = stream::iter(physical.into_values())
-            .map(|topics| async move { self.derive_wal_cursors_for_physical_table(wal, topics).await.unwrap_or(0) })
+            .map(|topics| async move { self.derive_wal_cursors_for_physical_table(wal, topics, layer).await.unwrap_or(0) })
             .buffer_unordered(self.config.buffer.delta_scan_concurrency())
             .collect()
             .await;
         Ok(totals.into_iter().sum())
     }
 
-    async fn derive_wal_cursors_for_physical_table(&self, wal: &crate::write::wal::WalManager, topics: Vec<(String, String)>) -> anyhow::Result<usize> {
+    async fn derive_wal_cursors_for_physical_table(
+        &self, wal: &crate::write::wal::WalManager, topics: Vec<(String, String)>, layer: Option<&crate::write::BufferedWriteLayer>,
+    ) -> anyhow::Result<usize> {
         let Some((representative_project, representative_table)) = topics.first() else { return Ok(0) };
         // Scan recent commits; replay-derived commits without a watermark
         // contribute nothing so they can't reset the MAX backward.
@@ -1414,7 +1416,7 @@ impl Database {
             // the cursor advance below, which stays governed by the conservative
             // watermark. See `LANDED_DIGESTS_KEY`.
             if self.config.buffer.landed_skip_enabled()
-                && let Some(layer) = self.buffered_layer()
+                && let Some(layer) = layer
             {
                 let digests: Vec<[u8; 32]> = commits.iter().flat_map(|ci| parse_landed_digests_from_json(&ci.info, &project_id, &table_name)).collect();
                 if !digests.is_empty() {

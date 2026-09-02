@@ -55,6 +55,7 @@ pub struct E2eEnvBuilder {
     wide_scan_max_mb: Option<u64>,
     unordered_leg_sort_max_mb: Option<u64>,
     repair_resume: bool,
+    landed_skip: bool,
     mark_sorted_at_write: bool,
 }
 
@@ -89,6 +90,7 @@ impl Default for E2eEnvBuilder {
             dml_coalesce_secs: 0,
             page_row_count_limit: None,
             repair_resume: false,
+            landed_skip: false,
             mark_sorted_at_write: true,
         }
     }
@@ -128,6 +130,12 @@ impl E2eEnvBuilder {
     }
     pub fn with_repair_resume(mut self) -> Self {
         self.repair_resume = true;
+        self
+    }
+    /// Decline a flush whose rows are provably already committed
+    /// (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
+    pub fn with_landed_skip(mut self) -> Self {
+        self.landed_skip = true;
         self
     }
     /// Shrink the in-process sort budget (in-memory Arrow bytes) so a test can
@@ -290,6 +298,7 @@ impl E2eEnvBuilder {
             unordered_leg_sort_max_mb: self.unordered_leg_sort_max_mb,
             page_row_count_limit: self.page_row_count_limit,
             repair_resume: self.repair_resume,
+            landed_skip: self.landed_skip,
             mark_sorted_at_write: self.mark_sorted_at_write,
             test_id: &test_id,
         });
@@ -408,6 +417,7 @@ impl E2eEnv {
             unordered_leg_sort_max_mb: self.builder.unordered_leg_sort_max_mb,
             page_row_count_limit: self.builder.page_row_count_limit,
             repair_resume: self.builder.repair_resume,
+            landed_skip: self.builder.landed_skip,
             mark_sorted_at_write: self.builder.mark_sorted_at_write,
             test_id: &self.test_id,
         });
@@ -530,6 +540,7 @@ struct BuildCfgArgs<'a> {
     wide_scan_max_mb: Option<u64>,
     unordered_leg_sort_max_mb: Option<u64>,
     repair_resume: bool,
+    landed_skip: bool,
     mark_sorted_at_write: bool,
     test_id: &'a str,
 }
@@ -561,6 +572,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_repair_resume_enabled = args.repair_resume;
+    cfg.buffer.timefusion_landed_skip_enabled = args.landed_skip;
     cfg.maintenance.timefusion_repair_mark_sorted_at_write = args.mark_sorted_at_write;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     // A 0% selectivity floor is the off switch for the WHOLE prefilter: any hit

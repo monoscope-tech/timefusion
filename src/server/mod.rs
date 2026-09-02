@@ -112,7 +112,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     );
     if !skip_delta_scan {
         let t_delta = std::time::Instant::now();
-        let advanced = db.derive_wal_cursors_from_delta(wal_ref).await.unwrap_or(0);
+        let advanced = db.derive_wal_cursors_from_delta(wal_ref, Some(buffered_layer.as_ref())).await.unwrap_or(0);
         tracing::info!("bootstrap.phase=delta_cursor_reconcile shards_advanced={advanced} elapsed_ms={}", t_delta.elapsed().as_millis());
     }
 
