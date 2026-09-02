@@ -500,3 +500,44 @@ capacity win; the claim-ordering work was worth 1% against it.
 Prior art already in memory: sorted footers were being lost
 ([[tf_sort_skip_kills_footer_ordering_2026-08-01]]). If files land unsorted, every
 later rewrite pays a full sort — which is exactly this cost.
+
+### Located: the rewrite provider declares NO output ordering
+
+`Database::narrow_provider` (src/database/compact.rs) builds the rewrite's scan:
+
+```rust
+TableProviderBuilder::default()
+    .with_log_store(log_store)
+    .with_eager_snapshot(snapshot)
+    .with_file_selection(FileSelection::from_file_paths(files))
+```
+
+No sort order is declared. DataFusion therefore CANNOT know the files are already
+timestamp-sorted, so it must insert a `SortExec` beneath the window's
+`PARTITION BY (timestamp, id)` — **every dedup rewrite re-sorts the whole
+partition from scratch**, inside the operation that is ~96% of maintenance worker
+time.
+
+The read path does not pay this: its `DedupExec` runs `mode=bounded[timestamp]`,
+i.e. it already exploits the ordering. Only the rewrite path throws it away.
+
+**Expected size.** The local bench puts sorted-vs-shuffled at 8.7x for the read
+path's operator (45.6 ms vs 396.8 ms, 1M rows, prod's zero-dup/greatest case). The
+rewrite's win is bounded by what fraction of its ~21 minutes is the sort, which is
+the one number still missing.
+
+**Verify before building** (this is a claim from reading, not a measurement):
+
+```
+timefusion run-unit --source otel_logs_and_spans --project <busy> --date <sealed> --op Dedup
+```
+
+with the phase timers on, or `EXPLAIN ANALYZE` the rewrite SQL. Confirm a
+`SortExec` under the `BoundedWindowAggExec` and read its share of wall clock.
+
+**Then the fix** is to declare the ordering the files already have, so the window
+streams instead of sorting — not to make the sort faster. Note the ordering must
+be genuinely present: `SORT_SKIP_BYTES` has previously left files unsorted
+([[tf_sort_skip_kills_footer_ordering_2026-08-01]]), and declaring an order the
+data does not have would produce WRONG dedup results, not merely slow ones. Gate
+it on the footer check that already exists.
