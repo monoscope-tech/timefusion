@@ -1341,3 +1341,51 @@ Two further things this settles:
 
 This is the strongest form of the evidence available without shipping a change:
 live state, replayed from the same two files the coordinator itself loads.
+
+## Dedup — the largest lane, squeezed from BOTH sides
+
+Repair is 310 tasks; **dedup is 1,540** — two thirds of the actionable queue, and
+the operation that consumes ~96% of maintenance worker time. Its profile makes
+Decision 2 much sharper than the all-operations averages did.
+
+**Sizes** (622 of the 1,540 carry an estimate; the rest are unpriced, likely
+cleared by `clear_stale_estimates`):
+
+| bucket | count | share of priced |
+| --- | --- | --- |
+| ≤32 MiB (busy-pool floor) | 38 | 6.1% |
+| 32–512 MiB | 219 | 35.2% |
+| **>512 MiB — NEVER admissible** | **365** | **58.7%** |
+
+median **512 MiB**, p90 553 MiB, max 1,150 GiB
+
+**The median queued dedup task sits exactly at the admission ceiling**, and
+**58.7% of priced dedup work can never be admitted at any pool occupancy.** The
+earlier all-operations figure (14.1%) badly understated this for the lane that
+matters most.
+
+**Retry reasons:**
+
+| reason | count |
+| --- | --- |
+| *(none — never attempted)* | 1,023 |
+| **`dedup: Not enough memory to continue external sort`** | **245** |
+| `worker_error` | 155 |
+| `source_not_flushed` | 54 |
+| `resource_admission` | 30 |
+| `dedup_incomplete` | 12 |
+
+**Dedup is squeezed from both sides simultaneously**, which is exactly why
+Decision 2 insists the two constants move together:
+
+- **From above:** 58.7% of priced work exceeds the 512 MiB admission ceiling and
+  can never enter.
+- **From below:** of the work that *does* enter, the single largest failure is
+  the sort exhausting its 510 MB slice — **245 tasks**.
+
+Raising admission alone moves tasks from the first bucket into the second.
+Raising the sort slice alone leaves 58.7% still unable to enter. This is the
+clearest evidence in this document that they are one change, not two.
+
+**Age:** median 22.4h, p90 386h, **44% older than 48 hours** — so this is not a
+transient backlog either.
