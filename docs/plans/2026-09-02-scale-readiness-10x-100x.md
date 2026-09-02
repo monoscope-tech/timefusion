@@ -1044,3 +1044,56 @@ Both are the same shape as Decision 2, which is now the strongest signal of the
 night: **every stuck lane is a unit that does not fit the budget it must pass
 through**, and the budgets are calibrated well below real unit sizes in three
 independent places (admission 512 MiB, per-sort slice 510 MB, repair 1,280 MiB).
+
+### The complete repair mechanism: two gates, two prices, no re-measurement
+
+Chasing the 5x estimate disagreement to the bottom gives the whole picture.
+
+**Gate 1 — admission** (`maintain.rs:3298`) prices the unit on its **stored**
+estimate:
+
+```rust
+let request = Resources { decoded_bytes: task.estimated_decoded_bytes.clamp(1, MAX_DECODED_BYTES), .. };
+```
+
+Stored median for these units: **0.25 GiB**. It passes.
+
+**Gate 2 — the repair rewrite semaphore** (`maintain.rs:~6857`) prices the same
+work on the **actual files**:
+
+```rust
+let want_mib = estimated_decoded_bytes(targets.iter().map(|a| a.size).sum()).clamp(1, budget_mib);
+```
+
+Real value: **≥1.25 GiB**, which is the entire 1,280 MiB budget. It bounces.
+
+**And nothing ever reconciles the two.** The byte preflight that re-measures a
+unit and splits it (`split_time_task`) has exactly two call sites, and **both are
+dedup paths** — repair never passes through it. So a repair unit is:
+
+1. created with an estimate that is ~5x below what its rewrite will cost,
+2. admitted on that cheap estimate,
+3. refused by the semaphore on the real cost,
+4. requeued unchanged — never re-measured, never split,
+5. repeat ~17 times a day, for 17 days.
+
+**That is the whole 3,409-claims-per-day waste**, and it is not a tuning problem:
+no value of the repair budget fixes a unit that is priced one way to get in and
+another way to run. The two gates have to agree, or the unit has to be
+re-measured between them.
+
+**Fix shapes, cheapest first:**
+
+1. **Price admission on the same number the semaphore uses.** The unit is
+   admitted on a figure that has no bearing on whether it can run.
+2. **Re-measure and split repair like dedup does.** `split_time_task` already
+   exists and repair simply never calls it. This is the structural fix, and it
+   is the same "size the unit to the budget" theme as the rest of this document.
+3. Raising `repair_rewrite_budget_bytes` alone treats the symptom and still
+   leaves the two gates disagreeing.
+
+**Caveat:** repair rewrites WHOLE FILES by design (it is fixing a file's sort
+order), so "split the unit" may not be expressible for repair the way it is for
+a time-sliced dedup unit. If so, option 1 is the real fix and option 2 is not
+available — that distinction needs a read of the repair rewrite before anyone
+commits to a direction.
