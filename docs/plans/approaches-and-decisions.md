@@ -68,6 +68,42 @@ restarts → more replayed rows → more duplicates → more dedup → less main
 throughput → and the deploy cadence never lets it drain
 (`tf_deploy_cadence_starves_dedup`, `tf_units_die_to_restarts`).
 
+### Two candidate producers, and the instrument separates them
+
+Be precise about what is proven. "One stamping event" has TWO possible causes,
+and one prod file cannot distinguish them:
+
+1. **replay** of an already-stamped batch (replay preserves stamps — see
+   `observe_stamp`, "the first stamp issued after this boot must exceed every
+   replayed one"), or
+2. **a single client batch containing the same row twice**, stamped once.
+
+What IS ruled out is the ordinary client retry: `stamp_version` overwrites the
+column on every write to a `version_append` table, so a genuinely separate insert
+of the same span carries a NEW stamp and would land in the 42% bucket, not the
+58% one.
+
+`wal.replay_rows` decides between the two in production: if it stays near zero
+across a window in which duplicates keep accruing, the producer is the batch
+path; if it spikes with unclean restarts and duplicate creation tracks it, it is
+replay. That is the whole reason the instrument was the right thing to ship
+before any fix.
+
+**A first data point, already:** on the clean deploys tonight,
+`wal.recovery_complete = true` with `recovery_duration_ms = 0` — this boot
+replayed NOTHING. So a clean drain does advance the cursor, and replay duplicates
+would come from UNCLEAN exits: OOM kills and SIGKILLs, which this system has a
+documented history of (`tf_oom_peak_anon_back_to_124gb`, `tf_units_die_to_restarts`).
+If that holds, the chain is:
+
+```
+OOM kill -> unclean exit -> cursor not advanced -> replay re-inserts flushed rows
+         -> duplicates -> dedup consumes ~96% of maintenance -> backlog never drains
+```
+
+which links the memory pressure work and the maintenance throughput work that
+have been treated as separate problems all along.
+
 ### Why this is THE 100x lever
 
 Everything else tonight made dedup *cheaper per unit*: 2.4x from `RunCollapse`,
