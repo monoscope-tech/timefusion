@@ -239,6 +239,14 @@ replay re-inserted, and dedup is ~96% of maintenance time.
 It interacts with Decision 2: with the flag off, any OOM-driven unclean restart
 manufactures exactly these duplicates.
 
+**Observed tonight:** `wal.replay_rows` was **0 on every restart** (several,
+including two from another session's deploys). All were clean drains, so no
+duplicates were manufactured. That sharpens what the flag is for: it is
+**insurance against OOM kills and hard crashes, not routine deploys** — and its
+value is therefore proportional to how often the memory ceiling bites, which is
+what Decisions 0–2 are about. On a healthy process it does nothing, which is
+also why turning it on is low-risk.
+
 ---
 
 ## The one-line answer to "are we breaking a sweat?"
