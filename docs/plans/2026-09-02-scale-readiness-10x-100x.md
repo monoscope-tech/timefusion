@@ -51,6 +51,34 @@ retries — and running more of them concurrently just produces more timeouts.
 The coordinator does split (644–988 splits), but at 100x splitting-after-failure
 does not converge.
 
+### Both findings hold across seeds
+
+Single-sample conclusions have been wrong repeatedly in this codebase, so both
+were re-run on four seeds (pending remaining after 24h, from 813):
+
+| seed | 50x w10 | 50x w20 | 100x w20 | 100x w160 |
+| --- | --- | --- | --- | --- |
+| `0x5eed` | 55 | **0** | 198 | 59 |
+| `0xa11ce` | 21 | **0** | 201 | 74 |
+| `0xb0b` | 44 | **0** | 219 | 54 |
+| `0x1234` | 37 | **0** | 236 | 53 |
+
+4/4: at 50x doubling the workers drains it completely; at 100x **eight times**
+the workers moves pending only ~210 → ~60 and never reaches zero.
+
+### It is not the split guard
+
+The obvious suspect for "splitting does not converge" is the split guard, so it
+was tested directly (`--guard-off`, 100x, 40 workers, pending remaining):
+
+| seed | guard on | guard off |
+| --- | --- | --- |
+| `0x5eed` | 134 | **287** |
+| `0xb0b` | 123 | **287** |
+
+Turning the guard off makes it **twice as bad**. The guard is doing its job; the
+limit is upstream of it, in how large a unit is allowed to be in the first place.
+
 ## What this means for the roadmap
 
 1. **10x needs nothing.** Do not spend effort there. The subsystems the goal
