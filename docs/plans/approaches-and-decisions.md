@@ -108,6 +108,25 @@ a genuinely green 1314/1314 baseline, before master regressed).
 **Method note:** "the canary is red" is only evidence when you have re-measured
 the baseline THAT DAY. A shared checkout moves under you.
 
+**CORRECTION — the canary is not trustworthy, and it retracts an earlier
+verdict.** Chasing which of the two master commits broke it, both alibi out:
+
+- removing `attributes___http___route` from the YAML does NOT fix it (full suite,
+  and it costs two other failures that assert the column is there);
+- `f1681269` adds one match arm to a CLI subcommand — it cannot reach routing.
+
+Meanwhile the test fails 2/2 in ISOLATION on a quiet machine at a HEAD whose full
+suite passed it earlier today. So it passes or fails on scheduling, not on the
+tree. That means **the 2026-09-01 verdict "the `sorting_columns` reorder breaks
+rollup routing, 2/2 reproducible" was built on this same unreliable signal and
+must be treated as UNPROVEN**, not as a refutation.
+
+It happens not to matter: widening `dedup_keys` reaches the same alignment
+WITHOUT touching physical layout, so the reorder is moot either way. But the
+lesson generalises — a test that is order-sensitive can manufacture a clean
+2-for-2 and retire a good idea. Before this test can condemn anything again it
+needs its scheduling dependence fixed or named.
+
 ### Still open
 
 - `narrow_provider` declaring footer ordering (gated on EVERY selected file
