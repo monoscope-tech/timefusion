@@ -824,6 +824,13 @@ pub struct StatsTableProvider {
     cache_sizes: Option<CacheSizeSnapshot>,
     foyer_stats: Option<FoyerStatsSnapshot>,
     query_pool: Option<PoolSnapshot>,
+    /// Maintenance + coordinator pool usage. Their SIZES were already reported
+    /// (`budget.maintenance_pool_mb`) while their USE was not — so every memory
+    /// decision about maintenance (repair budget, admission ceiling, per-sort
+    /// slice, permit count) was unverifiable after shipping. See
+    /// `docs/plans/2026-09-02-scale-readiness-10x-100x.md`.
+    maintenance_pool: Option<PoolSnapshot>,
+    coordinator_pool: Option<PoolSnapshot>,
     logical_count: Option<LogicalCountSnapshot>,
     tantivy_search: Option<Arc<crate::tantivy::search::TantivySearchService>>,
     bloom_prune: Option<Arc<crate::read::bloom_prune::BloomPruneRegistry>>,
@@ -843,6 +850,8 @@ impl StatsTableProvider {
             cache_sizes: None,
             foyer_stats: None,
             query_pool: None,
+            maintenance_pool: None,
+            coordinator_pool: None,
             logical_count: None,
             tantivy_search: None,
             bloom_prune: None,
@@ -864,6 +873,10 @@ impl StatsTableProvider {
 
     pub fn with_query_pool(self, f: PoolSnapshot) -> Self {
         Self { query_pool: Some(f), ..self }
+    }
+
+    pub fn with_maintenance_pools(self, maintenance: PoolSnapshot, coordinator: PoolSnapshot) -> Self {
+        Self { maintenance_pool: Some(maintenance), coordinator_pool: Some(coordinator), ..self }
     }
 
     pub fn with_logical_count(self, f: LogicalCountSnapshot) -> Self {
@@ -1070,6 +1083,10 @@ impl StatsTableProvider {
             let (used, limit) =
                 (crate::database::process_memory_bytes().unwrap_or(0) as u64, crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes as u64));
             let (pool_used, pool_size) = self.query_pool.as_ref().map_or((0, 0), |f| f());
+            // Reported as `usize::MAX` size when unwired would be misleading, so
+            // keep the same (0, 0) convention as the query pool and guard the pct.
+            let (mpool_used, mpool_size) = self.maintenance_pool.as_ref().map_or((0, 0), |f| f());
+            let (cpool_used, cpool_size) = self.coordinator_pool.as_ref().map_or((0, 0), |f| f());
             [
                 rows!["memory";
                     "charged_bytes" => used,
@@ -1080,6 +1097,13 @@ impl StatsTableProvider {
                     // 30.0/30.0 GB), invisible before this row.
                     "query_pool_used_bytes" => pool_used,
                     "query_pool_pct" => if pool_size > 0 { pool_used * 100 / pool_size } else { 0 },
+                    // The pools every maintenance memory decision is about. Their
+                    // sizes were already visible; their USE was not, so a budget
+                    // change could not be verified against the pool it moved.
+                    "maintenance_pool_used_bytes" => mpool_used,
+                    "maintenance_pool_pct" => if mpool_size > 0 { mpool_used * 100 / mpool_size } else { 0 },
+                    "coordinator_pool_used_bytes" => cpool_used,
+                    "coordinator_pool_pct" => if cpool_size > 0 { cpool_used * 100 / cpool_size } else { 0 },
                 ],
                 rows!["scan_decode";
                     "peak_batch_bytes" => dpeak,
