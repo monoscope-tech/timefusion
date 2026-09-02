@@ -1390,107 +1390,42 @@ clearest evidence in this document that they are one change, not two.
 **Age:** median 22.4h, p90 386h, **44% older than 48 hours** — so this is not a
 transient backlog either.
 
-## A same-process observation that fits the starvation story
+## RETRACTED: the "dedup rate is decaying" observation was my own timestamp error
 
-Prod ran ~2 hours with no restart, so this is a valid same-process comparison
-(the trap that invalidated most of tonight's earlier counter readings):
+I published a same-process reading claiming the dedup commit rate fell ~3x
+(37.6/hour → 12/hour) while `pending_dedup` rose, and called it corroboration
+for the starvation diagnosis. **It was wrong, and the error was mine.**
 
-| | at 75 min | at ~120 min |
-| --- | --- | --- |
-| `dedup_bins_committed_total` | 47 | 56 |
-| implied rate | 37.6/hour | **12/hour over the last 45 min** |
-| `pending_dedup` | 1,434 | 1,458 |
+The middle data point's elapsed time was **estimated, not measured** — I wrote
+"~120 min" without computing it from `boot_micros`. Measuring properly:
 
-`dedup_failed_total` 0, `dedup_bin_stage_timeouts_total` 0, 33,817 queries
-served — nothing is erroring.
-
-**The dedup commit rate falls by ~3x while pending slowly rises.** That is the
-signature the starvation diagnosis predicts: a fresh process drains the work it
-CAN run first, and what remains is increasingly the population that cannot be
-admitted or cannot fit its sort. A throughput problem would show a steady rate;
-a starvation problem shows a decaying one against a queue that does not shrink.
-
-It is one process and two points, so it is corroboration rather than proof — but
-it is the first same-process throughput reading of the night that was not
-invalidated by a restart, and it points the same way as everything else.
-
-## Prior art for the starvation: everyone else SHRINKS THE UNIT; we refuse it
-
-The user's standing instruction is to check how other systems solved a problem
-before we invent an answer. For "a maintenance unit does not fit its budget",
-two independent systems converge on the same strategy, and **it is not ours.**
-
-| system | what it does when a unit will not fit |
+| uptime (measured) | `dedup_bins_committed_total` |
 | --- | --- |
-| **Cassandra** | *"the available disk space is checked against the estimated compaction output size, and if the available disk space is not enough then **largest SSTables are dropped from the input list** to reduce storage space needed"* |
-| **ClickHouse** | caps merge output at selection (`max_bytes_to_merge_at_max_space_in_pool`) and **scales that cap DOWN as free pool slots run out** (`number_of_free_entries_in_pool_to_lower_max_size_of_merge`) |
-| **TimeFusion (today)** | **refuses the unit and requeues it, unchanged, forever** |
-
-Both prior-art systems **adapt the work to the budget**. Neither has a state
-where a unit is permanently unrunnable, because neither ever presents the
-scheduler with a take-it-or-leave-it unit: Cassandra removes inputs until it
-fits; ClickHouse never selects one that would not.
-
-**We are the outlier, and the 310 stuck repair units are the direct consequence.**
-Our repair unit is atomic by construction — one whole file, `.take(1)` — so when
-it exceeds the byte budget there is no smaller version to fall back to, and the
-only behaviour left is the one we observe: bounce, requeue, repeat.
-
-**What this suggests, beyond raising the constant.** Raising
-`repair_rewrite_budget_bytes` (Decision 1) fixes today's numbers, but it leaves
-the structural property intact: the next file larger than the new budget starves
-exactly the same way, and the whale's files are already 1,150 GiB at the maximum.
-The prior art says the durable fix is that a unit which does not fit should be
-made smaller rather than refused — for repair that means rewriting a file in
-row-group ranges rather than whole, which is a real design change and not a
-constant.
-
-So the honest framing for the morning is two-tier:
-
-1. **Now:** raise the budget so correctly-sized files stop starving (derivable,
-   cheap, Decision 1).
-2. **Structural:** give maintenance a way to shrink a unit to its budget, which
-   is what both comparable systems do and what would make the 100x whale safe.
-
-Sources: [Cassandra compaction docs](https://cassandra.apache.org/doc/4.1/cassandra/operating/compaction/index.html),
-[DataStax: configuring compaction](https://docs.datastax.com/en/cassandra-oss/3.0/cassandra/operations/opsConfigureCompaction.html),
-[ClickHouse#16838](https://github.com/ClickHouse/ClickHouse/issues/16838).
-
-### CORRECTION to my own prior-art recommendation: shrinking is not available here
-
-I recommended, on Cassandra/ClickHouse precedent, that the durable fix is to
-shrink a unit to its budget — for repair, "rewrite the file in row-group ranges".
-**At these constants that does not work either**, and the arithmetic is short:
+| 75 min | 47 |
+| 115 min | **80** |
 
 ```
-TARGET_ROW_GROUP_BYTES        = 128 MiB compressed   (database/mod.rs:3129)
-DECODED_BYTES_PER_COMPRESSED  = 12
-one row group                 = 1,536 MiB decoded
-repair budget                 = 1,280 MiB            -> a SINGLE ROW GROUP is already 20% over
+window rate = 33 commits / 40 min = 49.5/hour
+first-75-min average                = 37.6/hour
 ```
 
-A target-sized file holds just **2 row groups** (`estimated_row_groups` =
-`size / 128 MiB`), so "split by row group" yields two pieces that each still
-exceed the budget. **The indivisible read unit is already over budget**, which
-means there is no shrinking strategy available at these numbers:
+**The rate went UP, not down.** And `pending_dedup` read 1434 → 1458 → 1434 —
+oscillating, not rising. The middle sample was taken at roughly 95 minutes, not
+120; dividing by the wrong elapsed time manufactured a decay that is not there.
 
-| minimum budget to admit… | MiB |
-| --- | --- |
-| one row group | **1,536** |
-| one whole target-sized file | **3,072** |
-| *current* | 1,280 |
+**What this does and does not change:**
 
-**So Decision 1 simplifies rather than expanding: the budget must be raised —
-there is no cheaper structural alternative to fall back on.** Even a perfect
-implementation of the Cassandra/ClickHouse "shrink the input" pattern needs
-≥1,536 MiB before it has any move to make.
+- **Retracted:** "the dedup commit rate is decaying against a queue that does not
+  shrink." There is no such trend in the data. Dedup is committing at ~40–50/hour
+  and pending is flat.
+- **Untouched:** every finding in this document that rests on the journal, the
+  prod logs, or the source constants — the 310 stuck repair units, the
+  `want_mib=1280 budget_mib=1280` bounces, dedup's 58.7% never-admissible, and
+  the 256 MiB x 12 vs 1,280 MiB arithmetic. None of them came from this reading.
 
-That does not retire the prior-art point, it relocates it: shrinking is the
-right *general* mechanism and is what makes an arbitrarily large future file
-safe, but it is not a way to avoid raising this constant now. **Raise the budget
-first; shrinking becomes useful only above 1,536 MiB.**
-
-*(Splitting a file into several independently-sorted files is a third option —
-it would satisfy "each file is internally sorted", which is what repair is for —
-but it multiplies file count and works directly against compaction, so it needs
-its own analysis rather than a footnote.)*
+**The irony is the point.** I spent the night correcting conclusions drawn from
+estimated or mis-scoped numbers — cross-process counters, a stale checkpoint, a
+`pending` that counts superseded, an `attempts` that resets — and then made the
+same class of error myself by eyeballing an elapsed time instead of computing it
+from `boot_micros`. **Every rate needs its denominator measured, including
+mine.**
