@@ -194,6 +194,28 @@ benching filled this laptop's disk to 100% tonight and faked a memory failure, s
 whatever number is chosen should be derived from free space with headroom, not
 set to "large".
 
+## First 22 minutes on the admission fix (`d683f78`) — no abort signal
+
+Sampled 50 times over 21 minutes. Too short to call, but nothing is going wrong:
+
+| signal | reading | vs before |
+|---|---|---|
+| `pending_dedup` | 1,270 → **1,242** | drifting DOWN |
+| `pending_repair` | 296 → 294 | flat (expected — see above) |
+| `dedup_failed_total` | **0** | unchanged |
+| `coordinator_pool_pct` | median 0, **max 47** | peak DOWN from 70 pre-fix |
+| `maintenance_pool_pct` | median 14, max 67 | comparable |
+| sort-OOM in logs | 1 in 30 min, and that window spans the PREVIOUS container | no rise |
+
+Pool peak going **down** while more work is admitted is the encouraging part —
+it is consistent with the fix letting units through rather than with it
+overloading the pool.
+
+Caveat, and it is the one I kept tripping over tonight: `docker service logs`
+spans containers, so any count over a window longer than the current process's
+uptime mixes processes. Check `docker service ps` for the current task's age
+before attributing anything.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
