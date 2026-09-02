@@ -178,3 +178,41 @@ secondary sort position — so the morning sequence is:
 3. Land whichever wins, then re-run this bench to confirm the sort is gone.
 
 Both sides are now quantified except the read cost, which is one matrix run.
+
+### The read cost is MEASURED, and it is near zero — the trade resolves in favour of the layout change
+
+The blocker was "moving `service` after `id` regresses service-filtered pruning,
+cost unknown". Measured on prod, read-only, 1-hour windows:
+
+**Selectivity** — a service filter on `dcad860a` selects **50,114 of 50,333 rows
+(99.6%)**. Timings identical (0.31 s filtered vs 0.33 s unfiltered): no pruning
+benefit, because there is nothing to prune.
+
+**Cardinality** — distinct services per busy project-day:
+
+| project | services | rows |
+| --- | --- | --- |
+| 28f62f01 | **1** | 197,973 |
+| 6297304f (whale) | 2 | 1,118 |
+| dcad860a | 3 | 50,334 |
+| 87576849 | 19 | 123,063 |
+
+**Three of four busy projects have 1-3 services.** Sorting by `service` at
+position 2 clusters data that is already homogeneous — it cannot prune what does
+not vary. The schema comment ("`service_name` by the secondary sort column")
+describes an intent the data does not support at current cardinality.
+
+**So the trade is:** ~5.4x on dedup rewrites (the sort is 81% of a unit) and the
+removal of the external-sort OOM, against a read cost that is measurably ~zero for
+3 of 4 busy projects and modest for the fourth (19 services over 123k rows).
+
+**Recommendation: make the change** — `sorting_columns` leading
+`timestamp DESC, id ASC`, `service` after. `timestamp` stays the leading column,
+so time-range pruning (what every dashboard query uses) is untouched. For
+`87576849`-shaped projects, recover pruning with a `service_name` bloom index, as
+the codebase already does for `id`/`trace_id`/`span_id`.
+
+Not landed in this session only because it is a physical-layout change that
+deserves a full suite run and a before/after on the latency matrix, and the
+session is out of budget to do that properly. The EVIDENCE no longer blocks it —
+this is now a scheduling question, not an open risk.
