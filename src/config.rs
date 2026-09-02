@@ -2947,6 +2947,43 @@ mod tests {
         assert_eq!(b.optimize_merge_tasks(), 2);
     }
 
+    /// REPRODUCES the 2026-09-02 repair starvation: the repair rewrite budget is
+    /// smaller than ONE target-sized file, so no repair unit can ever share it.
+    ///
+    /// A repair unit is exactly one file (`coordinator_compaction_files` returns
+    /// `.take(1)` for Repair), so it cannot be split to fit. Its decoded cost is
+    /// `file_size * DECODED_BYTES_PER_COMPRESSED`, and compaction deliberately
+    /// produces `COORDINATOR_HOT_TARGET_BYTES`-sized files. When the budget is
+    /// below that product, every unit's request clamps to the WHOLE semaphore
+    /// and repair serializes to one 40-minute rewrite at a time.
+    ///
+    /// Prod 2026-09-02: `want_mib=1280 budget_mib=1280` logged 243 times in
+    /// three hours, with 310 repair units stuck in Retry. 2,188 HAD completed —
+    /// those are the files small enough to fit (under ~107 MiB compressed),
+    /// which is why the lane looks alive while the target-sized work never runs.
+    /// The byte-pricing change that introduced this budget intended "bins below
+    /// the budget now share it"; at these constants no correctly-sized bin is
+    /// ever below it.
+    ///
+    /// FAILS at 1,280 MiB against a 3,072 MiB requirement. Raising
+    /// `repair_rewrite_budget_bytes` to `N * target * 12` lets N rewrites share.
+    #[test]
+    fn repair_budget_must_fit_one_target_sized_file() {
+        let b = &AppConfig::default().derived;
+        const TARGET_FILE_BYTES: usize = 256 * 1024 * 1024; // COORDINATOR_HOT_TARGET_BYTES
+        const DECODED_PER_COMPRESSED: usize = 12; // database::maintain::DECODED_BYTES_PER_COMPRESSED
+        let one_file_decoded = TARGET_FILE_BYTES * DECODED_PER_COMPRESSED;
+        assert!(
+            b.repair_rewrite_budget_bytes() >= one_file_decoded,
+            "repair budget {} MiB cannot hold ONE target-sized file ({} MiB decoded = {} MiB x {}), \
+             so every repair unit clamps to the whole semaphore and repair serializes",
+            b.repair_rewrite_budget_bytes() / MIB,
+            one_file_decoded / MIB,
+            TARGET_FILE_BYTES / MIB,
+            DECODED_PER_COMPRESSED,
+        );
+    }
+
     /// Certification must reach back far enough to serve a 30d query.
     ///
     /// `dedup_sweep` is the only caller of `record_certification`, scoped to
