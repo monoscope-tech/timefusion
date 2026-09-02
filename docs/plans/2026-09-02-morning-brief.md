@@ -211,6 +211,22 @@ manufactures exactly these duplicates.
 
 ---
 
+## The one-line answer to "are we breaking a sweat?"
+
+> **No, on flow.** Dedup (~50 commits/hour), hot-tail packing and rollups all
+> keep pace with arrivals — `pending_dedup` is flat at ~1,434 over two hours,
+> with **zero failures and zero staging timeouts**.
+>
+> **Yes, on a bounded permanently-stuck set.** ~900–1,400 dedup units that can
+> never be admitted, plus 310 repair units that cannot fit the rewrite budget.
+> This set does not grow with load — it is a fixed toll — but it never runs, so
+> the data it should maintain goes unmaintained indefinitely.
+
+**Why that reframes 10x:** the risk is *not* falling behind. Throughput scales
+(the sim drains a 10x-costlier backlog fine). The risk is that **the unrunnable
+fraction grows with file size** — every constant in the three decisions below is
+a fixed byte budget, and a larger tenant means larger files.
+
 ## Scale readiness
 
 | load | result |
