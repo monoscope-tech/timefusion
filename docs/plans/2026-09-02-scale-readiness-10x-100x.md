@@ -1429,3 +1429,44 @@ estimated or mis-scoped numbers — cross-process counters, a stale checkpoint, 
 same class of error myself by eyeballing an elapsed time instead of computing it
 from `boot_micros`. **Every rate needs its denominator measured, including
 mine.**
+
+## What the corrected reading actually shows: dedup KEEPS UP, and carries a fixed residue
+
+Retracting the false decay left a better finding underneath it. Same process,
+2 hours, no restart:
+
+| | |
+| --- | --- |
+| dedup commits | 47 (75 min) → 80 (115 min) = **~50/hour** |
+| `pending_dedup` | 1434 → 1458 → 1434 = **flat** |
+| `dedup_failed_total` | 0 |
+| staging timeouts | 0 |
+
+**Completions are keeping pace with arrivals — dedup is not falling behind.** The
+~1,434 is a *persistent residue*, not a growing backlog. That is a materially
+different and more tractable problem than "the queue is growing", which is what
+several earlier framings in this document claimed before they were corrected.
+
+**And the residue has a size that matches the diagnosis.** From the journal:
+1,540 queued dedup tasks, and **58.7% of the priced ones can never be admitted**
+at any pool occupancy — which is on the order of **~900 units**, the same
+magnitude as the standing `pending_dedup`. The residue is not random backlog; it
+is approximately the population that cannot pass the admission ceiling.
+
+**So the honest answer to "are we breaking a sweat at today's load" is:**
+
+> **No — on flow.** Dedup, hot-tail packing and rollups all keep pace with
+> arrivals, with zero failures and zero staging timeouts.
+>
+> **Yes — on a bounded, permanently-stuck set.** ~900–1,400 dedup units that
+> cannot be admitted, plus 310 repair units that cannot fit the rewrite budget.
+> These do not grow with load; they are a fixed toll, and they are exactly the
+> units the three constants exclude.
+
+That reframing matters for the 10x question. A system that keeps up but carries a
+fixed unrunnable set scales its *throughput* fine — the earlier sim work showed
+10x drains — while the stuck set stays stuck and the data it should have
+maintained goes unmaintained indefinitely. **The risk at 10x is not falling
+behind; it is that the unrunnable fraction grows with file size**, because every
+constant here is a fixed byte budget and files only get bigger with a larger
+tenant.
