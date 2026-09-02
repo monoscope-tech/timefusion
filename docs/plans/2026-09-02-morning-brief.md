@@ -19,6 +19,20 @@ unit that does not fit a budget it must pass through, and three budgets are
 calibrated below real unit sizes — admission 512 MiB, per-sort slice 510 MB,
 repair 1,280 MiB.
 
+**Recommended order, by strength of evidence — which is NOT the order below.**
+The sections are numbered by how I found them; this is how I would act on them:
+
+| do | why |
+| --- | --- |
+| **1st — Decision 0** (pool instrument) | Without it, no budget change below can be verified after shipping. Two read-only rows, branch ready. |
+| **2nd — Decision 2** (admission + sort slice) | The only one evidenced as a **priority**, not just a defect: dedup is ~96% of maintenance time, **58.7% of it can never be admitted**, and 245 of what does enter fails its sort. 1,362 actionable units affected. |
+| **3rd — Decision 1** (repair budget) | Evidenced as a **defect** beyond doubt (0 rewrites in 12h, 177 bounces, four converging lines) but **unevidenced as a priority** — nothing measures what the stalled lane costs on the read path. Cheap and derivable, so it may still be worth doing first on effort grounds; just do not confuse the volume of evidence with urgency. |
+| **4th — Decision 3** (landed-skip flag) | Insurance against OOM-driven restarts. `replay_rows` was 0 on every restart tonight, so it is currently inert — its value rises as the memory ceiling bites, i.e. after the above. |
+
+A second instrumentation gap is worth fixing alongside Decision 0: **nothing
+counts a scan that pays a sort because a file lacked its sort tag**, which is
+exactly what would rank Decision 1 properly.
+
 The full evidence chain, including the wrong turns, is in
 `2026-09-02-scale-readiness-10x-100x.md` and
 `2026-09-02-stop-manufacturing-duplicates.md`.
