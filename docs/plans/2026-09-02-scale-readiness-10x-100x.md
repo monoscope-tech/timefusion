@@ -2047,3 +2047,39 @@ that event. **I did not resolve which**, and the distinction matters: the first
 is a scheduling defect, the second means my "zero rewrites" evidence is weaker
 than stated. The 310 stuck units and 177 bounces stand either way, but this is
 the loose end I would pull first.
+
+### Loose end, half resolved — and the leading hypothesis for the rest
+
+**Resolved: the "zero repair rewrites in 12h" evidence is sound.**
+`wave_bin_staged` is logged **unconditionally** (`maintain.rs:7223`), *before* the
+`if pass == TailPass::Repair` branch that follows it. So a repair rewrite that
+staged would appear in that log. None did.
+
+**Unresolved: why does no unit acquire the semaphore?** The clamp argument says a
+lone unit should always fit. Combined with the above, the two facts only reconcile
+if the semaphore is **never** fully free. Its capacity is exactly the budget:
+
+```rust
+repair_rewrite_sem: Arc::new(Semaphore::new(cfg.derived.repair_rewrite_budget_mib()))   // 1,280 permits
+```
+
+and every real unit requests **all 1,280**. So the acquire succeeds only when
+**every single permit** is free. **One permit held by anything — a detached task,
+a rewrite whose future was dropped, a cancelled unit — makes the semaphore
+permanently unacquirable**, and every subsequent unit bounces forever. That fits
+every observation: zero rewrites, constant bounces, a queue frozen at ~310, and
+the fact that "a lone unit always fits" is true in theory and false in prod.
+
+**It is a hypothesis, not a finding.** I have not confirmed a leak, and a restart
+would clear one — though prod restarts hourly and the behaviour persists across
+them, which either weakens the leak theory or implies the leak recurs quickly.
+
+**It is cheap to settle**, and worth doing before choosing a budget value:
+expose `repair_rewrite_sem.available_permits()` as a stat (the codebase already
+asserts on it in tests, `mod.rs:20219`). If it reads 1,280 while units bounce,
+the budget is not the bug and raising it fixes nothing. If it reads less than
+1,280 with no rewrite running, there is a permit leak.
+
+**That check should precede Decision 1.** Raising a budget that is never fully
+available would be a change with no effect — and would look, from the queue, like
+the fix simply did not work.

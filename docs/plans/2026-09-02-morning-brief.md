@@ -105,7 +105,17 @@ is admitted ~5x underpriced, refused on the real price, and requeued *unchanged*
 **No value of the repair budget fixes this**, because the unit is priced one way
 to get in and another way to run.
 
-**RESOLVED — it is three constants that cannot all be true.** A repair unit is
+**⚠ CHECK THIS FIRST — it may make the budget change a no-op.** The semaphore's
+capacity IS the budget (1,280 permits) and every real unit requests **all of
+them**, so the acquire succeeds only if **every** permit is free. One permit held
+by a detached or cancelled task makes it permanently unacquirable — which fits
+every observation (zero rewrites, constant bounces, a frozen queue) better than
+the size argument alone does. **Expose `repair_rewrite_sem.available_permits()`
+before choosing a value:** if it reads 1,280 while units bounce, raising the
+budget fixes nothing. Hypothesis, not finding — but a cheap one to settle, and
+getting it wrong looks exactly like "the fix didn't work".
+
+**The size arithmetic — three constants that cannot all be true.** A repair unit is
 exactly one file (`.take(1)`), so it cannot be split. Then:
 
 | constant | value | where |
