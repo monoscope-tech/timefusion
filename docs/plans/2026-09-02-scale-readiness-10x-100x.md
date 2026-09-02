@@ -930,3 +930,49 @@ candidate set in one pass rather than `take(1)` — the footer reads are
 independent and already cached. That turns weeks of one-at-a-time clearing into
 a single pass, and it does not touch the memory constants at all, which makes it
 the lowest-risk of tonight's three candidates.
+
+### CORRECTION to the section above: claims are NOT scarce — and that makes it worse
+
+Two things in the profile above were misread, both caught by re-checking rather
+than reasoning:
+
+**1. `attempts` is not cumulative.** I read "median 14 attempts over 412 hours"
+as one claim per ~29 hours, i.e. a starved lane. Wrong — `attempts` is reset
+(`reset_repair_attempts`). Measuring the real rate from the two snapshots
+4.4 hours apart:
+
+| | |
+| --- | --- |
+| cohort tasks present in both | 197 |
+| **gained ≥1 attempt** | **197 (100%)** |
+| total attempts gained | **625 in 4.4h** |
+| **claim rate** | **142/hour = ~3,409/day**, ~17 per task per day |
+
+The lane is not starved. Every one of these tasks is being claimed roughly
+hourly, running, and not completing. **The cost is ~3,409 maintenance claims per
+day that each yield exactly one footer verification.**
+
+**2. The cohort was bulk-enqueued, not organically aged.** All 197 share one
+identical `created_unix_ms` = **2026-08-16T11:09:57.595Z** — a single
+enqueue event, which is why median age equalled max age exactly. They have
+genuinely been queued 17 days; they did not accumulate over 17 days.
+
+**The arithmetic now closes on itself**, which is the strongest evidence the
+mechanism is understood:
+
+```
+17 days elapsed x 3,409 claims/day = 57,953 files cleared, one per claim
+repair_verified_sorted.txt = 12,758,889 bytes
+   -> ~58,000 paths at ~220 B per Delta path
+```
+
+The verified-sorted list is exactly the size the claim rate predicts. Three
+independent quantities — elapsed time, measured claim rate, and the on-disk
+listing — agree.
+
+**This strengthens the fix rather than weakening it.** Because claims are
+plentiful and yield is the bottleneck, per-attempt yield is precisely the lever:
+verifying the whole candidate set per attempt instead of `take(1)` converts
+~3,400 claims/day of one-file grinding into a small number of passes. Had claims
+been scarce (my original misreading), `take(1)` would have been secondary and
+the real fix would have been upstream in claim scheduling.
