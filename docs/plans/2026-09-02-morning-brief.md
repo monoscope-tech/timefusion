@@ -214,6 +214,10 @@ experiment in miniature today.
   journal by task key instead.
 - **`attempts` is reset, not cumulative.** Reading it as cumulative made a
   plentiful lane look starved.
+- **"pending" means three different things.** `timefusion_stats`'
+  `pending_dedup`, the sim's `pending_start`, and journal `state == Pending` are
+  three different populations — the sim's includes SUPERSEDED, which is ~89% of
+  it. The actionable queue is ~2,000, not ~21,000. Say which one you mean.
 - The journal is **not** on the host disk or in S3; it is inside the container at
   `/app/data/timefusion/.timefusion_meta/`.
 - **That JSON is a periodic CHECKPOINT, not live state** — live state is the
