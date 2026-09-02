@@ -2260,3 +2260,63 @@ the rest of the night left open:
 the success criterion is sharp: after raising the budget, repair-shaped commits
 with inputs **>100 MB** should start appearing in the Delta log. They currently
 never do.
+
+## RETRACTION of the "decisive" section: repair is SERIALIZED, not dead
+
+**The section above titled "DECISIVE: repair works on small files and never on
+large ones" is WRONG, and it is the most consequential error in this document.**
+
+My filter required a commit to have **exactly one add AND one remove**. A repair
+rewrite of a large file splits its output to the 256 MB compaction target, so it
+commits as **1 remove → 2 adds** and my filter silently excluded exactly the
+population I claimed did not exist.
+
+Re-scanning without that assumption, the same 571 commits contain **7 large
+single-file rewrites in 6 hours**:
+
+| version | in | out | ratio | files |
+| --- | --- | --- | --- | --- |
+| v517227 | 831.9 MB | 887.6 MB | **1.07** | 1 → 2 |
+| v517284 | 724.7 MB | 788.3 MB | **1.09** | 1 → 2 |
+| v517464 | 958.5 MB | 675.9 MB | 0.71 | 1 → 2 |
+| v517555 | 898.9 MB | 666.6 MB | 0.74 | 1 → 2 |
+| v517396 | 649.4 MB | 414.9 MB | 0.64 | 1 → 1 |
+| v517142 | 318.3 MB | 181.0 MB | 0.57 | 1 → 1 |
+| v517532 | 584.2 MB | 153.3 MB | 0.26 | 1 → 1 |
+
+**Two are row-preserving (ratio > 1.0) — the repair signature.** Large rewrites
+are happening, on inputs up to **958 MB**.
+
+**The corrected picture:**
+
+```
+large rewrites observed:        7 in 6h  =  1.17/hour
+serialization ceiling:          60 / 40 min  =  1.50/hour
+observed / predicted:           0.78
+310 queued units at 1.17/hour:  266 hours  =  11 days
+```
+
+**Repair is SERIALIZED, not dead.** The clamp behaves exactly as its comment
+says — *"prod's worst bin is far over budget, so it still takes everything and
+runs alone"* — and the 177 `repair_rewrite_permit_busy` events are other units
+bouncing off a semaphore held by one of these big rewrites. That is the design
+working, not failing.
+
+**What this does to Decision 1.** It weakens it substantially and changes its
+character:
+
+- **Not** "repair is dead and the budget is the cause".
+- **Yes** "repair is serialized to ~1.2/hour against a 310-unit queue, so the
+  backlog needs ~11 days to drain and never gets a quiet 11 days."
+- The fix is still the same shape (let more than one rewrite share the budget),
+  but the payoff is **throughput multiplication, not resurrection**, and the
+  urgency is lower than I argued.
+
+**Why I got it wrong, and it is the night's recurring error in its purest form:**
+I encoded an assumption about the data's *shape* — "a repair rewrite is 1-in,
+1-out" — into a filter, found zero matches, and reported the absence as a
+finding. **The filter was the finding.** The same mistake as counting `pending`
+without knowing it included superseded, and reading `Repair/Complete` without
+knowing what a completion was. **When a query returns zero, suspect the query
+before believing the zero** — especially when it is the answer you were
+looking for.
