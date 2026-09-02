@@ -1752,41 +1752,46 @@ admission/per-sort-slice pair as well.
 consistent enough to state as a rule: **on a system this bursty, a handful of
 instantaneous reads is not a measurement.**
 
-## The serialization mechanism PREDICTS the observed rate — 0.89 of prediction
+## RETRACTED and REPLACED: repair is not slow, it is doing NOTHING
 
-The strongest confirmation available short of shipping a fix: the mechanism makes
-a quantitative prediction, and the measured rate matches it.
+I claimed the serialization mechanism predicted the observed repair rate
+(1.33/hour measured vs 1.50 predicted, "0.89 of prediction"). **That match was a
+coincidence, because the completions I counted were not rewrites.**
 
-**Prediction.** If repair is serialized by the byte budget — every unit clamps to
-the whole semaphore, so one 40-minute rewrite runs at a time — the ceiling is:
+Prod logs, 12 hours, `wave_bin_staged` — every bin that actually reached the
+staging (rewrite) phase:
 
-```
-60 min / 40 min per rewrite = 1.50 repair completions per hour
-```
+| input MB | files | staging s |
+| --- | --- | --- |
+| 0.03 … 1.93 | 1–11 | 0.2–1.0 |
+| 10.20 | 6 | 2.0 |
+| **30.19** | 5 | **14.9** |
 
-**Measured**, from two live journal replays ~3 hours apart, spanning several
-process restarts:
+**All 17 staged bins in 12 hours are ≤30 MB.** A repair unit is a
+**256 MB** file. **Not one repair rewrite reached staging.** The repair-specific
+events over the same window:
 
-| | earlier | now | Δ |
-| --- | --- | --- | --- |
-| `Repair/Complete` | 2,188 | **2,192** | **+4 in ~3h = 1.33/hour** |
-| `Repair/Retry` | 310 | 306 | −4 |
-| Dedup actionable | 1,467 | 1,362 | −105 = 35/hour |
+| event | count |
+| --- | --- |
+| **`repair_rewrite_permit_busy`** | **177** |
+| `repair_suspect_cleared` | 1 |
+| `repair_seed_swept` | 4 |
+| `repair_verified_loaded` | 2 |
 
-**Observed / predicted = 0.89.** For contrast, dedup drained at **35/hour over
-the same window — 26x repair's rate** — on the same workers, same pool, same
-process. The lanes differ by an order of magnitude and the slow one matches the
-serialization ceiling almost exactly.
+So the `Repair/Complete` 2,188 → 2,192 increments were units retiring through the
+**already-sorted / verification** path — not rewrites. **Repair has performed
+essentially zero actual file rewrites in 12 hours** while bouncing off the byte
+semaphore 177 times.
 
-This is independent of every earlier argument. It does not rely on the journal's
-stored estimates, on the prod log counts, or on the constants arithmetic — it is
-just "how fast did repair actually complete", and the answer is the rate the
-mechanism predicts.
+**The corrected conclusion is stronger than the retracted one.** Repair is not
+running at a reduced rate that happens to match a serialization ceiling; it is
+running at **zero**. The lane is fully stalled, not merely serialized. Every
+number in the Decision 1 case stands — the constants, the 177 bounces, the 310
+persistently-queued units — and the "0.89x" coincidence is removed from it.
 
-**At 1.33/hour the 306 stuck units need ~10 days**, assuming none are added and
-every one of them turns out to fit — neither of which holds, which is why the
-population has been stable at ~310 all night rather than draining.
-
-**And restarts do not help.** This window spans several process restarts
-(including two from another session's deploys). The cohort survived all of them
-unchanged, which rules out "it is a transient in-memory state" as an explanation.
+**How the error happened, because it is the night's recurring one:** I took a
+counter (`Repair/Complete`) and assumed it counted the thing I cared about
+(rewrites). It counts *completions*, and a unit can complete without doing any
+work. **Check what a counter counts before deriving a rate from it** — the same
+mistake as reading `pending` as actionable work, `attempts` as cumulative, and
+five pool samples as a distribution.
