@@ -871,3 +871,62 @@ about).
 
 That is a two-constant change on the OOM path with a real interaction, not the
 one-liner it looked like an hour ago. It wants a canary and someone awake.
+
+## A SECOND, distinct defect: repair converges one file per attempt
+
+The largest retry reason among the stuck survivors is not admission at all —
+it is `compaction_incomplete` (194–197), and it is a different failure.
+
+Profile of that population (snapshot 2):
+
+| | |
+| --- | --- |
+| operation | **repair, 197 of 197** |
+| state | 195 retry, 2 running |
+| attempts | median **14**, max **875** |
+| age | **412.0 hours (17.2 days) — median AND max**, i.e. one cohort |
+| estimated bytes | median **0.25 GiB**, max 0.3 GiB |
+| whale share | **80%** |
+
+**These units are small.** At 0.25 GiB they sit comfortably inside the 512 MiB
+admission ceiling, so this is *not* the admission problem — they are admitted,
+they run, and they do not finish. One has been attempted **875 times**.
+
+**Mechanism.** Repair's candidate selection is:
+
+```rust
+// coordinator_compaction_files, Operation::Repair
+candidates.filter(|add| !self.repair_verified_sorted.contains(&add.path)).take(1)
+```
+
+**`.take(1)` — one candidate file per attempt.** Admission picks a file on the
+*absence* of a sort tag, which is only a suspicion; `stage_hot_bin` then reads
+the footer, finds it already sorted, records it in `repair_verified_sorted`, and
+returns `BinOutcome::Retry` → `completed = false` →
+`journal.retry(key, "compaction_incomplete", now + 30s)`.
+
+So each attempt clears exactly one false suspect. The code comment predicts this
+outcome in as many words:
+
+> *"could take days to reach the file that actually poisons its scans — while
+> looking busy the whole time."*
+
+It is taking **weeks**. `repair_verified_sorted.txt` on the prod host is
+**12.76 MB** and still being written (16:30 today) — on Delta path lengths that
+is on the order of **100,000 files already verified**, one attempt at a time.
+
+**Why this matters independently of the admission finding:**
+
+- It is the single largest stuck population, and it is **not** fixed by moving
+  admission or sort constants — those units already fit.
+- Every attempt is real work (a footer read plus scheduling) that retires one
+  file, so the cost scales with the size of the suspect set, not the damage.
+- It is **80% whale**, so it grows with exactly the tenant profile the 100x
+  customer question is about.
+
+**The shape of a fix** (not implemented, not validated): the suspicion is
+per-FILE but the unit is per-CELL, so a repair attempt could verify the whole
+candidate set in one pass rather than `take(1)` — the footer reads are
+independent and already cached. That turns weeks of one-at-a-time clearing into
+a single pass, and it does not touch the memory constants at all, which makes it
+the lowest-risk of tonight's three candidates.
