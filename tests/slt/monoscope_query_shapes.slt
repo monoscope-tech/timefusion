@@ -436,6 +436,24 @@ api 50
 web 33
 db-proxy 16
 
+# §13c. The fix, pinned beside the bug. Casting the operands to float keeps the
+# fraction, and it is the spelling `endpoint-stats.yaml` now uses for its
+# "% of Total" column. Same data as 13b: 33.3 and 16.7, not 33 and 16.
+# The trailing ::float matters too -- ROUND(<numeric>, 1)::text renders
+# "33.3000000000" here, because the numeric does not carry its scale.
+query TT
+SELECT resource___service___name,
+       ROUND((COUNT(*)::float * 100.0 / GREATEST(1, SUM(COUNT(*)) OVER ())::float)::numeric, 1)::float::text AS pct
+FROM otel_logs_and_spans
+WHERE project_id = 'mono_shapes'
+  AND timestamp BETWEEN TIMESTAMP '2026-01-15T09:00:00Z' AND TIMESTAMP '2026-01-15T11:00:00Z'
+GROUP BY resource___service___name
+ORDER BY 1
+----
+api 50.0
+db-proxy 16.7
+web 33.3
+
 # ---------------------------------------------------------------------------
 # §14. The compatibility surface that exists for one named caller each.
 # Every one of these was a production incident; a plain regression test here
