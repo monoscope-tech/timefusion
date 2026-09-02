@@ -446,3 +446,28 @@ should not be mistaken for the answer.
 - `synth:whale` cannot validate scheduling: it is a fixed 813-task backlog that
   always drains, so no reservation ever binds. Only the real journal reproduces
   contention.
+
+## THE CAPACITY LEVER: dedup is 8.7x faster on sorted input
+
+`cargo bench --bench dedup_benchmarks`, 1M rows, zero duplicates (prod's case —
+the measured rate is 0.0004%), `greatest` mode (prod's mode, from the EXPLAIN:
+`DedupExec: keys=[timestamp, id], mode=bounded[timestamp]/greatest`):
+
+| input | time | throughput |
+| --- | --- | --- |
+| shuffled | 396.81 ms | 2.52 Melem/s |
+| **sorted** | **45.64 ms** | **21.91 Melem/s** |
+
+**8.7x.** On the operation that is ~96% of maintenance worker time, against ~1%
+from the claim-ordering work. This is the "cheaper units" item the prod-journal
+A/B identified as the actual lever, quantified.
+
+Next question, and the one that decides whether this is reachable: does the
+maintenance rewrite path (`stage_dedup_partition_range`) feed `DedupExec` sorted
+input, or does it shuffle? The read path's `bounded[timestamp]` mode suggests it
+already exploits timestamp ordering; the rewrite path is where the 96% is spent
+and is what to check first.
+
+Related and already known: sorted footers were being lost
+([[tf_sort_skip_kills_footer_ordering_2026-08-01]], `SORT_SKIP_BYTES` vs the
+compaction target). If files land unsorted, every later dedup pays the 8.7x.
