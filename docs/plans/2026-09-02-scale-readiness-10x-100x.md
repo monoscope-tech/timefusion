@@ -1508,3 +1508,49 @@ effect is measurable at today's scale, on today's whale.
 **The corollary is reassuring about throughput and unforgiving about budgets:**
 adding capacity does not help, because the excluded work is excluded by a
 comparison against a constant, not by a shortage of workers.
+
+## IMPLEMENTATION WARNING: do NOT raise `COORDINATOR_PER_SORT_BUDGET_BYTES`
+
+Decision 1 says "raise the repair budget from 1,280 MiB to ≥3,072 MiB". The
+obvious way to do that is wrong and would cause an outage.
+
+`repair_rewrite_budget_bytes()` **returns `COORDINATOR_PER_SORT_BUDGET_BYTES`
+directly**, and that same constant is the **divisor for `light_optimize_k`**:
+
+```rust
+// config.rs:533
+let mem_bound = (self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES).saturating_sub(1);
+```
+
+So raising it to 3 GiB would cut hot-tail packing's concurrency **K by 2.4x** —
+and the code already records what happens when K collapses:
+
+> *"raising the coordinator's cap shrank light from ~7.6 GB to 3 GB, which took
+> this from 3 to 1, and HotPacking — which must take the permit BEFORE it claims
+> — stopped being claimed at all (prod 2026-09-01: zero HotPacking units in 45
+> minutes with 17 pending, and `compaction_permits_unavailable` 23 on a
+> 35-minute-old process against 9 over 5.8h before)."*
+
+**That outage was five days ago, caused by this exact coupling, in the opposite
+direction.** Raising the shared constant to fix repair would walk straight back
+into it — trading a starved repair lane for a starved packing lane.
+
+| target | effect on `light_optimize_k` |
+| --- | --- |
+| 1.25 GiB (current) | baseline |
+| 1.5 GiB (one row group) | **0.83x** |
+| 3 GiB (one whole file) | **0.42x** — into the territory that stopped HotPacking |
+
+**The fix must give repair its OWN constant.** `repair_rewrite_budget_bytes()`
+is already a separate function — it just returns the shared value. Pointing it at
+a dedicated `REPAIR_REWRITE_BUDGET_BYTES` decouples the two, and then the repair
+lane can be sized to `target_file x 12` without touching packing's concurrency at
+all. The memory for it has to come from somewhere, which is the real judgement:
+repair and packing draw on the same coordinator share, so a bigger repair budget
+means fewer simultaneous packing sorts *in practice* even if `K` is unchanged.
+
+**Revised effort estimate for Decision 1:** still small, but it is
+"add a constant and re-point one function", not "change a number" — and it needs
+`light_optimize_k` checked at the new value, because that assertion
+(`k + 1 == coordinator_share / PER_SORT_BUDGET`) is what encodes the one-budget
+holdback for repair.
