@@ -251,3 +251,39 @@ experiment could not detect the cost it was meant to measure. Re-measure on
 `87576849` (19 services) or synthetically, at the page level, not by wall clock.
 
 Tree left at the known-good state (original ordering, suite green at 1314/1314).
+
+### RESOLVED: the layout change DOES break rollup routing (2/2 reproducible)
+
+Final evidence, after correcting my own correction:
+
+| tree | full suite |
+| --- | --- |
+| original ordering | **1314/1314 green** |
+| `timestamp, id` leading (run 1) | 1314/1315 — `a_chart_under_a_derived_table_routes_and_agrees_with_raw` FAILS |
+| `timestamp, id` leading (run 2) | 1314/1315 — same test FAILS |
+
+**Reproducible 2/2 against a green baseline. The change breaks rollup routing.**
+
+The isolation result was a red herring: that test also fails when run alone with
+the ORIGINAL schema, because it depends on state the suite establishes. I briefly
+concluded from that the change was exonerated — wrong. **Isolation behaviour said
+nothing; the full-suite delta is the signal**, and it is unambiguous.
+
+Assertion: *"a derived table only re-qualifies; the chart under it must route"* —
+so with dedup-key-leading files, a chart under a derived table stops routing to
+its rollup and falls through to raw. That is a dashboard-latency regression, i.e.
+the change trades a 5.4x maintenance win for a read-path loss.
+
+**So `sorting_columns` cannot simply be reordered.** The 81%-of-a-rewrite sort is
+still the right target, but the remedy must not move `service` out of position 2.
+Open options, none yet tested:
+
+1. Find why routing depends on sort order (`dedup_compaction_test.rs:2748` is the
+   entry point) and decouple it — most likely the real fix.
+2. Declare the ordering only for the REWRITE's provider (`narrow_provider`),
+   leaving the written layout unchanged — but this needs an ordering the files
+   actually have, which today they do not for `(timestamp, id)`.
+3. Sort by `(timestamp, id)` only for files that no rollup routes over.
+
+Tree restored to the green baseline. Net for the night: the target is quantified
+(81% of a unit, 5.4x, plus the OOM) and one remedy is now definitively excluded.
