@@ -392,3 +392,57 @@ changes the same fan-in envelope.
 Ladder, per CLAUDE.md: `timefusion sim <journal>` first — it is IO-free and
 replays a real prod queue on virtual time, so it answers "does the window drain
 without starving the tail" in seconds. Then `run-unit`, then staging, then prod.
+
+## The A/B on the REAL prod journal: the queue is CAPACITY-bound, not order-bound
+
+77,034 tasks fetched read-only from the running container
+(`docker cp c9e33d1e7ccb:/app/data/timefusion/.timefusion_meta/maintenance_tasks.json`),
+replayed through `timefusion sim --hours 24`. One variable, isolated by checking
+out `maintenance_coordinator.rs` at the pre-change commit.
+
+| metric | baseline | +window reservation | delta |
+| --- | --- | --- | --- |
+| `pending_end` | 10,610 | 10,576 | -34 (0.3%) |
+| Dedup completions | 8,183 | 8,264 | **+81 (1.0%)** |
+| executions | 27,175 | 27,232 | +57 |
+| `frontier_lag_secs_max` | 86,978 | 86,518 | -460 (0.5%) |
+| `min_contiguous_days_end` | 0 | 0 | none |
+| `hours_to_contiguous_14` | None | None | none |
+
+**The reservation is real, safe and worth ~1%. It is not the lever.** The 14-day
+window never becomes contiguous under either policy.
+
+### What the numbers actually say
+
+`pending_start` 22,162 and 24 simulated hours produce 27,175 executions, and the
+backlog only halves. `frontier_lag_secs_max` is 86,978 s — a full DAY behind, in
+both arms. **Reordering cannot fix a throughput deficit.** No claim policy makes
+27k executions cover 22k+ tasks plus everything minted while they run.
+
+So the goal — "keep up with the data streams" — is a CAPACITY question:
+throughput per unit, or fewer units, not better ordering. The ordering defect is
+real (`months_old_history_outranks_the_dates_dashboards_read`) and worth ~1%; it
+should not be mistaken for the answer.
+
+### Consequences for the 10x/100x target, in priority order
+
+1. **Fewer units.** Prevent duplicates at ingest — a dedup-key check inside the
+   MemBuffer's 10-minute bucket — so dates are born certifiable and need neither
+   a rewrite nor a probe. This deletes work rather than scheduling it, and it is
+   the only item on this list that scales to 100x. Design discussion first.
+2. **Cheaper units.** A unit averages ~21 min and the fleet is ~96% Dedup. The
+   2026-09-01 batch-size fix (bytes, not rows) took one file 39.4s -> 20.3s;
+   that class of work compounds where ordering does not.
+3. **Ordering.** ~1%. Ship it when something else is already deploying; it does
+   not justify a restart on its own (~8 restarts tonight each killed in-flight
+   21-minute units).
+
+### Method notes, both errors caught here
+
+- The first "baseline" was invalid: the change had already been COMMITTED, so
+  `git stash` stashed nothing and both arms ran the same code. A/B by
+  `git checkout <pre-commit> -- <file>`, and verify with a marker
+  (`grep -c window_turn` must be 0 in the baseline build).
+- `synth:whale` cannot validate scheduling: it is a fixed 813-task backlog that
+  always drains, so no reservation ever binds. Only the real journal reproduces
+  contention.
