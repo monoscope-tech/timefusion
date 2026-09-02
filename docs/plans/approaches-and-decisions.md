@@ -287,3 +287,34 @@ Open options, none yet tested:
 
 Tree restored to the green baseline. Net for the night: the target is quantified
 (81% of a unit, 5.4x, plus the OOM) and one remedy is now definitively excluded.
+
+### Why routing depends on sort order — the mechanism, named
+
+`sorting_columns` is not just physical layout: it becomes the parquet footer's
+**advertised ordering**, which the read path consumes directly. See
+`src/read/mod.rs`:
+
+- `:98` — "a parquet footer's `sorting_columns` is lying" (the ordering probe)
+- `:379` — "footer missing/misreporting `sorting_columns` makes a scan declare..."
+- `:586` — "no footer `sorting_columns` and ONE unordered branch erases the
+  ordering"
+
+So changing `sorting_columns` changes what every scan ADVERTISES, and an
+advertised ordering that no longer matches what a consumer requires can silently
+disqualify a plan — which is consistent with the chart under a derived table
+ceasing to route.
+
+**Morning entry point, one command to reproduce:**
+
+```
+cargo nextest run a_chart_under_a_derived_table_routes_and_agrees_with_raw
+```
+
+(fails alone for an unrelated isolation reason — judge it by the FULL suite:
+green at 1314/1314 on the original ordering, 1314/1315 twice with the dedup-key
+ordering.)
+
+Trace from `rollup_hits_hybrid`/`rollup_hits_full` back to whatever ordering
+precondition the derived-table route checks. If routing can be decoupled from the
+advertised ordering — or if the rewrite provider can declare an ordering without
+changing what files advertise — the 5.4x is reachable without touching reads.
