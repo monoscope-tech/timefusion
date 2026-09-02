@@ -52,6 +52,23 @@ Detail: `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`.
 
 Detail: `docs/plans/2026-09-02-scale-readiness-10x-100x.md`.
 
+## The four subsystems you named, measured
+
+| subsystem | verdict tonight |
+| --- | --- |
+| **rollups** | sim: drains at 10x untouched; knee 30–50x (above) |
+| **dedup** | expensive path **healthy** — prod logs show ZERO staging timeouts over an hour; the 114 "timeouts" were the cheap probe, and its backlog is draining 61 → 7 groups/phase |
+| **hot-tail packing** | not starved: the memory brake fired **5 times in 24h**, not chronically. It trips at a **64 GiB** limit against a 120 GiB cgroup — i.e. we stop compacting with ~56 GiB unused, which is worth a look but is not hurting us today |
+| **sorting** | the flush-path sort was measured directly: the landed digest is 0.37x a parquet encode, and tonight's earlier work removed the rewrite's remaining `SortExec` |
+
+**Caveat I want to be explicit about:** prod redeployed onto my build partway
+through, so the `timefusion_stats` counters are from a **10-minute-old
+process**. Their zeros are *consistent with* health but are not evidence of it —
+a young process reads as fixed. Every claim above rests on **event counts over a
+window** (restart-insensitive), not on cumulative counters. For the same reason
+I did not read `pending_dedup` 1647 → 1538 as draining: those are two different
+processes.
+
 ## What shipped tonight
 
 | area | change |
