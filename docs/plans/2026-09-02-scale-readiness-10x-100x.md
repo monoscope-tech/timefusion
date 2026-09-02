@@ -1709,3 +1709,45 @@ ceiling.** Two rows of instrumentation turn every one of those decisions from
 It also settles the query-pool rebalance question directly: if maintenance runs
 near its ceiling while query runs at zero, the case for moving budget between
 them is made with two numbers instead of an argument.
+
+### The query-pool measurement, completed — and it corrects the preliminary reading
+
+I said five samples were too thin to act on and ran the sampler. It was right to
+wait: **the pool is not idle, it is peaky.**
+
+58 samples at 20-second intervals:
+
+| | |
+| --- | --- |
+| samples | 58 |
+| non-zero | **7 (12%)** |
+| non-zero values (GB) | 0.01, 0.74, 1.04, **1.32** |
+| **peak** | **1.32 GB = 8.3% of the 16 GB pool** |
+| restarts during sampling | 1 (`queries_total` reset at sample 54) |
+
+**Corrected claim:** the query pool is idle ~88% of the time and peaks around
+**8% of its ceiling**, not the flat 0% the first five samples suggested. Those
+five happened to land in idle gaps — the exact sampling error I flagged as
+possible and then confirmed.
+
+**The rebalance case survives, better sized.** A pool whose observed peak is
+1.32 GB does not need 16.4 GB of reservation. Leaving ~4 GB — **3x the observed
+peak** — would free roughly **12 GB**, which is far more than the repair budget
+needs (+1,792 MB to reach 3,072) and would comfortably fund the
+admission/per-sort-slice pair as well.
+
+**Caveats that remain, and they matter:**
+
+- One hour, one workload, and a restart landed mid-window. The peak under a
+  heavy report or a wide-window dashboard query is unmeasured, and DataFusion
+  reserves for sorts/joins/aggregates — precisely the operators a heavy report
+  uses.
+- 3x the observed peak is a judgement, not a derivation. The honest version is
+  "reclaim conservatively and watch", which is exactly what the
+  `maintenance-pool-stats` instrument (Decision 0) makes possible: after a
+  rebalance you could see both pools' utilisation instead of inferring.
+
+**This is the third time tonight that taking more samples changed the answer**
+(after the cross-process counters and the estimated-uptime rate). The pattern is
+consistent enough to state as a rule: **on a system this bursty, a handful of
+instantaneous reads is not a measurement.**
