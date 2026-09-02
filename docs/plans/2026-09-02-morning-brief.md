@@ -9,8 +9,9 @@ shipped** — but read the incident note first.
 > commits carried their work to master — including **`src/rollup.rs`** — and
 > **that triggered a prod deploy** (prod runs `e07421d`). Verified after the
 > fact: master builds clean, their `monoscope_query_shapes` test passes, prod is
-> serving normally (23,465 queries, dedup ~37/hour). No damage, but that is luck
-> rather than process, and it means my "no deploys since X" claims are wrong for
+> serving normally (23,465 queries, dedup ~37/hour), and the **full suite is
+> 1330/1330 green on current master**, including their added tests. No damage,
+> but that is luck rather than process, and it means my "no deploys since X" claims are wrong for
 > those windows. I did not revert — their work is intentional and may be built
 > upon. Detail in the scale-readiness doc. Three decisions are
 waiting for you. **They are one problem in three places:** every stuck lane is a
