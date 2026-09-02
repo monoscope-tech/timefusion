@@ -187,10 +187,28 @@ bound in the key precisely so a false ordering can only under-dedup. Anything
 that trusts the full ordering — a `SortPreservingMerge` fed by this claim, which
 is exactly phase 2 — would be wrong.
 
-**So phase 2 is gated on fixing this first**, in the DataFusion fork. NOT done
-tonight: it is a correctness change in the hottest read path, it needs a fork
-bump, and stacking it on an unverified row-deleting deploy is the mistake the
-one-change-per-deploy rule exists for.
+**CORRECTION — this does NOT gate phase 2.** The bug bites only a projection that
+OMITS a sorting column. The dedup rewrite selects `{columns}` = every schema
+field, so no sorting column is ever missing from its read schema and `filter_map`
+behaves identically to `map_while` there. Phase 2 is reachable without touching
+DataFusion. What the bug does threaten is the QUERY path, where narrow
+projections are the norm.
+
+The fix (`filter_map` → `map_while` in the `tonyalaribe/datafusion` fork, which
+already carries a `datafusion-sql` patch) is therefore its own change on its own
+deploy, and it is not free: some scans would declare SHORTER orderings, which is
+correct but can turn a streaming TopK into a blocking sort wherever the current
+claim is false-but-useful. Measure the latency matrix before shipping it.
+
+**And phase 2 may be partly done already.** The delta-rs fork's
+`derive_common_ordering` declares footer ordering on Delta scans automatically
+(conforming files only, prefix-limited by stats), and `regroup_for_declared_ordering`
+even repacks file groups so the claim survives. The bench numbers above come from
+a plain `register_parquet` with no footer pushdown at all — so **13.5 s
+UNDERSTATES what the same shape can do in prod**. The open question is not "how
+do we declare the ordering" but "does the rewrite's scan actually get it, and
+does the sort disappear when it does". Answer it with an EXPLAIN on the
+maintenance path, not by building anything.
 
 ### Ingest-side dedup prevention — design, for the morning
 
