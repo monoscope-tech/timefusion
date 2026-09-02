@@ -541,3 +541,45 @@ be genuinely present: `SORT_SKIP_BYTES` has previously left files unsorted
 ([[tf_sort_skip_kills_footer_ordering_2026-08-01]]), and declaring an order the
 data does not have would produce WRONG dedup results, not merely slow ones. Gate
 it on the footer check that already exists.
+
+## The rewrite bench: the SORT is the unit, and it OOMs a 1 GB pool
+
+`TF_BENCH_PARQUET=<204 MB real prod bin> TF_BENCH_POOL_MB=1024 cargo bench
+--bench rewrite_throughput` — the REWRITE path (scan + its `ORDER BY`), not the
+read path:
+
+| config | result |
+| --- | --- |
+| `sort b2048 p8` | **FAILED — external sort OOM** |
+| `sort b8192 p1` | **FAILED — OOM**, `ExternalSorterMerge` alone at 801.7 MB |
+| `sort b8192 p8` | **FAILED — OOM** |
+| `PROD: b256 p1 x13 slices` | 13.2 s, 1,639,811 rows, **15.44 MB/s** |
+
+**One 204 MB bin cannot be sorted in a 1 GB pool** except in prod's own
+configuration, which survives only by slicing the work 13 ways — and still runs at
+15 MB/s.
+
+So the missing output ordering in `narrow_provider` is not "a speedup available".
+It is why dedup is simultaneously the fleet's dominant cost AND its memory hazard:
+every unit builds `ExternalSorter`s over data that is already in the right order,
+spills them, and risks the pool. It ties the whole night together —
+`tf_sealed_retries_are_memory_not_deadline_2026-08-27` (sort budgets in the wrong
+unit), `tf_repair_merge_unspillable_2026-08-09` (a sort dying 25.3 MB short), the
+124.9 GB OOM — all are the same sort that should not need to run.
+
+**Expected effect of declaring the ordering:** the `SortExec` disappears, the
+window streams, `ExternalSorter`/`ExternalSorterMerge` allocate nothing, and the
+per-unit memory ceiling collapses. That is the 10x-capacity change; the claim
+reservation was 1%.
+
+**Still gated on correctness, and this is not negotiable.** Declaring an ordering
+the files do not have yields WRONG dedup output — silently keeping the wrong row —
+not a slow one. `SORT_SKIP_BYTES` has previously left files unsorted
+([[tf_sort_skip_kills_footer_ordering_2026-08-01]]), so the declaration must be
+gated on the per-file footer check that already exists, and files failing it must
+keep the sort. Build it that way or not at all.
+
+Verification before shipping: `run-unit --op Dedup` on a busy sealed date, with
+`EXPLAIN ANALYZE` confirming no `SortExec` under the window for footer-sorted
+files, and the dedup output row-for-row identical to the sorted path on a fixture
+containing known duplicates.
