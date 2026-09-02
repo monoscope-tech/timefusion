@@ -471,3 +471,32 @@ and is what to check first.
 Related and already known: sorted footers were being lost
 ([[tf_sort_skip_kills_footer_ordering_2026-08-01]], `SORT_SKIP_BYTES` vs the
 compaction target). If files land unsorted, every later dedup pays the 8.7x.
+
+### Correction: the REWRITE does not use DedupExec
+
+`stage_dedup_chunk` runs
+
+```sql
+SELECT {cols} FROM (SELECT {cols}, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order}) AS __tf_rn
+                    FROM {scan} WHERE {filter}) WHERE __tf_rn = 1 {order_by}
+```
+
+— a WINDOW function, not `DedupExec`. So the 8.7x benchmark measures the READ
+path, not the 96% of fleet time. Stated plainly because acting on the number
+without this would have optimised the wrong operator.
+
+**The mechanism still transfers, and this is the lead to pull first:** the window
+needs its input ordered by `PARTITION BY` (timestamp, id), and the query then adds
+a final `ORDER BY`. Two blocking operators, as the code's own comment says. If the
+scanned files are ALREADY sorted on those keys, DataFusion can stream the window
+instead of re-sorting the whole partition — the same sorted-vs-shuffled asymmetry
+the benchmark quantifies at 8.7x for the read path.
+
+So the question to answer first, with `EXPLAIN ANALYZE` on a `run-unit` rewrite:
+**is there a SortExec under that window, and how much of the unit's wall clock is
+it?** A ~21-minute unit that is mostly a re-sort of already-sorted data is the
+capacity win; the claim-ordering work was worth 1% against it.
+
+Prior art already in memory: sorted footers were being lost
+([[tf_sort_skip_kills_footer_ordering_2026-08-01]]). If files land unsorted, every
+later rewrite pays a full sort — which is exactly this cost.
