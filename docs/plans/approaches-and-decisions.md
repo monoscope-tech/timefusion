@@ -319,9 +319,24 @@ only adjacency, which that ordering guarantees, a dedup rewrite over conforming
 files becomes a streaming pass. The bench put the sort at 81% of a rewrite
 (scan-only 2.2 s vs 11.6 s for the prod shape).
 
+Suite: **1317/1318**, lint clean. The ONLY new failure was
+`sorting_columns_index_excludes_partitions` — the existing test that asserted the
+old expectation directly, i.e. it encoded the bug it was meant to guard. Its real
+intent (a partition column must not consume a leaf) was folded into the new test,
+which checks it the stronger way. Every ordering-sensitive test — bounded dedup,
+TopK, merge-on-read — passed with the corrected footers.
+
 Caveats to carry into the morning:
 - **Old files keep their wrong footers.** The win phases in as rewrites replace
   them — and every dedup/compaction rewrite now writes a correct one.
+- **So expect `ordered_scan=false` to persist at first.** A dedup unit reads a
+  whole `(project, date)` partition, which for a while mixes old and new
+  footers; `derive_common_ordering` then gives the claim to the conforming subset
+  and scans the rest separately, so the sort only disappears for partitions whose
+  files were ALL written after this deploy. Today's data converges within hours;
+  older dates convert as they are rewritten. Judge this on the ratio
+  `dedup_bin_stage_timeouts_total : dedup_bins_committed_total` over hours, not
+  on the first unit.
 - The DataFusion `filter_map` (skip instead of truncate) is still there and still
   wrong; it is what converted our bad index into a silently shortened ordering
   rather than an error. Worth fixing upstream so the next such bug is loud.
