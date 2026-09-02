@@ -211,6 +211,16 @@ fn bench_flush_dedup(c: &mut Criterion) {
 /// taken in a DEBUG build, where SHA-256 runs ~30x under its release speed and
 /// the digest looked 5x more expensive than the encode. The flag's cost is
 /// this ratio; measure it here, not in a test binary.
+fn ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 1024);
+    {
+        let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+        w.write(batch).unwrap();
+        w.finish().unwrap();
+    }
+    buf
+}
+
 fn bench_landed_digest(c: &mut Criterion) {
     let mut group = c.benchmark_group("landed_digest");
     for &rows in &[20_000usize, 200_000] {
@@ -219,6 +229,25 @@ fn bench_landed_digest(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function(BenchmarkId::new("digest", rows), |b| {
             b.iter(|| std::hint::black_box(timefusion::write::landed_digest(&batches)))
+        });
+        // The FLOOR: the Arrow round-trip alone, no hash. Tells us how much of
+        // the digest any hash choice can possibly remove.
+        group.bench_function(BenchmarkId::new("canonicalize_only", rows), |b| {
+            b.iter(|| {
+                let mut total = 0usize;
+                for batch in &batches {
+                    let once = ipc_bytes(batch);
+                    let mut r = datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&once), None).unwrap();
+                    let back = r.next().unwrap().unwrap();
+                    total += ipc_bytes(&back).len();
+                }
+                std::hint::black_box(total)
+            })
+        });
+        // Hash-only, over the canonical bytes: what the hash choice actually buys.
+        let canonical: Vec<Vec<u8>> = batches.iter().map(ipc_bytes).collect();
+        group.bench_function(BenchmarkId::new("hash_xxh3_128", rows), |b| {
+            b.iter(|| std::hint::black_box(canonical.iter().map(|c| twox_hash::XxHash3_128::oneshot(c) as usize).sum::<usize>()))
         });
         group.bench_function(BenchmarkId::new("parquet_encode", rows), |b| {
             b.iter(|| {

@@ -1733,9 +1733,9 @@ const LANDED_DIGESTS_KEY: &str = "timefusion.landed_digests";
 
 /// `{ "<project>:<table>": ["<hex digest>", …] }` — topic-scoped exactly like
 /// the watermark, since unified-table tenants share one Delta log.
-fn serialize_landed_digests_to_json(entries: impl IntoIterator<Item = (String, String, [u8; 32])>) -> serde_json::Map<String, serde_json::Value> {
+fn serialize_landed_digests_to_json(entries: impl IntoIterator<Item = (String, String, crate::write::LandedDigest)>) -> serde_json::Map<String, serde_json::Value> {
     entries.into_iter().fold(serde_json::Map::new(), |mut map, (project_id, table_name, digest)| {
-        let hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
+        let hex = digest.iter().fold(String::with_capacity(crate::write::DIGEST_BYTES * 2), |mut s, b| {
             use std::fmt::Write;
             let _ = write!(s, "{b:02x}");
             s
@@ -1751,7 +1751,7 @@ fn serialize_landed_digests_to_json(entries: impl IntoIterator<Item = (String, S
 /// Inverse of [`serialize_landed_digests_to_json`], for one topic. Malformed
 /// entries are skipped: a digest we cannot read is simply an identity we will
 /// not match, which costs a duplicate, never a loss.
-fn parse_landed_digests_from_json(info: &HashMap<String, serde_json::Value>, project_id: &str, table_name: &str) -> Vec<[u8; 32]> {
+fn parse_landed_digests_from_json(info: &HashMap<String, serde_json::Value>, project_id: &str, table_name: &str) -> Vec<crate::write::LandedDigest> {
     let Some(list) =
         info.get(LANDED_DIGESTS_KEY).and_then(|v| v.as_object()).and_then(|m| m.get(&wal_topic(project_id, table_name))).and_then(|v| v.as_array())
     else {
@@ -1759,10 +1759,10 @@ fn parse_landed_digests_from_json(info: &HashMap<String, serde_json::Value>, pro
     };
     list.iter()
         .filter_map(|v| v.as_str())
-        .filter(|s| s.len() == 64)
+        .filter(|s| s.len() == crate::write::DIGEST_BYTES * 2)
         .filter_map(|s| {
-            let mut out = [0u8; 32];
-            (0..32).try_fold(&mut out, |acc, i| {
+            let mut out = [0u8; crate::write::DIGEST_BYTES];
+            (0..crate::write::DIGEST_BYTES).try_fold(&mut out, |acc, i| {
                 acc[i] = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
                 Some(acc)
             })?;
@@ -1841,7 +1841,7 @@ fn base_commit_properties() -> CommitProperties {
 /// it — chaining a second call would silently drop the watermark and break
 /// cursor derivation.
 fn build_watermark_commit_properties(
-    watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>, digests: impl IntoIterator<Item = (String, String, [u8; 32])>,
+    watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>, digests: impl IntoIterator<Item = (String, String, crate::write::LandedDigest)>,
 ) -> CommitProperties {
     let metadata = flush_commit_metadata(watermarks, digests);
     if metadata.is_empty() {
@@ -1854,7 +1854,7 @@ fn build_watermark_commit_properties(
 /// [`build_watermark_commit_properties`] so tests can read back what a commit
 /// would actually record — `CommitProperties::app_metadata` is private.
 fn flush_commit_metadata(
-    watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>, digests: impl IntoIterator<Item = (String, String, [u8; 32])>,
+    watermarks: impl IntoIterator<Item = (String, String, crate::write::DeltaWatermark)>, digests: impl IntoIterator<Item = (String, String, crate::write::LandedDigest)>,
 ) -> Vec<(String, serde_json::Value)> {
     let entries = serialize_watermarks_to_json(watermarks);
     let landed = serialize_landed_digests_to_json(digests);
@@ -15657,7 +15657,7 @@ mod tests {
     /// metadata map, so building the two keys separately would drop one.
     #[test]
     fn landed_digests_roundtrip_and_stay_scoped_to_their_topic() {
-        let (a, b) = ([7u8; 32], [9u8; 32]);
+        let (a, b) = ([7u8; crate::write::DIGEST_BYTES], [9u8; crate::write::DIGEST_BYTES]);
         let info: HashMap<String, serde_json::Value> = flush_commit_metadata(
             [("p".to_string(), "t".to_string(), vec![Some(walrus_rust::WalPosition { block_id: 5, offset: 64 })])],
             [("p".to_string(), "t".to_string(), a), ("p".to_string(), "t".to_string(), b), ("other".to_string(), "t".to_string(), a)],
@@ -15680,9 +15680,9 @@ mod tests {
     /// sit below a landed one — the acked-write loss the plan documents.
     #[test]
     fn landed_digests_never_advance_a_cursor() {
-        let info: HashMap<String, serde_json::Value> = flush_commit_metadata([], [("p".to_string(), "t".to_string(), [3u8; 32])]).into_iter().collect();
+        let info: HashMap<String, serde_json::Value> = flush_commit_metadata([], [("p".to_string(), "t".to_string(), [3u8; crate::write::DIGEST_BYTES])]).into_iter().collect();
 
-        assert_eq!(parse_landed_digests_from_json(&info, "p", "t"), vec![[3u8; 32]], "the identity is recorded");
+        assert_eq!(parse_landed_digests_from_json(&info, "p", "t"), vec![[3u8; crate::write::DIGEST_BYTES]], "the identity is recorded");
         assert_eq!(max_watermark_across_commits([&info], 4, "p", "t"), vec![None; 4], "and it advances NOTHING");
     }
 

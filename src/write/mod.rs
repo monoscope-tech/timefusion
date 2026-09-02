@@ -398,6 +398,16 @@ pub type DeltaWriteCallback =
 ///
 /// `None` for an empty set (nothing to skip) and on any serialization failure —
 /// both mean "no identity", which declines the skip and flushes normally.
+/// Width of a landed-batch identity. 128 bits: with at most a few dozen
+/// identities live per topic, a random collision is out of reach by ~25 orders
+/// of magnitude, and the hash is not exposed to clients (it lives in Delta
+/// commit metadata, and TF — not the client — assigns the `updated_at` that
+/// goes into it), so the non-cryptographic hash below cannot be aimed.
+pub const DIGEST_BYTES: usize = 16;
+
+/// Identity of a batch set. See [`landed_digest`].
+pub type LandedDigest = [u8; DIGEST_BYTES];
+
 /// Whether "identical content" is safe to read as "already durable" for this
 /// table — it is only so when the table declares `dedup_keys`.
 ///
@@ -415,20 +425,19 @@ pub(crate) fn landed_identity_applies(table_name: &str) -> bool {
     crate::schema::get_schema(table_name).is_some_and(|s| !s.dedup_keys.is_empty())
 }
 
-pub fn landed_digest(batches: &[RecordBatch]) -> Option<[u8; 32]> {
+pub fn landed_digest(batches: &[RecordBatch]) -> Option<LandedDigest> {
     if batches.iter().all(|b| b.num_rows() == 0) {
         return None;
     }
-    batches.iter().try_fold([0u8; 32], |mut acc, batch| {
+    batches.iter().try_fold([0u8; DIGEST_BYTES], |mut acc, batch| {
         let once = crate::write::wal::serialize_record_batch(batch).ok()?;
         let canonical = crate::write::wal::deserialize_record_batch(&once)
             .ok()
             .map(crate::write::mem_buffer::compact_batch)
             .and_then(|b| crate::write::wal::serialize_record_batch(&b).ok())?;
-        let digest = blake3::hash(&canonical);
-        let digest = digest.as_bytes();
+        let digest = twox_hash::XxHash3_128::oneshot(&canonical).to_be_bytes();
         let mut carry = 0u16;
-        for i in (0..32).rev() {
+        for i in (0..DIGEST_BYTES).rev() {
             let sum = acc[i] as u16 + digest[i] as u16 + carry;
             acc[i] = sum as u8;
             carry = sum >> 8;
@@ -711,7 +720,7 @@ pub struct BufferedWriteLayer {
     /// commits — the same shape as ClickHouse's
     /// `replicated_deduplication_window`. Empty means "no proof of anything",
     /// which costs duplicates, never a loss.
-    landed_digests: dashmap::DashMap<(String, String), std::collections::HashSet<[u8; 32]>>,
+    landed_digests: dashmap::DashMap<(String, String), std::collections::HashSet<LandedDigest>>,
     /// Test hook: drop the post-commit cursor advance, modelling the one
     /// producer of replay duplicates that a test can otherwise not reach — a
     /// Delta commit that LANDS while the advance that should follow it is
@@ -1359,7 +1368,7 @@ impl BufferedWriteLayer {
     /// Called at boot with what the Delta history scan found, and after each
     /// flush lands with that flush's own identity (so an in-process re-flush of
     /// an identical set is declined too).
-    pub fn note_landed_digests(&self, project_id: &str, table_name: &str, digests: impl IntoIterator<Item = [u8; 32]>) {
+    pub fn note_landed_digests(&self, project_id: &str, table_name: &str, digests: impl IntoIterator<Item = LandedDigest>) {
         let mut digests = digests.into_iter().peekable();
         if digests.peek().is_none() {
             return;
