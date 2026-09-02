@@ -126,13 +126,38 @@ flushes normally (duplicates, as today). The dominant case is unaffected:
 different bucket, so a replayed old bucket reproduces exactly the committed batch
 set and the skip fires.
 
-## The load-bearing assumption, verified not assumed
+## The load-bearing assumption — verified, and it FAILED
 
 **Is a replayed bucket's `prepare_flush` output byte-identical to the original's?**
-This is the whole feature, so it is the failing test written first:
+This is the whole feature, so it was the failing test written first —
+`a_replayed_bucket_reflushes_to_the_same_digest`, which flushes, captures the
+digest, replays the same WAL into a fresh layer, re-flushes, and compares.
 
-- `a_replayed_bucket_reflushes_to_the_same_digest` — flush, capture digest;
-  replay the same WAL into a fresh layer; re-flush; assert the digest matches.
+**It failed on the first run.** The naive digest — SHA-256 over each batch's
+current IPC encoding — did not match. Had this been assumed rather than tested,
+the feature would have shipped completely inert: every check a miss, every
+duplicate still written, and nothing in the metrics to say why.
+
+The cause, measured on a one-row otel span:
+
+| | IPC bytes |
+| --- | --- |
+| client-supplied batch | 28,168 |
+| after one WAL round-trip | 26,888 |
+| after a second round-trip | 26,888 |
+
+The client's arrays carry slack (view buffers, over-allocated offsets) that the
+round-trip drops, and **the round-trip is a fixed point after one pass.**
+Replayed batches are already at that fixed point; client batches are not.
+
+So `landed_digest` hashes the **round-trip fixed point**, not the current
+encoding, which puts both paths on the same footing. The cost is one extra
+IPC round-trip per flush, paid only when the feature is enabled.
+
+An incidental finding worth its own look later: buffered batches are ~4.5%
+larger than they need to be. Canonicalising at insert would reclaim that
+MemBuffer memory *and* make the digest a single serialize — but it touches the
+hot ingest path, so it is not part of this change.
 
 Determinism inputs checked while designing:
 - `dedup_batches` preserves input batch order and boundaries (fast path returns
@@ -144,19 +169,20 @@ Determinism inputs checked while designing:
   share key+tiebreak but differ in payload, the winner can differ, the digest
   differs, the skip declines. Safe direction.
 
-## Tests
+## Tests (all written, all passing)
 
-1. `a_replayed_bucket_reflushes_to_the_same_digest` — the feature's failing test.
-2. `an_already_landed_batch_set_is_not_written_twice` — commit lands, cursor
-   advance suppressed, replay, re-flush → zero new physical rows, all acked rows
-   present. Row counts via the witness method, not `COUNT(*)` (count pushdown
-   cannot probe this — `tf_count_star_is_wrong_not_flaky`).
-3. `a_dml_mutated_bucket_still_flushes` — DML replays after refill, digest
-   misses, flush proceeds, post-DML state is durable. Proves the skip **declines**
-   when it must; this is the DML-hazard regression guard.
-4. `landed_digests_never_advance_a_cursor` — the invariant above.
-5. Digest unit tests: order-independence, and that duplicate batches do not
-   cancel (the XOR trap).
+| test | what it pins |
+| --- | --- |
+| `a_replayed_bucket_reflushes_to_the_same_digest` | the load-bearing assumption; caught the round-trip bug |
+| `an_already_landed_batch_set_is_declined_but_a_changed_one_still_flushes` | both directions: the skip fires on identical content, and **declines** for a DML-changed bucket — the DML-hazard guard |
+| `landed_digests_never_advance_a_cursor` | the invariant: a commit carrying only digests advances nothing |
+| `landed_digests_roundtrip_and_stay_scoped_to_their_topic` | on-disk format, per-tenant scoping, and the `with_metadata` clobber trap |
+| `landed_digest_is_order_independent_and_never_cancels` | commutativity, and the XOR trap |
+
+The DML case is worth stating as a property rather than an example: the skip is
+**content**-keyed, so anything that changes what the bucket would write —
+a DML, a late arrival, a different dedup winner — changes the identity and the
+skip declines. There is no state to keep in sync for that to hold.
 
 ## Rollout
 
