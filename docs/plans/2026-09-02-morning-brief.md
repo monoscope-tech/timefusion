@@ -39,10 +39,28 @@ the budget now share it … a count of 1 … held repair to ~2/hour."* **In
 production no bin is below the budget, so the intended sharing never happens**
 and repair sits in the state that change was written to escape.
 
-- **Fix shape:** either raise `repair_rewrite_budget_bytes` above a real bin's
-  decoded size, or size repair bins below the budget.
-- **Risk:** a memory budget on the rewrite path — related to Decision 2, and
-  best decided with it.
+**The root of it: two gates price the same unit differently, and nothing
+reconciles them.**
+
+| gate | prices on | result |
+| --- | --- | --- |
+| admission (`maintain.rs:3298`) | `task.estimated_decoded_bytes` = **0.25 GiB** stored | **passes** |
+| rewrite semaphore (`~6857`) | actual files = **≥1.25 GiB** | clamps to the whole budget → **bounces** |
+
+`split_time_task` — the preflight that re-measures a unit and splits it — has
+exactly two call sites and **both are dedup**. Repair never calls it, so the unit
+is admitted ~5x underpriced, refused on the real price, and requeued *unchanged*
+~17 times a day for 17 days.
+
+**No value of the repair budget fixes this**, because the unit is priced one way
+to get in and another way to run.
+
+- **Fix shape (cheapest first):** (1) price admission on the same number the
+  semaphore uses; (2) re-measure/split repair the way dedup does. Raising the
+  budget alone treats the symptom.
+- **Caveat:** repair rewrites WHOLE FILES by design, so "split the unit" may not
+  be expressible for it — which would make (1) the real fix. Needs a read of the
+  repair rewrite before committing.
 - **Status:** not implemented.
 
 **A data problem worth fixing on its own:** these tasks' stored
