@@ -1,6 +1,6 @@
 # Morning brief — 2026-09-04
 
-Final state, not the journey. Three fixes shipped, one customer question
+Final state, not the journey. **Four fixes shipped**, one customer question
 answered with a "don't build this", and four decisions that are yours.
 
 ## The headline
@@ -59,8 +59,8 @@ tree**. The other lanes report through `note_unit_progress`, which counts rows
 **written**. So `work.BaseRollup.progress_rows` will now read much LARGER than
 the rows actually published — it is a liveness proxy, not an output count, and
 **`progress_rows` now means different things on different lanes.** Do not compare
-the two families against each other. (That inconsistency is itself a row in the
-coverage matrix below.)
+the two families against each other. (That inconsistency is itself a row in
+`2026-09-04-lane-coverage-matrix.md`.)
 
 ## The pattern behind all four fixes
 
@@ -76,7 +76,9 @@ applied to some lanes but not the one that needed it most.**
 
 That is the generalisation worth acting on: not any single fix, but that the
 codebase has no checklist saying a cross-cutting mechanism must cover every lane.
-A coverage matrix is the cheap version of that checklist.
+A coverage matrix is the cheap version of that checklist, and it is written up in
+**`2026-09-04-lane-coverage-matrix.md`** — including the two lanes that still have
+no "did nothing" signal at all, which is the recommended first task in daylight.
 
 ## The customer question, answered — and the answer is "don't build it"
 
