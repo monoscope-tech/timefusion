@@ -225,3 +225,38 @@ Note the privileged cohort *contains* 85 day-wide units, yet all 9 privileged
 claims were small: within the band, ranking is oldest-data-first, and the very
 oldest (42–43 d) happen to be small. So even inside the privileged lane the
 day-wide work waits behind cyclers.
+
+---
+
+## 10x VALIDATION — matched A/B on two binaries, same journal, same seed
+
+Two binaries built from the same tree differing only in `horizon_turn`
+(`% 8 == 5` vs `false`), each run 6 virtual hours at **200 ingesting streams**
+(10x the journal's ~20 active), minting on.
+
+| metric | BASE | FIXED | delta |
+| --- | --- | --- | --- |
+| **mid_band (3-31 d) claims** | **2** | **21** | **10.5x** |
+| **day-wide claims** | 52 | **81** | **+56%** |
+| executions | 875 | 895 | +20 |
+| pending at end | 17,084 | **16,872** | better |
+| Dedup completions | 119 | 124 | +5 |
+| BaseRollup completions | 377 | 386 | +9 |
+| frontier claims | 684 | 685 | unchanged |
+| privileged (>31 d) claims | 205 | 205 | unchanged |
+
+**The reservation costs nothing.** Frontier and privileged claim counts are
+identical, so the turn is taking from slack rather than from another lane, and
+every lane's completions are equal or better.
+
+**THE LIVELOCK IS SCALE-INVARIANT.** `mid_band = 2` on BASE at 1x *and* at 10x.
+It is a structural ordering defect, not a capacity shortage — **adding workers or
+memory would never have fixed it**, which is precisely why it survived every
+previous throughput investigation.
+
+### What this does NOT claim
+
+10x still does not keep up. Pending ends at ~16.9k against ~2.3k at 1x on the
+same 6 hours, so the queue drains far less under 10x load — the saturation
+finding stands unchanged. **The horizon turn is necessary, not sufficient**: it
+unblocks a band that was structurally unreachable; it does not add throughput.
