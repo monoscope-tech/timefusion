@@ -163,7 +163,39 @@ pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
 /// File-count band for hygiene benefit ranking — see `scheduling_class`.
-const BENEFIT_BUCKET_FILES: u32 = 64;
+///
+/// Coarse ON PURPOSE: `claim_next` matches the winning rank tuple EXACTLY, so a
+/// continuous key would make one cell the sole winner of every claim and defeat
+/// the per-project rotation in `fair_cursors`. The band must still be fine
+/// enough to SEPARATE the cells that exist.
+///
+/// 64 was not. Measured from the prod Delta checkpoint 2026-09-03 over the 104
+/// cells that actually qualify (>= `timefusion_compact_min_files`), file counts
+/// are p50 **35**, p75 56, p90 107, max 338 — squarely inside a 64-wide zero
+/// band:
+///
+/// | bucket | cells tied at zero | distinct bands |
+/// |---|---|---|
+/// | **64** | **88/104 = 84.6%** | 6 |
+/// | 32 | 47/104 = 45.2% | 8 |
+/// | 16 | 22/104 = 21.2% | 13 |
+/// | **8** | **9/104 = 8.7%** | **17** |
+/// | 4 | 0/104 = 0% | 27 |
+///
+/// At 64 the ranker could not separate five sixths of the queue, so ordering
+/// fell through to recency and the project cursor — prod logged the most
+/// indebted HotPacking cell (`files=37`, i.e. band 0) reported `outranked_by` a
+/// same-day rival 50 times in 100 minutes.
+///
+/// **32, not 8**, because the coarseness is a real invariant and 8 breaks it:
+/// `sealed_hygiene_ranks_by_files_removed_not_by_date` requires 200 and 210
+/// files to TIE so `fair_cursors` can rotate projects rather than one cell
+/// winning every claim, and at 8 they land in bands 25 and 26. At 32 they share
+/// band 6, while a p50 cell (35) still separates from a nearly-empty one and
+/// from p90 (107). The linear band cannot separate p50 from p75 (35 and 56 both
+/// land in band 1) — a RATIO band (log2) would do both, but that is a change of
+/// kind on a hot ranking path and wants its own measurement.
+const BENEFIT_BUCKET_FILES: u32 = 32;
 pub const TAG_SOURCE: &str = "timefusion.source";
 pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
@@ -5370,6 +5402,32 @@ mod tests {
     /// Every counter in this system reports how much work EXISTS; none reported
     /// why an existing task is passed over, and `claim_next` decides that inside
     /// filter predicates that leave no trace. Five correct fixes shipped against
+    /// The hygiene benefit band must separate cells at the sizes that EXIST.
+    ///
+    /// Prod 2026-09-03, over the 104 cells meeting `timefusion_compact_min_files`:
+    /// p50 = 35 files, p75 = 56, p90 = 107. At the old 64-wide band **84.6% tied
+    /// at zero** — the ranker could not separate five sixths of the queue, so
+    /// ordering fell through to recency and the project cursor, and the most
+    /// indebted HotPacking cell (`files=37`) was reported `outranked_by` a
+    /// same-day rival 50 times in 100 minutes.
+    ///
+    /// These three sizes are p50-ish, p75-ish and a small cell; at 64 all three
+    /// collapse to band 0.
+    #[test]
+    fn the_benefit_band_separates_cells_at_the_sizes_that_exist() {
+        let band = |files: u32| files / BENEFIT_BUCKET_FILES;
+        assert_ne!(band(35), band(9), "a p50 cell must outrank a nearly-empty one");
+        assert_ne!(band(107), band(35), "p90 must be separable from p50");
+        // ...while staying COARSE. This is not a nicety: `fair_cursors` rotates
+        // projects only among cells that TIE, so a band fine enough to separate
+        // every count makes one cell win every claim. 200 vs 210 must tie —
+        // pinned independently by `sealed_hygiene_ranks_by_files_removed_not_by_date`.
+        assert_eq!(band(200), band(210), "comparable large cells must tie, or rotation dies");
+        assert_eq!(band(35), band(36), "the band must remain coarse enough to tie neighbours");
+        // Honest limit of a LINEAR band at this width: p50 and p75 still tie.
+        assert_eq!(band(35), band(56), "linear banding cannot separate p50 from p75; a ratio band would");
+    }
+
     /// `outranked_by` says the ranker could not separate the WORST cell from a
     /// rival. This says whether it can separate ANY of them — the number that
     /// decides whether `BENEFIT_BUCKET_FILES` is too coarse, and one that cannot
@@ -5385,7 +5443,7 @@ mod tests {
         // Three cells under the 64-file bucket and one far above it: the shape
         // that makes `benefit` inert for the small ones while still ranking the
         // large one.
-        for (project, files) in [("a", 5usize), ("b", 37), ("c", 60), ("d", 400)] {
+        for (project, files) in [("a", 5usize), ("b", 9), ("c", 60), ("d", 400)] {
             let key = task(project, now - 2 * DAY, now - DAY, Operation::HotPacking).key.clone();
             journal.enqueue(key.clone(), 0, 0, 0);
             journal.record_input(&key, InputFootprint::new((0..files).map(|i| format!("{project}/{i}.parquet")), 0));
@@ -5395,8 +5453,10 @@ mod tests {
         assert!(spread.contains("files_max=400"), "the large cell is reported: {spread}");
         // THE point: three of four collapse to bucket 0, so the ranker sees one
         // value for a 5-file cell and a 60-file cell alike.
-        assert!(spread.contains("tied_at_zero=3"), "must report how many cells benefit cannot separate: {spread}");
-        assert!(spread.contains("distinct_buckets=2"), "4 cells occupy only 2 benefit buckets: {spread}");
+        // 5 and 9 land in band 0; 60 -> 1; 400 -> 12. The point of the metric is
+        // the tie count, whatever the band width happens to be.
+        assert!(spread.contains("tied_at_zero=2"), "must report how many cells benefit cannot separate: {spread}");
+        assert!(spread.contains("distinct_buckets=3"), "4 cells occupy 3 benefit bands: {spread}");
     }
 
     /// wrong models of the queue before this existed.
