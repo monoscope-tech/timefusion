@@ -76,6 +76,38 @@ Recording these so nobody re-runs them.
   2026-05-28 incident where FairSpill gave ~30 concurrent INSERTs ~76 MB slots.
   Whether that still applies is worth knowing — but it is now moot for *this*
   failure, per consequence 1 above.
+- **"Files without honest footer ordering force a full sort under `DedupExec`,
+  where the LIMIT cannot reach it."** This was my best structural theory — the
+  dedup requires input ordered by `timestamp DESC`, so a scan that cannot
+  declare that ordering must be sorted in full, below the fetch. **Refuted by
+  counters before it was written up:** `mor_delta_leg_sorts_total` = 0 and
+  `read_dedup.ordering_violations_{total,delta,mem}` = 0 on the live process.
+  The delta leg is not paying a sort.
+
+## Corrections to the first draft of this document
+
+- **`query.text` IS logged** — the first draft said the whale was unattributable
+  because `db.statement` was absent. Wrong field name: the pgwire span carries
+  `query.text` with the statement parameterized. Attribution is available; I
+  simply grepped for the wrong key.
+- **The dominant shape near the failures carries a `LIMIT`.** It is monoscope's
+  log-explorer list query:
+  `select jsonb_build_array(...) from otel_logs_and_spans where project_id = ?
+  and timestamp between ? and ? order by timestamp asc limit ?`
+- **TopK DOES engage for that shape.** `EXPLAIN` on prod over 1-hour and 3-day
+  windows both plan `SortExec: TopK(fetch=100)` above the `DedupExec`, with the
+  scan declaring `output_ordering=[timestamp DESC]` so no sort is needed below.
+  So "the LIMIT never became a TopK" is **not** the general story.
+
+**Therefore the whale remains unattributed.** The failing sorts are 16-partition
+`ExternalSorter` + unspillable `ExternalSorterMerge`, which is a
+`preserve_partitioning=true` sort — a shape none of the plans above produce.
+Correlating by `grep -B1` was too loose to trust (interleaved logs from ~20k
+queries). **The sound method is to match the failing `ThreadId(N)` against that
+thread's most recent `query.text`**, which is the next step. Note one candidate
+seen in the loose correlation, worth checking first: monoscope's enrichment
+`UPDATE ... FROM (SELECT unnest(...) ... ORDER BY ...)`, which sorts with **no
+LIMIT at all**.
 
 ## What must be verified before any fix
 
