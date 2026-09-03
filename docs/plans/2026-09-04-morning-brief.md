@@ -95,6 +95,42 @@ A coverage matrix is the cheap version of that checklist, and it is written up i
 **`2026-09-04-lane-coverage-matrix.md`** — including the two lanes that still have
 no "did nothing" signal at all, which is the recommended first task in daylight.
 
+## Maintenance capacity allocation is UNSTABLE, not misallocated
+
+Two samples of `work.*.worker_secs` normalised to total maintenance work, from
+two different processes an hour apart:
+
+| lane | sample A (uptime 1,260 s) | sample B (uptime 992 s) |
+|---|---:|---:|
+| BaseRollup | 33.5 % | **62.5 %** |
+| Dedup | **35.4 %** | 7.7 % |
+| HotPacking | 15.1 % | 16.0 % |
+| SealedConsolidation | 8.6 % | 8.0 % |
+| Repair | 5.2 % | 4.7 % |
+| DerivedRollup | 2.2 % | 1.1 % |
+
+The two big lanes **swap places completely** — Dedup goes from the largest
+consumer to 7.7 %, BaseRollup from a third to nearly two thirds — while the four
+smaller lanes stay within a point or two.
+
+**The tempting read is "BaseRollup is hogging capacity and starving dedup". I do
+not think that is supported.** What the pair actually shows is that with ~20-minute
+process lifetimes, **which lane dominates is decided by whatever the coordinator
+claims first after a cold start**, and a long unit that begins early holds its
+share for the rest of the (short) process. Allocation is therefore close to
+arbitrary from one restart to the next.
+
+That matters for the goal in a specific way: **no lane can currently be shown to
+be starved, and none can be shown to be greedy** — so any scheduling change made
+now would be tuned against noise. It is a third independent line of evidence for
+decision 2, and it is the reason I stopped shipping scheduling changes tonight.
+
+If sample B's split were the steady state, it alone would explain the entire
+customer chain: dedup at 7.7 % of capacity cannot clear a 2,152-unit backlog, so
+bins stay dirty, certification never grants, and the `hashes` predicate stays
+stranded. Establishing whether it IS the steady state needs exactly one thing —
+a process that lives for a few hours.
+
 ## The customer question, answered — and the answer is "don't build it"
 
 `hashes @> ARRAY['err:…']` on issues pages. Selectivity is superb (**0.03 %–0.54 %**
