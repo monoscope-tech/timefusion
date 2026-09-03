@@ -972,6 +972,33 @@ a red suite is how the next real regression gets waved through.
 buckets**, almost all `e2e-<uuid>` leftovers. Harmless individually; it makes
 `aws s3 ls` useless and will eventually matter.
 
+## Guard fix is LIVE (`ca60cc9`) — and the obvious "win" is NOT attributable
+
+Post-deploy journal comparison, and a number I nearly reported as a result:
+
+| | before (00:21 UTC) | after (08:42 UTC) |
+|---|---|---|
+| live units at the 60 s floor | **147** | **39** |
+| completed at the floor | 8,595 | 8,703 (**+108**) |
+
+A 73% drop — **but the fix had been live for 14 of those 8 hours**, so this is the
+pre-existing backlog draining, not the fix. The +108 completed matches the 108
+drained exactly, which says the population was being worked off and says nothing
+about whether NEW floor units are still being minted.
+
+**The actual test is whether 39 stays flat.** If the guard is working, that number
+should not grow; if it climbs, the fix is not covering the path that mints them.
+Re-pull the journal (checkpoint AND wal) and re-count.
+
+**A counter that cannot answer this, and should be split:**
+`split_declined_at_floor` reads 6 at 14 minutes uptime, which looks like the
+guard biting — except it is incremented at TWO sites in `split_time_task`: the
+`Operation::Repair` early return AND the `split_sheds_enough` decline. Repair
+declines unconditionally, so the 6 could be entirely Repair. This is the same
+one-counter-two-sites trap as the probe-vs-staging timeout conflation from
+2026-09-02. Splitting it would make the guard's effect directly observable
+instead of inferable.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
