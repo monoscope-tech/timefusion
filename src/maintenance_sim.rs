@@ -271,19 +271,58 @@ pub struct SimReport {
 /// finished between 75s and 300s in the measured window.
 fn duration_range_secs(operation: Operation, width_micros: i64, rng: &mut Rng) -> u64 {
     let frontier = width_micros < DAY_MICROS;
+    // MEASURED FROM PRODUCTION 2026-09-03: 676 `maintenance_task_finished`
+    // events over 4 h, bucketed by operation and slice width. The previous
+    // numbers predated the 2026-09-02 dedup-key widening AND priced BaseRollup
+    // at 5-60 s when its real mean is 571 s — a ~16x under-estimate that made
+    // rollup look almost free, which is what produced the "dedup costs 7x a
+    // rollup unit" conclusion. It does not: measured means are Dedup 541 s vs
+    // BaseRollup 571 s, and worker-seconds split 43.7% / 46.7%.
+    //
+    // The dominant feature is BIMODALITY, not the mean: ~65-70% of units in both
+    // lanes finish at ~0 s because they find no work, and the rest are very
+    // expensive. A single uniform range cannot express that, and averaging it
+    // away is what hid the real shape.
+    //
+    //   operation            n    p50    p70    p90    max
+    //   BaseRollup <1d     193      0   1227   2034   2368
+    //   Dedup      <1d     202      0      6   1910   7203
+    //   Repair     <1d      67     37     49    663   5678
+    //   DerivedRollup       68      0      0      0      3
+    //   HotPacking          68      0      0      1     13
+    //   SealedConsolidation 68      0      0     14     26
+    let pct = rng.next() % 100;
     let range = match (operation, frontier) {
-        (Operation::Dedup, true) => (50, 80),
-        (Operation::BaseRollup, true) => (5, 15),
-        (Operation::BaseRollup, false) => (10, 60),
-        (Operation::DerivedRollup, true) => (5, 15),
-        (Operation::DerivedRollup, false) => (10, 60),
-        (Operation::HotPacking, _) => (320, 895),
-        (Operation::SealedConsolidation, _) => (294, 767),
-        (Operation::Repair, _) => (600, 1200),
-        (Operation::Dedup, false) => {
-            // 70% quick, 30% past the deadline — the bimodal shape #175
-            // measured, and the reason a deadline change alone cannot fix it.
-            if rng.next() % 10 < 7 { (60, 240) } else { (300, 900) }
+        // 70% no-op, 20% cheap, 10% the long tail that actually costs.
+        (Operation::Dedup, _) => {
+            if pct < 70 {
+                (0, 6)
+            } else if pct < 90 {
+                (6, 300)
+            } else {
+                (1_910, 7_203)
+            }
+        }
+        // 65% no-op, then a WIDE and frequent expensive mode — this is the one
+        // the old model got most wrong.
+        (Operation::BaseRollup, true) => {
+            if pct < 65 {
+                (0, 5)
+            } else {
+                (1_227, 2_368)
+            }
+        }
+        (Operation::BaseRollup, false) => (0, 11),
+        (Operation::DerivedRollup, _) => (0, 3),
+        (Operation::HotPacking, _) => (0, 13),
+        (Operation::SealedConsolidation, _) => (0, 26),
+        // Half no-op, half a long tail.
+        (Operation::Repair, _) => {
+            if pct < 50 {
+                (0, 49)
+            } else {
+                (49, 5_678)
+            }
         }
     };
     rng.uniform_secs(range.0, range.1)
