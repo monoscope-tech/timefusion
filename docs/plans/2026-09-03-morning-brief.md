@@ -1234,6 +1234,59 @@ along. It remains open work, and it is now the clearest instance of the
 single dedup unit's `GroupedHashAggregateStream` alone peaked at 141 MB across
 ~150 `count(DISTINCT ...)` aggregates.
 
+## THE NEXT OPTIMIZATION: the immutable-column audit is 150 hash sets per group
+
+Found by reading the pool-exhaustion error that scared me during the K=3 check.
+Its top memory consumer is a `GroupedHashAggregateStream` at **141 MB peak**,
+and the aggregate is roughly **150 `count(DISTINCT ...)` accumulators in one
+GROUP BY**.
+
+That is `immutable_audit_sql` (`compact.rs:1063`). For every immutable,
+non-composite field it emits
+
+```sql
+COUNT(DISTINCT c) > 1 OR (COUNT(c) > 0 AND COUNT(c) < COUNT(*))
+```
+
+and `otel_logs_and_spans` has ~150 such fields. It runs **unconditionally** on
+every coordinator dedup shard, justified in its own comment as *"one extra
+aggregate over a shard this rewrite is about to read in full anyway"*.
+
+**That cost model is wrong.** `COUNT(DISTINCT)` is not a scan-bound aggregate: it
+keeps a per-group hash set of observed values. A hundred and fifty of them, over
+every dedup key in the shard, is why it shows up as a top consumer in a pool
+exhaustion — and the pool it exhausts is the 5.0 GB heavy share where the dedup
+rewrite's own sort lives. **A correctness audit is contributing to the failures
+that stop dedup running.**
+
+**It is NOT dead weight** — `immutable_column_disagreement_total` = 4 on the
+current process and 2 log events in 24 h, so it catches real disagreements, and
+the comment is right that "a correctness audit that is off is not an audit".
+
+**The fix turns on what it REPORTS.** The warning logs a COUNT of disagreeing
+groups (`disagreeing`) and the counter is a total — **no per-column granularity
+is consumed anywhere**. So 150 per-column distinct-counts can collapse to ONE
+over a hash of the immutable columns:
+
+```sql
+COUNT(DISTINCT <hash of all immutable columns>) > 1
+```
+
+One accumulator instead of 150, detecting exactly what is currently reported:
+"versions of this key disagree on something immutable".
+
+**The one thing to get right is NULLs.** The current predicate is deliberately
+two-sided because `COUNT(DISTINCT)` ignores nulls and enrichment (a field absent
+on first emit, filled on retry) is the shape that matters. A hash must therefore
+encode null distinctly — `concat_ws` skips nulls and would conflate "null" with
+"absent", so it needs an explicit null marker per column. Get that wrong and the
+audit silently stops catching the case it was built for.
+
+**Not implemented.** It is a semantics change to a correctness audit, the
+existing tests (`compact.rs:1996-2040`) pin the null-shape behaviour precisely,
+and it deserves a deliberate review rather than a 13:00 commit. Ready to write on
+approval.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
