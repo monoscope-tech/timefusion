@@ -422,6 +422,26 @@ thing**, and the remaining lever is more maintenance throughput per unit time �
 not a fairer tuple. Retract my earlier "never claimed, therefore a claim-path
 defect" framing: never-claimed was real, the inference from it was not.
 
+### A second sim defect, found by using it — `--streams` did not scale
+
+Running the 10x experiment immediately exposed that `--streams N` set the
+**total** stream count, not the ingesting one. Once minting became
+activity-gated that modelled almost nothing: a journal with 124 streams of which
+20 ingest answers `--streams 100` by TRUNCATING to 100 real streams — still only
+20 active — so a "5x" run is measured 1x. And the clone template was
+`streams.first()`, whichever stream the journal happened to mention first,
+usually a dormant account whose clones never mint at all.
+
+Now it targets the ingesting count: clone a stream that genuinely ingests and
+stamp the clones active; scaling DOWN retires excess actives rather than dropping
+streams, so their backlog is preserved. `--streams 200` on the prod journal
+reports **200 ingesting of 304** — the 10x customer-count experiment the flag
+already documents.
+
+Worth noting how this was found: not by reading the code, but by running the
+tool and disbelieving a result that looked too flat. A 5x run that produced 1x
+numbers would have been quietly reassuring.
+
 **Left on branch `sim/ingesting-streams`, deliberately unpushed** — it is a code
 change, so pushing restarts prod, and it has no operational urgency at 03:30. It
 is one cherry-pick when you want it. Lint clean; the 20 `maintenance_sim` tests
