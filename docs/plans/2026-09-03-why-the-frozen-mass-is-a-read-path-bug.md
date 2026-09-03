@@ -101,3 +101,34 @@ suggests is NOT small. **Measure before building.**
 - The query-side mitigation (bounding per-partition unspillable merge memory) is
   separate and also unbuilt — but if compaction keeps up, the whale plan should
   stop being generated at all.
+
+## Do not confuse the retired dirty-bin QUEUE with the live probe
+
+Chasing the lever above I found `dirty_bin_enqueued_total = 128` with
+`dirty_bin_eligible_total = 0` and `dirty_bin_processed_total = 0`, and briefly
+read it as another inert mechanism. **It is not — it is deliberate**, and the
+code says so at `maintain.rs:~897`:
+
+> the dedup cron skips every rollup-declared source as "owned by durable
+> coordinator tasks", and both tables that produce dirty bins declare rollups. So
+> the flush path has been filling a queue with no consumer … Retired HERE, not
+> suppressed at `enqueue_dirty_bin`: the queue is the flush path's honest record
+> of what changed, and six tests correctly assert it produces one.
+
+`retire_undrainable_dirty_bins()` drops them on purpose. **`eligible = 0` is the
+designed steady state** for `otel_logs_and_spans`, because the coordinator's
+durable dedup tasks own that work instead.
+
+**This does not weaken the IOx lever, but it does relocate it.** Two different
+mechanisms share the word "bin":
+
+| | what it is | status |
+| --- | --- | --- |
+| dirty-bin QUEUE | the flush path's durable record of changed bins | **retired by design** for rollup-declared tables |
+| `probe_dup_bins` | a LIVE probe that classifies each 10-min bin, ~200x cheaper than a rewrite | alive, but wired only into `run_certification_pass` |
+
+The lever is the **probe**, not the queue: give
+`run_coordinator_dedup_once` the probe's answer so a day-wide unit rewrites only
+the bins that actually carry duplicates. Nothing about the retired queue blocks
+that — but equally, the retired queue is not evidence that bin-level narrowing is
+already tried and rejected.
