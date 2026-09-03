@@ -3242,6 +3242,24 @@ impl Database {
         };
         let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
         let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
+        // The PACKER's own two smallest under-target files. `plan_compaction_debt`
+        // only enqueues a cell whose two smallest fit the same target — "the same
+        // test the packer applies" — so if this pair does NOT fit, the two are not
+        // looking at the same candidate set and that guarantee is void. The
+        // planner does not apply the packer's range filter
+        // (`after_date_filter` -> `after_project_filter` -> `after_range_filter`),
+        // and a subset's two smallest can be a larger pair than the whole set's.
+        //
+        // Prod 2026-09-03: 49% of SealedConsolidation claims selected nothing,
+        // which is that guarantee failing in the field 11 days after the
+        // 2026-08-23 fix. This field decides between "sets differ" and "snapshot
+        // moved between plan and claim" without another deploy.
+        let mut small: Vec<i64> = candidates.iter().map(|add| add.size).filter(|size| *size < target).collect();
+        small.sort_unstable();
+        let smallest_pair = match small.as_slice() {
+            [a, b, ..] => a.saturating_add(*b),
+            _ => -1,
+        };
         let selected = select_coordinator_compaction_candidates(candidates, target);
         // Only when the unit will do NOTHING, so this cannot become chatter: a
         // selection of one file is a 1:1 rewrite and retires no files either.
@@ -3260,6 +3278,8 @@ impl Database {
                 under_target = under_target_candidates,
                 selected = selected.len(),
                 target,
+                smallest_pair_bytes = smallest_pair,
+                smallest_pair_fits = smallest_pair >= 0 && smallest_pair <= target,
                 event = "compaction_unit_selected_nothing",
                 "a compaction unit selected fewer than two files and will retire none"
             );
