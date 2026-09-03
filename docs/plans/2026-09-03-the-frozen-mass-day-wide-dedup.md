@@ -199,3 +199,29 @@ query window from the privileged lane. The shape that fits this codebase is a
 bounded SHARE, which is what both existing reservations (`sealed_turn`,
 `window_turn`) already do. **Design it in the sim first; selection changes are
 this repo's most outage-prone category.**
+
+### The mechanism's own prediction, tested
+
+The livelock predicts: sealed turns land on the >31-day privileged cohort, and
+the 3–31 day band — where the entire day-wide mass lives — gets nothing. Bucketing
+the 29 claimed units by DATA AGE:
+
+| data age of claimed unit | claims |
+| --- | --- |
+| <3 d (fresh frontier) | 20 |
+| **>31 d (privileged)** | **9** |
+| **3–31 d (the 5,132 GiB)** | **0** |
+
+All 29 were ≤10 min wide; zero day-wide. And of the 6 units claimed twice or
+more, **two are 42-day-old privileged smalls** failing with `Resources exhausted`
+and `worker_error` — the cyclers the mechanism requires.
+
+**This unifies the two findings.** The 36.8% killed capacity and the frozen mass
+are one defect: units that fail are not demoted, so the oldest-data cohort holds
+the front of the sealed lane and burns capacity re-failing, while everything
+between 3 and 31 days old — 96% of the queued bytes — is never reached.
+
+Note the privileged cohort *contains* 85 day-wide units, yet all 9 privileged
+claims were small: within the band, ranking is oldest-data-first, and the very
+oldest (42–43 d) happen to be small. So even inside the privileged lane the
+day-wide work waits behind cyclers.
