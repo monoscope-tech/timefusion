@@ -1315,3 +1315,97 @@ approval.
   raise the budgets; they do not make them adaptive.
 - No profiling this session (CPU profiling is off in prod since the 08-11
   SIGSEGV).
+
+---
+
+# Continuation — 2026-09-03 midday
+
+Four more changes shipped. The through-line: **three of the four were found by
+disbelieving a measurement**, and one of my own fixes was correct-but-
+insufficient, which is what led to the real one.
+
+## Shipped
+
+| # | change | status |
+|---|---|---|
+| `cf6e9099` | immutable audit: `COUNT(DISTINCT c)` -> `MIN(c) <> MAX(c)` | **insufficient** — see below |
+| `229e7510` | immutable audit folded into `RunCollapse` | **works**: audit failures 15/28min -> **0** |
+| `e0987d22` | `immutable_audit_shards_total` — the audit's denominator | armed in prod (=4) |
+| `5dbd2b79` | pool exhaustion classified by the SHARED classifier | correct; reach limited, see caveat |
+| `60a28581` | staging failure names `pass` / `files` / `capacity` | deployed, awaiting an event |
+
+## The audit: a correct fix that did not work, and why
+
+`MIN/MAX` removed the audit from the top-5 pool consumers (it had been a 141 MB
+top consumer) — **and it still failed on whale shards.** The dump said why:
+
+```
+top consumers: RepartitionExec ~47 MB (x4)      <- the audit is NOT among them
+... 30-49 MB remain available ... fair(pool_size: 5.0 GB)
+```
+
+**A `FairSpillPool` slices into per-consumer quotas, so the binding constraint is
+the SLOT, not the total.** No accumulator swap reaches that, and as an extra
+consumer the audit was also shrinking the dedup rewrite's own slot — a
+correctness audit degrading the work it rode along with.
+
+The real fix uses a property the codebase already paid for: `RunCollapse` streams
+rows sorted by dedup key, so every version of a key is **adjacent**. Comparing
+each row's row-encoded immutable tuple to the run's first is **O(1) state, one
+compare per row, zero extra consumers** — and strictly better than the SQL,
+because row encoding distinguishes NULL from any value, so both disagreement
+shapes are caught without the two-sided COUNT term. Purely additive: it observes
+the stream and never changes which rows are emitted.
+
+## The second classifier
+
+Chasing "Light optimize staging failed" on one project — failing on **every
+process across three builds** — turned up a divergent copy of the capacity
+classifier:
+
+```rust
+let exhausted = e.to_string().contains("Resources exhausted");   // misses the sort-OOM wording
+```
+
+A spilling sort dies with **"Not enough memory to continue external sort"**. So
+the dominant pool failure scored transient, took the `(None, 1)` branch, and the
+`REPAIR_SORT_PARTITION_LADDER` built to retry it cheaper **never engaged** —
+while the comment beside it asserted the opposite.
+
+**Two self-consistent classifiers cannot be told apart by behaviour tests**, so
+the guard is at the source (`no_second_capacity_classifier_exists`). Same shape
+as the stats-keys-are-two-hand-lists trap.
+
+**CAVEAT, stated because it limits the fix:** `exhausted` is consumed only inside
+`if pass == TailPass::Repair`. The **Pack pass has no failure accounting at
+all** — cleanup, warn, return, re-offer the same bin forever. Whether the whale's
+failures are Repair or Pack was **not in the log**, which is what `60a28581`
+fixes. Pack-side accounting is deliberately NOT added yet: it could park
+legitimate packing work, so observe first.
+
+## Open: 0.083% of user queries fail on sort memory
+
+17 of 20,456 queries in one 62-minute process, every one sort-memory. See
+`2026-09-03-user-queries-are-failing-on-sort-memory.md`. **Not fixed, and not
+attributed** — three hypotheses died (RAM-backed /tmp; TopK never engaging; files
+lacking footer ordering forcing a sort under the dedup — the last refuted by
+`mor_delta_leg_sorts_total = 0`). The failing shape is a 16-partition
+`preserve_partitioning=true` sort that none of the explained plans produce.
+
+## Method corrections — the expensive part of the night
+
+1. **`docker service logs` interleaves tasks and is NOT chronological.**
+   `head`/`tail` of timestamps reads across task blocks and reports a nonsense
+   window — I got "5,436 lines spanning 2 seconds" and nearly wrote it up twice.
+   Compute min/max with `sort`; print the task ids. I also RETRACTED a wrong
+   conclusion drawn from the broken window ("`--since` is bounded to the current
+   task" — it is not; a 12 min window spans two tasks).
+2. **Cluster before dividing.** "6 failures in 11 min" was **4 in 30 seconds** —
+   one dedup wave. And "2 in 8 min = 15/hr" was an n=2 extrapolation. The sound
+   claim was chronic-ness, not a rate.
+3. **A test that passes on the old code is not a regression guard.** My first
+   guard for the classifier bug exercised the *coordinator's* classifier, which
+   was already correct.
+4. **Check a counter before crediting a fix.** `pgwire_sortoom: 0` sits in the
+   16 GB greedy QUERY pool; the audit lives in the 5 GB maintenance pool. No
+   mechanism connects them, so the fix gets no credit for it.
