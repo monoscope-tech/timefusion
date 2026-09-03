@@ -30,10 +30,16 @@ customer's queries **by the same mechanism**.
 | `875ea2a1` | Packer: the row cap must not reduce a bin to ONE file | **Prod cell merged.** `dcad860a/2026-06-17` went 4 files → 3; the 915,417 + 1,108,187 row pair became one file of **exactly 2,023,604 rows**. Livelocked for hours before. |
 | `fa62883e` | Planner: check ROWS too, not just bytes | Its guard claimed to apply "the same test the packer applies" while checking one of two budgets. Test runs the **real packer** and asserts agreement. |
 | `c627b356` | Dedup: certification probes were queued behind probes that cannot certify | Position is budget (one shared deadline). Test verified to fail on the old append ordering. |
-| `eadc9def` | Rollup: the lane had **no liveness signal at all** | Neither `note_unit_progress` nor `PlanProgress` was reachable from it, so the clock read zero for the whole unit. Source-level guard, verified to fail unwatched. |
+| `eadc9def` | Rollup: the lane had **no liveness signal at all** | **VERIFIED IN PROD.** `work.BaseRollup.progress_rows` read **0 in every reading all night**; on the first process carrying this fix it reads **7,778,341**. Neither `note_unit_progress` nor `PlanProgress` was reachable from the lane before. |
 
-`c627b356` and `eadc9def` were still deploying at the time of writing; their
-acceptance checks are listed under "Where I would go next".
+**Two of the four now have direct, counter-independent confirmation:** `875ea2a1`
+by the merged file in the Delta log, and `eadc9def` by `progress_rows` leaving 0.
+`fa62883e` and `c627b356` remain unproven in prod — their effects are grants and
+claim counts, which need the sustained uptime nobody had tonight.
+
+Remember the caveat above: those 7.8 M rows are **plan `output_rows`**, i.e. rows
+read and aggregated, not rows published. The number confirms the lane is now
+*visible*; it is not an output measure.
 
 Lane effect, `work.SealedConsolidation.worker_secs / uptime`: **4.0 % → 49.1 %**,
 with 40.9 M `progress_rows`. Certification counters, comparable ~730 s uptimes,
