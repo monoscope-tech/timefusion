@@ -29,7 +29,11 @@ customer's queries **by the same mechanism**.
 |---|---|---|
 | `875ea2a1` | Packer: the row cap must not reduce a bin to ONE file | **Prod cell merged.** `dcad860a/2026-06-17` went 4 files → 3; the 915,417 + 1,108,187 row pair became one file of **exactly 2,023,604 rows**. Livelocked for hours before. |
 | `fa62883e` | Planner: check ROWS too, not just bytes | Its guard claimed to apply "the same test the packer applies" while checking one of two budgets. Test runs the **real packer** and asserts agreement. |
-| `c627b356` | Dedup: certification probes were queued behind probes that cannot certify | Position is budget (one shared deadline). Test verified to fail on the old append ordering. **Not yet deployed at time of writing.** |
+| `c627b356` | Dedup: certification probes were queued behind probes that cannot certify | Position is budget (one shared deadline). Test verified to fail on the old append ordering. |
+| `eadc9def` | Rollup: the lane had **no liveness signal at all** | Neither `note_unit_progress` nor `PlanProgress` was reachable from it, so the clock read zero for the whole unit. Source-level guard, verified to fail unwatched. |
+
+`c627b356` and `eadc9def` were still deploying at the time of writing; their
+acceptance checks are listed under "Where I would go next".
 
 Lane effect, `work.SealedConsolidation.worker_secs / uptime`: **4.0 % → 49.1 %**,
 with 40.9 M `progress_rows`. Certification counters, comparable ~730 s uptimes,
@@ -46,6 +50,33 @@ consistent across three independent counters, but the magnitudes need a re-read
 on a process with a couple of quiet hours. `dedup_skipped` is still 0 — two
 grants is not enough, because a query loses its `DedupExec` only when **every**
 date it reads is granted.
+
+### One measurement caveat this creates
+
+`eadc9def` gives the rollup lane liveness via `PlanProgress`, which feeds the
+progress counter from **`output_rows` summed over every operator in the plan
+tree**. The other lanes report through `note_unit_progress`, which counts rows
+**written**. So `work.BaseRollup.progress_rows` will now read much LARGER than
+the rows actually published — it is a liveness proxy, not an output count, and
+**`progress_rows` now means different things on different lanes.** Do not compare
+the two families against each other. (That inconsistency is itself a row in the
+coverage matrix below.)
+
+## The pattern behind all four fixes
+
+Every one is the same shape: **a mechanism that exists, is correct, and was
+applied to some lanes but not the one that needed it most.**
+
+| mechanism | fixed for | was missing from |
+|---|---|---|
+| shared capacity classifier | coordinator | hot-tail staging (`5dbd2b79`, earlier) |
+| both packer budgets in the planner | bytes | rows (`fa62883e`) |
+| fair position under a shared deadline | claim ordering (`dd4a557f`) | probe ordering (`c627b356`) |
+| liveness watcher for blocking operators | repair, dedup (2026-09-01) | **rollups** (`eadc9def`) |
+
+That is the generalisation worth acting on: not any single fix, but that the
+codebase has no checklist saying a cross-cutting mechanism must cover every lane.
+A coverage matrix is the cheap version of that checklist.
 
 ## The customer question, answered — and the answer is "don't build it"
 
