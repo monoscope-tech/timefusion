@@ -953,12 +953,17 @@ there too. That is a real exoneration.
 - Not the local environment as far as I can reach it: MinIO healthy, the
   `timefusion-tests` bucket present, disk at 99 GiB free.
 
-**What is not established:** why it passed at 01:00 and has failed since. The
-`tiny_interior` decline depends on the certified interior, which depends on what
-dedup/certification has done for those dates — so a plausible reading is that the
-fixture's certification is not reproducible from a cold local store, and the
-01:00 pass was the lucky state rather than the correct one. I did not confirm
-that, and I am not going to assert it.
+**It fails in CI too** — run 33733339918, `Clippy & Test (shard 1)`, retried
+three times, on a docs-only commit. That **kills my "cold local store"
+speculation** from an hour earlier: CI is a clean environment with no inherited
+MinIO state, so this is deterministic given the current code and date, not local
+cruft. It also means **master's CI is red for everyone**, not just my worktree.
+
+**What is still not established:** why it passed in the 01:00 local full suite
+and has failed everywhere since. The window is anchored to
+`Utc::now().date_naive()`, so a date-dependent interaction is the obvious
+suspect, but the fixture writes its own synthetic data and I could not close the
+argument. I am not going to assert a mechanism I have not shown.
 
 **Someone should own this**: it is the only thing keeping master's suite red, and
 a red suite is how the next real regression gets waved through.
