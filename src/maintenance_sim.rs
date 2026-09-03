@@ -320,7 +320,27 @@ struct Stream {
     derived_rollup_table: Option<String>,
     source: String,
     project_id: String,
+    /// Newest `created_unix_ms` this stream ever produced — the journal's own
+    /// record of when it last ingested. See `STREAM_IDLE_MICROS`.
+    last_created_ms: u64,
 }
+
+/// How recently a stream must have produced work to count as INGESTING.
+///
+/// The sim used to mint for EVERY stream every `MINT_INTERVAL_MICROS`, but prod
+/// invalidates on actual WRITES — an idle stream costs nothing there. The gap is
+/// not small: measured from `created_unix_ms` in a real journal, prod's arrival
+/// rate is **5,782 tasks/day** against the model's **35,712**, a ~6x
+/// over-estimate, because only **21 of 124** streams were active.
+///
+/// That made the sim useless for the question it exists to answer. With minting
+/// off it drains any backlog (nothing competes); with minting on it buries the
+/// queue under arrivals that are not real. Neither reproduces contention, which
+/// is the regime every scheduler decision actually lives in.
+///
+/// Calibrated from the journal rather than guessed: a stream mints only if it
+/// produced a task within this window of the journal's newest record.
+const STREAM_IDLE_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 
 /// Contiguity model mirroring `min_contiguous_days`: a day counts for a tier
 /// once that tier covers its full width, and contiguity counts back from
@@ -520,11 +540,13 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     derived_rollup_table: None,
                     source: key.source.clone(),
                     project_id: key.project_id.clone(),
+                    last_created_ms: 0,
                 });
                 streams.len() - 1
             }
         };
         let stream = &mut streams[position];
+        stream.last_created_ms = stream.last_created_ms.max(task.created_unix_ms);
         match key.operation {
             Operation::Dedup | Operation::HotPacking => stream.source_table = key.physical_table.clone(),
             Operation::BaseRollup => stream.base_rollup_table = key.physical_table.clone(),
@@ -532,6 +554,13 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             _ => {}
         }
     }
+    // Only streams that are actually INGESTING mint. Discovery walks every task
+    // the journal ever held, so without this an account that stopped writing
+    // weeks ago still generates frontier work forever — which is where the ~6x
+    // arrival over-estimate came from. See `STREAM_IDLE_MICROS`.
+    let newest_created_ms = streams.iter().map(|s| s.last_created_ms).max().unwrap_or_default();
+    let idle_cutoff_ms = newest_created_ms.saturating_sub(STREAM_IDLE_MICROS as u64 / 1_000);
+    let ingesting = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
     anyhow::ensure!(!streams.is_empty() || !cfg.mint_frontier, "no streams found in journal; pass --no-mint");
     if let Some(target) = cfg.streams {
         let Some(template) = streams.first().cloned() else { anyhow::bail!("--streams needs at least one real stream in the journal") };
@@ -543,6 +572,11 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         streams.truncate(target);
     }
 
+    if cfg.mint_frontier {
+        // Printed because it is the single number that decides whether an
+        // arrival-rate result is believable at all.
+        eprintln!("sim: minting from {ingesting} INGESTING streams of {} in the journal", streams.len());
+    }
     let mut coverage =
         Coverage { days: HashMap::new(), pairs: streams.iter().map(|s| (s.source.clone(), s.project_id.clone(), s.derived_rollup_table.is_some())).collect() };
     // Seed coverage from already-complete rollup tasks so a fetched journal
@@ -598,7 +632,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
 
         if now >= next_mint {
             if cfg.mint_frontier {
-                for stream in &streams {
+                for stream in streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms) {
                     mint_stream(&mut journal, stream, next_mint - MINT_INTERVAL_MICROS, next_mint, next_mint);
                 }
             }
