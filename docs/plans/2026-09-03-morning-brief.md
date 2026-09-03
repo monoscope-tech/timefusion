@@ -598,10 +598,25 @@ The levers that actually matter, in order of proven effect:
 1. **Make a dedup unit cheaper.** The dedup-key widening shipped 2026-09-02 did
    exactly this (2.4x on the real prod bin) and is the single biggest lever
    already banked.
-2. **Stop doing the expensive form when a cheap one suffices** — dedup is a
-   PROOF, not a removal, and `probe_dup_bins` computes the same proof ~200x
-   cheaper (see `2026-09-01` notes). That remains unexploited and is the largest
-   remaining item.
+2. ~~Stop doing the expensive form when a cheap one suffices~~ — **CORRECTION:
+   this is ALREADY DONE, and I nearly handed it over as the largest open item.**
+   `dedup_partition_range_limited` probes first and rewrites only the bins that
+   actually contain duplicates: *"identify the hour buckets that actually contain
+   duplicates … bounds the materialization to one hour of one project instead of
+   the whole day"*, and *"probe keys before materializing rows: it bounds the
+   common no-duplicate case by key cardinality rather than row width."* The
+   "`probe_dup_bins` computes the proof 200x cheaper and throws it away" note
+   describes the CRON sweep, not the coordinator path the fleet actually runs.
+
+   **So the ~285 s mean dedup duration is ALREADY the probe-optimised cost.**
+   What remains expensive is the probe itself — a `GROUP BY` over dedup-key
+   cardinality across the partition — which is precisely the "scans 454M rows to
+   drop 3,782" shape. The proof, not the removal, is the cost.
+
+   That makes the real lever **not re-proving cleanliness for data that has not
+   changed** — which is what certification is for, and certification's blocker is
+   coverage, not cost. The chain closes on itself: cheaper dedup needs
+   certification, certification needs dedup coverage.
 3. **Stop manufacturing the input** — 58% of duplicates are rows our own WAL
    replay re-inserted; `TIMEFUSION_LANDED_SKIP_ENABLED` addresses it and is still
    defaulted OFF.
