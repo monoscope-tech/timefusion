@@ -561,9 +561,56 @@ faithfully. Repair staying at 293 in both is a good internal check: it is
 throttled by its byte semaphore rather than by claims, so it should not move with
 stream count, and it does not.
 
-**Next experiment (cheap, offline):** add a Dedup reservation lane and re-run the
-same two rows. The sim now makes that a minutes-long question rather than a
-prod deploy.
+**I ran that experiment, and it FAILED — which is the more useful result.**
+
+The lane mix is set by `operation_cycle`: `CYCLE_BALANCED` gives Dedup 3 slots of
+10, and `CYCLE_COVERAGE_SHORT` — selected whenever the fleet contiguity gauge is
+low — gives it **1 of 10** while BaseRollup gets 4. That looks like a feedback
+loop: coverage short -> starve dedup -> certification cannot happen -> coverage
+stays short. So I doubled dedup's share in that cycle (1/10 -> 2/10, BaseRollup
+4 -> 3) and re-ran 10x:
+
+| 10x, 12 h | Dedup=1/10 | **Dedup=2/10** |
+|---|---|---|
+| Dedup completions | 1,510 | **1,725 (+14%)** |
+| BaseRollup | 14,472 | 14,411 |
+| pending | 14,510 | 14,156 |
+
+**Doubling the slots bought 14%, not 2x.** Slot allocation is not the binding
+constraint, and a scheduling fix here would have been a wasted deploy.
+
+### The actual constraint: a dedup unit costs ~7x a rollup unit
+
+From the sim's own duration model, itself fitted to measured prod behaviour:
+
+```
+Dedup      frontier  50-80 s    sealed  60-240 s (70%) / 300-900 s (30%)  mean ~285 s
+BaseRollup frontier   5-15 s    sealed  10-60 s                           mean  ~35 s
+```
+
+Dedup occupies a worker **6.5x longer on the frontier and ~8x sealed**. With a
+fixed worker pool, its completions are governed by worker-SECONDS, not by slots —
+so giving it more turns barely moves the number, exactly as measured.
+
+**That is the 10x answer, and it is a cost problem, not a scheduling problem.**
+The levers that actually matter, in order of proven effect:
+
+1. **Make a dedup unit cheaper.** The dedup-key widening shipped 2026-09-02 did
+   exactly this (2.4x on the real prod bin) and is the single biggest lever
+   already banked.
+2. **Stop doing the expensive form when a cheap one suffices** — dedup is a
+   PROOF, not a removal, and `probe_dup_bins` computes the same proof ~200x
+   cheaper (see `2026-09-01` notes). That remains unexploited and is the largest
+   remaining item.
+3. **Stop manufacturing the input** — 58% of duplicates are rows our own WAL
+   replay re-inserted; `TIMEFUSION_LANDED_SKIP_ENABLED` addresses it and is still
+   defaulted OFF.
+
+Only after those does more capacity help. This also explains why tonight's three
+shipped fixes are necessary but not sufficient: they unblock units, they do not
+make units cheaper.
+
+
 
 ## Honest uncertainties
 
