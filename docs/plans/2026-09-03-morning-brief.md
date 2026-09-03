@@ -34,7 +34,43 @@ urgency): the two `timefusion sim` fixes, on `sim/ingesting-streams` and
 `fix/streams-active`. **Both matter** — without them every scale run measures
 roughly 1x. Cherry-pick when convenient.
 
-## THE TOP LEVER, measured: stop manufacturing the duplicates
+## ~~THE TOP LEVER~~ — RETRACTED ONE HOUR LATER, and here is the falsifying number
+
+**I published the section below and then tried to falsify it, which is what I
+should have done first.** The claim was that
+`TIMEFUSION_LANDED_SKIP_ENABLED` is the number-one 10x lever. It is not.
+
+```
+replay_rows        0      <- WAL replay re-inserted NOTHING on this 5.5 h process
+landed_skips       0
+landed_skipped_rows 0
+```
+
+And the last five prod shutdowns carry **no error string** — they are clean
+deploys, not crashes. The landed skip only ever fires on a **dirty** boot, so on
+the current restart pattern **it would never fire at all**.
+
+**What survives, and what does not:**
+
+- **Survives:** certification declines 231:1 on dirty bins, and that IS the
+  binding constraint on the 10x chain. The table below stands.
+- **Does not survive:** that the flag would fix it. The 58%-self-inflicted figure
+  came from a sampled prod file — those are duplicates ALREADY ON DISK from an
+  earlier OOM-crash era. The flag prevents NEW ones during unclean exits; it does
+  not remove existing ones, and prod is currently exiting cleanly.
+
+So the flag is **insurance against a future OOM era**, exactly as my own note
+called it ("the flag is OOM insurance"), and worth enabling on that basis — but
+it is not what clears the 12,716 dirty-bin declines. **Clearing those requires
+actually running dedup over them, which puts the top lever back on dedup
+throughput and unit cost** — where the 10x section already put it.
+
+**Method note for next time:** I ranked a lever from a causal story
+(replay → dirty bins → declines) without checking whether the first arrow was
+currently firing. One counter (`replay_rows`) falsified it in a single query.
+Check that the mechanism is ACTIVE before ranking it, not after.
+
+## The original section, kept for its measurements: certification declines on dirty bins
 
 The 10x chain ends at certification — cheaper dedup needs certification, and
 certification needs dedup. Measured on the 5.5 h quiet process, certification is
