@@ -79,3 +79,52 @@ split already bisects a selected unit for free. **Selection is the defect.**
 **Selection/ordering changes are the most outage-prone category in this repo's
 history** (`tf_sealed_lane_pinned_by_metrics`, the superseded-vetoes incident), so
 whatever comes out of this runs through the sim first and ships alone.
+
+---
+
+## Update — the ordering analysis REFUTES my own "selection excludes them"
+
+I read the full selection path afterwards. It does **not** exclude day-wide
+units; if anything it should PREFER them:
+
+- `claimable` = right operation, `Pending|Retry`, `deadline <= now`, not
+  quarantined. **561 day-wide units have `retry_reason = None`**, so they are not
+  quarantined; 700 of 719 pass the deadline gate.
+- `hole_rank` returns **2 for any non-rollup operation**, so dedup tasks have
+  `hole = 2`. That matters: `rank` zeroes width only when `hole == 0`, so for
+  dedup **width is preserved**, not discarded (I briefly believed the opposite).
+- The sealed branch returns `(1, starved, -scheduling_width(), benefit, …)`.
+  Width is **negated**, so a day-wide unit sorts BEFORE a ten-minute one.
+- `starved` = 255 while `waited < STARVATION_MICROS` (3 d), else 254 (until the
+  31-day horizon). The day-wide cohort waited ~18 days -> **254**; freshly minted
+  smalls -> **255**. Smaller runs first, so day-wide **outranks** them here too.
+- `eligible_watermark_lag_seconds = 0`, so `sealed_turn` is `claim_tick % 2`,
+  i.e. a **50%** share, not 25%.
+
+**So "never selected" is not established, and I withdraw it as a diagnosis.**
+Every ordering rule I can find favours these units. What is measured and stands
+is the OUTCOME: 2 distinct day-wide keys touched in a 3h20m journal window, and a
+cohort that has not moved in 18 days. Mechanism: **still open.**
+
+## The finding that IS solid, and is separately serious
+
+`work.Dedup.killed_secs = 9,905` against `work.Dedup.worker_secs = 26,933` on a
+3,835 s process:
+
+> **36.8% of all dedup worker capacity produced nothing** — units claimed, run to
+> their deadline, killed, requeued.
+
+Dedup holds ~7.0 of the fleet's 16 slots on average (26,933/3,835), so this is
+not a small lane wasting a little; it is the largest lane wasting over a third of
+itself. `dedup_timed_out_total` reads 0, so **the kills are not being counted as
+timeouts** — another zero-that-means-not-measured, like the audit denominator.
+
+That waste is a plausible mechanism for the frozen mass without any selection
+defect at all: if day-wide units are the ones being claimed and killed, they
+would show as "touched rarely, never completing" exactly as observed — and
+`retry` state is **73% day-wide**, which is consistent.
+
+**Next measurement, and it is cheap:** correlate the killed units' identities.
+If `killed_secs` is concentrated on day-wide units, the diagnosis collapses into
+one sentence — *the mass is claimed, cannot finish inside the deadline, and is
+requeued forever* — and the lever is unit cost and deadline, not selection.
