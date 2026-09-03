@@ -134,3 +134,68 @@ would show as "touched rarely, never completing" exactly as observed — and
 If `killed_secs` is concentrated on day-wide units, the diagnosis collapses into
 one sentence — *the mass is claimed, cannot finish inside the deadline, and is
 requeued forever* — and the lever is unit cost and deadline, not selection.
+
+---
+
+## RESOLVED — the mechanism is a starvation livelock past the 31-day horizon
+
+The withdrawal above was itself wrong. A second journal pull, diffed against the
+first on `attempts` (which increments AT CLAIM), settles it:
+
+| dedup band | claims in ~50 min |
+| --- | --- |
+| **day-wide** | **0** |
+| mid | 0 |
+| ≤10 min | **35** (15 completed) |
+
+All **96 newly minted** dedup keys in that window were ≤10 min. So "never
+claimed" is confirmed twice, by two independent signals — and my code reading was
+the thing that was wrong.
+
+### What the code reading missed
+
+`starved` is not a two-value flag. It is:
+
+```rust
+if waited < STARVATION_MICROS { u8::MAX }                                  // 255
+else { (u8::MAX - 1).saturating_sub((waited - STARVATION_HORIZON).max(0) / DAY) }  // 254 and BELOW
+```
+
+Past the **31-day horizon** it keeps improving, one rank per extra day. So a unit
+whose DATA is 43 days old scores 243 and permanently outranks everything at
+254/255. Measured on the live journal:
+
+- **148 of 761** sealed claimable dedup units have data older than 31 days, so
+  `starved < 254`. They outrank **all 613 others**, forever.
+- Their data age is 32–43 days; **76 of the 148 are the whale project**.
+- **55 of the 148 are in `retry`** — `worker_error` (26), `resource_admission`
+  (14), sort-OOM (9).
+
+**The livelock:** the oldest-data units win every sealed turn; a large share of
+them fail; they requeue; they are still the oldest; they win again. Nothing
+younger — including the 5,132 GiB of day-wide work — ever gets a sealed turn.
+This is the 31-day cliff from `tf_starvation_cliff_and_refuted_premises` seen
+from the other side: the cliff does not merely protect old work, it **pins the
+lane**.
+
+A second, smaller distortion found on the way: `scheduling_width()` is
+`backfill_priority_micros.unwrap_or(slice.width())`, so a **360-second** unit
+carrying a day-sized `backfill_priority` presents as day-wide to the ranker. 54
+of the 148 privileged units carry one. Width is therefore not a reliable
+statement of unit size in the ordering.
+
+### Confidence and its limits
+
+The rank comparison was reproduced by transcribing `rank`/`scheduling_class` into
+Python and running it over the real journal — a **diagnostic aid, not an
+authority** (transcribing this logic is exactly how the sim drifted). It is
+believed because it PREDICTS the observed behaviour: it picks a small
+old-data unit as the sealed winner, and prod claims only small units.
+
+### Do not fix by raising STARVATION_MICROS
+
+Already refuted locally (9 test failures) per the code comment — it evicts the
+query window from the privileged lane. The shape that fits this codebase is a
+bounded SHARE, which is what both existing reservations (`sealed_turn`,
+`window_turn`) already do. **Design it in the sim first; selection changes are
+this repo's most outage-prone category.**
