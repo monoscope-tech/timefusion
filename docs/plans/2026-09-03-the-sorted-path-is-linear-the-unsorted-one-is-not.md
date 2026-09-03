@@ -246,3 +246,31 @@ ingest path, which carries an acked-write-loss incident history.
 **What would settle it:** the gate's width and the current escalation rate. If
 escalations are rare and the gate is wide, lowering toward ~256 MB is close to
 free; if the gate is narrow, the queueing term has to be measured first.
+
+### RESOLVED: do NOT lower `sort_skip_bytes`. The gate is 2 permits wide, by incident.
+
+The open question was the gate's width and the escalation rate. The width settles
+it alone:
+
+- `timefusion_flush_sort_pool_mb` = **1024 MB**
+- `flush_sort_gate` is sized at **512 MB per permit** -> **2 permits**
+- and the code records why concurrency here is capped:
+
+> "N>1 partitions fans out to N ExternalSorters plus an UNSPILLABLE
+> SortPreservingMergeExec, and **concurrent escalations starved the FairSpillPool
+> into the unsorted fallback (prod 2026-08-03)**"
+
+**Lowering the threshold from 2 GiB toward the measured ~93 MB crossover would
+push far more flushes through a two-permit gate whose contention has ALREADY
+produced unsorted files in production** — the precise failure the whole sorted
+path depends on avoiding, and the one `flush_sort_unsorted_fallbacks` exists to
+page on.
+
+So the +769 ms at 1.5 GB is **the price of a safety property, not an oversight.**
+The comment's "~370 MB" understates the crossover, but the threshold is not set at
+the crossover and should not be: it is set where escalation stays rare enough to
+fit two permits.
+
+**If this is ever revisited, the order is: widen the pool FIRST (more permits at
+512 MB each), verify `flush_sort_unsorted_fallbacks` stays 0 under load, and only
+then lower the threshold.** Doing it the other way round reproduces 2026-08-03.
