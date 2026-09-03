@@ -2809,7 +2809,27 @@ impl TaskJournal {
             self.park_schema_failure(key, crate::support::now_micros(), &reason);
             return;
         }
-        if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1), None) {
+        // Price the guard on the unit's OWN estimate, not a bare synthetic.
+        //
+        // This passed `MAX_DECODED_BYTES + 1`, which made `split_sheds_enough`
+        // compare a CONSTANT against the parent's real measured bytes: against
+        // any parent above ~683 MiB, 512 MiB always satisfies
+        // `observed * 4 < parent * 3`, so the shed test passed at EVERY level
+        // and the lineage bisected to `MIN_SLICE_MICROS`. The guard was
+        // structurally blind here — it cannot compare a measurement to a
+        // constant. Prod 2026-09-03: 147 live units at or below the 60 s floor
+        // (all `base_rollup`, one whale) and 8,595 completed there.
+        //
+        // `max(estimate, MAX + 1)` because the synthetic does TWO jobs and only
+        // one was wrong. It also forces `byte_bounded_units` past its
+        // `<= MAX_DECODED_BYTES` early return, so a unit that OVERRAN ITS
+        // DEADLINE still splits though its estimate claims it fits
+        // (`a_unit_that_overruns_its_deadline_twice_is_bisected`). Taking the
+        // max keeps that: a large real estimate reaches the guard intact, a
+        // small or unpriced one falls back to the synthetic and splits as before.
+        let estimate = self.task_indices.get(key).map_or(0, |index| self.snapshot.tasks[*index].estimated_decoded_bytes);
+        let observed = estimate.max(MAX_DECODED_BYTES.saturating_add(1));
+        if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, observed, None) {
             return;
         }
         // Split refused (already at minimum width, or would hash-shard) on a
@@ -3881,6 +3901,45 @@ mod tests {
         let children: Vec<_> = journal.tasks().filter(|t| t.key != key && t.state == TaskState::Pending).collect();
         assert_eq!(children.len(), 2, "one bisection: two half-day children");
         assert!(children.iter().all(|t| t.attempts == 0));
+    }
+
+    /// REPRODUCES the 2026-09-03 split-floor leak: `retry_or_split` handed the
+    /// guard a SYNTHETIC `MAX_DECODED_BYTES + 1` instead of the unit's own
+    /// estimate, so `split_sheds_enough` compared a CONSTANT against the
+    /// parent's real measured bytes. Against any parent above ~683 MiB that
+    /// constant always satisfies `observed * 4 < parent * 3`, so the shed test
+    /// passed at every level and the lineage bisected to `MIN_SLICE_MICROS`.
+    ///
+    /// Prod 2026-09-03: **147 live units at or below the 60 s floor** — all
+    /// `base_rollup`, all one whale project — plus 8,595 completed there
+    /// historically, with `parent_measured_bytes` 512 MiB..17,020 MiB against
+    /// own estimates of 171 MiB..8,510 MiB. The guard was consulted at every
+    /// level and said yes at every level.
+    ///
+    /// The unit below shed NOTHING: its own estimate equals its parent's
+    /// measurement, so bisecting again cannot help and must be declined.
+    #[test]
+    fn a_lineage_that_did_not_shed_is_not_split_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        const DAY: i64 = 86_400_000_000;
+        const MEASURED: u64 = 8 * 1024 * 1024 * 1024;
+        let mut unit = task("whale", 0, DAY, Operation::BaseRollup);
+        unit.attempts = 3;
+        unit.parent_measured_bytes = Some(MEASURED);
+        unit.estimated_decoded_bytes = MEASURED;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+
+        journal.retry_or_split(&key, "resource_admission".into(), 1_000_000, 3);
+
+        assert_eq!(
+            journal.state(&key),
+            Some(TaskState::Retry),
+            "a unit that shed NOTHING against its parent must be retried, not bisected again — \
+             splitting it only mints children that each pay the same scan"
+        );
+        assert_eq!(journal.tasks().filter(|t| t.key != key).count(), 0, "and it must mint no children");
     }
 
     /// When the split is REFUSED (already at minimum width), a repeated
