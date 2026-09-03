@@ -1168,6 +1168,35 @@ differenced: 36 Dedup completions/hour.
 quarter of fleet throughput while carrying the largest queue (1,596 against
 base_rollup's 935), and it is the lane certification depends on.
 
+## K=3 IS LIVE (`d8253be`) — one risk signal, one counter-signal, not yet judgeable
+
+| signal | K=4 baseline | K=3 at 5 min uptime |
+|---|---|---|
+| `compaction_permits_unavailable` | 58 / 99 min = **0.59/min** | 88 / 5 min = **16.0/min (27x)** |
+| `pending_hot_packing` | 18 | **15** |
+| `dedup_failed_total` | 0 | 0 |
+
+**The 27x jump is the abort signal I wrote down before deploying.** It is also a
+five-minute-old process, which is precisely the reading this file warns about
+twice already — a fresh coordinator claims hard through a smaller permit pool,
+and cumulative counters divided by a tiny uptime exaggerate it.
+
+**The counter-signal disagrees:** `pending_hot_packing` went 18 -> 15. Starvation
+looks like the queue GROWING while claims stop; this is the queue shrinking.
+
+**So it is not judgeable yet, and I am not acting on either reading.** What to
+compare at ~40 minutes of uptime:
+
+- `compaction_permits_unavailable` rate against 0.59/min. If it settles near or
+  below ~2/min, the burst was startup. If it holds above ~5/min, the permit pool
+  is genuinely too small at K=3.
+- HotPacking completions per hour against the **26/hr** measured at K=4.
+- `pending_hot_packing` against 18 — climbing is the real starvation tell.
+
+**Revert if it holds:** `REPAIR_REWRITE_TARGET_FILES` 2 -> 1. That keeps the
+honest decoded-to-pool ratio and returns the permit by asking repair for less
+concurrency, rather than restoring an envelope the bench says fails.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
