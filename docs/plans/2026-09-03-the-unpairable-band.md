@@ -162,3 +162,49 @@ the full selection).
 precondition is not the packer's precondition, and that is why an incident
 "fixed" on 2026-08-23 is measurably still occurring on 2026-09-03 at 49% of
 SealedConsolidation claims.
+
+## RESOLVED — and the byte hypothesis was WRONG
+
+The `smallest_pair_bytes` field this doc asked for (shipped `c9365d55`) reported,
+from prod `dcad860a/2026-06-17`:
+
+```
+after_range_filter=4 unsorted_candidates=0 under_target=2 selected=0
+smallest_pair_bytes=220396056 smallest_pair_fits=true target=268435456
+```
+
+**`fits=true`.** The two smallest files sit at 82 % of the byte budget. So the
+"unpairable band between target/2 and 7/8 target" described above — a BYTE
+problem — **is not what is happening**, and neither proposed fix (convergence at
+`target/2`, relaxing the byte limit) would have moved this cell. Nor was it the
+planner/packer candidate-set mismatch guessed in the FURTHER CORRECTION.
+
+**It is the ROW cap, and the two cells measured fail it in opposite ways:**
+
+| cell | two smallest | bytes | rows | vs `MAX_BIN_ROWS` |
+|---|---|---|---|---|
+| `dcad860a/2026-06-17` | 95.4 + 114.8 MiB | 82 % of budget | 2,023,604 | **1.18 % over** |
+| `be87ebc1/2026-07-02` | 99.0 + 107.7 MiB | 81 % of budget | 12,646,579 | **532 % over** |
+
+Both are livelocks — claimed repeatedly, selecting one file, retiring nothing,
+because a one-file bin is discarded by the `< 2` guard. But they need opposite
+answers, and both shipped:
+
+1. **`875ea2a1` — the packer.** A marginal overshoot must not cost a whole unit.
+   The SECOND file is now exempt from the row cap, bounded at `2 * MAX_BIN_ROWS`;
+   bytes still bind unconditionally, so such a pair is never larger than one
+   converged file. This unblocks `dcad860a`. The dense shape the cap exists for
+   (256 MB bins at 5.58 M rows, 9/9 past the 900 s deadline) stays excluded.
+2. **`fa62883e` — the planner.** A massive overshoot must stop being QUEUED.
+   `plan_compaction_debt` checked bytes only while its comment claimed to apply
+   "the same test the packer applies". Both budgets now live in one predicate,
+   `packer_admits_pair`, and a test runs the real packer and asserts the two
+   answers agree. `be87ebc1` is correctly no longer admitted — merging 12.6 M
+   rows is exactly what the deadline cannot hold.
+
+**The lesson is about the instrument, not the bug.** This doc reached three
+different confident conclusions from counters alone — an unpairable byte band, a
+`MAX_BIN_ROWS` co-binding, a candidate-set mismatch — and the one field that
+actually settled it (`smallest_pair_fits`) took four lines to add. The funnel
+already logged six numbers about this failure and not one of them was the
+binding constraint.
