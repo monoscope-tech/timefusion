@@ -382,6 +382,46 @@ reservation, and the slot is genuinely free). The design is sound, but the sim
 says the band is not what starves these units — so shipping it would treat a
 symptom I cannot demonstrate. Not writing it is what the tool was for.
 
+### RESOLUTION — they are not blocked, they are BEHIND A BACKWARD-WALKING FRONTIER
+
+The discriminator is not project, source, or date. **23 of the 24 stuck
+(project, source) pairs also COMPLETE units**, and 15 slice-dates have both
+completions and stuck units. So nothing categorical is blocking them.
+
+Age is what separates them, as a gradient rather than a cliff:
+
+| day-wide =MAX dedup | n | slice age (days) min / **median** / max |
+|---|---|---|
+| **completed** | 312 | 18 / **38** / 47 |
+| **stuck** | 297 | 10 / **21** / 32 |
+
+63 completed while inside the band and 19 stuck while past it, so 31 d is not a
+hard gate — but `starved` improves *one step per day past the horizon*
+("saturating at 0, ~285 d"), so older work wins more often and the fleet **walks
+backward through history**. It has worked down to ~38 days and is grinding
+through the 30–40 d range; the 10–30 d cohort is simply **ahead of the frontier,
+not excluded by it**.
+
+That reconciles every observation, including the two I could not fit before:
+
+- **`attempts` never increments** — correct, and not evidence of a gate. These
+  units have never been the best-ranked candidate, so `claim_next` has never
+  returned one. Never-selected and never-blocked look identical in the journal.
+- **The sim drains them** — also correct. It is IO-free, so its throughput is far
+  above prod's; given enough executions the backward walk reaches everything
+  inside 24 h. The starvation only appears when capacity is genuinely scarce,
+  which the sim cannot represent.
+
+**So this is a THROUGHPUT problem, not a scheduling bug** — the same conclusion
+the whole night converged on from four directions. The queue is progressing in a
+defensible order; it is progressing too slowly, and certification for those dates
+waits behind it.
+
+That also means **the two throughput fixes shipped tonight are aimed at the right
+thing**, and the remaining lever is more maintenance throughput per unit time —
+not a fairer tuple. Retract my earlier "never claimed, therefore a claim-path
+defect" framing: never-claimed was real, the inference from it was not.
+
 **Left on branch `sim/ingesting-streams`, deliberately unpushed** — it is a code
 change, so pushing restarts prod, and it has no operational urgency at 03:30. It
 is one cherry-pick when you want it. Lint clean; the 20 `maintenance_sim` tests
