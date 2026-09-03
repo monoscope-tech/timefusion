@@ -239,6 +239,25 @@ const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
 /// without widening total concurrency. Raise it only alongside a bench that
 /// moves the cliff.
 const REPAIR_REWRITE_TARGET_FILES: usize = 2;
+/// Decoded bytes one byte of sort pool can carry before rewrites start failing.
+///
+/// THE UNIT CONVERSION the repair lane was missing. Its semaphore is priced in
+/// DECODED bytes (what admission grants) while the pool it draws from is priced
+/// in POOL bytes, and until now one constant stood in for both — so raising
+/// repair's concurrency silently re-priced `light_optimize_k`'s holdback, and
+/// the two could never be reasoned about separately.
+///
+/// Measured, `benches/rewrite_throughput.rs` fleet ladder, one shared 8 GiB pool
+/// against a real 204 MB prod file at 2,451 MB decoded each:
+///
+/// ```text
+/// 6 workers  14.7 GB decoded / 8 GiB pool = 1.79x   0 failed
+/// 8 workers  19.6 GB decoded / 8 GiB pool = 2.39x   4 FAILED
+/// ```
+///
+/// 1.79 is the passing point, not a midpoint guess — the cliff is between these
+/// two rungs and this takes the safe side of it.
+const SAFE_DECODED_PER_POOL_BYTE: f64 = 1.79;
 /// Heavy maintenance's minimum share of the maintenance pool. 0.40, up from
 /// 0.25 — a REBALANCE inside the existing pool (total unchanged), following
 /// the workload: hot-tail packing (light share) converged once unstarved,
@@ -464,6 +483,26 @@ impl DerivedBudget {
         (self.repair_rewrite_budget_bytes() / MIB).max(1)
     }
 
+    /// Per-sort budgets `light_optimize_k` must hold back so the repair lane's
+    /// DECODED budget has enough POOL behind it.
+    ///
+    /// Derived rather than hand-set, which is the whole point: the semaphore and
+    /// the holdback measure different things (decoded bytes vs pool bytes), and
+    /// a single shared constant meant changing repair's concurrency moved
+    /// hot-tail packing's permit count as a side effect. That coupling is the
+    /// 2026-09-01 HotPacking outage class — K went 3 -> 1 and packing stopped
+    /// being claimed at all.
+    ///
+    /// At today's values: 6,144 MiB decoded / 1.79 = 3,432 MiB of pool, which is
+    /// 3 slices of `COORDINATOR_PER_SORT_BUDGET_BYTES`. The previous hand-set
+    /// holdback of 2 implied 2.4x decoded-to-pool — past the 2.39x rung that
+    /// FAILED on the bench. So this costs one light permit and buys repair's
+    /// two-way concurrency an envelope it can actually run in.
+    pub fn repair_pool_holdback_slices(&self) -> usize {
+        let pool_bytes = self.repair_rewrite_budget_bytes() as f64 / SAFE_DECODED_PER_POOL_BYTE;
+        (pool_bytes / COORDINATOR_PER_SORT_BUDGET_BYTES as f64).ceil() as usize
+    }
+
     /// What heavy and light divide, once the coordinator has taken its share.
     fn maintenance_split_bytes(&self) -> usize {
         self.maintenance_pool_bytes - self.coordinator_share_bytes()
@@ -565,7 +604,7 @@ impl DerivedBudget {
         // before they could. Prod 2026-09-01: `Not enough memory to continue
         // external sort` on repair staging as soon as long-running units and
         // K=4 hygiene bins shared 8 GB sixteen ways.
-        let mem_bound = (self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES).saturating_sub(REPAIR_REWRITE_TARGET_FILES);
+        let mem_bound = (self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES).saturating_sub(self.repair_pool_holdback_slices());
         let cpu_bound = self.cores / 4;
         mem_bound.min(cpu_bound).min(hot_project_count).max(1)
     }
@@ -2945,7 +2984,7 @@ mod tests {
         // on the same coordinator pool and was never counted here.
         assert!((3..=11).contains(&k), "K={k} outside the expected 3..=11 range");
         assert_eq!(
-            k + REPAIR_REWRITE_TARGET_FILES,
+            k + b.repair_pool_holdback_slices(),
             b.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES,
             "exactly the repair lane's holdback is reserved out of light's share"
         );
@@ -3101,16 +3140,29 @@ mod tests {
         let prod = DerivedBudget::from_limits(80 * GIB, 48);
         assert_eq!(
             prod.light_optimize_k(11),
-            prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES - REPAIR_REWRITE_TARGET_FILES,
-            "the memory term is the coordinator's pool, less the budgets repair draws from it"
+            prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES - prod.repair_pool_holdback_slices(),
+            "the memory term is the coordinator's pool, less the pool repair's decoded budget actually needs"
         );
         assert!(prod.light_optimize_k(11) > 1, "one permit shared by HotPacking and SealedConsolidation starves packing");
         // The bench's measured optimum: k hygiene permits + 1 repair = 6
         // concurrent rewrites, one rung below the 8-worker cliff.
         assert_eq!(
-            prod.light_optimize_k(11) + REPAIR_REWRITE_TARGET_FILES,
+            prod.light_optimize_k(11) + prod.repair_pool_holdback_slices(),
             6,
             "the fleet must run at the measured optimum, not one rung either side — the light/repair SPLIT may move, the total may not"
+        );
+        // THE INVARIANT the decoupling exists to hold: repair's decoded budget
+        // must fit the pool its holdback reserves, at the ratio the bench
+        // measured. Violating it is what the old hand-set holdback of 2 did —
+        // 6,144 MiB decoded against 2,560 MiB of pool is 2.4x, past the 2.39x
+        // rung that FAILED.
+        let holdback_pool_bytes = prod.repair_pool_holdback_slices() * COORDINATOR_PER_SORT_BUDGET_BYTES;
+        assert!(
+            prod.repair_rewrite_budget_bytes() as f64 <= holdback_pool_bytes as f64 * SAFE_DECODED_PER_POOL_BYTE,
+            "repair may not be admitted more decoded bytes ({} MiB) than its pool holdback ({} MiB at {}x) can carry",
+            prod.repair_rewrite_budget_bytes() / MIB,
+            holdback_pool_bytes / MIB,
+            SAFE_DECODED_PER_POOL_BYTE,
         );
         assert!(prod.light_optimize_k(11) < prod.cores / 4, "and the CPU term is not what binds on a big box");
     }
