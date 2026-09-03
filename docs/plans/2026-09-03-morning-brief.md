@@ -277,6 +277,52 @@ the obstruction is in the real claim path, which the sim does not model.
 That is the handoff: a precisely localised unknown, four dead ends closed off,
 and a reproduction (`--no-mint`) that shows the queue is drainable in principle.
 
+### THE MECHANISM: a 14–31 day no-man's-land between two protections
+
+Live dedup units bucketed by SLICE age (the age `starved` actually grades):
+
+| bucket | n | attempts=0 | median attempts | **exactly =MAX** |
+|---|---|---|---|---|
+| 0–3 d fresh | 761 | 405 | 0 | **0** |
+| 3–14 d — inside the query window | 271 | 175 | 0 | **9** |
+| **14–31 d** | **270** | 103 | **1.0** | **269** |
+| >31 d ancient | 113 | 63 | 0 | 19 |
+
+**269 of 270 units in the 14–31 d band are exactly `MAX_DECODED_BYTES`**, and it
+is the only band whose median `attempts` is 1 — tried once, then never again.
+The stuck cohort is not scattered; it is a *band*.
+
+Two protections exist in `claim_next`, and they bracket this band without
+covering it:
+
+1. **The window reservation** — "one claim in four is RESERVED for work inside
+   the window dashboards read", `QUERY_WINDOW_MICROS` = **14 d**. Shipped
+   precisely because *"days 4–14 of every dashboard window … are outranked by
+   months of history starved by a wider margin."* It protects **≤14 d**.
+2. **`starved`** — better the longer a slice has waited, so **>31 d** work
+   outranks everything younger.
+
+A slice at 14–31 days is **too old for the reservation and too young to win on
+`starved`**. It can only be claimed on an ordinary turn, where it loses to both.
+
+So the earlier fix did not remove the starvation point — **it moved it**, from
+≤14 d to 14–31 d. And that is exactly where `coarsen_sealed_slices_capped` puts
+its day-wide =MAX output, which is why the two signatures coincide so completely.
+
+**Why the sim drains them anyway:** `--no-mint` generates no frontier work, so
+nothing competes and the reservation logic never binds. The sim is right that the
+queue is drainable; it cannot see a contention effect that only exists under live
+ingest.
+
+**Still not fixed tonight, and the reason is in the code's own comments:**
+*"Raising `STARVATION_MICROS` is the WRONG fix and was refuted locally (9 test
+failures) — it evicts the window from the privileged lane instead of protecting
+it."* The shape that has worked twice here is reserving a SHARE, not moving a
+threshold. A third reservation lane, or widening the window lane's definition to
+cover the coarsening output, is the candidate — with `timefusion sim` under
+**mint enabled** (the default) to reproduce the contention first, because
+`--no-mint` provably cannot.
+
 ### (superseded hypothesis, kept for the reasoning) the [3 d, 31 d] band
 
 My first guess was class starvation — sealed work losing to frontier forever.
