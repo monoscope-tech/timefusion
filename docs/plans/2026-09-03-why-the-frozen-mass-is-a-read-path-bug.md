@@ -132,3 +132,63 @@ The lever is the **probe**, not the queue: give
 the bins that actually carry duplicates. Nothing about the retired queue blocks
 that — but equally, the retired queue is not evidence that bin-level narrowing is
 already tried and rejected.
+
+---
+
+## RETRACTION — the IOx bin-narrowing lever is REFUTED, by a measurement taken two days ago
+
+I proposed narrowing the dedup rewrite to dirty bins and said "measure before
+building". **The measurement already existed**, in
+`tf_dedup_removal_is_the_constraint_2026-09-01`, and it refutes the lever:
+
+- Duplicates are **sparse** — 0.0004% of rows (~8k dropped per 2B scanned).
+- Duplicates are **SPREAD** — **≈26-50 dirty bins of 144 per date**.
+- And it was already tried: *"Slice-scoped dedup exists (`DedupRangeOptions.slice`)
+  but does NOT help — `stage_dedup_chunk` re-reads every file a chunk touches and
+  **files span bins**, so rewriting 18-35% of bins still touches most files.
+  **The whole-date unit is approximately right-sized.**"*
+
+**Narrowing ROWS does not narrow FILES**, and the file set is the cost. IOx's rule
+holds for IOx because its compactor reasons over file overlap; our rewrite already
+reads whole files, so bin-level selectivity buys nothing.
+
+That note also records the near-miss in the other direction: a first sample of
+1 decline / 1 dirty bin looked "concentrated" and would have justified building
+bin-scoped scheduling for a workload with the opposite shape. **Sample size, not
+reasoning, settled it — twice now.**
+
+## Correction: how much of a read-path fix is `dd4a557f`, really?
+
+Above I wrote that the horizon turn "is a read-path fix as much as a maintenance
+one". **Qualify that.** The same note says dedup ranks by AGE and therefore works
+the oldest backlog *while queries read the newest dates*, and its recommendation
+was a boost scoped to the **last-14-day window** — which `window_turn` already
+serves.
+
+`dd4a557f` reserves a share for the **(14 d, 31 d]** band, i.e. work OUTSIDE the
+query window. So:
+
+- **What it does fix:** a band that was structurally unreachable, its
+  contribution to certification, and the disjointness of days that 14d/30d
+  dashboards read.
+- **What it does NOT fix:** latency for the common recent-window query. That
+  band was already covered by `window_turn`, and the burst failures measured
+  today are not evidence about the 14-31 d band specifically.
+
+The honest claim is narrower than the one I made: **the horizon turn unblocks
+backlog and coverage; it is not the recent-query latency lever.**
+
+## So what IS the remaining unit-cost lever?
+
+Not bin narrowing. The same note points at the durable one, and it is an INGEST
+fix, not a maintenance one:
+
+> 0.0004% spread everywhere smells like client retries landing in separate files.
+> Prevent them at ingest with a dedup-key check inside the MemBuffer's 10-minute
+> bucket, so new dates are born certifiable and need neither rewrite nor probe.
+
+That attacks the problem where it is cheapest — a hash check against rows already
+in memory — instead of paying to remove duplicates after they have been written,
+sorted, and spread across files. It is also the only option that scales to 100x,
+because its cost is per-row-at-ingest rather than per-byte-rewritten-later.
+**Unbuilt, and the correct next investigation.**
