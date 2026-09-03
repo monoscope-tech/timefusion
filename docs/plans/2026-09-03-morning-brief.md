@@ -1504,3 +1504,56 @@ behaviour tests** — the guard is at the source.
 - **Query sort-memory failures are BURSTY** (17 in one hour, 0 in the next three)
   and still unattributed. `query.text` IS logged, so the correlation must be
   ARMED before a burst rather than run after one.
+
+## VERIFIED IN PROD — `dd4a557f` moves both numbers it should
+
+The pre-fix build was sampled at two ages, so the comparison needs no
+interpolation: the fixed build falls outside that range, favourably, on both
+metrics.
+
+| build | uptime | killed_secs / worker_secs | rows/worker-sec |
+| --- | --- | --- | --- |
+| pre-fix | 64 min | **36.8%** | 315,483 |
+| pre-fix | 180 min | **23.2%** | 293,668 |
+| **`dd4a557f`** | **82 min** | **8.8%** | **587,082** |
+
+**36.8% -> 8.8% of dedup capacity wasted**, and ~2x the rows per worker-second.
+Both pre-fix trends were *decreasing* with age, so an age effect cannot explain a
+value below the older, lower point.
+
+Caveats kept: n=1 per build, workload uncontrolled, shard mix drives
+`progress_rows`. The strength here is the bracketing, not the single reading.
+
+## The duplicate measurement — and the number I nearly published
+
+The proposed ingest-side dedup check was gated on one measurement. It came back
+**refuting the lever**, and it caught an artifact first.
+
+Reading all **625 files** in the whale's `date=2026-09-02` prefix said 70.5% of
+keys were duplicated, 3.2x physical. **Wrong: only 201 of those files are LIVE.**
+The other 424 are superseded files Delta removed and VACUUM has not deleted, and
+reading them re-materialises every pre-compaction version — manufacturing the
+duplicates.
+
+On the **201 live files**: **1.014x** rows/keys, **1.36%** of keys duplicated, and
+**ZERO exact duplicates** — every live same-key group differs in `updated_at`,
+i.e. is a legitimate merge-on-read enrichment version. With 95.8% cross-file on
+top, an in-bucket ingest check would see nothing and a key-only check would EAT
+enrichment.
+
+**Rule: a partition prefix is not a table.** Resolve the Delta live set from the
+checkpoint before measuring anything over an object listing.
+
+**Two follow-ups:** 68% of the files in that prefix are dead and awaiting VACUUM
+(bucket bytes, and they inflate any tool that scans the prefix); and dedup's real
+job on this table is collapsing enrichment VERSIONS, not removing client
+duplicates.
+
+## Levers researched and REFUTED tonight (do not re-propose without new data)
+
+| lever | why it is dead |
+| --- | --- |
+| bin-narrowed dedup rewrite (IOx-style) | files SPAN bins, so narrowing rows does not narrow the file set — and the file set is the cost |
+| ingest-side dedup-key check | 95.8% cross-file (uncatchable in-bucket) AND zero exact duplicates to catch |
+| attempts-based demotion for the livelock | sim: mid_band stayed at 2, because 76 of 148 privileged units never failed |
+| raising `STARVATION_MICROS` | previously refuted, 9 test failures — evicts the query window from the privileged lane |
