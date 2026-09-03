@@ -1142,11 +1142,26 @@ now (10:11 UTC) — about **+22/hour**.
 If both hold, arrivals are running near 58/hour against 36 completed, i.e. the
 dedup lane is **falling behind by roughly 22 units/hour** during daytime load.
 
-**The caveat that stops this being a headline:** session start was night and now
-is the working day, so some of that rise is diurnal, and my pending readings were
-opportunistic rather than sampled. A 24-hour comparison at the same clock time is
-what would separate "diurnal" from "trend", and I do not have one. A clean
-one-minute-interval sample is running to get the real slope.
+**RETRACTED, by the sample I started to check it.** Twelve readings at
+one-minute intervals:
+
+```
+pending_dedup:  1569 1590 1596 1596 1589 1564 1584 1574 1532 1524 1494 1520
+tasks_pending:  2580 2602 2615 2615 2603 2553 2593 2270 2291 2270 2210 2255
+```
+
+Over 11 minutes `pending_dedup` **FELL by 49** — the opposite direction — while
+oscillating by ±50 inside the window. The "+22/hour drift" came from comparing
+two opportunistic readings 13 hours apart, across a night-to-day transition and
+several process restarts. **There is no measured upward trend.**
+
+`tasks_pending` also drops **323 in a single minute** (2,593 -> 2,270), so the
+queue moves in bulk steps — most likely a coarsening/supersede pass — which makes
+any short window unreliable in BOTH directions. A defensible trend claim needs
+hours of sampling, not two points or eleven minutes.
+
+**What survives is the completion rate**, which is directly counted rather than
+differenced: 36 Dedup completions/hour.
 
 **Why it matters anyway:** 36/hour is the number to hold against the sim's
 ~141 units/hour fleet-wide figure and prod's ~162/hour. Dedup is roughly a
