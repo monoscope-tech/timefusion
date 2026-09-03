@@ -1082,6 +1082,42 @@ by a shared constant.
 failure being the pre-existing `a_chart_under_a_derived_table_routes`), lint and
 fmt clean.
 
+## K=4 -> 3 BASELINE, and a precondition of mine that has since changed
+
+The holdback derivation takes `light_optimize_k` from 4 to 3. I justified
+spending that permit on "HotPacking has zero backlog, so there is slack" — taken
+from the lane survey earlier in the night. **That is no longer true**, and it is
+worth saying plainly rather than letting the justification stand unexamined.
+
+Measured just before the change deployed, at K=4, 99 minutes uptime:
+
+| signal | value |
+|---|---|
+| `pending_hot_packing` | **18** (was 0 earlier tonight) |
+| HotPacking units finished | **41 in 95 min = ~26/hr** |
+| `compaction_permits_unavailable` | 58 in 99 min = 0.59/min |
+| `pending_dedup` | 1,596 (drifting up from ~1,300 overnight) |
+| `pending_base_rollup` / `sealed_consolidation` / `derived_rollup` | 935 / 222 / 204 |
+
+**The lane is FLOWING, not starved** — 41 completed against 18 queued is a
+working queue, not a stall. The 2026-09-01 outage was K=1 with **zero** claims in
+45 minutes against 17 pending, which is a different condition entirely. K=3
+should cost roughly a quarter of the permit pool, not stop it.
+
+**But that is now a prediction, not an assumption, and it is testable** —
+unlike the three dormant fixes, this lane is actively claiming, so there IS a
+live before/after here:
+
+- `pending_hot_packing` should stay bounded near 18, not climb.
+- HotPacking completions should land near ~20/hr, not near zero.
+- `compaction_permits_unavailable` will rise somewhat (fewer permits, same
+  demand); a jump of an order of magnitude is the abort signal.
+
+**If it climbs, revert is one constant**: `SAFE_DECODED_PER_POOL_BYTE` back to
+the implied 2.4x, or `REPAIR_REWRITE_TARGET_FILES` to 1. I would take the second —
+it keeps the honest ratio and gives the permit back by asking repair for less
+concurrency, rather than restoring an envelope the bench says fails.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
