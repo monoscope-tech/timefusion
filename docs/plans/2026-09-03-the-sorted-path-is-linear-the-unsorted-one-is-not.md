@@ -274,3 +274,58 @@ fit two permits.
 **If this is ever revisited, the order is: widen the pool FIRST (more permits at
 512 MB each), verify `flush_sort_unsorted_fallbacks` stays 0 under load, and only
 then lower the threshold.** Doing it the other way round reproduces 2026-08-03.
+
+---
+
+## Confirmed on a REAL prod file (34.6 MB whale parquet, 117,024 rows, pool 256 MB)
+
+`TF_BENCH_PARQUET=<real whale file> TF_BENCH_POOL_MB=256 cargo bench --bench
+rewrite_throughput` — 256 MB is prod's actual per-worker share (4.2 GB / 16 jobs),
+so these are the conditions a real unit runs under.
+
+| variant | secs | MB/s in |
+| --- | --- | --- |
+| scan only | 0.7 | 49.1 |
+| sort b256 p1 | 0.6 | 58.3 |
+| sort b256 p8 | 0.7 | 54.2 |
+| sort b2048 p1 | 0.7 | 50.8 |
+| **sort b2048 p8** | **FAILED — pool exhausted** | — |
+| sort b8192 p1 | 0.7 | 51.5 |
+| **sort b8192 p8** | **FAILED — pool exhausted** | — |
+| PROD: b256 p1 x13 slices | 1.1 | 32.7 |
+| **dedup WINDOW b256 p1** | **12.7** | **2.86** |
+| **dedup COLLAPSE b256 p1** | **0.7** | **55.35** |
+| dedup COLLAPSE b2048 p1 | 0.8 | 45.0 |
+
+### 1. The collapse is worth 18x ON REAL DATA
+
+**WINDOW 12.7 s vs COLLAPSE 0.7 s.** The `ROW_NUMBER() OVER (PARTITION BY ...)`
+plan against the streaming `RunCollapse` (shipped 2026-09-02), on the real row
+shape and row-group layout — which the doc comment warns a generator cannot
+reproduce. It independently corroborates the 20-43x synthetic result above.
+
+### 2. Eight partitions CANNOT run at prod's per-worker pool
+
+`sort b2048 p8` and `sort b8192 p8` both fail at 256 MB, and the dump names why:
+
+```
+SortPreservingMergeExec[0](can spill: FALSE) consumed 116.5 MB, peak 116.5 MB
+Failed to allocate additional 196.7 MB ... fair(pool_size: 256.0 MB)
+```
+
+**An UNSPILLABLE merge takes 116 MB of a 256 MB share before any sorting
+happens.** `p1` survives every variant. This is direct justification for
+`target_partitions = 1` on the rewrite path — and it is the SAME unspillable-merge
+shape that kills the whale queries in the 16 GB query pool. One mechanism, two
+symptoms, now measured in both places.
+
+### 3. Repair's slicing costs 57%
+
+`PROD: b256 p1 x13 slices` takes **1.1 s** against **0.7 s** for the single pass
+over the same file — 13 SQL passes over one file, each re-reading it. That is a
+57% tax on the repair path specifically, and it is a knob (`slice count`) rather
+than a law.
+
+**Batch size barely matters** (b256 / b2048 / b8192 all ~0.6-0.7 s at p1), so the
+`batch_size = 256` choice costs nothing here — the cost is partitions and plan
+shape, not batching.
