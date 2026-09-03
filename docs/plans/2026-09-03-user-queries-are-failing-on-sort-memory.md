@@ -1,4 +1,8 @@
-# 0.083% of user queries fail on sort memory — and one query cannot fit the pool
+# A BURST of user queries fails on sort memory — and one query cannot fit the pool
+
+> **Read the two updates at the end before quoting anything here.** The headline
+> rate below (0.083%) is ONE process's hour; three later hours had zero. It is a
+> burst, not a steady state.
 
 **Measured 2026-09-03** on a single 62-minute prod process (`uptime_seconds` =
 3698), build `d8253be`. This is the first *user-facing* failure rate this
@@ -116,11 +120,11 @@ so the levers are partition count, batch size, and the up-front reservation —
 all three interact, and two of them trade against query latency. Before touching
 any of them:
 
-1. **Get the query shape.** `db.statement` is not logged, so the whale is
-   currently unattributable. A sort of 4+ GB with no effective bound suggests an
-   `ORDER BY` that never became a TopK. If it carries a `LIMIT`, the real fix is
-   why TopK did not engage — that is a bounded-memory fix worth far more than
-   re-slicing the pool.
+1. **Get the query shape.** ~~`db.statement` is not logged~~ — corrected above:
+   the span field is `query.text` and it IS logged. The dominant nearby shape
+   carries a LIMIT and DOES plan a TopK, so the "ORDER BY that never became a
+   TopK" theory is refuted for it. The whale is still unattributed, and because
+   the failures are BURSTY the correlation must be armed BEFORE one happens.
 2. **Do not bundle this with the audit-fix verification window.** One change per
    deploy; the audit fix (`cf6e9099`) is mid-deploy and needs a clean window.
 3. **Any change that makes queries spill *more* makes the 100 GB
