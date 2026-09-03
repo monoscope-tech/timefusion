@@ -116,3 +116,49 @@ accounting rather than in the selector, which already returns empty correctly.
 **Net for the morning:** the measurement stands (29.2% of cells, 49% of claims),
 the diagnosis stands, and the fix is smaller in scope than first written — but it
 lands in `plan_compaction_debt`, not in `select_coordinator_compaction_candidates`.
+
+---
+
+## FURTHER CORRECTION: the guard EXISTS. The bug is a planner/packer set mismatch.
+
+Both fixes above are moot: **`plan_compaction_debt` already applies the exact test
+I derived**, with the same reasoning and the same incident cited —
+
+```rust
+small.sort_by_key(|file| file.size);
+let mergeable = small.len() >= 2 && small[0].size.saturating_add(small[1].size) <= small_target;
+if mergeable { /* enqueue */ }
+```
+
+> "Requiring the two SMALLEST to fit together is the same test the packer applies,
+> so a queued unit can always do work." — prod 2026-08-23, `dcad860a/2026-08-22`
+
+And the thresholds agree: the planner uses `COORDINATOR_SEALED_TARGET_BYTES` for a
+sealed date, and `select_coordinator_compaction_candidates` is called with the
+same constant.
+
+**So why do 49% of claims still select nothing?** The comment's claim — "the same
+test the packer applies" — is what to doubt, because the two run over
+**different candidate sets**:
+
+- the planner tests the two smallest of the files IT saw when planning;
+- the packer tests the two smallest of what survives ITS filters, and the funnel
+  shows one the planner does not apply:
+  `after_date_filter=77 -> after_project_filter=19 -> after_range_filter=19`.
+
+If the packer's set is a subset, its two smallest can be a DIFFERENT, larger pair
+than the planner's — and the guarantee evaporates. `snapshot_files=6373` vs
+`after_date_filter=77` also means planner and packer may simply be looking at
+different snapshots at different times.
+
+**This is the precise next step, and it is a measurement, not a change:** log the
+PAIR the planner accepted (its two smallest and their sum) alongside the funnel,
+and compare against what the packer saw for the same cell. Either the sets differ
+(fix: apply the same range filter in the planner) or the snapshot moved between
+plan and claim (fix: re-check mergeability at claim time, cheaply, before doing
+the full selection).
+
+**Do NOT "add" the mergeable guard — it is there.** The defect is that its
+precondition is not the packer's precondition, and that is why an incident
+"fixed" on 2026-08-23 is measurably still occurring on 2026-09-03 at 49% of
+SealedConsolidation claims.
