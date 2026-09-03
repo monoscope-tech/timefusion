@@ -105,3 +105,9 @@ Then, in order:
 Item 2/3 is the real design change and it is not small. Item 1 is a measurement
 and should come first, because if sealed dates are *not* moving, then the 94.5 %
 is all today's partition and the whole picture changes.
+
+> **SUPERSEDED in its central mechanism** — see
+> `2026-09-03-correction-the-proof-is-stale-not-churned.md`. Sealed dates in the
+> 2-7d band received ZERO file-set changes in 4.2 h, so there is no churn to race:
+> the proof is STALE and never re-issued, not repeatedly destroyed. The root
+> (starved dedup lane) and the customer-facing conclusion are unchanged.
