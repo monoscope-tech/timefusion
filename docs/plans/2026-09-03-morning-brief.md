@@ -889,6 +889,51 @@ orderings that starved narrow repair units, then the opposite end). This wants
 review, and the sim — now that its durations are measured — can test either
 candidate offline before it goes near prod.
 
+## The sim REIMPLEMENTS the split guard, so it tests a copy
+
+Worth knowing before anyone tries to reconcile the four failing sim tests.
+`maintenance_sim.rs:510` carries its own transcription of `split_sheds_enough`:
+
+```rust
+let sheds = task.parent_measured_bytes.is_none_or(|parent|
+    observed > parent || observed * denominator < parent * numerator);
+...
+let split = journal.split_time_task(key, observed, footprint);   // a MODELLED observation
+```
+
+It calls `split_time_task` directly and passes a modelled observation — it never
+goes through `retry_or_split`, and therefore never sees the synthetic
+`MAX_DECODED_BYTES + 1` that was the actual defect. **That is why the sim never
+reproduced it**, and why the guard fix (`ca60cc95`) changes none of the four
+failing tests: the sim is exercising a copy of the rule, not the rule.
+
+So the causal story is narrower than it first looked:
+
+- The **prod journal** is what proved the defect — 147 live units at the 60 s
+  floor, 8,595 historically. The fix rests on that, not on the sim.
+- The **sim failure** is what made me go and look. Useful, but indirect.
+- The sim's own floor behaviour under measured durations is a statement about
+  ITS model of splitting, which has now drifted from the real one in a way that
+  matters.
+
+**That reframes the four failures.** Three options, and I do not think this
+should be decided by whoever is next to touch it:
+
+1. **Make the sim call the real guard** instead of transcribing it. Removes a
+   whole class of drift, and would let the sim actually model the synthetic path.
+   Biggest change, best long-term.
+2. **Rewrite the assertions** to what measured durations make true (e.g. 13
+   projects no longer hold the frontier). Honest, but bakes in the new numbers
+   without fixing the duplication.
+3. **Keep the old durations** and lose the calibration — cheapest, and wrong: the
+   optimistic model is what hid a live defect for as long as it did.
+
+`a_unit_that_overruns_its_deadline_twice_is_bisected` is a fourth, separate case:
+it is now FLAKY rather than wrong. Its comment says "with scale 10x, a timeout is
+certain", which was true when every dedup unit ran 60-900 s; under the measured
+bimodal model ~70% finish in 0-6 s and never time out. That one needs a
+duration floor in the fixture, not a new assertion.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
