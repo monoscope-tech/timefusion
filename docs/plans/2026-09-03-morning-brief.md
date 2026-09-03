@@ -834,6 +834,61 @@ stopped bouncing, which is exactly what the budget increase was supposed to do.
 The remaining contention is entirely the oversized class — the one the
 decoupling fix (top morning decision) addresses.
 
+## WHY THE SPLIT-FLOOR GUARD LEAKS — diagnosed, fix NOT written
+
+The sim's third failing test (`units_at_min_slice == 0`) reproduces a real prod
+defect: **147 live units sit at or below `MIN_SLICE_MICROS` (60 s)** — all
+`base_rollup`, all the whale — plus **8,595 completed there historically**
+(7,726 base_rollup, 869 dedup). `base_rollup`'s bisect floor IS `MIN_SLICE`, so a
+60-second rollup unit is exactly the shred the guard exists to prevent.
+
+**The guard:**
+
+```rust
+fn split_sheds_enough(parent_measured_bytes: Option<u64>, observed_bytes: u64) -> bool {
+    let Some(parent) = parent_measured_bytes else { return true };   // fail-OPEN
+    observed_bytes > parent || observed_bytes * 4 < parent * 3       // permit if it sheds >=25%
+}
+```
+
+**It is not the fail-open branch.** All 147 at-floor units DO carry
+`parent_measured_bytes` (512 MiB … 17,020 MiB). The guard was consulted every
+level and said yes every level.
+
+**It is the synthetic measurement.** `retry_or_split` splits via
+
+```rust
+self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1), None)
+```
+
+— a **synthetic 512 MiB**, not an observation. The guard then compares that
+constant against the parent's REAL measured bytes. Against any parent above
+~683 MiB, 512 MiB always satisfies `observed * 4 < parent * 3`, so the shed test
+passes at every level and the lineage bisects to the floor. The at-floor units'
+own estimates are 171 MiB … 8,510 MiB, so many are still over budget when they
+get there — and with `hash_shards = 1` they cannot shed by key either.
+
+The design is aware of the synthetic (there is a test named
+`a_synthetic_stamp_still_splits_at_scale`) — the intent is that a synthetically
+stamped lineage must still be splittable. The unintended consequence is that on
+the retry path **the guard is structurally blind**: it is asked to compare a
+measurement against a constant.
+
+**Two candidate fixes, both real changes to split behaviour:**
+
+1. **Re-measure before splitting on the retry path** — pass a real observation
+   instead of `MAX + 1`, so the guard sees the truth. Costs a measurement per
+   capacity failure.
+2. **Make a synthetic observation non-satisfying** — treat `None`/synthetic as
+   "cannot prove it sheds", i.e. fail-CLOSED for the ratio test while still
+   allowing the first split. Cheaper, but inverts a deliberate default and could
+   stall lineages that genuinely need splitting.
+
+**Not written.** Split behaviour has caused repeated outages here (the width
+orderings that starved narrow repair units, then the opposite end). This wants
+review, and the sim — now that its durations are measured — can test either
+candidate offline before it goes near prod.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
