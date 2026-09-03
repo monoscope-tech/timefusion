@@ -1197,6 +1197,43 @@ compare at ~40 minutes of uptime:
 honest decoded-to-pool ratio and returns the permit by asking repair for less
 concurrency, rather than restoring an envelope the bench says fails.
 
+## K=3 VERDICT: fine. The 27x was a startup burst, and the OOM is a different pool
+
+Settled process, 35 minutes uptime:
+
+| signal | K=4 baseline | K=3 at 5 min | K=3 at 35 min |
+|---|---|---|---|
+| `compaction_permits_unavailable` | 0.59/min | 16.0/min (27x) | **2.6/min (4.4x)** |
+| `pending_hot_packing` | 18 | 15 | **17** |
+| `dedup_failed_total` | 0 | 0 | **0** |
+
+The burst subsided exactly as a young-process artifact should. HotPacking's queue
+is flat against its baseline, so the lane is not starving. **No revert needed.**
+
+**And the arithmetic checks out**, which I should have confirmed before deploying
+rather than after. From the live budget rows, `maintenance_pool_mb` = 16,964:
+
+```
+coordinator share = min(16 jobs x 512 MiB, 16,964 MB x 3/5) = 8,192 MiB
+slices            = 8,192 / 1,280 = 6
+light K           = 6 - 3 (holdback) = 3      <- as intended, not 1
+```
+
+**A scare worth recording.** A live dedup retry carried
+`Not enough memory to continue external sort ... fair(pool_size: 5.0 GB)`, and
+5.0 GB is not the 8 GiB coordinator share — for a moment that looked like the
+share having collapsed and K with it, which would be the 2026-09-01 outage
+condition. It is not: **5.0 GB is the HEAVY share** (0.30 x 16,964 MB = 5,089 MB),
+which is where `stage_dedup_chunk` allocates. Two different pools, and the
+K change touches only the coordinator one.
+
+**So the dedup sort-OOM is real but pre-existing and unrelated to tonight's
+changes** — it is the same heavy-pool exhaustion the journal has carried all
+along. It remains open work, and it is now the clearest instance of the
+"three budgets below real unit sizes" theme: the heavy share is 5.0 GB while a
+single dedup unit's `GroupedHashAggregateStream` alone peaked at 141 MB across
+~150 `count(DISTINCT ...)` aggregates.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
