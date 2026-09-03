@@ -329,3 +329,57 @@ than a law.
 **Batch size barely matters** (b256 / b2048 / b8192 all ~0.6-0.7 s at p1), so the
 `batch_size = 256` choice costs nothing here — the cost is partitions and plan
 shape, not batching.
+
+---
+
+## The instrument's first reading: `d1ff6a32` fixes ONE of the two lanes
+
+`maintenance_hygiene_debt_spread`, live on prod:
+
+```
+SealedConsolidation  cells=221 files_p50=36 files_p90=97 files_max=338 tied_at_zero=188 distinct_buckets=6
+HotPacking           cells=16  files_p50=16 files_p90=28 files_max=43  tied_at_zero=16  distinct_buckets=1
+```
+
+**Cross-validation:** SealedConsolidation's in-process numbers (p50 36, p90 97,
+max 338, 85.1% tied, 6 bands) match the figures I computed offline from the Delta
+checkpoint (p50 35, p90 107, max 338, 84.6% tied, 6 bands). Two independent
+methods, same answer — the offline recipe is sound.
+
+**But HotPacking is a different population, and 32 does not reach it:**
+
+| lane | p50 | p90 | max | at bucket 64 | at bucket 32 |
+| --- | --- | --- | --- | --- | --- |
+| SealedConsolidation | 36 | 97 | 338 | 85% tied | p50 separates (band 1) |
+| **HotPacking** | **16** | **28** | **43** | **100% tied, ONE band** | **p50 and p90 STILL band 0** |
+
+HotPacking's largest cell is **43 files — below the old 64 band entirely**, so the
+benefit term could never do anything for that lane. At 32 only cells above 32
+files separate, which is p90-and-above. **`d1ff6a32` improves SealedConsolidation
+and leaves HotPacking mostly tied.** Stated plainly because the commit message
+does not carve out the distinction.
+
+### The two lanes want opposite things, which is why a LINEAR band cannot serve both
+
+- HotPacking needs FINE bands at small counts (16 vs 28 must differ).
+- SealedConsolidation needs COARSE bands at large counts (200 and 210 must tie,
+  pinned by `sealed_hygiene_ranks_by_files_removed_not_by_date`, or `fair_cursors`
+  rotation dies).
+
+No single divisor does both: 8 separates 16/28 but splits 200/210; 32 ties
+200/210 but also ties 16/28.
+
+**A RATIO band is the shape that satisfies both** — fine at small magnitudes,
+coarse at large — and it can stay integer-only, e.g.
+
+```rust
+if files < 64 { files / 8 } else { 8 + files / 64 }
+```
+
+which gives 16->2, 28->3, 43->5 (separated) and 200->11, 210->11 (tied).
+
+**NOT shipped tonight:** it is a third selection change in one session, in the
+category with the worst incident history here, and `d1ff6a32` has not yet been
+observed in prod. The evidence and the candidate function are recorded; the
+acceptance test is `tied_at_zero` falling for BOTH lanes with
+`sealed_hygiene_ranks_by_files_removed_not_by_date` still green.
