@@ -73,8 +73,14 @@ the ordering code: load this checkpoint+wal into a `TaskJournal` locally and cal
 key loses. Zero prod risk. The calibrated sim is the other route.
 
 **Do not "fix" this by minting narrower slices.** That multiplies unit count
-against known per-unit fixed costs, and sizing is not the defect — the pre-claim
-split already bisects a selected unit for free. **Selection is the defect.**
+against known per-unit fixed costs, and the pre-claim split already bisects a
+selected unit for free.
+
+> ~~**Selection is the defect.**~~ **WITHDRAWN — see the update at the end of this
+> document.** Reading the whole selection path afterwards showed every ordering
+> rule *favours* these units, and a 36.8%-of-capacity kill rate is the better
+> candidate. The line is kept because it shows how confidently a wrong diagnosis
+> can follow from a correct measurement.
 
 **Selection/ordering changes are the most outage-prone category in this repo's
 history** (`tf_sealed_lane_pinned_by_metrics`, the superseded-vetoes incident), so
