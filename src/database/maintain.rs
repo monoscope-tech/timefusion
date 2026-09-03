@@ -7156,7 +7156,15 @@ impl Database {
             // and zero quarantines while shipbubble's file was never reached.
             // A deterministic failure has to be worth the whole threshold or the
             // mechanism cannot fire at the rate passes actually run.
-            let exhausted = e.to_string().contains("Resources exhausted");
+            // THE SHARED classifier, not a local `contains`. A local one matched
+            // only "Resources exhausted" and missed "Not enough memory to
+            // continue external sort" — which is what a spilling sort actually
+            // dies with, and what every light-optimize failure observed on
+            // 2026-09-03 said. So the dominant pool failure scored
+            // `exhausted = false`, took the `(None, 1)` branch, and the
+            // `REPAIR_SORT_PARTITION_LADDER` built to retry it cheaper never
+            // engaged — while the comment below asserted the opposite.
+            let exhausted = crate::maintenance_coordinator::is_capacity_failure(&e.to_string());
             if pass == TailPass::Repair {
                 let level = files.first().and_then(|f| self.repair_degradation.get(f).map(|v| *v)).unwrap_or(0);
                 let (retry_at, step) = repair_failure_action(exhausted, level);

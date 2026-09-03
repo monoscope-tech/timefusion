@@ -8390,6 +8390,26 @@ mod decode_tests {
         }
     }
 
+    /// The ladder above is only reachable if the staging site RECOGNISES a pool
+    /// exhaustion, and it classified with a local `contains("Resources
+    /// exhausted")` that missed the message a spilling sort actually dies with.
+    /// Every light-optimize failure observed on prod 2026-09-03 used the missed
+    /// wording, so the dominant pool failure scored transient and the ladder
+    /// never engaged. Verbatim prod text; the classifier is now the shared one.
+    #[test]
+    fn the_sort_oom_prod_text_reaches_the_parallelism_ladder() {
+        let prod = "Not enough memory to continue external sort. Consider increasing the memory limit config: \
+                    'datafusion.runtime.memory_limit', or decreasing the config: \
+                    'datafusion.execution.sort_spill_reservation_bytes'.";
+        assert!(crate::maintenance_coordinator::is_capacity_failure(prod), "the sort-OOM prod text is a capacity failure");
+        assert!(!prod.contains("Resources exhausted"), "the fixture must be the wording the old local check MISSED");
+        assert_eq!(
+            super::repair_failure_action(crate::maintenance_coordinator::is_capacity_failure(prod), 0),
+            (Some(4), 1),
+            "a sort OOM must buy a cheaper retry, not be filed as transient"
+        );
+    }
+
     /// Regression: the dedup rewrite retried at the SAME parallelism forever.
     ///
     /// Prod 2026-08-25 had 56 units (17 on one project) looping on

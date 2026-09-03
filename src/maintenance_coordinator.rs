@@ -7336,6 +7336,28 @@ mod tests {
         }
     }
 
+    /// THE defect this classifier keeps re-acquiring: a SECOND, divergent copy.
+    ///
+    /// The hot-tail staging site classified with its own
+    /// `contains("Resources exhausted")`, which misses the wording a spilling
+    /// sort actually dies with — the one the test above pins FIRST. So every
+    /// light-optimize pool failure on prod 2026-09-03 scored transient, and the
+    /// `REPAIR_SORT_PARTITION_LADDER` built to retry it cheaper never engaged.
+    ///
+    /// A partial local copy is undetectable by behaviour tests (each classifier
+    /// is self-consistent), so pin it at the source: one definition, no
+    /// second-guessers.
+    #[test]
+    fn no_second_capacity_classifier_exists() {
+        for (name, source) in [("database/maintain.rs", include_str!("database/maintain.rs")), ("database/compact.rs", include_str!("database/compact.rs"))] {
+            assert!(
+                !source.contains(r#"contains("Resources exhausted")"#),
+                "{name} classifies pool exhaustion locally — use `maintenance_coordinator::is_capacity_failure`, \
+                 or it will miss the sort-OOM wording exactly as it did before 2026-09-03"
+            );
+        }
+    }
+
     /// A slice too big for the pool fails identically every pass. Back off once
     /// (a FairSpillPool squeeze is transient), then shrink it.
     #[test]
