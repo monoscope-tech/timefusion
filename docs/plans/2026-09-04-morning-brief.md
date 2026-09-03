@@ -39,17 +39,32 @@ Lane effect, `work.SealedConsolidation.worker_secs / uptime`: **4.0 % → 49.1 %
 with 40.9 M `progress_rows`. Certification counters, comparable ~730 s uptimes,
 before → after the first two fixes:
 
-| | before | after |
-|---|---|---|
-| `cert_granted_total` | 0 | **2** |
-| `dedup_probe_timeouts_total` | 40 | **10** |
-| `pending_sealed_consolidation` | 221 | 215 |
+| reading | `875ea2a1` | `fa62883e` | `c627b356` |
+|---|---|---|---|
+| uptime at read | 703 s | 734 s | 842 s |
+| `cert_granted_total` | 0 | 2 | **0** |
+| `dedup_probe_timeouts_total` | 40 | 10 | **20** |
+| `dedup_skipped` | 0 | 0 | **0** |
 
-**Caveat I am holding to:** these are young processes (~730 s). The direction is
-consistent across three independent counters, but the magnitudes need a re-read
-on a process with a couple of quiet hours. `dedup_skipped` is still 0 — two
-grants is not enough, because a query loses its `DedupExec` only when **every**
-date it reads is granted.
+**RETRACTION — do not read the middle column as evidence.** An earlier version of
+this brief reported `cert_granted_total` 0 → 2 and probe timeouts 40 → 10 as
+directional confirmation. The next reading put them at 0 and 20. **These are
+single-digit counts sampled from different processes with different queue states,
+and they are noise, not signal.**
+
+The reason is decision 2 below, and it is now quantified: the process restarts
+observed while writing this were **13, 37 and 55 minutes ago** — lifetimes of
+24, 18 and 14 minutes against maintenance units that run ~21 minutes.
+**Certification grants and dedup skips are outcomes that require sustained
+uptime, so in this environment they are not measurable at all.**
+
+What survives that, because it does not depend on counters:
+
+- The `875ea2a1` cell merge — a **file-level** fact from the Delta log: the pair
+  became one file of exactly 2,023,604 rows.
+- Every fix's **test**, each verified to fail on the pre-fix code.
+- `dedup_skipped` has been **0 in every reading**, which is the honest bottom
+  line: the customer-facing chain is **not yet unblocked**.
 
 ### One measurement caveat this creates
 
