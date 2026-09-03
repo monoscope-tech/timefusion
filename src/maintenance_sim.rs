@@ -560,17 +560,41 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     // arrival over-estimate came from. See `STREAM_IDLE_MICROS`.
     let newest_created_ms = streams.iter().map(|s| s.last_created_ms).max().unwrap_or_default();
     let idle_cutoff_ms = newest_created_ms.saturating_sub(STREAM_IDLE_MICROS as u64 / 1_000);
-    let ingesting = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
     anyhow::ensure!(!streams.is_empty() || !cfg.mint_frontier, "no streams found in journal; pass --no-mint");
     if let Some(target) = cfg.streams {
-        let Some(template) = streams.first().cloned() else { anyhow::bail!("--streams needs at least one real stream in the journal") };
-        while streams.len() < target {
+        // `--streams N` means **N INGESTING streams** — the doc calls it "the
+        // minted stream count", and scaling the active customer count is the
+        // only thing it is used for.
+        //
+        // It used to set the TOTAL, which since minting became activity-gated
+        // means it silently modelled almost nothing: a journal with 124 streams
+        // of which 20 ingest answered `--streams 100` by TRUNCATING to 100 real
+        // streams — still only 20 active — so a "5x" run was 1x. And the clone
+        // template was `streams.first()`, whichever stream the journal happened
+        // to mention first, usually a dormant account whose clones never mint.
+        let Some(template) = streams.iter().find(|s| s.last_created_ms >= idle_cutoff_ms).or_else(|| streams.first()).cloned() else {
+            anyhow::bail!("--streams needs at least one real stream in the journal")
+        };
+        let mut active = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
+        // Down: retire the excess actives rather than dropping streams, so the
+        // journal's existing backlog for them is preserved.
+        for stream in streams.iter_mut().filter(|s| s.last_created_ms >= idle_cutoff_ms) {
+            if active <= target {
+                break;
+            }
+            stream.last_created_ms = 0;
+            active -= 1;
+        }
+        // Up: synthetic clones of a stream that is genuinely ingesting.
+        while active < target {
             let mut synthetic = template.clone();
             synthetic.project_id = format!("synth-{}", streams.len());
+            synthetic.last_created_ms = newest_created_ms;
             streams.push(synthetic);
+            active += 1;
         }
-        streams.truncate(target);
     }
+    let ingesting = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
 
     if cfg.mint_frontier {
         // Printed because it is the single number that decides whether an
