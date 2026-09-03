@@ -240,7 +240,44 @@ work class 0 and sealed work a worse class, and smaller tuples run first, so
 while frontier work keeps arriving sealed work waits. That is the already-known
 [sealed backlog does not drain] problem, not the admission boundary.
 
-### ROOT CAUSE FOUND: they are inside the [3 d, 31 d] starvation BAND, where `starved` ties
+### VERIFIED ON LIVE STATE — and four hypotheses eliminated
+
+I nearly published this off a **stale checkpoint**.
+`maintenance_tasks.json` was last written **20:00 UTC**; the fix deployed at
+**23:43**. So the "fresh" pull was 4h21m stale and predated the change entirely.
+`maintenance_tasks.wal` is the live half (my own note says fetch both; I had not).
+
+Replaying the WAL over the checkpoint — 97,734 records, state current to
+**00:21 UTC**, 38 minutes after the fix — the finding **survives unchanged**:
+
+```
+exactly-512-MiB dedup: 297 · all Pending · retry_reason none
+attempts {1:170, 0:104, 2:13, 3:5, 4:4, 27:1}   — identical to the 17:07 read
+```
+
+And `attempts` is incremented by `mark_running`, i.e. **at claim time**
+(`maintenance_coordinator.rs:2330`), so an unchanged `attempts` really does mean
+never claimed. (`retry()` does NOT touch attempts — worth knowing, because it
+means a bouncing unit shows a changing *state*, not a changing *count*.)
+
+**Four hypotheses tested and eliminated tonight, each with data:**
+
+| hypothesis | verdict | evidence |
+|---|---|---|
+| admission boundary | **no** | they never reach the gate (attempts unchanged) |
+| sealed-vs-frontier class starvation | **no** | 350 day-wide =MAX units HAVE completed |
+| the [3 d, 31 d] `starved` band | **no** | most completions are in-band; and the comparison is confounded, since band is computed at *now* not at claim time |
+| quarantine slots | **no** | `is_quarantined` needs a worker/schema failure reason; these have `none` |
+
+**And the sim clears them.** `timefusion sim mt_new.json --hours 24 --no-mint`
+drains the whole backlog to 21 units in 11.5 h. The sim replays the same journal
+through the same ranking, so **ranking and eligibility are not the blocker** —
+the obstruction is in the real claim path, which the sim does not model.
+
+That is the handoff: a precisely localised unknown, four dead ends closed off,
+and a reproduction (`--no-mint`) that shows the queue is drainable in principle.
+
+### (superseded hypothesis, kept for the reasoning) the [3 d, 31 d] band
 
 My first guess was class starvation — sealed work losing to frontier forever.
 **The journal refutes that**: 350 day-wide dedup units HAVE completed, **312 of
