@@ -41,6 +41,29 @@ work); the remaining third run 1,200-2,400 s. Capacity is set by that tail, and
 it is lane-agnostic — which is why giving dedup more cycle slots bought only
 +14%, and why the answer is unit COST, not scheduling.
 
+### The three failing tests are a REAL result, not a calibration artifact — verified
+
+My first worry was that the new model adds an extra `rng.next()` per call, which
+shifts the whole seeded stream and could break seeded tests for trivial reasons.
+Isolated it directly: **old durations + one extra dummy draw = 20/20 pass.** So
+the stream shift is harmless and the three failures are caused by the duration
+MAGNITUDES.
+
+What each one now says, with production numbers in the model:
+
+| test | old premise | with measured durations |
+|---|---|---|
+| `frontier_keeps_up_at_13_projects_and_diverges_at_10x` | 13 projects hold the frontier ("~15k/day of small-unit capacity") | **they do not** — that capacity figure assumed small units; a third are 1,200-2,400 s |
+| `a_floored_whale_shreds_to_the_minute_without_the_guard` | guard OFF shreds to >1,000 units at the floor | shred is smaller — fewer units execute per horizon |
+| `the_floor_guard_declines_above_the_floor_and_the_shred_stops` | guard ON: `units_at_min_slice == 0` | **8 reach the floor** |
+
+The third is the one worth attention: it is a near-correctness assertion about
+the split-floor guard, and under realistic durations units queue longer, get
+split more, and some now reach `MIN_SLICE_MICROS` anyway. That may be a genuine
+weakness in the guard that the optimistic model was hiding — or the assertion may
+simply be too absolute for a slower fleet. **I am not deciding that unilaterally**;
+it is the kind of question where re-baselining a test could erase a real signal.
+
 **Status:** the recalibrated model is committed on `fix/sim-durations`, **not
 pushed** — three `maintenance_sim` tests encode the old premise (notably
 `frontier_keeps_up_at_13_projects_and_diverges_at_10x`, whose "~15k/day of
