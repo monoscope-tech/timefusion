@@ -1153,8 +1153,19 @@ atomic_stats! {
         ///
         /// The audit runs unconditionally, so zero here means CLEAN rather than
         /// "not measured" — the one reading a flag-gated version of this counter
-        /// could never give.
+        /// could never give. Read it WITH `immutable_audit_shards_total`: the
+        /// streaming audit is armed by column lookup, so a rename could silently
+        /// disarm it and this counter would read zero for the other reason.
         immutable_column_disagreement_total,
+        /// Dedup shards whose collapse ran with the immutable audit ARMED.
+        ///
+        /// The denominator for `immutable_column_disagreement_total`, and the
+        /// answer to the only question a zero there cannot settle by itself:
+        /// clean, or never measured? `RunCollapse::with_immutable_audit` resolves
+        /// columns by name and disarms itself when none resolve — cheap to do,
+        /// and invisible without this. Non-zero here plus zero there is a real
+        /// clean bill; zero here means the audit is not running at all.
+        immutable_audit_shards_total,
         /// Partitions where the coverage ledger and the Delta tags disagree.
         ///
         /// The ledger is destined to be the authority, and an authority can DRIFT

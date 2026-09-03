@@ -1753,6 +1753,9 @@ impl Database {
                                 // Reported here rather than mid-stream so one run straddling a
                                 // batch boundary is counted once. Diagnostics must never fail the
                                 // rewrite that carries them, so there is nothing to propagate.
+                                if collapse.as_ref().is_some_and(RunCollapse::is_auditing) {
+                                    crate::observability::maintenance_stats().immutable_audit_shards_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 if let Some(disagreeing) = collapse.as_ref().map(RunCollapse::disagreements).filter(|count| *count > 0) {
                                     crate::observability::maintenance_stats()
                                         .immutable_column_disagreement_total
@@ -2024,6 +2027,12 @@ impl RunCollapse {
     /// Dedup keys whose versions disagreed on a column declared immutable.
     pub(crate) fn disagreements(&self) -> u64 {
         self.disagreements
+    }
+
+    /// Whether the immutable audit is armed — `disagreements()` is only a clean
+    /// bill of health when this is true. See `immutable_audit_shards_total`.
+    pub(crate) fn is_auditing(&self) -> bool {
+        self.audit.is_some()
     }
 
     /// One compact row of `batch`, detached from its buffers so a held-back run
@@ -2420,6 +2429,27 @@ mod immutable_audit_tests {
         collapse.finish();
 
         assert_eq!(collapse.disagreements(), 0, "an un-audited collapse reports nothing");
+    }
+
+    /// The streaming audit arms by resolving column NAMES against the rewrite's
+    /// output schema, and disarms silently when none resolve. That is the seam:
+    /// a rename would leave `immutable_column_disagreement_total` reading zero
+    /// for the wrong reason. Pin it against the real shipped schema.
+    #[test]
+    fn the_streaming_audit_arms_against_the_real_rewrite_schema() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = logs_schema();
+        // The rewrite selects every schema field, so this is the shape
+        // `plan.schema()` has at the call site.
+        let arrow = Schema::new(schema.fields.iter().map(|field| Field::new(&field.name, DataType::Utf8, true)).collect::<Vec<_>>());
+        let columns = Database::immutable_audit_columns(schema);
+        let collapse = RunCollapse::new(&arrow, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())
+            .expect("collapse")
+            .with_immutable_audit(&arrow, &columns)
+            .expect("audit");
+
+        assert!(collapse.is_auditing(), "the audit must arm against the real rewrite output schema, or it silently measures nothing");
     }
 
     /// Both audit forms must read the SAME column list, or the streaming path
