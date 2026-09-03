@@ -73,3 +73,46 @@ recorded so the next session can pick with evidence rather than rediscover it.
 **Acceptance test when it is done:** `compaction_unit_selected_nothing` rate falls
 from ~49% of SealedConsolidation claims, and `work.SealedConsolidation.worker_secs`
 rises from its current ~0.25% of one worker.
+
+---
+
+## CORRECTION: fix (2) is NOT a one-line relaxation — `MAX_BIN_ROWS` blocks it too
+
+I wrote that letting a bin exceed the target would retire a file "at the cost of
+files above target". Reading the loop, **two guards bind, not one**:
+
+```rust
+if !selected.is_empty() && (bytes + add.size > limit || next_rows > MAX_BIN_ROWS) {
+    break;
+}
+```
+
+`MAX_BIN_ROWS = 2_000_000`, and its comment says it was chosen to sit **just above
+the 1.73 M rows a 256 MB logs bin holds**, so a bin fits the 900 s deadline at
+prod's staging rate. Two ~180 MB files are ~360 MB ~= **2.4 M rows — over the
+cap.** Relaxing only the byte budget therefore changes nothing for exactly the
+cells this document is about; the rows guard rejects the same pair.
+
+Making (2) work means relaxing **both**, which puts a 2.4 M-row bin against a
+deadline that `MAX_BIN_ROWS` exists to protect. That is a real trade, not a
+tidy-up, and it wants a soak rather than a late-night edit.
+
+## Which leaves (1) as the right fix, and it is not a cop-out
+
+Two files of ~180 MB are **not fragmentation** — they are near-target files. The
+overlap that costs the read path 20-43x comes from MANY SMALL files in one time
+bucket, not from a cell holding three or four near-target files. So a cell whose
+files cannot pair within either budget **is converged in every sense that
+matters**, and counting it as debt is what wastes ~49% of the lane's claims.
+
+**The honest fix is accounting, not packing:** stop treating a file that cannot
+pair as outstanding debt. The subtlety to respect when implementing it — and the
+reason this is still not a one-liner — is that "cannot pair" is a property of the
+SET, not of one file: a 200 MB file pairs fine with a 40 MB one. A per-file
+`>= target/2` rule is a good approximation (any two such files always exceed the
+target) but it is an approximation, and it belongs in the planner's debt
+accounting rather than in the selector, which already returns empty correctly.
+
+**Net for the morning:** the measurement stands (29.2% of cells, 49% of claims),
+the diagnosis stands, and the fix is smaller in scope than first written — but it
+lands in `plan_compaction_debt`, not in `select_coordinator_compaction_candidates`.
