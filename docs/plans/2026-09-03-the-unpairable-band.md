@@ -247,3 +247,56 @@ evidence does not depend on that: the pair is merged and the row counts match.
 `fa62883e` (the planner half, which stops `be87ebc1/2026-07-02` and its 12.6 M-row
 pair being queued at all) had not deployed at this reading, so
 `pending_sealed_consolidation` was still 221. That is the number to watch next.
+
+## CENSUS — I OVER-CORRECTED. The byte band is real, and it is the larger class.
+
+The section above says "the byte hypothesis was WRONG". That is too strong, and
+the fleet-wide census says so. Replaying the packer over the LIVE file set of
+**every** cell in the checkpoint (1,209 cells, 8,004 files, `packer_census.py` —
+the denominator the funnel cannot give, since it sees only cells that were
+claimed):
+
+| outcome | cells | of all |
+|---|---:|---:|
+| converged (fewer than 2 under-target files) | 1,041 | 86.1 % |
+| works, before and after | 111 | 9.2 % |
+| **BLOCKED: two smallest exceed the BYTE budget** | **49** | **4.1 %** |
+| FIXED by `875ea2a1` (marginal row overshoot) | 7 | 0.6 % |
+| BLOCKED: rows past 2x cap (`fa62883e` now declines) | 1 | 0.1 % |
+
+**49 of the 168 cells that have two or more under-target files — 29.2 % —
+cannot pair on BYTES.** That is, to three significant figures, the *same* 29 %
+this doc measured originally. The original measurement was right. What was wrong
+was generalising it to the cell I then went and investigated, which failed for a
+different reason.
+
+**Both classes are real, and they are disjoint:** 49 byte-blocked cells and 8
+row-blocked ones. My fixes addressed the 8.
+
+### Why the small class produced ~49 % of the empty claims
+
+Because the byte-blocked cells were **never queued in the first place**. The
+planner's `mergeable` guard has always required the two smallest to fit in bytes,
+so those 49 cells are correctly declined and cost nothing. The row-blocked cells
+were queued — the guard did not check rows — and, being unable ever to clear,
+were **re-claimed forever**. A handful of never-clearing cells dominates a claim
+stream. The funnel's two repeat offenders, `dcad860a/2026-06-17` and
+`be87ebc1/2026-07-02`, are both in the row-blocked class.
+
+So the accounting closes: 8 cells generated the wasted claims, both fixes landed
+on them, and `work.SealedConsolidation` went from 4.0 % to 49.1 % of uptime.
+
+### What the 49 byte-blocked cells actually cost
+
+Not claims — they are not claimed. They hold **35.9 GiB** that will not compact
+further, and each file in them is already above half the 256 MiB target, so this
+is near-converged data rather than fragmentation. The original doc's judgement
+stands: a cell whose files cannot pair within either budget IS converged in every
+sense that matters.
+
+The remaining defect is **accounting, not scheduling**:
+`sealed_compaction_debt_bytes` (1.33 TB) counts bytes in cells that are provably
+unworkable, so the headline debt number overstates the work that exists. Fixing
+that changes no behaviour and misleads no scheduler — but it is the number a
+human reads to decide whether compaction is keeping up, and today it says no
+when a large part of it can never be yes.
