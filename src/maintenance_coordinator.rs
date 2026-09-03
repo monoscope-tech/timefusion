@@ -1797,6 +1797,57 @@ impl TaskJournal {
     /// Selects by `input.files` — for hygiene that IS the debt, and it is what
     /// the planner already counted — so the answer is about the cell that matters
     /// rather than whichever one the journal happens to hold first.
+    /// File-count spread of an operation's claimable cells, and how many of them
+    /// the `benefit` term cannot tell apart.
+    ///
+    /// `benefit = -(input.files / BENEFIT_BUCKET_FILES)` with the bucket at 64,
+    /// so every cell under 64 files scores ZERO — identical to a one-file cell.
+    /// Prod 2026-09-03 showed the consequence without being able to size it: the
+    /// most indebted HotPacking cell (`files=37`) was reported `outranked_by` a
+    /// same-day rival 50 times in 100 minutes, because at 37 files its debt is
+    /// invisible to the ranker and ordering falls through to recency and the
+    /// `fair_cursors` rotation.
+    ///
+    /// Whether shrinking the bucket would help depends entirely on the spread of
+    /// REAL candidate cells, and nothing recorded it: hygiene cells are planned
+    /// per tick and are **absent from the persisted journal** (a pulled prod
+    /// journal holds only base_rollup/dedup/derived_rollup/repair), so the
+    /// question cannot be answered offline. Hence this, which answers it from
+    /// inside the process.
+    ///
+    /// Returns `None` when there is nothing claimable, so a quiet lane stays
+    /// silent.
+    pub fn hygiene_debt_spread(&self, operation: Operation, now_micros: i64) -> Option<String> {
+        let mut files: Vec<u32> = self
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.key.operation == operation
+                    && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                    && task.deadline_micros <= now_micros
+                    && !Self::is_quarantined(task)
+            })
+            .map(|task| task.input.map_or(0, |input| input.files))
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        files.sort_unstable();
+        let at = |q: f64| files[((files.len() - 1) as f64 * q) as usize];
+        let tied = files.iter().filter(|f| **f / BENEFIT_BUCKET_FILES == 0).count();
+        let buckets = files.iter().map(|f| f / BENEFIT_BUCKET_FILES).collect::<std::collections::BTreeSet<_>>().len();
+        Some(format!(
+            "cells={} files_p50={} files_p90={} files_max={} tied_at_zero={} distinct_buckets={}",
+            files.len(),
+            at(0.5),
+            at(0.9),
+            files[files.len() - 1],
+            tied,
+            buckets
+        ))
+    }
+
     pub fn most_indebted_unclaimed(&self, operation: Operation, now_micros: i64) -> Option<String> {
         let eligible =
             || self.snapshot.tasks.iter().filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry));
@@ -5319,6 +5370,35 @@ mod tests {
     /// Every counter in this system reports how much work EXISTS; none reported
     /// why an existing task is passed over, and `claim_next` decides that inside
     /// filter predicates that leave no trace. Five correct fixes shipped against
+    /// `outranked_by` says the ranker could not separate the WORST cell from a
+    /// rival. This says whether it can separate ANY of them — the number that
+    /// decides whether `BENEFIT_BUCKET_FILES` is too coarse, and one that cannot
+    /// be recovered offline because hygiene cells never reach the persisted
+    /// journal (a pulled prod journal holds only base_rollup / dedup /
+    /// derived_rollup / repair).
+    #[test]
+    fn the_hygiene_spread_reports_how_many_cells_the_ranker_cannot_separate() {
+        const DAY: i64 = 86_400_000_000;
+        let now = 40 * DAY;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Three cells under the 64-file bucket and one far above it: the shape
+        // that makes `benefit` inert for the small ones while still ranking the
+        // large one.
+        for (project, files) in [("a", 5usize), ("b", 37), ("c", 60), ("d", 400)] {
+            let key = task(project, now - 2 * DAY, now - DAY, Operation::HotPacking).key.clone();
+            journal.enqueue(key.clone(), 0, 0, 0);
+            journal.record_input(&key, InputFootprint::new((0..files).map(|i| format!("{project}/{i}.parquet")), 0));
+        }
+        let spread = journal.hygiene_debt_spread(Operation::HotPacking, now).expect("cells are claimable");
+        assert!(spread.contains("cells=4"), "all four cells are claimable: {spread}");
+        assert!(spread.contains("files_max=400"), "the large cell is reported: {spread}");
+        // THE point: three of four collapse to bucket 0, so the ranker sees one
+        // value for a 5-file cell and a 60-file cell alike.
+        assert!(spread.contains("tied_at_zero=3"), "must report how many cells benefit cannot separate: {spread}");
+        assert!(spread.contains("distinct_buckets=2"), "4 cells occupy only 2 benefit buckets: {spread}");
+    }
+
     /// wrong models of the queue before this existed.
     #[test]
     fn the_claimability_census_separates_the_reasons_a_task_is_skipped() {

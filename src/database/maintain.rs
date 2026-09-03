@@ -928,6 +928,15 @@ impl Database {
                 if let Some(refusal) = journal.most_indebted_unclaimed(operation, now) {
                     info!(?operation, refusal, event = "maintenance_hygiene_debt_unclaimed", "the most indebted hygiene cell is not being claimed");
                 }
+                // `outranked_by` says the ranker could not tell the worst cell
+                // from a rival; this says whether it could tell ANY of them
+                // apart. `benefit` buckets file counts by 64, so a lane whose
+                // cells are all smaller ranks them all at zero and falls through
+                // to recency — and hygiene cells never reach the persisted
+                // journal, so this cannot be measured from outside.
+                if let Some(spread) = journal.hygiene_debt_spread(operation, now) {
+                    info!(?operation, spread, event = "maintenance_hygiene_debt_spread", "how far apart the ranker can tell this lane's cells");
+                }
             }
         }
         for (storage_project, source, table_ref) in self.all_tables().await {
