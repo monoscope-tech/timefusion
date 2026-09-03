@@ -934,6 +934,39 @@ certain", which was true when every dedup unit ran 60-900 s; under the measured
 bimodal model ~70% finish in 0-6 s and never time out. That one needs a
 duration floor in the fixture, not a new assertion.
 
+## The one red test on master: `a_chart_under_a_derived_table_routes_and_agrees_with_raw`
+
+**Not caused by tonight's changes — and my first exoneration of it was invalid.**
+I originally checked it "fails on origin/master too", but master already carried
+my admission fix at that moment, so the check proved nothing. Re-done properly
+against **`a32db47a`, the commit immediately BEFORE the admission fix**: it fails
+there too. That is a real exoneration.
+
+**What is established:**
+
+- Fails reproducibly, standalone and in the full suite, on master and pre-fix.
+- Miss reason is `tiny_interior=1` — "the certified interior is too small a slice
+  of the window to be worth the union's second scan" (`rollup.rs:2350`).
+- The test window is time-anchored: `today = Utc::now().date_naive()`, query span
+  `yesterday 12:00 -> today 02:00` UTC.
+- It DID pass in the 01:00 local full-suite run, so something changed between.
+- Not the local environment as far as I can reach it: MinIO healthy, the
+  `timefusion-tests` bucket present, disk at 99 GiB free.
+
+**What is not established:** why it passed at 01:00 and has failed since. The
+`tiny_interior` decline depends on the certified interior, which depends on what
+dedup/certification has done for those dates — so a plausible reading is that the
+fixture's certification is not reproducible from a cold local store, and the
+01:00 pass was the lucky state rather than the correct one. I did not confirm
+that, and I am not going to assert it.
+
+**Someone should own this**: it is the only thing keeping master's suite red, and
+a red suite is how the next real regression gets waved through.
+
+**Unrelated local cruft worth a sweep:** the dev MinIO has accumulated **2,510
+buckets**, almost all `e2e-<uuid>` leftovers. Harmless individually; it makes
+`aws s3 ls` useless and will eventually matter.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
