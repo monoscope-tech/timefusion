@@ -999,6 +999,42 @@ one-counter-two-sites trap as the probe-vs-staging timeout conflation from
 2026-09-02. Splitting it would make the guard's effect directly observable
 instead of inferable.
 
+## The guard fix is CORRECT BUT CURRENTLY DORMANT — and that is a pattern
+
+Verification, 43 minutes after `ca60cc9` went live:
+
+| | 08:42 UTC (+14 min) | 09:25 UTC (+43 min) |
+|---|---|---|
+| live at the 60 s floor | 39 | **37** |
+| completed at the floor | 8,703 | 8,705 |
+
+Two drained, **zero new minted**. That looks like the guard working — until you
+check the same arithmetic for the 8 hours BEFORE the fix: −108 live, +108
+completed, also **zero new minted**. The population was not growing beforehand
+either, so this comparison cannot demonstrate the fix at all.
+
+**The fix is still right.** The 8,595 units that reached the floor historically
+are the evidence, and the mechanism (a constant compared against a measurement)
+is provable from the code. But the path that mints them — a capacity failure
+driving `retry_or_split` — is not firing in the current quiet regime, so there is
+no live A/B to be had.
+
+**This is the third time tonight the same shape has appeared**, and it is worth
+naming as a rule for whoever picks this up:
+
+| change | proven by | currently firing? |
+|---|---|---|
+| `TIMEFUSION_LANDED_SKIP_ENABLED` | 58% of duplicates are replay-manufactured | **No** — `replay_rows` = 0, prod exits cleanly |
+| repair budget (`ca60cc95`'s predecessor) | every unit clamped to the whole semaphore | Partly — sub-budget units stopped bouncing, oversized still serialize |
+| split-floor guard (`ca60cc9`) | 8,595 units reached the floor | **No** — no capacity failures minting new ones right now |
+
+**The rule:** in a quiet regime, a correct fix produces no measurable delta, and
+demanding one before shipping would block every one of these. The evidence has to
+come from the HISTORICAL record — the journal, the Delta log, the counters'
+accumulated totals — not from a post-deploy A/B. Conversely, "the counter did not
+move" is not evidence the fix failed. Both errors were available tonight and I
+made the second one twice before catching it.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
