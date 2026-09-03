@@ -92,3 +92,44 @@ a property of partition count, not of data size.**
 Practical consequence for the 10x question: **raising `target_partitions` to buy
 throughput buys OOMs instead**, on any pool, because the unspillable floor grows
 linearly with partitions while the pool does not.
+
+## 5. Pool sweep — the window form cannot be fixed with memory
+
+Same file, same variants, pool swept across an **8x range**:
+
+| variant | 128 MB | 256 MB | 512 MB | 1024 MB |
+|---|---|---|---|---|
+| scan only | 1.4 s | 1.4 s | 1.4 s | 1.4 s |
+| sort b2048 p1 | 1.1 s | 1.1 s | 1.1 s | 1.1 s |
+| sort b8192 p8 | **FAILED** | 1.9 s | 1.8 s | 1.8 s |
+| dedup WINDOW b256 p1 | **FAILED** | 46.8 s | 41.5 s | 55.9 s |
+| dedup WINDOW b2048 p1 | 63.6 s | 41.5 s | 40.1 s | 32.1 s |
+| **dedup WINDOW b2048 p8** | **FAILED** | **FAILED** | **FAILED** | **FAILED** |
+| dedup COLLAPSE b2048 p8 | 1.7 s | 1.7 s | 1.8 s | 1.7 s |
+
+Three conclusions, in descending order of importance.
+
+**5a. `dedup WINDOW` at 8 partitions fails at every pool size tested, including
+1 GB — eight times the share a prod worker gets.** This is not a pool-size
+problem and **cannot be bought off with memory.** It is the same family as the
+query-side finding that one 16-partition query's unspillable merges need ~24 GB
+against a 16 GB pool: past some partition count the unspillable floor outruns any
+pool you are willing to configure. The fix for that shape is never a bigger pool;
+it is a plan that does not build the floor.
+
+**5b. The collapse path runs in 1.7 s at every pool size, including 128 MB.** So
+the choice between the two dedup forms is not "slower vs faster" — it is
+**"runs at 128 MB vs does not run at 1 GB"**. Combined with the 20–58x timing
+gap, this is the single most valuable maintenance change already in the tree, and
+the reason to make sure nothing silently falls back to the window form.
+
+**5c. For everything else, pool size buys nothing.** Scan and single-partition
+sort times are flat to three significant figures across an 8x pool range. At this
+unit size the maintenance pool is **not** the constraint — consistent with §2, where
+the deadline is spent on IO and the commit rather than on memory-bound sorting.
+That is worth knowing before anyone proposes more RAM as the 10x answer.
+
+**Config note:** the bench header describes 256 MB as "4.2 GB / 16 jobs", but
+`HEAVY_REWRITE_PERMITS = 10` (`config.rs:190`), so a worker's fair share is nearer
+420 MB. The 512 MB column is therefore the closest to prod, and 5a holds there
+too — the conclusion is unaffected, but the comment should be corrected.
