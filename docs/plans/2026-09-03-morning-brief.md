@@ -9,7 +9,46 @@ corrections in place.** Six of my claims were retracted after checking them, and
 the retractions are kept next to the claims rather than deleted — the reasoning
 is often the useful part. Where a section is superseded it says so.
 
-## The headline
+## THE HEADLINE — corrected 2026-09-03 morning, after measuring the duration model
+
+**We are SATURATED, not lane-inverted.** With the sim's duration model rebuilt
+from 676 real `maintenance_task_finished` events, 10x load produces **the same
+throughput as 1x**:
+
+| 12 h, measured durations | 1x (20 active) | 10x (200 active) |
+|---|---|---|
+| **executions** | **1,691** | **1,712** |
+| pending | 21,288 -> 3,731 | 21,288 -> **31,614 (grows)** |
+| BaseRollup / Dedup | 682 / 228 | 684 / 235 |
+
+The fleet does **~141 units/hour regardless of load** (production measures
+~162/hr, so the model is now within ~13%). At 10x the queue simply grows.
+
+**This RETRACTS the "lane inversion" headline below.** That result — dedup
+completions falling 30% while BaseRollup took 7.7x more — was an artifact of the
+old model pricing BaseRollup at 5-60 s when its real mean is **571 s**, a ~16x
+under-estimate. With measured durations the lane mix does not shift at all.
+
+**And it retracts "a dedup unit costs ~7x a rollup unit".** Measured means are
+**Dedup 541 s vs BaseRollup 571 s**; worker-seconds split 43.7% / 46.7%. Dedup is
+marginally CHEAPER. That figure came from comparing a post-widening lane against
+a constant last updated two weeks before the widening shipped — the same class of
+error as citing a cohort that never reaches the gate.
+
+**What the real constraint is:** total maintenance throughput, dominated by a
+bimodal tail. **~65-70% of units in both lanes finish at ~0 s** (they find no
+work); the remaining third run 1,200-2,400 s. Capacity is set by that tail, and
+it is lane-agnostic — which is why giving dedup more cycle slots bought only
++14%, and why the answer is unit COST, not scheduling.
+
+**Status:** the recalibrated model is committed on `fix/sim-durations`, **not
+pushed** — three `maintenance_sim` tests encode the old premise (notably
+`frontier_keeps_up_at_13_projects_and_diverges_at_10x`, whose "~15k/day of
+small-unit capacity" assumption is exactly what these measurements refute).
+Deciding what those tests should now assert is a real question about the system,
+not a mechanical fixup.
+
+## The superseded headline, kept for the reasoning
 
 **We do not keep up at 10x, and it is a UNIT COST problem, not a scheduling or
 capacity one.** At 10x active streams the fleet does 4x the executions and
