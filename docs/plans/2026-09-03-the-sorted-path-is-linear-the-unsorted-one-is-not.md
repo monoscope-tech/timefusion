@@ -81,3 +81,58 @@ pool bigger, but **keeping partitions on the sorted path**:
 operator costs, not whole-unit costs, and real units also pay S3 round trips.
 The RATIO and the scaling exponent are the transferable results, not the absolute
 milliseconds.
+
+---
+
+## PROD CONFIRMATION: 98.8% of dedup rewrites are on the expensive path
+
+`dedup_plan_shape` over 96 minutes of production, 83 dedup rewrites:
+
+| | |
+| --- | --- |
+| **`ordered_scan=false`** | **82 of 83 — 98.8%** |
+| `ordered_scan=true` | 1 |
+| `sorts=1` (a SortExec is present) | 82 |
+
+**Essentially every production dedup unit pays the sort** — the path the benchmark
+above prices at **20-43x**. This is the concrete answer to "is dedup breaking a
+sweat": yes, and by a measurable factor.
+
+### It is NOT a footer-metadata bug
+
+Sampling the newest 25 files on five dates (2026-08-20 through 2026-09-03):
+**every file declares 5 sorting columns.** The footers are honest, on old and new
+files alike, so the 2026-09-02 leaf-index fix is holding and this is not legacy
+damage.
+
+### It is OVERLAP, measured
+
+On the 201 Delta-live files of one whale day:
+
+| | |
+| --- | --- |
+| files disjoint from ALL others | **8 of 201 — 4.0%** |
+| max files overlapping at one instant | **10** |
+| file time-span | p50 **300 s**, p90 958 s, max **66,603 s (18.5 h)** |
+
+Each file is internally sorted; the file SET has no global order, so DataFusion
+must sort. That is exactly the mechanism `tf_mor_breaks_time_disjoint_files`
+predicted, now measured on the file set rather than inferred from a plan.
+
+### Sub-hypothesis TESTED AND REFUTED: "the wide files are the poison"
+
+An 18.5-hour file overlaps everything, so eliminating the wide ones looked like a
+cheap, targeted fix. **Modelled, it is not:**
+
+- wide files (span > 1 h): **5 of 201 (2.5%)**, holding 23% of rows — and three of
+  the five are tiny (4 to 14k rows), i.e. scattered enrichment updates
+- **removing them lifts disjointness only 4.0% -> 18.4%** (max overlap 10 -> 7)
+
+**81.6% of files would still overlap.** The overlap is pervasive among ordinary
+~5-minute files, because a time bucket accumulates SEVERAL files — the original
+flush plus every later enrichment append that lands in it.
+
+**So the lever is merging files WITHIN a bucket — which is precisely what hot-tail
+packing does, and `pending_hot_packing` has sat at 16-17 all night.** Not a new
+mechanism: an existing lane whose throughput now has a measured 20-43x
+consequence on dedup, and a read-path consequence on top.
