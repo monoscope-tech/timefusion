@@ -394,6 +394,22 @@ fn admission_backoff(attempts: u32) -> std::time::Duration {
     std::time::Duration::from_secs(1u64 << attempts.min(6))
 }
 
+/// Order the dedup phase's probe groups so both classes get real budget.
+///
+/// Every probe in a phase shares ONE deadline and takes whatever is left of it,
+/// so **position is budget**. `dirty` groups carry duplicate-bearing bins and
+/// therefore DECLINE certification by construction; `certify_only` groups carry
+/// no bins and are the only ones that can GRANT one. Running the second class
+/// after the first spends the whole phase on probes that cannot produce the
+/// outcome the phase exists for.
+///
+/// Interleaving gives each class every other slot, so a starved class reaches
+/// the front within one position regardless of how many of the other there are.
+/// `cap` bounds the total, since an unbounded tail cannot be probed anyway.
+fn interleave_probe_groups<T>(dirty: Vec<T>, certify_only: Vec<T>, cap: usize) -> Vec<T> {
+    itertools::interleave(dirty, certify_only).take(cap).collect()
+}
+
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
 pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
@@ -6113,7 +6129,21 @@ impl Database {
         // only loses its `DedupExec` when EVERY date it reads is granted. These
         // carry no bins: they are probed purely for the certification, and the
         // same closure handles them because an empty bin list clears nothing.
-        groups.extend(certify_only.into_iter().map(|group| (group, Vec::new())));
+        //
+        // INTERLEAVED, not appended. Every probe in this phase shares ONE
+        // deadline and takes whatever is left of it, so position IS budget.
+        // Appended last, the certify-only groups — the only ones that can GRANT,
+        // since a group with dirty bins declines by construction — ran on the
+        // remainder and got none: prod 2026-09-04 read `cert_granted_total=0`
+        // beside `dedup_probe_timeouts_total=40`, with every refusal accounted
+        // for by dirty groups (`cert_declined_dirty_bins=6`, `dropped=4`). The
+        // work that can produce the outcome was queued behind work that
+        // provably cannot.
+        // `2 *` so the dirty class keeps its full `BATCH_PROBE_GROUPS` volume —
+        // this changes ORDER, not how much bin classification gets done — while
+        // the certify-only class gets an equal share instead of the remainder.
+        let certify_only: Vec<_> = certify_only.into_iter().map(|group| (group, Vec::new())).collect();
+        let groups = interleave_probe_groups(groups, certify_only, 2 * BATCH_PROBE_GROUPS);
         // BEFORE the probes, not only after each one. Every other line in this
         // phase is emitted on completion, so a phase that does not complete
         // prints nothing at all — which is how prod 2026-08-12 spent 55 minutes
@@ -9073,5 +9103,36 @@ mod date_coverage_recovery_tests {
         // tier every 7d/30d query reads.
         assert_eq!(fold_fleet_gauge(seeded, 5, true, false), Some(5));
         assert_eq!(fold_fleet_gauge(5, 30, true, false), Some(5), "min, not last-writer");
+    }
+
+    /// The probe phase must not queue the only groups that can GRANT behind the
+    /// ones that provably cannot.
+    ///
+    /// Every probe in the phase shares ONE deadline and takes what is left of
+    /// it, so POSITION IS BUDGET. `certify_only` groups carry no dirty bins and
+    /// are the only source of a certification; groups that carry dirty bins
+    /// decline by construction. Appended last, the certify-only class ran on the
+    /// remainder and got none — prod 2026-09-04 read `cert_granted_total=0`
+    /// beside `dedup_probe_timeouts_total=40`, with every refusal attributable
+    /// to dirty groups.
+    #[test]
+    fn certification_probes_are_not_queued_behind_probes_that_cannot_certify() {
+        let dirty: Vec<&str> = vec!["d0", "d1", "d2", "d3"];
+        let certify: Vec<&str> = vec!["c0", "c1"];
+
+        let order = super::interleave_probe_groups(dirty.clone(), certify.clone(), 32);
+        let first_certify = order.iter().position(|g| g.starts_with('c')).expect("a certify-only group must be scheduled");
+        assert!(first_certify <= 1, "a certify-only probe must reach the front, got position {first_certify} in {order:?}");
+        assert_eq!(order.len(), 6, "interleaving must not drop groups when under the cap");
+
+        // The dirty class keeps its full volume — this changes order, not how
+        // much bin classification happens.
+        let many_certify: Vec<&str> = (0..50).map(|_| "c").collect();
+        let order = super::interleave_probe_groups(dirty.clone(), many_certify, 2 * 16);
+        assert_eq!(order.iter().filter(|g| g.starts_with('d')).count(), dirty.len(), "every dirty group must survive");
+
+        // A cap still bounds the total, since an unprobeable tail is waste.
+        let flood: Vec<&str> = (0..100).map(|_| "d").collect();
+        assert_eq!(super::interleave_probe_groups(flood, vec!["c0"], 32).len(), 32, "the cap bounds the phase");
     }
 }
