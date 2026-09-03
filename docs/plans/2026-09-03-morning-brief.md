@@ -522,6 +522,49 @@ spans containers, so any count over a window longer than the current process's
 uptime mixes processes. Check `docker service ps` for the current task's age
 before attributing anything.
 
+## THE 10x ANSWER — no, and the failure mode is LANE INVERSION
+
+With the arrival model calibrated and `--streams` actually scaling, the sim can
+finally answer the question the whole night was for. 12 h virtual, real prod
+journal (live state), 1x = the 20 streams that actually ingest:
+
+| | 1x (20 active) | 10x (200 active) |
+|---|---|---|
+| pending | 21,288 -> **349** | 21,288 -> **14,510** |
+| executions | 4,635 | 18,374 |
+| BaseRollup | 1,881 | **14,472** (7.7x) |
+| **Dedup** | **2,162** | **1,510 — DOWN 30%** |
+| DerivedRollup | 299 | 2,099 |
+| Repair | 293 | 293 (unchanged — it is byte-bound, not claim-bound) |
+
+**At 10x the fleet does 4x the executions and yet completes FEWER dedup units.**
+That is not "we need more capacity"; it is the lane mix inverting. Rollup work is
+minted per stream and is individually cheap, so at 10x it wins the overwhelming
+majority of claims and dedup is crowded out — while **dedup is the lane
+certification depends on**, and certification is what lets a 14d/30d dashboard
+query route to a rollup at all.
+
+So the 10x failure is self-defeating in a specific way: the system spends its
+capacity building rollups that queries cannot use, because the dedup that would
+certify them never runs.
+
+**This also reframes tonight's throughput conclusion.** More maintenance
+throughput alone does not fix 10x — at 10x there IS more throughput (4x the
+executions) and dedup still goes backwards. What is missing is a floor: an
+operation-level reservation for Dedup, the same shape as the sealed and
+window reservations that `claim_next` already implements twice.
+
+**Caveats, stated plainly.** The sim is IO-free, so absolute counts are not prod
+rates; what transfers is the SHAPE — the ratio between lanes under load, which is
+decided by claim ordering, and claim ordering is real code the sim runs
+faithfully. Repair staying at 293 in both is a good internal check: it is
+throttled by its byte semaphore rather than by claims, so it should not move with
+stream count, and it does not.
+
+**Next experiment (cheap, offline):** add a Dedup reservation lane and re-run the
+same two rows. The sim now makes that a minutes-long question rather than a
+prod deploy.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
