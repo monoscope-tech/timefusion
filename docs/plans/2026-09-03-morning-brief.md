@@ -315,13 +315,39 @@ never binds; it drains the backlog to 21 in 11.5 h. **Turning mint ON does not
 help either**: pending GROWS to 8,346 in 12 h, because the arrival model is ~6x
 prod's real rate and swamps the effect.
 
-So there is **no offline reproduction of claim contention today**. The one regime
-that matters — realistic arrivals competing against a real backlog — is precisely
-the one `timefusion sim` cannot model. Every scheduler fix therefore has to be
-validated in prod, which is the loop CLAUDE.md explicitly says costs half a day
-per hypothesis. **Making the sim's arrival rate match production is the highest-
-leverage tooling work available**, and it gates testing any fix to the band
-above.
+So there was **no offline reproduction of claim contention** — the one regime that
+matters is exactly the one the sim could not model, forcing every scheduler fix
+through the half-day prod loop.
+
+### FIXED (change 4, committed, NOT pushed) — the sim now mints only from INGESTING streams
+
+The sim minted for every stream in the journal every 10 minutes; prod
+invalidates on actual WRITES, so idle streams cost nothing there. **Only 20 of
+the journal's 124 streams are still ingesting**, and 124/20 = 6.2x is the entire
+arrival discrepancy (prod 5,782 tasks/day vs the model's 35,712).
+
+Calibrated from the journal rather than guessed: a stream mints only if it
+produced a task within `STREAM_IDLE_MICROS` of the journal's newest record. The
+active count is printed, because it is the one number that decides whether an
+arrival-rate result is believable.
+
+| same 12 h run, real journal | pending after 12 h |
+|---|---|
+| before | **8,346 and climbing** |
+| after | **765, falling from ~2,000** |
+| `--no-mint` control | 21 (nothing competes) |
+
+The 20-of-124 figure independently reproduces the "21 of 124 active" measured
+straight from prod's `created_unix_ms` — that agreement is what makes it
+trustworthy rather than merely convenient.
+
+**This is what unblocks the 14–31 d fix**: a scheduler change can now be tested
+against realistic arrivals competing with a real backlog, offline, in minutes.
+
+**Left on branch `sim/ingesting-streams`, deliberately unpushed** — it is a code
+change, so pushing restarts prod, and it has no operational urgency at 03:30. It
+is one cherry-pick when you want it. Lint clean; the 20 `maintenance_sim` tests
+pass.
 
 **Still not fixed tonight, and the reason is in the code's own comments:**
 *"Raising `STARVATION_MICROS` is the WRONG fix and was refuted locally (9 test
