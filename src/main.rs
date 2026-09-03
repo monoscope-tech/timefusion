@@ -293,6 +293,10 @@ fn run_sim_cli() -> anyhow::Result<()> {
         timeouts.sort();
         println!("timeouts:    {}", timeouts.iter().map(|(op, n)| format!("{op}={n}")).collect::<Vec<_>>().join(" "));
     }
+    println!(
+        "claims by data age: frontier={} mid_band(3-31d)={} privileged(>31d)={} | day-wide claims={}",
+        report.claims_frontier, report.claims_mid_band, report.claims_privileged, report.claims_day_wide
+    );
     println!("frontier lag max: {}s", report.frontier_lag_secs_max);
     println!(
         "min contiguous days at end: {} (14d at {}, 30d at {})",

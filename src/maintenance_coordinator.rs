@@ -2602,12 +2602,45 @@ impl TaskJournal {
         // when debugging a stalled queue by hand.
         let window_turn = self.claim_tick % 4 == 3;
         let rank = |journal: &Self, task: &MaintenanceTask| -> Rank { journal.rank(task, now_micros) };
-        let best_class = |journal: &Self, sealed_only: bool, window_only: bool| -> Option<Rank> {
+        // One claim in eight for the band NOTHING else serves: older than the
+        // query window, younger than the starvation horizon.
+        //
+        // The `starved` slope rescues work past `STARVATION_HORIZON_MICROS`, and
+        // nothing bounded the rescue: every unit past the horizon outranks every
+        // unit inside it, forever, so a large past-horizon cohort takes every
+        // sealed turn. Prod 2026-09-03 measured the consequence — of 29 dedup
+        // claims, 20 frontier and 9 past-horizon, and **0** in the 3-31 day band
+        // that held **96% of the queue's 5,334 GiB**. That band had not moved in
+        // 18 days.
+        //
+        // `window_turn` covers only the last `QUERY_WINDOW_MICROS` (14 d), so
+        // between the window and the horizon there is a band with NO reservation
+        // at all: it loses every sealed turn to past-horizon work, and it is
+        // outside the window turn. That gap is where the frozen mass sat. Taking
+        // the band from `QUERY_WINDOW_MICROS` rather than `STARVATION_MICROS`
+        // keeps this turn disjoint from `window_turn` instead of duplicating it.
+        //
+        // `% 8 == 5`, one claim in eight. ODD, so it can never collide with a
+        // sealed turn (multiples of 2 or 4); `5 % 4 == 1`, so it never collides
+        // with `window_turn`'s 3 either.
+        //
+        // NOT residue 1, for the reason the comment above already gives and
+        // which the local suite proves: `claim_tick` is incremented before use,
+        // so `% 4 == 1` fires on the very FIRST claim of a fresh journal and
+        // changes what every rank-ordering test asserts. Taking it broke
+        // `damage_outranks_work_inside_the_starvation_window` — the damaged cell
+        // there is two days sealed, so an inside-horizon-only turn excludes the
+        // very unit the invariant is about. Residue 5 is first reached at tick 5,
+        // after a fresh journal has handed out its documented order.
+        let horizon_turn = self.claim_tick % 8 == 5;
+        let best_class = |journal: &Self, sealed_only: bool, window_only: bool, horizon_only: bool| -> Option<Rank> {
             let mut class: Option<Rank> = None;
             for task in journal.snapshot.tasks.iter().filter(|task| {
+                let waited = now_micros.saturating_sub(task.key.slice.end_micros);
                 claimable(task)
                     && !(sealed_only && is_frontier_task(task, now_micros))
-                    && !(window_only && now_micros.saturating_sub(task.key.slice.end_micros) > QUERY_WINDOW_MICROS)
+                    && !(window_only && waited > QUERY_WINDOW_MICROS)
+                    && (!horizon_only || (QUERY_WINDOW_MICROS..=STARVATION_HORIZON_MICROS).contains(&waited))
             }) {
                 let candidate = rank(journal, task);
                 if class.is_none_or(|best| candidate < best) && journal.dependencies_complete(task) {
@@ -2619,11 +2652,15 @@ impl TaskJournal {
         // Falls through to the normal order when the window is already clean, so
         // a quiet window never idles a worker.
         let class = if window_turn {
-            best_class(self, false, true).or_else(|| best_class(self, sealed_turn, false))
+            best_class(self, false, true, false).or_else(|| best_class(self, sealed_turn, false, false))
+        } else if horizon_turn {
+            // Falls back to the normal order, so an empty band never idles a
+            // worker — the same shape the other two reservations use.
+            best_class(self, true, false, true).or_else(|| best_class(self, false, false, false))
         } else if sealed_turn {
-            best_class(self, true, false).or_else(|| best_class(self, false, false))
+            best_class(self, true, false, false).or_else(|| best_class(self, false, false, false))
         } else {
-            best_class(self, false, false)
+            best_class(self, false, false, false)
         }?;
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
         let mut fallback: Option<&MaintenanceTask> = None;
@@ -3390,7 +3427,7 @@ const QUERY_WINDOW_MICROS: i64 = 14 * 24 * 60 * 60 * 1_000_000;
 /// deliberate policy. `publish_statistics` now counts
 /// beyond-horizon work separately for exactly that reason. See
 /// `docs/plans/2026-08-25-oldest-task-tail.md`.
-const STARVATION_HORIZON_MICROS: i64 = 31 * 24 * 60 * 60 * 1_000_000;
+pub(crate) const STARVATION_HORIZON_MICROS: i64 = 31 * 24 * 60 * 60 * 1_000_000;
 
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
     if is_frontier_task(task, now_micros) {
@@ -7279,6 +7316,52 @@ mod tests {
         assert!(
             claims(FRONTIER_LAG_BUDGET_SECS + 1) > 0,
             "but sealed must keep SOME share: withdrawing it entirely stops the backfill that builds 30d coverage"
+        );
+    }
+
+    /// Work INSIDE the horizon must keep a share against work past it.
+    ///
+    /// `starved` improves for every day past `STARVATION_HORIZON_MICROS`, so a
+    /// past-horizon unit outranks every inside-horizon unit — and nothing made
+    /// that rescue relinquish the lane. Prod 2026-09-03: 148 of 761 claimable
+    /// dedup units were past the horizon (55 of them re-failing), and the
+    /// 3-31 day band — holding **96% of the queue's 5,334 GiB**, untouched for
+    /// 18 days — took **0 of 29** claims.
+    ///
+    /// The unit here is 20 days sealed on purpose: `window_turn` already covers
+    /// the last 14 days, so a 10-day unit passes this test WITHOUT the fix and
+    /// proves nothing. The band between the window and the horizon is the one
+    /// nothing served.
+    #[test]
+    fn work_inside_the_horizon_keeps_a_share_against_work_past_it() {
+        const DAY_MICROS: i64 = 86_400_000_000;
+        let now = 100 * DAY_MICROS;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        // Ancient: 60 days sealed, so `starved` has gained ~29 steps.
+        let ancient = task("p", now - 61 * DAY_MICROS, now - 60 * DAY_MICROS, Operation::Dedup).key.clone();
+        // 20 days sealed: PAST the 14-day query window, so `window_turn` does
+        // not cover it, and inside the horizon, so it ties at the band floor.
+        // This band is the one with no reservation of its own.
+        let inside = task("p", now - 21 * DAY_MICROS, now - 20 * DAY_MICROS, Operation::Dedup).key.clone();
+        journal.enqueue(ancient.clone(), 0, 0, 0);
+        journal.enqueue(inside.clone(), 0, 0, 0);
+
+        let mut inside_claims = 0;
+        for _ in 0..16 {
+            let Some(claimed) = journal.claim_next(Operation::Dedup, now, true) else { continue };
+            if claimed.key == inside {
+                inside_claims += 1;
+            }
+            journal.complete(&claimed.key);
+            // Re-open both, so the ancient unit is always available to win again
+            // — the shape of a past-horizon cohort that fails and requeues.
+            journal.enqueue(claimed.key.clone(), 0, 0, 0);
+        }
+        assert!(
+            inside_claims > 0,
+            "a unit inside the horizon must get a claim; without a reserved turn the past-horizon unit wins every tick \
+             and the band holding most of the queue's bytes never moves"
         );
     }
 

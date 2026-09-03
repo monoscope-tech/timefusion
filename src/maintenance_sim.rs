@@ -248,6 +248,23 @@ pub struct SimReport {
     /// `MIN_SLICE_MICROS`: reaching the floor is the shred.
     pub sharded_runs: u64,
     pub sharded_runs_above_min_slice: u64,
+    /// Claims bucketed by the DATA AGE of the slice, which is what `starved`
+    /// ranks on — the diagnostic that identifies a starvation livelock and the
+    /// acceptance test for any fix to one.
+    ///
+    /// `starved` improves monotonically past `STARVATION_HORIZON_MICROS`, so a
+    /// cohort whose data is older than 31 days outranks everything else
+    /// permanently; if those units also fail and requeue, they hold the lane and
+    /// the middle band is never reached. Prod 2026-09-03 measured exactly that
+    /// for Dedup: of 29 claims, 20 frontier, 9 privileged, and **0** in the
+    /// 3-31 day band that held 96% of the queue's bytes. A fix is only believable
+    /// if the sim first REPRODUCES `claims_mid_band == 0` and then releases it.
+    pub claims_frontier: u64,
+    pub claims_mid_band: u64,
+    pub claims_privileged: u64,
+    /// Claims whose slice is a full day or wider, regardless of age — the
+    /// population that carries the queue's bytes.
+    pub claims_day_wide: u64,
     pub narrowest_sharded_run_micros: i64,
     /// The most any single execution decoded, after runtime sharding. Above
     /// `MAX_DECODED_BYTES` means the memory bound was broken.
@@ -809,6 +826,19 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     continue;
                 }
                 if let Some(task) = journal.claim_next(operation, now, false) {
+                    // Bucketed on the SAME quantity `starved` ranks on: how long
+                    // ago the slice's DATA ended, not when the record was made.
+                    let waited = now.saturating_sub(task.key.slice.end_micros);
+                    if waited > crate::maintenance_coordinator::STARVATION_HORIZON_MICROS {
+                        report.claims_privileged += 1;
+                    } else if waited > 3 * crate::maintenance_coordinator::DAY_MICROS {
+                        report.claims_mid_band += 1;
+                    } else {
+                        report.claims_frontier += 1;
+                    }
+                    if task.key.slice.width() >= crate::maintenance_coordinator::DAY_MICROS {
+                        report.claims_day_wide += 1;
+                    }
                     if is_debt_op(operation) {
                         debt_busy += 1;
                     }
