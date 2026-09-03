@@ -309,10 +309,19 @@ So the earlier fix did not remove the starvation point — **it moved it**, from
 ≤14 d to 14–31 d. And that is exactly where `coarsen_sealed_slices_capped` puts
 its day-wide =MAX output, which is why the two signatures coincide so completely.
 
-**Why the sim drains them anyway:** `--no-mint` generates no frontier work, so
-nothing competes and the reservation logic never binds. The sim is right that the
-queue is drainable; it cannot see a contention effect that only exists under live
-ingest.
+**Why the sim drains them anyway — and a tooling gap worth its own ticket.**
+`--no-mint` generates no frontier work, so nothing competes and the reservation
+never binds; it drains the backlog to 21 in 11.5 h. **Turning mint ON does not
+help either**: pending GROWS to 8,346 in 12 h, because the arrival model is ~6x
+prod's real rate and swamps the effect.
+
+So there is **no offline reproduction of claim contention today**. The one regime
+that matters — realistic arrivals competing against a real backlog — is precisely
+the one `timefusion sim` cannot model. Every scheduler fix therefore has to be
+validated in prod, which is the loop CLAUDE.md explicitly says costs half a day
+per hypothesis. **Making the sim's arrival rate match production is the highest-
+leverage tooling work available**, and it gates testing any fix to the band
+above.
 
 **Still not fixed tonight, and the reason is in the code's own comments:**
 *"Raising `STARVATION_MICROS` is the WRONG fix and was refuted locally (9 test
