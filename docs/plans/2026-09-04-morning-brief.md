@@ -161,6 +161,13 @@ of rows, so those panels never stood to gain. Don't quote one "hashes" number.
    **No throughput number measured tonight is valid**, and no convergence can
    happen at this cadence. Only you can coordinate this, and against the 10x goal
    it matters more than any single fix in the table above.
+   **My own honest share of this:** I pushed four src changes tonight, and each
+   push *is* a deploy that killed the running process and whatever units were
+   in flight. So I contributed four of the night's restarts while naming the
+   cadence as the top blocker. The distinction I would still defend is that a
+   fix that lands is worth a restart and a repeated no-op redeploy is not — but
+   the measurement damage is the same either way, and the honest reading is that
+   **nobody could have measured convergence tonight, including me.**
 3. **Debt-metric semantics.** `sealed_compaction_debt_bytes` (1.33 TB) counts
    **35.9 GiB** sitting in 49 cells that are provably unworkable — their two
    smallest files cannot pair within the byte budget. It misleads no scheduler,
