@@ -1046,9 +1046,9 @@ impl Database {
     /// and read filters on immutable columns are pushed BELOW the merge-on-read
     /// dedup precisely because they were promised not to.
     ///
-    /// Two ways a group can disagree, and `COUNT(DISTINCT)` alone catches only
+    /// Two ways a group can disagree, and the value term alone catches only
     /// the first:
-    /// - different non-null values — `COUNT(DISTINCT c) > 1`;
+    /// - different non-null values — `MIN(c) <> MAX(c)`;
     /// - null in some versions and set in others — which `COUNT(DISTINCT)`
     ///   ignores entirely, and which is the SHAPE ENRICHMENT PRODUCES: a field
     ///   absent on the first emit and filled on the retry. Hence
@@ -1058,8 +1058,26 @@ impl Database {
     ///
     /// Dedup keys are excluded (they are the grouping), as are the tiebreak and
     /// tombstone columns, which vary across versions by construction. Composite
-    /// types are excluded because `COUNT(DISTINCT)` over them is neither cheap
-    /// nor meaningful.
+    /// types are excluded because ordering over them is neither cheap nor
+    /// meaningful.
+    ///
+    /// `MIN(c) <> MAX(c)`, NOT `COUNT(DISTINCT c) > 1`. The two are equivalent
+    /// for the question asked — "does this group hold two different non-null
+    /// values?" — because `MIN <> MAX` exactly when at least two distinct
+    /// non-null values exist, and both ignore nulls identically. But
+    /// `COUNT(DISTINCT)` keeps a per-group HASH SET per column, and this schema
+    /// audits ~150 columns, so it built ~150 hash sets for every dedup key in
+    /// the shard. Prod 2026-09-03: the `GroupedHashAggregateStream` carrying
+    /// them was a top memory consumer at **141 MB peak** inside a
+    /// `fair(pool_size: 5.0 GB)` exhaustion — the heavy share, which is where
+    /// the dedup rewrite's own sort also lives. A correctness audit was helping
+    /// cause the OOMs that stop dedup running.
+    ///
+    /// `MIN`/`MAX` carry O(1) state per group per column. The audit keeps its
+    /// meaning, its per-column granularity and its unconditional execution; only
+    /// the accumulator changes. The comment below the call site — "one extra
+    /// aggregate over a shard this rewrite is about to read in full anyway" — is
+    /// true of this formulation and was not true of the old one.
     fn immutable_audit_sql(schema: &crate::schema::TableSchema, scan_name: &str, rows_filter: &str) -> Option<String> {
         let excluded: std::collections::HashSet<&str> =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect();
@@ -1073,7 +1091,7 @@ impl Database {
             })
             .map(|field| {
                 let column = crate::rollup::quoted(&field.name);
-                format!("COUNT(DISTINCT {column}) > 1 OR (COUNT({column}) > 0 AND COUNT({column}) < COUNT(*))")
+                format!("MIN({column}) <> MAX({column}) OR (COUNT({column}) > 0 AND COUNT({column}) < COUNT(*))")
             })
             .collect::<Vec<_>>();
         if predicates.is_empty() || schema.dedup_keys.is_empty() {
@@ -1993,7 +2011,7 @@ mod immutable_audit_tests {
         crate::schema::get_schema("otel_logs_and_spans").expect("the real shipped schema")
     }
 
-    /// `COUNT(DISTINCT c)` ignores nulls, so on its own it cannot see the shape
+    /// `MIN`/`MAX` ignore nulls, so on their own they cannot see the shape
     /// enrichment actually produces: a column absent on the first emit and
     /// filled on the retry. The null-transition term is what makes the audit
     /// answer the question it was written for, and it must be TWO-SIDED — a
@@ -2002,7 +2020,7 @@ mod immutable_audit_tests {
     #[test]
     fn the_audit_catches_a_null_to_value_transition_not_just_differing_values() {
         let sql = Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns");
-        assert!(sql.contains("COUNT(DISTINCT"), "differing non-null values are caught");
+        assert!(sql.contains("MIN(") && sql.contains("MAX("), "differing non-null values are caught");
         assert!(
             sql.contains("> 0 AND COUNT(") && sql.contains("< COUNT(*)"),
             "a null-in-some-versions transition is caught, and only when the column is set in at least one: {sql}"
@@ -2022,7 +2040,7 @@ mod immutable_audit_tests {
         assert!(!grouped.is_empty(), "the schema has dedup keys, or this test proves nothing");
         for column in grouped {
             assert!(
-                !sql.contains(&format!("COUNT(DISTINCT {})", crate::rollup::quoted(column))),
+                !sql.contains(&format!("MIN({})", crate::rollup::quoted(column))),
                 "{column} varies across versions by construction and must not be audited"
             );
         }
@@ -2076,6 +2094,67 @@ mod immutable_audit_tests {
         let count = Database::scalar_i64(&ctx, &sql).await.expect("audit runs").expect("one row");
 
         assert_eq!(count, 2, "`a` differs outright and `b` goes null -> error; `c` agrees and `d` is null throughout ({sql})");
+    }
+
+    /// THE PERFORMANCE PROPERTY, pinned so it cannot regress silently.
+    ///
+    /// `COUNT(DISTINCT c)` keeps a per-group HASH SET per column, and this
+    /// schema audits ~150 columns — so the old formulation built ~150 hash sets
+    /// for every dedup key in the shard. Prod 2026-09-03 measured the
+    /// `GroupedHashAggregateStream` carrying them at **141 MB peak**, a top
+    /// consumer inside a `fair(pool_size: 5.0 GB)` exhaustion of the heavy
+    /// share — the same pool the dedup rewrite's own sort draws on.
+    ///
+    /// `MIN`/`MAX` answer the identical question with O(1) state per group.
+    #[test]
+    fn the_audit_uses_no_distinct_accumulators() {
+        let sql = Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns");
+        assert!(!sql.contains("COUNT(DISTINCT"), "the audit must not build a per-group hash set per column; it audits ~150 of them");
+        let audited = sql.matches("MIN(").count();
+        assert!(audited > 50, "the real schema audits many columns, or this test proves nothing: {audited}");
+    }
+
+    /// `MIN`/`MAX` must PLAN for every non-composite type the audit admits, not
+    /// just the strings the truth-table test uses. A type DataFusion cannot
+    /// order would make the audit query error at plan time — and the call site
+    /// swallows that into `warn!`, so the audit would go silently dead while
+    /// still looking present in the SQL.
+    #[tokio::test]
+    async fn the_audit_plans_for_non_string_types() {
+        use datafusion::arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let mut schema = logs_schema().clone();
+        schema.fields.retain(|field| ["id", "context___is_remote", "message_size_bytes", "observed_timestamp"].contains(&field.name.as_str()));
+        schema.fields.iter_mut().for_each(|field| field.mutable = false);
+        schema.dedup_keys = vec!["id".to_owned()];
+        schema.dedup_tiebreak = None;
+        schema.tombstone_column = None;
+        assert!(schema.fields.len() >= 3, "the trimmed schema must keep a bool, an int and a timestamp: {:?}", schema.fields.len());
+
+        let arrow = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("context___is_remote", DataType::Boolean, true),
+            Field::new("message_size_bytes", DataType::Int64, true),
+            Field::new("observed_timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b", "b"])),
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true), Some(true)])),
+                Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2), Some(2)])),
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(10), Some(10), Some(20), Some(20)])),
+            ],
+        )
+        .expect("batch");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_batch("scan", batch).expect("register");
+        let sql = Database::immutable_audit_sql(&schema, "scan", "true").expect("columns to audit");
+        let count = Database::scalar_i64(&ctx, &sql).await.expect("the audit must PLAN and RUN over bool/int/timestamp").expect("one row");
+        assert_eq!(count, 1, "only `a` disagrees, on the boolean ({sql})");
     }
 
     /// The whole streaming-collapse rewrite rests on this one property, and it
