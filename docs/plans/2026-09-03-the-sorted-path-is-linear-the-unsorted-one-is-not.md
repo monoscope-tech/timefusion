@@ -136,3 +136,67 @@ flush plus every later enrichment append that lands in it.
 packing does, and `pending_hot_packing` has sat at 16-17 all night.** Not a new
 mechanism: an existing lane whose throughput now has a measured 20-43x
 consequence on dedup, and a read-path consequence on top.
+
+---
+
+## Following the lever: hot packing is CLAIMED but cannot aim
+
+If overlap is fixed by merging files within a bucket, hot packing is the lane
+that matters. It is **not** starved of claims — 100 minutes of prod:
+
+| operation | task starts |
+| --- | --- |
+| Dedup | 108 |
+| BaseRollup | 107 |
+| SealedConsolidation | 36 |
+| Repair | 36 |
+| **HotPacking** | **35** |
+| DerivedRollup | 35 |
+
+But it consumes **1,106 worker-seconds of ~96,800 available (1.1%)** — ~31 s per
+unit, with 7 units reporting `compaction_unit_selected_nothing`. It runs often and
+does little.
+
+**`maintenance_hygiene_debt_unclaimed` fired 50 times and names why:**
+
+```
+operation=HotPacking refusal="outranked_by:6297304f:2026-09-03:00000000:2026-09-03:files=37"
+```
+
+Format is `outranked_by:<winner>:<winner_date>:<worst>:<worst_date>:files=N`. Both
+cells are TODAY, so they tie on `starved` and fall through to `benefit`:
+
+```rust
+const BENEFIT_BUCKET_FILES: u32 = 64;
+benefit = -(input.files / BENEFIT_BUCKET_FILES)
+```
+
+**37 / 64 = 0.** The most indebted hot-packing cell scores identically to a
+one-file cell. Measured across the journal's hygiene-style lane:
+
+| lane | pending with file counts | under 64 files | file p50 / max |
+| --- | --- | --- | --- |
+| **repair** | 24 | **24 = 100%** | **1 / 27** |
+
+Every one lands in bucket 0. HotPacking's worst cell (37) does too. Only
+SealedConsolidation's 338-file cell reaches a non-zero bucket (5).
+
+**So the debt term is switched OFF precisely in the small-file lanes — and merging
+small files is what hot packing IS.** With `benefit` tied at 0, ordering falls
+through to recency and the per-project cursor, i.e. effectively blind to debt.
+
+### Why the bucket exists — a fix must respect this
+
+The coarse bucket is deliberate: `claim_next` matches the winning rank tuple
+EXACTLY, so a continuous key would make one unit the sole winner of every claim
+and defeat the per-project rotation in `fair_cursors`. **A fix cannot simply use
+raw file counts.** A smaller bucket (e.g. 8) keeps quantisation while restoring
+discrimination at the sizes these lanes actually see; the sim's
+`claims_*` counters plus a per-lane debt metric are the acceptance test.
+
+### NOT SHIPPED TONIGHT, deliberately
+
+This is a second selection/ordering change, the category with the worst incident
+history in this repo, and one such change (`dd4a557f`) already shipped tonight and
+is still being verified. **One change per deploy.** The evidence is recorded here;
+the fix belongs to a session that can sim it, ship it alone, and watch it.
