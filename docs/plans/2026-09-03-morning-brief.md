@@ -34,6 +34,48 @@ urgency): the two `timefusion sim` fixes, on `sim/ingesting-streams` and
 `fix/streams-active`. **Both matter** — without them every scale run measures
 roughly 1x. Cherry-pick when convenient.
 
+## THE TOP LEVER, measured: stop manufacturing the duplicates
+
+The 10x chain ends at certification — cheaper dedup needs certification, and
+certification needs dedup. Measured on the 5.5 h quiet process, certification is
+running but barely covering anything:
+
+| metric | value |
+|---|---|
+| `cert_granted_total` | 55 |
+| **`cert_declined_dirty_bins`** | **12,716** — a 231:1 ratio against grants |
+| `cert_slice_files_proved` / `unproven` | 1,781 / **22,300** (only **7.4%** proved) |
+| `cert_skip_blocked_overlap` | 42,703 |
+| `cert_dwell_p50` | 81,674 s = **22.7 h** |
+
+**The dominant decline is DIRTY BINS by two orders of magnitude.** Certification
+is not blocked by contiguity, plumbing, or fingerprints
+(`cert_refused_fp_moved` = 0, `cert_refused_incomplete` = 0,
+`cert_skip_blocked_no_stats` = 0) — it is blocked because the data genuinely
+still contains duplicates.
+
+And **58% of those duplicates are byte-identical rows our own WAL replay
+re-inserted** (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`). So the
+causal chain is:
+
+```
+WAL replay re-inserts rows  ->  bins are dirty  ->  certification declines
+  ->  DedupExec stays in every plan  ->  dedup must keep re-proving the partition
+  ->  dedup costs ~7x a rollup unit  ->  10x starves dedup  ->  coverage never builds
+```
+
+**`TIMEFUSION_LANDED_SKIP_ENABLED` cuts that chain at its head, and it is still
+defaulted OFF.** It is already shipped, tested, and instrumented
+(`wal.landed_skips`, `wal.replay_rows`). It only ever fires after an unclean
+restart, so it costs nothing on a clean boot — and prod restarts often enough
+(three times last night alone) that it would fire regularly.
+
+**This reorders the levers I gave earlier.** I ranked it third behind "make dedup
+cheaper"; the certification numbers say it is FIRST, because it is the only one
+that reduces the amount of dedup that must happen at all rather than making each
+unit faster. The caveat from its own design doc stands: validate in staging, not
+prod, because the skip cannot be induced on a read-only prod host.
+
 ## The four maintenance lanes you named
 
 | lane | verdict |
