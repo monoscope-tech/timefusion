@@ -627,6 +627,35 @@ make units cheaper.
 
 
 
+## Repair, measured over a 5-hour quiet process (updates change 1's verdict)
+
+Earlier in the night I reported change 1's concurrency gain as **zero**, from a
+60-minute window taken minutes after a restart. With the current process quiet
+for 5.1 hours the picture is better, though I cannot cleanly attribute it:
+
+| | previous container (`6cfd51d`) | current (`d683f78`, 5.1 h quiet) |
+|---|---|---|
+| `repair_rewrite_permit_busy` | 88 in 60 min = **1.47/min** | 39 in 300 min = **0.13/min** |
+| `want_mib` clamped at 6,144 | 65 of 88 (74%) | 37 of 39 (95%) |
+| `pending_repair` | 302 (night start) | 288 |
+
+**Repair permit contention fell ~11x**, and `pending_repair` drained ~14 units in
+~7 h (~2/hr against the ~1.2/hr baseline).
+
+**Why I am not claiming credit for it.** The change between those two processes
+is the ADMISSION fix, not the repair budget — so this could equally be workload
+variation, or repair units simply completing and releasing the semaphore rather
+than bouncing. One process either side is not an experiment. What is safe to say:
+**contention is materially lower and nothing regressed**, and the earlier "gain
+is zero" reading was taken in the worst possible window (a just-restarted
+process) — which is the trap my own notes warn about and I walked into anyway.
+
+The `want_mib` shift is the more interesting number: **95% of bounces are now
+the clamped ≥6,144 class**, up from 74%. The sub-budget units have largely
+stopped bouncing, which is exactly what the budget increase was supposed to do.
+The remaining contention is entirely the oversized class — the one the
+decoupling fix (top morning decision) addresses.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
