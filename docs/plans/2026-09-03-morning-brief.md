@@ -90,6 +90,10 @@ gap.
 | 1 | repair budget sized by the target file, in its own constant | repair | **Live.** Permit contention down ~11x over a 5 h quiet process, and 95% of remaining bounces are the oversized class (was 74%) — but see *Change 1 UNDER-DELIVERED*: the budget still cannot hold two REAL units, and the decoupling fix is the **top morning decision**. |
 | 2 | maintenance/coordinator pool USAGE exposed, denominator corrected | all | **Live.** Coordinator pool peaks at 47–70%, not the 0% a single reading suggested. |
 | 3 | admission grants the full cap at half-free, not only at an idle pool | dedup + base_rollup | **Live**, and the gate defect is real and tested — but its *benefit* is **unproven**: the 297-unit cohort I cited as motivation never reaches that gate. See the correction and resolution below. |
+| 4 | split-floor guard priced on the unit's own estimate, not a synthetic constant | all splitting | **Live** (`ca60cc9`). Real defect — prod had 147 live units at the 60 s floor and 8,595 completed there — but currently DORMANT: the capacity-failure path that mints them is not firing. |
+| 5 | sim duration model rebuilt from 676 production events | tooling | **Deploying.** The old numbers predated the dedup-key widening and priced BaseRollup 16x too cheap; they are what produced the retracted 10x conclusions. |
+| 6 | sim calls the real split guard instead of transcribing it | tooling | **Deploying.** Removes a live drift class — the copy is why the sim never reproduced defect 4. Four tests reconciled against measurement. |
+| 7 | repair's pool holdback derived from its decoded budget | repair + hot-tail | **Deploying.** Decouples two things one constant was doing. Costs a light permit (K 4 -> 3), which was NOT the predicted direction — see the K baseline section. |
 
 **Not pushed, deliberately** (a code push restarts prod, and these had no
 overnight urgency): the two `timefusion sim` fixes. **Both matter** — without
