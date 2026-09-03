@@ -135,3 +135,35 @@ any of them:
 - The `QUERY_PARTITIONS_MAX = 16` cap already exists *because* per-partition
   non-spillable reservations exhausted the pool on the 48-core box. **The cap was
   the right diagnosis and is still too high** for this query.
+
+---
+
+## Update — the failures are BURSTY, and have not recurred in 3h10m
+
+Measured over a properly-established window (14:38:53 → 17:48:48, timestamps
+sorted, multi-task):
+
+| | |
+| --- | --- |
+| `PgWire internal error` | **9 — all "Prepared statement 'all' does not exist"** |
+| sort-memory query failures | **0** |
+| `Not enough memory to continue external sort` | 2, both `pass=Repair` maintenance |
+
+**Nothing was changed in the query pool**, so this is not a fix — it is evidence
+about the shape of the problem. The 17-in-62-minutes measured this morning was a
+**burst**, not a steady rate, which matches the original observation that the
+failures clustered (4 in 23 s, then 4 in 4 min). A whale query shape runs
+occasionally and takes its neighbours down with it.
+
+Two consequences:
+
+1. **Do not quote 0.083% as a steady-state failure rate.** It was one process's
+   hour. The honest statement is "a burst of 17 sort-memory failures in one hour,
+   none in the following three".
+2. **A burst is harder to attribute**, because the correlation has to be running
+   when it happens. The thread-matched `query.text` correlation should be armed
+   ahead of time rather than run retrospectively over interleaved logs.
+
+Unrelated but worth an owner: 9 `Prepared statement 'all' does not exist` in the
+same window is a client/protocol error from monoscope, not a TimeFusion memory
+problem.
