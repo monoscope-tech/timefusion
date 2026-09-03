@@ -2714,7 +2714,14 @@ impl Database {
                 (key.slice.start_micros, key.slice.end_micros),
                 derived,
             )?;
-            let shard_aggregate = ctx.sql(&aggregate_sql).await.map_err(|error| lease.note_failure(error))?.collect().await?;
+            // WATCHED. A rollup IS an aggregate, and a bare `collect()` reports
+            // nothing until it returns, so a unit spending its whole deadline
+            // inside the GROUP BY is indistinguishable from a stalled one — the
+            // exact defect `collect_watched` was written for, fixed for repair
+            // and dedup on 2026-09-01 and never applied to the lane that is
+            // aggregate from end to end. Prod 2026-09-04 read
+            // `work.BaseRollup.worker_secs=1097` against `progress_rows=0`.
+            let shard_aggregate = collect_watched(&ctx, &aggregate_sql).await.map_err(|error| lease.note_failure(error))?;
             if hash_shards == 1 {
                 aggregate = shard_aggregate;
             } else {
@@ -2740,7 +2747,7 @@ impl Database {
                 (key.slice.start_micros, key.slice.end_micros),
                 true,
             )?;
-            aggregate = ctx.sql(&merge_sql).await?.collect().await?;
+            aggregate = collect_watched(&ctx, &merge_sql).await?;
         }
         let mut by_project = crate::rollup::to_rollup_batches_by_project(
             spec,
@@ -9134,5 +9141,35 @@ mod date_coverage_recovery_tests {
         // A cap still bounds the total, since an unprobeable tail is waste.
         let flood: Vec<&str> = (0..100).map(|_| "d").collect();
         assert_eq!(super::interleave_probe_groups(flood, vec!["c0"], 32).len(), 32, "the cap bounds the phase");
+    }
+
+    /// Every maintenance SQL that can hold a unit's whole deadline must be
+    /// WATCHED, or the unit looks stalled while it works.
+    ///
+    /// `collect()` reports nothing until it returns, and the liveness clock reads
+    /// the plan's own `output_rows`. Repair and dedup were fixed on 2026-09-01
+    /// after prod killed seven working units at `timeout_seconds=3600`; the
+    /// rollup lane — which is an aggregate from end to end — was never converted,
+    /// and prod 2026-09-04 read `work.BaseRollup.worker_secs=1097` against
+    /// `progress_rows=0`. A source-level guard because the failure is the ABSENCE
+    /// of a call, which no behavioural test on the rollup path can observe
+    /// without standing up the whole builder.
+    #[test]
+    fn maintenance_aggregates_are_collected_watched() {
+        let source = include_str!("maintain.rs");
+        let unwatched: Vec<_> = source
+            .lines()
+            .enumerate()
+            // Built by `concat!` so this line does not match itself, and
+            // `expect(` excludes test code — production maintenance SQL uses
+            // `?`/`map_err`, never `expect`.
+            .filter(|(_, line)| line.contains(concat!("ctx.sql", "(")) && line.contains(concat!(".collect", "().await")) && !line.contains("expect("))
+            .map(|(n, line)| format!("{}: {}", n + 1, line.trim()))
+            .collect();
+        assert!(
+            unwatched.is_empty(),
+            "these run a maintenance SQL to completion without a liveness watcher — use `collect_watched`:\n{}",
+            unwatched.join("\n")
+        );
     }
 }
