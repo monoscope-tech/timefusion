@@ -1557,3 +1557,29 @@ duplicates.
 | ingest-side dedup-key check | 95.8% cross-file (uncatchable in-bucket) AND zero exact duplicates to catch |
 | attempts-based demotion for the livelock | sim: mid_band stayed at 2, because 76 of 148 privileged units never failed |
 | raising `STARVATION_MICROS` | previously refuted, 9 test failures — evicts the query window from the privileged lane |
+
+### `dd4a557f` verification, strengthened: the kills STOPPED
+
+The ratio understates it. `work.Dedup.killed_secs` is **flat at 3,600** across 44
+minutes in which `work.Dedup.worker_secs` nearly doubled (40,784 -> 78,581), and
+two samples 50 s apart confirm it is not moving.
+
+| build | uptime | killed_secs | worker_secs | share |
+| --- | --- | --- | --- | --- |
+| pre-fix | 64 min | 9,905 | 26,933 | 36.8% |
+| pre-fix | 180 min | 29,707 | 128,311 | 23.2% |
+| fixed | 82 min | 3,600 | 40,784 | 8.8% |
+| **fixed** | **126 min** | **3,600 (unchanged)** | **78,581** | **4.6%** |
+
+The deadline is 900 s, so **3,600 = exactly 4 units killed** — all early in the
+process, none in the 44 minutes since. The pre-fix build's 29,707 s is ~33 killed
+units over a comparable window.
+
+**A flat absolute counter against rising capacity is much stronger than a falling
+ratio**: a ratio can fall because the denominator grows, but a numerator that
+stops moving means the failure mode stopped happening.
+
+Caveats unchanged: one process per build, workload uncontrolled. What makes this
+robust is that the pre-fix build was sampled at ages either side of 126 min and
+the fixed build is below both, and that the kill counter has stopped advancing
+entirely.
