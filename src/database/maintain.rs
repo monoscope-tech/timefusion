@@ -7138,7 +7138,22 @@ impl Database {
         .await;
         if let Err(e) = staged {
             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-            warn!("Light optimize staging failed for project={} table={}: {}", project_id, table_name, e);
+            // `pass` and `files` are the two facts this warn existed without, and
+            // without them it cannot be acted on: the two passes have DIFFERENT
+            // failure handling (Repair walks the parallelism ladder and can
+            // quarantine; Pack has no accounting at all and re-offers the same
+            // bin forever), so which one failed decides whether a fix is even
+            // reachable. Prod 2026-09-03: one project failed here on every
+            // process across three builds and the pass was not in the record.
+            warn!(
+                project_id,
+                table_name,
+                ?pass,
+                files = files.len(),
+                capacity = crate::maintenance_coordinator::is_capacity_failure(&e.to_string()),
+                event = "hot_bin_staging_failed",
+                "Light optimize staging failed: {e}"
+            );
             // Count it against the candidate so a deterministically-impossible
             // file stops being re-offered and the queue behind it drains.
             //
