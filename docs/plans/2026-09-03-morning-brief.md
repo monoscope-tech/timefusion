@@ -1122,6 +1122,37 @@ the implied 2.4x, or `REPAIR_REWRITE_TARGET_FILES` to 1. I would take the second
 it keeps the honest ratio and gives the permit back by asking repair for less
 concurrency, rather than restoring an envelope the bench says fails.
 
+## Dedup's measured completion rate: 36/hour — and the queue is drifting UP
+
+The prior-art survey's rule 10 says to judge by **backlog trajectory**, not
+completion counters. Both, measured on the morning's live fleet:
+
+```
+last 60 min, Dedup `maintenance_task_finished`:  60 events
+   Complete   36     <- the actual completion rate
+   Retry      15
+   Running     7
+   Superseded  2
+```
+
+**36 completions/hour**, with 25% of finishes being retries. Meanwhile
+`pending_dedup` has drifted from ~1,304 at session start (21:00 UTC) to ~1,596
+now (10:11 UTC) — about **+22/hour**.
+
+If both hold, arrivals are running near 58/hour against 36 completed, i.e. the
+dedup lane is **falling behind by roughly 22 units/hour** during daytime load.
+
+**The caveat that stops this being a headline:** session start was night and now
+is the working day, so some of that rise is diurnal, and my pending readings were
+opportunistic rather than sampled. A 24-hour comparison at the same clock time is
+what would separate "diurnal" from "trend", and I do not have one. A clean
+one-minute-interval sample is running to get the real slope.
+
+**Why it matters anyway:** 36/hour is the number to hold against the sim's
+~141 units/hour fleet-wide figure and prod's ~162/hour. Dedup is roughly a
+quarter of fleet throughput while carrying the largest queue (1,596 against
+base_rollup's 935), and it is the lane certification depends on.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
