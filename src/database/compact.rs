@@ -1073,15 +1073,34 @@ impl Database {
     /// the dedup rewrite's own sort also lives. A correctness audit was helping
     /// cause the OOMs that stop dedup running.
     ///
-    /// `MIN`/`MAX` carry O(1) state per group per column. The audit keeps its
-    /// meaning, its per-column granularity and its unconditional execution; only
-    /// the accumulator changes. The comment below the call site — "one extra
-    /// aggregate over a shard this rewrite is about to read in full anyway" — is
-    /// true of this formulation and was not true of the old one.
-    fn immutable_audit_sql(schema: &crate::schema::TableSchema, scan_name: &str, rows_filter: &str) -> Option<String> {
+    /// `MIN`/`MAX` carry O(1) state per group per column, which removed the
+    /// audit from the top-5 consumers — but NOT enough. Measured on prod the
+    /// same day: whale-shard audits still died, and the top consumers at death
+    /// were `RepartitionExec` at ~47 MB with **30-49 MB "remain available"**
+    /// against `fair(pool_size: 5.0 GB)`. A `FairSpillPool` slices into
+    /// per-consumer quotas, so the binding constraint is the SLOT, not the
+    /// total — and the aggregate is still O(groups x ~150 columns), which no
+    /// accumulator swap fixes. Being an extra consumer, it also shrank the
+    /// rewrite's own slot.
+    ///
+    /// So this SQL form is now the FALLBACK, used only when the streaming
+    /// collapse cannot run (`dedup_keys_lead_the_sort` false). When it can, the
+    /// audit rides the collapse instead — see
+    /// `RunCollapse::with_immutable_audit` — at O(1) state and no extra
+    /// consumer. The old call-site claim, "one extra aggregate over a shard this
+    /// rewrite is about to read in full anyway", was never true of either SQL
+    /// formulation; it is true of the streaming one.
+    /// Columns an immutable-column audit compares — the single definition both
+    /// audit forms read, so the SQL and the streaming collapse cannot drift.
+    ///
+    /// Dedup keys are excluded (they are the grouping), as are the tiebreak and
+    /// tombstone columns, which vary across versions by construction. Composite
+    /// types are excluded because ordering over them is neither cheap nor
+    /// meaningful.
+    fn immutable_audit_columns(schema: &crate::schema::TableSchema) -> Vec<String> {
         let excluded: std::collections::HashSet<&str> =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect();
-        let predicates = schema
+        schema
             .fields
             .iter()
             .filter(|field| !field.mutable && !excluded.contains(field.name.as_str()))
@@ -1089,8 +1108,15 @@ impl Database {
                 let ty = field.data_type.to_ascii_lowercase();
                 !["variant", "binary", "list", "struct", "map"].iter().any(|composite| ty.contains(composite))
             })
-            .map(|field| {
-                let column = crate::rollup::quoted(&field.name);
+            .map(|field| field.name.clone())
+            .collect()
+    }
+
+    fn immutable_audit_sql(schema: &crate::schema::TableSchema, scan_name: &str, rows_filter: &str) -> Option<String> {
+        let predicates = Self::immutable_audit_columns(schema)
+            .iter()
+            .map(|name| {
+                let column = crate::rollup::quoted(name);
                 format!("MIN({column}) <> MAX({column}) OR (COUNT({column}) > 0 AND COUNT({column}) < COUNT(*))")
             })
             .collect::<Vec<_>>();
@@ -1589,7 +1615,19 @@ impl Database {
                                 // anyway, and what it detects is silently wrong
                                 // query results. A correctness audit that is off
                                 // is not an audit.
-                                if let Some(audit_sql) = Self::immutable_audit_sql(schema, scan_name, &rows_filter) {
+                                // Keys leading the sort make the window redundant: sort ONCE in
+                                // schema order and collapse adjacent runs (`RunCollapse`). The
+                                // window plan pays two full external sorts — its partition
+                                // ordering is normalized to ASC, so it can never double as the
+                                // DESC output sort.
+                                let order_by = schema_order_by_clause(schema);
+                                let streaming_collapse = dedup_keys_lead_the_sort(schema) && !order_by.is_empty();
+                                // When the collapse runs, it audits inline (see
+                                // `RunCollapse::with_immutable_audit`) and this
+                                // aggregate would be a second, redundant pass —
+                                // one that could not fit its slot of the heavy
+                                // pool on whale shards anyway.
+                                if let Some(audit_sql) = (!streaming_collapse).then(|| Self::immutable_audit_sql(schema, scan_name, &rows_filter)).flatten() {
                                     // Diagnostics must never fail the rewrite that carries them.
                                     match Self::scalar_i64(ctx, &audit_sql).await {
                                         Ok(Some(disagreeing)) if disagreeing > 0 => {
@@ -1614,13 +1652,6 @@ impl Database {
                                     .dedup_tiebreak
                                     .as_ref()
                                     .map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", crate::rollup::quoted(field)));
-                                let order_by = schema_order_by_clause(schema);
-                                // Keys leading the sort make the window redundant: sort ONCE in
-                                // schema order and collapse adjacent runs (`RunCollapse`). The
-                                // window plan pays two full external sorts — its partition
-                                // ordering is normalized to ASC, so it can never double as the
-                                // DESC output sort.
-                                let streaming_collapse = dedup_keys_lead_the_sort(schema) && !order_by.is_empty();
                                 let sql = if streaming_collapse {
                                     format!("SELECT {columns} FROM {scan_name} WHERE {rows_filter}{order_by}")
                                 } else {
@@ -1679,7 +1710,10 @@ impl Database {
                                 }
                                 let _progress = crate::database::maintain::PlanProgress::watch(Arc::clone(&plan));
                                 let mut collapse = streaming_collapse
-                                    .then(|| RunCollapse::new(&plan.schema(), &schema.dedup_keys, schema.dedup_tiebreak.as_deref()))
+                                    .then(|| {
+                                        RunCollapse::new(&plan.schema(), &schema.dedup_keys, schema.dedup_tiebreak.as_deref())
+                                            .and_then(|collapse| collapse.with_immutable_audit(&plan.schema(), &Self::immutable_audit_columns(schema)))
+                                    })
                                     .transpose()?;
                                 let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
                                 let mut shard_after = 0usize;
@@ -1715,6 +1749,21 @@ impl Database {
                                             );
                                         }
                                     }
+                                }
+                                // Reported here rather than mid-stream so one run straddling a
+                                // batch boundary is counted once. Diagnostics must never fail the
+                                // rewrite that carries them, so there is nothing to propagate.
+                                if let Some(disagreeing) = collapse.as_ref().map(RunCollapse::disagreements).filter(|count| *count > 0) {
+                                    crate::observability::maintenance_stats()
+                                        .immutable_column_disagreement_total
+                                        .fetch_add(disagreeing, std::sync::atomic::Ordering::Relaxed);
+                                    warn!(
+                                        table = %table_name,
+                                        project_id = %project_id,
+                                        disagreeing,
+                                        event = "immutable_column_disagreement",
+                                        "versions of one key differ on a column declared immutable; read filters on it are pushed below dedup"
+                                    );
                                 }
                                 // The coordinator takes this streaming branch, so the
                                 // collecting branch's identical probe below would never fire in
@@ -1916,6 +1965,12 @@ pub(crate) struct RunCollapse {
     key_idxs: Vec<usize>,
     /// The winning row of the run still in flight, as its own compact batch.
     carry: Option<(RecordBatch, Vec<u8>, Option<Vec<u8>>)>,
+    /// Immutable-column audit: the columns to compare, and the run state that
+    /// carries across batches with `carry`. See `with_immutable_audit`.
+    audit: Option<(Vec<usize>, datafusion::arrow::row::RowConverter)>,
+    run_immutable: Option<Vec<u8>>,
+    run_disagreed: bool,
+    disagreements: u64,
 }
 
 impl RunCollapse {
@@ -1932,7 +1987,43 @@ impl RunCollapse {
             tiebreak: tiebreak.map(|name| index(name).and_then(|idx| Ok((idx, RowConverter::new(vec![field(idx)])?)))).transpose()?,
             key_idxs,
             carry: None,
+            audit: None,
+            run_immutable: None,
+            run_disagreed: false,
+            disagreements: 0,
         })
+    }
+
+    /// Audit immutable columns while collapsing, instead of with a separate
+    /// `GROUP BY` aggregate.
+    ///
+    /// The collapse already has every version of a key adjacent, so a run
+    /// disagrees exactly when some row's immutable tuple differs from the run's
+    /// first — one row-encoding compare, O(1) state, riding a stream that
+    /// already exists. The SQL form it replaces built ~600 accumulators
+    /// (`MIN`/`MAX`/`COUNT` over ~150 columns) keyed by dedup key, and on prod
+    /// whale shards it could not fit its slot of the 5 GB `FairSpillPool` — so
+    /// the audit failed on exactly the shards that most needed it, while its
+    /// slot also shrank the rewrite's own.
+    ///
+    /// The row encoding distinguishes NULL from any value, so this catches both
+    /// disagreement shapes — two different non-null values, and the enrichment
+    /// shape where a field is absent on first emit and filled on a retry — with
+    /// no separate null-transition term.
+    pub(crate) fn with_immutable_audit(mut self, schema: &arrow_schema::Schema, columns: &[String]) -> Result<Self> {
+        use datafusion::arrow::row::{RowConverter, SortField};
+        let idxs = columns.iter().filter_map(|name| schema.index_of(name).ok()).collect::<Vec<_>>();
+        if idxs.is_empty() {
+            return Ok(self);
+        }
+        let converter = RowConverter::new(idxs.iter().map(|idx| SortField::new(schema.field(*idx).data_type().clone())).collect())?;
+        self.audit = Some((idxs, converter));
+        Ok(self)
+    }
+
+    /// Dedup keys whose versions disagreed on a column declared immutable.
+    pub(crate) fn disagreements(&self) -> u64 {
+        self.disagreements
     }
 
     /// One compact row of `batch`, detached from its buffers so a held-back run
@@ -1952,6 +2043,12 @@ impl RunCollapse {
         let key_rows = self.keys.convert_columns(&self.key_idxs.iter().map(|idx| Arc::clone(batch.column(*idx))).collect::<Vec<_>>())?;
         let tiebreak_rows = self.tiebreak.as_ref().map(|(idx, converter)| converter.convert_columns(&[Arc::clone(batch.column(*idx))])).transpose()?;
         let tiebreak_at = |row: usize| tiebreak_rows.as_ref().map(|rows| rows.row(row).as_ref().to_vec());
+        let audit_rows = self
+            .audit
+            .as_ref()
+            .map(|(idxs, converter)| converter.convert_columns(&idxs.iter().map(|idx| Arc::clone(batch.column(*idx))).collect::<Vec<_>>()))
+            .transpose()?;
+        let immutable_at = |row: usize| audit_rows.as_ref().map(|rows| rows.row(row).as_ref().to_vec());
 
         let mut out = Vec::new();
         let mut winners: Vec<u32> = Vec::new();
@@ -1963,6 +2060,12 @@ impl RunCollapse {
             let tiebreak = tiebreak_at(row);
             match &mut current {
                 Some(open) if open.key == key => {
+                    // Another version of the run in flight: count the run once
+                    // if its immutable tuple ever differs from the run's first.
+                    if self.audit.is_some() && !self.run_disagreed && immutable_at(row) != self.run_immutable {
+                        self.run_disagreed = true;
+                        self.disagreements += 1;
+                    }
                     // Strictly greater only: ties keep the earlier row.
                     if tiebreak > open.best {
                         open.winner = Some(u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?);
@@ -1979,6 +2082,8 @@ impl RunCollapse {
                     }
                     let winner = Some(u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?);
                     current = Some(OpenRun { key, winner, best: tiebreak });
+                    self.run_immutable = immutable_at(row);
+                    self.run_disagreed = false;
                 }
             }
         }
@@ -2006,6 +2111,7 @@ impl RunCollapse {
 #[cfg(test)]
 mod immutable_audit_tests {
     use super::*;
+    use test_case::test_case;
 
     fn logs_schema() -> &'static crate::schema::TableSchema {
         crate::schema::get_schema("otel_logs_and_spans").expect("the real shipped schema")
@@ -2256,5 +2362,75 @@ mod immutable_audit_tests {
 
         assert_eq!(render(collapsed), windowed, "the one-pass collapse must reproduce the window's rows exactly");
         assert!(windowed.contains("web"), "the fixture must actually exercise two services sharing (timestamp, id)");
+    }
+
+    /// The streaming audit replaces a `GROUP BY` aggregate that could not fit
+    /// its slot of the heavy pool on whale shards. It must count a dedup key
+    /// ONCE when its versions disagree on an immutable column, across both
+    /// disagreement shapes, and with `batch_size 1` every run straddles a batch
+    /// boundary — the carry path, which is where a per-run flag can double-count
+    /// or reset.
+    #[test_case(&[(10, "a", Some("info")), (10, "a", Some("warn"))], 1 ; "two different non-null values")]
+    #[test_case(&[(10, "a", None), (10, "a", Some("info"))], 1 ; "enrichment: absent then filled")]
+    #[test_case(&[(10, "a", Some("info")), (10, "a", Some("info"))], 0 ; "versions that agree")]
+    #[test_case(&[(10, "a", None), (10, "a", None)], 0 ; "null in every version agrees")]
+    #[test_case(&[(10, "a", Some("info")), (20, "b", Some("warn"))], 0 ; "different keys never disagree")]
+    #[test_case(&[(10, "a", Some("x")), (10, "a", Some("y")), (10, "a", Some("z"))], 1 ; "a three-way disagreement counts once")]
+    #[test_case(&[(10, "a", Some("x")), (10, "a", Some("y")), (20, "b", Some("p")), (20, "b", Some("q"))], 2 ; "two disagreeing keys count separately")]
+    fn the_collapse_audit_counts_disagreeing_keys(rows: &[(i64, &str, Option<&str>)], expected: u64) {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let arrow = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let keys = vec!["timestamp".to_string(), "id".to_string()];
+        let mut collapse = RunCollapse::new(&arrow, &keys, None).expect("collapse").with_immutable_audit(&arrow, &["level".to_string()]).expect("audit");
+
+        // One row per batch, so every run is carried across a boundary.
+        for row in rows {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&arrow),
+                vec![Arc::new(Int64Array::from(vec![row.0])), Arc::new(StringArray::from(vec![Some(row.1)])), Arc::new(StringArray::from(vec![row.2]))],
+            )
+            .expect("batch");
+            collapse.push(batch).expect("push");
+        }
+        collapse.finish();
+
+        assert_eq!(collapse.disagreements(), expected, "rows {rows:?}");
+    }
+
+    /// A collapse with no audit configured must not count anything — the audit
+    /// is opt-in, and the non-streaming path still uses the SQL form.
+    #[test]
+    fn a_collapse_without_the_audit_counts_nothing() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let arrow = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, true), Field::new("level", DataType::Utf8, true)]));
+        let mut collapse = RunCollapse::new(&arrow, &["timestamp".to_string()], None).expect("collapse");
+        let batch = RecordBatch::try_new(arrow, vec![Arc::new(Int64Array::from(vec![10, 10])), Arc::new(StringArray::from(vec![Some("info"), Some("warn")]))])
+            .expect("batch");
+        collapse.push(batch).expect("push");
+        collapse.finish();
+
+        assert_eq!(collapse.disagreements(), 0, "an un-audited collapse reports nothing");
+    }
+
+    /// Both audit forms must read the SAME column list, or the streaming path
+    /// silently audits a different set than the SQL path it replaces.
+    #[test]
+    fn both_audit_forms_read_one_column_list() {
+        let columns = Database::immutable_audit_columns(logs_schema());
+        let sql = Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns");
+        assert!(!columns.is_empty(), "the logs schema must have auditable columns");
+        for column in &columns {
+            assert!(sql.contains(&format!("MIN(\"{column}\")")), "{column} is audited by the streaming form but absent from the SQL form");
+        }
     }
 }
