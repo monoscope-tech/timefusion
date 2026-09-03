@@ -200,3 +200,49 @@ This is a second selection/ordering change, the category with the worst incident
 history in this repo, and one such change (`dd4a557f`) already shipped tonight and
 is still being verified. **One change per deploy.** The evidence is recorded here;
 the fix belongs to a session that can sim it, ship it alone, and watch it.
+
+---
+
+## The WRITE path is exonerated — which narrows the lever to merging
+
+Before blaming compaction, the flush path had to be ruled out, because an
+unsorted flush file would disable ordering for its whole partition. It is clean:
+
+| check | result |
+| --- | --- |
+| `flush_sort_unsorted_fallbacks_total` (documented "PAGE if > 0") | **0** |
+| files declaring `sorting_columns`, 25 newest on 5 dates | **all 5 columns** |
+| escalation to a pooled/spilling sort above the threshold | **implemented** (`write.rs:118`) |
+
+**Flush never wrote an unsorted file.** So the 98.8% unordered scans are NOT
+"files aren't sorted" — every file is. They are **overlapping** sorted files, and
+nothing on the write path can fix that. Only MERGING can, which is hot packing.
+That is the narrowing this measurement buys.
+
+## A tuning discrepancy the benchmark exposes (evidence recorded, NOT changed)
+
+`cargo bench --bench sort_strategy_benchmarks`, in-process Arrow lexsort vs the
+pooled DataFusion sort:
+
+| rows | MB (arrow) | arrow_ms | datafusion_ms | ratio |
+| --- | --- | --- | --- | --- |
+| 8,192 | 11.6 | 3.3 | 3.5 | 1.07 |
+| **65,536** | **93.1** | 34.5 | 30.8 | **0.89** |
+| 262,144 | 372.4 | 188.5 | 112.2 | 0.59 |
+| 1,048,576 | 1,489.5 | 1,214.9 | 446.1 | **0.37** |
+
+**The crossover is ~93 MB.** But `timefusion_sort_skip_bytes` is **2 GiB**, and its
+comment cites "~370 MB" as the crossover — itself 4x above what this measures.
+Between ~93 MB and 2 GiB the flush path therefore uses the SLOWER sort: ~76 ms
+extra at 372 MB, **~769 ms extra at 1.5 GB**.
+
+**NOT changed tonight, and the reason is not just caution:** the threshold is not
+only a speed knob. The in-process sort holds everything in memory while the
+pooled path spills, and escalated sorts pass through the `flush_sort_gate`
+semaphore — so lowering the threshold sends MORE flushes through a serialising
+gate. Faster per sort can still be slower per flush if they queue. This is the
+ingest path, which carries an acked-write-loss incident history.
+
+**What would settle it:** the gate's width and the current escalation rate. If
+escalations are rare and the gate is wide, lowering toward ~256 MB is close to
+free; if the gate is narrow, the queueing term has to be measured first.
