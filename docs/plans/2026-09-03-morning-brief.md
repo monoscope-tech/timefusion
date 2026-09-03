@@ -344,6 +344,44 @@ trustworthy rather than merely convenient.
 **This is what unblocks the 14–31 d fix**: a scheduler change can now be tested
 against realistic arrivals competing with a real backlog, offline, in minutes.
 
+### And the first thing it proved is a NEGATIVE result — the model does not stall
+
+I built the calibrated sim to test a fix for the 14–31 d band. I ran the baseline
+before writing the fix, and it does not reproduce the problem:
+
+| sim input, 24 h, calibrated arrivals | pending |
+|---|---|
+| stale checkpoint (`mt_new.json`) | 21,073 → **99** |
+| **true live state** (checkpoint + WAL, `live3/`) | 21,288 → **73** |
+
+8,031 executions, **3,850 Dedup completions**, and the backlog — band included —
+clears. Prod, on that same live state, has not claimed those 297 units in 8.5 h.
+
+**That is a strong constraint, not a dead end.** The sim *is* the coordinator's
+ranking and claiming logic, and it drains the cohort. So the defect is **not in
+the scheduling model** — which is exactly where I had been looking all night, and
+it retires the whole ranking-tuple line of investigation.
+
+Combined with `attempts` never incrementing — and `attempts` is bumped by
+`mark_running`, i.e. **at claim**, before admission, before execution, before any
+restart could interrupt — the surviving explanations are narrow:
+
+- something in the worker loop between "run dedup" and `claim_next` returning;
+- or prod's in-memory journal not matching what it persists;
+- or a runtime predicate whose INPUTS differ from the sim's
+  (`dependencies_complete` runs in both, but is fed different state).
+
+**Six hypotheses eliminated tonight, each with data:** admission boundary,
+sealed-vs-frontier class starvation, the [3 d, 31 d] `starved` band, quarantine
+slots, the old dedup-cron rollup-table skip (that code is gone — the coordinator
+owns slice maintenance now), and the scheduling model as a whole.
+
+**I did not write the pre-horizon reservation lane** I had designed (residue 1
+mod 4, bounded by `STARVATION_HORIZON_MICROS`; it collides with neither existing
+reservation, and the slot is genuinely free). The design is sound, but the sim
+says the band is not what starves these units — so shipping it would treat a
+symptom I cannot demonstrate. Not writing it is what the tool was for.
+
 **Left on branch `sim/ingesting-streams`, deliberately unpushed** — it is a code
 change, so pushing restarts prod, and it has no operational urgency at 03:30. It
 is one cherry-pick when you want it. Lint clean; the 20 `maintenance_sim` tests
