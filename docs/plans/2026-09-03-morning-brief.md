@@ -1035,6 +1035,53 @@ accumulated totals — not from a post-deploy A/B. Conversely, "the counter did 
 move" is not evidence the fix failed. Both errors were available tonight and I
 made the second one twice before catching it.
 
+## SHIPPED: option A (sim calls the real guard) and decision 2 (holdback decoupled)
+
+Both landed together. Three commits: the measured duration model, the guard
+de-duplication with its four reconciled tests, and the holdback derivation.
+
+**Option A.** `split_sheds_enough_at(parent, observed, num, denom)` is now the
+single implementation — the shipped predicate delegates at the shipped
+constants, the sim's sweep calls it at the swept ones. The transcription is
+gone, and with it the reason the sim never reproduced the synthetic defect.
+
+The four tests were reconciled against measurement, not re-baselined:
+
+| test | change | why |
+|---|---|---|
+| `a_unit_that_overruns…` | 1 unit -> **20** | "a timeout is certain" held at 60-900 s; ~70% now finish in 0-6 s, so one unit was a coin flip |
+| `a_floored_whale_shreds…` | 1,000 -> **500** | same shred, ~819 not ~1,200 — pinning the old number pins the old model |
+| `the_floor_guard_declines…` | `== 0` -> **`<= 16`** | 8 reach the floor vs 819 unguarded, a 99% collapse; prod has the same leak |
+| `frontier_keeps_up_at_13…` | **renamed**, lag check **deleted** | it does not keep up, and the comparison was invalid |
+
+That last deletion is the one worth reading. The lag comparison ran the two
+cases at **different horizons** (6 h vs 2 h), and maximum lag is bounded by run
+length — so 10x reports **5,400 s against 13-project 13,050 s**, the worse
+configuration scoring better purely because it ran less virtual time. It only
+ever passed while both lags were small relative to both horizons, which the
+optimistic durations guaranteed. `pending_end` is horizon-fair and already
+asserts the >10x divergence.
+
+**Decision 2, and it did NOT go the way I predicted.** The semaphore prices
+DECODED bytes, the holdback reserves POOL bytes, and the missing piece was the
+conversion between them — measurable from the fleet ladder: **1.79x
+decoded-to-pool passes, 2.39x fails**. `repair_pool_holdback_slices()` now
+derives the holdback from the semaphore budget through
+`SAFE_DECODED_PER_POOL_BYTE = 1.79`. **No new environment variable** — both
+numbers fall out of constants the tree already owns.
+
+I expected this to FREE a light permit. It costs one. Today's config allows
+6,144 MiB decoded against a 2-slice (2,560 MiB) holdback = **2.4x, past the
+2.39x rung that failed on the bench**. The honest holdback is 3, so K goes
+4 -> 3 — the value the fleet ran at BEFORE the 09-01 outage, not near it. The
+trade is one hot-tail permit for an envelope repair's two-way concurrency can
+actually run in, and the invariant is now asserted directly instead of implied
+by a shared constant.
+
+**Gate:** 142/142 coordinator+sim, 28/28 config, full suite 1334/1335 (the one
+failure being the pre-existing `a_chart_under_a_derived_table_routes`), lint and
+fmt clean.
+
 ## Honest uncertainties
 
 - **Pool peak is 70%, not 28%.** Sampling `coordinator_pool_pct` 45 times over
