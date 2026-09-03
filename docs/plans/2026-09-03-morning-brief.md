@@ -29,10 +29,22 @@ gap.
 | 2 | maintenance/coordinator pool USAGE exposed, denominator corrected | all | **Live.** Coordinator pool peaks at 47–70%, not the 0% a single reading suggested. |
 | 3 | admission grants the full cap at half-free, not only at an idle pool | dedup + base_rollup | **Live**, and the gate defect is real and tested — but its *benefit* is **unproven**: the 297-unit cohort I cited as motivation never reaches that gate. See the correction and resolution below. |
 
-Not pushed, deliberately (a code push restarts prod, and these had no overnight
-urgency): the two `timefusion sim` fixes, on `sim/ingesting-streams` and
-`fix/streams-active`. **Both matter** — without them every scale run measures
-roughly 1x. Cherry-pick when convenient.
+**Not pushed, deliberately** (a code push restarts prod, and these had no
+overnight urgency): the two `timefusion sim` fixes. **Both matter** — without
+them every scale run measures roughly 1x.
+
+Ready to merge as branch **`sim/ready`**: rebased onto current master, one file
+(`src/maintenance_sim.rs`, +62/-4), `cargo fmt --check` clean, `cargo lint` clean,
+20/20 `maintenance_sim` tests pass. Two commits:
+
+```
+fix(sim): mint only from INGESTING streams, so arrivals match production
+fix(sim): --streams means N INGESTING streams, so a scale run actually scales
+```
+
+The failed cycle experiment (Dedup 1/10 -> 2/10, +14%) was deliberately NOT
+committed — it is documented in *THE 10x ANSWER* as a negative result and should
+not ship.
 
 ## ~~THE TOP LEVER~~ — RETRACTED ONE HOUR LATER, and here is the falsifying number
 
