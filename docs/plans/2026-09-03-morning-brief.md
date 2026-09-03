@@ -1409,3 +1409,98 @@ lacking footer ordering forcing a sort under the dedup — the last refuted by
 4. **Check a counter before crediting a fix.** `pgwire_sortoom: 0` sits in the
    16 GB greedy QUERY pool; the audit lives in the 5 GB maintenance pool. No
    mechanism connects them, so the fix gets no credit for it.
+
+---
+
+# Evening continuation — the frozen mass, and what it cost to find
+
+## The headline: a starvation LIVELOCK, found, fixed, and 10x-validated
+
+**96% of the dedup queue's bytes had not moved in 18 days.** 719 day-wide units
+holding 5,132 of 5,334 GiB, oldest slice 2026-08-16, largest single unit
+**1,150 GiB**. Two journal pulls diffed on `attempts` (which increments AT CLAIM)
+showed the 3-31 day band taking **0 of 29 claims**.
+
+**Mechanism.** `starved` is not a flag — past `STARVATION_HORIZON_MICROS` it
+improves one rank per extra day, forever:
+
+```rust
+else { 254u8.saturating_sub((waited - STARVATION_HORIZON).max(0) / DAY) }
+```
+
+So 148 of 761 claimable units (data 32-43 d old) permanently outranked all 613
+others; 55 of those were in `retry`, so they won, failed, requeued, were still
+the oldest, and won again. The slope was itself a fix (2026-08-25) for
+past-horizon work being *unclaimable* — it over-corrected into a livelock.
+
+**Fix `dd4a557f`:** one claim in eight reserved for the band between the query
+window and the horizon — the gap `window_turn` (<=14 d) and the sealed turn both
+miss. Live in prod.
+
+| sim, real journal, same seed | mid_band | day-wide | executions |
+| --- | --- | --- | --- |
+| 1x base / fixed | 2 -> **17** | 41 -> **51** | 554 -> 537 |
+| **10x base / fixed** | 2 -> **21** | 52 -> **81** | 875 -> **895** |
+
+At 10x the frontier and privileged lanes are *identical* (684->685, 205->205), so
+the reservation takes from slack, not from other work.
+
+**`mid_band = 2` on base at BOTH 1x and 10x — the livelock is scale-invariant.**
+Adding workers or memory could never have fixed it, which is why every previous
+throughput investigation missed it: they asked "is the fleet busy?" and it was —
+busy on the wrong work.
+
+## Also shipped tonight
+
+| commit | what | status |
+| --- | --- | --- |
+| `229e7510` | immutable audit folded into `RunCollapse` (O(1) state, zero extra pool consumers) | audit failures 15/28min -> **0** |
+| `e0987d22` | `immutable_audit_shards_total` — the denominator that makes a zero disagreement count mean CLEAN | armed, shards == bins |
+| `5dbd2b79` | pool exhaustion classified by the SHARED classifier | **VERIFIED LIVE** (below) |
+| `60a28581` | staging failure names `pass` / `files` / `capacity` | answered its own question in 3 h |
+| `dd4a557f` | the horizon turn | live, 10x-validated |
+
+**`5dbd2b79` is the one with direct evidence.** The hot-tail staging site
+classified pool exhaustion with its own `contains("Resources exhausted")`, which
+misses `"Not enough memory to continue external sort"` — the message a *spilling*
+sort actually dies with. So the `REPAIR_SORT_PARTITION_LADDER` was inert. After
+the fix, prod shows `footer_repair_parallelism_degraded` twice
+(`partitions=4`, then `1`) and one `footer_repair_quarantined`. All of that was
+unreachable before. **Two self-consistent classifiers cannot be told apart by
+behaviour tests** — the guard is at the source.
+
+## What the process caught that reasoning did not
+
+1. **My first fix for the livelock was rejected by the sim.** Attempts-based
+   demotion left mid_band at 2, because 76 of the 148 privileged units have never
+   failed — demoting failures just promotes their neighbours. It would have
+   shipped as inert complexity in the most outage-prone code here.
+2. **I picked the residue the codebase documents as wrong.** `% 4 == 1` broke
+   `damage_outranks_work_inside_the_starvation_window`; the `window_turn` comment
+   already warned it "fires on a fresh journal's FIRST claim".
+3. **Two of my regression tests passed without their fix** — the classifier one
+   and the livelock one. Both were rewritten until they failed on the old code.
+   *Always run the negative control.*
+4. **Three diagnosis swings on the livelock**, the middle one caused by reading
+   `starved` as two-valued. When measurement and code-reading disagree, doubt the
+   reading.
+
+## Open, with the measurement each one needs
+
+- **Unit cost is the remaining 10x gap.** `dd4a557f` unblocks a band; it adds no
+  throughput. Pending still ends ~16.9k at 10x vs ~2.3k at 1x.
+- **Bin-narrowing is REFUTED** — files span bins, so narrowing rows does not
+  narrow files, and the whole-date unit is already right-sized
+  (`2026-09-03-why-the-frozen-mass-is-a-read-path-bug.md`).
+- **The durable lever is an INGEST-side dedup-key check**, not a maintenance one:
+  cost per row at ingest instead of per byte rewritten later, which is the only
+  shape that scales to 100x. **Gated on one measurement:** classify duplicate
+  groups in RECENT prod files as **same-file** (both copies bucket-resident
+  together -> catchable) vs **cross-file** (arrived after flush -> missed). If
+  cross-file dominates, the lever is dead. Three design hazards if it survives:
+  enrichment is legitimate same-key traffic (must be key+tiebreak exact), a drop
+  at MemBuffer still leaves the WAL copy, and certification is BINARY — the
+  acceptance metric is "new bins born clean", not duplicate rate.
+- **Query sort-memory failures are BURSTY** (17 in one hour, 0 in the next three)
+  and still unattributed. `query.text` IS logged, so the correlation must be
+  ARMED before a burst rather than run after one.
