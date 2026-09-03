@@ -7931,7 +7931,21 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
         // `MAX_BIN_ROWS`. Unknown row counts (absent stats) do not accumulate, so
         // this can never be stricter than the byte budget alone.
         let next_rows = rows.saturating_add(add.rows.unwrap_or(0));
-        if !selected.is_empty() && (bytes.saturating_add(add.size) > limit || next_rows > MAX_BIN_ROWS) {
+        // The row cap must not be what reduces a bin to ONE file. A one-file bin
+        // retires nothing — the `< 2` guard below discards it and the cell is
+        // re-claimed immediately, forever. Prod 2026-09-03 `dcad860a/2026-06-17`:
+        // 95.4 MiB (915,417 rows) + 114.8 MiB (1,108,187) is 82% of the BYTE
+        // budget but 2,023,604 rows, 1.18% over the cap — claimed 8+ times an
+        // hour for hours, never losing a file.
+        //
+        // So the SECOND file may pass the row cap, bounded at twice it: making
+        // progress beats livelocking, but not unboundedly. The cap was written
+        // for a table whose 256 MB bins hold 5.58 M rows and blew the 900 s
+        // deadline 9 times out of 9 (2026-08-28), and that shape stays excluded.
+        // Bytes still bind unconditionally, so such a pair is never bigger than
+        // one converged file.
+        let pair_exemption = selected.len() == 1 && next_rows <= 2 * MAX_BIN_ROWS;
+        if !selected.is_empty() && (bytes.saturating_add(add.size) > limit || (next_rows > MAX_BIN_ROWS && !pair_exemption)) {
             break;
         }
         bytes = bytes.saturating_add(add.size);
@@ -16291,6 +16305,44 @@ mod tests {
             super::select_coordinator_compaction_candidates(unknown, super::COORDINATOR_SEALED_TARGET_BYTES).len(),
             23,
             "unknown row counts do not accumulate, so the byte budget still governs"
+        );
+    }
+
+    /// The row cap must never be what reduces a bin to ONE file.
+    ///
+    /// A one-file bin retires nothing: `select_coordinator_compaction_candidates`
+    /// discards it on the `< 2` guard, the unit logs
+    /// `compaction_unit_selected_nothing`, and the cell is claimed again
+    /// immediately — a livelock that burns claims forever and never moves a byte.
+    ///
+    /// Prod 2026-09-03, `dcad860a / 2026-06-17`, read off the funnel log
+    /// (`smallest_pair_bytes=220396056 smallest_pair_fits=true selected=0`): the
+    /// two under-target files are 95.4 MiB (915,417 rows) and 114.8 MiB
+    /// (1,108,187 rows). Together they are **82 % of the byte budget** but
+    /// **2,023,604 rows — 1.18 % over `MAX_BIN_ROWS`**. The cell was re-claimed 8+
+    /// times an hour for hours without ever losing a file.
+    #[test]
+    fn a_pair_that_fits_the_byte_budget_is_never_blocked_by_the_row_cap() {
+        const MB: i64 = 1024 * 1024;
+        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd { path: path.into(), size: bytes, is_sorted_run: true, event_range: None, rows: Some(rows) };
+
+        // The exact prod cell, sizes and row counts as measured.
+        let cell = vec![
+            f("small", 100_040_704, 915_417),
+            f("mid", 120_355_352, 1_108_187),
+            f("converged-a", 534_000_000, 4_675_365),
+            f("converged-b", 538_000_000, 4_701_864),
+        ];
+        let picked = super::select_coordinator_compaction_candidates(cell, super::COORDINATOR_SEALED_TARGET_BYTES);
+        assert_eq!(picked, vec!["small", "mid"], "a pair inside the byte budget must be selected even at 2,023,604 rows");
+
+        // The bound on the exemption: it buys a PAIR, never an unbounded bin. A
+        // dense table whose files each carry more than the whole cap must still
+        // not be packed two-at-a-time into a bin the 900 s deadline cannot hold.
+        let huge = vec![f("h0", 60 * MB, 3_000_000), f("h1", 60 * MB, 3_000_000)];
+        assert!(
+            super::select_coordinator_compaction_candidates(huge, super::COORDINATOR_SEALED_TARGET_BYTES).is_empty(),
+            "6 M rows is past the ceiling — the exemption must not admit it"
         );
     }
 
