@@ -1,21 +1,47 @@
 # Morning brief — 2026-09-03
 
-Three behaviour changes shipped, all from the same root cause, all measured
-before shipping. Two of the four maintenance lanes turned out to need nothing.
+Three behaviour changes shipped and stable for 5+ hours, two benchmarks and one
+simulator fix added, and **the 10x question answered**. `dedup_failed_total`
+stayed 0 throughout.
 
-## The one sentence
+**This document was written incrementally through the night and contains its own
+corrections in place.** Six of my claims were retracted after checking them, and
+the retractions are kept next to the claims rather than deleted — the reasoning
+is often the useful part. Where a section is superseded it says so.
 
-**Every stuck lane was a unit whose size the gate in front of it could not
-grant — and in two of the three cases the gate could not grant the size the
-system itself was designed to produce.**
+## The headline
+
+**We do not keep up at 10x, and it is a UNIT COST problem, not a scheduling or
+capacity one.** At 10x active streams the fleet does 4x the executions and
+completes **30% FEWER dedup units** — BaseRollup crowds out the one lane
+certification depends on. I tested the obvious scheduling fix (double dedup's
+cycle share) and it bought **+14%, not 2x**, because a dedup unit occupies a
+worker **~7x longer** than a rollup unit. See *THE 10x ANSWER*.
+
+Tonight's three fixes unblock units; they do not make units cheaper. That is the
+gap.
 
 ## What shipped
 
-| # | change | lane | evidence it was needed |
+| # | change | lane | status this morning |
 |---|---|---|---|
-| 1 | repair budget sized by the target file (`2 x 256 MiB x 12`), in its own constant | repair | budget was **0.42x** one target-sized file, so every unit clamped to the whole semaphore; ~1.2 rewrites/hr, 310 queued, ~11 days to drain — **but see below: measured concurrency gain so far is ZERO** |
-| 2 | maintenance/coordinator pool USAGE exposed, and its denominator corrected | all | pool sizes were visible, usage was not, so no memory decision could be verified after shipping |
-| 3 | admission grants the full cap at **half-free**, not only at a perfectly idle pool | dedup + base_rollup | 365 dedup units at a median of **exactly 512.0 MiB**, median age **14.6 days** |
+| 1 | repair budget sized by the target file, in its own constant | repair | **Live.** Permit contention down ~11x over a 5 h quiet process, and 95% of remaining bounces are the oversized class (was 74%) — but see *Change 1 UNDER-DELIVERED*: the budget still cannot hold two REAL units, and the decoupling fix is the **top morning decision**. |
+| 2 | maintenance/coordinator pool USAGE exposed, denominator corrected | all | **Live.** Coordinator pool peaks at 47–70%, not the 0% a single reading suggested. |
+| 3 | admission grants the full cap at half-free, not only at an idle pool | dedup + base_rollup | **Live**, and the gate defect is real and tested — but its *benefit* is **unproven**: the 297-unit cohort I cited as motivation never reaches that gate. See the correction and resolution below. |
+
+Not pushed, deliberately (a code push restarts prod, and these had no overnight
+urgency): the two `timefusion sim` fixes, on `sim/ingesting-streams` and
+`fix/streams-active`. **Both matter** — without them every scale run measures
+roughly 1x. Cherry-pick when convenient.
+
+## The four maintenance lanes you named
+
+| lane | verdict |
+|---|---|
+| **Sorting / HotPacking** | **Fine.** Zero live units — keeping up completely. |
+| **Rollups** | Derived healthy (1.1 h median). Base is the lane that *wins* at 10x, to everyone else's cost. |
+| **Dedup** | The binding constraint at 10x, and the one certification depends on. |
+| (repair, not in your list) | Serialized by a byte budget; change 1 improved it, decoupling would finish it. |
 
 ## Lane survey — two lanes are already fine
 
