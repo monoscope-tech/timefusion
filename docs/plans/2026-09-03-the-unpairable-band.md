@@ -208,3 +208,42 @@ different confident conclusions from counters alone — an unpairable byte band,
 actually settled it (`smallest_pair_fits`) took four lines to add. The funnel
 already logged six numbers about this failure and not one of them was the
 binding constraint.
+
+## MEASURED OUTCOME — the livelocked cell cleared
+
+`875ea2a1` deployed (confirmed live: `ghcr.io/monoscope-tech/timefusion:875ea2a`).
+Re-reading the exact cell this investigation started from,
+`dcad860a-…/date=2026-06-17`:
+
+```
+BEFORE   4 live files, 2 under target
+           95.4 MiB    915,417 rows
+          114.8 MiB  1,108,187 rows      -> selected=0, claimed 8+/hour for hours
+
+AFTER    3 live files, 1 under target
+          201.5 MiB  2,023,604 rows      <- the pair, merged
+```
+
+The new file's row count is **exactly** the sum of the pair's, so this is the
+same rows and unambiguously this unit's work. The cell now holds one under-target
+file, so `mergeable` is false and it stops being queued at all — the livelock is
+closed from both ends.
+
+Lane-level, same process:
+
+| | before (`worker_secs` / `uptime`) | after |
+|---|---|---|
+| `work.SealedConsolidation` | 62 s / 1,550 s = **4.0 %** | 345 s / 703 s = **49.1 %** |
+
+with `work.SealedConsolidation.progress_rows` at **40.9 M** rows in 12 minutes of
+uptime. A lane that idled because its claims selected nothing now spends about
+half a worker actually rewriting.
+
+**Caveat, and the re-measure that settles it:** uptime is 703 s, and a young
+process can front-load catch-up work — this ratio must be re-read on a process
+with a couple of quiet hours before 12x is quoted as steady state. The file-level
+evidence does not depend on that: the pair is merged and the row counts match.
+
+`fa62883e` (the planner half, which stops `be87ebc1/2026-07-02` and its 12.6 M-row
+pair being queued at all) had not deployed at this reading, so
+`pending_sealed_consolidation` was still 221. That is the number to watch next.
