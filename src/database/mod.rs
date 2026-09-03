@@ -6606,6 +6606,10 @@ pub(crate) struct HotStageOptions {
 struct CompactionDebtFile {
     size: i64,
     path: String,
+    /// `None` when the file carries no `numRecords` stat, which the mergeability
+    /// test must read as "no objection" — exactly as the packer's own row budget
+    /// does, so a missing stat can never be stricter than bytes alone.
+    rows: Option<u64>,
 }
 
 /// Arrow ONE dedup bin may hold across all its concurrent shards.
@@ -7879,6 +7883,23 @@ const UNSORTED_BIN_DECODED_BUDGET_BYTES: i64 = 768 * 1024 * 1024;
 /// The unsorted-bin budget in COMPRESSED bytes, which is what `Add.size` is.
 fn unsorted_bin_budget_bytes() -> i64 {
     UNSORTED_BIN_DECODED_BUDGET_BYTES / crate::database::maintain::DECODED_BYTES_PER_COMPRESSED
+}
+
+/// Will the packer make a bin of at least TWO files out of the two smallest
+/// under-target files of a cell? This is THE planner/packer agreement test.
+///
+/// `plan_compaction_debt` queues a cell only when this holds, so a queued unit
+/// can always do work. It must mirror **both** of the packer's budgets: the
+/// guard used to check bytes alone while claiming to be "the same test the
+/// packer applies", and the packer also breaks on rows. Prod 2026-09-03
+/// `be87ebc1/2026-07-02` — 99.0 + 107.7 MiB (81% of budget, so bytes said yes)
+/// carrying 8,509,391 + 4,137,188 = 12.6 M rows, 6.3x the cap — was queued,
+/// claimed, and retired nothing on every pass.
+///
+/// Unknown row counts are NO OBJECTION, exactly as in the packer, so a missing
+/// `numRecords` can never be stricter than bytes alone.
+fn packer_admits_pair(sizes: (i64, i64), rows: (Option<u64>, Option<u64>), target: i64) -> bool {
+    sizes.0.saturating_add(sizes.1) <= target && rows.0.unwrap_or(0).saturating_add(rows.1.unwrap_or(0)) <= 2 * MAX_BIN_ROWS
 }
 
 fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target: i64) -> Vec<String> {
@@ -16344,6 +16365,37 @@ mod tests {
             super::select_coordinator_compaction_candidates(huge, super::COORDINATOR_SEALED_TARGET_BYTES).is_empty(),
             "6 M rows is past the ceiling — the exemption must not admit it"
         );
+    }
+
+    /// The planner's admission test must agree with the packer, on BOTH budgets.
+    ///
+    /// `plan_compaction_debt` queues a cell only when `packer_admits_pair` says
+    /// the packer can bin its two smallest files, and its comment has always
+    /// claimed to apply "the same test the packer applies". It checked bytes
+    /// only. The packer breaks on bytes OR rows, so a cell could be promised work
+    /// the packer then refused — queued, claimed, retiring nothing, forever.
+    ///
+    /// Rather than restate the rule, this runs the REAL packer and demands the
+    /// two answers match, which is the property that was actually violated.
+    #[test]
+    fn the_planner_admits_exactly_what_the_packer_can_bin() {
+        let target = super::COORDINATOR_SEALED_TARGET_BYTES;
+        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd { path: path.into(), size: bytes, is_sorted_run: true, event_range: None, rows: Some(rows) };
+
+        // Both cells read off prod 2026-09-03. Bytes fit in BOTH — 82% and 81% of
+        // the budget — so a bytes-only planner queues both; the packer bins only
+        // the first, whose 1.18% row overshoot the pair exemption covers.
+        let agree = |cell: &str, (size_a, rows_a): (i64, u64), (size_b, rows_b): (i64, u64), expected: bool| {
+            let admits = super::packer_admits_pair((size_a, size_b), (Some(rows_a), Some(rows_b)), target);
+            let packs = super::select_coordinator_compaction_candidates(vec![f("a", size_a, rows_a), f("b", size_b, rows_b)], target).len() >= 2;
+            assert_eq!(admits, packs, "{cell}: planner said {admits}, packer said {packs} — the two must never disagree");
+            assert_eq!(admits, expected, "{cell}: expected admits={expected}");
+        };
+        agree("dcad860a/2026-06-17", (100_040_704, 915_417), (120_355_352, 1_108_187), true);
+        agree("be87ebc1/2026-07-02", (103_809_024, 8_509_391), (112_918_528, 4_137_188), false);
+
+        // Absent stats must not make the planner stricter than bytes alone.
+        assert!(super::packer_admits_pair((100 * 1024 * 1024, 100 * 1024 * 1024), (None, None), target), "unknown rows are no objection");
     }
 
     /// A bin holding unsorted files gets a budget sized in DECODED bytes too.

@@ -955,7 +955,8 @@ impl Database {
                     else {
                         continue;
                     };
-                    partitions.entry((project, date)).or_default().push(CompactionDebtFile { size: file.size(), path: path.to_string() });
+                    let rows = file.num_records().and_then(|n| u64::try_from(n).ok());
+                    partitions.entry((project, date)).or_default().push(CompactionDebtFile { size: file.size(), path: path.to_string(), rows });
                 }
             }
             // Every partition this scan examined, and every (partition, op) it
@@ -1014,8 +1015,20 @@ impl Database {
                 // shape were claimed every 30-60s for hours and never lost a
                 // file. Requiring the two SMALLEST to fit together is the same
                 // test the packer applies, so a queued unit can always do work.
+                //
+                // ROWS as well as bytes, because the packer breaks on EITHER and
+                // this test claimed to be "the same test" while checking only one
+                // of them. Prod 2026-09-03 `be87ebc1/2026-07-02`: two files of
+                // 99.0 MiB and 107.7 MiB — 81% of the byte budget, so mergeable
+                // said yes — carrying 8,509,391 and 4,137,188 rows. At 12.6 M
+                // rows, 6.3x the cap, the packer takes one file and the unit
+                // retires nothing, forever. The ceiling is the packer's own
+                // pair exemption (`2 * MAX_BIN_ROWS`), so the two agree exactly.
+                //
+                // Unknown row counts are NO OBJECTION, matching the packer: a
+                // missing `numRecords` must never be stricter than bytes alone.
                 small.sort_by_key(|file| file.size);
-                let mergeable = small.len() >= 2 && small[0].size.saturating_add(small[1].size) <= small_target;
+                let mergeable = small.len() >= 2 && packer_admits_pair((small[0].size, small[1].size), (small[0].rows, small[1].rows), small_target);
                 if mergeable {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
                     planned_keys.insert((project_id.clone(), date, operation));
