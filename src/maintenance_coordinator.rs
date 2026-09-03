@@ -564,8 +564,20 @@ const SPLIT_MUST_SHED_DENOMINATOR: u64 = 4;
 /// has three incidents of. Let it split once more; the next preflight stamps a
 /// real number and the guard starts working.
 fn split_sheds_enough(parent_measured_bytes: Option<u64>, observed_bytes: u64) -> bool {
+    split_sheds_enough_at(parent_measured_bytes, observed_bytes, SPLIT_MUST_SHED_NUMERATOR, SPLIT_MUST_SHED_DENOMINATOR)
+}
+
+/// The shed test at an arbitrary ratio, so the simulator's threshold sweep runs
+/// THIS function rather than a copy of it.
+///
+/// `maintenance_sim` used to transcribe the predicate inline to vary the ratio,
+/// which is a drift hazard by construction: the copy silently kept its own
+/// meaning while this one changed. It is also why the sim never reproduced the
+/// 2026-09-03 synthetic-observation defect — the copy was fed a modelled
+/// observation and never saw what `retry_or_split` actually passes.
+pub fn split_sheds_enough_at(parent_measured_bytes: Option<u64>, observed_bytes: u64, numerator: u64, denominator: u64) -> bool {
     let Some(parent) = parent_measured_bytes else { return true };
-    observed_bytes > parent || observed_bytes.saturating_mul(SPLIT_MUST_SHED_DENOMINATOR) < parent.saturating_mul(SPLIT_MUST_SHED_NUMERATOR)
+    observed_bytes > parent || observed_bytes.saturating_mul(denominator) < parent.saturating_mul(numerator)
 }
 
 /// Split a unit that does not fit, **one level per call**.  A one-minute whale
