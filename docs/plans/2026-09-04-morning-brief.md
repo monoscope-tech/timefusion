@@ -1706,3 +1706,45 @@ sort; concurrency of those exhausts the pool. **Which query, and why its sort is
 5.5 GB when the plan shape streams, is not yet established.** The next step is
 to label sort reservations with the statement that owns them, so the log names
 the query instead of leaving it to adjacency.
+
+## RESOLVED: the query pool was Greedy, and a spillable sort starved the merge that follows it
+
+**Fixed by a concurrent session's work** (`4643af52`, `4ffa89f5`, `91a4a9bd`),
+which I nearly lost — the shared checkout had moved me onto their branch and my
+commits were landing there. Recovered by cherry-picking both sets onto master.
+
+**The mechanism, and it is a better diagnosis than any of mine.** The query pool
+defaulted to `Greedy`: one global cap, first-come first-served. A **spillable**
+`ExternalSorter` therefore grows instead of spilling until the pool is gone — and
+the merge halves that follow it (`ExternalSorterMerge`, `SortPreservingMerge`,
+`DedupExec[keep-greatest]`) **cannot spill**. So the sorter eats the pool and the
+merge fails for a fraction of it. Prod 2026-09-02: one 16-partition sort holding
+5.9 GB and 7.3 GB of a 16 GB pool while `ExternalSorterMerge[3]` could not get
+331 MB. Under `FairSpill` each sorter is capped at
+`(pool − unspillable) / num_spill` and spills instead.
+
+The historical reason for `Greedy` was retired properly rather than assumed: ~30
+concurrent INSERTs once got ~76 MB slots and bounced, but the write path took its
+own FairSpill pool in August, and `tests/suite/query_pool_insert_test.rs`
+**measures** that INSERTs reserve nothing from the query pool.
+
+**Measured, matched 15-minute windows, traffic HIGHER after:**
+
+| build | pool | `ExternalSorterMerge` errors / 15 min | throughput |
+|---|---|---:|---|
+| `9a0c75a` | Greedy | **26** | — |
+| `91a4a9b` | FairSpill | **0** | 12,339 queries in 1,080 s (11.4/s) |
+
+The only residual pgwire errors in the window are 7 × `Prepared statement 'all'
+does not exist` — a client-side protocol issue, unrelated.
+
+Rollback if needed: `TIMEFUSION_MEMORY_POOL=greedy`, no redeploy.
+
+**What this says about my own work on this incident.** Four hypotheses refuted by
+counters I shipped, two conclusions published and withdrawn, and the actual cause
+found by someone else reading the pool configuration. The instrumentation was
+worth it — it eliminated the entire ordering family and stopped me raising a
+memory budget for no reason — but the lesson stands: **I kept reasoning forward
+from a symptom instead of reading the configuration the symptom named.** The
+error message said "Additional allocation failed for ExternalSorterMerge" and
+named its own consumers; the pool policy was one config field away.
