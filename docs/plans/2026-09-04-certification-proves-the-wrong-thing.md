@@ -589,3 +589,47 @@ established, and worth the morning:
 3. "converged" is defined on size and the read path needs it defined on overlap;
 4. the simulation harness (`scratchpad/sim_timeranged.py`) is written, so the
    next candidate rule can be tested against real cells before anyone builds it.
+
+## One more layer: dedup IS bin-scoped, and the whale's files straddle ~9 bins
+
+Checking whether *any* lane can touch over-target files: `dedup_partition_paths`
+takes **every** file of the partition with **no size filter**, so the dedup path
+is not subject to the packer's `size >= target` skip. Dedup can read these files.
+
+And dedup is scoped to **bins** — the 10-minute time buckets tracked in
+`dedup_dirty_bins` and probed by `probe_dup_bins`. A bin-scoped rewrite emits
+that bin's rows in sort order, so **its output is time-bounded by construction**.
+That is the time-ranged mechanism I proposed building. **It already exists, in
+the dedup lane.**
+
+So why is the whale still frozen? Put the two measurements together:
+
+- the whale's files have **p50 span 6.3 % of a day ≈ 90 minutes**;
+- a bin is **10 minutes**.
+
+**Each file straddles roughly nine bins.** So a bin-scoped rewrite of one 10-minute
+bin must read every file overlapping it — on this cell, several GiB of input to
+emit one bin's output — and it cannot retire those inputs, because they still
+hold eight other bins' rows. That is the shape behind the budget refusals this
+repo has recorded before (92.9 % refused on budget).
+
+**I am stating this as an interaction to verify, not as a fourth mechanism.** I
+have now revised this diagnosis three times tonight, each revision correct
+against its own measurement and each superseded by the next; the honest position
+at 04:00 is to record what is established and stop.
+
+**Established, and independently checkable:**
+
+1. The packer skips every file at or above target (`mod.rs:7944`), so
+   HotPacking and SealedConsolidation can never touch 99 % of the whale.
+2. The dedup path applies **no size filter**, so it can.
+3. Dedup is **bin-scoped**, and a bin-scoped rewrite's output is time-bounded —
+   the disjointness mechanism exists there and nowhere else.
+4. The whale's files span **~9 bins each**, so bin-scoped work over them reads far
+   more than it writes and cannot retire its inputs.
+
+**The question that decides the fix — and the one to open with in daylight:**
+*is the frozen mass frozen because dedup refuses it on budget, or because nothing
+ever enqueues those bins?* Facts 1–4 make both plausible, they imply completely
+different fixes, and the funnel to tell them apart does not exist — which is the
+same instrumentation gap that `prep/unit-phase-timers` opens.
