@@ -58,6 +58,17 @@ So the one genuinely blocking dependency for the night's top recommendation is
 **somewhere in-region to run it from** — an infrastructure choice, not a
 technical unknown.
 
+**And the obvious way around it does not work — I proposed it and retracted it
+within the hour.** Exposing `RECOMPRESS` as a pgwire admin command beside
+`OPTIMIZE` would run in-region inside the prod process. But `OptimizeCmd`'s own
+comment records why `OPTIMIZE` demands a project scope: *"a whole-date optimize
+… tens of GB on a busy day … doesn't fit in-process next to serving load
+(2026-07-27: two OOMs)"* — and `--recompress` **cannot** be project-scoped
+(scoped `replace_where` deadlocks). An in-process recompress would be whole-date
+at 85 GiB, several times what already OOM'd prod twice. **Do not re-propose it
+without first fixing the `replace_where` deadlock**, which would shrink the job
+to the few-GB partitions `OPTIMIZE` already tolerates.
+
 ## IF YOU READ ONE SCREEN
 
 **The answer to "can we handle 10x".** Dedup consumes **~98 % of the heavy
