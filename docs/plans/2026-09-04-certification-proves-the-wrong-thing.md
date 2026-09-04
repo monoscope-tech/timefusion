@@ -2163,3 +2163,25 @@ check, because both counters already exist.
 641-unit rollup backlog and removes 171 query misses, the user-visible return is
 larger than the storage number suggests — and it lands on dashboards, which is
 where most queries actually go.
+
+### `rollup_miss_filter_not_eligible` is one label over three decline paths
+
+The second-largest rollup miss reason (**78**) cannot be acted on as it stands:
+`MissReason::FilterNotEligible` is returned from **three separate sites**
+(`rollup.rs:2315`, `:2432`, `:2580`), so the counter says a filter was refused
+without saying which rule refused it.
+
+**This codebase has already been bitten by exactly this and already knows the
+fix.** The tantivy prefilter had one label hiding four distinct refusals until it
+was split per-reason (2026-08-23), and the split immediately showed that 76 % of
+skips were a missing index rather than the mechanism failing.
+
+**So the cheap move, if anyone wants those 78 misses back, is to split the label
+before theorising** — three variants or a `site` field, mirroring what
+`MissReason` already does for every other reason. Without it, "78 filter
+declines" supports no conclusion, and I am recording it rather than guessing
+which of the three it is.
+
+That also completes the rollup picture: of ~260 misses, **171 are capacity**
+(`not_built` + `stale_coverage`, fixed by freeing the lane), **78 are
+unattributable** until the label is split, and 11 are `unaligned_bucket`.
