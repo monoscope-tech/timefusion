@@ -1662,3 +1662,43 @@ predictions arriving together in a single before/after.**
 means more compaction, and more compaction means more of this: a lane that
 improves its own metric by 7.8 % per three hours while the maintenance cost it
 drives stays exactly where it was. **Scaling the fleet scales the wrong number.**
+
+## Projected payoff: rewrite 85 GiB once, cut fleet maintenance read 8.5 %
+
+Modelling `--recompress` on the worst cells — the whole cell sorted and cut at
+512 MiB, so each output is contiguous and sub-bin — against today's 44,127 GiB
+fleet sweep read:
+
+| recompress top N cells | GiB rewritten (one-off) | fleet sweep after | reduction |
+|---:|---:|---:|---:|
+| **1** | **85 G** | 40,379 G | **8.5 %** |
+| 3 | 208 G | 37,198 G | 15.7 % |
+| **6** | **364 G** | 33,654 G | **23.7 %** |
+| 10 | 605 G | 29,605 G | 32.9 % |
+| 20 | 732 G | 26,309 G | **40.4 %** |
+| 50 | 768 G | 24,008 G | 45.6 % |
+
+**One cell — one command, 85 GiB rewritten once — takes 8.5 % off the fleet's
+entire maintenance read cost, permanently.** Six cells take off 23.7 %. Twenty
+cells take off 40.4 %.
+
+**And note the cost column flattens: 20 cells cost 732 GiB, 50 cells cost 768 GiB
+— thirty more cells for thirty-six more gigabytes**, because the tail is small.
+So the natural stopping point is around 20 cells: past that, effort rises and
+return does not.
+
+**Compare against the measured alternative.** Three hours of the maintenance
+lanes running flat out moved this number by **0.007 %**. One `--recompress` of a
+single cell moves it by **8.5 %** — roughly **1,200x the effect of everything
+compaction did in three hours**, for a bounded, one-off cost.
+
+**Caveats, all stated earlier and none of them dissolved:**
+- the model assumes recompress output is contiguous and sub-bin, which follows
+  from the sorted rewrite plus the 512 MiB cut but has not been observed;
+- `--recompress` cost on an 85 GiB cell is unmeasured (built for footer repair on
+  ordinary partitions);
+- it will contend with live maintenance on the same partition;
+- and without a span bound on `SealedConsolidation`, the gain re-accumulates.
+
+**But the first move is now unambiguous, small, and measurable**: one command,
+one cell, and the same statistics script re-run afterwards to confirm 8.5 %.
