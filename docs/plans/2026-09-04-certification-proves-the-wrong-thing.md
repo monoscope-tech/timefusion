@@ -772,3 +772,50 @@ established facts are recorded above; the next person should start from
 `prep/unit-phase-timers` and a decomposition of that ~58 worker-minutes, because
 every option in the paragraph above trades differently against read, sort and
 commit, and nobody currently knows which one dominates.
+
+## Prior art on the three structural options — one is eliminated by our stack
+
+The three ways out named above are not novel; the field has an answer, and it is
+worth knowing which before choosing.
+
+**The industry answer to exactly our problem is DELETION VECTORS.** Delta Lake's
+own framing of the motivation is our situation almost verbatim:
+
+> "if we had a Delta table with one massive Parquet file containing 1,000,000,000
+> rows and we delete or update one row, copy-on-write would result in
+> 999,999,999 rows of data being written to a new Parquet file, even though only
+> 1 row is being updated"
+
+That is precisely what a dedup bin does here: rewrite ~9 bins of file content to
+remove a handful of duplicate rows. Deletion vectors mark rows as removed
+**without rewriting the file**, and defer the real rewrite to a later `OPTIMIZE`
+— which is exactly the read-amplification fix option 2 describes.
+
+**But delta-rs cannot write them.** It *reads* tables with deletion vectors;
+writing is an **open feature request** (delta-io/delta-rs issue #4079, opened
+2026-01-14), and `delta-kernel-rs` does not support writing at all yet.
+
+**So option 2 is blocked on upstream or fork work.** We do carry a delta-rs fork,
+so it is not impossible — but it is a protocol-level feature with correctness
+consequences across every reader, not a maintenance tweak, and it would be the
+largest thing in this document by a wide margin.
+
+**That elevates the two options we can actually build today:**
+
+1. **Narrower files at write time** — if a file spans one bin, a dirty bin
+   rewrites one file and the amplification disappears at the source. This is a
+   flush/compaction output-sizing change, entirely within our control, and it
+   only helps data written *after* it ships.
+3. **A one-time re-cut of existing files onto bin boundaries** — pays the
+   amplification once, deliberately, to make every later dedup bin-local. This is
+   what would drain the existing whale mass, and it is schedulable per cell.
+
+**They are complements, not alternatives:** (1) stops the problem being created,
+(3) clears what already exists. Neither needs a protocol change, and both are
+sized by the same unknown — the read/sort/commit split that
+`prep/unit-phase-timers` would emit.
+
+Sources:
+- [Delta Lake Deletion Vectors](https://delta.io/blog/2023-07-05-deletion-vectors/)
+- [What are deletion vectors? — Delta Lake docs](https://docs.delta.io/delta-deletion-vectors/)
+- [delta-rs #4079: Support writing to tables with Deletion Vectors enabled](https://github.com/delta-io/delta-rs/issues/4079)
