@@ -1884,3 +1884,44 @@ deadline, so on this evidence deadline pressure is not currently what bounds it.
 the soak — 6x fewer, larger units against the claim/lease/deadline machinery —
 which needs staging and real object-store latency, not MinIO and not the IO-free
 sim.
+
+## The full quiet hour: the SHAPE holds, the SHARE was badly wrong
+
+96 units over 60 uninterrupted minutes (vs the 49-unit sample above):
+
+| pass | n | read+sort | write | median | p90 | max | worker-min | **share** | median rows |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Pack | 87 | 46.0% | 53.7% | 16.7 s | 127.6 s | 367 s | 67.1 | **86.6%** | 974,247 |
+| Dedup | 9 | **60.8%** | 39.0% | 10.2 s | 502 s | 502 s | 10.4 | **13.4%** | 74,587 |
+
+**What HOLDS, and is now solid:** dedup is **read-bound at 60.8%** (60.0% at
+n=5). The shape is stable across samples and lanes, and it is the fact the
+bin-width lever depends on — widening removes reads.
+
+**What COLLAPSES: the share.** I quoted "dedup is ~98% of the heavy pool" all
+night, then ~20% at n=5. At n=9 over a quiet hour it is **13.4%**, and **Pack is
+86.6%**. Each larger, quieter sample moved it further down. The 98% came from
+`work.Dedup.worker_secs / uptime / permits` on a churned process — a ratio of
+counters whose denominator I never validated, which is the exact failure mode
+this document catalogues twice already.
+
+**And dedup's 10.4 worker-minutes is essentially ONE unit:** median 10.2 s, but
+p90 = max = 502 s. Eight trivial units and one that is 8.4 minutes — 80% of the
+lane's cost. The heavy tail is not a property of dedup's *rate*, it is one unit.
+
+**This changes the priority ordering I have been asserting.** On this evidence
+**Pack — hot compaction — is the dominant consumer of maintenance worker time,
+not dedup.** Pack is also the more balanced lane (46% read / 54% write), so the
+read-side lever helps it less. Two consequences:
+
+1. **Bin widening is still correctly aimed** (dedup is read-bound) but its
+   *total* impact is bounded by dedup's share, which is far smaller than claimed.
+   A 5.1x read reduction on 13.4% of worker time is not a 5x system win.
+2. **The ClickHouse-style adaptive budget looks more valuable than before**: the
+   problem it targets — a few large units monopolising the pool — is exactly
+   dedup's one 502 s unit and the earlier 2 Repair units at 29% of worker time.
+
+**Standing caveat, applied to myself:** this is one hour on one process. It is a
+better sample than anything quoted earlier tonight, and it may still not be
+steady state. The stable quantity across every sample is the per-unit read/write
+*shape*; every *share* number I have produced has moved.
