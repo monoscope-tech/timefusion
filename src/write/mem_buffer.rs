@@ -3260,12 +3260,12 @@ mod tests {
 
         // Uniform batches sort, so the claim holds.
         let uniform = vec![create_test_batch(ts), create_test_batch(ts + 1)];
-        assert!(sort_partition(&schema, uniform).is_some(), "a uniform partition must sort, or this test proves nothing");
+        assert!(sort_partition(schema, uniform).is_some(), "a uniform partition must sort, or this test proves nothing");
 
         // Add ONE batch carrying an extra nullable column — accepted on insert —
         // and the partition becomes unsortable.
         let diverse = vec![create_test_batch(ts), create_test_batch_with_extra_field(ts + 1)];
-        assert!(sort_partition(&schema, diverse).is_none(), "a partition mixing schemas is refused, which is what retracts the ordering for the entire leg");
+        assert!(sort_partition(schema, diverse).is_none(), "a partition mixing schemas is refused, which is what retracts the ordering for the entire leg");
     }
 
     fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
