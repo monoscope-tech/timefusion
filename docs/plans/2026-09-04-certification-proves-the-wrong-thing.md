@@ -650,3 +650,40 @@ time buckets", which the code contradicts — that constant is 5 minutes.** A sm
 thing, but it is exactly the sort of stale figure that produces a confidently
 wrong calculation, and `BIN_MICROS` being copy-pasted in three files is a second
 one waiting to happen.
+
+## The open question, answered: neither. The lanes are not blocked, they are slow.
+
+I proposed two possibilities — dedup refuses these bins on budget, or nothing
+enqueues them. **The counters say neither.** On the long-lived process:
+
+```
+dedup_bins_committed_total        20      dedup_failed_total              0
+dedup_waves_committed_total       15      dedup_timed_out_total           0
+                                          dedup_bin_stage_timeouts_total  0
+                                          dedup_bins_deferred_cold_total  0
+retry.Dedup.dedup                 22      retry.Repair.compaction_incomplete   68
+retry.Dedup.dedup_incomplete       5      retry.HotPacking.compaction_debt_remaining 24
+retry.Dedup.source_not_flushed    16      retry.BaseRollup.source_not_flushed  20
+retry.Dedup.worker_error           6
+```
+
+**Every hard-refusal counter is zero.** No budget deferrals, no stage timeouts,
+no failures, no cold deferrals. Dedup is being claimed, is running, and has
+committed **20 bins** — up from 4 earlier in the night. The lanes are working.
+
+**So the constraint is throughput, not blockage** — and that is a materially
+better answer than either hypothesis, because it means nothing needs unblocking.
+It also puts a number on the scale of the problem: at 10-minute bins a single
+day-cell holds **~144 bins**, the ten whale cells hold **~1,440**, and each of
+those bins must read the several GiB of overlapping GiB-sized files that straddle
+it. **Twenty bins committed in roughly two hours** is the rate against that.
+
+**This makes `prep/unit-phase-timers` unambiguously the first thing to merge.**
+The question is no longer "what is blocked" — nothing is. It is "what does a bin
+cost, and which phase owns the cost", and that is precisely the number the
+codebase does not currently emit. Everything downstream — whether to change the
+convergence rule, whether to split, whether more uptime helps — turns on it.
+
+**And it retires my own framing.** I spent the small hours looking for the thing
+that was stuck. The counters say nothing is stuck; the work is simply far larger
+than the rate, and the rate has never been decomposed.
