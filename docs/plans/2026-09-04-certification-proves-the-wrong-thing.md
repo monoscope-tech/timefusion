@@ -1571,3 +1571,49 @@ does.
 **Worth stating plainly:** these units are running right now, and each one is
 making the dedup lane's next pass more expensive. The `--recompress` cleanup
 addresses the accumulated damage; only a span bound stops it accumulating.
+
+## The span histogram, from live prod — and a candidate policy
+
+14 `compaction_unit_span` samples (small n, one process, ~10 minutes — treat as
+indicative, not settled):
+
+```
+bins spanned: p10 3   p50 16   p90 105   max 119   mean 39
+
+span bound -> units it would REJECT
+    1 bins:  93%        16 bins:  43%
+    4 bins:  86%        32 bins:  29%
+    8 bins:  79%       128 bins:   0%
+
+HotPacking           n=8   p50  16   p90  16   max  16
+SealedConsolidation  n=6   p50  92   p90 119   max 119
+```
+
+**The two lanes separate almost perfectly at 16 bins.** Every `HotPacking` sample
+is exactly 16 bins or less; every `SealedConsolidation` sample is far above it.
+So a **16-bin span bound would leave hot packing entirely untouched and reject
+essentially all sealed consolidation.**
+
+**That is a much sharper policy than "bound the span at X" in the abstract, and
+its implication is uncomfortable and worth facing:** such a bound would
+effectively **disable `SealedConsolidation`**, because — per the three selection
+refutations — that lane cannot choose narrower inputs. Its files are scattered
+across the day, so any merge it makes spans the day.
+
+**And that may well be correct.** `SealedConsolidation` exists to reduce file
+count on sealed dates. Measured tonight, its outputs span 92-119 bins, and each
+such output is then read by 92-119 dedup bins in full. **The lane is trading a
+small file-count win for a very large read-amplification loss**, and nothing in
+the system was accounting for the second half of that trade.
+
+**What would settle it** — and what I am explicitly not concluding from n=6:
+1. more samples, over a longer window and several processes;
+2. the per-unit cost decomposition from `prep/unit-phase-timers`, to price the
+   file-count win against the read-amplification loss in the same units;
+3. whether sealed dates still *need* consolidation once `--recompress` has
+   rewritten them, since a recompressed cell is already at target sizes.
+
+**Note the third point may dissolve the question entirely.** If the cleanup pass
+leaves cells with correctly-sized, narrow files, `SealedConsolidation` would have
+nothing to do on them — and the lane's cost would fall to zero without any policy
+change at all.
