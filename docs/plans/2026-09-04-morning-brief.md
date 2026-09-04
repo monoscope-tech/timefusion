@@ -238,10 +238,18 @@ is another restart for no safety gain. **Review it after the fact.**
 | `scratch/replace-where-deadlock-v2` | the scoped-recompress experiment | **DO NOT MERGE** — lifts a safety guard |
 
 **Verified: all four `prep/` branches merge cleanly onto master together, and the
-combined result is green** — 1134 lib tests, `cargo lint` clean, `cargo fmt`
-clean. They touch disjoint areas (`maintain.rs`, `config.rs` + `mod.rs`,
-`schemas/` + `read/`, `rollup.rs` + `observability.rs`), so they can be taken in
-any order or all at once.
+combined result passes the FULL suite** — **1,357 of 1,358**, plus `cargo lint`
+and `cargo fmt` clean. They touch disjoint areas (`maintain.rs`, `config.rs` +
+`mod.rs`, `schemas/` + `read/`, `rollup.rs` + `observability.rs`), so they can be
+taken in any order or all at once.
+
+**The single failure is `a_chart_under_a_derived_table_routes_and_agrees_with_raw`,
+and it is NOT from these branches — it fails on plain `origin/master` too**
+(re-checked just now). It is the wall-clock-dependent test documented below: its
+miss reason is `tiny_interior`, which depends on where `now()` falls relative to
+bucket boundaries, so it passes at some times of day and fails at others. **Do
+not read a red CI run on these branches as their fault without checking that test
+in isolation first.**
 | ~~`prep/bin-width`~~ | already on master by accident (see above) | reviewed after the fact |
  (single-sources
 `BIN_MICROS`, adds `compaction_unit_span` reporting), `prep/unit-phase-timers`
