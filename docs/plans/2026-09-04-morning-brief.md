@@ -992,3 +992,33 @@ Recorded because the reasoning is the useful part:
    leaving 0.
 3. Only then, the certification redesign — it is a real design change and should
    not start until the cheap fixes are proven to have run out.
+
+## Postscript — the one failing test was time-of-day dependent (fixed)
+
+`dedup_compaction_test::a_chart_under_a_derived_table_routes_and_agrees_with_raw`
+was the single failure in the 1,357/1,358 verification run above. It is **not**
+caused by any of the prep branches — it fails on plain `origin/master` — and it
+is not random: it is a function of the wall clock, reproduced deterministically
+in **both** directions by pinning `support::set_micros`.
+
+Instrumenting the `interiors()` call site with the same fixture gives:
+
+| pinned `now` | 1h tier `covered` | 1m tier `covered` | result |
+|---|---|---|---|
+| 03:55 UTC | yesterday 00:00 → **14:00** | yesterday 00:00 → **14:00** | FAIL `tiny_interior` |
+| 12:00 UTC | yesterday 00:00 → **14:00** | yesterday 00:00 → **today 00:00** | PASS |
+
+The window is `[yesterday 12:00:00.000017, today 02:00:00.000017)`; the fixture's
+three rows sit at yesterday 12:00–13:01.
+
+- The **1h tier declines in both cases, correctly.** `ceil_grain(lo)` = 13:00 and
+  coverage ends at 14:00, so the interior is exactly **one** 1h bucket — below
+  `MIN_INTERIOR_BUCKETS = 2`. The floor is working as designed.
+- So the query's whole fate rests on the **1m tier**, whose coverage end **moves
+  with `now`** while the 1h tier's does not. That asymmetry is a *fixture
+  observation, not a prod claim* — it may simply be which units
+  `run_maintenance_units(1024)` happened to plan at each clock position. Worth a
+  look; not chased further tonight.
+
+**Fixed** by pinning the clock at the top of the test (`5f83a89b`); the existing
+`ClockGuard` already restores wall time on drop. 56/56 in that file green.
