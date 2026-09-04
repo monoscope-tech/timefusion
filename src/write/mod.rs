@@ -5662,8 +5662,13 @@ mod tests {
         layer.recover_from_wal().await.unwrap();
         assert_eq!(layer.snapshot_stats().mem_total_rows, 0, "quarantine re-drive must not block recovery/readiness");
         layer.start_background_tasks().await;
+        // Wait for the ARCHIVE, not the row. The re-drive inserts first and
+        // renames into `redriven/` after (`redrive_quarantine`), so waiting on
+        // `mem_total_rows` alone lets the assertions below run in the window
+        // between the two — which is exactly how this failed under full-suite
+        // load while passing in isolation.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while layer.snapshot_stats().mem_total_rows != 1 {
+            while !qdir.join("redriven/1_insert_incompatible_t.meta").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
