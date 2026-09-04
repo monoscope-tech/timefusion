@@ -1950,3 +1950,47 @@ runner** — the same dependency as the cleanup itself, which is convenient: one
 environment unblocks both. The test to run there is exactly
 `scratch/replace-where-deadlock-v2`'s second case, which already exercises
 concurrent writes into the partition being overwritten.
+
+## The canonical prior art: TimeFusion has L0 and nothing else
+
+LSM engines solved this exact problem thirty years ago, and RocksDB's leveled
+compaction states the solution plainly:
+
+> "In leveled compaction, **Level 0 allows overlapping keys, while Level 1 and
+> above maintain non-overlapping key ranges within each level.** … every level is
+> **key-range partitioned into many files**, and when the size of a level exceeds
+> its target, one or more of its files are picked and merged into the next
+> level."
+
+**Non-overlap is maintained by how the OUTPUT is written — key-range partitioned
+— not by which inputs are chosen.** That is precisely the conclusion tonight's
+four refuted designs arrived at independently: selection cannot fix span; only
+output partitioning can.
+
+**And it gives the sharpest possible description of TimeFusion's compaction:
+every file is effectively L0.** Files overlap arbitrarily; merges combine them
+without re-partitioning the output by time; so the output is *also* L0. **There
+is no level at which non-overlap is established, so there is nothing to fall out
+of.** Every LSM design treats L0 as the emergency to escape — it is where read
+amplification is worst, and the whole point of levels is to get out of it fast.
+We never leave.
+
+**RocksDB's "clean cut" is the same boundary question I measured tonight.** It
+"chooses not to expand if this would cause a level to include some internal keys
+for a user key while excluding others" — i.e. never split one key across files.
+That is the dedup-key-boundary concern, and the data says it is cheap here: the
+largest run of identical timestamps is **36 rows** on logs and **768** on
+metrics, so a cut between distinct values is always available.
+
+**What this changes:** nothing about the immediate recommendation — the cleanup
+and the span budget stand. What it changes is the *shape* of the long-term fix.
+Rather than inventing a span policy, the well-trodden path is **a level whose
+files are time-range partitioned by construction**, with compaction writing into
+it rather than merging within one undifferentiated pool. `--recompress` on a whole
+cell is, in effect, a manual one-off "promote this partition to L1" — which is
+why it works and why the four partial-merge designs did not.
+
+Sources:
+- [Leveled Compaction — RocksDB wiki](https://github.com/facebook/rocksdb/wiki/Leveled-Compaction)
+- [Choose Level Compaction Files — RocksDB wiki](https://github.com/facebook/rocksdb/wiki/Choose-Level-Compaction-Files)
+- [Level-based Compaction Changes — RocksDB blog](https://rocksdb.org/blog/2017/06/26/17-level-based-changes.html)
