@@ -1433,3 +1433,47 @@ It has to come from one of exactly two places:
 refutations, each cheap because the harnesses were already written — and together
 they localise the defect to the writer, which no amount of scheduling work would
 have reached.
+
+## The writer-side fix is refuted too — and that leaves exactly one lever
+
+The three selection refutations localised the defect to the writer's cut. So:
+what if the writer cut output at bin boundaries as well as at `max_file_bytes`?
+Simulated over the 123 merges the packer would actually perform:
+
+```
+IF the writer cut at BIN boundaries, each merge would emit:
+  output files: mean 126   p50 144   p90 144
+  avg output size: mean 1.42 MiB   p50 1.44 MiB
+
+today each merge emits ONE file of up to 256 MiB.
+```
+
+**~144 files of ~1.4 MiB each, per merge.** That is catastrophic fragmentation —
+precisely what compaction exists to prevent, and it would multiply the file count
+the query planner and the packer both pay for. **Refuted.**
+
+### Four designs eliminated; one survives, and the reason is structural
+
+| design | verdict |
+|---|---|
+| time-RANGED unit selection | identical (1,405 vs 1,407 overlapping pairs) |
+| splitting compaction for oversized components | those files are never selected (`size >= target`) |
+| time-ADJACENT ordering | identical (128.1 vs 128.2 bins) |
+| **bin-boundary cutting in the writer** | **144 files of 1.4 MiB per merge** |
+| **`optimize --recompress`** | **~170 files of ~8.5 min each — works** |
+
+**Why the survivor is different, stated precisely:** the four failures are all
+*partial* operations over a *scattered* subset. A merge of files spread across a
+whole day produces a day-spanning output no matter how you choose or cut it —
+narrow output requires narrow input, and the input is scattered by construction.
+
+**`--recompress` is the only one that rewrites the ENTIRE partition, sorted.**
+That is what breaks the circularity: with all the data present and re-sorted by
+timestamp, the writer's ordinary 512 MiB cut lands on a contiguous stream and
+every output is narrow automatically. The scatter of the inputs stops mattering
+because nothing is left out.
+
+**So the recommendation is not a preference among options — it is the only option
+that survived measurement**, and the four that did not are recorded above so
+nobody spends a day rediscovering them. Each took minutes to refute once the
+harness existed; the harnesses are in `scratchpad/` and take a partition path.
