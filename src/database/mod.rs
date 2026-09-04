@@ -16144,7 +16144,7 @@ mod tests {
 
         // One partition: files arrive, the packer picks a bin, the bin becomes a
         // single larger file. Deterministic — no clock, no RNG.
-        let run = |floor: i64| -> (i64, i64) {
+        let run = |floor: i64| -> (i64, i64, usize) {
             let (mut live, mut written, mut ingested, mut seq) = (Vec::<i64>::new(), 0i64, 0i64, 0i64);
             for _ in 0..ROUNDS {
                 live.push(ARRIVAL);
@@ -16180,16 +16180,21 @@ mod tests {
                 live = keep;
                 written += bytes;
             }
-            (written, ingested)
+            (written, ingested, live.len())
         };
 
-        let (w_off, ing) = run(0);
-        let (w_on, _) = run(100 * 1024 * 1024); // the recommended ~100 MiB/file floor
+        let (w_off, ing, files_off) = run(0);
+        let (w_on, _, files_on) = run(100 * 1024 * 1024); // the recommended ~100 MiB/file floor
         let amp = |w: i64| w as f64 / ing as f64;
-        println!("amplification: floor OFF {:.2}x   floor ON {:.2}x", amp(w_off), amp(w_on));
+        println!("amplification: OFF {:.2}x  ON {:.2}x   |   live files: OFF {files_off}  ON {files_on}", amp(w_off), amp(w_on));
 
         assert!(amp(w_off) > 1.0, "the unguarded packer must rewrite more than it ingests, or the fixture is wrong");
         assert!(amp(w_on) < amp(w_off), "the value floor must LOWER steady-state write amplification: off {:.2}x, on {:.2}x", amp(w_off), amp(w_on));
+        // THE RISK THIS GUARD CARRIES, measured rather than argued. Refusing a
+        // merge leaves its files in place, so the floor trades maintenance cost
+        // for the READER's file count. A floor that halves writes but doubles
+        // files per partition is a bad trade — every query opens every file.
+        assert!(files_on <= files_off * 2, "the floor must not blow up the live file count: off {files_off}, on {files_on}");
     }
 
     /// The VALUE guard, benchmarked against the shape prod actually produces.
