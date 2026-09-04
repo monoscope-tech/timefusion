@@ -136,16 +136,27 @@ project_id=6297304f…/date=2026-09-03
   groups where the proposed key is COARSER  : 0
 ```
 
-Exactly equal again, independently, on a different tenant — **two full
-partition-days, 9.4 M raw rows across 118 files, zero coarsening**. The third
-heavy project (`00000000…`, the largest) was still running when its task was
-stopped and remains unchecked.
+Exactly equal again, independently, on a different tenant. And the third and
+largest:
+
+```
+project_id=00000000…/date=2026-09-03
+  LIVE files 68    rows 13,360,165
+  (timestamp, id) keys                      : 13,347,334
+  (timestamp, metric_name, series_id) keys  : 13,347,334
+  groups where the proposed key is COARSER  : 0
+```
+
+**All three heavy projects verified on raw files: 22,773,893 rows across 186
+files, three tenants, ZERO coarsening, identical cardinality every time.** The
+row/key gaps (1,174 / 90 / 12,831) are real multi-version work, so none of these
+is a partition with nothing to dedup.
 
 ### What still stands between this and shipping
 
-1. **Two of three heavy projects verified on raw files** (all three verified
-   through pgwire). Finish the third — `scratchpad/metrics_key_equiv.py` takes a
-   partition path; it is slow because that partition is the largest on the fleet.
+1. ~~Verify the key equivalence on real data.~~ **DONE** — all three heavy
+   projects, on raw files, over every live version. This was the blocking
+   correctness question and it is answered.
 2. **Equivalence in today's data is not a schema guarantee.** If it is adopted,
    the invariant deserves an assertion — the natural place is the same audit that
    already checks immutable columns during compaction.
