@@ -7191,13 +7191,27 @@ impl Database {
             // One pass when not sliced; otherwise one pass per slice, in sort
             // order, all feeding the SAME writer.
             let passes: Vec<String> = if slices.is_empty() { vec![String::new()] } else { slices };
+            // Where a unit's wall clock actually goes. Prod emitted only total
+            // `elapsed_secs`, so "of the ~21 minutes a unit takes, how much is
+            // object-store read, how much the sort, how much the commit" had no
+            // answer — and that number is what sizes any backlog paydown
+            // (docs/plans/2026-09-04-certification-proves-the-wrong-thing.md).
+            // `upstream` is scan+sort (time blocked in `stream.next()`), `write`
+            // is encode+upload, `plan` is optimisation.
+            let (mut t_plan, mut t_upstream, mut t_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
             for predicate in &passes {
+                let planned_at = std::time::Instant::now();
                 let plan = ctx.sql(&format!("SELECT * FROM {bin_table}{predicate}{order_by}")).await?.create_physical_plan().await?;
+                t_plan += planned_at.elapsed();
                 // Held for the life of the stream: the sort below it can run for
                 // most of the unit without emitting a row.
                 let _progress = PlanProgress::watch(Arc::clone(&plan));
                 let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
-                while let Some(batch) = stream.next().await {
+                loop {
+                    let pulled_at = std::time::Instant::now();
+                    let next = stream.next().await;
+                    t_upstream += pulled_at.elapsed();
+                    let Some(batch) = next else { break };
                     let batch = cast_variant_columns_to_binary(batch?)?;
                     if batch.num_rows() == 0 {
                         continue;
@@ -7207,13 +7221,17 @@ impl Database {
                     // reads it instead of a fixed budget.
                     note_unit_progress(batch.num_rows());
                     let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
+                    let wrote_at = std::time::Instant::now();
                     writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
+                    t_write += wrote_at.elapsed();
                     // Cut the file at the ceiling instead of buffering the whole bin
                     // into one Add. The cut is on a contiguous slice of the sorted
                     // stream, so each piece keeps an honest footer and the pieces
                     // stay event-time disjoint.
                     if writer.buffer_len() >= max_file_bytes {
+                        let flushed_at = std::time::Instant::now();
                         adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
+                        t_write += flushed_at.elapsed();
                     }
                 }
             }
@@ -7245,7 +7263,27 @@ impl Database {
                     anyhow::bail!("sliced repair staged {rows_staged} rows but the inputs hold {expected} — refusing to commit a lossy rewrite");
                 }
             }
+            let final_flush_at = std::time::Instant::now();
             adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(tag_sorted));
+            t_write += final_flush_at.elapsed();
+            // THE decomposition. `upstream` is scan + sort (object-store read
+            // included, since the scan blocks on it), `write` is encode +
+            // upload, `plan` is optimisation. Emitted on every staged bin, not
+            // only slow ones: the question is where a TYPICAL unit's time goes,
+            // and `maintenance_unit_slow` samples exactly the atypical tail.
+            info!(
+                table_name,
+                project_id,
+                ?pass,
+                files = files.len(),
+                rows_staged,
+                outputs = adds.len(),
+                plan_secs = t_plan.as_secs_f64(),
+                upstream_secs = t_upstream.as_secs_f64(),
+                write_secs = t_write.as_secs_f64(),
+                event = "unit_phase_timing",
+                "where a maintenance unit's wall clock went"
+            );
             Ok(())
         }
         .await;
