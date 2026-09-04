@@ -126,10 +126,26 @@ So the widening is a **relabelling of the same grouping**: the same rows collaps
 nothing is lost, nothing is left uncollapsed — and `dedup_keys` becomes a prefix
 of `sorting_columns`, which flips `otel_metrics` onto the streaming collapse.
 
+### Confirmed on a second project
+
+```
+project_id=6297304f…/date=2026-09-03
+  LIVE files 53    rows 2,315,168
+  (timestamp, id) keys                      : 2,315,078
+  (timestamp, metric_name, series_id) keys  : 2,315,078
+  groups where the proposed key is COARSER  : 0
+```
+
+Exactly equal again, independently, on a different tenant — **two full
+partition-days, 9.4 M raw rows across 118 files, zero coarsening**. The third
+heavy project (`00000000…`, the largest) was still running when its task was
+stopped and remains unchecked.
+
 ### What still stands between this and shipping
 
-1. **One partition-day, one project.** Repeat on the other two heavy projects
-   before committing; the script takes a partition path as its argument.
+1. **Two of three heavy projects verified on raw files** (all three verified
+   through pgwire). Finish the third — `scratchpad/metrics_key_equiv.py` takes a
+   partition path; it is slow because that partition is the largest on the fleet.
 2. **Equivalence in today's data is not a schema guarantee.** If it is adopted,
    the invariant deserves an assertion — the natural place is the same audit that
    already checks immutable columns during compaction.
