@@ -3,7 +3,44 @@
 Final state, not the journey. **Four fixes shipped**, one customer question
 answered with a "don't build this", and four decisions that are yours.
 
-## THE ANSWER TO THE 10x QUESTION
+## THE ONE NUMBER
+
+You asked whether sorting, hotpacking, rollups and dedup are "breaking a sweat."
+Measured on prod, one process, 7,148 s uptime:
+
+```
+work.Dedup.worker_secs        69,752        = 9.76 workers, continuously
+HEAVY_REWRITE_PERMITS             10        -> dedup is ~98% of heavy maintenance
+work.Dedup.progress_rows  19,186,817,032
+work.Dedup.rows_dropped          105,053    -> ~182,000 rows read per row removed
+dedup_bins_committed_total            20    -> ~58 worker-MINUTES per committed bin
+```
+
+**Dedup is using 98 % of the heavy maintenance pool to remove a hundred thousand
+rows.** Every other lane — packing, consolidation, repair, rollups — divides the
+remaining 2 %. That is why nothing else keeps up.
+
+And it is **not** a scheduling, budget, livelock or certification problem. Every
+hard-refusal counter is zero; the lanes run and commit. **The work per unit of
+benefit is four to five orders of magnitude too high**, because the physical
+layout makes every 10-minute bin read the files that overlap it **nine deep**.
+
+*(Caveat: `progress_rows` is fed by both progress reporters on this path, so
+19.2 B is an upper bound and may double-count. Halve it and it is still
+~91,000 rows read per row removed. The 98 % figure does not depend on it — it is
+arithmetic on `worker_secs`, uptime and permits.)*
+
+**At 10x ingest this gets worse, not proportionally harder**: components grow by
+chain-overlap, so more files straddle more bins and the read-amplification rises
+with volume.
+
+**This reframes everything else in this brief, including my own fixes.** The four
+shipped tonight are real and each removed a genuine defect — but they tune the
+allocation of a pool that is 98 % consumed by an operation reading 182,000x more
+than it removes. **The layout is the cost. Nothing scheduled on top of it can be
+cheap.**
+
+## THE MECHANISM BEHIND IT
 
 Measured tonight, from Delta statistics alone:
 
