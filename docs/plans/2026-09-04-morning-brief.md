@@ -1247,6 +1247,7 @@ With `--mint` (`626e3c2d`) a synthetic queue finally generates arrivals, so
 | 74 | 1x | 18,029 / 18,403 / 18,015 | 5,376 / 5,045 / 5,307 | 83,09x |
 | 148 | 2x | 39,241 / 39,497 / 39,241 | 5,338 / 5,089 / 5,257 | 83,08x |
 | 370 | 5x | 102,635 / 102,979 / 102,757 | 5,333 / 5,106 / 5,319 | 83,07x |
+| 740 | **10x** | **208,532** (1 seed) | **5,347** | 83,084 |
 
 Seed spread is **~2%** on `pending_end` and **~5%** on `executions`, against
 **2.2x** and **5.7x** between configurations — so unlike the un-minted sweep,
@@ -1269,10 +1270,15 @@ change can create headroom — only making a unit cheaper can.** That is exactly
 what the bin-width lever does (5.1x less read per sweep), and it is the argument
 for prioritising it over any further scheduler tuning.
 
-**The 10x point (740 streams) is MISSING, not zero** — it exceeded the 4-minute
-per-run budget in the sweep; it is running separately. The sim itself slows
-superlinearly with queue size, which is worth knowing before anyone plans a
-large sweep.
+**The 10x point landed** (it needed a 25-minute budget, not the sweep's 4 — the
+sim slows superlinearly with queue size). It is one seed, but it falls exactly on
+the line: **executions 5,347, inside the 5,045–5,376 band every other
+configuration produced, while backlog reached 208,532 — 11.6x the 1x run.**
+
+So across a **10x** increase in arrival rate, completion throughput moves by
+**under 6%**, which is within the seed noise. There is no headroom at all: the
+system is throughput-saturated at 1x and converts additional load into backlog
+essentially 1:1.
 
 **Honest limits of this measurement:** it is the IO-free coordinator sim, so it
 models unit durations from a byte model rather than real object-store latency —
