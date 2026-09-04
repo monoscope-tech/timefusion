@@ -819,3 +819,43 @@ Sources:
 - [Delta Lake Deletion Vectors](https://delta.io/blog/2023-07-05-deletion-vectors/)
 - [What are deletion vectors? — Delta Lake docs](https://docs.delta.io/delta-deletion-vectors/)
 - [delta-rs #4079: Support writing to tables with Deletion Vectors enabled](https://github.com/delta-io/delta-rs/issues/4079)
+
+## Option 1 sized: the mismatch is BIN vs FILE SPAN, and either side can move
+
+`timefusion_writer_max_file_bytes` is **512 MiB**, and its own comment already
+records the property we want:
+
+> "each cut lands on a contiguous slice of an already-sorted stream, so every
+> piece keeps a sorted footer and stays **event-time disjoint**"
+
+**So the writer already emits event-time-disjoint pieces.** The problem is not the
+cut, it is the *size* it cuts at relative to the bin:
+
+| | span |
+|---|---|
+| dedup bin (`BIN_MICROS`) | **10 min** |
+| a 512 MiB file at whale density | **~45 min** |
+| the whale's actual files (p50 1017 MiB) | **~90 min** |
+
+**A file straddles ~4.5 bins at today's setting and ~9 at the sizes actually on
+disk.** That single mismatch is the read amplification.
+
+It can be closed from either end, and the trade is different:
+
+- **Shrink the file to the bin.** Cutting at a bin boundary means ~114 MiB files
+  at whale density — **4.5x more files**, which is precisely the fragmentation
+  compaction exists to remove. This buys bin-locality at the cost of file count,
+  and file count is what the packer and the query planner both pay for.
+- **Widen the bin to the file.** `BIN_MICROS` is a constant (10 min, duplicated
+  in three files). A ~45-minute bin would make a 512 MiB file span roughly one
+  bin with **no change to file sizes at all** — the cheapest possible version of
+  option 1. The cost is dedup granularity: a dirty bin drags 4.5x more rows into
+  each unit, so units get bigger even as they get fewer.
+
+**I have not tested either and I am not recommending one.** What is worth having
+written down is that the defect is a *ratio*, not a property of files or of bins
+alone, and that one side of it is a constant. That is a much smaller design space
+than "change the storage layout", and it is the first thing I would put in front
+of whoever picks this up — along with the caution that `BIN_MICROS` is
+copy-pasted in three places (`compact.rs:1150`, `write.rs:502`,
+`maintain.rs:5726`) and would need to move in all of them.
