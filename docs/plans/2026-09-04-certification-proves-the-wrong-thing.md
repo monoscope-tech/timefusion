@@ -346,3 +346,41 @@ timestamps is safe; a cut *inside* a run of equal timestamps is not.
 direction, so this is a question to settle against that code rather than a new
 problem — but it is the thing to get right, and it is exactly the class of bug
 that is invisible until someone trusts a wrong count.
+
+### The cut-point caveat, measured — and it is not a blocker
+
+The open question was whether a time-ranged unit can always cut *between*
+distinct timestamps, since a cut inside a run of equal timestamps would put two
+versions of one row in different units and the dedup would never see them
+together.
+
+**Logs** — measured on the real prod file `875ea2a1` produced, locally, no prod
+load:
+
+```
+rows 2,023,604   distinct timestamps 1,765,665   (1.15 rows per timestamp)
+rows sharing ONE timestamp: p50 1  p90 2  p99 2  max 36
+rows in runs > 1000: 0
+possible cut points: 1,765,664
+```
+
+The largest indivisible unit is **36 rows — 0.0018 % of the file.** Cuts are
+available at essentially any granularity.
+
+**Metrics** — the shape most likely to break this, because scrape-aligned
+timestamps put many series on the same instant. Prod, 10-minute window:
+
+```
+total rows 65,246   distinct timestamps 1,830   (35.7 rows per timestamp)
+max rows sharing one timestamp: 768
+```
+
+**Metrics is 31x more clustered than logs, exactly as expected — and still fine.**
+768 rows is a trivial granularity floor for a unit sized in the millions. The
+concern was real enough to check and is not a blocker for either table.
+
+What this does confirm is that the two tables have **very different timestamp
+structures**, so a cut-point strategy must be derived from the data (pick the
+next distinct value) rather than from a fixed row or time stride. A fixed stride
+tuned on logs would be 31x off on metrics — the same family of mistake as pricing
+a bin in rows when the deadline is spent on IO.
