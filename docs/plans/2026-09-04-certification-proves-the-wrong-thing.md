@@ -1140,3 +1140,62 @@ this cost function is `span x size`, and **a median tells you nothing about a
 tail-dominated total.** The right question was never "how wide is a typical
 file" but "which files cause the most reading" — and that one is answerable
 directly, in seconds, from statistics that were there all along.
+
+## COMPACTION CREATES THE WIDE FILES. The two lanes work against each other.
+
+Is the wide-file problem legacy, or still being made? Wide files (>50 % of a day)
+by partition age:
+
+```
+ age         date  files  wide  wide%  sweep GiB
+   0d   2026-09-04     70     0   0.0%          2
+   3d   2026-09-01   1657    12   0.7%         75
+   6d   2026-08-29    231    34  14.7%        239
+   8d   2026-08-27    317    42  13.2%        246
+  12d   2026-08-23     22    16  72.7%        339
+  13d   2026-08-22     22    12  54.5%        244
+
+last 7 days : 115 wide of 3,645 files ( 3.2%)
+older       : 1,158 wide of 3,979 files (29.1%)
+```
+
+**Look at the file counts against the wide percentages.** `2026-09-01` has
+**1,657 files and 0.7 % wide**. `2026-08-23` has **22 files and 72.7 % wide** —
+and costs **339 GiB of sweep read**, more than any recent date, from 22 files.
+
+**The correlation is inverse and near-perfect: the more compacted a partition,
+the wider its files, and the more the dedup lane pays for it.**
+
+That is not a coincidence, it is arithmetic. **Merging files unions their time
+ranges.** Compaction's whole job is to produce fewer, larger files; larger files
+made from merged inputs span wider; and a wider file is read once per bin it
+touches. **Compaction is manufacturing exactly the property that makes dedup
+expensive.**
+
+### This is the same defect as "converged means large enough", seen from the cost side
+
+`select_coordinator_compaction_candidates` optimises file COUNT and calls a file
+done at 256 MiB. Nothing anywhere scores a file's SPAN. So the compaction lane
+improves its own metric while degrading the dedup lane's, and neither can see the
+other. A partition compacted down to 22 files is, by compaction's definition, in
+excellent shape — and is the single most expensive thing in the fleet for dedup
+to touch.
+
+**Consequences, in order of how much they change the plan:**
+
+1. **Splitting wide files is NOT a one-time cleanup.** It is a treadmill *fed by
+   compaction*, not by ingest. Splitting the top 500 today would help enormously
+   and then slowly refill, at whatever rate compaction merges across wide ranges.
+2. **So the source fix belongs in the packer**: bound the output's SPAN, not only
+   its size. "Do not merge files whose combined range exceeds X" is a
+   candidate-selection rule of the same shape as the byte and row budgets already
+   there — and this document has now measured what X costs at several values.
+3. **Recent data is mostly healthy** (3.2 % wide in 7 days vs 29.1 % older), so
+   the damage is concentrated in the compacted past, which is also where the
+   frozen mass lives. Those are the same cells for the same reason.
+
+**And it reframes tonight's four fixes one last time.** They made compaction work
+better — the packer livelock, the planner budget, the probe ordering, the rollup
+liveness. **Compaction working better means files merged wider, faster.** None of
+them is wrong, but the lane they accelerate is the one manufacturing the dominant
+cost, and that interaction is not visible from inside any of them.
