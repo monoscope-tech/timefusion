@@ -2683,3 +2683,62 @@ of 10 heavy permits and completing nothing, and the fix is blocked behind a
 budget split that cannot accommodate both lanes at once. That is a design
 constraint, and it is the thing standing between here and wide queries working
 reliably — not bin width, not the packer floor, not dedup.
+
+## The tuning space is CLOSED: repair needs a cheaper unit, not a bigger budget
+
+I tried option 1 — shrink `COORDINATOR_PER_SORT_BUDGET_BYTES` 1,280 → 896 MiB so
+the 8 GiB share yields 9 slices instead of 6, and raise
+`REPAIR_REWRITE_TARGET_FILES` 2 → 3. On paper that gave `K = 3` (today's packing
+concurrency) with a 50% larger repair budget: a strict improvement.
+
+**A test refused it, correctly:**
+
+```
+the_packing_permit_follows_the_coordinator_pool_not_the_light_share
+  light_optimize_k + repair_pool_holdback_slices  ==  6
+  left: 9   right: 6
+  "the fleet must run at the measured optimum, not one rung either side —
+   the light/repair SPLIT may move, the total may not"
+```
+
+**Slice size is not a free parameter.** It sets how many concurrent rewrites fit,
+and the bench measured **6 as the optimum, with 8 as a cliff**. My change would
+have run 9 — past the cliff. Shrinking the slice does not create capacity, it
+just re-labels it.
+
+**So the constraint is not the coordinator share after all** (my previous
+section said it was — wrong). It is the **measured 6-concurrent-rewrite
+optimum**, and within it:
+
+| | holdback | K (packing) | total |
+|---|---:|---:|---:|
+| today (`files = 2`) | 3 | 3 | 6 |
+| `files = 3` | 5 | 1 → **starves packing** | 6 |
+| `files = 4` | 6 | 0 → floored to 1, total 7 | — |
+
+**Repair can only get more budget by taking it from packing, and packing at
+K = 1 is the 2026-09-01 outage.** There is no setting that gives repair more
+without breaking something the bench already measured.
+
+### What that means, and it is the session's most useful conclusion
+
+**Repair throughput cannot be fixed by tuning. The unit has to get cheaper.**
+A repair unit is a whole-file rewrite (measured 43 minutes contention-free on a
+1 GiB file), and there are 252 of them queued behind a 6-slot envelope shared
+with packing. The options are structural:
+
+1. **Don't rewrite the whole file.** Repair exists to give a file a sorted footer;
+   if sortedness could be recorded without a full rewrite — or if the writer
+   never emitted unsorted files in the first place (`repair_sorted_at_write_total`
+   = 490 suggests that path already exists and is partially working) — the queue
+   drains without competing for the envelope at all.
+2. **Deletion vectors** would remove the dedup rewrites from the same envelope,
+   freeing slots for repair. Blocked on delta-rs `#4079`.
+3. **A bigger box** raises the pool but NOT the concurrency optimum, which is a
+   bench-measured property of the sort machinery. It would make each of the 6
+   slots larger, not create a seventh.
+
+**This is where the 10x question actually lands.** Not on bin width, not on the
+packer floor, not on dedup — on the fact that a fixed 6-slot rewrite envelope is
+shared by three lanes, one of which (repair) has a 252-unit backlog of
+40-minute units. At 10x ingest that envelope does not grow.
