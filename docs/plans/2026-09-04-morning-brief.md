@@ -2186,3 +2186,57 @@ attacking what remains:
 
 **This is the honest capacity ladder, and it is the thing I should have built at
 the start of the night instead of at the end.**
+
+## We are ~21x above the theoretical floor — the amplification is policy, not physics
+
+Tiered compaction has an unavoidable cost: each byte is rewritten once per level
+on its way to the target, so the floor is `log_fanin(target / arrival)`.
+Measured from the same 163 Pack units:
+
+```
+input file size (rows):  p10 260   p50 176,743   p90 1,907,723
+fan-in (files/merge):    p50 3     mean 5.4
+target bin:              ~2,581,110 rows  (256 MiB at ~104 B/row)
+```
+
+| arrival rows | levels at k=2 | k=5 | k=10 | k=20 |
+|---:|---:|---:|---:|---:|
+| 10,000 | 8.0 | 3.5 | 2.4 | 1.9 |
+| 50,000 | 5.7 | 2.5 | 1.7 | 1.3 |
+| **176,743 (our p50)** | 3.9 | **1.7** | 1.2 | 0.9 |
+| 500,000 | 2.4 | 1.0 | 0.7 | 0.5 |
+
+**At our own median file size and our own observed mean fan-in of 5.4, the floor
+is ~1.7 rewrites per byte. We measured 36.5.** That is **~21x above floor** — so
+the 36x is *not* what tiered compaction costs. It is what this selection policy
+costs.
+
+**The mechanism is visible in the same numbers.** p90 input file is **1,907,723
+rows against a 2,581,110-row target** — the packer is repeatedly feeding
+near-target files back into merges. A file that is already 74% of target has
+almost nothing to gain from another rewrite, and pays full price for it.
+
+### The capacity ladder, quantified
+
+| state | write amplification | vs today |
+|---|---:|---:|
+| today | **36.5x** | — |
+| after the value guard (removes 82.4% of Pack writes) | **~6.4x** | 5.7x less work |
+| floor at current fan-in (k≈5) | ~1.7x | — |
+| floor at k=10 | ~1.2x | — |
+
+**And this is what answers the 10x question.** Keeping up at 10x ingest requires
+work-per-ingested-row to fall by roughly 10x — from 36.5 to ~3.6. **The value
+guard alone reaches ~6.4x; raising fan-in toward k=10 on the surviving merges
+would reach ~2-3x.** Together they span the requirement. Neither is an
+architectural change, and neither is the bin-width lever I spent the night on.
+
+**Caveats, because this is the number everything now rests on:**
+- The floor assumes every merge reaches target. Ours frequently do not, which is
+  precisely why we are above it — so the gap is real, but "21x of pure waste" is
+  the optimistic reading; some of it is the cost of merges that stop early for
+  legitimate reasons (seal boundaries, time slices).
+- The ~6.4x post-guard figure assumes the refused work is never done. Some of it
+  will return later at higher fan-in, adding volume back. It is a lower bound on
+  post-guard amplification, not a prediction.
+- 104 B/row is from an earlier measurement, used to convert rows to bytes.
