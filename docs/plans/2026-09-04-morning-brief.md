@@ -2822,3 +2822,45 @@ what the measurement says.
 which change did it — the ordering knobs read zero usage, so `FairSpill` remains
 the most plausible cause and it was not my change. Attribution failed; the
 outcome is real and verified over repeated runs.
+
+## The packer floor, finally correct: −69% amplification with a fan-in escape
+
+Two bugs in my own guard, both found by its own counter reading zero in prod:
+
+1. **It could never fire.** I derived 100 MiB from a ROWS measurement
+   (3,129,141 rows per file eliminated) converted at 104 B/row **decoded** — but
+   `select_tail_bin` compares `add.size`, **compressed**, 12x smaller. Prod's
+   median 2-file merge is 3.77M rows ≈ **31 MiB compressed**, far under a 100 MiB
+   floor. Now priced in ROWS, which `TailAdd::rows`' own doc says is what a
+   rewrite costs.
+2. **A biting floor WEDGES packing.** At 18 MiB arrivals (~2.18M rows/file) even
+   a 10-file merge exceeds 1M rows per file eliminated, so the measured knee
+   refused **every** bin: amplification fell to **0.00x** — nothing merged. The
+   harness also reported 0.04x at another setting, below the 1.0x floor of
+   writing each byte once, which is what flagged it as untrustworthy.
+
+**The fix is a fan-in escape: never refuse a bin of `min_files` or more.** High
+fan-in is the shape we are steering toward; refusing it leaves the partition
+unpacked forever. The guard can now only remove LOW-fan-in bins — exactly the
+measured problem (2-file merges: 82.5% of packing write volume for 9.9% of the
+file reduction) and never the remedy.
+
+**Result on the real `select_tail_bin`, 400 rounds:**
+
+```
+amplification  6.73x -> 2.06x   (-69%)
+live files       31  ->   32    (no regression)
+```
+
+**2.06x sits just above the `log_fanin` floor of ~1.7x** for this file size, and
+the numbers are physically sensible again.
+
+**Shipped enabled** at 1,000,000 rows per file eliminated (`395980d3`), gate
+green at 1387/1387 + 62/62 after confirming the one failure was load flake by
+rate (3 clean lib runs, then a clean full gate). Rollback: set to 0.
+
+**This is the first maintenance change tonight with a mechanism, a safety
+argument, and a measured effect that survived its own scrutiny.** The counter
+`pack_value_refused` / `pack_value_refused_rows` is what to watch in prod — and
+it is the same counter that caught both bugs above, which is the argument for
+shipping guards in shadow first.
