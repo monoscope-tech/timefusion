@@ -148,11 +148,19 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
 /// A plain (non-SortBy) `compact_date` concatenates two flushed files into one
 /// file with no declared footer order; one further flush adds a conforming file
 /// beside it, which is the fork's isolation shape.
-async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<String>)> {
+async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<String>, String)> {
     let bucket_secs = 60u64;
     let env = E2eEnv::builder()
         .with_bucket_duration(Duration::from_secs(bucket_secs))
         .with_retention(Duration::from_secs(60 * 60))
+        // The fixture owns its flushes. Left on the default interval the periodic
+        // task fires between two of the three inserts below, so the last flush
+        // emits TWO files (1 row + 2) instead of one; the 2-row file holds
+        // s-7,s-8 in ASCENDING order and declares no `timestamp DESC` footer, so
+        // NO child of the union carries the claim and `repair_isolated_scan_ordering`
+        // has nothing to propagate. That is what made this test intermittent —
+        // the fixture never built the conforming/non-conforming pair it asserts on.
+        .with_flush_interval(Duration::from_secs(3600))
         .with_unordered_leg_sort_max_mb(budget_mb)
         .start()
         .await?;
@@ -171,11 +179,46 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
     let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date, None).await?;
     assert!(removed >= 2 && added >= 1, "the fixture needs a real concatenation (removed={removed}, added={added})");
 
-    for i in 0..3i64 {
-        insert_at(&client, &format!("s-{}", 6 + i), FROZEN_START_MICROS + (6 + i) * sec).await?;
+    // ONE statement, not three. Three separate INSERTs are three MemBuffer
+    // batches, and whether the flush coalesces them into one Delta file is a
+    // timing decision — when it does not, the conforming file the test needs
+    // arrives as a 1-row and a 2-row file, the 2-row one holds s-7,s-8
+    // ASCENDING and declares no `timestamp DESC` footer, and NO child of the
+    // union carries the ordering claim for the repair to propagate. That is the
+    // whole of this test's intermittency; it was never the repair.
+    {
+        let dt = |i: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS + (6 + i) * sec).unwrap();
+        let values = (0..3i64)
+            .map(|i| {
+                format!(
+                    "('e2e_project', '{}', '{}', 's-{}', 'span', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])",
+                    dt(i).date_naive(),
+                    dt(i).format("%Y-%m-%d %H:%M:%S%.f"),
+                    6 + i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) VALUES {values}"
+                ),
+                &[],
+            )
+            .await?;
     }
     env.advance(Duration::from_secs(bucket_secs * 2));
     env.force_flush().await?;
+
+    // Fail on the FIXTURE, not on the plan, when the shape is wrong: "3 files
+    // where 2 were intended" is a different bug from "the claim was lost", and
+    // reading it off a physical plan cost hours.
+    {
+        let t = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+        let n = t.read().await.snapshot().map_or(0, |s| s.log_data().iter().count());
+        anyhow::ensure!(n == 2, "fixture must be one compacted non-conforming file beside one conforming flush, got {n} files");
+    }
 
     let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
     let plan: String = client
@@ -186,7 +229,30 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
         .collect::<Vec<_>>()
         .join("\n");
     let ids = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
-    Ok((plan, ids))
+    // The fixture's own shape, from the Delta log. A plan missing the ordering
+    // claim is a SYMPTOM; whether the fixture even built the two-file
+    // conforming/non-conforming pair it intends is the thing to check first.
+    let table = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
+    let files = {
+        let t = table.read().await;
+        t.snapshot().map_or_else(
+            |e| format!("no snapshot: {e}"),
+            |s| {
+                s.log_data()
+                    .iter()
+                    .map(|f| {
+                        // numRecords and the min/max timestamp, not size: the otel schema's
+                        // footer dominates a small file, so a 3-row and a 6-row file weigh
+                        // the same and size cannot tell the fixture's shapes apart.
+                        let stats = f.stats().map_or_else(|| "no stats".into(), |s| s.to_string());
+                        format!("    ...{} {}", f.path().chars().rev().take(20).collect::<String>().chars().rev().collect::<String>(), stats)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+        )
+    };
+    Ok((plan, ids, files))
 }
 
 // One non-conforming file must not cost the conforming majority its ordering
@@ -208,15 +274,18 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn one_unsorted_file_does_not_cost_the_majority_its_ordering() -> anyhow::Result<()> {
-    let (plan, ids) = isolated_union_plan(64).await?;
-    assert!(plan.contains("SortPreservingMergeExec"), "one unsorted file must not disable the streaming merge for the conforming majority; plan was:\n{plan}");
+    let (plan, ids, files) = isolated_union_plan(64).await?;
+    assert!(
+        plan.contains("SortPreservingMergeExec"),
+        "one unsorted file must not disable the streaming merge for the conforming majority.\nlive files:\n{files}\nplan was:\n{plan}"
+    );
     // The same lost claim is what drops `DedupExec` into its unbounded mode.
     assert!(!plan.contains("mode=full-set"), "DedupExec must stay bounded once the ordering is restored; plan was:\n{plan}");
     assert_eq!(ids, vec!["s-8", "s-7", "s-6"], "wrong top-n or order; plan:\n{plan}");
 
     // Budget 0: the repair must decline, restoring the un-repaired plan exactly —
     // this is the guard that keeps a whole-window leg from ever being sorted.
-    let (off, off_ids) = isolated_union_plan(0).await?;
+    let (off, off_ids, _off_files) = isolated_union_plan(0).await?;
     assert!(!off.contains("SortPreservingMergeExec") && off.contains("mode=full-set"), "budget 0 must leave the plan un-repaired; plan was:\n{off}");
     assert_eq!(off_ids, ids, "declining the repair must not change the answer");
     Ok(())
