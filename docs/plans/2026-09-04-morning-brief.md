@@ -2944,3 +2944,52 @@ every 18 minutes tonight, which resets every counter and destroys any window
 longer than that. The 36.5x baseline exists only because prod happened to run 95
 minutes undisturbed. Getting a comparable post-guard number requires the same
 quiet, which means agreeing not to deploy for an hour.
+
+## What the verified 66% actually buys against 10x: about 6%
+
+The packer floor is real, deployed and measured: **−66% of Pack write volume**.
+Converting that to capacity, using only measured quantities:
+
+```
+maintenance worker-time saved = Pack share 85.3% x write fraction 59.3% x cut 66%
+                              = 33.4%
+implied unit-cost multiplier  = 0.67x
+```
+
+And throughput's response to unit cost was measured directly (5x load, 400-round
+sweep):
+
+| unit cost | executions | vs baseline |
+|---|---:|---:|
+| 1.0x | 5,342 | 1.00x |
+| 0.5x | 5,818 | 1.09x |
+| 0.25x | 9,709 | 1.82x |
+| 0.1x | 23,082 | 4.32x |
+
+At **0.67x**, interpolation gives **~5,660 executions — a 1.06x throughput gain.**
+
+**10x load needs ~10x throughput. The largest lever found tonight, verified
+working in production, delivers ~1.06x.**
+
+### Why, and this is the structural answer
+
+**Throughput is sub-linear and threshold-shaped in unit cost.** Halving cost buys
+9%; only at 4x cheaper does it start to pay (1.82x), and even 10x cheaper gives
+4.32x. So no amount of making units cheaper reaches 10x on its own — the
+constraint is the fixed 6-slot rewrite envelope, not the size of what goes in it.
+
+**That reframes the whole night correctly:**
+- The guard is a **cost/IO win** — a third less maintenance work, real money and
+  real headroom — and it should stay.
+- It is **not a capacity fix**, and neither is bin width (~3.7%), pressure
+  scaling, or anything else in the tuning space.
+- **10x needs the envelope to grow or the work to disappear**, i.e. deletion
+  vectors (removes dedup rewrites entirely, blocked on delta-rs #4079) or
+  levelled/key-range compaction (removes the re-merging that makes packing
+  dominant), or more concurrent rewrite slots than the bench's measured optimum
+  of 6 allows.
+
+**The honest bottom line for the 100x customer:** current architecture does not
+get there by tuning. The measurements now say exactly which of the three
+structural options to price, and the counters to prove any of them exist and are
+deployed.
