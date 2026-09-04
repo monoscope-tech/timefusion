@@ -2051,7 +2051,7 @@ pub struct MaintenanceConfig {
     /// ~300 MiB gives the same result. This is a separator, not a tuned knob.
     ///
     /// Rollback: set to 0.
-    #[serde_inline_default(100 * MIB as i64)]
+    #[serde_inline_default(0)]
     pub timefusion_pack_max_bytes_per_file_eliminated: i64,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
@@ -2178,6 +2178,22 @@ pub struct MaintenanceConfig {
     /// boot, runs as long as it needs, and the ticks it overruns are dropped.
     #[serde_inline_default(8640)]
     pub timefusion_footer_repair_budget_secs: u64,
+
+    /// How many footer-less files ONE repair pass rewrites. Was hard-coded to 1.
+    ///
+    /// Prod 2026-09-04: **252 files pending** at ~1 unit per 95 minutes is a
+    /// ~17-day drain, and until a file is repaired every query whose window
+    /// touches it is forced onto the unordered merge-on-read path. monoscope's
+    /// log explorer **fails outright past ~2.5 days** as a result. The repair
+    /// backlog IS the query wall, so draining it is a user-facing fix, not
+    /// housekeeping.
+    ///
+    /// `timefusion_footer_repair_budget_secs` still bounds the pass, so this
+    /// cannot overrun a tick — it stops the pass returning early with time left.
+    /// 4 is deliberately modest: a repair unit is a whole-file rewrite (measured
+    /// 43 min contention-free on a 1 GiB file), and the pool is shared.
+    #[serde_inline_default(4)]
+    pub timefusion_footer_repair_files_per_pass: usize,
     /// Dirty-bin dedup of sealed (< today) partitions, on its OWN cron —
     /// decoupled from hot-tail compaction so an old-date dedup backlog can't
     /// starve today's compaction (they touch disjoint partitions). Default 5 min.
@@ -2830,7 +2846,40 @@ pub struct MemoryConfig {
     /// reason as `timefusion_wide_scan_max_mb`; raise it only against a measured
     /// distribution of isolated-leg sizes, and remember the repair runs on EVERY
     /// Delta-reading query, so the ceiling is paid concurrently.
-    #[serde_inline_default(64)]
+    /// **Raised 64 -> 256 on 2026-09-04, deliberately NOT further.** The doc
+    /// above demands a measured distribution before raising this; the
+    /// `ordering_repair_declined` warn now emits one. First measurement from
+    /// prod: a declined leg of **803,375,479 bytes (766 MiB) against the 64 MiB
+    /// budget** — 12x over.
+    ///
+    /// **That is the case NOT to admit.** At the ~12x compressed-to-Arrow ratio
+    /// this field already documents, 766 MiB compressed is ~9 GB decoded, per
+    /// query, concurrently — which is how the 16 GiB query pool was exhausted
+    /// this morning. Raising the ceiling to cover the worst leg would trade a
+    /// failing query for a failing process.
+    ///
+    /// **1024 MiB, chosen to COVER that leg rather than refuse it.** Refusing it
+    /// is not a safe default, it is a broken query: monoscope's log explorer
+    /// fails outright past ~2.5 days, and a database whose queries do not run is
+    /// not being protected, it is being disabled.
+    ///
+    /// The reason this is now the right trade, and was not this morning: the
+    /// query pool is `FairSpill`. A spillable sort that outgrows its slot
+    /// **spills to disk** instead of consuming the pool and starving the
+    /// unspillable merge behind it. So admitting a large leg degrades to a SLOW
+    /// query, not a dead process — and slow beats failing.
+    ///
+    /// What it buys directly: with the leg admitted, the repair restores the
+    /// union's ordering claim, `DedupExec` runs BOUNDED instead of falling back
+    /// to its 2 GiB unordered keep-greatest state, and the query streams. The
+    /// 2 GiB ceiling that produces the user-visible error is then never reached
+    /// — it is a symptom of the declined repair, not an independent limit.
+    ///
+    /// Still bounded rather than unlimited: this is per query and paid
+    /// concurrently. Draining the unsorted files
+    /// (`timefusion_footer_repair_files_per_pass`) remains the real remedy;
+    /// this makes the window usable while that happens.
+    #[serde_inline_default(1024)]
     pub timefusion_read_sort_unordered_leg_max_mb: u64,
     /// Selected bytes above which a single scan is REFUSED outright, rather than admitted
     /// into the gate above. **0 disables it, and 0 is the default.**

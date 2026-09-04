@@ -8355,7 +8355,26 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     // and among equals the SMALLEST (so one un-finishable file can't
     // head-of-line block its date).
     if pass == TailPass::Repair {
-        return fresh.iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2))).map(|(path, _, _, _)| vec![path.to_string()]).unwrap_or_default();
+        // How many files ONE repair pass takes. It was hard-coded to 1, and with
+        // 252 files pending on prod 2026-09-04 at ~1 unit per 95 minutes that is
+        // a **~17 day** drain — during which every query whose window touches an
+        // unrepaired file is forced onto the unordered merge-on-read path.
+        //
+        // That is not a background concern: monoscope's log explorer FAILS
+        // outright past ~2.5 days with "unordered merge-on-read dedup exceeded
+        // its 2048 MiB per-query limit", and one declined repair was measured
+        // carrying an 803 MB unsorted leg against a 64 MiB budget. **The repair
+        // backlog is the query wall.**
+        //
+        // Still newest-first (the recent footer-less date is the wall users hit)
+        // and smallest-among-equals (one un-finishable file must not head-of-line
+        // block its date); the pass's own `budget` still bounds wall clock, so
+        // taking more files per pass cannot overrun the tick — it only stops the
+        // pass returning early with time left.
+        let take = crate::config::try_config().map_or(1, |c| c.maintenance.timefusion_footer_repair_files_per_pass).max(1);
+        let mut ranked: Vec<_> = fresh.iter().filter(|(_, _, _, repair)| is_candidate(*repair)).collect();
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        return ranked.into_iter().take(take).map(|(path, _, _, _)| path.to_string()).collect();
     }
     // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
     // per tick. Small commit converges quickly and shrinks the conflict window;
