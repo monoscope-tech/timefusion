@@ -11,13 +11,21 @@ Measured on prod, one process, 7,148 s uptime:
 ```
 work.Dedup.worker_secs        69,752        = 9.76 workers, continuously
 HEAVY_REWRITE_PERMITS             10        -> dedup is ~98% of heavy maintenance
-work.Dedup.progress_rows  19,186,817,032
-work.Dedup.rows_dropped          105,053    -> ~182,000 rows read per row removed
+work.Dedup.rows_dropped          105,053
 dedup_bins_committed_total            20    -> ~58 worker-MINUTES per committed bin
 ```
 
 **Dedup is using 98 % of the heavy maintenance pool to remove a hundred thousand
-rows.** Every other lane — packing, consolidation, repair, rollups — divides the
+rows.**
+
+> **RETRACTION.** An earlier version of this section said "~182,000 rows read per
+> row removed", from `work.Dedup.progress_rows = 19,186,817,032`. **That is not a
+> read count and the ratio must not be quoted.** `PlanProgress` feeds that counter
+> via `plan_metric_sum`, which **recursively sums `output_rows` over EVERY
+> operator in the plan tree** (`maintain.rs:519-522`) — so it is rows x plan
+> width, and retries add more on top. The amplification is real and large, but
+> **its magnitude is unmeasured.** The two figures either side of this box do not
+> depend on it: `worker_secs` is wall time, and `rows_dropped` is a real count. Every other lane — packing, consolidation, repair, rollups — divides the
 remaining 2 %. That is why nothing else keeps up.
 
 And it is **not** a scheduling, budget, livelock or certification problem. Every
@@ -29,6 +37,14 @@ layout makes every 10-minute bin read the files that overlap it **nine deep**.
 19.2 B is an upper bound and may double-count. Halve it and it is still
 ~91,000 rows read per row removed. The 98 % figure does not depend on it — it is
 arithmetic on `worker_secs`, uptime and permits.)*
+
+**And row-group pruning should be bounding this, but the numbers say it is not.**
+Measured on the real prod file: **20 row groups, every one carrying timestamp
+min/max, and a 10-minute bin touches 1 of 20 — 5 %.** The statistics needed to
+read a bin without reading whole files are present and correct. So either the
+dedup scan applies no bin-scoped timestamp predicate, or it does and the cost
+lies elsewhere. **That is a concrete, cheap thing to check first, and it could be
+worth ~20x on the dominant consumer of the entire maintenance pool.**
 
 **At 10x ingest this gets worse, not proportionally harder**: components grow by
 chain-overlap, so more files straddle more bins and the read-amplification rises
