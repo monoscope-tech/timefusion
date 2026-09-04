@@ -1899,3 +1899,39 @@ been rewritten since.
 already runs in-process. That single fix would collapse the infrastructure
 dependency, the OOM risk, and the blast radius all at once — the three objections
 that killed the in-process route above.
+
+### EXPERIMENT RUN: the scoped-recompress deadlock does not reproduce locally
+
+I ran the experiment rather than leaving it as a suggestion. Branch
+`scratch/replace-where-deadlock` (**DO NOT MERGE** — it lifts the guard) removes
+the `project.is_some()` bail and scopes **both** predicates, the input plan and
+`replace_where`, by project. Two tests:
+
+| case | result |
+|---|---|
+| minimal: 2 projects, 80 rows, 2 files | `Rewritten { files: 2 }` in **1.2 s** |
+| contention: 12 files/project + 12 concurrent write batches into the same partition, mid-overwrite | `Rewritten { files: 12 }` in **3.5 s** |
+
+**No hang in either, and the second project's rows survived the scoped
+overwrite** — the correctness property a wrong `replace_where` would silently
+destroy.
+
+**This does NOT prove the restriction is obsolete.** Local MinIO has none of the
+real object-store latency, the held maintenance-rewrite permit, or the data scale
+that a deadlock plausibly needs. **What it does establish is that the failure is
+not unconditional**, which changes the daylight task from "investigate a
+mysterious deadlock" into "try it on staging with a timeout and watch".
+
+**One methodological note, because it nearly cost the whole experiment:** the
+first version of the test passed in 0.9 s while proving *nothing* — it returned
+`Skipped("already at target tier and every footer is sorted")`, so the
+`replace_where` write never ran. A green tick on a test that never reaches the
+code under test is the most expensive kind of false confidence. It is fixed by
+passing a different zstd level, and the test now **asserts `Rewritten`** so it
+cannot silently regress to proving nothing.
+
+**Why this matters more than it looks:** if scoping is safe, an 85 GiB whole-date
+rewrite becomes a few-GB partition rewrite — the size `OPTIMIZE` already runs
+in-process. **That one change would collapse the in-region runner requirement,
+the OOM risk and the blast radius simultaneously**, and it is the cheapest path
+from tonight's analysis to something actually running.
