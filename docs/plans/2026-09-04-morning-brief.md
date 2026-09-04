@@ -3078,3 +3078,51 @@ WHERE key IN ('pack_value_refused','pack_value_refused_rows','uptime_seconds');
 plus `median fan-in` from `unit_phase_timing`. If fan-in stays high and
 `pack_value_refused_rows` keeps climbing on a process that has been up for
 hours, the win is real and steady.
+
+## The 8-worker "cliff" is an OOM, confirmed by re-running the bench
+
+Re-ran `benches/rewrite_throughput.rs` (`TF_BENCH_FLEET=1`) with a file small
+enough that memory never binds (35 MB prod sample), at two pool sizes:
+
+| workers | pool 512 MB | pool 1024 MB | failed |
+|---:|---:|---:|---:|
+| 1 | 51.86 MB/s | 53.11 | 0 |
+| 6 | 132.58 | 142.94 | 0 |
+| 8 | 138.03 | 144.09 | 0 |
+| 10 | 137.26 | **148.01** | 0 |
+| 12 | 133.90 | 139.45 | 0 |
+| 16 | 140.09 | 143.27 | **0** |
+
+**Zero failures at every concurrency, up to 16 workers.** Throughput rises to a
+plateau around 6-10 and stays flat — it does **not** collapse.
+
+Compare the original bench, which produced the "6 optimum / 8 cliff" constant
+with a **204 MB** file and an 8 GiB pool:
+
+```
+6 workers  33.32 MB/s  0 failed
+8 workers  15.07 MB/s  4 FAILED
+```
+
+**The difference is entirely file size against pool.** 8 x ~1.33 GiB exceeded
+8 GiB and four workers died; 16 x a small file fits anywhere. **So the cliff is
+an out-of-memory boundary, not a scheduling property of the sort machinery, and
+the "measured optimum of 6" is `pool / per-unit footprint` — not a law.**
+
+### Why that matters more than it looks
+
+**The packer floor reduces per-unit footprint** (it refuses the large low-fan-in
+bins; median fan-in went 2-3 -> 8, and those bins are smaller per file
+eliminated). **A smaller per-unit footprint means MORE units fit the same pool** —
+so the two levers compose: cheaper units do not just cost less, they raise the
+concurrency ceiling that the whole capacity argument rests on.
+
+**This is the first evidence tonight that the 6-slot envelope can move**, and it
+did not need a bigger box — only smaller units, which is already deployed.
+
+**What it does NOT establish:** the optimal N at *prod's* file sizes and pool.
+The small-file run shows the cliff is memory-shaped; it cannot say where prod's
+new optimum sits now that units are smaller. That needs the 204 MB file
+(`scratchpad/whale/recent204.parquet`, already on disk) against an 8 GiB pool,
+on a machine not also serving prod — this laptop was at 97% disk and 360 MB free
+memory, which is why the small file was used.
