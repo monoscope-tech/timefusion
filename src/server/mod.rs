@@ -997,6 +997,30 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
     if let Some(metrics) = metrics {
         metrics.record_pgwire_query(duration_us);
     }
+    // A FAILED statement is always worth an event, however fast it died. The
+    // `LoggingErrorHandler` runs OUTSIDE the query span, so its "PgWire internal
+    // error: ..." line carries no `query.text` — which on 2026-09-04 left the
+    // failing statement to be guessed from whichever span happened to be logged
+    // next, on a different thread. That is adjacency, not attribution.
+    //
+    // Emitted here, inside the span, so a resource-exhaustion failure names the
+    // query that caused it. Failures are rare relative to traffic; a retrying
+    // client is a handful per minute.
+    if !success {
+        let (_, op) = classify_query(query);
+        let (tbls, proj) = query_dimensions(query);
+        warn!(
+            event = "pgwire.failed_statement",
+            query.class = op,
+            query.fingerprint = %query_fingerprint(query),
+            query.template = %query_template(query),
+            query.tables = %tbls,
+            project.id = %proj,
+            protocol,
+            duration_us,
+            "PostgreSQL statement failed"
+        );
+    }
     const SLOW_QUERY_US: u64 = 1_000_000;
     if duration_us < SLOW_QUERY_US {
         return;
