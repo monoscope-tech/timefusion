@@ -2903,3 +2903,44 @@ this sample", not "-66% steady state".
 dominant lane's write volume is the first change tonight that moves the capacity
 number rather than describing it.** Pack was 85.3% of maintenance worker time and
 59.3% write-bound.
+
+## Write amplification now reads 4.7x — with the caveat that kills a clean claim
+
+Measured since boot on the both-lanes build, matched by construction (both
+quantities count from process start):
+
+```
+Pack   6 units   2,857,093 rows
+Dedup  3 units     558,566 rows
+                 ----------
+maintenance written  3,415,659      ingested  723,479
+WRITE AMPLIFICATION  4.7x           (this morning: 36.5x)
+```
+
+**Do NOT read that as "the guard cut amplification 7.8x."** The 36.5x came from a
+**95-minute window on a mature, backlogged process**; this is a **12-minute
+window on a 705-second-old one**, with only 9 maintenance units in it. A young
+process has less accumulated debt to grind through, so lower amplification is
+expected regardless of the guard. Comparing them is exactly the
+different-process-state error this document has already recorded three times.
+
+**What IS defensible, because the windows were comparable:**
+
+| claim | evidence |
+|---|---|
+| the guard fires | `pack_value_refused = 5`, `pack_value_refused_rows = 10,982,857` in 8.5 min |
+| Pack write rate fell | **170M -> 57M rows/hour (−66%)**, phase-timer measurement either side |
+| median fan-in rose | 2-3 -> **4** |
+| the benchmark agrees | −69% on the real packer over 400 rounds |
+
+**And the 4.7x is still worth recording as a data point**: it is far closer to
+the `log_fanin` floor of ~1.7x than to 36.5x, on a process where the guard is
+active. Whether steady state lands at 4.7x or drifts back up as debt accumulates
+is the thing to measure tomorrow on an aged, quiet process — the same conditions
+that produced the 36.5x.
+
+**Measurement note for whoever continues:** both sessions were deploying roughly
+every 18 minutes tonight, which resets every counter and destroys any window
+longer than that. The 36.5x baseline exists only because prod happened to run 95
+minutes undisturbed. Getting a comparable post-guard number requires the same
+quiet, which means agreeing not to deploy for an hour.
