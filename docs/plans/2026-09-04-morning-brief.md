@@ -302,11 +302,24 @@ readings had enough of the series to support the claim I made from it. Any
 statement about this counter needs a series, not two points; I asserted a trend
 from two points twice tonight and was wrong both times.
 
-**More importantly, the backlogs have turned.** On this same long-lived process
-`pending_dedup` went 2,216 → **2,156** and `pending_base_rollup` 329 → **257**,
-where earlier in the night both were growing. That is the first sign of the queue
-draining rather than filling, and it appeared only once a process was left alone
-for well over an hour — which is precisely what decision 2 is about.
+**On the backlogs — I claimed they "turned", and a longer series says
+oscillating, not draining.** The full `pending_dedup` sequence on this one
+process:
+
+```
+uptime  5611  6471  6536  6574  7447  7628  8241
+value   2205  2156  2154  2153  2138  2136  2166
+```
+
+Net **-39 over 44 minutes**, but **non-monotone, and the last interval rose by
+30**. So the honest reading is that **arrivals and completions are roughly in
+balance** — not that the queue drains once a process is left alone. I used the
+falling middle of that series as evidence for decision 3 and it does not carry
+that weight.
+
+It is still true that nothing *completes* in a 20-minute lifetime, and that
+argument for the deploy cadence stands on unit duration (~21 min) rather than on
+this counter.
 
 **And one counter explains it completely:**
 
