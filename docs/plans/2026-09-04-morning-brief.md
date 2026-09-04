@@ -519,17 +519,30 @@ The disjointness test above changed this ranking after it was first written. The
 deploy cadence was top; it is now second, because more uptime alone converges to
 a tidier table rather than a faster one.
 
+0. **Merge `prep/bin-width` — safe today, no behaviour change.** `BIN_MICROS` was
+   a `const` copy-pasted into three files (producer, prober, drain). They **must**
+   agree — a bin marked dirty by one and looked up at a different width by
+   another is never found — so three definitions is a latent correctness bug.
+   Now single-sourced, value unchanged, with the measurement in its doc comment.
 1. **Merge `prep/unit-phase-timers`.** One number — where a unit's ~21 minutes
    actually goes — decides whether tiling 4,857 units is a day of maintenance or
    a week, and no other item here can be scheduled without it. Instrumentation
    only, 1132 tests green.
-2. **Widen `BIN_MICROS` — the cheapest lever, now sized.** `bins/file` is the read
-   amplification of a bin-scoped rewrite; at today's 10 minutes it is **27.8 mean
-   fleet-wide, 11.35 where the mass is**. At 60 minutes it is 5.20 / 2.52
-   (**5.3x / 4.5x better**); at 120 minutes, 9.4x / 6.8x. **From one constant.**
-   The unresolved risk is that wider bins make units bigger — unless unit cost is
-   bounded by files read rather than bin width, which is precisely what item 1
-   measures. Do not ship this before item 1.
+2. **Widen `BIN_MICROS` — the strongest lever found, and the risk is measured
+   away.** A unit rewrites every file overlapping its bin, and files span 45-90
+   minutes, so a narrow bin does not read less — **it reads the same files once
+   per bin**. Over the 95 cells holding 17+ files:
+
+   | width | unit size | total read to sweep once |
+   |---|---|---|
+   | **10 min (today)** | 1,469 MiB | **19,530 GiB** |
+   | **60 min** | 1,734 MiB (**+18 %**) | **3,847 GiB (5.1x less)** |
+   | 120 min | 2,053 MiB (+40 %) | 2,280 GiB (8.6x less) |
+
+   I had said only the phase timers could tell whether wider bins bloat the unit.
+   **That was wrong — `Add.stats` answers it, and the answer is +18 % for 5.1x.**
+   What remains is not a measurement but a **soak**: 6x fewer, larger units
+   interact with claim/lease/deadline machinery that statistics cannot see.
 3. ~~**Build time-ranged unit selection for oversized components.**~~ **REFUTED
    by simulation** — identical to today's rule (1,405 vs 1,407 overlapping
    pairs), because those files are never selected at all. The actual fix.
