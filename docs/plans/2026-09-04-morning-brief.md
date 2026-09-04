@@ -1367,3 +1367,42 @@ the unit-count collapse, and that is the stronger argument.
 so unit COUNT can be swept directly, rather than inferring it. That is the
 measurement that would justify flipping `timefusion_dedup_bin_minutes` in
 staging.
+
+## The sim cannot validate bin widening — and that closes the line, it does not stall it
+
+I said the next experiment was "teach the sim to model dedup bins so unit count
+is a direct input". I built that knob (`--debris-slice-minutes`, same total work
+as `600 / n` units of `n` minutes) and swept it. **Both configurations are null,
+for two different reasons:**
+
+| config | what moved | what did not |
+|---|---|---|
+| `--mint`, 5x load | nothing | 600 → 300 units changed `pending_end` by **0.1%** (102,696 → 102,804) — the debris is 0.6% of a ~102,000-unit queue |
+| no minting | `pending_start` **813 / 513 / 313 / 263** for n = 1/2/6/12, exactly as designed | `executions` and `pending_end` **IDENTICAL at every width** (1,774 and 2 on seed 1) |
+
+The second is the interesting one: the knob provably works — the starting queue
+collapses as intended — and the outcome does not change at all. **The
+coordinator's own coarsening already fuses those units, so pre-collapsing them
+buys nothing.**
+
+**The structural reason, which generalises past this fixture:** the simulator
+schedules rollup/compaction TASKS on virtual time. Widening `BIN_MICROS` pays off
+in **read bytes** — the same file read once per bin it straddles. An IO-free
+model cannot see bytes, so it cannot see the benefit *by construction*. No amount
+of extra modelling fixes that without making the sim do IO, at which point it is
+staging.
+
+**This is a conclusion, not a dead end.** It says: stop trying to price bin width
+locally; the repo's own ladder already said so — *"MinIO validates correctness,
+not cost, because per-unit cost is object-store round trips"*. The validated plan
+is therefore:
+
+1. `timefusion_dedup_bin_minutes = 60` in **staging**, on the seeded whale days.
+2. Watch `unit_phase_timing` with `pass=Dedup` (now emitted, `c5edeca6`) —
+   `upstream_secs` is the phase widening should collapse.
+3. Compare against prod's 10-minute baseline over the same cells.
+
+**What the local work DID establish, and it is the useful part:** backlog is
+linear in unit count and nearly insensitive to unit cost, throughput is flat
+under 10x load, and rewrite wall-clock is ~61% read+sort. Those bound what any
+fix must do. They just cannot score this particular fix.
