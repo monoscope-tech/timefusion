@@ -44,8 +44,19 @@ far less. The general rule is **`--recompress` cuts sweep cost by about
 `cell_bytes / 512 MiB`** — large exactly where the cell is large.
 
 **First move: one command, one cell, then re-run
-`scratchpad/wide_rank.py` to confirm the 8.5 %.** A two-hour experiment with an
+`scratchpad/wide_rank.py` to confirm the 8.5 %.** An experiment with an
 unambiguous success criterion.
+
+**It must run IN-REGION, and that is why I did not run it myself.** The job reads
+85 GiB from object storage; measured from this machine that link sustains
+**3.9 MiB/s**, so the read alone would take **~6 hours** — impractical, and it
+would hold a maintenance-rewrite permit the whole time. It needs a runner in the
+bucket's region. The prod host itself is not an option: our own standing rule is
+that it is strictly read-only (logs / `inspect` / `ps`), never `exec`-mutate.
+
+So the one genuinely blocking dependency for the night's top recommendation is
+**somewhere in-region to run it from** — an infrastructure choice, not a
+technical unknown.
 
 ## IF YOU READ ONE SCREEN
 
