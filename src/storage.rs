@@ -3534,6 +3534,30 @@ pub struct DirtyBin {
     pub table_name: String,
     pub date: String,
     pub bin: i64,
+    /// The bin width `bin` was computed at. Carried PER RECORD rather than per
+    /// file so a sidecar written across a width change still reads correctly,
+    /// and so an old file (no field) means the historical 10 minutes.
+    #[serde(default = "default_bin_minutes")]
+    pub width_minutes: i64,
+}
+
+fn default_bin_minutes() -> i64 {
+    crate::database::DEFAULT_BIN_MINUTES
+}
+
+/// Every bin at `to_micros` that overlaps bin `bin` of width `from_micros`.
+///
+/// Both directions and non-multiple widths, because the only safe error is an
+/// over-approximation: marking a clean bin dirty costs one probe, while missing
+/// a dirty bin leaves duplicates in place forever. Widening maps many old bins
+/// onto one new; narrowing fans one old bin out across several.
+pub fn remap_bin(bin: i64, from_micros: i64, to_micros: i64) -> std::ops::RangeInclusive<i64> {
+    if from_micros == to_micros {
+        return bin..=bin;
+    }
+    let lo = bin.saturating_mul(from_micros);
+    let hi = lo.saturating_add(from_micros - 1);
+    lo.div_euclid(to_micros)..=hi.div_euclid(to_micros)
 }
 
 /// Sidecar files in the WAL meta dir (certifications, dirty bins): best-effort,
@@ -3925,6 +3949,36 @@ impl CoverageLedger for JsonCoverageLedger {
 
     fn cells(&self) -> Vec<CoverageCell> {
         self.cells.iter().map(|entry| entry.key().clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod bin_remap_tests {
+    use super::*;
+
+    const MIN: i64 = 60 * 1_000_000;
+
+    /// Re-keying the dirty-bin queue across a width change must never LOSE a
+    /// dirty bin; gaining one costs a probe, missing one leaves duplicates in
+    /// place forever. So every case asserts the new bins fully COVER the old
+    /// bin's time span, in both directions and at a non-multiple width.
+    #[test_case::test_case(7, 10, 60, 1..=1; "widen 10->60: six old bins collapse onto one")]
+    #[test_case::test_case(6, 10, 60, 1..=1; "widen: the first bin of the hour")]
+    #[test_case::test_case(5, 10, 60, 0..=0; "widen: the last bin of hour zero")]
+    #[test_case::test_case(1, 60, 10, 6..=11; "narrow 60->10: one old bin fans out to six")]
+    #[test_case::test_case(2, 10, 45, 0..=0; "non-multiple, contained")]
+    #[test_case::test_case(4, 10, 45, 0..=1; "non-multiple, straddling a boundary")]
+    #[test_case::test_case(3, 10, 10, 3..=3; "same width is the identity")]
+    #[test_case::test_case(-1, 10, 60, -1..=-1; "negative bins (pre-epoch) stay contained")]
+    fn remap_bin_covers_the_old_span(bin: i64, from_min: i64, to_min: i64, expect: std::ops::RangeInclusive<i64>) {
+        let (from, to) = (from_min * MIN, to_min * MIN);
+        let got = remap_bin(bin, from, to);
+        assert_eq!(got, expect, "bin {bin} at {from_min}min -> {to_min}min");
+        // The property the table exists to protect, asserted independently of
+        // the expected values: the new bins must cover every instant of the old.
+        let (lo, hi) = (bin * from, (bin + 1) * from - 1);
+        assert!(*got.start() * to <= lo, "first new bin must start at or before the old bin");
+        assert!((*got.end() + 1) * to - 1 >= hi, "last new bin must end at or after the old bin");
     }
 }
 

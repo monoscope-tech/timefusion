@@ -1152,7 +1152,7 @@ impl Database {
         let safe_pid = project_id.replace('\'', "''");
         let filter = format!("project_id = '{safe_pid}' AND date = DATE '{date_str}'");
         let keys_csv = schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ");
-        Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / BIN_MICROS).collect())
+        Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / bin_micros()).collect())
     }
 
     /// Probe one partition/bin for duplicates and STAGE (never commit) a
@@ -1957,10 +1957,21 @@ impl Database {
 /// | 60 min | 1,734 MiB (+18%) | 3,847 GiB (**5.1x less**) |
 ///
 /// Widening is therefore the cheapest known lever on dedup, which consumes ~98%
-/// of the heavy maintenance pool. It is NOT changed here: 6x fewer, larger units
-/// interact with the claim/lease/900s-deadline machinery in ways statistics
-/// cannot see, and that wants a soak.
-pub(crate) const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+/// of the heavy maintenance pool. The DEFAULT is still 10 minutes: 6x fewer,
+/// larger units interact with the claim/lease/900s-deadline machinery in ways
+/// statistics cannot see, and that wants a soak at real object-store latency.
+/// `timefusion_dedup_bin_minutes` is the knob that makes the soak possible
+/// without a code change.
+pub(crate) const DEFAULT_BIN_MINUTES: i64 = 10;
+
+/// The dedup bin width, in micros. Read through the config `OnceLock`, so it is
+/// fixed for the life of the process — a width that changed under a running
+/// coordinator would leave the dirty-bin queue keyed two ways at once.
+/// Falls back to the default before config init (unit tests, early boot).
+#[inline]
+pub(crate) fn bin_micros() -> i64 {
+    crate::config::try_config().map_or(DEFAULT_BIN_MINUTES, |c| c.buffer.timefusion_dedup_bin_minutes).max(1) * 60 * 1_000_000
+}
 
 pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> bool {
     !schema.dedup_keys.is_empty()

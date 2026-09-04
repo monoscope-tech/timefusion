@@ -1505,6 +1505,43 @@ pub struct BufferConfig {
     /// budget treats an absent `numRecords`.
     #[serde_inline_default(0)]
     pub timefusion_compaction_span_budget_bins: i64,
+    /// Width of a dedup bin, in minutes. **10 = today's behaviour, unchanged.**
+    ///
+    /// A dedup unit rewrites every file overlapping its bin, and file-granular
+    /// replacement REQUIRES reading those files whole — so a file straddling N
+    /// bins is read N times to sweep them. Files are cut at
+    /// `timefusion_writer_max_file_bytes` (512 MiB), which at whale density is
+    /// ~45 minutes of event time, and the whale's real 1017 MiB files are ~90 —
+    /// against a 10-minute bin. **That ratio IS the read amplification**, and
+    /// dedup is ~98% of the heavy maintenance pool.
+    ///
+    /// Measured from `Add.stats` over 7,702 live files (no data read), total
+    /// bytes to sweep the fleet once:
+    ///
+    /// | width | unit size | total read |
+    /// |---:|---:|---:|
+    /// | 10 min | 1,469 MiB | 19,530 GiB |
+    /// | 60 min | 1,734 MiB (+18%) | 3,847 GiB (**5.1x less**) |
+    /// | 120 min | 2,053 MiB (+40%) | 2,280 GiB (8.6x less) |
+    ///
+    /// Narrow bins do not read less — they read THE SAME FILES once per bin.
+    /// `otel_metrics` lands within half a point on both axes (5.5x at 60 min)
+    /// on 104 vs 12 B/row and a different sort key, which is why this is
+    /// structural rather than an artefact of one shape.
+    ///
+    /// **What is NOT measured is the soak**: 6x fewer, larger units interact
+    /// with the claim/lease/900s-deadline machinery, and that needs real
+    /// object-store latency (staging), not MinIO — per-unit cost is round
+    /// trips. Ship at 10, flip in staging first.
+    ///
+    /// Changing this RE-KEYS the dirty-bin queue. Each persisted `DirtyBin`
+    /// carries the width it was recorded at and is remapped on load
+    /// (`crate::storage::remap_bin`), so a change costs an over-approximation,
+    /// never a lost bin. **Rollback hazard:** a binary predating that field
+    /// reads a post-flip sidecar's ids at its own width and sweeps the wrong
+    /// windows — clear `dedup_dirty_bins.json` when rolling back across a flip.
+    #[serde_inline_default(10)]
+    pub timefusion_dedup_bin_minutes: i64,
     #[serde_inline_default(false)]
     pub timefusion_landed_skip_enabled: bool,
 }

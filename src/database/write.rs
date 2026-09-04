@@ -499,14 +499,14 @@ impl Database {
         } else {
             // Dirty-bin granularity, intentionally independent of MemBuffer's (configurable,
             // currently 5-min) bucket duration — the two ideas coincide at "10 min" only historically.
-            use crate::database::compact::BIN_MICROS;
+            use crate::database::compact::bin_micros;
             batches
                 .iter()
                 .filter_map(|batch| batch.column_by_name("timestamp"))
                 .filter_map(|column| column.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>())
                 .flat_map(|timestamps| {
                     timestamps.iter().flatten().filter_map(|timestamp| {
-                        chrono::DateTime::from_timestamp_micros(timestamp).map(|time| (time.date_naive().to_string(), timestamp.div_euclid(BIN_MICROS)))
+                        chrono::DateTime::from_timestamp_micros(timestamp).map(|time| (time.date_naive().to_string(), timestamp.div_euclid(bin_micros())))
                     })
                 })
                 .collect::<HashSet<_>>()
