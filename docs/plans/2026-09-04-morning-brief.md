@@ -1074,3 +1074,67 @@ not a trend* ([[tf_what_survived_and_what_did_not_2026-09-04]]).
 eight suites back-to-back with `target/` at 46 GB and the volume 93 % full). If
 green, push — the bundle is one deploy and one restart, and `prep/unit-phase-timers`
 is what prices every remaining decision in this document.
+
+## Closed: `COUNT(*)` loses acked rows — root cause found and fixed
+
+The `count_star` failure above is not a flake and never was
+([[tf_count_star_is_wrong_not_flaky_2026-08-28]], open since 2026-08-25). The
+diagnostics I added to `tests/e2e/smoke.rs` settle it in one shot:
+
+```
+COUNT(*) returned 4 of 7 acked inserts.
+  visible ids (4): ["smoke-3","smoke-4","smoke-5","smoke-6"]
+  re-query immediately: 4          <- not in flight
+  MemBuffer rows: 4
+  Delta files: 1 at version Some(1)
+  Delta-only ids: smoke-0, smoke-1, smoke-2
+```
+
+Delta **has** the missing rows and the scan **can** read them. The union dropped
+them. That kills the last standing hypothesis from August ("the Delta leg reads a
+snapshot predating the flush commit").
+
+**The mechanism.** `get_bucket_ranges` returns each buffered bucket's
+`[min_timestamp, max_timestamp]`, and the Delta leg is filtered to *exclude* those
+ranges so the union cannot double-count. The premise is "memory is authoritative
+over this range". For any instant the bucket has **already flushed**, that premise
+is false — those rows are in Delta and gone from memory, so the mask makes them
+answer no query at all.
+
+The prefix-drain narrowing (`bf8b9a16`, 2026-08-28) aimed at exactly this and
+cannot hold, for three independent reasons — all three now pinned as a case table
+in `a_flushed_instant_stays_visible_however_the_bucket_emptied`, each failing
+before the fix:
+
+| how the bucket empties | why the narrowing misses |
+|---|---|
+| `take_bucket_for_flush` | resets min/max to sentinels; the next insert rebuilds the mask from nothing |
+| drain to empty | narrowing runs only under `!emptied` |
+| partial drain | it `store`s `drained_max + 1` into `min_timestamp`, and the **insert path `fetch_min`s the same atomic** — one later row at that instant pulls the mask straight back down |
+
+And both flush paths `remove_if` the bucket the moment it empties, so a per-bucket
+watermark is gone before the next insert recreates the bucket under the same id.
+
+**The fix (`b9fd6f28`).** A table-level `flushed_max` (bucket id → highest
+timestamp ever handed to Delta), applied as a floor at **read** time in
+`get_bucket_ranges`. It has to live outside the value inserts maintain *and*
+outside the bucket's lifetime; pruned by `evict_old_data`, since past the
+retention cutoff no query can ask about that instant. The trade is the one already
+argued at the narrowing site: an unmasked survivor may be double-counted, and
+read-side dedup collapses a duplicate while a masked row is simply wrong.
+
+1,136 / 1,136 lib tests, `cargo lint` clean, and `count_star` did not fail in
+three further e2e runs (it had failed 3 of ~13 before).
+
+**Prod exposure, stated carefully.** The e2e reproduction is inflated by the
+harness: `current_bucket_id()` reads the virtual clock, which the harness freezes
+in the past, so wall-clock rows land in a bucket the test already treats as
+sealed. In prod wall == virtual and the current bucket is exempt. The real
+exposure is **a late arrival into a sealed bucket that has already flushed rows at
+that instant** — every row that bucket previously committed at or below the new
+row's timestamp disappears from queries until the bucket flushes again. Identical
+timestamps are the norm here, not an edge: a batch of OTel spans arrives stamped
+to the same instant.
+
+**Still open:** `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering`
+remains intermittent (1 of the 3 verification runs). Untouched by this fix.
