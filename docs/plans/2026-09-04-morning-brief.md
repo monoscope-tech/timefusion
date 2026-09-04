@@ -100,13 +100,18 @@ deploy. And it names the culprit precisely — **24 units over 60 minutes:**
 
 | | n | p50 bins | max | ≤16 bins |
 |---|---:|---:|---:|---:|
-| `HotPacking` | 13 | 16 | 16 | **100 %** |
-| `SealedConsolidation` | 11 | 74 | **144** | **9 %** |
+| `HotPacking` | 118 | **13** | 20 | 62.7 % |
+| `SealedConsolidation` | 179 | **84** | **144** | 4.5 % |
 
-**`SealedConsolidation` is the lane manufacturing the cost; `HotPacking` is
-essentially innocent.** Every hot unit stays within 16 bins; 10 of 11 sealed
-units exceed it, and one produced an output spanning **144 bins — an entire
-day.** More samples sharpened this separation rather than blurring it.
+**`SealedConsolidation` is the lane manufacturing the cost** — p50 **84 bins**
+against hot packing's **13**, and one unit produced an output spanning **144
+bins, an entire day.**
+
+*(These are n=297 over 90 minutes. An earlier n=24 sample showed `HotPacking`
+13 of 13 under 16 bins and made 16 look like a clean separator; it is 62.7 % at
+n=297, so **16 would reject 37 % of hot packing too**. The distributions
+separate strongly, but the usable bound is **~20–24**, above hot packing's
+observed maximum of 20.)*
 
 **File count does not track span at all** (10 files → 8 bins, 2 files → 119), so
 a packer measuring count and bytes is blind to this by construction.
