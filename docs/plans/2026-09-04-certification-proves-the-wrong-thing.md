@@ -1388,3 +1388,48 @@ an 85 GiB cell is a lot of transfer; a runner in the same region as the bucket
 will finish in a fraction of the time a laptop would. My own measurement of
 3.9 MiB/s from here — explicitly not a prod number — is what that difference
 looks like.
+
+## Three selection designs refuted. The lever is provably NOT in selection.
+
+The packer sorts candidates by SIZE. A natural idea is to sort by event time
+instead, so a unit picks a contiguous run and its output spans only that run —
+same bytes, same file count, narrower output, no threshold to choose. Simulated
+over the 119 cells that actually have selectable files:
+
+| ordering | mean bins spanned | p50 | p90 |
+|---|---:|---:|---:|
+| smallest-first (today) | **128.2** | 145.0 | 145.0 |
+| time-adjacent | **128.1** | 145.0 | 145.0 |
+
+**Identical.** 9 % of cells improve by >10 %, 6 % get worse. Noise.
+
+**And the p50 explains why: 145 bins is the whole day** (a day is 144
+ten-minute bins). **The under-target files are individually scattered across the
+entire day**, so *any* subset of them spans it. Ordering cannot narrow an output
+whose inputs are spread end to end.
+
+That is now three selection designs refuted by measurement in one night:
+
+| design | result |
+|---|---|
+| time-RANGED unit selection | 1,405 vs 1,407 overlapping pairs — identical |
+| splitting compaction for oversized components | those files are never selected at all (`size >= target` skip) |
+| time-ADJACENT ordering | 128.1 vs 128.2 bins — identical |
+
+**So the conclusion is a negative one, and it is worth as much as a positive:
+the output-span problem cannot be fixed by choosing WHICH files a unit merges.**
+It has to come from one of exactly two places:
+
+1. **The WRITER'S CUT** — cut output at bin boundaries, not only at
+   `max_file_bytes`. A 200 MiB merge of day-scattered inputs currently produces
+   ONE file spanning the day; cutting on bin boundaries would produce several
+   narrow ones. **Cost: more files** — the fragmentation the packer exists to
+   remove, and the same tension as bin widening, but now located precisely.
+2. **The INPUTS being narrow already** — which is what
+   `optimize --recompress` achieves in one pass, and why it remains the top
+   recommendation.
+
+**This is why I stopped proposing selection changes.** Three attempts, three
+refutations, each cheap because the harnesses were already written — and together
+they localise the defect to the writer, which no amount of scheduling work would
+have reached.
