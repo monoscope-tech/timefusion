@@ -30,9 +30,29 @@ times per sweep — **142 GiB of reading for 1 GiB of data.**
 
 **What to do, in order:**
 
-1. **Split the widest files, worst-first.** ~500 files, ~60 % of maintenance read.
-   No new mechanism, no constant change, no soak — the writer already emits
-   time-contiguous pieces. `scratchpad/wide_rank.py` produces the list.
+1. **Split the widest files, worst-first — and it is a COMMAND, not a project:**
+
+   ```
+   timefusion optimize --project 87576849-… --date 2026-07-22 --recompress --dry-run
+   ```
+
+   `--recompress` is the documented **only force-rewrite** (`main.rs:956`): it
+   rewrites the partition through the schema `ORDER BY` **regardless of file
+   count or size**, and the writer cuts that sorted stream at 512 MiB into
+   time-contiguous, event-time-disjoint pieces. On an 85 GiB cell that is ~170
+   outputs of **~8.5 minutes each — narrower than the 10-minute dedup bin**, so
+   the cell goes from **45x read amplification to roughly 1x**.
+
+   Six cells ≈ 440 GiB of rewriting against **~8 TiB of sweep read saved per
+   pass**. Ranked list from `scratchpad/wide_rank.py`.
+
+   **Note `--consolidate --target-size-mb` will NOT work** — bin-packing skips
+   files already at target, so lowering the target makes wide files *more*
+   skipped. That trap is worth knowing before someone tries the obvious thing.
+
+   **Unverified:** `--recompress` was built for footer repair on ordinary
+   partitions; its cost on an 85 GiB cell is unmeasured. `--dry-run` first, then
+   the smallest of the six.
 2. **Bound SPAN in the packer's candidate selection**, the same shape as the byte
    and row budgets already there. Without this, (1) is a treadmill refilled by
    compaction itself.
