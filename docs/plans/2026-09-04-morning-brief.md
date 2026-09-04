@@ -371,7 +371,7 @@ built precisely for this.
 Worth fixing on its own merits, and worth knowing before anyone reads a red CI
 run tonight as evidence against the four fixes.
 
-## A branch is ready for review: `prep/otel-metrics-collapse`
+## Two branches are ready for review (neither deploys)
 
 Pushed as a branch, deliberately **not** master, so it does not deploy
 (`deploy.yml` triggers on master only). It contains the `otel_metrics`
@@ -388,6 +388,17 @@ conversion described in `2026-09-04-otel-metrics-never-got-the-collapse.md`:
 Its correctness precondition is measured, not assumed: **22,773,893 rows across
 186 files and all three heavy tenants, identical key cardinality every time.**
 Full lib suite green (1133).
+
+**`prep/unit-phase-timers`** — the measurement that gates the architectural work
+above. Prod emits only `maintenance_unit_slow`, and only for units past a quarter
+of their deadline, so *where a typical unit's time goes* is unknown. This adds
+`plan_secs` / `upstream_secs` / `write_secs` around the existing staging loop and
+emits `unit_phase_timing` on **every** staged bin. Instrumentation only, no
+behaviour change; 1132 lib tests green.
+
+**Merge this one first.** It is the difference between "4,857 units is about a
+day of maintenance" and "about a week", and no other decision here can be made
+without it.
 
 ## Decisions that are yours
 
