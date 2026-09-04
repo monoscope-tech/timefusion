@@ -2035,7 +2035,23 @@ pub struct MaintenanceConfig {
     /// file eliminated, against 27,098 for 9+-file merges. Maintenance wrote
     /// ~36 rows per row ingested. A floor near the 5-8 file shape would move
     /// most of that 82.5%.
-    #[serde_inline_default(0)]
+    /// **ENABLED at 100 MiB (2026-09-04)** after both the benefit and the risk
+    /// were measured, by two independent methods:
+    ///
+    /// - replaying 163 real prod Pack units: refuses **82.4%** of packing write
+    ///   volume, deferring **8.8%** of file elimination;
+    /// - driving the real `select_tail_bin` for 400 rounds
+    ///   (`the_value_floor_lowers_steady_state_write_amplification`): steady-state
+    ///   amplification **6.73x -> 3.85x**, and live file count **31 -> 29** —
+    ///   *lower*, because refusing low-value merges redirects the packer to
+    ///   high-fan-in merges that remove more files each.
+    ///
+    /// The population is BIMODAL — expensive bins sit at ~3.77M rows per file
+    /// eliminated, everything else under 1M — so any floor between ~100 and
+    /// ~300 MiB gives the same result. This is a separator, not a tuned knob.
+    ///
+    /// Rollback: set to 0.
+    #[serde_inline_default(100 * MIB as i64)]
     pub timefusion_pack_max_bytes_per_file_eliminated: i64,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
@@ -2095,7 +2111,14 @@ pub struct MaintenanceConfig {
     /// start emitting bigger files. Anything above this is left to `timefusion
     /// optimize --recompress`, the only thing that can touch a single-file
     /// partition.
-    #[serde_inline_default(512 * MIB)]
+    ///
+    /// Raised to 1 GiB on 2026-09-04: a census of the legacy population found
+    /// the largest un-repaired files at 889 MB (five of them, 3.74 GB total,
+    /// written 2026-08-03 by the pre-cut writer), sitting permanently above the
+    /// old 512 MB ceiling with no automatic path back. 1 GiB covers that whole
+    /// tail. It does NOT widen what we write — `timefusion_writer_max_file_bytes`
+    /// still cuts output at 512 MB, so this can only ever shrink the suspect set.
+    #[serde_inline_default(1024 * MIB)]
     pub timefusion_repair_max_file_bytes: usize,
     /// Sealed dates (yesterday backwards) the hot tail also scans for FOOTER
     /// REPAIR — rewriting files with no `sorting_columns` so the reader's
