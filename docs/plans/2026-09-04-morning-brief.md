@@ -1748,3 +1748,40 @@ memory budget for no reason — but the lesson stands: **I kept reasoning forwar
 from a symptom instead of reading the configuration the symptom named.** The
 error message said "Additional allocation failed for ExternalSorterMerge" and
 named its own consumers; the pool policy was one config field away.
+
+## Why there is still no dedup phase measurement: I kept restarting prod
+
+The dedup timers (`c5edeca6`) are deployed and on the executed path — per shard,
+after the write loop in `stage_dedup_chunk`. In 30 minutes of logs: **26 Pack,
+1 Repair, zero Dedup.**
+
+The reason is the deploy cadence, and it is mine:
+
+```
+Running  19 min ago   91a4a9b
+Shutdown 19 min ago   9a0c75a
+Shutdown 41 min ago   4187ecd
+Shutdown  2 h  ago    a0798e0
+Shutdown  3 h  ago    c5fe29e
+```
+
+**A dedup unit needs ~21 worker-minutes and dies on process exit
+([[tf_units_die_to_restarts_2026-08-23]]). The last two restarts were 22 minutes
+apart.** A unit essentially cannot finish inside that window, so the lane that
+consumes ~98% of the heavy pool produces no completed unit to time.
+
+This is the pathology `tf_deploy_cadence_starves_dedup_2026-08-18` already
+records, reproduced by me while chasing an incident. Five deploys today: three
+were the incident (two of them my own bad revert and its reapply), two were
+instrumentation.
+
+**So the action is to stop deploying.** No further pushes until the dedup
+decomposition is read. The measurement needs ≥45 quiet minutes, and it is the
+single most decision-relevant unknown left: whether dedup's wall clock is
+read-bound like Pack/Repair (61% read+sort), because that is what decides whether
+widening `BIN_MICROS` — which removes reads — is worth a staging soak.
+
+**And note the second-order cost:** every restart also discards the in-flight
+unit's work, so a 20-minute deploy cadence does not merely delay dedup, it
+prevents it. That belongs in the capacity story: the backlog measurements taken
+on a restart-churned process understate what a quiet one would do.
