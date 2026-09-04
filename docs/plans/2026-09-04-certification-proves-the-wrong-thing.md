@@ -1994,3 +1994,38 @@ Sources:
 - [Leveled Compaction — RocksDB wiki](https://github.com/facebook/rocksdb/wiki/Leveled-Compaction)
 - [Choose Level Compaction Files — RocksDB wiki](https://github.com/facebook/rocksdb/wiki/Choose-Level-Compaction-Files)
 - [Level-based Compaction Changes — RocksDB blog](https://rocksdb.org/blog/2017/06/26/17-level-based-changes.html)
+
+## n=297 CORRECTS the histogram: HotPacking is NOT all under 16 bins
+
+I flagged n=24 as "enough to see the separation but not to set a production
+constant". That caution was right, and the larger sample proves it:
+
+```
+297 samples over 90 minutes      bins: p50 39   p90 112   max 144   mean 51
+
+                      n     p50   max   <= 16 bins
+HotPacking          118      13    20      62.7 %
+SealedConsolidation 179      84   144       4.5 %
+
+a 16-bin bound rejects 215 of 297 (72 %)
+```
+
+**At n=24, `HotPacking` was 13 of 13 under 16 bins — 100 %. At n=297 it is
+62.7 %.** So a 16-bin bound would reject **37 % of hot-packing units too**, not
+"only the guilty lane" as I wrote. **That claim is retracted.**
+
+**The separation is still real, but the threshold moves.** The distributions are
+far apart — `HotPacking` p50 **13**, max **20**; `SealedConsolidation` p50 **84**,
+max **144**. A bound at **~20–24 bins** would spare essentially all hot packing
+(its maximum observed is 20) while still rejecting the great majority of sealed
+consolidation. **16 was fitted to noise; ~20–24 is fitted to the distribution.**
+
+**This does not change the span budget's design, only its value** — which is a
+config field precisely so it can be set from data rather than guessed. But the
+doc comment on `prep/span-budget` cites the n=24 figures and must be corrected
+before that branch is read as authoritative.
+
+**Eleventh correction of the night, and the most predictable one:** I named the
+sample size as the weakness, said it was too small to set a constant, and the
+larger sample moved exactly the number I had been careful about. The discipline
+worked; the temptation to quote "100 %" was the part that nearly did not.
