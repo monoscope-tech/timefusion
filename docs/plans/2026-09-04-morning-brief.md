@@ -1278,3 +1278,33 @@ large sweep.
 models unit durations from a byte model rather than real object-store latency —
 it answers "does the queue converge", not "what does a unit cost". Per-unit cost
 still needs the phase timers now deployed in `0c667f8f`, plus staging.
+
+## The phase timers work — and they miss the lane they were built for
+
+`0c667f8f` is live and emitting. 87 units in the first hour, aggregated:
+
+| pass | n | plan | read+sort | write | median unit | max |
+|---|---:|---:|---:|---:|---:|---:|
+| Pack | 86 | 2.2% | **61.0%** | 36.8% | 16.4 s | 253 s |
+| Repair | 1 | 0.0% | 60.2% | 39.8% | 1,337 s | 1,337 s |
+| **all** | 87 | 1.5% | **60.7%** | 37.8% | | |
+
+Two things follow.
+
+**1. Rewrite cost is read-and-sort bound, ~61% against 38% write.** That is the
+result the bin-width lever needs: widening bins removes READ (the same file is
+read once per bin it straddles), so it attacks the dominant phase. Had write
+dominated, widening would have bought much less. The single Repair unit at
+**1,337 s** also confirms the ~21-minute unit from the prod counters, from a
+direct measurement rather than a rate.
+
+**2. None of those 87 units is a dedup unit — and dedup is ~98% of the heavy
+pool.** The timers shipped in `prep/unit-phase-timers` instrument the Pack/Repair
+staging loop in `maintain.rs`; the dedup rewrite is a different function
+(`compact.rs::stage_dedup_chunk`) and was never touched. **The instrumentation
+built to price the dedup decision does not instrument dedup.** So the 61/38 split
+above describes compaction rewrites, and it must not be quoted for dedup.
+
+Fixed on the branch: `stage_dedup_chunk` now emits the same three phases under
+the same `unit_phase_timing` event with `pass=Dedup`, so both paths aggregate
+together and the next quiet hour answers the question for the lane that matters.
