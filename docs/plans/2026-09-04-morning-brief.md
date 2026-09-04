@@ -7,23 +7,35 @@ answered with a "don't build this", and four decisions that are yours.
 
 Measured tonight, from Delta statistics alone:
 
-**Our compaction MERGES but never SPLITS. That is sufficient until a group of
-mutually-overlapping files outgrows a compaction bin — after which it is
-permanently unmergeable and permanently overlapping. That is the frozen mass, and
-it grows super-linearly with ingest volume.**
+**Compaction defines "converged" as LARGE ENOUGH. The read path needs it defined
+as NON-OVERLAPPING. Those are different properties, and nothing in the system
+notices the difference — so a cell of mutually-overlapping 1 GiB files satisfies
+compaction completely and defeats the reader completely, forever.**
 
-The overlap graph's connected components, over the 107 cells holding 17+ files:
-**6,544 files form 206 components**; 71 % are under the 256 MiB target (median
-9.8 MiB) and merge trivially, while **25 exceed 1 GiB and the largest is 89 GiB
-across 328 files.** A component grows by chain-overlap — one file spanning two
-windows welds them, and everything in either window then joins it — so **higher
-ingest welds faster and pushes more components past the threshold.**
+`select_coordinator_compaction_candidates` opens with
+`if add.size >= target { continue; }` — "a file at or above target is converged
+and never packing's work". In the largest frozen cell, **99 % of files are over
+that target** (p50 **1017 MiB**) while overlapping each other across ~90-minute
+spans. Every one of them is skipped before any selection rule runs. The cell is,
+by compaction's own definition, finished.
 
-IOx's compactor merges *and* splits, which is why it can hold non-overlap as an
-invariant at any scale. **The cheapest high-value change is a splitting
-compaction for oversized components**: not a re-layout, just the ability to cut
-one component into bin-sized time ranges. 71 % of components need nothing; 25
-need this; and the 25 are where the bytes are.
+That is the whole mechanism: **the frozen mass is over-target, mutually
+overlapping files, and compaction skips them by design and always will.**
+
+This was arrived at by refuting two of my own proposals with measurements — see
+`2026-09-04-certification-proves-the-wrong-thing.md` for the full sequence,
+including a simulation showing that time-ranged unit selection performs
+identically to today's rule (1,405 vs 1,407 overlapping pairs) because **the
+files in question are never selected at all.**
+
+IOx's compactor merges *and* splits, and holds non-overlap as a recorded,
+per-file invariant. Ours records nothing about overlap anywhere.
+
+**I am not proposing the replacement rule.** The last two designs I proposed were
+each refuted within the hour by their own measurement, and a third at 04:00 would
+not deserve your confidence. What is established is the diagnosis, and a
+simulation harness (`scratchpad/sim_timeranged.py`) that will test the next
+candidate against real cells before anyone builds it.
 
 ### Confirmed in real time, not inferred
 
