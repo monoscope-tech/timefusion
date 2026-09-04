@@ -947,3 +947,35 @@ and the deadline and memory budgets were tuned around today's shape — `+18 %` 
 an average hides a tail. And `bins with data` falling from 13,610 to 2,271 means
 far fewer, larger units, which interacts with the claim/lease machinery
 (starvation ordering, retries, the 900 s deadline) in ways this table cannot see.
+
+## It generalizes: `otel_metrics` gives 5.5x for +8 %
+
+The bin-width table above was `otel_logs_and_spans` only. Re-run against
+`otel_metrics` (95 cells with 17+ files, 5,364 files):
+
+| width | files/bin | unit size | total read to sweep once |
+|---:|---:|---:|---:|
+| **10 min (today)** | 4.96 | **277 MiB** | **3,666 GiB** |
+| 30 min | 5.73 | 285 MiB | 1,263 GiB |
+| **60 min** | 6.87 | **299 MiB (+8 %)** | **661 GiB (5.5x less)** |
+| 120 min | 9.16 | 324 MiB (+17 %) | 359 GiB (10.2x less) |
+
+**Better than logs on both axes: +8 % unit size instead of +18 %, for 5.5x
+instead of 5.1x.** And metrics units are far smaller in absolute terms — 277 MiB
+against logs' 1,469 MiB — so the deadline risk that argues for a soak is much
+lower on this table.
+
+**Across both tables the sweep cost falls 23,196 GiB → 4,508 GiB, 5.1x.**
+
+Two things follow.
+
+**The lever is not tenant- or table-specific.** It comes from the same fact in
+both: files span far more than a bin, so narrow bins re-read them. That it lands
+within half a point on two tables with completely different row widths
+(logs ~104 B/row, metrics ~12 B/row) and different sort keys is the strongest
+evidence available that it is structural rather than an artefact of one shape.
+
+**`otel_metrics` is the better place to try it first.** Its units are 5x smaller,
+its improvement is larger, and it is already the table with the worst dedup path
+(`2026-09-04-otel-metrics-never-got-the-collapse.md` — it takes the window form
+on every rewrite). A soak there risks less and would show more.
