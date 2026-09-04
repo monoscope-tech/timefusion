@@ -81,20 +81,33 @@ async fn count_star_returns_correct_value() -> anyhow::Result<()> {
                     .unwrap_or(usize::MAX)
             })
             .unwrap_or(0);
-        // Delta's own view, bypassing SQL entirely.
-        let delta_files = match env.db().resolve_table("e2e_project", "otel_logs_and_spans").await {
+        // Delta's own view, bypassing SQL entirely. VERSION as well as file
+        // count: "one file exists" and "the snapshot the scan planned against
+        // knows about it" are different claims, and only the second explains a
+        // query that returns exactly the MemBuffer's rows.
+        let (delta_files, delta_version) = match env.db().resolve_table("e2e_project", "otel_logs_and_spans").await {
             Ok(table_ref) => {
                 let table = table_ref.read().await;
-                table.snapshot().map(|s| s.log_data().iter().count()).unwrap_or(0)
+                (table.snapshot().map(|s| s.log_data().iter().count()).unwrap_or(0), table.version())
             }
-            Err(_) => 0,
+            Err(_) => (0, None),
+        };
+        // THE DISCRIMINATOR. Delta-only, no MemBuffer leg, no union, no mask:
+        //   == 7 - mem_rows -> Delta holds the missing rows and the UNION lost
+        //                      them (mask or dedup), so the bug is above the scan;
+        //   == 0            -> the scan itself cannot see a committed file, so
+        //                      it is snapshot staleness below the union.
+        let delta_only = match env.db().query_delta_only("SELECT id FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY id").await {
+            Ok(batches) => datafusion::arrow::util::pretty::pretty_format_batches(&batches).map_or_else(|e| e.to_string(), |t| t.to_string()),
+            Err(e) => format!("query_delta_only failed: {e}"),
         };
         panic!(
             "COUNT(*) returned {count} of 7 acked inserts.\n  \
              visible ids ({}): {ids:?}\n  \
              re-query immediately: {again} (== 7 means TRANSIENT: rows were durable, the read was wrong)\n  \
              MemBuffer rows: {mem_rows}\n  \
-             Delta files: {delta_files}",
+             Delta files: {delta_files} at version {delta_version:?}\n  \
+             Delta-only ids:\n{delta_only}",
             ids.len()
         );
     }
