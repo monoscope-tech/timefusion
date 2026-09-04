@@ -6356,8 +6356,14 @@ impl Database {
                     // most: completions are biased toward cheap dates precisely
                     // because the expensive ones are what time out, so an EMA
                     // fed only by them under-estimates cost and re-admits the
-                    // wave this exists to prevent. The elapsed time is a lower
-                    // bound on the real cost, which errs toward admitting less.
+                    // wave this exists to prevent. The elapsed time is only a
+                    // LOWER bound on the real cost, and for a probe admitted
+                    // with three seconds left it is a wild under-estimate that
+                    // pulls the EMA down — so this is not a conservative
+                    // observation, it is a less-wrong one. It self-corrects:
+                    // once admission stops creating late starters, the timeouts
+                    // that remain are genuinely expensive dates that ran most of
+                    // a budget.
                     self.note_probe_cost(started.elapsed());
                     crate::observability::maintenance_stats().dedup_probe_timeouts.fetch_add(1, Relaxed);
                     warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
