@@ -1484,3 +1484,42 @@ project's files conforming (a Repair/recompress pass, so the leg disappears), or
 raise the budget — noting the doc's warning that the ceiling is paid concurrently
 on EVERY Delta-reading query.
 ||||||| 0c667f8f
+
+## The ordering-cliff hypothesis is REFUTED — by the counters shipped to test it
+
+`a0798e0b` deployed. After ~14 minutes and **6,020 queries**:
+
+```
+scan.ordering_repair_applied   0
+scan.ordering_repair_declined  0
+scan.ordering_repair_no_claim  0
+queries_total               6020    uptime_seconds  838
+```
+
+and the incident is **still firing** — 30 `ExternalSorterMerge` errors in the last
+12 minutes on the new build.
+
+**So `repair_isolated_scan_ordering` is not on the path of any failing query, and
+the 64 MB budget is not what broke project `6297304f`.** Zero on all three means
+the fork's isolation shape never appears: either every file conforms (nothing to
+repair) or the union has a non-scan child and is skipped by design. Either way the
+ordering claim is not what these queries are losing.
+
+**This is the instrumentation paying for itself in 15 minutes.** I had written
+"most likely trigger: the isolated leg grew past
+`timefusion_read_sort_unordered_leg_max_mb`" as the leading hypothesis. It is
+wrong, and the counter that says so cost ~40 lines. Without it the next step
+would have been raising a memory budget on a memory-tight instance to fix a
+problem it has nothing to do with.
+
+**The live lead, unchanged and now the only one:** the failing span carries
+**`scan.has_limit=false scan.limit=0`**. The `LIMIT` never reaches the scan, so
+`ORDER BY timestamp DESC LIMIT n` materialises the whole window. With the
+ordering repair excluded, the candidates are (a) `DedupExec` sitting in its
+unbounded `full-set` mode for a different reason — dedup keys not leading the
+sort — which blocks limit pushdown by construction, or (b) the projection
+(`jsonb_build_array(...)`, `to_jsonb(summary)`) defeating the TopK.
+
+**Next step is local, not prod:** reproduce this exact query shape against a
+seeded local table and `EXPLAIN` it. `dedup_keys_lead_the_sort` in `compact.rs`
+is the specific predicate to check for `otel_logs_and_spans`.
