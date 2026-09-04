@@ -2051,7 +2051,7 @@ pub struct MaintenanceConfig {
     /// ~300 MiB gives the same result. This is a separator, not a tuned knob.
     ///
     /// Rollback: set to 0.
-    #[serde_inline_default(0)]
+    #[serde_inline_default(100 * MIB as i64)]
     pub timefusion_pack_max_bytes_per_file_eliminated: i64,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
