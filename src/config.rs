@@ -2604,7 +2604,23 @@ pub struct MaintenanceConfig {
     /// boundary. Applies only under an aggregate; a `ORDER BY … LIMIT` keeps its
     /// streaming TopK. Each branch re-opens the files its range touches, so
     /// raising this trades file opens for parallelism.
-    #[serde_inline_default(4)]
+    ///
+    /// **DEFAULT 1 (OFF) after it regressed prod.** Shipped at 4 on 2026-09-04
+    /// and measured on a warm process: 7 d 3.1 s -> 26.3 s and 14 d 14.0 s ->
+    /// TIMEOUT, i.e. worse than not splitting at all. Cause: this rule runs
+    /// after `push_down_filter`, so each branch's bound never reached
+    /// `TableScan.filters` — all four branches pruned to the SAME files and
+    /// re-read the whole window (four identical pushed predicates, 52 file
+    /// groups where the unsplit plan had 22). `narrow_scan_window` now writes
+    /// the bound into the scan itself, which is what makes a branch cost a
+    /// QUARTER of the window rather than all of it.
+    ///
+    /// Left OFF regardless: the fix is unverified against prod, and the thing it
+    /// is competing with (one thread, but reading each file once) currently
+    /// wins. Raise it only behind a measurement on a warm process — the deploy
+    /// churn on 2026-09-04 made every cold reading look like a regression and
+    /// every regression look like a cold reading.
+    #[serde_inline_default(1)]
     pub timefusion_query_range_split_branches: usize,
     /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only

@@ -3585,8 +3585,23 @@ fn narrow_scan_window(plan: &LogicalPlan, lo: i64, hi: i64) -> Option<LogicalPla
             };
             let literal = |micros| Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), timezone.clone()), None);
             let timestamp = Expr::Column(Column::new(Some(scan.table_name.clone()), "timestamp"));
-            let window = timestamp.clone().gt_eq(literal(lo)).and(timestamp.lt(literal(hi)));
-            Filter::try_new(window, Arc::new(plan.clone())).ok().map(LogicalPlan::Filter)
+            let (lower, upper) = (timestamp.clone().gt_eq(literal(lo)), timestamp.lt(literal(hi)));
+            // Push the bound INTO the scan, not merely above it. This rule runs
+            // after DataFusion's `push_down_filter`, so a Filter node placed here
+            // is never folded into `TableScan.filters` — the provider then sees
+            // only the ORIGINAL window and every branch prunes to the same files,
+            // reading the whole window N times and filtering afterwards. Prod
+            // 2026-09-04 measured that directly: four branches whose pushed
+            // predicate was byte-identical, 52 file groups where the unsplit plan
+            // had 22, and 14d regressing 14.0s -> 53s.
+            //
+            // The Filter node STAYS: `TableScan.filters` is a pruning hint the
+            // provider may apply approximately, so it cannot be the only thing
+            // enforcing a branch boundary the row counts depend on.
+            let mut narrowed = scan.clone();
+            narrowed.filters.push(lower.clone());
+            narrowed.filters.push(upper.clone());
+            Filter::try_new(lower.and(upper), Arc::new(LogicalPlan::TableScan(narrowed))).ok().map(LogicalPlan::Filter)
         }
         LogicalPlan::Filter(filter) => {
             Filter::try_new(filter.predicate.clone(), Arc::new(narrow_scan_window(&filter.input, lo, hi)?)).ok().map(LogicalPlan::Filter)
@@ -3680,18 +3695,28 @@ mod range_parallel_dedup_tests {
         assert!(plan.contains("groupBy=[[t.id]]"), "the parent must still bind `t.id`:\n{plan}");
     }
 
-    /// Splitting must partition the window, not resample it: the branch bounds
-    /// have to tile `[lo, hi]` with no gap and no overlap. A gap silently drops
-    /// rows; an overlap silently double-counts them, and both look like a
-    /// working query.
+    /// Splitting must PARTITION the window, not resample it: the branches have to
+    /// tile `[lo, hi]` with no gap and no overlap. A gap silently drops rows, an
+    /// overlap silently double-counts them, and both still return a plausible
+    /// number — so this asserts on the boundary VALUES, not on how they are
+    /// spelled in the plan.
     #[tokio::test]
     async fn branch_bounds_tile_the_window_exactly() {
         let plan = optimized(&format!("SELECT count(*) FROM t WHERE {WIDE}"), true).await;
-        let bounds: Vec<&str> = plan.matches("timestamp >=").collect();
-        assert_eq!(bounds.len(), range_split_branches(), "expected one lower bound per branch:\n{plan}");
-        // One upper bound per branch. The LAST branch is built as `< hi + 1`,
-        // which DataFusion's simplifier folds back to `<= hi` — so both forms
-        // count, and the total must still be exactly one per branch.
-        assert_eq!(plan.matches("timestamp <").count(), range_split_branches(), "one upper bound per branch:\n{plan}");
+        let bounds: Vec<(i64, i64)> = plan
+            .lines()
+            .filter(|line| line.trim_start().starts_with("Filter:"))
+            .filter_map(|line| {
+                let mut it = line
+                    .match_indices("TimestampMicrosecond(")
+                    .map(|(i, _)| line[i + "TimestampMicrosecond(".len()..].split(',').next().unwrap_or_default().parse::<i64>().unwrap_or_default());
+                Some((it.next()?, it.next()?))
+            })
+            .collect();
+        assert_eq!(bounds.len(), range_split_branches(), "one [lo, hi) per branch:\n{plan}");
+        for (i, window) in bounds.windows(2).enumerate() {
+            assert_eq!(window[0].1, window[1].0, "branch {i} must end exactly where branch {} begins:\n{plan}", i + 1);
+        }
+        assert!(bounds[0].1 > bounds[0].0, "each branch must be non-empty:\n{plan}");
     }
 }
