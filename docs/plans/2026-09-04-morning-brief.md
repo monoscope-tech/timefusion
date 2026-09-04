@@ -2240,3 +2240,50 @@ architectural change, and neither is the bin-width lever I spent the night on.
   will return later at higher fan-in, adding volume back. It is a lower bound on
   post-guard amplification, not a prediction.
 - 104 B/row is from an earlier measurement, used to convert rows to bytes.
+
+## The local benchmark: the floor cuts steady-state amplification 43%
+
+Everything above measured ONE prod window and reasoned about what a floor *would
+have* refused. `the_value_floor_lowers_steady_state_write_amplification`
+(`0572c56d`) closes that gap: it drives the **real** `select_tail_bin` over 400
+rounds, feeds each merge's output back in as the packer would next see it, and
+reports bytes written per byte ingested.
+
+```
+amplification: floor OFF 6.73x   floor ON 3.85x     (-43%)
+```
+
+Deterministic — no clock, no RNG — one partition, arrivals at prod's p50 input
+size (~18 MiB / ~176k rows) against the 256 MiB target. The floor is applied via
+`bin_exceeds_value_floor`, the **same predicate `select_tail_bin` uses**, so the
+benchmark cannot pass while the guard does something different.
+
+**Two independent estimates now agree in direction and rough size:**
+
+| method | result |
+|---|---|
+| replaying 163 real prod Pack units against the floor | 82.4% of write volume refused, 8.8% of file-elimination lost |
+| driving the real packer for 400 rounds | steady-state amplification **6.73x → 3.85x** |
+
+**The sim's 6.73x baseline is far below prod's 36.5x, and that gap is honest
+rather than concerning:** one clean partition with uniform arrivals omits time
+slices, seal boundaries, repair, and cross-partition re-merging — all of which
+prod has and all of which add rewrites. **The relative 43% is the result; the
+absolute is not comparable to prod.** If anything it suggests prod's win is
+larger, since prod's excess over the floor is what the guard targets.
+
+**Status of the ladder, with what is now proven vs projected:**
+
+| step | evidence |
+|---|---|
+| 36.5x measured today | **proven** — matched windows, real writer counts |
+| floor cuts amplification ~43% | **proven locally** — real packer, 400 rounds |
+| floor refuses 82.4% of prod's Pack write volume | **proven on prod data** — 163 real units replayed |
+| that reaches ~6.4x in prod | **projected** — arithmetic, not measured |
+| fan-in raising reaches ~2-3x | **projected** — from the `log_fanin` floor |
+| the two together keep up at 10x | **projected** — requires ~10x reduction; the pair spans it on paper |
+
+**The top three rows are measurements. The bottom three are arithmetic.** Nothing
+here yet demonstrates prod keeping up at 10x; what it demonstrates is a lever
+with a proven mechanism, a proven local effect, and a quantified prod-data
+estimate — which is the state a change should be in before it is enabled.
