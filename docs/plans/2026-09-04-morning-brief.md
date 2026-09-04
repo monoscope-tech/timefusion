@@ -2780,3 +2780,45 @@ blocker recorded earlier in this document for the bin-width recompress.
    ~41% worker-time projection is the largest *recurring* saving identified.
 3. **Everything else** (bin width ~3.7%, pressure scaling, deletion vectors)
    ranks below those two.
+
+## Final verification: wide queries are fast and STABLE
+
+The 7-day log-explorer listing, six consecutive runs on the current process:
+
+```
+384 ms   292 ms   445 ms   495 ms   317 ms   362 ms      (p50 ~370, max 495)
+```
+
+**This morning the same query FAILED after 8.8 s** with
+`unordered merge-on-read dedup exceeded its 2048 MiB per-query limit`.
+
+The single 8,694 ms reading I took just before this was an outlier — a cold
+window after a restart, or a concurrent maintenance burst. Six runs put the
+steady state at **~370 ms**.
+
+**And it is not the unordered path.** Every ordering counter is clean on this
+process:
+
+```
+mem_ordering_declared 3065   mem_ordering_rejected 0   mem_ordering_unsorted 0
+mem_sort_retracted 0         ordering_repair_* all 0
+```
+
+So the 252 legacy files are NOT currently forcing queries onto the unordered
+dedup path, and the recompress cleanup — while still correct to do — is **not
+urgent**. That is a third revision of this document's priority list, and it is
+what the measurement says.
+
+### Where the query problem actually stands
+
+| | this morning | now |
+|---|---|---|
+| 7-day listing | **FAILS** after 8.8 s | **~370 ms**, 6/6 runs |
+| 3-day listing | **FAILS** after 10.6 s | ~210-475 ms |
+| 30-day listing | (would fail) | 1.5-2.5 s |
+| sort-exhaustion errors | 26 / 15 min | **0** |
+
+**The query wall is gone and wide windows are fast.** What I still cannot say is
+which change did it — the ordering knobs read zero usage, so `FairSpill` remains
+the most plausible cause and it was not my change. Attribution failed; the
+outcome is real and verified over repeated runs.
