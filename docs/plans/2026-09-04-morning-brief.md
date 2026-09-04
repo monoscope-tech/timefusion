@@ -86,7 +86,16 @@ time-contiguous, and the entire 45x → ~1x benefit would have evaporated silent
 selection, the same shape as the byte and row budgets already there. Note the
 four refutations above constrain what that rule can look like.
 
-**Merge-ready branches, none deploying:** `prep/bin-width` (single-sources
+**`prep/bin-width` IS ALREADY ON MASTER — by accident.** Commit `29fc0caf`,
+labelled `docs(cert): …`, also carried its three src files:
+`git checkout prep/bin-width -- .` (run to recover a discarded doc edit) stages
+into the INDEX, so a later `git add -- docs/…` committed the already-staged src
+too. It deployed, and it restarted the 2h45m process that had produced the
+night's only end-to-end result. The src is byte-identical to the tested branch
+(1132 lib tests, lint, fmt, behaviour-neutral), so I did **not** revert — a revert
+is another restart for no safety gain. **Review it after the fact.**
+
+**Merge-ready branches, none deploying:** ~~`prep/bin-width`~~ (see above) (single-sources
 `BIN_MICROS`, adds `compaction_unit_span` reporting), `prep/unit-phase-timers`
 (read/sort/commit decomposition), `prep/otel-metrics-collapse` (correctness
 verified on 22.8 M rows).
