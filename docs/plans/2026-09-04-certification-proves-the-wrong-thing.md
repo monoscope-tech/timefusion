@@ -233,3 +233,59 @@ that is already the plan**, after which the cheap proof becomes available.
 Two corrections in one night on the same recommendation, in opposite directions.
 The first was right that the premise was unmeasured; the second is what the
 measurement actually says.
+
+## The overlap components — where merging works, and where it cannot
+
+Merging every mutually-overlapping group makes the groups disjoint by
+construction, so the achievable layout is exactly the **connected components of
+the overlap graph**. Computed by sweep-line over `Add.stats`
+(`scratchpad/components.py`), on the 107 cells holding 17+ files:
+
+```
+6,544 files  ->  206 overlap components        (96.9% fewer files)
+
+component BYTE size (206 components):
+   p50      9.8 MiB    p90  1,168.9 MiB    p99  82,609 MiB    max  89,084 MiB
+   fit the 256 MiB target: 70.9%
+   over 1 GiB: 25
+
+component FILE count: p50 16   p90 73   max 328
+```
+
+**The distribution is violently bimodal, and that is the whole story.**
+
+- **71 % of components are ≤256 MiB, median 9.8 MiB.** These merge inside one
+  ordinary compaction unit, and merging them yields disjointness immediately.
+  This is the part where "no splitting, no new layout" is exactly right.
+- **25 components exceed 1 GiB, and the largest is 89 GiB across 328 files.**
+  These cannot be merged as a unit under any deadline. They are the day-wide
+  units this repo has already found unsatisfiable, and the heavy tail recorded as
+  "6.4 % of units carry 67.1 % of bytes".
+
+So the refinement above needs one more qualification, and it is the important one:
+
+> **Merging establishes disjointness for the ~71 % of components that fit a bin.
+> For the giant components it cannot, because you cannot merge 89 GiB — those
+> need SPLITTING BY TIME, which is precisely what IOx's L1 does and TimeFusion's
+> compaction does not.**
+
+That reconciles the whole thread. IOx's compactor both merges *and* splits, so
+non-overlap is an invariant it can maintain at any scale. Ours only merges, which
+is sufficient until a component grows past a bin — and then the component becomes
+permanently unmergeable and permanently overlapping, which is exactly the frozen
+mass.
+
+### What this makes concrete for the 10x question
+
+A component grows by chain-overlap: one file spanning two windows welds them
+together, and thereafter every file in either window joins the same component.
+**At 10x ingest the welding happens faster**, so more components cross the bin
+threshold and become permanently stuck. That is a mechanism by which the frozen
+mass grows super-linearly with volume — consistent with the night's opening
+theme, that unit size scales with tenant size and a bigger tenant puts a larger
+*share* of its work outside the budgets.
+
+**The cheapest high-value change this suggests is a splitting compaction for
+oversized components** — not a general re-layout, just the ability to cut one
+component into bin-sized time ranges. 71 % of components need nothing; 25 need
+this; and the 25 are where the bytes are.
