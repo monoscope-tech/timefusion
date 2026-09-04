@@ -1624,3 +1624,41 @@ the system was accounting for the second half of that trade.
 leaves cells with correctly-sized, narrow files, `SealedConsolidation` would have
 nothing to do on them — and the lane's cost would fall to zero without any policy
 change at all.
+
+## THREE HOURS OF COMPACTION REDUCED THE COST BY 0.007 %
+
+The same statistics-only measurement, taken **three hours apart**, across a period
+in which the maintenance lanes ran continuously:
+
+| | 3 hours ago | now | change |
+|---|---:|---:|---|
+| live files | 8,122 | **7,485** | **−637 (−7.8 %)** |
+| wide files (>50 % of a day) | 1,273 | **1,275** | **+2** |
+| wide as a share | 15.7 % | **17.0 %** | **worse** |
+| **total sweep read at 10-min bins** | **44,130 GiB** | **44,127 GiB** | **−3 GiB (−0.007 %)** |
+
+**Compaction retired 637 files in three hours and reduced the cost that actually
+matters by three gigabytes out of forty-four thousand.**
+
+This is the whole investigation in one table:
+
+- **The lane is working.** 7.8 % of the table's files are gone. By its own
+  metric — file count — it had a good three hours.
+- **The cost it exists to reduce did not move.** Sweep read is flat to four
+  significant figures.
+- **The wide-file population grew slightly**, and its *share* rose from 15.7 % to
+  17.0 %, because the files being retired are the narrow ones. **Compaction is
+  concentrating the table toward exactly the shape that costs the most.**
+
+**Every earlier finding predicted this**, and it is worth noting that they were
+derived independently: `span x size` concentration said the cost lives in a few
+wide files, so retiring 637 narrow ones could not move it; the live
+`compaction_unit_span` histogram said sealed units emit 74–144-bin outputs, so the
+lane replaces narrow files with wide ones; and the age analysis said heavily
+compacted partitions are the most expensive. **This table is those three
+predictions arriving together in a single before/after.**
+
+**And it is the clearest possible statement of the 10x problem.** More volume
+means more compaction, and more compaction means more of this: a lane that
+improves its own metric by 7.8 % per three hours while the maintenance cost it
+drives stays exactly where it was. **Scaling the fleet scales the wrong number.**
