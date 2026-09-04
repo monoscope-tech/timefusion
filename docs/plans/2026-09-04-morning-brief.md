@@ -1022,3 +1022,55 @@ three rows sit at yesterday 12:00–13:01.
 
 **Fixed** by pinning the clock at the top of the test (`5f83a89b`); the existing
 `ClockGuard` already restores wall time on drop. 56/56 in that file green.
+
+## The merge is staged on local `master` but NOT pushed — here is exactly why
+
+**Staged (7 commits ahead of `origin/master`, unpushed):** `prep/unit-phase-timers`,
+`prep/span-budget`, `prep/split-filter-miss`, `prep/fix-chart-test-flake`, plus one
+new test-race fix. `cargo lint` clean; **main suite 1,357 / 1,357** (both
+previously-failing tests now fixed — the chart-routing one above, and
+`write::tests::boot_redrives_quarantined_insert_payloads`, which waited on
+`mem_total_rows` while asserting the archive rename that `redrive_quarantine`
+performs *after* it).
+
+**What stopped the push: the e2e suite is currently unstable, and I could not
+attribute it.** Eight full `make test-e2e` runs this morning:
+
+| tree | runs | result |
+|---|---|---|
+| `origin/master` | 3 | 3 green |
+| master + timers + span-budget | 1 | green |
+| + split-filter-miss | 3 | fail, fail, **green** |
+| full merge | 3 | fail, fail, fail(*different test*) |
+
+Two distinct tests failed, each passing in isolation:
+`ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering`
+(×3) and `smoke::count_star_returns_correct_value` (×1).
+
+**I published, then retracted, a "regression in `prep/split-filter-miss`".** The
+bisect pointed there on one failing run — but that branch is **22 lines**: two
+`MissReason` variants, two name-keyed counters, two return sites. Nothing in it
+can reach a physical plan. The rerun on that exact commit went **green**, which
+kills the hypothesis. Same trap as the rest of the night: *a two-point series is
+not a trend* ([[tf_what_survived_and_what_did_not_2026-09-04]]).
+
+**Two things worth chasing, both on-goal:**
+
+1. **`one_unsorted_file_does_not_cost_the_majority_its_ordering` is intermittent,
+   and what it guards is a real prod cliff.** When the isolated union loses its
+   ordering claim, `DedupExec` drops to unbounded `full-set` and
+   `ORDER BY ts DESC LIMIT n` becomes a **blocking** `SortExec` over the whole
+   window — prod p1 at 30 d selected 431 GB for 251 rows. The repair
+   (`repair_isolated_scan_ordering`) needs *some* child to declare an ordering:
+   `children.iter().find_map(|c| c.properties().output_ordering())`. If a flushed
+   hot file's footer sometimes fails to declare one, the same intermittency exists
+   **in prod**, not just in the test. Not verified — but it is the first
+   hypothesis to test, and it is cheap.
+2. **`COUNT(*) returned 4 of 7 acked inserts`**, MemBuffer 4 / Delta 1 file, and
+   the immediate re-query still returned 4 — so **not transient**. This is
+   [[tf_count_star_is_wrong_not_flaky_2026-08-28]] reproducing.
+
+**Recommended next step:** one `make test-e2e` on an idle machine (this one ran
+eight suites back-to-back with `target/` at 46 GB and the volume 93 % full). If
+green, push — the bundle is one deploy and one restart, and `prep/unit-phase-timers`
+is what prices every remaining decision in this document.
