@@ -3924,11 +3924,7 @@ async fn scoped_recompress_does_not_deadlock() -> Result<()> {
     // of scoping, and the thing a wrong `replace_where` would silently destroy.
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    let rows = ctx
-        .sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{p2}'"))
-        .await?
-        .collect()
-        .await?;
+    let rows = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{p2}'")).await?.collect().await?;
     let n = rows[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
     assert_eq!(n, 40, "a project-scoped recompress must not touch another project's rows");
     Ok(())
@@ -3951,8 +3947,7 @@ async fn scoped_recompress_does_not_deadlock_under_concurrent_writes() -> Result
     // More files than the minimal case: 6 commits per project.
     for (pid, n) in [(&p1, 0u32), (&p2, 1u32)] {
         for c in 0..6u32 {
-            let rows: Vec<_> =
-                (0..60).map(|i| test_span_ts(&format!("r{n}-{c}-{i}"), "v", pid, ts + (c * 100 + i) as i64 * 1_000)).collect();
+            let rows: Vec<_> = (0..60).map(|i| test_span_ts(&format!("r{n}-{c}-{i}"), "v", pid, ts + (c * 100 + i) as i64 * 1_000)).collect();
             write(&db, pid, rows, true).await?;
         }
     }
@@ -3963,18 +3958,14 @@ async fn scoped_recompress_does_not_deadlock_under_concurrent_writes() -> Result
     // Hammer the same partition while the scoped overwrite is in flight.
     let writer = tokio::spawn(async move {
         for c in 0..12u32 {
-            let rows: Vec<_> =
-                (0..40).map(|i| test_span_ts(&format!("w-{c}-{i}"), "v", &writer_p2, ts + (5_000 + c * 100 + i) as i64 * 1_000)).collect();
+            let rows: Vec<_> = (0..40).map(|i| test_span_ts(&format!("w-{c}-{i}"), "v", &writer_p2, ts + (5_000 + c * 100 + i) as i64 * 1_000)).collect();
             let _ = write(&writer_db, &writer_p2, rows, true).await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     });
 
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(180),
-        db.recompress_partition(&table_ref, "otel_logs_and_spans", date, 9, Some(p1.as_str())),
-    )
-    .await;
+    let out =
+        tokio::time::timeout(std::time::Duration::from_secs(180), db.recompress_partition(&table_ref, "otel_logs_and_spans", date, 9, Some(p1.as_str()))).await;
     let _ = writer.await;
 
     match out {
