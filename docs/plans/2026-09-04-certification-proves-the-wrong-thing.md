@@ -1234,3 +1234,48 @@ it would make the 500-file cleanup an operation after all.
 **I am flagging this rather than asserting either way.** I have been wrong nine
 times tonight and every one was reasoning past something I had not read. The
 `size >= target` skip is read; the CLI's behaviour under a lowered target is not.
+
+### ...and reading further, the operation DOES exist: `--recompress`
+
+My prediction about `--consolidate --target-size-mb` was right, and the code says
+so in the same file (`main.rs:956`):
+
+> "**`--recompress` is the ONLY force-rewrite.** Bin-packing (`Compact`/`SortBy`,
+> and `consolidate`'s leveled variant) **skips files already at target** AND drops
+> single-file bins, so a lone file can never be rewritten by them"
+
+So `--consolidate` cannot touch wide over-target files — as predicted. **But
+`--recompress` can, and it is documented as doing exactly what is needed:**
+
+> "`recompress_partition` rewrites the partition through `replace_where` with the
+> **schema ORDER BY**, **regardless of file count or size** … `--project`
+> narrows the overwrite predicate … which is what makes the job small enough to
+> run on an ordinary runner."
+
+**That is the whole fix, and it ships today:**
+
+```
+timefusion optimize --project 87576849-… --date 2026-07-22 --recompress
+```
+
+It rewrites the cell through a sorted `ORDER BY`, and the writer cuts that sorted
+stream at `max_file_bytes` (512 MiB) into **time-contiguous, event-time-disjoint**
+pieces. On an 85 GiB cell that is ~170 outputs, each spanning ~1/170 of the day —
+**about 8.5 minutes, narrower than the 10-minute dedup bin.**
+
+**A cell recompressed this way would go from 45x read amplification to roughly
+1x.** Six cells at ~85 GiB each is ~440 GiB of rewriting, against ~8 TiB of sweep
+read saved per pass.
+
+**So the top recommendation is an operation, not a project:** run `--recompress`,
+worst cell first, ranked by `scratchpad/wide_rank.py`. It needs no code, no
+constant change, no soak, and it is the documented force-rewrite path built for
+precisely the "one bad file poisons a partition" shape — which is what a wide
+file is, measured in read cost rather than footers.
+
+**What to check before running it**, since I have not: `--recompress` was built
+for footer repair on partitions of ordinary size, and its cost on an 85 GiB whale
+cell is unmeasured. Start with `--dry-run`, then the smallest of the six, and
+watch that the outputs really are ~512 MiB and narrow — `compaction_unit_span`
+(on `prep/bin-width`) would report exactly that, which is another reason to merge
+it first.
