@@ -900,3 +900,50 @@ a `const` copy-pasted into three files (`compact.rs:1150`, `write.rs:502`,
 `maintain.rs:5726`). Changing it also re-keys `dedup_dirty_bins`, so in-flight
 bin state from the old width would need to be discarded rather than
 reinterpreted.
+
+## The tension RESOLVED from statistics — wider bins barely grow the unit
+
+I said the risk of widening `BIN_MICROS` was that units grow, and that only the
+phase timers could settle it. **That was wrong: it is answerable from `Add.stats`
+alone.** A unit must rewrite every file overlapping its bin, so unit size is
+"bytes of files overlapping the bin" — computable per bin width, no code, no IO.
+Over the 95 cells holding 17+ files (5,966 files):
+
+| `BIN_MICROS` | files/bin | **bytes/bin (unit size)** | bins with data | **total read to sweep once** |
+|---:|---:|---:|---:|---:|
+| **10 min (today)** | 5.17 | **1,469 MiB** | 13,610 | **19,530 GiB** |
+| 20 min | 5.60 | 1,522 MiB | 6,808 | 10,120 GiB |
+| 30 min | 6.01 | 1,577 MiB | 4,540 | 6,990 GiB |
+| 45 min | 6.66 | 1,653 MiB | 3,028 | 4,887 GiB |
+| **60 min** | 7.26 | **1,734 MiB** | 2,271 | **3,847 GiB** |
+| 120 min | 9.76 | 2,053 MiB | 1,137 | 2,280 GiB |
+
+**Going from 10 to 60 minutes: unit size grows 1,469 → 1,734 MiB — just +18 % —
+while the total read volume to sweep every cell once falls 19,530 → 3,847 GiB, a
+5.1x reduction. At 120 minutes it is +40 % unit size for an 8.6x reduction.**
+
+**The feared trade barely exists**, and the reason is the same fact as everything
+else: **files already span 45–90 minutes**, so a 60-minute bin overlaps almost the
+same file set a 10-minute bin does. Today's narrow bins do not read less per
+unit — they read *the same files, over and over, once per bin*. 13,610 bins each
+pulling 1.4 GiB is the 19.5 TiB.
+
+### Why this is the strongest lever found tonight
+
+- It attacks the **dominant** consumer: dedup at ~98 % of the maintenance pool.
+- It is **one constant**, not a layout change, not a protocol change, not a new
+  compaction mode.
+- The measured prize is **~5x less total read volume** for **+18 % unit size**.
+- It needs **no new data**: this table is the whole analysis, and anyone can
+  re-run `scratchpad/bin_unit_size.py` against a fresh checkpoint.
+
+**What still argues for the phase timers first** — but no longer as a blocker:
+they give the *absolute* cost (is a unit read-bound or commit-bound?), which sets
+expectations for how much of that 5x actually shows up as wall-clock. The
+*relative* question, which I wrongly said needed them, is settled above.
+
+**Caveats I can see, stated rather than buried:** a 1,734 MiB unit is not small,
+and the deadline and memory budgets were tuned around today's shape — `+18 %` on
+an average hides a tail. And `bins with data` falling from 13,610 to 2,271 means
+far fewer, larger units, which interacts with the claim/lease machinery
+(starvation ordering, retries, the 900 s deadline) in ways this table cannot see.
