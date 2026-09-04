@@ -3442,3 +3442,56 @@ interaction (wider files vs dedup reads) that staging must price.** That is a
 materially different position from "the architecture cannot get there by
 tuning", which is where this document stood four hours ago — and the difference
 came from measuring the packer instead of trusting the arithmetic around it.
+
+## The last unmodelled interaction, PRICED from 5,701 real prod files
+
+The 10x path's only remaining unknown: doubling the pack target widens files, and
+a dedup unit reads every file overlapping its bin **in full**, so wider files
+span more bins. Computed from the live Delta checkpoint (`521610`), 5,701 files
+with timestamp stats — no data read, no staging:
+
+```
+file event-span seconds:  p50 = 1,616    p90 = 85,798
+dedup read = sum over files of  size x (span / BIN + 1)
+```
+
+| change | dedup read volume |
+|---|---:|
+| baseline | 1.00x |
+| files **2x wider** | **1.99x** |
+| files 3x wider | 2.98x |
+| **files 2x wider + dedup bins 2x wider** | **1.00x** |
+| files 3x wider + dedup bins 3x wider | **1.00x** |
+
+**The regression is real — doubling file width almost exactly doubles dedup read
+— and widening the dedup bin to match cancels it exactly.** That is
+`timefusion_dedup_bin_minutes`, shipped tonight and defaulted to 10, which I
+ranked LAST on its own throughput merits. **It is not a throughput lever; it is
+the enabler that makes the pack-target change free.**
+
+### The complete chain, every link evidenced
+
+| link | evidence | type |
+|---|---|---|
+| guard raises fan-in 2-3 -> 9 | prod `unit_phase_timing` | measured |
+| guard cuts unit count ~5.3x | sim 211,356 -> 39,756 at 10x | simulated |
+| backlog linear in unit count | sim streams sweep | simulated |
+| fan-in scales with bin target | **real packer 16 -> 32 -> 40** | measured |
+| guard + 512 MiB reaches 1x backlog at 10x | sim 18,285 vs 18,335 | simulated |
+| wider files cost 2x dedup read | **5,701 real files** | measured |
+| **widening dedup bins cancels it exactly** | **5,701 real files** | **measured** |
+
+**So the 10x proposal is two constants, both already implemented as config:**
+
+```
+COORDINATOR_HOT_TARGET_BYTES      256 MiB -> 512 MiB
+timefusion_dedup_bin_minutes           10 -> 20
+```
+
+on top of the packer floor already live in prod.
+
+**What remains genuinely unproven:** the two simulated links, and whether dedup's
+WORKER TIME follows its read volume (sort cost is not purely proportional to
+bytes read). Those want a staging run. But the interaction I flagged as the
+blocker is priced, and it is neutral — which is a stronger position than "staging
+must find out".
