@@ -3933,3 +3933,53 @@ async fn scoped_recompress_does_not_deadlock() -> Result<()> {
     assert_eq!(n, 40, "a project-scoped recompress must not touch another project's rows");
     Ok(())
 }
+
+/// SCRATCH EXPERIMENT part 2: does it deadlock UNDER CONTENTION?
+///
+/// The minimal case completes in ~1s, so if the restriction is real the trigger
+/// is scale or concurrency. This runs a project-scoped recompress while another
+/// task writes into the SAME date partition — writer contention on the partition
+/// being overwritten is the shape most likely to deadlock a `replace_where`.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_recompress_does_not_deadlock_under_concurrent_writes() -> Result<()> {
+    let (db, p1) = buffered_db("scoped_recompress_conc").await?;
+    let p2 = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = chrono::Utc::now().timestamp_micros();
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+
+    // More files than the minimal case: 6 commits per project.
+    for (pid, n) in [(&p1, 0u32), (&p2, 1u32)] {
+        for c in 0..6u32 {
+            let rows: Vec<_> =
+                (0..60).map(|i| test_span_ts(&format!("r{n}-{c}-{i}"), "v", pid, ts + (c * 100 + i) as i64 * 1_000)).collect();
+            write(&db, pid, rows, true).await?;
+        }
+    }
+
+    let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
+    let writer_db = Arc::clone(&db);
+    let writer_p2 = p2.clone();
+    // Hammer the same partition while the scoped overwrite is in flight.
+    let writer = tokio::spawn(async move {
+        for c in 0..12u32 {
+            let rows: Vec<_> =
+                (0..40).map(|i| test_span_ts(&format!("w-{c}-{i}"), "v", &writer_p2, ts + (5_000 + c * 100 + i) as i64 * 1_000)).collect();
+            let _ = write(&writer_db, &writer_p2, rows, true).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(180),
+        db.recompress_partition(&table_ref, "otel_logs_and_spans", date, 9, Some(p1.as_str())),
+    )
+    .await;
+    let _ = writer.await;
+
+    match out {
+        Err(_) => panic!("scoped recompress DEADLOCKED under concurrent writes (180s) — the restriction is real and concurrency is the trigger"),
+        Ok(r) => println!("scoped recompress under contention: {:?}", r.map_err(|e| format!("{e}"))),
+    }
+    Ok(())
+}
