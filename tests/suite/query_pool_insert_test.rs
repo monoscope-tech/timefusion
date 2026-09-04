@@ -31,8 +31,8 @@
 mod query_pool_insert {
     use std::{
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -143,19 +143,16 @@ mod query_pool_insert {
         let db = fair_spill_db(&test_id).await?;
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
-        ctx.sql(&insert_sql(0)).await?.collect().await?;
 
         let (peak, stop, sampler) = spawn_pool_sampler(&ctx);
-        // `sort_spill_reservation_bytes` is claimed up-front per sort partition,
-        // so any external sort registers against the pool regardless of row count.
-        ctx.sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id, timestamp, name")
-            .await?
-            .collect()
-            .await?;
+        // Millions of rows, not the handful this file inserts: a sort small
+        // enough to finish between two polls proves nothing about the sampler.
+        // No table involved, so the control cannot fail for storage reasons.
+        ctx.sql("SELECT value FROM generate_series(1, 4000000) ORDER BY value DESC LIMIT 1").await?.collect().await?;
         stop.store(true, Ordering::Relaxed);
         sampler.await?;
 
-        assert!(peak.load(Ordering::Relaxed) > 0, "sampler saw no reservation for a sort — it cannot witness the INSERT claim either");
+        assert!(peak.load(Ordering::Relaxed) > 0, "sampler saw no reservation for a 4M-row sort — it cannot witness the INSERT claim either");
         Ok(())
     }
 }

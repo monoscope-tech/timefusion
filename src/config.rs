@@ -2658,22 +2658,30 @@ impl MaintenanceConfig {
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
 ///
-/// - `Greedy` (default): all consumers share the full pool; first-come,
-///   first-served. Right for write-heavy workloads where INSERTs dominate
-///   and per-statement memory needs vary widely (e.g. one batch is 50 MB
-///   of Arrow, another is 5 MB). FairSpillPool would slice the pool into
-///   per-consumer quotas (`pool / num_consumers`) and reject any consumer
-///   whose batch exceeded its slot — bit prod when ~30 concurrent INSERTs
-///   each got a ~76 MB slot and every 700-row batch hit `Memory limit
-///   exceeded`.
-/// - `FairSpill`: slot-per-consumer fairness. Better for ad-hoc query
-///   workloads with many concurrent users where one large query
-///   shouldn't starve the others. Not the right default for ingest.
+/// - `FairSpill` (default): a spillable consumer may hold at most
+///   `(pool − unspillable) / num_spill`, and an unspillable one takes from
+///   what is left. That is the bound the query pool needs, because the sort
+///   machinery's merge halves — `ExternalSorterMerge`, `SortPreservingMerge`,
+///   `DedupExec[keep-greatest]` — CANNOT spill. Under `Greedy` a spillable
+///   `ExternalSorter` grows instead of spilling until the pool is gone, and
+///   the merge that follows it fails: prod 2026-09-02, one 16-partition sort
+///   whose partitions held 5.9 GB and 7.3 GB of a 16 GB pool while
+///   `ExternalSorterMerge[3]` could not get 331 MB. The process restarted.
+///   Under FairSpill each of those sorters is capped at ~1 GB and spills.
+/// - `Greedy`: one global cap, first-come first-served. Was the default from
+///   `81dcc1cd` (2026-05-28), when FairSpill sliced ~30 concurrent INSERTs
+///   into ~76 MB slots and every batch bounced with `Memory limit exceeded`.
+///   That reason expired: the write path took its own FairSpill pool in
+///   `flush_sort_runtime_env` (2026-08-20), and INSERTs reserve nothing from
+///   this pool at all — measured, not inferred, by
+///   `tests/suite/query_pool_insert_test.rs`.
+///
+/// Rollback is `TIMEFUSION_MEMORY_POOL=greedy`; it needs no redeploy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPoolKind {
-    #[default]
     Greedy,
+    #[default]
     FairSpill,
 }
 
