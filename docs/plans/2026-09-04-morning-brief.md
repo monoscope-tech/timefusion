@@ -1785,3 +1785,63 @@ widening `BIN_MICROS` — which removes reads — is worth a staging soak.
 unit's work, so a 20-minute deploy cadence does not merely delay dedup, it
 prevents it. That belongs in the capacity story: the backlog measurements taken
 on a restart-churned process understate what a quiet one would do.
+
+## Prior art: what others do about exactly this, and what it says about our design
+
+Two searches, both aimed at the open problem — maintenance saturated at 1x, and
+read amplification from file-granular replacement.
+
+### 1. Deletion vectors are the industry answer, and they fit dedup exactly
+
+Delta's merge-on-read: DELETE/UPDATE/MERGE mark rows in a bitmap and leave the
+data files untouched, instead of rewriting them (copy-on-write). The canonical
+example is a 1-billion-row file where deleting one row rewrites 999,999,999 rows.
+**Our dedup is a delete** — keep-greatest removes older versions of a key — so a
+deletion vector turns "rewrite the ~1.4 GB of files overlapping this bin" into
+"write a bitmap". That removes the cost driver of ~98% of the heavy pool, not
+by scheduling it better but by not doing it.
+
+The trade is explicit in the literature: *"whatever time the DELETE saves by
+avoiding eagerly rewriting files, the reader and compaction commands pay for
+later."* **For us that trade is unusually favourable, because our read path
+ALREADY pays merge-on-read dedup** — applying a bitmap is strictly cheaper than
+the `DedupExec` keep-greatest we run today.
+
+**Still blocked, re-verified today:** delta-rs supports READING deletion-vector
+tables but not writing them; `delta-io/delta-rs#4079` is open (filed 2026-01-14),
+and the roadmap points at delta-kernel-rs adoption as the path. We carry a fork,
+so this is possible rather than impossible — but it is a protocol-level change
+affecting every reader, and it is the largest single lever identified in this
+document.
+
+### 2. ClickHouse bounds merge cost two ways we do not
+
+`ReplacingMergeTree` is literally our keep-greatest dedup, so its merge policy is
+the closest prior art there is. Two rules stand out:
+
+- **The max merge size ADAPTS to pool pressure.** `max_bytes_to_merge_at_max_space_in_pool`
+  defaults to 150 GB, and *"when the background pool is nearly full, ClickHouse
+  automatically reduces the maximum allowed merge size to keep slots available for
+  smaller, more urgent merges rather than letting a few large merges monopolize
+  the entire pool."* **We have the exact failure that rule prevents**: dedup holds
+  9.76 of 10 heavy permits continuously, and today's phase timers show **2 Repair
+  units consuming 29% of all measured worker time** (38.6 of 134 worker-minutes)
+  against 203 Pack units. Our budgets are static; theirs are a function of
+  pressure.
+- **Merge selection prefers parts of SIMILAR SIZE**, explicitly "to avoid
+  repeatedly rewriting large data". Ours sorts by size but opens with
+  `if add.size >= target { continue }` — over-target files are not "deprioritised",
+  they are *invisible*, which is why 99% of the frozen mass is never a candidate
+  ([[tf_overlap_components_are_the_frozen_mass_2026-09-04]]).
+
+**Two concrete, borrowed designs, neither speculative:**
+1. Scale the per-unit byte/row budget DOWN as heavy-pool occupancy rises, so a
+   few giant units cannot monopolise the pool. This is cheap and local, and it
+   directly targets the 29%-from-2-units observation.
+2. Replace the `>= target` skip with a similar-size preference, so over-target
+   files remain candidates at lower priority instead of being permanently frozen.
+
+Sources: [Delta Lake deletion vectors](https://delta.io/blog/2023-07-05-deletion-vectors/) ·
+[delta-rs #4079](https://github.com/delta-io/delta-rs/issues/4079) ·
+[ClickHouse part merges](https://clickhouse.com/docs/merges) ·
+[MergeTree engine](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree)
