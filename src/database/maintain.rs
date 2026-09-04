@@ -6170,6 +6170,18 @@ impl Database {
         self.batch_probe_classify(table, table_name, Vec::new(), candidates, deadline).await;
     }
 
+    /// Fold one probe's wall clock into the admission estimate.
+    ///
+    /// Half-weight EMA: probe cost varies by an order of magnitude with a date's
+    /// file count, so admission must track it without chasing a single outlier
+    /// into either a wedged pass or another doomed wave.
+    fn note_probe_cost(&self, elapsed: std::time::Duration) {
+        let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let _ = self.dedup_probe_cost_ms.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |prior| {
+            Some(if prior == 0 { ms } else { (prior + ms) / 2 })
+        });
+    }
+
     /// Runs the batch probe over each (project, date) with ≥2 queued bins and
     /// strips the probe-clean bins out of `ready`, consuming them. Group keys
     /// are dequeued BEFORE the probe so dirtiness enqueued while it runs
@@ -6275,12 +6287,7 @@ impl Database {
             let started = std::time::Instant::now();
             match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
                 Ok(Ok(dup_bins)) => {
-                    // Half-weight EMA: probe cost varies by an order of
-                    // magnitude with a date's file count, so admission must
-                    // track it without chasing a single outlier into either a
-                    // wedged pass or another doomed wave.
-                    let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                    let _ = self.dedup_probe_cost_ms.fetch_update(Relaxed, Relaxed, |prior| Some(if prior == 0 { elapsed } else { (prior + elapsed) / 2 }));
+                    self.note_probe_cost(started.elapsed());
                     let stats = crate::observability::maintenance_stats();
                     let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
                     stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
@@ -6345,6 +6352,13 @@ impl Database {
                     Vec::new()
                 }
                 Err(_) => {
+                    // A timeout is an observation too, and the one that matters
+                    // most: completions are biased toward cheap dates precisely
+                    // because the expensive ones are what time out, so an EMA
+                    // fed only by them under-estimates cost and re-admits the
+                    // wave this exists to prevent. The elapsed time is a lower
+                    // bound on the real cost, which errs toward admitting less.
+                    self.note_probe_cost(started.elapsed());
                     crate::observability::maintenance_stats().dedup_probe_timeouts.fetch_add(1, Relaxed);
                     warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
                     Vec::new()
