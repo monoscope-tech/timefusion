@@ -3126,3 +3126,34 @@ new optimum sits now that units are smaller. That needs the 204 MB file
 (`scratchpad/whale/recent204.parquet`, already on disk) against an 8 GiB pool,
 on a machine not also serving prod — this laptop was at 97% disk and 360 MB free
 memory, which is why the small file was used.
+
+### Prod-scale confirmation is blocked: the sample files were deleted
+
+Attempting the same sweep with the 204 MB prod file (to find where the OOM
+threshold sits at real file size, and whether it doubles with the pool) failed:
+
+```
+panicked at benches/rewrite_throughput.rs:127: stat: No such file or directory
+```
+
+`scratchpad/whale/` is now empty — `recent204.parquet` (195 MB),
+`wide431.parquet` (411 MB) and `big1148.parquet` (1.1 GB) were removed by disk
+pressure while this laptop sat at 97-98% full. Only the 35 MB `prod_sample.parquet`
+survives.
+
+**So the structural claim stands on the small-file run** (cliff is memory-shaped:
+0 failures to 16 workers when memory suffices) **and the arithmetic of the
+original bench** (8 x 1.33 GiB > 8 GiB), **but the prod-scale optimum is
+unmeasured.** Re-running it needs `recent204.parquet` back — roughly 50 minutes
+to re-fetch at the ~3.9 MiB/s this machine gets from the bucket, or seconds from
+an in-region runner.
+
+**The one-command version, for whoever has a box:**
+
+```bash
+TF_BENCH_FLEET=1 TF_BENCH_PARQUET=<204MB prod file> TF_BENCH_POOL_MB=8192 \
+  cargo bench --bench rewrite_throughput
+# then repeat at TF_BENCH_POOL_MB=12288. If the failure threshold moves from
+# 8 workers to ~12, the envelope is pool-bound and `coordinator_jobs` (clamped
+# at 16, holding 1.9 GiB of maintenance pool unreachable) is the lever.
+```
