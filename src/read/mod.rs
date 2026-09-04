@@ -2554,7 +2554,7 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 // "2": the key tail became the FULL dedup key (see `KeyTail`). A "1" file
 // encodes `id` alone, so appending "2" keys to it would count one logical row
 // per (timestamp, id) and one per (timestamp, service, id) in the same index.
-const FORMAT_VERSION: &str = "2";
+const FORMAT_VERSION: &str = "3";
 const META_VERSION: &str = "tf.logical_count.version";
 const META_FINGERPRINT: &str = "tf.logical_count.fingerprint";
 const META_FILES: &str = "tf.logical_count.files";

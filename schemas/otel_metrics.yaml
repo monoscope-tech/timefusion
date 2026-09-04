@@ -2,9 +2,22 @@ table_name: otel_metrics
 partitions:
   - project_id
   - date
+# WIDENED to the sort prefix so `dedup_keys_lead_the_sort` holds and the rewrite
+# takes the one-pass streaming collapse instead of the ROW_NUMBER window — the
+# same change `otel_logs_and_spans` got on 2026-09-02 (`7beb411e`), which this
+# table never received. The window form is 20-58x slower and cannot run at 8
+# partitions at ANY pool size up to 1 GB
+# (`docs/plans/2026-09-04-the-row-cap-guards-the-wrong-cost.md`).
+#
+# SAFE because the two keys are EQUIVALENT, measured over every live version on
+# raw Delta files across all three heavy projects: 22,773,893 rows / 186 files,
+# identical key cardinality every time and zero groups where this key merges two
+# `id`s. Both columns are `nullable: false`, so there are no NULL-key cases.
+# `sorting_columns` is UNCHANGED, so no existing file's footer is invalidated.
 dedup_keys:
   - timestamp
-  - id
+  - metric_name
+  - series_id
 # TF-owned, for the same reason as otel_logs_and_spans: `stamp_version`
 # overwrites this column, and `ingested_at` is client-visible data.
 dedup_tiebreak: updated_at

@@ -2463,4 +2463,39 @@ mod immutable_audit_tests {
             assert!(sql.contains(&format!("MIN(\"{column}\")")), "{column} is audited by the streaming form but absent from the SQL form");
         }
     }
+
+    /// Every merge-on-read table must be able to take the STREAMING COLLAPSE.
+    ///
+    /// `dedup_keys_lead_the_sort` decides between the one-pass collapse and the
+    /// `ROW_NUMBER() OVER (PARTITION BY …)` window. Measured on a real prod file
+    /// (`docs/plans/2026-09-04-the-row-cap-guards-the-wrong-cost.md`) the window
+    /// form is **20-58x slower** and **fails at 8 partitions at every pool size
+    /// up to 1 GB** — it cannot be bought off with memory, and it fails even at
+    /// one partition at 128 MB.
+    ///
+    /// `otel_logs_and_spans` was moved onto the collapse on 2026-09-02
+    /// (`7beb411e`) by widening its `dedup_keys` to the sort prefix.
+    /// **`otel_metrics` was never converted and nothing noticed for two days**,
+    /// because the fallback is silent — it produces correct results, just slowly
+    /// and fragilely. This test is the notice.
+    #[test]
+    fn every_merge_on_read_table_can_take_the_streaming_collapse() {
+        let registry = crate::schema::registry();
+        let offenders: Vec<String> = registry
+            .list_tables()
+            .into_iter()
+            .filter_map(|name| registry.get(&name))
+            .filter(|schema| schema.version_append && !schema.dedup_keys.is_empty())
+            .filter(|schema| !super::dedup_keys_lead_the_sort(schema))
+            .map(|schema| {
+                let sort: Vec<&str> = schema.sorting_columns.iter().map(|c| c.name.as_str()).collect();
+                format!("{}: dedup_keys={:?} is not a prefix of sorting_columns={:?}", schema.table_name, schema.dedup_keys, sort)
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these tables fall back to the ROW_NUMBER window on every dedup rewrite — 20-58x slower, and it OOMs at 8 partitions at any pool size:\n{}",
+            offenders.join("\n")
+        );
+    }
 }
