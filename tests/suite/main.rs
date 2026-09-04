@@ -25,6 +25,7 @@ mod pg_client_compat;
 mod pgwire_dml_tag_test;
 mod plan_cache_shape_repro;
 mod proptest_invariants;
+mod query_pool_insert_test;
 mod sqllogictest;
 mod statistics_test;
 mod tantivy_e2e_test;
