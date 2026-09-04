@@ -2670,8 +2670,31 @@ pub struct MaintenanceConfig {
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only
     /// fires when the window is fully flushed, dedup-provably-clean, and
     /// every overlapping file lies entirely inside the window — otherwise
-    /// the normal scan runs. See src/count_pushdown.rs.
-    #[serde_inline_default(true)]
+    /// the normal scan runs. See the `count_pushdown` section of `read/mod.rs`
+    /// (the `src/count_pushdown.rs` this used to name no longer exists).
+    ///
+    /// **DEFAULT false since 2026-09-04: it returns SILENTLY WRONG COUNTS.**
+    /// Measured on prod, project 28f62f01, `date=2026-08-21`:
+    ///
+    /// | query | answer |
+    /// |---|---|
+    /// | `count(*)` (pushdown fires) | **2,604,236** |
+    /// | `sum(1)` (forces the scan) | 3,551,640 |
+    /// | `count(*)` + a neutral predicate (gate declines) | 3,551,640 |
+    ///
+    /// A 27% undercount, reproducible across restarts. It is provably the
+    /// PUSHDOWN that is wrong, not the scan: the scan yields 3,551,640 rows that
+    /// are pairwise DISTINCT on the dedup key, and each is a real physical row
+    /// (5,419,022 physical in that partition), so at least 3,551,640 distinct
+    /// keys exist and no correct logical count can be below it.
+    ///
+    /// For any `tombstones_possible()` table — which is every OTel table — only
+    /// the logical-count INDEX path can fire, and `try_logical_count` declines
+    /// beyond a 3-day window. So this flag never affected 14/30-day dashboards;
+    /// turning it off costs only the narrow-window fast path, which is exactly
+    /// where the wrong numbers were being served. Re-enable once the index is
+    /// fixed and has a test that pins it against a scan.
+    #[serde_inline_default(false)]
     pub timefusion_count_pushdown: bool,
     /// Per-shard COMPRESSED-bytes target for a dedup chunk rewrite (`sum(add.size)`).
     /// The rewrite is split into `ceil(compressed_bytes / this)` hash-bucketed passes
