@@ -2029,3 +2029,56 @@ merged, re-merged and merged again on the way up.
 Pack's amplification per merge level. If near-target files are being re-merged,
 the ClickHouse similar-size preference is a bounded, well-understood change with
 a much larger ceiling than the ~4% bin widening offers.
+
+## Where the 36x goes: the packer spends 82.5% of its writes on its worst merges
+
+Pack units from the same quiet 95 minutes, grouped by how many files each merged:
+
+| files merged | units | rows written | share of Pack writes | median rows/unit |
+|---:|---:|---:|---:|---:|
+| **2** | 71 | **222,169,019** | **82.5%** | **3,770,398** |
+| 3–4 | 27 | 11,798,760 | 4.4% | 32,910 |
+| 5–8 | 29 | 23,785,836 | 8.8% | 210,480 |
+| 9+ | 36 | 11,679,205 | 4.3% | 102,481 |
+
+Priced as **rows rewritten per file actually eliminated** (`files − outputs`):
+
+| merge shape | rows written | files eliminated | **rows per file eliminated** |
+|---|---:|---:|---:|
+| 2-file | 222,169,019 | 71 | **3,129,141** |
+| 9+-file | 11,679,205 | 431 | **27,098** |
+| all Pack | 269,432,825 | 720 | 374,212 |
+
+**A 2-file merge costs 115x more per file removed than a 9+-file merge.** And the
+packer spends **82.5% of its write budget** on the shape that delivers **9.9% of
+the file reduction** (71 of 720), while the shape delivering **60%** of it (431
+files) costs **4.3%**.
+
+**That is the 36x, localised.** It is not compaction being inherently expensive;
+it is compaction repeatedly merging *pairs of already-large files* — median
+3.77M rows over 2 files, so ~1.9M rows each — to remove one file.
+
+### Why the existing guard does not stop it
+
+`select_tail_bin` checks `if fresh.len() < min_files && !repairs_present` —
+**`min_files` (default 5) is tested against the CANDIDATE POOL, not the bin.** A
+pool of 5+ candidates can still emit a 2-file bin once bytes fill it. The rule
+prevents packing a *sparse partition*; it does nothing about an *expensive bin*.
+
+**Checked, not assumed: my `pair_exemption` from earlier tonight is NOT
+implicated.** That lives in `select_coordinator_compaction_candidates`; the tail
+packer here is a separate byte-based loop with no `MAX_BIN_ROWS` term. The
+resemblance between the observed 3.77M median and `2 x MAX_BIN_ROWS = 4M` is a
+coincidence, and I checked the loop before writing this rather than after.
+
+### The fix, and it is the ClickHouse rule stated precisely
+
+Score a candidate bin by **files eliminated per byte written** and refuse the bin
+if that ratio is worse than a floor. Equivalently: require the bin to contain at
+least `min_files` files *unless the files are small enough that the merge is
+cheap anyway*. Today the packer optimises for "reach the target size"; it should
+optimise for "remove the most files per byte rewritten".
+
+Expected ceiling, from this window: moving the 2-file volume to the value of even
+the 5–8 shape would cut Pack writes by most of that 82.5% — against a bin-width
+lever whose ceiling is ~3.7%. **This is the change worth soaking.**
