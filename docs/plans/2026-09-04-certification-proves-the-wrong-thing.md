@@ -1310,3 +1310,46 @@ could touch it.
 roughly 400x the 211 MB / 2 M-row bin benchmarked at 1.1–2.7 s, so order tens of
 minutes of sort plus object-store IO for the whole cell. That is fine for an
 operator job and impossible for a 900 s unit — which is the entire point.
+
+## What this means for a 100x customer, specifically
+
+The brief's question named a prospect at ~100x current total volume. Everything
+above is about *today's* cost; this is the scaling shape, and it follows from the
+same arithmetic rather than from any new assumption.
+
+**Today, maintenance cost is `data x bins_per_file`.** A file is read once per bin
+it overlaps, so the total sweep read is not proportional to the data — it is
+proportional to the data times how many bins each file straddles. Measured
+fleet-wide, `bins_per_file` is **27.8 mean** at a 10-minute bin.
+
+**And `bins_per_file` is not a constant — it GROWS with volume**, for two
+measured reasons:
+
+1. **Compaction widens files as it merges**, and more data means more merging.
+   The correlation is already visible: 1,657-file partitions are 0.7 % wide,
+   22-file partitions are 72.7 % wide.
+2. **Components grow by chain-overlap.** One file spanning two windows welds them,
+   and everything in either window then joins. Higher ingest welds faster.
+
+**So maintenance cost today is SUPER-LINEAR in volume.** That is the precise
+statement of "it will not hold at 10x", and it is why the frozen mass grows
+faster than the fleet does.
+
+**With span-bounded output, it becomes linear.** If a file never spans more than
+one bin, `bins_per_file = 1` by construction and the cost collapses to `data` —
+one read per byte per sweep. Nothing else in this document changes that exponent;
+the pool size does not, the scheduler does not, the certification design does
+not. **Only the file-to-bin ratio sits in the exponent.**
+
+**That is the honest answer to the 100x question:** not "we need N times more
+machines", but **"the cost currently scales worse than the data, and one bounded
+change moves it to scaling with the data."** A 100x tenant on today's layout does
+not need 100x the maintenance capacity — it needs considerably more than that,
+and the multiplier is not knowable in advance because it depends on how the
+tenant's writes weld. On a span-bounded layout, 100x the data is 100x the
+maintenance, which is a capacity question rather than an architectural one.
+
+**Caveat, and it is the same one throughout:** `bins_per_file = 1` is the ideal.
+Real output will not be perfect, and the residual depends on how tightly the
+writer's byte cut aligns with bin boundaries — the tension quantified in the
+bin-widening section. The claim here is about the exponent, not the constant.
