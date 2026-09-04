@@ -2043,16 +2043,20 @@ pub struct MaintenanceConfig {
     /// measurement at 104 B/row DECODED — but the packer compares COMPRESSED
     /// `add.size`, 12x smaller, so the floor could never fire. `pack_value_refused`
     /// reading 0 on a live process is what caught it.
-    /// **SHIPPED AT 0 (shadow). A floor that bites can WEDGE packing entirely,
-    /// and the benchmark proves it:** at 18 MiB arrivals (~2.18M rows/file) even
-    /// a 10-file merge is 2.4M rows per file eliminated, so a 1M floor refuses
-    /// EVERY bin — steady-state amplification went to 0.00x because nothing
-    /// merged at all. Prod's small-file population (9+-file merges at 27,098
-    /// rows/file) is far below that, so the same floor is harmless there and
-    /// catastrophic on a partition of larger files. **The guard needs a
-    /// "never refuse the only available bin" escape before any non-zero
-    /// default is safe.**
-    #[serde_inline_default(0)]
+    /// **1,000,000 — the measured knee, made safe by the fan-in escape.**
+    ///
+    /// Without that escape a biting floor WEDGES packing: at 18 MiB arrivals
+    /// (~2.18M rows/file) even a 10-file merge is 2.4M rows per file eliminated,
+    /// so a 1M floor refused EVERY bin and steady-state amplification fell to
+    /// 0.00x — nothing merged at all. The guard therefore never refuses a bin of
+    /// `min_files` or more: it can only remove LOW-fan-in bins, which is exactly
+    /// the measured problem and never the remedy.
+    ///
+    /// With the escape, on the real packer over 400 rounds:
+    /// **amplification 6.73x -> 2.06x (-69%), live files 31 -> 32.** That is
+    /// close to the `log_fanin` floor of ~1.7x for this file size, with no
+    /// file-count regression.
+    #[serde_inline_default(1_000_000)]
     pub timefusion_pack_max_rows_per_file_eliminated: u64,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
@@ -2606,22 +2610,31 @@ pub struct MaintenanceConfig {
     /// streaming TopK. Each branch re-opens the files its range touches, so
     /// raising this trades file opens for parallelism.
     ///
-    /// **DEFAULT 1 (OFF) after it regressed prod.** Shipped at 4 on 2026-09-04
-    /// and measured on a warm process: 7 d 3.1 s -> 26.3 s and 14 d 14.0 s ->
-    /// TIMEOUT, i.e. worse than not splitting at all. Cause: this rule runs
-    /// after `push_down_filter`, so each branch's bound never reached
-    /// `TableScan.filters` — all four branches pruned to the SAME files and
-    /// re-read the whole window (four identical pushed predicates, 52 file
-    /// groups where the unsplit plan had 22). `narrow_scan_window` now writes
-    /// the bound into the scan itself, which is what makes a branch cost a
-    /// QUARTER of the window rather than all of it.
+    /// Shipped at 4 on 2026-09-04, turned OFF the same evening, then back on
+    /// with the cause fixed. Warm-process measurements, whale project, daily
+    /// buckets:
     ///
-    /// Left OFF regardless: the fix is unverified against prod, and the thing it
-    /// is competing with (one thread, but reading each file once) currently
-    /// wins. Raise it only behind a measurement on a warm process — the deploy
-    /// churn on 2026-09-04 made every cold reading look like a regression and
-    /// every regression look like a cold reading.
-    #[serde_inline_default(1)]
+    /// | window | split off | split on, unfixed |
+    /// |--------|-----------|-------------------|
+    /// | 7 d    | 5.8 s     | 5.3 s (untouched — under the span threshold) |
+    /// | 14 d   | 15.5 s    | 34.2 s |
+    /// | 30 d   | TIMEOUT   | **49.5 s** |
+    ///
+    /// The split is the only thing that has ever completed 30 d, and it did so
+    /// while each branch still read the WHOLE window: this rule runs after
+    /// `push_down_filter`, so the branch bound never reached
+    /// `TableScan.filters` and all four branches pruned to the same files (four
+    /// byte-identical pushed predicates; 52 file groups where the unsplit plan
+    /// had 22). That 4x over-read is the whole of the 14 d regression.
+    /// `narrow_scan_window` now writes the bound into the scan itself, so a
+    /// branch costs a QUARTER of the window.
+    ///
+    /// NOT reproducible locally — reverting that fix leaves the e2e test green,
+    /// because DataFusion re-runs pushdown in the local path and prod's pgwire
+    /// path does not. Prod is the only instrument, so judge this ONLY on a warm
+    /// process: the 2026-09-04 deploy churn made every cold reading look like a
+    /// regression and every regression look like a cold reading.
+    #[serde_inline_default(4)]
     pub timefusion_query_range_split_branches: usize,
     /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only

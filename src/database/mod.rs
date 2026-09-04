@@ -8437,7 +8437,18 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
         // same "unknown, do not count" the row cap uses — it can only admit.
         let rows: u64 = files.iter().filter_map(|p| adds.iter().find(|a| &a.path == p).and_then(|a| a.rows)).sum();
         let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated);
-        if bin_exceeds_value_floor(rows, files.len(), floor) {
+        // THE ESCAPE, without which a floor can stop compaction dead. A bin that
+        // already merges `min_files` or more is never refused, however expensive:
+        // high fan-in IS the shape we are steering toward, and refusing it leaves
+        // the partition unpacked forever. Measured: at 18 MiB arrivals even a
+        // 10-file merge exceeds 1M rows/file, so an unescaped floor refused EVERY
+        // bin and steady-state amplification fell to 0.00x — nothing merged.
+        //
+        // With the escape the guard only ever removes LOW-fan-in bins, which is
+        // exactly the measured problem (2-file merges: 82.5% of packing write
+        // volume for 9.9% of the file reduction) and never the remedy.
+        let low_fan_in = files.len() < min_files.max(3);
+        if low_fan_in && bin_exceeds_value_floor(rows, files.len(), floor) {
             let stats = crate::observability::maintenance_stats();
             stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             stats.pack_value_refused_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
@@ -16206,7 +16217,7 @@ mod tests {
                 // guard prices rows, and a byte-priced floor was the bug it replaced.
                 let rows = (bytes as u64) * 12 / 104;
                 // The floor the guard applies, via the SAME predicate.
-                if super::bin_exceeds_value_floor(rows, idx.len(), floor) && floor > 0 {
+                if idx.len() < 5 && super::bin_exceeds_value_floor(rows, idx.len(), floor) && floor > 0 {
                     seq += 1;
                     if seq > 3 {
                         break; // wedged: nothing admissible, stop rather than spin
@@ -16227,7 +16238,7 @@ mod tests {
         // NOT wedged, below its 2-file merges (4.35M) so the expensive shape is
         // still refused. At 1M the floor refused EVERY bin and amplification
         // went to 0.00x — nothing merged. That is why the shipped default is 0.
-        let (w_on, _, files_on) = run(4_000_000);
+        let (w_on, _, files_on) = run(1_000_000); // the measured knee; the fan-in escape makes it safe
         let amp = |w: i64| w as f64 / ing as f64;
         println!("amplification: OFF {:.2}x  ON {:.2}x   |   live files: OFF {files_off}  ON {files_on}", amp(w_off), amp(w_on));
 
