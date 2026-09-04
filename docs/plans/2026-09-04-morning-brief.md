@@ -1314,3 +1314,56 @@ above describes compaction rewrites, and it must not be quoted for dedup.
 Fixed on the branch: `stage_dedup_chunk` now emits the same three phases under
 the same `unit_phase_timing` event with `pass=Dedup`, so both paths aggregate
 together and the next quiet hour answers the question for the lane that matters.
+
+## How much cheaper must a unit be? Sub-linear, and cost alone cannot fix it
+
+Same fixture at **5x load** (370 streams), 24 virtual hours, two seeds, sweeping
+`--scale` (unit duration — i.e. per-unit cost):
+
+| unit cost | executions | vs base | pending_end | vs base |
+|---|---|---:|---|---:|
+| 1x (base) | 5,342 / 5,100 | 1.00x | 102,721 / 103,027 | — |
+| **2x cheaper** | 5,818 / 5,566 | **1.09x** | 101,533 / 101,635 | −1% |
+| **4x cheaper** | 9,715 / 9,703 | **1.82x** | 96,681 / 96,689 | −6% |
+| **10x cheaper** | 23,028 / 23,137 | **4.32x** | 83,244 / 83,134 | −19% |
+
+Seeds agree to within 0.5% at every point.
+
+**Three results, and the first two temper what I wrote earlier.**
+
+1. **Throughput responds SUB-LINEARLY to unit cost**: 10x cheaper units buy only
+   **4.3x** the completions. Something else takes over as the constraint before
+   cost stops mattering.
+2. **A 2x-cheaper unit buys almost nothing (+9%).** There is a threshold between
+   2x and 4x — presumably units dropping under a deadline or permit boundary —
+   so a modest cost win can be worth approximately zero throughput.
+3. **Even 10x cheaper units do not drain a 5x queue**: backlog falls only 19%.
+
+**AMENDMENT to "only a cheaper unit can create headroom".** That was too strong.
+The first half stands — the streams sweep shows scheduling cannot help a
+saturated pool. But cheapness alone is *not sufficient*, and its returns are
+sub-linear and lumpy.
+
+**AND A TRAP I NEARLY WALKED INTO: `--scale` is NOT a model of bin widening.**
+It makes every unit uniformly cheaper. Bin widening does something different —
+it makes **~6x FEWER units, each ~18% bigger**. That is the *arrival* axis, not
+the cost axis. Mapping the 5.1x read reduction onto the `--scale` column would
+have put the lever at the "2x cheaper → +9%" row and argued *against* it, on a
+false equivalence.
+
+**Read the two sweeps together and they point the same way:**
+
+- streams sweep: **backlog is LINEAR in the number of units** (11.6x at 10x load)
+  while throughput is flat.
+- scale sweep: **backlog is barely sensitive to unit cost** (−19% for 10x
+  cheaper).
+
+**So the lever that matters is the one that reduces the NUMBER of units, not
+their cost — and bin widening is exactly that (~6x fewer dedup bins).** The 5.1x
+read reduction is a real IO/£ saving, but the *queue* argument for widening is
+the unit-count collapse, and that is the stronger argument.
+
+**Next experiment, and it is now well-posed:** teach the sim to model dedup bins
+so unit COUNT can be swept directly, rather than inferring it. That is the
+measurement that would justify flipping `timefusion_dedup_bin_minutes` in
+staging.
