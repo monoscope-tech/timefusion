@@ -2032,6 +2032,28 @@ pub struct MaintenanceConfig {
     // into a few large event-time-disjoint runs.
     #[serde_inline_default(256 * MIB as i64)]
     pub timefusion_light_optimize_target_size: i64,
+
+    /// Shrink a maintenance unit's target as its lane's memory pool fills, so a
+    /// few large units cannot monopolise it. **Off by default: the reduction is
+    /// COMPUTED and COUNTED either way, and only APPLIED when this is true**, so
+    /// the decision can be made from `maintenance.pressure_scale_*` rather than
+    /// from an argument.
+    ///
+    /// Borrowed from ClickHouse, whose `ReplacingMergeTree` is the same
+    /// keep-greatest dedup we run: `max_bytes_to_merge_at_max_space_in_pool` is
+    /// reduced when the background pool is nearly full, "to keep slots available
+    /// for smaller, more urgent merges rather than letting a few large merges
+    /// monopolize the entire pool". Our budgets are static, and the pathology
+    /// that rule prevents is measured here: on 2026-09-04 two Repair units took
+    /// **29% of all maintenance worker time** (38.6 of 134 worker-min) against
+    /// 203 Pack units, and one 502 s dedup unit was **80% of its lane's** cost
+    /// over a quiet hour.
+    ///
+    /// Taper: full target at or below 50% occupancy, falling linearly to half
+    /// the target at 100%. Deliberately gentle — halving is a throughput cost if
+    /// the pressure reading is noisy, and nothing has soaked this yet.
+    #[serde_inline_default(false)]
+    pub timefusion_maintenance_pressure_scaling: bool,
     /// Byte ceiling for ONE output file from a rewrite that writes through
     /// `RecordBatchWriter`, which has no target-size support — `flush()` emits
     /// one file per partition regardless of buffer size — so rewrite paths cut

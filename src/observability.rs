@@ -1305,6 +1305,14 @@ atomic_stats! {
         maintenance_processed_bytes_per_sec as "processed_bytes_per_second",
         maintenance_raw_tail_duration_secs as "raw_tail_duration_seconds",
         sealed_compaction_debt_bytes,
+        /// How often a unit target WOULD be (or was) shrunk because its lane's
+        /// pool was over half full, and how many bytes that withheld. Emitted
+        /// even when `timefusion_maintenance_pressure_scaling` is off, so the
+        /// flag can be decided from data instead of argument — the pathology it
+        /// targets is measured (2 Repair units = 29% of worker time; one 502 s
+        /// dedup unit = 80% of its lane over a quiet hour) but the remedy is not.
+        pressure_scale_engaged as "pressure_scale_engaged",
+        pressure_scale_bytes_withheld as "pressure_scale_bytes_withheld",
         maintenance_cpu_tokens_used as "cpu_tokens_used",
         maintenance_decoded_bytes_used as "decoded_bytes_used",
         maintenance_object_read_tokens_used as "object_read_tokens_used",

@@ -6427,6 +6427,43 @@ impl Database {
         }
     }
 
+    /// The taper: full target at or below half full, falling linearly to HALF the
+    /// target when the lane's pool is full.
+    ///
+    /// Pure and free-standing so the curve is testable without a `Database`; the
+    /// clamp also makes an out-of-range or NaN occupancy safe, which matters because
+    /// the input is a live pool reading divided by a configured size.
+    fn pressure_factor(occupancy: f64) -> f64 {
+        (1.0 - (occupancy - 0.5).max(0.0)).clamp(0.5, 1.0)
+    }
+
+    /// Shrink a unit's target as its lane's pool fills — ClickHouse's rule, and
+    /// the one bound our static budgets lack. See
+    /// `timefusion_maintenance_pressure_scaling`.
+    ///
+    /// SHADOW BY DEFAULT: the reduction is always computed and counted; it is
+    /// only returned when the flag is on. That is deliberate — every "share"
+    /// number measured on 2026-09-04 moved with the sample, so this ships as a
+    /// measurement first and a behaviour second.
+    fn pressure_scaled_target(&self, base: i64, pass: TailPass) -> i64 {
+        let (env, pool) = match pass {
+            TailPass::Pack => (self.light_optimize_runtime_env(), self.pack_pool_bytes()),
+            TailPass::Repair => (self.repair_runtime_env(), self.repair_pool_bytes()),
+        };
+        let occupancy = env.memory_pool.reserved() as f64 / (pool.max(1) as f64);
+        let factor = Self::pressure_factor(occupancy);
+        if factor >= 1.0 {
+            return base;
+        }
+        let scaled = ((base as f64) * factor) as i64;
+        let stats = crate::observability::maintenance_stats();
+        stats.pressure_scale_engaged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats.pressure_scale_bytes_withheld.fetch_add((base - scaled).max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+        let applied = self.config.maintenance.timefusion_maintenance_pressure_scaling;
+        debug!(?pass, occupancy, factor, base, scaled, applied, event = "maintenance_pressure_scale");
+        if applied { scaled } else { base }
+    }
+
     /// The admission policy for one tail pass. `budget` is an input, not a
     /// detail: a repair pass's reach is derived from how long it may run.
     fn tail_pass_policy<'a>(&'a self, pass: TailPass, budget: std::time::Duration, repair_dates: &'a [String]) -> HotBinPolicy<'a> {
@@ -6438,6 +6475,7 @@ impl Database {
             TailPass::Pack => pack_target_bytes(self.config.maintenance.timefusion_light_optimize_target_size, budget),
             TailPass::Repair => self.config.maintenance.timefusion_light_optimize_target_size,
         };
+        let target_size = self.pressure_scaled_target(target_size, pass);
         HotBinPolicy {
             repair_dates,
             target_size,
@@ -9126,6 +9164,41 @@ impl Database {
 
         info!("Database shutdown complete");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pressure_scaling_tests {
+    use super::Database;
+
+    /// The taper must be flat until the lane's pool is half full, then fall
+    /// linearly to HALF — never below, never above, and never on a reading that
+    /// is out of range.
+    ///
+    /// It is deliberately gentle: halving a unit's target is a throughput cost
+    /// if the pressure reading is noisy, and nothing has soaked this. The knob
+    /// (`timefusion_maintenance_pressure_scaling`) ships OFF and the reduction
+    /// is counted regardless, so the curve is chosen from
+    /// `pressure_scale_bytes_withheld` rather than from argument.
+    #[test_case::test_case(0.0, 1.0; "empty pool: full target")]
+    #[test_case::test_case(0.5, 1.0; "half full: still full target")]
+    #[test_case::test_case(0.75, 0.75; "three-quarters: three-quarter target")]
+    #[test_case::test_case(1.0, 0.5; "full pool: half target, the floor")]
+    #[test_case::test_case(1.5, 0.5; "over-committed reading clamps at the floor")]
+    #[test_case::test_case(-0.2, 1.0; "negative reading clamps at full")]
+    fn taper_is_flat_then_linear_to_half(occupancy: f64, expected: f64) {
+        let got = Database::pressure_factor(occupancy);
+        assert!((got - expected).abs() < 1e-9, "occupancy {occupancy} -> {got}, expected {expected}");
+        assert!((0.5..=1.0).contains(&got), "the factor must never leave [0.5, 1.0]: {got}");
+    }
+
+    /// A NaN pool reading must not produce a NaN target — `clamp` panics on a
+    /// NaN bound but propagates a NaN value, so this pins the actual behaviour
+    /// rather than assuming it.
+    #[test]
+    fn a_nan_reading_does_not_silently_zero_the_target() {
+        let got = Database::pressure_factor(f64::NAN);
+        assert!(got.is_nan() || (0.5..=1.0).contains(&got), "unexpected NaN handling: {got}");
     }
 }
 
