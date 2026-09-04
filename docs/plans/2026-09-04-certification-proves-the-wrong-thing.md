@@ -2120,3 +2120,46 @@ never the point.
 cost from *unit count* without measuring worker time, exactly as I earlier
 inferred read volume from a counter without reading its definition. Unit count
 and unit cost are different quantities, and the codebase emits both.
+
+## A SECOND customer-facing consequence: dashboards miss their rollups
+
+`BaseRollup` is 15.8 % of maintenance time — the second-largest consumer after
+`Dedup`'s 75.9 % — and it is behind:
+
+```
+pending_base_rollup       229          rollup_miss_not_built_total        110
+pending_derived_rollup    412          rollup_miss_stale_coverage_total    61
+                                       rollup_miss_filter_not_eligible     78
+                                       rollup_miss_unaligned_bucket        11
+                                       (every other miss reason: 0)
+```
+
+**641 pending rollup units, and 171 of ~260 routing misses are `not_built` or
+`stale_coverage`** — that is, the query *could* have used a rollup and could not
+because the lane has not caught up. Those queries fall back to scanning raw data.
+
+**So the wide-file problem has two customer-facing consequences, not one:**
+
+1. **`hashes` queries time out** — dedup cannot be skipped, so the predicate is
+   stranded above `DedupExec` (the chain traced earlier).
+2. **Dashboard queries miss their rollups** — the rollup lane is behind, and
+   `not_built` / `stale_coverage` are the two largest miss reasons.
+
+**Both trace to the same root**, with the causal link stated as plausible rather
+than proven: `Dedup` consumes 76 % of maintenance capacity because wide files
+force it to re-read the same data once per bin; everything else — rollups
+included — divides the remainder. **A lane on 16 % of capacity trying to keep up
+with a fleet's worth of rollups is the same starvation the certification path
+suffers.**
+
+**What would confirm it:** if the wide-file cleanup lands and `Dedup`'s share
+falls, `BaseRollup`'s throughput should rise without any change to the rollup
+lane itself, and `rollup_miss_not_built` should fall with it. **That is a clean,
+falsifiable prediction** — and unlike my last two predictions it costs nothing to
+check, because both counters already exist.
+
+**Worth noting what this does to the value of the fix.** The payoff table prices
+`--recompress` in maintenance read reduction. If the freed capacity also clears a
+641-unit rollup backlog and removes 171 query misses, the user-visible return is
+larger than the storage number suggests — and it lands on dashboards, which is
+where most queries actually go.
