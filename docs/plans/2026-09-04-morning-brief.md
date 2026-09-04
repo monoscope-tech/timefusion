@@ -35,6 +35,14 @@ permanently — roughly 1,200x what three hours of compaction achieved.** The co
 column flattens after ~20 cells (732 G → 768 G buys thirty more cells), so that
 is the natural stopping point.
 
+**Verified locally on real prod data**, cutting a sorted 201.5 MiB / 2 M-row file:
+sweep cost fell **8,282 → 4,242 → 2,814 MiB** at 1, 2 and 3 pieces — cost falls
+roughly as `1/pieces`, which is the mechanism. **One correction from that test:**
+pieces are sub-bin only when the cell is DENSE. The whale is 85 GiB/day, so
+512 MiB ≈ 8.7 min (sub-bin) and the projection holds; a sparse cell would gain
+far less. The general rule is **`--recompress` cuts sweep cost by about
+`cell_bytes / 512 MiB`** — large exactly where the cell is large.
+
 **First move: one command, one cell, then re-run
 `scratchpad/wide_rank.py` to confirm the 8.5 %.** A two-hour experiment with an
 unambiguous success criterion.
