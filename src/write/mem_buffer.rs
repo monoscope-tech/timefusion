@@ -3218,6 +3218,56 @@ mod tests {
         assert!(!bucket_overlaps_range(bucket.value(), &(Some(hi + 1), None)), "a bound above every row must still prune");
     }
 
+    /// The same row plus one EXTRA nullable column, which `insert_batch`
+    /// deliberately accepts — this is the shape a new optional field in a
+    /// tenant's ingest stream produces.
+    fn create_test_batch_with_extra_field(timestamp_micros: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("extra", DataType::Utf8View, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![timestamp_micros]).with_timezone("UTC")),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(StringViewArray::from(vec!["test"])),
+                Arc::new(StringViewArray::from(vec![Some("new-field")])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// ONE schema-diverse partition retracts the ordering claim for the WHOLE
+    /// leg — and the leg is all-or-nothing, so every other partition loses it too.
+    ///
+    /// The consequence is out of all proportion to the cause: an undeclared mem
+    /// source makes the `mem ∪ delta` union advertise no ordering (a union is
+    /// ordered only when EVERY child is), `DedupExec` drops to its unbounded
+    /// `full-set` mode, and `ORDER BY timestamp DESC LIMIT n` stops being a
+    /// streaming top-N and materialises the whole window.
+    ///
+    /// `insert_batch` ACCEPTS nullable field additions by design, so one new
+    /// optional field in a tenant's stream is enough to trigger this — which is
+    /// the shape of a query regression that starts at one minute with no deploy
+    /// behind it (prod 2026-09-04 09:58).
+    #[test]
+    fn one_schema_diverse_partition_retracts_the_whole_legs_ordering() {
+        let schema = crate::schema::get_schema("mor_versioned").expect("fixture registered");
+        let ts = 1_700_000_000_000_000i64;
+
+        // Uniform batches sort, so the claim holds.
+        let uniform = vec![create_test_batch(ts), create_test_batch(ts + 1)];
+        assert!(sort_partition(&schema, uniform).is_some(), "a uniform partition must sort, or this test proves nothing");
+
+        // Add ONE batch carrying an extra nullable column — accepted on insert —
+        // and the partition becomes unsortable.
+        let diverse = vec![create_test_batch(ts), create_test_batch_with_extra_field(ts + 1)];
+        assert!(sort_partition(&schema, diverse).is_none(), "a partition mixing schemas is refused, which is what retracts the ordering for the entire leg");
+    }
+
     fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
