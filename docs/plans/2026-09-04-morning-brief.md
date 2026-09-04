@@ -1,5 +1,25 @@
 # Morning brief — 2026-09-04
 
+## IF YOU READ ONE TABLE
+
+Same measurement three hours apart, maintenance running continuously throughout:
+
+| | 3 h ago | now | change |
+|---|---:|---:|---|
+| live files | 8,122 | **7,485** | **−637 (−7.8 %)** |
+| wide files (>50 % of a day) | 1,273 | 1,275 | +2 |
+| wide as a **share** | 15.7 % | **17.0 %** | **worse** |
+| **total maintenance read to sweep once** | **44,130 GiB** | **44,127 GiB** | **−0.007 %** |
+
+**Compaction retired 637 files in three hours and reduced the cost that actually
+matters by three gigabytes out of forty-four thousand.** It succeeded completely
+by its own metric — file count — and the cost it exists to reduce did not move.
+The wide-file *share* rose, because the files being retired are the narrow ones.
+
+**That is the answer to "can we handle 10x": more volume means more compaction,
+and compaction improves its own number while the cost it drives stays flat.
+Scaling the fleet scales the wrong number.**
+
 ## IF YOU READ ONE SCREEN
 
 **The answer to "can we handle 10x".** Dedup consumes **~98 % of the heavy
