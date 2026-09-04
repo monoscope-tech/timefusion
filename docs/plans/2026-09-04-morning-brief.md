@@ -1845,3 +1845,42 @@ Sources: [Delta Lake deletion vectors](https://delta.io/blog/2023-07-05-deletion
 [delta-rs #4079](https://github.com/delta-io/delta-rs/issues/4079) ·
 [ClickHouse part merges](https://clickhouse.com/docs/merges) ·
 [MergeTree engine](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree)
+
+## THE DEDUP DECOMPOSITION — measured at last, and it supports the bin-width lever
+
+Prod quiet for 35 minutes (no deploys), 49 units:
+
+| pass | n | plan | **read+sort** | write | median | max | worker-min | median rows staged |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Pack | 44 | 0.3% | 51.0% | 48.6% | 16.9 s | 367 s | 37.3 | 1,480,926 |
+| **Dedup** | **5** | 0.0% | **60.0%** | 40.0% | 11.9 s | 502 s | 9.1 | **97,306** |
+
+**The answer to the question this instrumentation was built for: dedup's wall
+clock is 60% read-and-sort.** Widening `BIN_MICROS` removes *reads* — the same
+file read once per bin it straddles — so it attacks the dominant phase. Had
+dedup been write-bound, the 5.1x read reduction would have bought far less. **The
+lever is aimed at the right thing.**
+
+**The second number is the read amplification, visible directly:** dedup stages a
+median of **97,306 rows** against Pack's **1,480,926** — 15x fewer — while its
+worst unit runs **502 s** against Pack's 367 s. Dedup does far more work per row
+it writes, which is what "read whole files to remove a few duplicate rows" looks
+like on a clock.
+
+**A correction to my own earlier framing.** On THIS process dedup is 9.1 of 46.4
+measured worker-minutes — about **20%**, not the ~98% quoted throughout this
+document. That 98% came from `work.Dedup.worker_secs / uptime / permits` on a
+different process hours earlier
+([[tf_dedup_is_98pct_of_the_pool_2026-09-04]]). Both can be true — occupancy
+varies with what is queued, and 35 minutes with 5 units is a small sample — but
+**the honest statement is that dedup's SHARE is variable and was measured at ~20%
+here, while its per-unit SHAPE (60% read) is what the lever depends on and is
+consistent across all three lanes** (Pack 51%, Repair 60%, Dedup 60%).
+
+Also worth noting: dedup's worst unit at 502 s sits comfortably inside the 900 s
+deadline, so on this evidence deadline pressure is not currently what bounds it.
+
+**This is the last blocker on the bin-width decision.** The remaining unknown is
+the soak — 6x fewer, larger units against the claim/lease/deadline machinery —
+which needs staging and real object-store latency, not MinIO and not the IO-free
+sim.
