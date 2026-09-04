@@ -101,6 +101,38 @@ A coverage matrix is the cheap version of that checklist, and it is written up i
 **`2026-09-04-lane-coverage-matrix.md`** — including the two lanes that still have
 no "did nothing" signal at all, which is the recommended first task in daylight.
 
+## THE CHAIN COMPLETED END TO END
+
+At **2,726 s (45 min) uptime** — the longest-lived process of the night, and the
+first to carry all four fixes for its whole life:
+
+```
+cert_granted_total   32      (0 in every reading before tonight's fixes)
+dedup_skipped         1      <-- LEFT ZERO FOR THE FIRST TIME
+dedup_eligible     5075
+```
+
+**`dedup_skipped` had been 0 in every single reading all night, and 0 is what the
+whole customer-facing chain reduces to.** A query finally skipped `DedupExec`.
+
+Read this for what it is and nothing more. **One skip in 5,075 eligible scans is
+0.02 % — not a customer-visible improvement**, and I am not claiming the issues
+page got faster. What it *is* is the first evidence that the chain can complete at
+all: before tonight it was structurally impossible, because certification produced
+zero grants, so no date could ever be skippable.
+
+The sequence is now demonstrated end to end:
+
+```
+probes get fair position (c627b356)  ->  grants accrue (0 -> 32)
+  ->  a date's files are proved (78)  ->  a scan skips the dedup (0 -> 1)
+```
+
+What remains between this and the customer's queries is **coverage arithmetic**,
+not a broken mechanism: a query needs EVERY date it reads granted, and 32 grants
+against 1,209 fleet cells is ~2.6 %. That is hours of uninterrupted uptime away —
+which is exactly, and only, decision 2.
+
 ## The first readable process of the night
 
 At 02:2x a process finally reached **1,828 s (30.5 min)** — the longest observed,
