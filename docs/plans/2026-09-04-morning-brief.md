@@ -523,7 +523,16 @@ a tidier table rather than a faster one.
    actually goes — decides whether tiling 4,857 units is a day of maintenance or
    a week, and no other item here can be scheduled without it. Instrumentation
    only, 1132 tests green.
-2. **Build time-ranged unit selection for oversized components.** The actual fix.
+2. **Widen `BIN_MICROS` — the cheapest lever, now sized.** `bins/file` is the read
+   amplification of a bin-scoped rewrite; at today's 10 minutes it is **27.8 mean
+   fleet-wide, 11.35 where the mass is**. At 60 minutes it is 5.20 / 2.52
+   (**5.3x / 4.5x better**); at 120 minutes, 9.4x / 6.8x. **From one constant.**
+   The unresolved risk is that wider bins make units bigger — unless unit cost is
+   bounded by files read rather than bin width, which is precisely what item 1
+   measures. Do not ship this before item 1.
+3. ~~**Build time-ranged unit selection for oversized components.**~~ **REFUTED
+   by simulation** — identical to today's rule (1,405 vs 1,407 overlapping
+   pairs), because those files are never selected at all. The actual fix.
    Not a re-layout: the cut points, time-bounded predicates and sort-ordered
    writer all exist; what is missing is that units select by SIZE. **~58 % of the
    oversized mass is ten cells of one tenant's late July**, so it can start
