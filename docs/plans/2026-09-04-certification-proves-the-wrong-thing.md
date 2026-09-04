@@ -384,3 +384,57 @@ structures**, so a cut-point strategy must be derived from the data (pick the
 next distinct value) rather than from a fixed row or time stride. A fixed stride
 tuned on logs would be 31x off on metrics — the same family of mistake as pricing
 a bin in rows when the deadline is spent on IO.
+
+## What time-ranged compaction would cost, and what it would buy
+
+Computed from `Add.stats` alone (`scratchpad/split_cost.py`): tile every overlap
+component once — merge the ones that fit a bin, cut the oversized ones into
+256 MiB time ranges.
+
+```
+components 1,318   over 8,106 files
+  fit a bin :  1,012  ->  1,012 merge units
+  oversized :    306  ->  3,845 time-ranged units   (919.7 GiB, 5,008 files)
+
+TOTAL UNITS to tile the fleet once: 4,857
+files after: ~4,857   (from 8,106 — 40.1% fewer)
+non-overlap: 13.5%  ->  ~100%   (every output disjoint BY CONSTRUCTION)
+```
+
+**The buy is the whole certification problem.** Once outputs are time-disjoint,
+non-overlap is provable from statistics per file, for free, surviving restarts —
+and the 218:1 decline ratio, the plateau at 52 grants, and `dedup_skipped = 1`
+all stop being about scheduling.
+
+**The cost is 4,857 units of debt paydown, one time.** Per-unit wall time is the
+open variable and it is NOT the sort: tonight's bench put a 211 MB / 2 M-row sort
+at **1.1–2.7 s**, while prod units run ~21 min, so the cost is object-store IO and
+the commit. That difference is the number to establish before scheduling this
+work — it is the difference between roughly one day and roughly one week of
+continuous maintenance.
+
+### The mass is far more concentrated than the fleet numbers suggest
+
+```
+oversized components, largest first        GiB   files  units   cell
+   87.0   121   348   87576849/2026-07-24
+   85.0   116   341   87576849/2026-07-22
+   80.7   104   323   87576849/2026-07-28
+   80.0   114   321   87576849/2026-07-23
+   53.4    76   214   87576849/2026-07-26
+   51.8    70   208   87576849/2026-07-21
+   50.6    70   203   87576849/2026-07-27
+   49.3   101   198   87576849/2026-07-30
+```
+
+**Every one of the eight largest components is the same tenant, on consecutive
+days in late July** — about 538 GiB of the 919.7 GiB oversized total, from ten
+days of one project. This is the whale, and its shape is now exact rather than
+anecdotal.
+
+**That changes the sequencing.** This does not have to be a fleet-wide programme
+before anything improves: **~58 % of the oversized mass is ten cells.** They can
+be tiled independently, in priority order, and the fleet's remaining 298
+oversized components are comparatively small. A targeted paydown of one tenant's
+July is a far easier thing to schedule — and to measure — than "drain the
+backlog".
