@@ -3229,3 +3229,42 @@ was the specific worry.
 **Reading for tomorrow:** if a process that has been up for hours still shows
 median Pack fan-in near 9 and `pack_value_refused_rows` climbing, the guard is
 doing in steady state exactly what it did here.
+
+## Safety check: the guard is not starving packing
+
+The one way this change could be quietly harmful is by refusing so much that
+files accumulate. Checked:
+
+```
+pending_hot_packing         16 -> 16    (flat across every reading tonight:
+                                         uptime 510s, 765s, 3148s, and a restart)
+pending_sealed_consolidation 93 -> 94
+```
+
+**Neither queue trends up.** Packing is keeping pace with a much smaller write
+rate, which is the intended outcome — fewer, higher-fan-in merges doing the same
+file reduction.
+
+### Reconciling the two regimes, honestly
+
+Pack now writes **3.6M rows/hr** against **170M rows/hr** before, at comparable
+ingest (4.0 vs 4.7 M rows/hr). That is a **47x** difference, far more than the
+66% I first measured on a 9-minute window — and more than the guard alone can
+plausibly explain.
+
+**The reconciliation is that the two processes were in different REGIMES:**
+- the 36.5x baseline ran 95 minutes on a process **grinding a backlog** —
+  164 Pack units, much of it re-merging accumulated debt;
+- this process is in **steady state** — 11 Pack units, queues flat, fan-in 9.
+
+**So "36.5x -> 1.1x" is not a like-for-like measurement of the guard, and should
+never be quoted as one.** What is like-for-like and does hold:
+- the guard fires continuously (`pack_value_refused_rows` 6.75M -> 8.91M);
+- median fan-in moved 2-3 -> 9, which is its designed mechanism and nothing
+  else in the system does that;
+- queues are flat, so the reduction is not deferred work piling up;
+- the local benchmark, which IS like-for-like, showed **6.73x -> 2.06x (-69%)**.
+
+**The defensible summary: the guard works as designed and the benchmark's -69% is
+the number to quote. The prod 36.5x -> 1.1x spans a regime change and overstates
+it.**
