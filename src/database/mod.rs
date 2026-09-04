@@ -7935,6 +7935,12 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     let mut bytes = 0i64;
     let mut rows = 0u64;
     let mut selected = Vec::new();
+    // SPAN budget, off unless configured. The output spans the UNION of what is
+    // merged, and every dedup bin overlapping it must read it in full — so an
+    // unbounded union is what makes a merge expensive for the read path. See
+    // `timefusion_compaction_span_budget_bins`.
+    let span_cap = crate::config::try_config().map_or(0, |c| c.buffer.timefusion_compaction_span_budget_bins);
+    let mut span: Option<(i64, i64)> = None;
     for add in candidates {
         // A file at or above target is converged and never packing's work,
         // whatever its tags say — sortedness is Repair's job. This skip must be
@@ -7946,6 +7952,17 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
         }
         if has_unsorted && add.is_sorted_run {
             continue;
+        }
+        // SKIP, not break: candidates are ordered by SIZE, so a later one may
+        // still sit inside the accumulated range even when this one does not.
+        if span_cap > 0
+            && let Some((lo, hi)) = add.event_range
+        {
+            let (nlo, nhi) = span.map_or((lo, hi), |(l, h)| (l.min(lo), h.max(hi)));
+            if !selected.is_empty() && (nhi - nlo) / crate::database::compact::BIN_MICROS + 1 > span_cap {
+                continue;
+            }
+            span = Some((nlo, nhi));
         }
         // ROWS, not just bytes. A byte budget prices a bin by how much it will
         // read; a rewrite costs what it must SORT AND WRITE, which is rows. See
@@ -16285,6 +16302,49 @@ mod tests {
             }
         }
         let _ = &make_batch; // the low-cardinality builder above supersedes it
+    }
+
+    /// The span budget rejects a merge whose OUTPUT would span too many dedup
+    /// bins — and is inert unless configured.
+    ///
+    /// A unit's output spans the union of its inputs, and every dedup bin
+    /// overlapping that output must read it in full. Prod 2026-09-04:
+    /// `SealedConsolidation` units ran p50 74 bins and max 144 (a whole day)
+    /// while `HotPacking` never exceeded 16 — and the packer, which measures
+    /// only bytes and rows, cannot tell the two apart.
+    #[test]
+    fn the_span_budget_rejects_wide_unions_and_is_off_by_default() {
+        const MB: i64 = 1024 * 1024;
+        let bin = crate::database::compact::BIN_MICROS;
+        let f = |path: &str, at_bin: i64| super::TailAdd {
+            path: path.into(),
+            size: 10 * MB,
+            is_sorted_run: true,
+            event_range: Some((at_bin * bin, at_bin * bin + bin / 2)),
+            rows: Some(1_000),
+        };
+        // Two files 100 bins apart: a merge of them spans ~101 bins.
+        let far = vec![f("a", 0), f("b", 100)];
+
+        // DEFAULT (no config in a unit test => cap 0): both are taken, exactly
+        // as today. This is the assertion that keeps the branch safe to merge.
+        assert_eq!(
+            super::select_coordinator_compaction_candidates(far.clone(), super::COORDINATOR_SEALED_TARGET_BYTES).len(),
+            2,
+            "with no span budget configured the packer must behave exactly as before"
+        );
+
+        // The union arithmetic the budget applies, asserted directly so the
+        // rule is pinned even though a unit test cannot set the global config.
+        let span_bins = |a: &super::TailAdd, b: &super::TailAdd| {
+            let (l1, h1) = a.event_range.expect("range");
+            let (l2, h2) = b.event_range.expect("range");
+            (h1.max(h2) - l1.min(l2)) / bin + 1
+        };
+        assert_eq!(span_bins(&far[0], &far[1]), 101, "two files 100 bins apart union to ~101 bins");
+        assert!(span_bins(&far[0], &far[1]) > 16, "and 101 exceeds the 16-bin separation measured in prod");
+        let near = [f("c", 0), f("d", 3)];
+        assert!(span_bins(&near[0], &near[1]) <= 16, "adjacent files stay well inside it, so hot packing is untouched");
     }
 
     /// A bin is capped by ROWS as well as bytes, because rows are what it costs.

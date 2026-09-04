@@ -1475,6 +1475,28 @@ pub struct BufferConfig {
     /// `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`). Off until
     /// staging proves it: the skip only fires after an unclean restart, which
     /// cannot be induced on the read-only prod host.
+    /// Reject a compaction candidate that would push the merged output's UNION
+    /// SPAN past this many dedup bins. **0 disables it, which is the default.**
+    ///
+    /// A unit's output spans the union of what it merged, and a dedup bin must
+    /// rewrite every file overlapping it — so a wide output is read once per bin
+    /// it touches, forever. The packer's other budgets are BYTES and ROWS;
+    /// neither is even correlated with span. Prod 2026-09-04 measured 24 units:
+    /// `HotPacking` never exceeded **16 bins** (13 of 13) while
+    /// `SealedConsolidation` ran **p50 74, max 144** — a full day from one unit
+    /// (`docs/plans/2026-09-04-certification-proves-the-wrong-thing.md`).
+    ///
+    /// **Off by default because the trade is real and unpriced.** At 16 this
+    /// leaves hot packing untouched and rejects essentially all sealed
+    /// consolidation — which cannot pick narrower inputs, so a bound effectively
+    /// disables that lane. Whether that is right depends on the file-count win
+    /// it gives up against the read amplification it stops, and that comparison
+    /// needs the per-unit cost decomposition (`prep/unit-phase-timers`).
+    ///
+    /// Candidates with no event range are NO OBJECTION, matching how the row
+    /// budget treats an absent `numRecords`.
+    #[serde_inline_default(0)]
+    pub timefusion_compaction_span_budget_bins: i64,
     #[serde_inline_default(false)]
     pub timefusion_landed_skip_enabled: bool,
 }
