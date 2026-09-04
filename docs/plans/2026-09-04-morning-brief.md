@@ -241,6 +241,40 @@ page a customer uses to decide what is broken.
 Note the dashboards are the opposite shape: the top *endpoint* hash matches **90 %**
 of rows, so those panels never stood to gain. Don't quote one "hashes" number.
 
+## A wall-clock-dependent test failure on master (not from tonight's fixes)
+
+`dedup_compaction_test::a_chart_under_a_derived_table_routes_and_agrees_with_raw`
+fails on master right now. **It is not a regression from tonight's four fixes:**
+it fails identically at `c627b356`, and that same commit ran the entire suite
+green (1355/1355) about two hours earlier. Same code, different answer.
+
+The miss reason it prints is **`tiny_interior=1`** — a rollup-routing refusal
+that depends on where `now()` falls relative to bucket boundaries. So the test is
+**wall-clock dependent**: it will fail CI at some times of day and pass at
+others. It uses real time where this repo has a virtual clock (`crate::support`)
+built precisely for this.
+
+Worth fixing on its own merits, and worth knowing before anyone reads a red CI
+run tonight as evidence against the four fixes.
+
+## A branch is ready for review: `prep/otel-metrics-collapse`
+
+Pushed as a branch, deliberately **not** master, so it does not deploy
+(`deploy.yml` triggers on master only). It contains the `otel_metrics`
+conversion described in `2026-09-04-otel-metrics-never-got-the-collapse.md`:
+
+- `dedup_keys` widened to the sort prefix — the same change logs got on
+  2026-09-02, which this table never received;
+- `FORMAT_VERSION` 2 → 3, which `read/mod.rs:2823` already documents as the only
+  coupling a widening needs (the sort order and every existing footer are
+  untouched, because `sorting_columns` does not change);
+- `every_merge_on_read_table_can_take_the_streaming_collapse`, a guard verified
+  to fail on the un-widened schema.
+
+Its correctness precondition is measured, not assumed: **22,773,893 rows across
+186 files and all three heavy tenants, identical key cardinality every time.**
+Full lib suite green (1133).
+
 ## Decisions that are yours
 
 1. **The monoscope `hashes` append-only contract.** If tags are *meant* to be
