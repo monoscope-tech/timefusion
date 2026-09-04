@@ -1138,3 +1138,36 @@ to the same instant.
 
 **Still open:** `ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering`
 remains intermittent (1 of the 3 verification runs). Untouched by this fix.
+
+## The other e2e flake: the fixture, not the repair
+
+`ordering_pushdown::one_unsorted_file_does_not_cost_the_majority_its_ordering`
+was the second gate blocker. Comparing a passing plan against a failing one,
+then adding a `numRecords` inventory of the live Delta files, settles it:
+
+| | live files | ordering claim |
+|---|---|---|
+| passing | **2** — one 6-row compacted file, one 3-row flush | the 3-row file declares `[timestamp DESC, service, id]` |
+| failing | **3** — 6-row compacted, then **1-row** and **2-row** | **none of the three declares anything** |
+
+The test intends "one non-conforming file beside one conforming file". When the
+last flush lands as two files instead of one, the 2-row file holds `s-7, s-8` in
+**ascending** order and declares no `timestamp DESC` footer, and the 1-row file
+declares nothing either. `repair_isolated_scan_ordering` needs *some* child to
+carry an ordering (`children.iter().find_map(|c| c.properties().output_ordering())`)
+— with none, it bails, the union advertises nothing, `DedupExec` drops to
+unbounded `full-set`, and the `LIMIT 3` becomes a blocking `SortExec`. Exactly
+the shape the test exists to catch, produced by the fixture rather than by a bug.
+
+**So the repair was never broken, and there is no prod ordering intermittency
+here** — I had flagged one as the first hypothesis; it is refuted. What splits
+the flush is that three separate `INSERT` statements are three MemBuffer batches,
+and whether the flush coalesces them into one Delta file is a timing decision.
+Raising the periodic flush interval did **not** fix it (still 3 files), which
+rules out the background flush task; issuing the three rows as **one** statement
+addresses it at the source.
+
+Two guards added so this cannot silently return: the fixture now asserts its own
+shape (`n == 2`) *before* the plan assertions — "3 files where 2 were intended"
+is a different bug from "the claim was lost", and reading that off a physical
+plan cost hours — and the failure message carries the live-file inventory.
