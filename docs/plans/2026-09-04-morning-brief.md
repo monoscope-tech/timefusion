@@ -120,10 +120,38 @@ produce. I would still call it *one* process rather than a trend, but it is the
 first evidence that the certification path can produce grants at all when
 something runs longer than half an hour.
 
+**Confirmed WITHIN one process, which is the methodologically strong form.** Two
+reads 50 s apart on the same process: `cert_granted_total` **27 → 29**, and
+`cert_slice_files_proved` up to **78**. That is a delta inside a single lifetime,
+not a comparison across processes, so it is immune to the noise that made me
+retract the earlier 0 → 2. **Certification is actively granting, at roughly two
+grants per minute.**
+
 **`dedup_skipped` is nevertheless still 0**, and that remains the honest bottom
 line. A query loses its `DedupExec` only when **every** date it reads is granted,
 so 27 grants spread across projects and dates need not unblock a single query.
 The customer-facing chain is **not yet closed.**
+
+### Grants are produced; COVERAGE is the next wall
+
+29 grants and 78 proved files, against **4,705 eligible scans with zero skips**
+and a fleet of **1,209 partition cells** (the census in
+`2026-09-04-lane-coverage-matrix.md`'s companion). That is roughly **2.4 % cell
+coverage**, and the per-date skip requires **every** date a query reads to be
+granted — so at 2.4 % essentially no real query window is fully covered.
+
+This is a genuinely different state from where the night started. Then, the
+question was "why does certification never grant?" — which turned out to be
+starved probes and a starved dedup lane. Now grants are being produced steadily
+and the question becomes **"how long until enough of them accumulate to cover a
+query window?"** That is arithmetic on the grant rate against 1,209 cells, and it
+is the first time that arithmetic has been possible.
+
+It also re-points at decision 2: at ~2 grants/min, covering a meaningful fraction
+of the fleet takes hours of **uninterrupted** uptime, and grants do not survive a
+restart (`dedup_clean_fp` is process-local, persisted best-effort). A process
+killed every 20 minutes can never accumulate coverage no matter how fast it
+grants.
 
 **The backlogs are still growing**, not shrinking: `pending_dedup` 2,185,
 `pending_sealed_consolidation` 231, `pending_base_rollup` 257 — all above their
