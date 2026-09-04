@@ -19,6 +19,20 @@ expensive thing in the fleet for dedup.
 read.** Several span 100 % of their day, so a 1 GiB file is read 144 times per
 sweep: 142 GiB of reading for 1 GiB of data.
 
+**And for the 100x prospect specifically — this is an EXPONENT, not a constant.**
+Maintenance cost today is `data x bins_per_file`, and `bins_per_file` (27.8 mean)
+**itself grows with volume**, because compaction widens files as it merges and
+components weld faster at higher ingest. **So cost scales WORSE than the data.**
+With span-bounded output `bins_per_file = 1` by construction and it scales *with*
+the data. Nothing else moves that exponent — not pool size, not the scheduler,
+not the certification design.
+
+So the answer is not "N times more machines". It is: **a 100x tenant on today's
+layout needs considerably more than 100x the maintenance, and the multiplier is
+not knowable in advance because it depends on how that tenant's writes weld. Fix
+the exponent and 100x data is 100x maintenance — a capacity question rather than
+an architectural one.**
+
 **Do this first — it is a command, not a project:**
 
 ```
