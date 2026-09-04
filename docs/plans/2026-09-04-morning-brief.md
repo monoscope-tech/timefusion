@@ -1611,3 +1611,55 @@ diverse partitions sortable** (unify to the table schema before sorting) rather
 than to retract globally — and the cost the original comment was avoiding should
 be measured against a blocking sort of the whole window, which is what it is
 actually being traded for.
+
+## Every ordering hypothesis is refuted. It is memory-pool contention.
+
+`4187ecde` live, 685 s uptime, 6,073 queries, 200 mem∪delta scans:
+
+```
+mem_ordering_declared              506      ordering_repair_applied    0
+mem_ordering_unsorted                0      ordering_repair_declined   0
+mem_ordering_rejected                0      ordering_repair_no_claim   0
+mem_sort_retracted                   0
+mem_sort_retracted_schema_diverse    0
+```
+
+**The ordering claim is intact on every scan — 506 declarations, zero
+retractions.** So the schema-diverse retraction, though real and now pinned by a
+unit test, is NOT what is happening in prod. The plans are streaming.
+
+That closes the whole ordering family. Four hypotheses, four refutations, each by
+measurement rather than argument:
+
+| hypothesis | refuted by |
+|---|---|
+| my deploy caused it | failures start 2 h after it |
+| Delta-side repair / the 64 MB budget | `ordering_repair_declined` = 0 / 6,073 |
+| dedup keys not leading the sort | schema fact — they do |
+| the `jsonb_build_array` projection | local test streams: SPM + bounded dedup + `fetch=3` |
+| mem leg loses its ordering claim | 506 declared, 0 retracted |
+
+**What is left is the one thing that was in front of me the whole time:** the
+errors name *several concurrent* `ExternalSorter`s as the top consumers, and they
+appear in **both** the query path and `maintenance-worker` ("Light optimize
+staging failed: Not enough memory to continue external sort"). Maintenance
+rewrites and customer queries draw on the same memory pool. **The plans are fine;
+the pool is oversubscribed.**
+
+**And that is not a separate problem from this document — it is the same one.**
+Maintenance is saturated at 1x (completions flat under 10x load, dedup holding
+9.76 of 10 heavy permits continuously). A saturated maintenance lane running
+continuous large sorts is now taking enough of the shared pool that customer
+`ORDER BY ... LIMIT` queries cannot reserve. **The capacity problem has stopped
+being a backlog statistic and started failing customer queries.**
+
+**That reframes the priority.** Everything in this document about unit count and
+bin width is about making maintenance cheaper. This incident says the deadline
+for that is not "before the 100x customer" but now.
+
+**Next measurements, both cheap and neither taken yet:**
+1. Attribute the pool: are the top consumers at failure time maintenance sorts or
+   query sorts? The error text lists consumers but not their lane — labelling
+   reservations by lane is the fix.
+2. `datafusion.runtime.memory_limit` vs the actual concurrent demand: how much of
+   the pool does maintenance hold at steady state?
