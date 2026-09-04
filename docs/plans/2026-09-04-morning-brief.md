@@ -3318,3 +3318,39 @@ by 3x by measuring it against the wrong variable.
 neither of which is an architectural rewrite — one already shipped, one a
 re-measurement on prod hardware. It does not demonstrate 10x, and the caveats
 above are not small. But the gap is now a factor of ~1.5, not a factor of 10.
+
+## Simulated directly: the guard's 5.3x is real, the envelope lever is worth ZERO
+
+The sim takes `--workers`, so both levers can be tested at 10x load rather than
+argued about. 24 virtual hours, seed 1, `--mint --streams N`:
+
+| scenario | pending_end | executions |
+|---|---:|---:|
+| 10x load, guard OFF (740 streams) | **211,356** | 794 |
+| 10x load, guard ON (140 streams ≡ 5.3x fewer units) | **39,756** | 794 |
+| 10x + guard + **2x workers** | 39,378 | **1,473** |
+
+**Two results, one confirming and one refuting my own claims:**
+
+1. **The guard's count-axis benefit is CONFIRMED: 211,356 -> 39,756, a 5.3x
+   backlog reduction at 10x load.** That is the first independent check of the
+   ~3.3x/5.3x estimate, and it lands at the top of the range.
+
+2. **Doubling workers is worth NOTHING: 39,756 -> 39,378 (0.9%), while
+   executions doubled 794 -> 1,473.** The queue is arrival-dominated in this
+   regime — more workers complete more units without touching the backlog.
+   **So "re-derive the envelope for up to 2x" is refuted**, and my "~6.6x
+   combined, gap of 1.5x" from the previous section is wrong. Combined is ~5.3x,
+   because the second lever contributes nothing.
+
+**Where that leaves 10x, measured rather than estimated:** at 10x load with the
+guard, backlog ends at **39,756 against the 1x baseline of 18,029** — still
+**2.2x above** the level that constitutes keeping up. **The guard closes most of
+the gap (11.6x -> 2.2x) and does not close it.**
+
+**The remaining 2.2x has to come from somewhere other than worker count**, and
+the sim says explicitly where not to look. The candidates left are the ones that
+remove work rather than schedule it faster: deletion vectors for dedup, and
+whatever further raises fan-in beyond 9 (the guard's floor is already at the
+measured knee, so this means changing how files are written, not how they are
+selected).
