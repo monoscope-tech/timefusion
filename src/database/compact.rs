@@ -1147,7 +1147,6 @@ impl Database {
     /// A dup group shares one exact `timestamp` (it is a dedup key), so the group's bin is derived
     /// exactly. Only valid when `timestamp` is a dedup key.
     pub(crate) async fn probe_dup_bins(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date_str: &str) -> Result<HashSet<i64>> {
-        const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
         let schema = schema_or_default(table_name);
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;
         let safe_pid = project_id.replace('\'', "''");
@@ -1940,6 +1939,29 @@ impl Database {
 /// costs TWO full external sorts because the window normalizes its partition
 /// ordering to ASC and can therefore never produce the DESC output order
 /// (measured 2026-09-02: 2 `SortExec` under every SQL formulation tried).
+/// Width of a dedup "dirty bin" — THE definition, used by the producer
+/// (`write.rs`), the prober (`probe_dup_bins`) and the drain (`maintain.rs`).
+///
+/// It was a `const` copy-pasted into all three; they must agree or a bin marked
+/// dirty by one is never found by another, so it lives here now.
+///
+/// **This width is the read-amplification knob.** A dedup unit must rewrite every
+/// file overlapping its bin, and files span 45-90 minutes, so a narrow bin does
+/// not read less — it reads THE SAME FILES once per bin. Measured over the 95
+/// prod cells holding 17+ files
+/// (`docs/plans/2026-09-04-certification-proves-the-wrong-thing.md`):
+///
+/// | width | unit size | total read to sweep once |
+/// |---|---|---|
+/// | 10 min | 1,469 MiB | 19,530 GiB |
+/// | 60 min | 1,734 MiB (+18%) | 3,847 GiB (**5.1x less**) |
+///
+/// Widening is therefore the cheapest known lever on dedup, which consumes ~98%
+/// of the heavy maintenance pool. It is NOT changed here: 6x fewer, larger units
+/// interact with the claim/lease/900s-deadline machinery in ways statistics
+/// cannot see, and that wants a soak.
+pub(crate) const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+
 pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> bool {
     !schema.dedup_keys.is_empty()
         && schema.sorting_columns.len() >= schema.dedup_keys.len()

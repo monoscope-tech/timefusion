@@ -5723,7 +5723,7 @@ impl Database {
             info!(table_name, event = "dedup_drain_flush_yield");
             return Ok(());
         }
-        const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+        use crate::database::compact::BIN_MICROS;
         // Eligible bins drained per table per tick. 8 couldn't keep up with the
         // enqueue rate (prod backlog 3341, 2026-07-20); 128 was sized for the
         // per-bin-probe cost model and drained a 22k backlog in ~a day. With

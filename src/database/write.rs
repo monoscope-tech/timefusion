@@ -499,7 +499,7 @@ impl Database {
         } else {
             // Dirty-bin granularity, intentionally independent of MemBuffer's (configurable,
             // currently 5-min) bucket duration — the two ideas coincide at "10 min" only historically.
-            const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+            use crate::database::compact::BIN_MICROS;
             batches
                 .iter()
                 .filter_map(|batch| batch.column_by_name("timestamp"))
