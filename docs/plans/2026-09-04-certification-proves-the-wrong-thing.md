@@ -471,3 +471,51 @@ for **which files a unit selects** — good enough that it exposed tonight's
 livelock — and **nothing at all for what a unit costs.** Adding four timers around
 the existing staging loop is a smaller change than any fix shipped tonight, and
 it is what converts "drain the backlog" from an aspiration into a schedule.
+
+## The drain is real, and it does NOT produce disjointness — measured 90 minutes apart
+
+Two runs of the same statistics-only measurement, ~90 minutes apart, on the same
+long-lived process:
+
+| | earlier | +90 min | change |
+|---|---:|---:|---|
+| live files | 8,122 | **7,781** | **-341 files** |
+| disjoint (all cells) | 13.5 % | 14.1 % | +0.6 pt |
+| cells 17-64: files | 3,114 | 2,983 | -131 |
+| cells 17-64: **disjoint** | 33 | **23** | **-10** |
+| cells 65+: files | 3,429 | 3,168 | -261 |
+| cells 65+: **disjoint** | 10 | **10** | **0** |
+
+**Compaction is unambiguously working: 341 files retired in ninety minutes, about
+3.8 files/minute, concentrated in exactly the big cells.** That settles any doubt
+that the lane is productive once a process is left alone.
+
+**And disjointness did not move.** Fleet-wide it went 13.5 % → 14.1 %, which is
+the single-file cells drifting. In the cells that hold 81 % of the data it is
+**flat at 0.3 %** for 65+ and actually **fell** for 17-64. Hundreds of files were
+merged away and the overlap property is exactly where it started.
+
+**This is the prediction of merge-but-never-split, confirmed in real time.**
+Merging files inside a cell reduces the count; it does not reduce overlap,
+because units select files by SIZE and each unit's output therefore spans the
+others' ranges. The property the read path needs is untouched by the work the
+maintenance lane is doing.
+
+### It separates the night's two competing explanations, and both are partly right
+
+- *"The queue drains linearly, so the deploy cadence is the whole problem."*
+  **True of file count** — 3.8 files/min, and it only happens on an unrestarted
+  process.
+- *"It asymptotes at the frozen mass, so the split defect is the whole problem."*
+  **True of disjointness** — 0.3 % before, 0.3 % after, 261 files later.
+
+So they are not rivals. **Draining fixes fragmentation. Only splitting fixes
+overlap.** And it is overlap, not fragmentation, that keeps `dedup_skipped` at 1,
+certification declining 218:1, and the customer's `hashes` predicate stranded
+above `DedupExec`.
+
+**The practical consequence is uncomfortable and worth stating plainly: letting
+the maintenance lane run to completion — even for many uninterrupted hours —
+would not fix the customer's queries.** It would leave a tidier table with the
+same overlap. That is the strongest argument yet for the time-ranged unit
+selection, and it is now an observation rather than an inference.
