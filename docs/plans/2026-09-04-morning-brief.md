@@ -1925,3 +1925,58 @@ read-side lever helps it less. Two consequences:
 better sample than anything quoted earlier tonight, and it may still not be
 steady state. The stable quantity across every sample is the per-unit read/write
 *shape*; every *share* number I have produced has moved.
+
+## 95 quiet minutes, 176 units: the bin-width lever is worth ~4%, not 5x
+
+| pass | n | read+sort | write | median | max | worker-min | **share** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Pack | 164 | 40.4% | **59.3%** | 18.0 s | 367 s | 124.1 | **85.3%** |
+| Dedup | 11 | **62.1%** | 37.8% | 8.5 s | 502 s | 11.0 | **7.5%** |
+| Repair | 1 | 48.7% | 51.3% | 625 s | 625 s | 10.4 | **7.2%** |
+
+**Three things, and two of them overturn what I have been recommending.**
+
+**1. Dedup's SHAPE is rock solid: read+sort 60.0% → 60.8% → 62.1%** across three
+growing samples. That part of the story survived everything.
+
+**2. Dedup's SHARE has collapsed monotonically: 98% → 20% → 13.4% → 7.5%.**
+Every larger, quieter sample halved it. **Pack is 85.3%.**
+
+**3. Pack is WRITE-bound, and increasingly so: read+sort 51% → 46% → 40.4%.** The
+dominant lane spends 59.3% of its time writing. **A read-side lever does not
+help the lane that consumes six-sevenths of maintenance.**
+
+### The arithmetic I should have done before championing bin widening
+
+Widening cuts object-store READS ~5.1x. Its effect on maintenance worker time is
+bounded by:
+
+```
+dedup share 7.5%  x  read+sort 62.1%  x  (1 − 1/5.1)  ≈  3.7%
+```
+
+**So the ceiling is ~4% of maintenance worker time — not 5x anything.** And that
+is a CEILING, because `upstream_secs` is time blocked in `stream.next()`, which
+conflates **scan and sort**. Widening removes reads; it does not remove the sort.
+The addressable fraction is therefore *smaller* than 62.1%, by an amount this
+instrumentation cannot separate.
+
+**The 5.1x figure was never wrong — it is bytes read, which is a real IO and cost
+saving, and it reduces cache pressure. I repeatedly let it stand in for a
+throughput win it does not deliver.**
+
+### What the data actually points at
+
+- **One Repair unit (625 s) is 7.2% of all worker time** — on its own, nearly the
+  entire dedup lane. Pack median is 18 s. This is the heavy tail, now measured
+  three times (2 Repair units = 29%; one dedup unit = 80% of its lane; one Repair
+  unit = 7.2% of everything). **`c3412de7`'s pressure scaling targets exactly
+  this**, and it ships in shadow mode so the taper can be chosen from
+  `pressure_scale_bytes_withheld`.
+- **Pack's write cost is the largest single line item in maintenance** — 59.3% of
+  85.3% ≈ **51% of all maintenance worker time is Pack writing**. Nothing in this
+  document addresses it. That is where the next investigation belongs.
+
+**Standing caveat:** one process, 95 minutes. But the direction has been
+consistent across four samples, and the two quantities that never moved are the
+per-unit read/write shapes and the presence of a dominating heavy tail.
