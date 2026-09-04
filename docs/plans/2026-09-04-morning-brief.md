@@ -2453,3 +2453,54 @@ exist — the same gap that made every other cliff tonight invisible.
 but to stop the un-masked rows reaching the unordered dedup path — i.e. the
 ordering repair, which is exactly what `pending_repair = 252` is blocking.
 **Everything converges on the repair backlog.**
+
+## Status at hand-off — what is deployed, what is observed, what is not
+
+**Live on prod (`1f9e2402`):**
+
+| change | deployed | observed doing anything? |
+|---|---|---|
+| query pool `FairSpill` | yes | **YES** — 26 errors/15 min → 0 |
+| `COUNT(*)` mask fix | yes | **YES** — 4-of-7 rows → all 7 |
+| repair 1 → 4 files/pass | yes | **NO** — `pending_repair` still 252 |
+| unordered leg 64 → 1024 MiB | yes | **NO** — `ordering_repair_declined` = 0, path not exercised |
+| packer value floor 100 MiB | yes | **NO** — `pack_value_refused` = 0 |
+| pressure scaling | yes | shadow only, by design |
+| dedup bin width knob | yes | inert by design (default 10) |
+
+**Three of the five behavioural changes have not been observed doing anything in
+prod.** They are deployed, gated and counted; the counters read zero. That is not
+the same as "working" and must not be reported as such.
+
+### Two hypotheses I raised and then had to drop
+
+1. **"The packer floor reliably SIGSEGVs."** Wrong. 3 runs on a laptop at 98%
+   disk under parallel builds; it does not reproduce (3 batch-queue runs, 3 full
+   suites, lldb, and a full gate all clean). I disabled the largest measured
+   lever on that, and the user challenged it.
+2. **"The query wall is a function of process age."** Not supported. The curve is
+   non-monotonic — 8.5 min gave 813/588 ms while 20 min gave 234/277 ms. Variance
+   with concurrent load exceeds any age trend.
+
+**The pattern across the whole session is one thing: I formed conclusions from
+small samples faster than the data justified, and the counters I shipped are what
+kept catching it.** Every claim that survived came from a computation over
+matched windows; every claim that fell came from a correlation.
+
+### What is genuinely established
+
+- **Write amplification is 36.5x** (7.5M rows ingested, 274.1M written, matched
+  windows) against a `log_fanin` floor of **~1.7x**.
+- **82.5% of packing write volume is 2-file merges** delivering **9.9%** of file
+  elimination — 115x worse per file removed.
+- **The system does not keep up at 10x**: completions flat within 6%, backlog
+  11.6x.
+- **Dedup is 13.4% of worker time, not 98%**; Pack is 86.6% and write-bound.
+- **The log explorer walls past ~2.5 days** on an aged process, with 252 files
+  pending repair.
+
+### What to watch next
+
+`pack_value_refused_bytes` (does the floor ever engage?), `pending_repair` (does
+4-per-pass drain 252?), and the window ladder on an aged process (does the wall
+return?). All three are counters that already exist; none needs new code.
