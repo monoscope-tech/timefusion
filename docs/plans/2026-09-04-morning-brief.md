@@ -186,7 +186,16 @@ night's only end-to-end result. The src is byte-identical to the tested branch
 (1132 lib tests, lint, fmt, behaviour-neutral), so I did **not** revert — a revert
 is another restart for no safety gain. **Review it after the fact.**
 
-**Merge-ready branches, none deploying:** ~~`prep/bin-width`~~ (see above) (single-sources
+**Branches ready, none deploying:**
+
+| branch | what | risk |
+|---|---|---|
+| `prep/unit-phase-timers` | read/sort/commit decomposition per unit — **merge first**, it prices every other decision | instrumentation only |
+| `prep/span-budget` | `timefusion_compaction_span_budget_bins`, **default 0 = off** — rejects a merge whose output union exceeds N dedup bins | no behaviour change until enabled; test asserts the default path is unchanged |
+| `prep/otel-metrics-collapse` | widen `otel_metrics` `dedup_keys` to its sort prefix, off the 20-58x window path | correctness verified on 22.8 M rows, 3 tenants |
+| `scratch/replace-where-deadlock-v2` | the scoped-recompress experiment | **DO NOT MERGE** — lifts a safety guard |
+| ~~`prep/bin-width`~~ | already on master by accident (see above) | reviewed after the fact |
+ (single-sources
 `BIN_MICROS`, adds `compaction_unit_span` reporting), `prep/unit-phase-timers`
 (read/sort/commit decomposition), `prep/otel-metrics-collapse` (correctness
 verified on 22.8 M rows).
