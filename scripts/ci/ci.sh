@@ -263,7 +263,6 @@ test_env() {
          AWS_REGION=${AWS_REGION:-us-east-1} \
          AWS_S3_BUCKET=${AWS_S3_BUCKET:-timefusion-test} \
          AWS_S3_ENDPOINT=${AWS_S3_ENDPOINT:-http://127.0.0.1:9000} \
-         TIMEFUSION_TEST_S3_ENDPOINT=${TIMEFUSION_TEST_S3_ENDPOINT:-http://127.0.0.1:9000} \
          AWS_ALLOW_HTTP=true \
          AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin} \
          AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin} \
@@ -276,6 +275,23 @@ test_env() {
          TIMEFUSION_FOYER_METADATA_MEMORY_MB=10 TIMEFUSION_FOYER_METADATA_DISK_MB=50 \
          TIMEFUSION_FOYER_SHARDS=2 \
          CARGO_TERM_COLOR=always RUST_BACKTRACE=1 CARGO_INCREMENTAL=0
+  # Pin the harnesses to a local MinIO ONLY when one actually answers.
+  #
+  # `TIMEFUSION_TEST_S3_ENDPOINT` is the FIRST branch of `ensure_local_minio`, so
+  # exporting it unconditionally made every later fallback unreachable — including
+  # the testcontainer the e2e harness is supposed to start for itself. `e2e`
+  # declares `docker`, NOT `minio` (ci/checks.tsv), precisely because it brings its
+  # own; but only `make ci` runs `compose up -d --wait minio`, so on every GitHub
+  # run the variable pointed at a MinIO nobody had started and all 62 e2e tests
+  # died in ~0.1s on `create_bucket ... ConnectionRefused (127.0.0.1:9000)`.
+  #
+  # It read as a code failure and was not one, which is the expensive part: two
+  # consecutive red E2E jobs on unrelated PRs. Anything already exported still
+  # wins, so a persistent MinIO is unaffected.
+  # shellcheck disable=SC2086
+  if [ -n "${TIMEFUSION_TEST_S3_ENDPOINT:-}" ] || probe_tcp $(url_hostport "$AWS_S3_ENDPOINT"); then
+    export TIMEFUSION_TEST_S3_ENDPOINT=${TIMEFUSION_TEST_S3_ENDPOINT:-$AWS_S3_ENDPOINT}
+  fi
   # macOS: the AWS SDK's rustls provider reads native roots from the keychain and
   # can fail to parse any, panicking with "TrustStore configured to enable native
   # roots but no valid root certificates parsed!" — from inside TLS setup, so the

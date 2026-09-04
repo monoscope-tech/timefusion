@@ -2573,3 +2573,63 @@ wide queries, and neither knob shipped tonight addresses it.
 **The tail-pass change is not wasted** — 4 files per pass is still strictly more
 footer repair per pass than 1, and the pass's own budget bounds it. But it should
 not be described as draining the 252.
+
+## THE REPAIR LANE IS THE BOTTLENECK, and it is measured
+
+Sampled 541 wall-seconds apart on one process (no restart between):
+
+```
+work.Repair.worker_secs   1,526 -> 6,577   (+5,051 in 541 s = 9.3 WORKERS CONTINUOUSLY)
+pending_repair              252 ->   252   (UNCHANGED)
+```
+
+**Repair consumes ~9.3 of the 10 heavy permits and the queue does not move.**
+That is the entire heavy pool, spent on the lane whose backlog gates wide
+queries. Note this is a different lane from the one I chased all night — dedup
+was 13.4% of worker time; Repair is currently ~93%.
+
+**The mechanism, and the two counters agree exactly:**
+
+```
+compaction_permits_unavailable      34
+retry.Repair.compaction_incomplete  34
+```
+
+`run_coordinator_compaction_once` returns `BinOutcome::Retry` when it cannot get
+a compaction rewrite permit; `maintain.rs:3511` then re-queues the task with
+`compaction_incomplete` and a 30-second delay. **Claim a task, fail to get a
+permit, retry, repeat.**
+
+**The budget is derived, and small:**
+
+```
+repair_rewrite_budget_bytes = REPAIR_REWRITE_TARGET_FILES (2)
+                            x COORDINATOR_HOT_TARGET_BYTES (256 MiB)
+                            x DECODED_BYTES_PER_COMPRESSED (12)
+                            = 6 GiB decoded
+```
+
+The config's own comment already describes this failure verbatim from an earlier
+occurrence: *"~2 units/hour against `pending_repair = 358` — 173
+`repair_rewrite_permit_busy` events in 40 minutes, a queue flat by arithmetic."*
+**It is flat by arithmetic again.**
+
+### The obvious lever, and why I am NOT pulling it tonight
+
+`REPAIR_REWRITE_TARGET_FILES = 2` sets the budget. Raising it to 4 doubles
+repair's concurrency envelope. But it is deliberately *derived* rather than
+hand-set, and `repair_pool_holdback_slices()` is computed from it — the comment
+records a bench where 2.4x decoded-to-pool FAILED at the 2.39x rung. **Raising
+it without redoing that sizing risks the 2026-09-01 pool exhaustion it exists to
+prevent**, and I have mis-attributed three times tonight on less.
+
+**This is the next change, and it is well-posed:** re-derive the holdback for
+`REPAIR_REWRITE_TARGET_FILES = 4`, confirm the decoded-to-pool ratio stays under
+the failing rung, then raise it. That drains 252, which fixes the unsorted files,
+which is what forces wide queries onto the unordered dedup path.
+
+**Correcting myself once more:** I said earlier tonight that dedup was the lane
+to fix, then that Pack was. On this process it is **Repair** — at ~93% of the
+heavy pool, achieving nothing. The share numbers move with what is queued; the
+only stable way to read them is `work.<Op>.worker_secs` deltas over a known wall
+interval on one process, which is what this section does.
