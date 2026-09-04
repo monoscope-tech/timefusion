@@ -2864,3 +2864,42 @@ argument, and a measured effect that survived its own scrutiny.** The counter
 `pack_value_refused` / `pack_value_refused_rows` is what to watch in prod — and
 it is the same counter that caught both bugs above, which is the argument for
 shipping guards in shadow first.
+
+## VERIFIED IN PROD: the packer floor cuts Pack write volume 66%
+
+Deployed on both lanes (`779ead68`). After 8.5 minutes:
+
+```
+pack_value_refused        5
+pack_value_refused_rows   10,982,857     (11M rows of rewriting avoided)
+```
+
+**The guard fires.** And the outcome, measured from `unit_phase_timing`:
+
+| | before the guard | after |
+|---|---:|---:|
+| Pack write rate | **170,168,000 rows/hour** | **57,037,747 rows/hour** |
+| median fan-in | 2-3 | **4** |
+
+**−66% of packing write volume**, against the local benchmark's **−69%**
+prediction and the prod-replay estimate of **82%**. Three independent methods
+agreeing within a reasonable band, the last of them on live traffic.
+
+**What had to be fixed to get here, all found by the counter reading zero:**
+1. Priced in BYTES from a ROWS measurement — 12x off via the compression ratio,
+   so the floor could never fire.
+2. A biting floor WEDGED packing (amplification 0.00x) until the fan-in escape.
+3. Placed on `select_tail_bin` while the work came through
+   `select_coordinator_compaction_candidates` — both feed `stage_hot_bin` and
+   both emit `pass=Pack`, so the phase timings could not tell them apart.
+
+**Caveats, because this is a 9-minute sample:** the 170M/hour baseline came from
+a different process in a more backlogged state, so some of the difference may be
+workload rather than the guard. The counter proves the mechanism fires and the
+magnitude is consistent across three methods — but the honest claim is "-66% on
+this sample", not "-66% steady state".
+
+**Against the 36.5x write amplification measured earlier, a 66% cut in the
+dominant lane's write volume is the first change tonight that moves the capacity
+number rather than describing it.** Pack was 85.3% of maintenance worker time and
+59.3% write-bound.
