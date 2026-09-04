@@ -410,6 +410,41 @@ fn interleave_probe_groups<T>(dirty: Vec<T>, certify_only: Vec<T>, cap: usize) -
     itertools::interleave(dirty, certify_only).take(cap).collect()
 }
 
+/// How many batch-probe groups a budget can actually FINISH.
+///
+/// Admission was a fixed cap regardless of the deadline. Prod 2026-09-04, every
+/// pass that had a budget: `groups=32 budget_secs=239` produced ~15
+/// `dedup_batch_probe` completions and ~17 `dedup_batch_probe_timeout` — a
+/// second wave that started with less than a probe's worth of deadline left and
+/// threw away a whole-date `GROUP BY` each. Doomed probes are not free: every
+/// one builds a provider and an eager snapshot over a date's files, holds one of
+/// `rewrite_permits`, and leaves allocator churn jemalloc retains as RSS. They
+/// also crowd out the certify-only groups interleaved behind them, which are the
+/// only ones that can GRANT.
+///
+/// `observed = None` (or zero) means nothing has completed yet — admit the cap
+/// and let the pass measure itself. The floor of `permits` is deliberate: a
+/// budget too small for even one probe still admits one wave, so a persistently
+/// pessimistic estimate cannot wedge classification at zero.
+///
+/// ```
+/// # use std::time::Duration;
+/// # use timefusion::database::probe_groups_for_budget as fit;
+/// // The measured prod pass: 239 s, 10 permits, ~159 s a probe -> one wave.
+/// assert_eq!(fit(10, Duration::from_secs(239), Some(Duration::from_secs(159)), 32), 15);
+/// // No observation yet: unchanged from the old fixed cap.
+/// assert_eq!(fit(10, Duration::from_secs(239), None, 32), 32);
+/// // Cheap probes still fill the cap.
+/// assert_eq!(fit(10, Duration::from_secs(239), Some(Duration::from_secs(1)), 32), 32);
+/// // Too small for even one probe: one wave, never zero.
+/// assert_eq!(fit(10, Duration::from_secs(1), Some(Duration::from_secs(159)), 32), 10);
+/// ```
+pub fn probe_groups_for_budget(permits: usize, budget: std::time::Duration, observed: Option<std::time::Duration>, cap: usize) -> usize {
+    let Some(observed) = observed.filter(|cost| !cost.is_zero()) else { return cap };
+    let fit = (budget.as_secs_f64() / observed.as_secs_f64() * permits as f64) as usize;
+    fit.clamp(permits.min(cap), cap)
+}
+
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
 pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
@@ -6146,6 +6181,13 @@ impl Database {
         deadline: std::time::Instant,
     ) -> Vec<(String, String, i64)> {
         use std::sync::atomic::Ordering::Relaxed;
+        // A pass with no deadline left classifies nothing however many groups it
+        // admits, and prod 2026-09-04 ran 21 of 33 of them (`budget_secs=0`).
+        // Returning here leaves every bin queued for a tick that can afford it.
+        let budget = deadline.saturating_duration_since(std::time::Instant::now());
+        if budget.is_zero() {
+            return ready;
+        }
         let mut groups: HashMap<(String, String), Vec<i64>> = Default::default();
         for (project, date, bin) in &ready {
             groups.entry((project.clone(), date.clone())).or_default().push(*bin);
@@ -6190,7 +6232,11 @@ impl Database {
         // this changes ORDER, not how much bin classification gets done — while
         // the certify-only class gets an equal share instead of the remainder.
         let certify_only: Vec<_> = certify_only.into_iter().map(|group| (group, Vec::new())).collect();
-        let groups = interleave_probe_groups(groups, certify_only, 2 * BATCH_PROBE_GROUPS);
+        let observed = match self.dedup_probe_cost_ms.load(Relaxed) {
+            0 => None,
+            ms => Some(std::time::Duration::from_millis(ms)),
+        };
+        let groups = interleave_probe_groups(groups, certify_only, probe_groups_for_budget(permits, budget, observed, 2 * BATCH_PROBE_GROUPS));
         // BEFORE the probes, not only after each one. Every other line in this
         // phase is emitted on completion, so a phase that does not complete
         // prints nothing at all — which is how prod 2026-08-12 spent 55 minutes
@@ -6199,6 +6245,9 @@ impl Database {
             table_name,
             groups = groups.len(),
             budget_secs = deadline.saturating_duration_since(std::time::Instant::now()).as_secs(),
+            // What sized the admission. `probe_cost_ms=0` means the estimate is
+            // still cold and `groups` is the old fixed cap.
+            probe_cost_ms = self.dedup_probe_cost_ms.load(Relaxed),
             event = "dedup_batch_probe_start"
         );
         let clean: HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
@@ -6223,8 +6272,15 @@ impl Database {
                 let table = table.read().await;
                 Self::partition_files_by_pid(&table, &format!("date={date}")).ok().and_then(|mut by_pid| by_pid.remove(&project)).unwrap_or_default()
             };
+            let started = std::time::Instant::now();
             match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
                 Ok(Ok(dup_bins)) => {
+                    // Half-weight EMA: probe cost varies by an order of
+                    // magnitude with a date's file count, so admission must
+                    // track it without chasing a single outlier into either a
+                    // wedged pass or another doomed wave.
+                    let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    let _ = self.dedup_probe_cost_ms.fetch_update(Relaxed, Relaxed, |prior| Some(if prior == 0 { elapsed } else { (prior + elapsed) / 2 }));
                     let stats = crate::observability::maintenance_stats();
                     let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
                     stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
