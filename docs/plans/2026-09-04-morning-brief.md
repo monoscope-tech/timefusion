@@ -170,8 +170,32 @@ series, not a cross-process comparison:
 | 2,726 s | 32 | 78 | **1** |
 | **4,928 s** | **52** | **106** | 1 |
 
-**Grants accumulate steadily at roughly 0.6/min and do not plateau.** That is the
-mechanism working as designed, and it is the clearest single result of the night.
+**CORRECTION — they DO plateau.** I wrote "roughly 0.6/min and do not plateau"
+after the 4,928 s sample. At **5,556 s** — ten minutes later on the same process —
+`cert_granted_total` is **still 52**, where that rate would have predicted ~six
+more. Meanwhile `cert_slice_files_proved` kept climbing, **106 → 127**.
+
+So the shape is a **burst then a stall**, not a steady rate:
+
+| uptime | grants | files proved |
+|---:|---:|---:|
+| 1,828 s | 27 | 78 |
+| 2,726 s | 32 | 78 |
+| 4,928 s | 52 | 106 |
+| **5,556 s** | **52** | **127** |
+
+That divergence — per-FILE proofs still accruing while whole-DATE grants stop —
+is exactly what "certification declines on dirty bins" predicts. The easy dates
+certify early; what remains is dirty everywhere, and a whole-date grant needs a
+complete clean pass that the dedup lane cannot deliver.
+
+**This makes the coverage conclusion worse, and more definite.** It is not that
+blanket coverage takes ~32 hours of uptime. It is that **coverage saturates well
+below what a query needs, and waiting does not fix it** — the remaining dates
+cannot be certified until they are cleaned, and cleaning is the backlog that is
+still growing. One interval is one interval, so treat the plateau as provisional
+until it is re-read; but it is the second reading in a row that contradicts a
+claim I made from a single sample, and the direction is unambiguous.
 
 **But the queue is not converging.** Over the same window
 `pending_dedup` went 2,169 → **2,223**, `pending_base_rollup` 257 → **337**,
@@ -182,10 +206,10 @@ That is the honest answer to the 10x question, and it is not a comfortable one:
 
 - certification was **structurally dead** before tonight and is now **alive and
   accruing** — that part is fixed;
-- but at ~0.6 grants/min against a fleet of **1,209 partition cells**, blanket
-  coverage is **~32 hours of uninterrupted uptime**, and cells are re-dirtied by
-  ingest far faster than that. Blanket coverage is therefore **not reachable by
-  waiting**; it needs either a much higher grant rate or a cheaper proof.
+- but grants **plateaued at 52** while file-level proofs kept climbing, so
+  coverage does not merely accrue slowly — it **saturates**, because the dates
+  that remain are dirty and a whole-date grant needs a clean pass the dedup lane
+  cannot deliver. Coverage is **not reachable by waiting at all.**
 - The cheaper proof is exactly what
   `2026-09-04-certification-proves-the-wrong-thing.md` argues for: certify
   **non-overlap from file statistics** rather than duplicate-freedom from a
