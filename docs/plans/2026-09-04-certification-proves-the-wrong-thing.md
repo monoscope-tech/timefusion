@@ -687,3 +687,51 @@ convergence rule, whether to split, whether more uptime helps — turns on it.
 **And it retires my own framing.** I spent the small hours looking for the thing
 that was stuck. The counters say nothing is stuck; the work is simply far larger
 than the rate, and the rate has never been decomposed.
+
+## The rate, decomposed as far as today's counters allow — and it is brutal
+
+On the long-lived process at **7,148 s** uptime:
+
+```
+work.Dedup.worker_secs        69,752        dedup_bins_committed_total   20
+work.Dedup.progress_rows  19,186,817,032    dedup_waves_committed_total  15
+work.Dedup.rows_dropped          105,053    pending_dedup             2,134
+```
+
+Three ratios, each worth stating on its own.
+
+**1. Dedup is consuming essentially the whole heavy maintenance pool.**
+69,752 worker-seconds in 7,148 wall-seconds is **9.76 workers running
+continuously**, against `HEAVY_REWRITE_PERMITS = 10`. **Dedup is ~98 % of heavy
+maintenance capacity.** Every other lane — packing, consolidation, repair,
+rollups — divides the remaining 2 %.
+
+**2. Each committed bin costs ~58 worker-MINUTES.**
+69,752 / 20 = **3,488 worker-seconds per bin.** At ~1,440 bins across the ten
+whale cells alone, that is ~1,400 worker-hours, or roughly **six days at the
+full ten-permit pool** — for one tenant's ten days.
+
+**3. It processes ~182,000 rows for every row it removes.**
+19.2 **billion** rows through the dedup path to drop **105,053**. That is the
+cost of files straddling ~9 bins each: a bin rewrite must read every overlapping
+file in full, and almost everything it reads is not a duplicate.
+
+**Caveat on ratio 3:** `progress_rows` on this path is fed by BOTH
+`note_unit_progress` (rows written) and `PlanProgress` (plan `output_rows`), so
+19.2 B is an upper bound and may double-count. Halve it and the figure is still
+~91,000 rows read per row removed. Ratio 1 does not depend on it at all —
+`worker_secs` against uptime and permits is arithmetic.
+
+### What this changes
+
+**"Sorting, hotpacking, rollups, dedup should not be breaking a sweat" — dedup is
+using 98 % of the pool to remove a hundred thousand rows.** That is the answer to
+the 10x question in one line, and it is not about scheduling, budgets, livelocks
+or certification: **the work per unit of benefit is four to five orders of
+magnitude too high**, because the physical layout forces every bin to read files
+that overlap it nine deep.
+
+It also reframes everything shipped tonight. The four fixes were real and each
+removed a genuine defect — but they were tuning the allocation of a pool that is
+98 % consumed by an operation doing 182,000x more reading than removing. **The
+layout is the cost. Nothing scheduled on top of it can be cheap.**
