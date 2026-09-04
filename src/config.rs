@@ -1254,7 +1254,22 @@ pub struct CoreConfig {
     pub pgwire_user: String,
     #[serde(default)]
     pub pgwire_password: Option<String>,
-    #[serde_inline_default(60)]
+    /// Interactive statement cap. 60 -> 90 on 2026-09-04: a 30-day dashboard
+    /// aggregate on the whale project MEASURES 44-50 s and was being cancelled at
+    /// 60 s, so the window failed outright while being only marginally over.
+    /// Measured single-query 30 d runs: 30.2 / 37.8 / 43.0 / 44.4 / 48.4 / 50.7 s
+    /// — the distribution straddles 60 s, which is why the same query sometimes
+    /// returned and usually did not.
+    ///
+    /// This is a CAP RAISE, not a speed-up: 30 d is genuinely ~45 s because the
+    /// scan is IO-bound on object-store reads shared with a saturated maintenance
+    /// tier (container CPU is identical with and without the query; ~17 of 48
+    /// cores and ~150-200 MB/s are consumed by maintenance alone). The real
+    /// speed-ups are reading less (dedup skip via certification, or rollups) and
+    /// more concurrent reads — two 15 d queries in parallel do the same work in
+    /// 11.8-21.3 s because in-query concurrency is bounded by the scan's ~22 file
+    /// groups while two sessions get ~44 in flight.
+    #[serde_inline_default(90)]
     pub timefusion_pgwire_max_statement_secs: u64,
     /// How far a session may RAISE its statement timeout by asking for one, in
     /// seconds. 0 (the default) means it cannot: the cap stays
