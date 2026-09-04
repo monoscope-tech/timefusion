@@ -25,6 +25,12 @@
 //! control — it uses the same sampler against a plan that provably reserves. A
 //! green INSERT assertion means nothing without a green control.
 //!
+//! Both inbound routes are covered. `insert_records_batch` sends an INSERT to
+//! the buffered layer when one is configured (prod: `use_queue=buffered_layer`)
+//! and to a synchronous direct-to-Delta commit when none is — and they diverge
+//! below the DataFusion sink, so measuring only the route a bare test config
+//! happens to take would settle the wrong path.
+//!
 //! Requires MinIO on 127.0.0.1:9000 (`make minio-start`).
 
 #[cfg(test)]
@@ -67,14 +73,28 @@ mod query_pool_insert {
         (peak, stop, handle)
     }
 
-    async fn fair_spill_db(test_id: &str) -> Result<Arc<Database>> {
+    /// `buffered` selects which of `insert_records_batch`'s two inbound routes
+    /// the INSERT takes. **Prod is the buffered one** (`use_queue=buffered_layer`);
+    /// without a layer the same statement falls through to a synchronous
+    /// direct-to-Delta commit. They diverge below the DataFusion sink, so a
+    /// measurement of one says nothing about the other and both are asserted.
+    async fn fair_spill_db(test_id: &str, buffered: bool) -> Result<Arc<Database>> {
         timefusion::support::init_test_logging();
         let cfg = minio_test_config(test_id, &format!("/tmp/timefusion-qpool-{test_id}"));
         let mut cfg = AppConfig::clone(&cfg);
         // The pool policy under test. Everything else stays at test defaults so
         // a failure here is about the pool and nothing else.
         cfg.memory.timefusion_memory_pool = timefusion::config::MemoryPoolKind::FairSpill;
-        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let cfg = Arc::new(cfg);
+        let db = Database::with_config(Arc::clone(&cfg)).await?;
+        let db = Arc::new(if buffered {
+            // The same Delta writer prod wires; a layer without one errors on
+            // flush rather than exercising the path being measured.
+            let layer = Arc::new(timefusion::support::test_helpers::test_layer(cfg)?.with_delta_writer(timefusion::server::delta_write_callback(&db)));
+            db.with_buffered_layer(layer)
+        } else {
+            db
+        });
         db.get_or_create_table("test_project", "otel_logs_and_spans").await?;
         Ok(db)
     }
@@ -102,9 +122,24 @@ mod query_pool_insert {
     /// untouched, so the pool's policy cannot bounce them.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_insert_does_not_reserve_from_the_query_pool() -> Result<()> {
+    async fn a_buffered_insert_does_not_reserve_from_the_query_pool() -> Result<()> {
+        assert_insert_reserves_nothing(true).await
+    }
+
+    /// The direct-to-Delta fallback, which does strictly MORE DataFusion work
+    /// than prod's buffered route — it commits the staged write inline.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_direct_insert_does_not_reserve_from_the_query_pool() -> Result<()> {
+        assert_insert_reserves_nothing(false).await
+    }
+
+    async fn assert_insert_reserves_nothing(buffered: bool) -> Result<()> {
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let db = fair_spill_db(&test_id).await?;
+        let db = fair_spill_db(&test_id, buffered).await?;
+        // `insert_records_batch` branches on exactly this, so pin the route
+        // rather than trusting the harness to have wired what it meant to.
+        assert_eq!(db.buffered_layer().is_some(), buffered, "harness did not build the route it claims to measure");
         let mut probe = db.clone().create_session_context();
         db.setup_session_context(&mut probe)?;
         let (peak, stop, sampler) = spawn_pool_sampler(&probe);
@@ -128,8 +163,8 @@ mod query_pool_insert {
         assert_eq!(
             peak.load(Ordering::Relaxed),
             0,
-            "INSERTs reserved from the query pool; FairSpill would slice that reservation and \
-             the 2026-05-28 ingest incident can recur"
+            "INSERTs reserved from the query pool (buffered={buffered}); FairSpill would slice \
+             that reservation and the 2026-05-28 ingest incident can recur"
         );
         Ok(())
     }
@@ -140,7 +175,7 @@ mod query_pool_insert {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_sort_does_reserve_from_the_query_pool() -> Result<()> {
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let db = fair_spill_db(&test_id).await?;
+        let db = fair_spill_db(&test_id, false).await?;
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
