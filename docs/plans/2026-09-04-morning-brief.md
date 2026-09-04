@@ -15,6 +15,12 @@ sweep read. `2026-08-23`: **22 files, 72.7 % wide, 339 GiB.** A partition
 compacted to 22 files is excellent by compaction's definition and the most
 expensive thing in the fleet for dedup.
 
+**Now confirmed LIVE in prod**, by instrumentation that shipped in the accidental
+deploy: `compaction_unit_span` shows **two files merging into an output spanning
+119 bins — 20 hours**, minutes after boot, on ordinary `SealedConsolidation`
+units. And **file count does not track span at all**: 10 files → 8 bins, 2 files
+→ 119. A packer measuring count and bytes is blind to this by construction.
+
 **It is concentrated.** **500 files — 6.5 % — cause 60 % of all maintenance
 read.** Several span 100 % of their day, so a 1 GiB file is read 144 times per
 sweep: 142 GiB of reading for 1 GiB of data.
