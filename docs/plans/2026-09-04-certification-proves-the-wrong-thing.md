@@ -519,3 +519,73 @@ the maintenance lane run to completion — even for many uninterrupted hours —
 would not fix the customer's queries.** It would leave a tidier table with the
 same overlap. That is the strongest argument yet for the time-ranged unit
 selection, and it is now an observation rather than an inference.
+
+## SIMULATION REFUTES the time-ranged proposal — and finds the real rule
+
+Before recommending time-ranged unit selection further, I simulated it against
+today's size-ordered rule on the largest real component
+(`87576849/2026-07-24`, 121 files, 87 GiB):
+
+```
+TIME-RANGED : 120 units   overlapping unit-range pairs: 1,405 of 7,140
+SIZE-ORDERED: 121 units   overlapping unit-range pairs: 1,407 of 7,260
+```
+
+**Essentially identical. The proposal does not work on the shape it was designed
+for.** One unit per file, and their ranges still overlap.
+
+The reason is in the cell's own statistics, which I had not looked at:
+
+```
+whale cell 87576849/2026-07-24, 121 files
+  file SIZE  : p10 668 MiB   p50 1017 MiB   p90 814 MiB
+  files over the 256 MiB target: 99%
+  file SPAN  : p50 6.3% of a day (~90 min)   >50% of a day: 1%
+```
+
+**Ninety-nine per cent of this cell's files are ALREADY over the compaction
+target** — a full GiB each — while overlapping one another across ~90-minute
+spans. So this is not "many small stacked files" at all. My earlier
+"narrow and stacked" characterisation was a fleet average that does not
+describe the mass.
+
+### The actual rule that freezes it
+
+`select_coordinator_compaction_candidates` opens with:
+
+```rust
+// A file at or above target is converged and never packing's work.
+if add.size >= target { continue; }
+```
+
+**So 99 % of this cell is skipped before any selection rule runs.** Time-ranged
+or size-ordered makes no difference — the packer never considers these files at
+all. The cell is, by compaction's own definition, *finished*.
+
+**And that definition is the defect.** "Converged" means *large enough*, which is
+a statement about FRAGMENTATION. The read path does not care about file size; it
+cares about OVERLAP. A cell of 121 mutually-overlapping 1 GiB files satisfies
+compaction completely and defeats the reader completely, and nothing in the
+system currently notices the difference.
+
+That is why disjointness sat at 0.3 % across ninety minutes while 341 files were
+retired elsewhere: **the work was happening in the cells that were already fine,
+and the frozen cells were skipped by design.**
+
+### What this changes
+
+The lever is not how units select among *eligible* files. It is that
+**over-target files are permanently ineligible, so an overlapping cell can never
+be repaired.** Any fix has to make overlap a first-class reason to rewrite a
+file, independent of its size — and rewriting 121 GiB-sized files to disentangle
+them is genuinely expensive, which is presumably why the rule exists.
+
+I am deliberately stopping the design here rather than proposing a replacement
+rule at 04:00 after the last one was refuted by its own simulation. What is
+established, and worth the morning:
+
+1. the frozen mass is **over-target, mutually-overlapping files**, not small ones;
+2. compaction **skips them by design** and always will;
+3. "converged" is defined on size and the read path needs it defined on overlap;
+4. the simulation harness (`scratchpad/sim_timeranged.py`) is written, so the
+   next candidate rule can be tested against real cells before anyone builds it.
