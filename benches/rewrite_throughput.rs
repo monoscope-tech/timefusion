@@ -373,7 +373,21 @@ async fn one_rewrite(path: &str, runtime: Arc<RuntimeEnv>) -> Result<(), String>
     let state = SessionStateBuilder::new().with_config(session("2048", 1)).with_runtime_env(runtime).with_default_features().build();
     let ctx = SessionContext::new_with_state(state);
     ctx.register_parquet("bin", path, ParquetReadOptions::default()).await.map_err(|e| e.to_string())?;
-    let mut stream = ctx.sql(&format!("SELECT * FROM bin{ORDER_BY}")).await.map_err(|e| e.to_string())?.execute_stream().await.map_err(|e| e.to_string())?;
+    let frame = ctx.sql(&format!("SELECT * FROM bin{ORDER_BY}")).await.map_err(|e| e.to_string())?;
+    // THE SORT MUST ACTUALLY RUN, and it silently does not on a fixture written
+    // by our own rewrite: such a file carries footer `sorting_columns` equal to
+    // this ORDER BY, DataFusion declares the scan already ordered, and the whole
+    // ladder degenerates into a scan benchmark that reports zero failures at
+    // every pool and every rung. 2026-09-05: `prod204.parquet` did exactly that
+    // — 8 workers passed at a 2 GiB pool, 4.8x past `SAFE_DECODED_PER_POOL_BYTE`,
+    // because there was nothing to spill. A ladder with no failures anywhere is
+    // a broken probe, and this turns it into a loud one.
+    let plan = frame.clone().create_physical_plan().await.map_err(|e| e.to_string())?;
+    let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+    if !rendered.contains("SortExec") {
+        return Err(format!("the fixture is ALREADY SORTED, so no sort ran and this measures a scan:\n{rendered}"));
+    }
+    let mut stream = frame.execute_stream().await.map_err(|e| e.to_string())?;
     while let Some(batch) = stream.next().await {
         batch.map_err(|e| e.to_string())?;
     }

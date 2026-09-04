@@ -3889,3 +3889,49 @@ and **neither is the coordinator pool**. Same shape as the packer floor's two
 packers and `footer_repair_files_per_pass`'s two repair lanes. The envelope is
 still what those permits express, so the question stands; the 15% is not evidence
 for it and is not quoted as such.
+
+### The first run was a BROKEN PROBE, and the reason matters
+
+The ladder returned **0 failures in every cell** — 8 workers passing at a 2 GiB
+pool, 4.8x past `SAFE_DECODED_PER_POOL_BYTE`. That is not a result. By the
+criterion written above ("the 8 GiB row must reproduce 6 pass / 8 fail or the rig
+is not measuring the same thing"), the rig was invalid and the prediction is
+neither confirmed nor refuted.
+
+**The cause is worth more than the run.** `prod204.parquet` is a file our own
+rewrite wrote, so its footer carries `sorting_columns` **exactly equal to the
+bench's ORDER BY**:
+
+```
+SortingColumn(column_index=0,  descending=True,  nulls_first=True)   # timestamp
+SortingColumn(column_index=82, ...)  # resource___service___name
+SortingColumn(column_index=2,  ...)  # id
+SortingColumn(column_index=9,  ...)  # level
+SortingColumn(column_index=7,  ...)  # status_code
+```
+
+DataFusion reads that, declares the scan already ordered, and **elides the sort**.
+The ladder degenerated into a scan benchmark. 183 MB/s per worker against the
+original ladder's 29 MB/s — a 6x discrepancy I would have had to explain away to
+believe the result.
+
+So: **the bench that sizes the entire maintenance envelope — the 6 slots,
+`COORDINATOR_PER_SORT_BUDGET_BYTES = 1.25 GiB`, `SAFE_DECODED_PER_POOL_BYTE =
+1.79`, `REPAIR_REWRITE_TARGET_FILES = 2` — silently stops measuring a sort when
+handed a current prod file.** Every one of those constants rests on a fixture
+that can no longer be obtained the obvious way, and the failure is silent in the
+direction that says "you have lots of headroom".
+
+Two changes so this cannot recur:
+
+1. `one_rewrite` now renders the physical plan and **fails loudly** if there is
+   no `SortExec` — "the fixture is ALREADY SORTED, so no sort ran". A ladder with
+   no failures anywhere is a broken probe; this makes it say so.
+2. The fixture is a row-shuffled copy written without `sorting_columns`
+   (2,023,604 rows, 98 columns, 0.51 GB uncompressed).
+
+**The hypothesis is re-stated so it does not depend on an absolute decoded size**
+(the shuffled fixture is not the original 2,451 MB/worker file, so the earlier
+prediction table no longer applies): measure the cliff rung at 8 GiB, call it
+`W8`, then linearity predicts `cliff(pool) = W8 x pool / 8`. Pools 2 / 4 / 8 GiB,
+rungs 1-24. A cliff that does not move with the pool refutes it.
