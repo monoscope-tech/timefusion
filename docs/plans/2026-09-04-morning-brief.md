@@ -2358,3 +2358,53 @@ shrinks toward the present.
 
 **This — not bin width, not the packer floor — is what is actually hurting the
 customer today, and it is the thing to fix first.**
+
+## The query wall is GONE — but I cannot attribute it to my fix, and it may be transient
+
+Same query, same project, before and after `1ba789e`:
+
+| window | before | after |
+|---|---|---|
+| 24h | 261 ms | 351 ms |
+| 60h | 2,574 ms | **370 ms** |
+| **3 days** | **FAILED** (10.6 s) | **213 ms** |
+| **7 days** | **FAILED** (8.8 s) | **227 ms** |
+| 14 days | (would have failed) | 732 ms |
+| 30 days | (would have failed) | 1,520 ms |
+
+**Not cache warming:** a *different*, busier project (`dcad860a`, 721k rows/2h,
+never queried during the "before" run) returns 3d in **725 ms** and 7d in
+**506 ms** cold.
+
+**BUT THE ATTRIBUTION FAILS, and this is the honest part.**
+
+```
+ordering_repair_applied  = 0
+ordering_repair_declined = 0
+pending_repair           = 252   (unchanged)
+uptime_seconds           = 279
+```
+
+**The ordering-repair path is not being exercised at all**, so raising
+`timefusion_read_sort_unordered_leg_max_mb` 64 → 1024 cannot be what fixed this —
+the code it governs never runs. And `pending_repair` is unchanged at 252, so the
+repair-throughput change has not drained anything yet either. **Both of my
+changes are, so far, inert.**
+
+**What else differs between the two measurements:** the process is **279 seconds
+old**. The failing measurements were taken on a process ~95 minutes old. The
+2 GiB ceiling is a per-query *unordered keep-greatest* buffer, and a fresh
+process has empty caches, empty certifications and no accumulated state
+competing for memory.
+
+**So the leading explanation is that the wall is a function of process age, not
+of my configuration** — which means **it will come back**. That is a testable
+prediction and the next thing to check: re-run this ladder at ~90 minutes uptime.
+If 3d and 7d fail again, the fix is illusory and the real defect is whatever
+state accumulates with age.
+
+**I am recording this rather than reporting a win** because the "before" numbers
+and the "after" numbers differ in at least three ways (config, process age,
+elapsed maintenance) and I changed all of them at once. That is the same
+attribution error as this morning's revert, and the only reason I caught it here
+is that I shipped a counter that could contradict me.
