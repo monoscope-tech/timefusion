@@ -1353,3 +1353,38 @@ maintenance, which is a capacity question rather than an architectural one.
 Real output will not be perfect, and the residual depends on how tightly the
 writer's byte cut aligns with bin boundaries — the tension quantified in the
 bin-widening section. The claim here is about the exponent, not the constant.
+
+### Operational notes for running `--recompress` against prod
+
+Checked, because "run this command against production" deserves more than a
+recommendation.
+
+**It does NOT start maintenance workers.** `run_optimize_cli` builds its Database
+with `Database::with_config`, and `start_maintenance_schedulers()` is called
+separately from `bootstrap` (`server/mod.rs:126`). So the CLI will not begin
+competing for claims, and will not run the coordinator.
+
+**It DOES load and rewrite a task journal** (`database/mod.rs:3431-3435`:
+`TaskJournal::load` then `requeue_running` then `checkpoint`). That journal lives
+at `cfg.core.timefusion_data_dir`, which is **local**, so from a laptop or a
+runner it touches a local, empty journal and cannot disturb prod's. **Do not run
+this with `TIMEFUSION_DATA_DIR` pointed at the prod volume.**
+
+**The real hazard is Delta commit contention.** `recompress_partition` performs a
+`replace_where` over the partition, and prod's live maintenance may be compacting
+or deduping the same cell at the same time. One of the two will lose its commit.
+That is not corruption — Delta's conditional put is what makes it safe — but it
+means a long recompress can be wasted work if the coordinator lands first, and
+the whale cells are exactly the ones the coordinator keeps claiming.
+
+**So the sequencing that avoids the waste:** pick a cell the coordinator is not
+currently working (the funnel logs which cells are claimed), or accept the risk
+on the first attempt and watch for a commit failure. The night's own evidence
+says the odds are reasonable — those cells are claimed often but complete rarely,
+which is the whole problem.
+
+**And prefer to run it where the bytes are.** The read is object-store-bound and
+an 85 GiB cell is a lot of transfer; a runner in the same region as the bucket
+will finish in a fraction of the time a laptop would. My own measurement of
+3.9 MiB/s from here — explicitly not a prod number — is what that difference
+looks like.
