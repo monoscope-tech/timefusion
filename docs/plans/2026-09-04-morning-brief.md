@@ -556,6 +556,12 @@ a tidier table rather than a faster one.
    **That was wrong — `Add.stats` answers it, and the answer is +18 % for 5.1x.**
    What remains is not a measurement but a **soak**: 6x fewer, larger units
    interact with claim/lease/deadline machinery that statistics cannot see.
+
+   **It generalizes — `otel_metrics` gives 5.5x for +8 %**, with units 5x smaller
+   in absolute terms (277 MiB vs 1,469 MiB). Landing within half a point on two
+   tables of 104 and 12 B/row is why this looks structural rather than a quirk of
+   one shape. **Soak it on `otel_metrics` first:** smallest risk, biggest win, and
+   it is already the table stuck on the slow window dedup path.
 3. ~~**Build time-ranged unit selection for oversized components.**~~ **REFUTED
    by simulation** — identical to today's rule (1,405 vs 1,407 overlapping
    pairs), because those files are never selected at all. The actual fix.
