@@ -3924,11 +3924,7 @@ async fn scoped_recompress_does_not_deadlock() -> Result<()> {
     // of scoping, and the thing a wrong `replace_where` would silently destroy.
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    let rows = ctx
-        .sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{p2}'"))
-        .await?
-        .collect()
-        .await?;
+    let rows = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{p2}'")).await?.collect().await?;
     let n = rows[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
     assert_eq!(n, 40, "a project-scoped recompress must not touch another project's rows");
     Ok(())

@@ -822,8 +822,7 @@ impl Database {
         ctx.register_table("recompress_src", Arc::new(provider))?;
         // `date_str` is a parsed `NaiveDate`; `order_by` uses quoted identifiers.
         let proj_pred = project.map(|p| format!(" AND project_id = '{p}'")).unwrap_or_default();
-        let input_plan =
-            ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{proj_pred}{order_by}")).await?.into_optimized_plan()?;
+        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{proj_pred}{order_by}")).await?.into_optimized_plan()?;
 
         let replace_pred = format!("date = '{date_str}'{proj_pred}");
         let write_result = table_clone
