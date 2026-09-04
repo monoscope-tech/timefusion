@@ -8052,6 +8052,27 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     if !has_unsorted && selected.len() < 2 {
         return Vec::new();
     }
+    // THE SAME VALUE GUARD as `select_tail_bin`, because BOTH selectors feed
+    // `stage_hot_bin` and both emit `pass=Pack` — so the phase timings that
+    // measured the problem cannot tell them apart, and putting the guard on one
+    // lane left it inert. Prod 2026-09-04: 14 two-file Pack units in 15 minutes,
+    // 11 of them above the floor, and `pack_value_refused` stayed 0 because the
+    // work was coming through HERE.
+    //
+    // Same rule, same escape: a bin of `min_files` or more is never refused
+    // (high fan-in is the remedy, not the problem), so this can only remove the
+    // low-fan-in bins that were 82.5% of packing write volume for 9.9% of the
+    // file reduction.
+    let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated);
+    let low_fan_in = selected.len() < 5;
+    if !has_unsorted && low_fan_in && bin_exceeds_value_floor(rows, selected.len(), floor) {
+        let stats = crate::observability::maintenance_stats();
+        stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats.pack_value_refused_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        if floor > 0 {
+            return Vec::new();
+        }
+    }
     selected.into_iter().map(|add| add.path).collect()
 }
 
