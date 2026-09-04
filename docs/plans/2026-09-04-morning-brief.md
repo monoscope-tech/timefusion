@@ -25,6 +25,31 @@ compaction for oversized components**: not a re-layout, just the ability to cut
 one component into bin-sized time ranges. 71 % of components need nothing; 25
 need this; and the 25 are where the bytes are.
 
+### Confirmed in real time, not inferred
+
+The same statistics-only measurement, taken **ninety minutes apart** on one
+long-lived process:
+
+| | earlier | +90 min |
+|---|---:|---:|
+| live files | 8,122 | **7,781** (−341, ~3.8/min) |
+| disjoint, cells 65+ | **0.3 %** | **0.3 %** |
+| disjoint, cells 17-64 | 33 files | **23 files** |
+
+**Compaction is unambiguously working — and disjointness did not move.** Hundreds
+of files were merged away in the big cells and the overlap property is exactly
+where it started. Merging reduces file COUNT, not OVERLAP, because units select
+by size and each output therefore spans the others' ranges.
+
+That reconciles the two explanations that competed all night, and both are right
+about different things: **draining fixes fragmentation, only splitting fixes
+overlap.** It is overlap that keeps `dedup_skipped` at 1, certification declining
+218:1, and the customer's predicate stranded.
+
+**So the uncomfortable consequence, stated plainly: letting the maintenance lane
+run to completion — even for many uninterrupted hours — would NOT fix the
+customer's queries.** It would leave a tidier table with the same overlap.
+
 Everything else below is either a fix that removed a blocker on the way to this,
 or a measurement that led to it.
 
