@@ -1279,3 +1279,34 @@ cell is unmeasured. Start with `--dry-run`, then the smallest of the six, and
 watch that the outputs really are ~512 MiB and narrow — `compaction_unit_span`
 (on `prep/bin-width`) would report exactly that, which is another reason to merge
 it first.
+
+### Verified: `--recompress` will not skip these files, and `--dry-run` is safe
+
+Two checks that remove the last uncertainty from the recommendation above.
+
+**1. `recompress_partition` has exactly ONE skip condition**, and it is
+`"no files in partition"` (`compact.rs:691`). There is no size test, no file-count
+test, no sorted-run test. **It will rewrite a whale cell.** That is the difference
+between it and every other path in this document, all of which begin by skipping
+over-target files.
+
+**2. `--dry-run` is genuinely read-only on this path.** I briefly thought it was
+not — the recompress block (`main.rs:969`) contains no `dry_run` check — but the
+dry-run branch at `main.rs:940` **returns at line 953**, before recompress is
+reached. It prints candidate partitions and file counts and mutates nothing.
+(Caught by reading rather than assuming; noted because the recompress block in
+isolation genuinely does look unguarded.)
+
+**And the reason this works when the coordinator cannot: the CLI has no 900 s
+deadline.** Every failure in this document traces to work that does not fit a
+fixed budget — day-wide units unsatisfiable against 900 s, components too large
+for a bin, sorts that exceed a pool slice. `optimize --recompress` is an
+operator-run, unbounded job. **It can do exactly the day-wide work the coordinator
+is structurally unable to do**, which is why the escape hatch exists and why it is
+the right tool for a backlog that accumulated precisely because nothing bounded
+could touch it.
+
+**Expect it to be slow, and size it before running.** An 85 GiB sorted rewrite is
+roughly 400x the 211 MB / 2 M-row bin benchmarked at 1.1–2.7 s, so order tens of
+minutes of sort plus object-store IO for the whole cell. That is fine for an
+operator job and impossible for a 900 s unit — which is the entire point.
