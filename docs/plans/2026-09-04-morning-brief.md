@@ -2504,3 +2504,37 @@ matched windows; every claim that fell came from a correlation.
 `pack_value_refused_bytes` (does the floor ever engage?), `pending_repair` (does
 4-per-pass drain 252?), and the window ladder on an aged process (does the wall
 return?). All three are counters that already exist; none needs new code.
+
+## The age hypothesis is REFUTED, and no wall has returned
+
+Five samples across a 40-minute process life, same query, same project:
+
+| uptime | 3d | 7d |
+|---:|---:|---:|
+| 507 s | 813 ms | 588 ms |
+| 1,109 s | 846 ms | 307 ms |
+| 1,209 s | 234 ms | 277 ms |
+| 1,711 s | 1,766 ms | 2,657 ms |
+| 2,316 s | 1,251 ms | 535 ms |
+
+**7d spans 277–2,657 ms — a 9.6x spread — and the correlation with uptime is
+0.28.** There is no age trend; the variation is concurrent load. **My
+process-age hypothesis is refuted by its own measurement**, which is the third
+hypothesis tonight to die that way (the first two: "my deploy caused the
+incident", "the packer floor reliably segfaults").
+
+**And the wall has NOT returned.** Every sample completed; the failure mode that
+produced `2048 MiB per-query limit` at 72h and 7d has not recurred in 40 minutes
+of a live process under real traffic. Wide windows that were impossible this
+morning are now consistently sub-3-second.
+
+**But I still cannot say which change did it.** `ordering_repair_declined = 0`,
+`pack_value_refused = 0`, `pending_repair = 252` unchanged. All three levers read
+zero. The honest position is: **the wall is gone, and the cause is unestablished
+— possibly the FairSpill pool change, possibly a workload difference, possibly
+something not in this session's changes at all.**
+
+**Standing question for whoever picks this up:** re-run the ladder when the
+process has been up for hours under load. If the wall never returns, the fix is
+real and mis-attributed; if it returns at high load rather than high age, the
+target is concurrency, not age or any of tonight's knobs.
