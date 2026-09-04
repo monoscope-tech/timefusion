@@ -236,6 +236,12 @@ is another restart for no safety gain. **Review it after the fact.**
 | `prep/otel-metrics-collapse` | widen `otel_metrics` `dedup_keys` to its sort prefix, off the 20-58x window path | correctness verified on 22.8 M rows, 3 tenants |
 | `prep/split-filter-miss` | splits `rollup_miss_filter_not_eligible` (78, prod's 2nd-largest miss) into its three actual decline rules | instrumentation only; existing label keeps its meaning |
 | `scratch/replace-where-deadlock-v2` | the scoped-recompress experiment | **DO NOT MERGE** — lifts a safety guard |
+
+**Verified: all four `prep/` branches merge cleanly onto master together, and the
+combined result is green** — 1134 lib tests, `cargo lint` clean, `cargo fmt`
+clean. They touch disjoint areas (`maintain.rs`, `config.rs` + `mod.rs`,
+`schemas/` + `read/`, `rollup.rs` + `observability.rs`), so they can be taken in
+any order or all at once.
 | ~~`prep/bin-width`~~ | already on master by accident (see above) | reviewed after the fact |
  (single-sources
 `BIN_MICROS`, adds `compaction_unit_span` reporting), `prep/unit-phase-timers`
