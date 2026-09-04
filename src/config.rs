@@ -282,7 +282,26 @@ const MAINTENANCE_FLOOR_BYTES: usize = GIB;
 /// the `TIMEFUSION_QUERY_PARTITIONS` tune site. It bounds the sort machinery's
 /// per-partition, non-spillable reservations, which is what exhausted the query
 /// pool on the 48-core box.
-const QUERY_PARTITIONS_MAX: usize = 16;
+/// 16 -> 24 on 2026-09-04, as a bounded step and NOT a return to 48.
+///
+/// This is the measured ceiling on a wide query's read concurrency, and wide
+/// aggregates are IO-bound: container CPU is identical with and without a 30-day
+/// query (maintenance already holds ~17 of 48 cores and ~150-200 MB/s), so reads
+/// in flight IS the throughput. Two client sessions — i.e. 2x16 workers — do the
+/// same 30 days in 11.8/21.3/14.6 s that one query takes 37.8/43.0/30.2 s to do.
+/// One query could not use more, which is why four attempts at CPU parallelism
+/// changed nothing.
+///
+/// 24 is deliberately short of the 48 that caused the incidents this cap was
+/// created for (2026-08-28/30/31 `ExternalSorterMerge` / TopK / SPM exhausting
+/// the 16 GiB query pool, plus monoscope's `row_number() OVER (…)` as XX000).
+/// Those reservations are non-spillable and scale with this number, so it buys
+/// +50% scan concurrency for +50% sort reservation rather than +200%.
+///
+/// JUDGE IT ON BOTH SIDES: 30-day completion rate AND the absence of
+/// `Resources exhausted` on sort-bound pages. `TIMEFUSION_QUERY_PARTITIONS`
+/// overrides it, so rollback is env-only and needs no rebuild.
+const QUERY_PARTITIONS_MAX: usize = 24;
 
 /// The number the whole tree derives from: the detected limit, LOWERED by an
 /// operator request — budgeting above the cgroup is never valid, so an
