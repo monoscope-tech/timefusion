@@ -1559,3 +1559,55 @@ projected-index bug's shape) are different defects, so they are counted apart.
 **Next:** deploy and read those three. If `_unsorted` dominates, the fix is to
 sort the mem partitions before exposing them; if `_rejected` does, it is an index
 or schema mismatch in the claim.
+
+## The candidate: one schema-diverse bucket retracts ordering for the whole query
+
+Reading the mem leg's sortedness decision
+(`query_partitioned_with_text_match`) gives a mechanism sharp enough to name:
+
+```rust
+match partitions.iter().map(|p| sort_partition(s, p.clone())).collect::<Option<Vec<_>>>() {
+    Some(sorted) => (sorted, true),
+    None => (partitions, false),   // <- ALL-OR-NOTHING
+}
+```
+
+and `sort_partition` refuses a partition whose batches do not share one schema:
+
+```rust
+// A schema-diverse partition is left alone rather than merged: the merge
+// is the expensive, failure-prone half of `sort_batches_by_schema` and this
+// path runs per query. Undeclared ordering is always safe.
+if batches.iter().any(|b| b.schema() != arrow_schema) { return None; }
+```
+
+"Undeclared ordering is always safe" is true for **correctness** and false for
+**cost**, and the comment does not say which it means. The consequence is out of
+all proportion to the cause:
+
+**ONE unsortable partition → the whole leg is `sorted = false` → the mem source
+declares no ordering → the union advertises none (a union is ordered only if
+EVERY child is) → `DedupExec` drops to unbounded `full-set` → `ORDER BY ts DESC
+LIMIT n` materialises the entire window.**
+
+And `insert_batch` **deliberately accepts nullable field additions**. So a single
+new optional field appearing in one project's ingest stream is enough to make one
+bucket schema-diverse and degrade *every* listing query for that project from a
+streaming top-N into a blocking sort. **That is exactly the shape of a failure
+that begins at one minute with no deploy behind it** — which is what 09:58 was.
+
+**Not yet confirmed** — it is a mechanism plus a matching signature, which is
+precisely the standard of evidence that produced the bad revert earlier today. So
+it is instrumented, not acted on (`4187ecde`):
+
+```
+scan.mem_sort_retracted                 the claim was dropped
+scan.mem_sort_retracted_schema_diverse  ...because a partition held mixed schemas
+scan.mem_ordering_declared / _unsorted / _rejected
+```
+
+**If `mem_sort_retracted_schema_diverse` tracks the failures, the fix is to make
+diverse partitions sortable** (unify to the table schema before sorting) rather
+than to retract globally — and the cost the original comment was avoiding should
+be measured against a blocking sort of the whole window, which is what it is
+actually being traded for.
