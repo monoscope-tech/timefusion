@@ -117,3 +117,69 @@ key` at query time: i.e. **always pay the merge-on-read cost**. That is
 TimeFusion's current behaviour (`dedup_skipped = 0 of 2,051`), reached by
 accident rather than by design. It is a working system at scale, so this is not
 fatal — but it is the state to move away from, and IOx is the one that shows how.
+
+## CORRECTION — the cheap proof does not exist yet, because the layout does not
+
+The section above recommends certifying **non-overlap from file statistics**
+rather than duplicate-freedom from a content scan, on the grounds that
+non-overlap in the dedup-key space implies what certification is trying to prove.
+The implication is sound. **The premise is not, on today's data.**
+
+Measured straight from `Add.stats` on the live Delta log — no data read, which is
+the whole point of the proposal (`scratchpad/disjointness.py`):
+
+```
+otel_logs_and_spans: 8,122 live files, 1,217 cells, 0 files lacking timestamp stats
+
+files that overlap NOTHING else in their cell : 1,100 / 8,122 = 13.5%
+cells where EVERY file is disjoint            :   968 / 1,217 = 79.5%
+
+cell size    files   disjoint    pct
+1              946        946  100.0%
+2-4            313         42   13.4%
+5-16           320         69   21.6%
+17-64        3,114         33    1.1%
+65+          3,429         10    0.3%
+```
+
+The 79.5 % of "fully disjoint cells" is **an artefact**: 946 of the 1,217 cells
+hold exactly one file, and a lone file is trivially disjoint. Those cells were
+never the problem.
+
+**In the cells that matter, non-overlap essentially does not exist.** Cells of
+17–64 files are **1.1 %** disjoint; cells of 65+ are **0.3 %** — and those two
+buckets hold **6,543 of 8,122 files, 81 % of the table.**
+
+So certifying non-overlap today would let ~13.5 % of files skip the dedup, almost
+all of it from single-file cells that already cost nothing. **It would not move
+the customer's queries.**
+
+### What this actually means — the recommendation was half right
+
+IOx's non-overlap proof is cheap *because its compactor maintains non-overlap as
+an invariant*: L1+ files are non-overlapping **by construction**. Ours are not,
+and the reason is documented in this repo already — `version_append` writes a
+row's ORIGINAL timestamp into a NEW file, so every update re-overlaps the
+partition (`2026-09-03-why-the-frozen-mass-is-a-read-path-bug.md`).
+
+Non-overlap is therefore **not a cheaper way to prove what we have. It is a
+different physical layout we would have to build**, and the proof only becomes
+cheap once the layout exists. Stated as a sequence:
+
+1. compaction **establishes** disjointness in the dedup-key space (this is work,
+   and it is the same work the frozen-mass docs already argue for);
+2. **then** statistics prove it for free, per file, surviving restarts and new
+   writes;
+3. **then** the querier unions the disjoint files above the dedup.
+
+Step 2 is the part I described as the fix. It is really the payoff, and step 1 is
+the cost — which is exactly the cost the maintenance backlog is currently failing
+to pay.
+
+**This does not rescue the coverage arithmetic in the morning brief**, and it
+should not be read as doing so. It says the escape route I proposed needs the
+layout work first, so the honest position is: **there is no cheap way out of the
+coverage problem that today's file layout supports.**
+
+I am glad this was measured before it was recommended further; it took one query
+against statistics that were already there.
