@@ -2742,3 +2742,41 @@ with packing. The options are structural:
 packer floor, not on dedup — on the fact that a fixed 6-slot rewrite envelope is
 shared by three lanes, one of which (repair) has a 252-unit backlog of
 40-minute units. At 10x ingest that envelope does not grow.
+
+## GOOD NEWS: the bleed is already stopped — 252 is a FINITE legacy backlog
+
+Measured over 300 seconds of live traffic:
+
+| counter | change |
+|---|---|
+| `repair_sorted_at_write_total` | 68 → 101 (**+33 files, ~400/hour**) |
+| `rows_flushed_total` | +332,539 rows |
+| `pending_repair` | **252 → 252 (flat)** |
+
+**The writer is marking new files sorted at write, and no new repair tasks are
+arriving.** `timefusion_repair_mark_sorted_at_write` defaults true and is working.
+
+**That changes the shape of the problem entirely.** The 252 is not a symptom of
+an ongoing failure that will grow with traffic — it is a fixed legacy population,
+written before that path existed. Every conclusion above about the repair lane
+being "the thing standing between here and wide queries" holds, but the remedy is
+a **one-time cleanup**, not an architectural change to the maintenance envelope.
+
+**And it means the 10x story is better than the preceding sections imply.** The
+6-slot rewrite envelope is shared by three lanes, but repair's demand on it is
+**bounded and shrinking to zero**, not proportional to ingest. At 10x traffic the
+repair lane does not scale up — only packing and dedup do.
+
+**The practical remedy, and it does not need the envelope:**
+`timefusion optimize --date <D> --recompress` is the only force-rewrite path and
+runs outside the coordinator's slot budget. It needs an in-region runner (from
+here, one whale cell is 85 GiB at 3.9 MiB/s ≈ 6 hours), which is the same
+blocker recorded earlier in this document for the bin-width recompress.
+
+**Revised priority, final:**
+1. **Run `--recompress` from an in-region runner** over the dates holding the 252.
+   Finite, one-time, unblocks wide queries, needs no code.
+2. **Watch `pack_value_refused_bytes`** — the packer floor is live and its
+   ~41% worker-time projection is the largest *recurring* saving identified.
+3. **Everything else** (bin width ~3.7%, pressure scaling, deletion vectors)
+   ranks below those two.
