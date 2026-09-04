@@ -15,6 +15,67 @@ use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
+/// monoscope's ACTUAL log-explorer listing must stream, not materialise.
+///
+/// `order_by_ts_desc_limit_merges_mem_and_delta` pins the same window and limit
+/// with a two-column projection and passes. Prod 2026-09-04 shows the real query
+/// failing: from 09:58 a listing on one project retried every ~15 s, each attempt
+/// dying in `ExternalSorterMerge` at 5.5 GB, with **`scan.has_limit=false
+/// scan.limit=0`** in the span — the LIMIT never reached the scan, so the sort
+/// materialised the whole window.
+///
+/// Two candidate causes were eliminated first, cheaply:
+/// - the ordering repair is NOT involved: `scan.ordering_repair_declined` was 0
+///   across 6,020 prod queries while the incident fired;
+/// - `dedup_keys_lead_the_sort` HOLDS for this table — `dedup_keys` are
+///   `[timestamp, resource___service___name, id]` and the sort leads with exactly
+///   those, so dedup can run bounded.
+///
+/// What is left is the PROJECTION: `jsonb_build_array` over a dozen columns plus
+/// `to_jsonb(summary)`, an `extract(epoch ...)` cast and a `coalesce(... or ...)`.
+/// This test is the same fixture as the sibling above with that projection
+/// swapped in, so a difference is attributable to it alone.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_monoscope_log_explorer_listing_streams() -> anyhow::Result<()> {
+    let bucket_secs = 60u64;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
+    let client = env.pg_client().await?;
+    let sec = 1_000_000i64;
+    for i in 0..5 {
+        insert_at(&client, &format!("old-{i}"), FROZEN_START_MICROS + i * sec).await?;
+    }
+    env.advance(Duration::from_secs(bucket_secs * 3));
+    env.force_flush().await?;
+    let new_base = FROZEN_START_MICROS + (bucket_secs as i64) * 3 * sec;
+    for i in 0..5 {
+        insert_at(&client, &format!("new-{i}"), new_base + i * sec).await?;
+    }
+
+    // The prod projection, verbatim in shape.
+    let sql = "SELECT jsonb_build_array(id, to_char(timestamp at time zone 'UTC', 'YYYY-MM-DD'), context___trace_id, name, duration, \
+               resource___service___name, parent_id, cast(extract(epoch from (start_time)) * 1000 as bigint), \
+               coalesce(errors is not null or (kind = 'server' and (lower(level) = 'error' or severity___severity_number >= 17 or status_code = 'ERROR')), false), \
+               to_jsonb(summary), context___span_id, kind) \
+               FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
+    let plan: String = client
+        .query(&format!("EXPLAIN {sql}"), &[])
+        .await?
+        .iter()
+        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // A blocking `SortExec` over the window is the prod failure: with a real
+    // tenant's data behind it that is the 5.5 GB ExternalSorterMerge.
+    assert!(
+        plan.contains("SortPreservingMergeExec") || plan.contains("TopK"),
+        "the log-explorer listing must stream or top-K, not materialise the window; plan was:\n{plan}"
+    );
+    assert!(!plan.contains("mode=full-set"), "DedupExec must stay bounded for this listing; plan was:\n{plan}");
+    Ok(())
+}
+
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {

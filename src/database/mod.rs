@@ -380,6 +380,17 @@ pub mod scan_metric_names {
         ORDERING_REPAIR_APPLIED = "timefusion.scan.ordering_repair_applied" as scan.ordering_repair_applied;
         ORDERING_REPAIR_DECLINED = "timefusion.scan.ordering_repair_declined" as scan.ordering_repair_declined;
         ORDERING_REPAIR_NO_CLAIM = "timefusion.scan.ordering_repair_no_claim" as scan.ordering_repair_no_claim;
+        // The SAME cliff on the memory leg, and it was even quieter: when the
+        // in-memory source cannot declare the table's ordering, the mem-union-delta
+        // union advertises none, `DedupExec` falls to unbounded `full-set`, and
+        // `ORDER BY ts DESC LIMIT n` materialises the window -- and the only
+        // signal was a `debug!` line, which prod does not emit. `unsorted` means
+        // the caller could not claim its partitions were ordered; `rejected`
+        // means it claimed and `try_with_sort_information` refused (the
+        // 2026-09-02 projected-index bug's shape).
+        MEM_ORDERING_DECLARED = "timefusion.scan.mem_ordering_declared" as scan.mem_ordering_declared;
+        MEM_ORDERING_UNSORTED = "timefusion.scan.mem_ordering_unsorted" as scan.mem_ordering_unsorted;
+        MEM_ORDERING_REJECTED = "timefusion.scan.mem_ordering_rejected" as scan.mem_ordering_rejected;
         // Why a CERTIFIED file still could not skip. Two very different
         // refusals: one uncertified file with no statistics blocks the entire
         // scan, whereas overlap blocks only the files it touches. Prod
@@ -9224,14 +9235,33 @@ impl ProjectRoutingTable {
     /// Attach the table's declared ordering to an in-memory source. Failure to
     /// attach is never fatal: an undeclared source is merely slower.
     fn declare_ordering(source: MemorySourceConfig, sorted: bool, table_name: &str, out: &SchemaRef) -> MemorySourceConfig {
-        let Some(ordering) = table_ordering(table_name, out, sorted) else { return source };
+        let Some(ordering) = table_ordering(table_name, out, sorted) else {
+            metrics::counter!(scan_metric_names::MEM_ORDERING_UNSORTED).increment(1);
+            return source;
+        };
         // `try_with_sort_information` consumes the source, so keep a copy to
         // fall back to — the undeclared source must still serve its rows.
         let undeclared = source.clone();
-        source.try_with_sort_information(vec![ordering]).unwrap_or_else(|e| {
-            debug!("in-memory leg for {table_name} could not declare its ordering ({e}); the plan will sort it instead");
-            undeclared
-        })
+        match source.try_with_sort_information(vec![ordering]) {
+            Ok(declared) => {
+                metrics::counter!(scan_metric_names::MEM_ORDERING_DECLARED).increment(1);
+                declared
+            }
+            Err(e) => {
+                // NOT merely slower, which is what this comment used to say and
+                // what the `debug!` implied: losing the claim costs the whole
+                // query its streaming merge, because a union advertises an
+                // ordering only when EVERY child does. Warn and count.
+                metrics::counter!(scan_metric_names::MEM_ORDERING_REJECTED).increment(1);
+                warn!(
+                    table_name,
+                    error = %e,
+                    event = "mem_ordering_rejected",
+                    "the in-memory leg could not declare its ordering, so the union loses it and ORDER BY ... LIMIT becomes a blocking sort"
+                );
+                undeclared
+            }
+        }
     }
 
     /// Scan a Delta table and coerce output schema to match our expected types.
