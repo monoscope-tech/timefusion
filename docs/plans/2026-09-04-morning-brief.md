@@ -2082,3 +2082,56 @@ optimise for "remove the most files per byte rewritten".
 Expected ceiling, from this window: moving the 2-file volume to the value of even
 the 5–8 shape would cut Pack writes by most of that 82.5% — against a bin-width
 lever whose ceiling is ~3.7%. **This is the change worth soaking.**
+
+## Choosing the floor from the real distribution (not from argument)
+
+Replaying the 163 real Pack units from the quiet window against candidate floors —
+what each would refuse, what it saves, and what benefit it gives up:
+
+| floor (rows per file eliminated) | units refused | **% writes saved** | **% file-elimination lost** |
+|---:|---:|---:|---:|
+| 25,000 | 104 | 98.8% | 41.4% |
+| 100,000 | 90 | 97.4% | 28.8% |
+| 250,000 | 82 | 94.5% | 19.7% |
+| 500,000 | 69 | 86.1% | 11.2% |
+| **1,000,000** | **63** | **82.4%** | **8.8%** |
+| 2,000,000 | 62 | 81.8% | 8.6% |
+
+Baseline: 269,432,820 rows written to eliminate 720 files — **374,212 rows per
+file**.
+
+**The knee is at ~1M rows per file eliminated: 82.4% of write volume saved for
+8.8% of the file reduction — roughly a 9:1 trade.** Above 1M the curve is flat
+(2M buys 0.6% more saving), and below 500K the benefit lost climbs fast for
+little extra saving.
+
+**Converting to the units the guard actually uses.** The guard is priced in
+BYTES; this table is in rows. At `otel_logs_and_spans`' ~104 B/row, the 1M-row
+knee is **≈100 MiB per file eliminated**, i.e.
+`timefusion_pack_max_bytes_per_file_eliminated = 104857600`. Sanity check both
+ends: two 128 MiB files write 256 MiB to remove one file → 256 MiB/file →
+**refused**; ten 20 MiB files write 200 MiB to remove nine → 22 MiB/file →
+**admitted**. That is the intended separation.
+
+**The risk, stated plainly, because it is the one that could make this wrong.**
+"Files lost" is deferral only if those pairs later join a cheaper bin. If they
+never do, the partition keeps two near-target files instead of one — permanently.
+That is the frozen-mass shape this document already describes
+([[tf_overlap_components_are_the_frozen_mass_2026-09-04]]), and it would trade
+maintenance cost for query file-count. Two things bound the risk: the refused
+files are already *near target*, so merging them buys little for the reader
+(2 files vs 1 in that partition), and the floor is a config value with an
+immediate rollback.
+
+**Recommendation:** set `timefusion_pack_max_bytes_per_file_eliminated =
+104857600` (100 MiB) in **staging** first and watch live file counts per
+partition alongside `pack_value_refused_bytes`. If file counts hold, it is worth
+~82% of packing write volume — which, since Pack is 85.3% of maintenance worker
+time and 59.3% write-bound, is the largest single lever measured tonight, by a
+wide margin over the ~3.7% bin-width ceiling.
+
+**Not enabled by me.** The evidence is strong and the analysis is on real prod
+units, but this changes the behaviour of the lane holding 85% of maintenance, the
+failure mode is a slow one (file counts drifting up over days, not an error), and
+I have been wrong repeatedly today on less. It wants a soak, not a flag flip at
+04:00.
