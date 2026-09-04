@@ -101,6 +101,34 @@ A coverage matrix is the cheap version of that checklist, and it is written up i
 **`2026-09-04-lane-coverage-matrix.md`** — including the two lanes that still have
 no "did nothing" signal at all, which is the recommended first task in daylight.
 
+## The first readable process of the night
+
+At 02:2x a process finally reached **1,828 s (30.5 min)** — the longest observed,
+and the first carrying all four fixes. Against every earlier reading:
+
+| | 703 s | 734 s | 842 s | **1,828 s** |
+|---|---|---|---|---|
+| `cert_granted_total` | 0 | 2 | 0 | **27** |
+| `dedup_probe_timeouts_total` | 40 | 10 | 20 | 49 |
+| `work.BaseRollup.progress_rows` | 0 | 0 | 0 | **131,078,878** |
+| `dedup_skipped` | 0 | 0 | 0 | **0** |
+
+**27 grants is the first certification number meaningfully above noise.**
+Normalised for uptime it is a ~5x higher grant rate than the 2 that I earlier
+retracted — and unlike that reading, 27 is not a count two coin-flips could
+produce. I would still call it *one* process rather than a trend, but it is the
+first evidence that the certification path can produce grants at all when
+something runs longer than half an hour.
+
+**`dedup_skipped` is nevertheless still 0**, and that remains the honest bottom
+line. A query loses its `DedupExec` only when **every** date it reads is granted,
+so 27 grants spread across projects and dates need not unblock a single query.
+The customer-facing chain is **not yet closed.**
+
+**The backlogs are still growing**, not shrinking: `pending_dedup` 2,185,
+`pending_sealed_consolidation` 231, `pending_base_rollup` 257 — all above their
+earlier values. Nothing tonight should be read as the queue converging.
+
 ## Maintenance capacity allocation is UNSTABLE, not misallocated
 
 Two samples of `work.*.worker_secs` normalised to total maintenance work, from
