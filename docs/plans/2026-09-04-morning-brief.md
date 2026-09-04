@@ -3268,3 +3268,53 @@ never be quoted as one.** What is like-for-like and does hold:
 **The defensible summary: the guard works as designed and the benchmark's -69% is
 the number to quote. The prod 36.5x -> 1.1x spans a regime change and overstates
 it.**
+
+## I priced the guard on the WRONG AXIS: it is worth ~3.3x, not 1.06x
+
+Earlier I converted the guard's benefit through **unit cost** — units get cheaper,
+and the measured throughput-vs-cost curve is sub-linear, so I concluded ~1.06x
+against 10x. **That was the wrong axis.**
+
+The sim's own streams sweep measured backlog as **linear in unit COUNT**:
+
+| arrivals | pending_end |
+|---:|---:|
+| 74 (1x) | 18,029 (1.0x) |
+| 148 (2x) | 39,241 (2.2x) |
+| 370 (5x) | 102,635 (5.7x) |
+| 740 (10x) | 208,532 (11.6x) |
+
+**And the guard's primary effect is on count, not cost.** Fan-in moved 2-3 -> 9,
+so files eliminated per unit went **1.5 -> 8.0**:
+
+```
+units needed for the SAME file reduction   5.3x FEWER
+Pack share of maintenance worker time      85.3%
+maintenance UNIT COUNT removed             ~69%
+headroom on the axis backlog is linear in  ~3.3x
+```
+
+**So the guard is worth roughly 3.3x, not 1.06x** — I under-valued my own change
+by 3x by measuring it against the wrong variable.
+
+**Caveats, and they are real:**
+- fan-in 9 comes from a steady-state process; the 2.5 baseline from a
+  backlog-grinding one. Same regime confound as the amplification numbers, so
+  treat 5.3x as an upper estimate of the count reduction.
+- "same file reduction" assumes the total need is unchanged; if higher fan-in
+  leaves some files unmerged the comparison flatters the guard. `pending_hot_packing`
+  flat at 16 argues against that, but does not disprove it.
+- the sim's linearity was measured on minted rollup arrivals, not Pack units.
+
+### What this does to the 10x picture
+
+| lever | status | multiplier |
+|---|---|---:|
+| packer floor (unit COUNT) | **deployed, verified firing** | **~3.3x** |
+| rewrite envelope re-derivation | bench says the 6-slot cliff does not reproduce; 16 workers ran clean | up to ~2x |
+| **combined** | | **~6.6x** |
+
+**That is within sight of 10x for the first time tonight**, from two changes
+neither of which is an architectural rewrite — one already shipped, one a
+re-measurement on prod hardware. It does not demonstrate 10x, and the caveats
+above are not small. But the gap is now a factor of ~1.5, not a factor of 10.
