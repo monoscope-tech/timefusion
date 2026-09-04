@@ -3,6 +3,46 @@
 Final state, not the journey. **Four fixes shipped**, one customer question
 answered with a "don't build this", and four decisions that are yours.
 
+## THE FINDING THAT MATTERS MOST
+
+**Compaction and dedup are working against each other, and nothing can see it.**
+
+Merging files unions their time ranges. Compaction's job is fewer, larger files —
+so its output spans wider. A dedup bin is 10 minutes, and **a file is read once
+per bin it touches.** So every compaction pass makes the next dedup more
+expensive, and the packer has no notion of span at all: it scores file COUNT and
+calls a file done at 256 MiB.
+
+The correlation in prod is inverse and near-perfect:
+
+```
+   3d   2026-09-01   1,657 files    0.7% wide     75 GiB of sweep read
+  12d   2026-08-23      22 files   72.7% wide    339 GiB of sweep read
+```
+
+**A partition compacted down to 22 files is, by compaction's own definition, in
+excellent shape — and is the single most expensive thing in the fleet for dedup
+to touch.**
+
+Ranked over all 7,632 live files, **500 files (6.5 %) cause 60 % of all
+maintenance read**; several span 100 % of their day, so a 1 GiB file is read 144
+times per sweep — **142 GiB of reading for 1 GiB of data.**
+
+**What to do, in order:**
+
+1. **Split the widest files, worst-first.** ~500 files, ~60 % of maintenance read.
+   No new mechanism, no constant change, no soak — the writer already emits
+   time-contiguous pieces. `scratchpad/wide_rank.py` produces the list.
+2. **Bound SPAN in the packer's candidate selection**, the same shape as the byte
+   and row budgets already there. Without this, (1) is a treadmill refilled by
+   compaction itself.
+3. **`prep/unit-phase-timers`** — now to measure the improvement, not to decide.
+
+**And this reframes the four fixes I shipped tonight.** They each made compaction
+work better. **Compaction working better means files merged wider, faster.** None
+is wrong; all of them accelerate the lane that manufactures the dominant cost,
+and that interaction is invisible from inside any of them.
+
 ## THE ONE NUMBER
 
 You asked whether sorting, hotpacking, rollups and dedup are "breaking a sweat."
