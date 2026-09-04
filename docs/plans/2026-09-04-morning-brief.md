@@ -20,6 +20,17 @@ The wide-file *share* rose, because the files being retired are the narrow ones.
 and compaction improves its own number while the cost it drives stays flat.
 Scaling the fleet scales the wrong number.**
 
+**The one-line description of why, borrowed from LSM literature: TimeFusion has
+L0 and nothing else.** RocksDB's leveled compaction keeps L1+ **key-range
+partitioned**, so non-overlap is maintained by how the OUTPUT is written, not by
+which inputs are chosen. Our compaction merges overlapping files without
+re-partitioning the output by time — so the output is *also* overlapping. **There
+is no level at which non-overlap is ever established.** Every LSM design treats
+L0 as the emergency to escape, because it is where read amplification is worst;
+we never leave it. `--recompress` on a whole cell is, in effect, **a manual
+"promote this partition to L1"** — which is why it works where four
+partial-merge designs measured identical to the status quo.
+
 **And here is what one command does instead** — modelled `--recompress` on the
 worst cells, against the same 44,127 GiB:
 
