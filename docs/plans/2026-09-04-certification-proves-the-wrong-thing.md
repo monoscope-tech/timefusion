@@ -1935,3 +1935,18 @@ rewrite becomes a few-GB partition rewrite — the size `OPTIMIZE` already runs
 in-process. **That one change would collapse the in-region runner requirement,
 the OOM risk and the blast radius simultaneously**, and it is the cheapest path
 from tonight's analysis to something actually running.
+
+**Why I could not take the deadlock experiment further tonight.** The one
+condition local MinIO cannot supply is real object-store latency, and the
+obvious place to get it is staging. But **there is no `.env.staging` in this
+checkout** (`.env`, `.env.prod`, `.env.ovh`, `.env.minio`, `.env.cloudflare`,
+`.env.test` — no staging), and `CLAUDE.md`'s description of it ("`timefusion-staging`,
+same **R2**, scratch prefix") predates the R2→OVH migration, so it may be stale
+as well as unconfigured. I was not going to guess at credentials for a write
+test.
+
+**So the remaining step needs someone with staging access or an in-region
+runner** — the same dependency as the cleanup itself, which is convenient: one
+environment unblocks both. The test to run there is exactly
+`scratch/replace-where-deadlock-v2`'s second case, which already exercises
+concurrent writes into the partition being overwritten.
