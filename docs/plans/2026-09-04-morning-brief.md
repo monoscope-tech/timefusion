@@ -1236,3 +1236,45 @@ The consequence is what matters: **that job has been providing no signal for at
 least five commits.** A gate nobody can distinguish from broken is worse than no
 gate, because a real regression in it would look exactly like today. Triaging it
 is the next CI task, ahead of adding anything new to CI.
+
+## The 10x answer: completions are FLAT, so load becomes backlog 1:1
+
+With `--mint` (`626e3c2d`) a synthetic queue finally generates arrivals, so
+`--streams` scales load for real. 24 virtual hours, **three seeds per point**:
+
+| streams | vs base | pending_end (3 seeds) | executions (3 seeds) | max lag |
+|---:|---:|---|---|---:|
+| 74 | 1x | 18,029 / 18,403 / 18,015 | 5,376 / 5,045 / 5,307 | 83,09x |
+| 148 | 2x | 39,241 / 39,497 / 39,241 | 5,338 / 5,089 / 5,257 | 83,08x |
+| 370 | 5x | 102,635 / 102,979 / 102,757 | 5,333 / 5,106 / 5,319 | 83,07x |
+
+Seed spread is **~2%** on `pending_end` and **~5%** on `executions`, against
+**2.2x** and **5.7x** between configurations — so unlike the un-minted sweep,
+this is signal.
+
+**The result: `executions` does not move — 5,045 to 5,376 across a 5x increase
+in arrival rate — while `pending_end` grows 5.7x.** Completion throughput is
+independent of load. The coordinator is saturated at 1x, so every additional
+stream converts **1:1 into backlog**, and `frontier_lag_secs_max` is pinned at
+~83,000 s (23 h) in every single run. This is the same conclusion the prod
+counters reached from the other direction — dedup holding 9.76 of 10 heavy
+permits continuously — now reproduced locally, on demand, in a form that can be
+re-run against a candidate fix in minutes.
+
+**Read it as a shape, not as prod numbers.** `synth:whale` is deliberately the
+queue that shredded prod, so the absolute backlog is pathological by
+construction. What generalises is the flatness of `executions`: throughput is
+capped by per-unit cost, not by how much work is waiting, so **no scheduling
+change can create headroom — only making a unit cheaper can.** That is exactly
+what the bin-width lever does (5.1x less read per sweep), and it is the argument
+for prioritising it over any further scheduler tuning.
+
+**The 10x point (740 streams) is MISSING, not zero** — it exceeded the 4-minute
+per-run budget in the sweep; it is running separately. The sim itself slows
+superlinearly with queue size, which is worth knowing before anyone plans a
+large sweep.
+
+**Honest limits of this measurement:** it is the IO-free coordinator sim, so it
+models unit durations from a byte model rather than real object-store latency —
+it answers "does the queue converge", not "what does a unit cost". Per-unit cost
+still needs the phase timers now deployed in `0c667f8f`, plus staging.
