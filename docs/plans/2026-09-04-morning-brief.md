@@ -3755,3 +3755,65 @@ the admission/budget pairs — not rates, not shares. The 159s-per-probe figure
 used in the doctest is inferred from 15 completions in 239s at 10 permits, not
 directly measured; it is illustrative of the arithmetic, and the EMA measures
 the real value at runtime rather than trusting it.
+
+### Where the zero budget comes from, and what the fix does not do
+
+`probe_deadline = min(pass_deadline, now + stage_deadline)`. `budget_secs=0`
+therefore means the dedup PASS deadline had already expired before phase 3 was
+reached — earlier phases of the tick consumed the whole thing. The logs show it
+per-table in sequence (`groups=32 budget=0`, then `groups=1 budget=0` twice),
+so it is the tick that is exhausted, not one unlucky table.
+
+**The change makes those passes free; it does not give probes budget.** Why the
+tick is exhausted before phase 3 is the next question in this lane, and it is
+answerable from the same logs. It is not fixed here.
+
+### What I expect to move, and what I expect NOT to
+
+| signal | baseline (23:12, young process) | expectation |
+|---|---:|---|
+| `dedup_probe_timeouts_total` | 15 | **falls toward 0** — the primary |
+| `dirty_bin_batch_probe_clean_total` | 0 | **must not fall** — the guard against the estimator over-throttling |
+| `probe_cost_ms` on `dedup_batch_probe_start` | absent | `> 0`, with `groups` below 32 — proves the mechanism engaged |
+| `cert_granted_total` | 0 | **stays 0**, and that is not a failure |
+
+That last row matters. `cert_declined_dirty_bins = 4917` against
+`cert_probe_declined = 53` says completed probes decline because the dates are
+genuinely dirty — not because they were starved. Certification is blocked by
+duplicate REMOVAL, exactly as the 2026-09-01 note concluded. This change frees
+permit-seconds in the largest lane; it does not and cannot certify a dirty date.
+
+The failure mode to watch is my own fix over-throttling: an EMA dragged upward
+by a few expensive dates would admit one wave forever and classify less than
+before. `dirty_bin_batch_probe_clean_total` is the tripwire, and
+`probe_cost_ms` says whether the estimate is the reason.
+
+### The next lever, and why it could not be pulled tonight
+
+`TIMEFUSION_LANDED_SKIP_ENABLED` (default **false**) declines a flush whose
+batch set is provably already committed — the duplicates WAL replay re-inserts
+after an unclean exit, measured at **58% of duplicate groups** in a sampled prod
+file. Since dedup exists to remove duplicates and is the largest lane, not
+manufacturing them is the largest available reduction in the work itself rather
+than in the cost of doing it.
+
+It is not flipped here for a reason that is about measurability, not nerve: **the
+skip only fires on a DIRTY boot.** A deploy is SIGTERM → clean shutdown → clean
+boot, so flipping the flag tonight would produce a dormant flag and a counter
+that reads 0 for the same reason whether it works or not — the exact
+never-fired/never-reached ambiguity that has already cost this project a night.
+It wants staging, where an unclean restart can be induced, and prod's host is
+read-only by standing rule. Direct test coverage is also thin (two tests), which
+is fine for a dormant flag and not fine for a durability-adjacent one that is
+live.
+
+### Position, stated plainly
+
+Tonight found and fixed measured waste in the largest maintenance lane, and
+closed the bin-width question against my own earlier recommendation by showing
+the mechanism already exists and has converged. It did **not** produce 10x
+headroom, and nothing here should be read as claiming it. The measured position
+is unchanged from the 09-04 ceiling note: throughput is sub-linear in unit cost,
+so cheaper units cannot reach 10x on their own, and 10x needs the rewrite
+envelope to grow or the work to disappear. Landed-skip is the "work disappears"
+candidate with the best evidence behind it, and it needs staging.
