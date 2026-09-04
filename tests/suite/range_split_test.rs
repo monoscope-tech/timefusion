@@ -79,6 +79,22 @@ async fn wide_window_splits_and_still_counts_each_row_once() -> Result<()> {
         .join("\n");
     assert!(rendered.contains("Union"), "a {DAYS}-day aggregate must split into branches:\n{rendered}");
 
+    // Branches must prune DIFFERENTLY, or four threads each do the work of one.
+    // Counting rows cannot catch that: the answer stays exactly right while the
+    // cost multiplies, which is how the 2026-09-04 regression reached prod
+    // (14d 14.0s -> 34.2s) past a green suite.
+    //
+    // HONEST LIMIT: this is NOT a falsifier for that bug. Reverting the fix (the
+    // bound written into `TableScan.filters`) leaves this assertion PASSING,
+    // because locally `push_down_filter` runs again after this rule and folds the
+    // Filter in anyway — prod's pgwire path evidently does not. Verified by
+    // reverting the fix and re-running: still green. So this pins that pruning
+    // differs, and nothing more; the prod behaviour has no local reproduction
+    // yet, which is exactly why the split ships OFF.
+    let bounds: std::collections::HashSet<&str> =
+        rendered.lines().filter_map(|line| line.split("predicate=").nth(1)).filter(|predicate| predicate.contains("timestamp")).collect();
+    assert!(bounds.len() > 1, "every branch pushed the SAME predicate, so each reads the whole window:\n{rendered}");
+
     let counted = scalar(&db, &format!("SELECT count(*) FROM otel_logs_and_spans WHERE {window}")).await?;
     assert_eq!(counted, expected, "split count must equal the logical row count (duplicates collapsed exactly once)");
     Ok(())
