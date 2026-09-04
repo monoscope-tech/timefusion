@@ -2021,6 +2021,22 @@ pub struct MaintenanceConfig {
     pub timefusion_flush_sort_pool_mb: u64,
     #[serde_inline_default(5)]
     pub timefusion_compact_min_files: usize,
+
+    /// Refuse a packing bin that rewrites more than this many BYTES per file it
+    /// eliminates. **0 = off; the refusal is counted either way.**
+    ///
+    /// `min_files` cannot express this: it is tested against the candidate POOL,
+    /// so a pool of five can still emit a two-file bin once bytes reach the
+    /// target. A bin's benefit is files removed; its cost is bytes rewritten,
+    /// and the packer priced only the cost.
+    ///
+    /// Prod 2026-09-04, quiet 95 min: 2-file merges were **82.5% of packing
+    /// write volume** and **9.9% of the file reduction** — 3,129,141 rows per
+    /// file eliminated, against 27,098 for 9+-file merges. Maintenance wrote
+    /// ~36 rows per row ingested. A floor near the 5-8 file shape would move
+    /// most of that 82.5%.
+    #[serde_inline_default(0)]
+    pub timefusion_pack_max_bytes_per_file_eliminated: i64,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
     #[serde_inline_default(true)]

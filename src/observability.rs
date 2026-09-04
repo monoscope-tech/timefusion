@@ -1313,6 +1313,10 @@ atomic_stats! {
         /// dedup unit = 80% of its lane over a quiet hour) but the remedy is not.
         pressure_scale_engaged as "pressure_scale_engaged",
         pressure_scale_bytes_withheld as "pressure_scale_bytes_withheld",
+        /// Packing bins whose bytes-per-file-eliminated exceeded the value floor
+        /// (counted even when the floor is 0/off, so it can be chosen from data).
+        pack_value_refused as "pack_value_refused",
+        pack_value_refused_bytes as "pack_value_refused_bytes",
         maintenance_cpu_tokens_used as "cpu_tokens_used",
         maintenance_decoded_bytes_used as "decoded_bytes_used",
         maintenance_object_read_tokens_used as "object_read_tokens_used",

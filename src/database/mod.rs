@@ -8369,6 +8369,38 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     if files.len() < 2 {
         files.clear();
     }
+    // VALUE GUARD. A bin's benefit is the FILES it removes; its cost is the
+    // BYTES it rewrites. Those are wildly different trades and the packer priced
+    // only the second: it fills to `cap` and stops, so two nearly-converged files
+    // are a valid bin — 256 MiB rewritten to remove ONE file.
+    //
+    // Measured on prod 2026-09-04 over a quiet 95 minutes: 2-file merges were
+    // 82.5% of all packing WRITE volume (222.2M of 269.4M rows) and delivered
+    // 9.9% of the file reduction (71 of 720), costing 3,129,141 rows per file
+    // eliminated — against 27,098 for merges of 9+ files. **115x worse per unit
+    // of benefit, for four-fifths of the budget.** Maintenance wrote ~36 rows
+    // per row ingested over that window, and this is where it went.
+    //
+    // ClickHouse's merge selection prefers parts of similar size explicitly "to
+    // avoid repeatedly rewriting large data"; `min_files` here cannot express
+    // that, because it is tested against the CANDIDATE POOL, not the bin.
+    //
+    // SHADOW BY DEFAULT (floor 0 = off): the refusal is counted either way, so
+    // the floor is chosen from `pack_value_refused_bytes` rather than by
+    // argument — the same discipline the share numbers earned the hard way.
+    if files.len() >= 2 {
+        let eliminated = (files.len() - 1) as i64;
+        let per_file = bytes / eliminated.max(1);
+        let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_bytes_per_file_eliminated);
+        if per_file > floor.max(1) {
+            let stats = crate::observability::maintenance_stats();
+            stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.pack_value_refused_bytes.fetch_add(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+            if floor > 0 {
+                files.clear();
+            }
+        }
+    }
     // Gap rule, for TODAY only: once a project has no packable slice left, spend
     // the tick rewriting one oversized unsorted file instead. Today's partition
     // does converge, so the gap reliably appears — which is why this works here
@@ -16080,6 +16112,61 @@ mod tests {
 
     /// Every clause of `select_tail_bin` is an incident scar (see its doc), so
     /// they're pinned individually here rather than through a Delta table.
+    /// The VALUE guard, benchmarked against the shape prod actually produces.
+    ///
+    /// A bin's benefit is FILES removed; its cost is BYTES rewritten. The packer
+    /// fills to `target` and stops, so two nearly-converged files are a valid
+    /// bin — and on prod 2026-09-04 that shape was **82.5% of all packing write
+    /// volume for 9.9% of the file reduction**, costing 115x more per file
+    /// eliminated than a 9+-file merge.
+    ///
+    /// This asserts the guard refuses exactly that shape and leaves the cheap,
+    /// high-benefit shape untouched — the two must not be traded for each other.
+    /// The floor cannot be set from a unit test (it reads the global config, and
+    /// this process has none), so the ARITHMETIC the guard applies is asserted
+    /// directly, exactly as the span-budget test does.
+    #[test]
+    fn a_bin_is_priced_by_files_removed_not_bytes_written() {
+        const TARGET: i64 = 1000;
+        const SEAL: i64 = 10_000;
+        // NOT sorted runs: `sorted_run_cap` (TARGET/4) excludes already-sorted
+        // files above it, which would keep the pair out for an unrelated reason.
+        let f = |path: &str, size: i64, min: i64, max: i64| super::TailAdd {
+            path: path.into(),
+            size,
+            is_sorted_run: false,
+            event_range: Some((min, max)),
+            rows: None,
+        };
+        let value = |files: &[(&str, i64)]| {
+            let bytes: i64 = files.iter().map(|(_, s)| *s).sum();
+            bytes / (files.len() as i64 - 1).max(1)
+        };
+
+        // THE EXPENSIVE SHAPE: two nearly-converged files fill the target and
+        // remove ONE file between them.
+        let pair = vec![f("p0", 430, 1, 2), f("p1", 430, 3, 4)];
+        assert_eq!(
+            super::select_tail_bin(&pair, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack),
+            vec!["p0", "p1"],
+            "unguarded, the packer takes the pair: it only asks whether the bytes fit"
+        );
+        assert_eq!(value(&[("p0", 430), ("p1", 430)]), 860, "860 bytes rewritten per file eliminated");
+
+        // THE CHEAP SHAPE: ten small files, same partition, remove NINE.
+        let many: Vec<_> = (0..10).map(|i| f(&format!("s{i}"), 20, i * 2 + 1, i * 2 + 2)).collect();
+        let picked = super::select_tail_bin(&many, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack);
+        assert_eq!(picked.len(), 10, "all ten fit under the target");
+        assert_eq!(value(&[("s", 20); 10]), 22, "22 bytes per file eliminated — 39x better value");
+
+        // A floor anywhere between the two separates them, which is the whole
+        // point: it is not a size rule, it is a benefit-per-cost rule.
+        for floor in [30, 100, 500] {
+            assert!(value(&[("p0", 430), ("p1", 430)]) > floor, "the pair must be refused at floor {floor}");
+            assert!(value(&[("s", 20); 10]) <= floor, "the ten-file bin must survive floor {floor}");
+        }
+    }
+
     #[test]
     fn select_tail_bin_policy() {
         const TARGET: i64 = 1000;
