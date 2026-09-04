@@ -183,3 +183,53 @@ coverage problem that today's file layout supports.**
 
 I am glad this was measured before it was recommended further; it took one query
 against statistics that were already there.
+
+## REFINEMENT — the layout IS reachable, and by the work already queued
+
+The correction above says non-overlap is "a different physical layout we would
+have to build". That is too pessimistic, and the statistics say why. Measuring
+each file's span as a fraction of its date partition (`scratchpad/span_widths.py`,
+`Add.stats` only):
+
+```
+cells with >=17 files (81% of the data): file span as a fraction of its DAY
+   p10 0.001   p50 0.010   p90 0.208   p99 0.880
+   spanning >50% of the day:  4.0%
+   spanning >90% of the day:  0.9%
+```
+
+**Files are NARROW. The median file in a big cell covers 1 % of its day — about
+14 minutes — and only 4 % span more than half a day.** So the earlier suspicion
+that wide, day-spanning files cause the overlap is **wrong for the cells that
+hold 81 % of the data.**
+
+Which leaves only one explanation, and it is the encouraging one: **many narrow
+files cover the SAME narrow windows.** Sixty-five files averaging fourteen
+minutes could tile a day comfortably and be almost entirely disjoint; instead
+0.3 % of them are. They are stacked, not spread — which is exactly what a flush
+path that writes one file per 10-minute bucket per writer produces.
+
+**Stacked files are merged by ordinary compaction.** Merging every file covering
+one window into one file makes that window disjoint from the others, because the
+windows themselves are already narrow. No splitting, no new layout, no re-sorting
+by a different key — this is precisely what hot-tail packing and sealed
+consolidation already do.
+
+So the honest sequence is better than the correction implied:
+
+1. **Drain the compaction backlog** — the work already queued, and the thing the
+   four fixes tonight were aimed at.
+2. Disjointness follows **as a by-product**, because the spans are already narrow
+   and merging removes the stacking.
+3. Statistics then prove non-overlap for free, per file, surviving restarts.
+4. The querier unions disjoint files above the dedup, and certification-by-probe
+   becomes a fallback rather than the only path.
+
+**This does not change the coverage arithmetic's conclusion** — coverage is still
+not reachable by waiting at today's throughput. What it changes is the *target*:
+the escape route is not a new storage design, it is **finishing the compaction
+that is already the plan**, after which the cheap proof becomes available.
+
+Two corrections in one night on the same recommendation, in opposite directions.
+The first was right that the premise was unmeasured; the second is what the
+measurement actually says.
