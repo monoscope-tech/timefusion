@@ -2633,3 +2633,53 @@ to fix, then that Pack was. On this process it is **Repair** — at ~93% of the
 heavy pool, achieving nothing. The share numbers move with what is queued; the
 only stable way to read them is `work.<Op>.worker_secs` deltas over a known wall
 interval on one process, which is what this section does.
+
+## Sizing the repair lever: it CANNOT be raised without starving packing
+
+I said the next step was to re-derive `repair_pool_holdback_slices()` for
+`REPAIR_REWRITE_TARGET_FILES = 4`. Doing it:
+
+```
+per-sort slice     = COORDINATOR_PER_SORT_BUDGET_BYTES = 1,280 MiB
+holdback slices    = ceil( files x 256 MiB x 12 / 1.79 / 1,280 MiB )
+coordinator_share  = min(coordinator_jobs x 512 MiB, maintenance_pool x 3/5)
+                   = min(16 x 512 MiB, 9.9 GiB) = 8 GiB = 6 slices
+light_optimize_k   = 6 slices − holdback   (floored at 1)
+```
+
+| `REPAIR_REWRITE_TARGET_FILES` | decoded budget | pool needed | holdback | **`light_optimize_k`** |
+|---:|---:|---:|---:|---:|
+| **2 (today)** | 6,144 MiB | 3,432 MiB | 3 | **3** |
+| 3 | 9,216 MiB | 5,149 MiB | 5 | **1** |
+| 4 | 12,288 MiB | 6,865 MiB | 6 | **1** |
+
+**Any increase above 2 drives `light_optimize_k` to 1 — the exact 2026-09-01
+HotPacking outage the code comments record** (*"K went 3 -> 1 and packing stopped
+being claimed at all... zero HotPacking units in 45 minutes with 17 pending"*).
+
+**So the obvious lever is unsafe, and not marginally: 3 is as bad as 4.** Repair
+already holds 3 of the coordinator's 6 slices; doubling it takes all six.
+
+### The real constraint is the COORDINATOR SHARE, not repair's budget
+
+Repair and hot-tail packing draw from one 6-slice coordinator budget, and it is
+capped by `coordinator_jobs x MAX_DECODED_BYTES = 16 x 512 MiB = 8 GiB` — well
+under the `maintenance_pool x 3/5` = 9.9 GiB ceiling. **The cap that binds is the
+job count (16, deliberately, for the job:permit ratio), not the pool.**
+
+Three ways out, none of them "raise the repair budget":
+
+1. **Shrink `COORDINATOR_PER_SORT_BUDGET_BYTES`** (1,280 MiB). At 1,024 MiB the
+   same 8 GiB yields 8 slices, so `files = 4` leaves `K = 2` instead of 1. Cheapest
+   arithmetic change; needs the per-sort budget to actually be sufficient at 1 GiB.
+2. **Raise the coordinator share** past 8 GiB by lifting the job cap — but that
+   cap exists because a 6:1 job:permit ratio collapsed completions from ~0.6/s to
+   0.035/s. It would need re-benching.
+3. **Give repair its own pool** rather than a holdback against packing's. The two
+   lanes are only coupled because they share the coordinator budget.
+
+**This is why the 252 backlog is not a tuning problem.** Repair is spending 9.3
+of 10 heavy permits and completing nothing, and the fix is blocked behind a
+budget split that cannot accommodate both lanes at once. That is a design
+constraint, and it is the thing standing between here and wide queries working
+reliably — not bin width, not the packer floor, not dedup.
