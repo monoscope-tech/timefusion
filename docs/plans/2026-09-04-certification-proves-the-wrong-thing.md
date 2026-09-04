@@ -1821,3 +1821,39 @@ which is exactly the property `--recompress` already has and the coordinator's
 
 **This also removes the last dependency on an in-region runner**, which was the
 only thing standing between the analysis and an experiment.
+
+### RETRACTED, one paragraph later: in-process RECOMPRESS is the shape that OOM'd prod
+
+The `OptimizeCmd` struct carries the reason my proposal will not work
+(`server/mod.rs:772-778`):
+
+> "Restrict the compaction to one tenant's partition. **A whole-date optimize
+> spans every project's files for that date — tens of GB on a busy day, which
+> doesn't fit in-process next to serving load (2026-07-27: two OOMs).** One
+> (project, date) partition is a few GB."
+
+**So `OPTIMIZE` requires a project scope precisely because whole-date in-process
+work killed the instance twice.** And `--recompress` **cannot be project-scoped**
+— `compact.rs:678` rejects it, because scoped `replace_where` deadlocks.
+
+**Those two constraints are mutually exclusive.** An in-process `RECOMPRESS`
+would be whole-date by construction, at **85 GiB** — several times the "tens of
+GB" that already caused two OOMs. **The proposal is dead, and it is the fifth
+design refuted tonight, this time by an incident recorded in a struct comment.**
+
+**So the in-region runner requirement stands after all.** The work must happen
+outside the serving process:
+
+- **a same-region runner or container** executing `timefusion optimize --date … --recompress`
+  against prod storage, with `TIMEFUSION_DATA_DIR` local — this is the only route
+  that exists today, and the infrastructure question is real rather than
+  avoidable;
+- or, if someone wants it in-process later, **first fix the reason recompress
+  cannot be project-scoped** (the `replace_where` deadlock), which would bring an
+  85 GiB job down to the few-GB partitions `OPTIMIZE` already tolerates. That is
+  a delta-rs/`replace_where` investigation, not a compaction one.
+
+**Two paragraphs, one proposal, one retraction — and the retraction came from
+reading eight lines further into the same file.** That is the ninth or tenth time
+tonight that the answer was already written down next to the thing I was
+proposing to change.
