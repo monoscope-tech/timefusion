@@ -1406,3 +1406,26 @@ is therefore:
 linear in unit count and nearly insensitive to unit cost, throughput is flat
 under 10x load, and rewrite wall-clock is ~61% read+sort. Those bound what any
 fix must do. They just cannot score this particular fix.
+
+## The phase split is steady-state, and two units eat a third of the pool
+
+Re-read on a **2-hour-old process**, 205 units over 110 minutes:
+
+| pass | n | plan | read+sort | write | median | p90 | max | worker-min |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Pack | 203 | 1.5% | **61.2%** | 37.3% | 13.3 s | 85.7 s | 292 s | 95.8 |
+| Repair | 2 | 0.0% | 59.5% | 40.5% | 1,158 s | 1,337 s | 1,337 s | **38.6** |
+| **all** | 205 | 1.0% | **60.7%** | 38.3% | | | | 134 |
+
+**The split is identical to the 87-unit young sample** (60.7 / 37.8 / 1.5), so it
+is steady-state rather than a warm-up artefact — the first measurement here that
+survives the "quiet process" rule instead of needing a caveat.
+
+**And the heavy tail is right there in it: 2 Repair units consumed 38.6 of 134
+worker-minutes — 29% of everything measured — against 203 Pack units at 95.8.**
+Median Pack unit is 13 s, p90 is 86 s, max 292 s. Consistent with
+`tf_unit_size_heavy_tail_2026-09-02` (6.4% of units carried 67.1% of bytes),
+now confirmed on wall clock rather than bytes.
+
+Still no `pass=Dedup` row, because the deployed build does not emit one
+(`c5edeca6` is what fixes that).
