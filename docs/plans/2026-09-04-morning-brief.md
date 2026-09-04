@@ -3202,3 +3202,30 @@ If it shows what this run shows, `coordinator_jobs` (clamped at 16, holding
 1.9 GiB of maintenance pool unreachable) and the 6-slot split are both leaving
 throughput on the table — and that is the remaining structural path to 10x,
 alongside the packer floor already deployed.
+
+## The guard holds as the process ages — it does not drift back
+
+I flagged that 1.2x might drift toward 36.5x as backlog accumulated. Measured
+across three windows on the SAME process:
+
+| window | amplification | median Pack fan-in | Pack rate |
+|---|---:|---:|---:|
+| 12 min | 4.7x | 4 | — |
+| 37 min | 1.2x | 8 | 4,885,364 rows/hr |
+| **51 min** | **1.1x** | **9** | **3,633,568 rows/hr** |
+
+**Amplification FALLS and fan-in RISES as the window lengthens** — the opposite
+of the drift I was worried about. 1.1x is essentially the floor (1.0x = writing
+each byte once), and `pack_value_refused` climbed 3 -> 4 with
+`pack_value_refused_rows` 6.75M -> 8.91M over the same period, so the guard is
+actively working the whole time rather than having fired once early.
+
+**The remaining honest caveat is unchanged and cannot be closed from here:** this
+process carries less backlog than the one that produced 36.5x, so part of the
+difference is state, not the guard. What the three windows DO establish is that
+**within one process the effect is stable and improving, not transient** — which
+was the specific worry.
+
+**Reading for tomorrow:** if a process that has been up for hours still shows
+median Pack fan-in near 9 and `pack_value_refused_rows` climbing, the guard is
+doing in steady state exactly what it did here.
