@@ -2287,3 +2287,74 @@ larger, since prod's excess over the floor is what the guard targets.
 here yet demonstrates prod keeping up at 10x; what it demonstrates is a lever
 with a proven mechanism, a proven local effect, and a quantified prod-data
 estimate — which is the state a change should be in before it is enabled.
+
+## THE USER-FACING PROBLEM, measured: the log explorer hits a WALL at ~2.5 days
+
+Timing monoscope's real projection against the affected project, read-only:
+
+| window | result |
+|---|---|
+| 1h / 6h / 24h | 222 / 278 / 261 ms |
+| 36h | 475 ms |
+| 48h | 1,178 ms |
+| 60h | 2,574 ms |
+| **72h (3 days)** | **FAILS after 10.6 s** |
+| **7 days** | **FAILS after 8.8 s** |
+
+```
+ERROR: Resources exhausted: unordered merge-on-read dedup exceeded its
+2048 MiB per-query limit; narrow the time window or compact unsorted files
+```
+
+**It is not slowness, it is a wall.** Under ~2.5 days queries are fast; past it
+they fail outright. A simple `SELECT id, timestamp` still works at 48h — it is
+the PROJECTION WIDTH (`jsonb_build_array` over a dozen columns plus
+`to_jsonb(summary)`) that pushes the unordered dedup over 2 GiB.
+
+### I WAS WRONG EARLIER, and this is the correction
+
+I wrote that the ordering-repair hypothesis was "refuted by its own counters"
+(0 declines across 6,073 queries) and moved on. **That measurement was taken on
+short-window traffic, where the repair never engages.** After running wide
+queries just now:
+
+```
+ordering_repair_applied  1
+ordering_repair_declined 4
+```
+
+**The declines are real and they are exactly the wide queries.** My refutation
+sampled a query population that could not exhibit the effect — a control-group
+error, not a counter error. The original hypothesis (the isolated unsorted leg
+exceeding `timefusion_read_sort_unordered_leg_max_mb`, 64 MiB) is back, and now
+has direct evidence.
+
+### And it ties the query problem to the maintenance problem
+
+```
+pending_repair = 252
+```
+
+252 files await footer repair. A Repair unit rewrites **exactly one file**, and
+the quiet-hour sample caught **one Repair unit in 95 minutes**. At that rate the
+backlog needs **~400 hours — about 17 days** — and until a file is repaired it
+keeps forcing the unordered dedup path for every query whose window touches it.
+
+**So "maintenance is not keeping up" and "queries are slow" are the same
+problem, and this is the causal link the whole night was missing:** the repair
+lane is starved, unsorted files accumulate, and the log explorer's usable window
+shrinks toward the present.
+
+### Two remedies, both immediate, neither yet applied
+
+1. **Raise `timefusion_read_sort_unordered_leg_max_mb` (64 MiB).** The repair is
+   declining because the leg exceeds it. This is the change I talked myself out
+   of earlier on the strength of the bad refutation above. It costs concurrent
+   query memory — but the pool is now FairSpill, which is what makes it safer
+   than it was this morning.
+2. **Give Repair more throughput.** One file per unit against 252 pending is the
+   binding constraint. `timefusion_repair_max_file_bytes` and the repair pass's
+   budget decide how many files a pass takes.
+
+**This — not bin width, not the packer floor — is what is actually hurting the
+customer today, and it is the thing to fix first.**
