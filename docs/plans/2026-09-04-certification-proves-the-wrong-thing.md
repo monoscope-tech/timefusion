@@ -1702,3 +1702,31 @@ compaction did in three hours**, for a bounded, one-off cost.
 
 **But the first move is now unambiguous, small, and measurable**: one command,
 one cell, and the same statistics script re-run afterwards to confirm 8.5 %.
+
+### The payoff model is robust to bursty data — the obvious objection does not bite
+
+The projection assumes a recompressed cell's 512 MiB pieces each span roughly
+`cell_span / N`, which for the whale is 24 h / 170 ≈ **8.5 minutes — under one
+bin**. The obvious objection is that ingest is bursty, so pieces covering quiet
+periods would span far longer than the average and cross many bins.
+
+**That objection does not bite, and the reason is worth stating because it also
+explains why the current layout is so bad.** A file's sweep cost is the number of
+bins it overlaps **that contain data** — a bin with nothing in it is never dirty
+and never rewritten. So a piece spanning a quiet gap costs nothing for the gap.
+
+Concretely: a 512 MiB piece contains 512 MiB of rows *whatever* the wall-clock
+gap between them. Because pieces are cut on a **sorted** stream, consecutive
+pieces are time-disjoint, and each covers exactly the bins its own rows occupy.
+Burstiness changes *which* bins a piece covers, not *how many have data in it*.
+
+**And that is precisely the property today's files lack.** A wide file is not
+wide because its rows are spread thinly — it is wide because it was *merged from
+inputs drawn from across the day*, so it genuinely holds rows in 100+ separate
+bins. The cost is real there and illusory in the bursty-data objection, and the
+difference is exactly "sorted contiguous output" versus "union of scattered
+inputs".
+
+So the sensitivity that remains is not burstiness. It is the two already stated:
+whether `--recompress` really emits contiguous sub-bin pieces (follows from the
+code, unobserved in prod), and its wall-clock cost on an 85 GiB cell.
