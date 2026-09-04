@@ -16189,6 +16189,42 @@ mod tests {
 
     /// Every clause of `select_tail_bin` is an incident scar (see its doc), so
     /// they're pinned individually here rather than through a Delta table.
+    /// Does FAN-IN scale with the bin target? The 10x path assumes it does.
+    ///
+    /// The modelled route to 10x is: the value floor cuts unit count 5.3x
+    /// (confirmed by simulation), and doubling `COORDINATOR_HOT_TARGET_BYTES`
+    /// supplies the residual 1.9x by doubling fan-in — because a bin fills to
+    /// the target, so twice the target should hold twice the files. **That is
+    /// an assumption, and it is the one the whole path rests on**; the packer
+    /// has other budgets (`MAX_BIN_ROWS`, the row cap) that could bind first.
+    ///
+    /// Driven through the real `select_tail_bin`, so it measures the packer
+    /// rather than a restatement of the arithmetic.
+    #[test]
+    fn fan_in_scales_with_the_bin_target() {
+        const SEAL: i64 = i64::MAX / 4;
+        let f = |i: usize, size: i64| super::TailAdd {
+            path: format!("f{i}"),
+            size,
+            is_sorted_run: false,
+            event_range: Some((i as i64, i as i64)),
+            rows: Some(10_000),
+        };
+        // 40 candidate files of 16 MiB, contiguous in event time.
+        let adds: Vec<_> = (0..40).map(|i| f(i, 16 * 1024 * 1024)).collect();
+
+        let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack).len();
+        let (at256, at512, at768) = (fan_in(256 * 1024 * 1024), fan_in(512 * 1024 * 1024), fan_in(768 * 1024 * 1024));
+        println!("fan-in: 256 MiB -> {at256}   512 MiB -> {at512}   768 MiB -> {at768}");
+
+        assert!(at256 >= 2, "the fixture must produce a real bin at the current target, or this proves nothing");
+        assert!(
+            at512 > at256,
+            "THE 10x PATH'S LOAD-BEARING ASSUMPTION: doubling the target must raise fan-in. \
+             256 MiB -> {at256}, 512 MiB -> {at512}"
+        );
+    }
+
     /// STEADY-STATE BENCHMARK: drive the real packer over many rounds and
     /// measure write amplification with the value floor off vs on.
     ///
