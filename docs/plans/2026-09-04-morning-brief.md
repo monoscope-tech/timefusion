@@ -3495,3 +3495,38 @@ WORKER TIME follows its read volume (sort cost is not purely proportional to
 bytes read). Those want a staging run. But the interaction I flagged as the
 blocker is priced, and it is neutral — which is a stronger position than "staging
 must find out".
+
+## The second constant is NOT safe alone: dedup already overruns its deadline
+
+Before recommending `timefusion_dedup_bin_minutes` 10 -> 20, I checked what
+bounds a dedup unit's wall clock:
+
+```
+timefusion_dedup_schedule  "0 */5 * * * *"   -> 300 s period
+tick_budget                 300 x 0.8        -> 240 s
+drain_deadline              240 x 0.6        -> 144 s      (mod.rs:5094)
+bin_deadline = stage_deadline.min(remaining)               (maintain.rs:5952)
+```
+
+**The drain gets 144 seconds. Tonight's phase timers measured a dedup unit at
+502 seconds — already 3.5x over.** Widening bins doubles the work per bin, so it
+would push further past a deadline that is already being exceeded.
+
+**So the two-constant proposal needs a third change, or it is unsafe:**
+
+| constant | change | why |
+|---|---|---|
+| `COORDINATOR_HOT_TARGET_BYTES` | 256 -> 512 MiB | doubles fan-in (measured on the real packer) |
+| `timefusion_dedup_bin_minutes` | 10 -> 20 | cancels the dedup read cost exactly (measured on 5,701 files) |
+| **`timefusion_dedup_schedule`** | **5 min -> 10+ min** | **a 144 s drain deadline cannot hold a bin that already takes 502 s** |
+
+**This is why the change wants staging rather than a 4 a.m. prod flip**, and it is
+a better reason than "unvalidated": there is a specific, measured conflict
+between the proposed bin width and the deadline the drain runs under. The
+sequencing matters too — the schedule change must land before or with the bin
+widening, never after.
+
+**And note the shape of this finding: it came from reading what bounds the unit,
+not from running anything.** The same 20 minutes spent earlier would have saved
+the detour where I ranked bin width last on throughput grounds; its real
+constraint was never throughput, it was the deadline.
