@@ -1770,3 +1770,17 @@ precisely where the cell is large. On the whale that is ~170x and the sub-bin
 floor caps it at the cell's byte size; on a sparse cell it is a handful of x.
 **The lever scales with the problem, which is the property you want, but the
 "~1x amplification after" claim is specific to dense cells.**
+
+**Checked: the payoff MODEL was already density-aware; only my prose was loose.**
+`sweep_after` computes `span = (hi-lo)/N` per piece and floors the bin count at 1
+(`(span//BIN)+1`) — so a sparse cell's pieces are correctly charged for the bins
+they really span, and only a dense cell's collapse to one. **The 8.5 % / 23.7 % /
+40.4 % figures therefore stand as computed**; what needed correcting was my
+description of *why* ("pieces are sub-bin", true only for dense cells), not the
+arithmetic. Worth stating because the distinction decides whether the table needs
+re-running: it does not.
+
+One residual approximation remains, and it is small: the model divides a cell's
+span evenly across its pieces, whereas equal-BYTE pieces of a bursty cell span
+unequal time. The estimate is therefore an average. Since empty bins cost
+nothing (above), the error is bounded and does not favour the recommendation.
