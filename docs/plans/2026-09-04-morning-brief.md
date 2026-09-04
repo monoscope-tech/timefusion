@@ -1216,3 +1216,23 @@ checkpoint, re-runnable in seconds, and does not depend on the simulator at all.
 That is the strongest 10x-relevant number available today, and
 `timefusion_dedup_bin_minutes` (`ab97d81a`) is now the knob that lets a staging
 soak test it without a code change.
+
+## CI's E2E job is red on master, and has been
+
+`0c667f8f` deployed cleanly (image live, no panic in the logs, process up). But
+its CI run shows **E2E: failure** — and so do the four commits before it:
+
+```
+0c667f8f E2E=failure   8859001f E2E=failure   c47a2a64 E2E=failure
+d7184417 E2E=failure   41093ba4 E2E=failure
+```
+
+It fails on tests that pass locally 8/8 (`bulk_alias_skips_membuffer_but_is_queryable`,
+`second_read_after_flush_hits_foyer`) — a different set from the local flakes, so
+it is environment-specific to CI's runner, not the same bug. **Clippy, Format,
+both test shards and the Gate are green**; only E2E is red.
+
+The consequence is what matters: **that job has been providing no signal for at
+least five commits.** A gate nobody can distinguish from broken is worse than no
+gate, because a real regression in it would look exactly like today. Triaging it
+is the next CI task, ahead of adding anything new to CI.
