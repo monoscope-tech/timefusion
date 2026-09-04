@@ -334,7 +334,17 @@ async fn fleet(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) 
     // never measured. `pool / jobs` is NOT the share a worker gets: one worker
     // sorts this file in a 512 MB pool (see `slice_floor`), yet 8 sharing 8 GB
     // — 1 GB nominal each — fail. Only the ladder answers what a job count costs.
-    for workers in [1usize, 2, 4, 5, 6, 8, 10, 12, 16] {
+    // `TF_BENCH_WORKERS=1,2,4,5,6` overrides the rungs. The point is the POOL
+    // ladder: to test whether the cliff is pool-priced rather than a fixed law,
+    // the same rungs run at several pool sizes, and rungs far past a small
+    // pool's predicted cliff only generate spill — which on a nearly-full disk
+    // fails for the wrong reason and reads as an early cliff.
+    let rungs: Vec<usize> = std::env::var("TF_BENCH_WORKERS")
+        .ok()
+        .map(|list| list.split(',').filter_map(|n| n.trim().parse().ok()).collect::<Vec<_>>())
+        .filter(|rungs: &Vec<usize>| !rungs.is_empty())
+        .unwrap_or_else(|| vec![1, 2, 4, 5, 6, 8, 10, 12, 16]);
+    for workers in rungs {
         // ONE pool for all of them, sized as prod sizes the coordinator's.
         let shared = runtime(pool_mb * 1024 * 1024, spill);
         let started = Instant::now();

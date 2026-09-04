@@ -3817,3 +3817,75 @@ is unchanged from the 09-04 ceiling note: throughput is sub-linear in unit cost,
 so cheaper units cannot reach 10x on their own, and 10x needs the rewrite
 envelope to grow or the work to disappear. Landed-skip is the "work disappears"
 candidate with the best evidence behind it, and it needs staging.
+
+---
+
+## Testing the thing that actually blocks 10x: is the 6-slot envelope a law?
+
+Every ceiling note tonight ends the same way — throughput is sub-linear in unit
+cost, so 10x needs the rewrite envelope to GROW or the work to disappear. The
+envelope has never been tested. It is worth testing before another lever.
+
+### Where the 6 comes from
+
+`light_optimize_k = coordinator_share_bytes / COORDINATOR_PER_SORT_BUDGET_BYTES
+- repair_pool_holdback_slices`. On prod: `coordinator_share = min(16 jobs x 512
+MiB, maintenance_pool x 3/5) = min(8192, 10178) = **8192 MiB**`, so
+`8192 / 1280 - 2 = 4` light `+ 2` repair `= 6`.
+
+The 6 traces to one bench ladder at an **8 GiB pool**:
+
+```
+6 workers  33.32 MB/s  0 failed   <- best
+8 workers  15.07 MB/s  4 FAILED   <- cliff
+```
+
+and the cliff is explained in the code itself as a RATIO, not a count:
+`SAFE_DECODED_PER_POOL_BYTE = 1.79` — 6 x 2,451 MB decoded / 8 GiB = 1.79 passes,
+8 x = 2.39 fails.
+
+**If the cliff is a ratio, the envelope is a pool-allocation decision. If it is a
+count, it is a law and 10x needs a different mechanism entirely.** Those two
+predict different things and the difference is measurable.
+
+### The prediction, written BEFORE the run
+
+Last passing rung `= pool_GiB x 1024 x 1.79 / 2451`:
+
+| pool | predicted last passing | predicted first failing |
+|---:|---:|---:|
+| 2 GiB | 1 | 2 |
+| 4 GiB | 2 | 4 |
+| 6 GiB | 4 | 5 |
+| 8 GiB | 5-6 | 8 |
+
+The 8 GiB row must reproduce the original ladder (6 pass, 8 fail) or the rig is
+not measuring the same thing. Every rung is run at every pool, and the cliff rung
+is repeated — this box is noisy enough that a single failure is not a cliff.
+
+### Stated limits, before any result
+
+- **Testing DOWNWARD.** 32 GB of RAM cannot honestly host a 16 GiB pool, so this
+  establishes linearity from below. Confirmation would prove the cliff is
+  pool-priced **within 2-8 GiB**. It would NOT prove 26 sorts work at a 36 GiB
+  pool — up there, spill-disk bandwidth shared across workers is a plausible new
+  binding constraint these rungs never touch.
+- **Disk is the confound.** A spill failure and a memory cliff are the same
+  entry in the `failed` column, and this box was at 97% (34 GiB) before I freed
+  `target/` to 68 GiB. `df` is recorded around every rung; a rung whose failure
+  coincides with a disk drop is not evidence.
+
+### A correction to make before the prod half of this argument
+
+I was about to write "permits bind while the coordinator pool sits at 15%". That
+crosses a boundary I have already been wrong across five times tonight:
+`coordinator_pool_pct = 15` is INSTANTANEOUS, `compaction_permits_unavailable =
+32` is CUMULATIVE — the pool may have been full during every one of those waits.
+
+Worse, and this is the third instance of the same defect tonight: **that counter
+is incremented from TWO different semaphores** — `light_rewrite_sem`
+(HotPacking/SealedConsolidation) and the byte-priced `repair_rewrite_sem` —
+and **neither is the coordinator pool**. Same shape as the packer floor's two
+packers and `footer_repair_files_per_pass`'s two repair lanes. The envelope is
+still what those permits express, so the question stands; the 15% is not evidence
+for it and is not quoted as such.
