@@ -1,5 +1,60 @@
 # Morning brief — 2026-09-04
 
+## IF YOU READ ONE SCREEN
+
+**The answer to "can we handle 10x".** Dedup consumes **~98 % of the heavy
+maintenance pool**. Not because of scheduling, budgets or livelocks — every
+hard-refusal counter is zero — but because **a dedup bin is 10 minutes and files
+span 45–90 minutes, and a file is read once per bin it touches.**
+
+**The root cause is that compaction creates that condition.** Merging unions time
+ranges, so compaction's output spans wider; the packer scores file COUNT and
+calls a file done at 256 MiB; **nothing anywhere scores SPAN**. Prod correlation
+is inverse and near-perfect — `2026-09-01`: 1,657 files, 0.7 % wide, 75 GiB of
+sweep read. `2026-08-23`: **22 files, 72.7 % wide, 339 GiB.** A partition
+compacted to 22 files is excellent by compaction's definition and the most
+expensive thing in the fleet for dedup.
+
+**It is concentrated.** **500 files — 6.5 % — cause 60 % of all maintenance
+read.** Several span 100 % of their day, so a 1 GiB file is read 144 times per
+sweep: 142 GiB of reading for 1 GiB of data.
+
+**Do this first — it is a command, not a project:**
+
+```
+timefusion optimize --project 87576849-… --date 2026-07-22 --recompress --dry-run
+```
+
+`--recompress` is the **only force-rewrite** (`main.rs:956`) and has exactly one
+skip condition, "no files in partition" — **it will rewrite a whale cell**, where
+every other path skips over-target files. It rewrites through the schema
+`ORDER BY`, and the writer cuts at 512 MiB into time-contiguous pieces: ~170
+outputs of **~8.5 minutes each, narrower than the dedup bin**, taking the cell
+from **45x read amplification to ~1x**. `--dry-run` is verified read-only
+(returns at `main.rs:953`). Ranked list: `scratchpad/wide_rank.py`.
+**Trap:** `--consolidate --target-size-mb` looks right and is wrong — lowering
+the target makes wide files *more* skipped.
+
+**Then, so it does not refill:** bound **span** in the packer's candidate
+selection, the same shape as the byte and row budgets already there.
+
+**Merge-ready branches, none deploying:** `prep/bin-width` (single-sources
+`BIN_MICROS`, adds `compaction_unit_span` reporting), `prep/unit-phase-timers`
+(read/sort/commit decomposition), `prep/otel-metrics-collapse` (correctness
+verified on 22.8 M rows).
+
+**Live in prod:** four fixes, each with a test verified to fail on pre-fix code.
+They took the customer `hashes` chain from structurally impossible to completing
+end to end. **They also all make compaction work better — which means files
+merged wider, faster.**
+
+**Caveat on everything below:** this document grew through the night and contains
+nine corrections I published against myself. Later sections supersede earlier
+ones; the summary above is current. The correction record is kept deliberately —
+the reasoning is the useful part.
+
+---
+
 Final state, not the journey. **Four fixes shipped**, one customer question
 answered with a "don't build this", and four decisions that are yours.
 
