@@ -234,6 +234,7 @@ is another restart for no safety gain. **Review it after the fact.**
 | `prep/unit-phase-timers` | read/sort/commit decomposition per unit — **merge first**, it prices every other decision | instrumentation only |
 | `prep/span-budget` | `timefusion_compaction_span_budget_bins`, **default 0 = off** — rejects a merge whose output union exceeds N dedup bins | no behaviour change until enabled; test asserts the default path is unchanged |
 | `prep/otel-metrics-collapse` | widen `otel_metrics` `dedup_keys` to its sort prefix, off the 20-58x window path | correctness verified on 22.8 M rows, 3 tenants |
+| `prep/split-filter-miss` | splits `rollup_miss_filter_not_eligible` (78, prod's 2nd-largest miss) into its three actual decline rules | instrumentation only; existing label keeps its meaning |
 | `scratch/replace-where-deadlock-v2` | the scoped-recompress experiment | **DO NOT MERGE** — lifts a safety guard |
 | ~~`prep/bin-width`~~ | already on master by accident (see above) | reviewed after the fact |
  (single-sources
