@@ -3661,3 +3661,97 @@ to aggregate, without checking its coverage. `work.*.worker_secs` was in every
 and measurably raises fan-in — that was never a share-dependent claim. What is
 now open is whether it, or dedup work, is the better target. **On the corrected
 split, dedup is.**
+
+---
+
+## Following the corrected split into the dedup lane: 64% of probe work is thrown away at a deadline
+
+The retraction above said dedup is the lane to attack. This is what attacking it
+found, and it is not the bin-width lever I expected.
+
+### First: bin widening is already implemented, and it has converged
+
+`coarsen_sealed_slices` fuses sealed Dedup/BaseRollup/DerivedRollup/HotPacking
+units up the ladder `10min -> 1h -> 6h -> 1day` (`SUBSUME_WIDTHS`), gated on the
+fused unit fitting `MAX_DECODED_BYTES` — with a partition-ceiling escape for
+Dedup specifically, added after the 2026-09-01 stall. Prod over six hours:
+
+```
+subsumed=96 fused=13 candidates=226 blocked=188 over_budget=25
+subsumed=80 fused=4  candidates=198 blocked=169 over_budget=25
+subsumed=64 fused=0  candidates=194 blocked=169 over_budget=25
+...
+subsumed=0  fused=0  candidates=194 blocked=169 over_budget=25
+```
+
+`subsumed` drains to zero and `fused` follows. **`over_budget` is flat at 25 —
+the fix that shipped worked, and coarsening is now converged, not stalled.** So
+"widen the dedup bin" is not an available lever on sealed work: it already
+happens. It remains unavailable on live-frontier work, which `coarsenable`
+excludes by design.
+
+That closes the question the retraction opened, and closes it against the lever
+I had just promoted. The real cost had to be somewhere else.
+
+### The measurement: the batch probe
+
+`dedup_batch_probe` is the certification/classification scan — a key-only
+`GROUP BY` over a whole `(project, date)` that decides whether a partition is
+duplicate-free. It is the mechanism the read path depends on: a query only sheds
+its `DedupExec` when every date it reads is certified. Six hours of prod:
+
+| event | count |
+|---|---:|
+| `dedup_batch_probe` (completed) | 40 |
+| **`dedup_batch_probe_timeout`** | **70** |
+
+**64% of probes time out.** And the admission side explains why:
+
+| `groups=` | `budget_secs=` | passes |
+|---:|---:|---:|
+| 32 | 239 | 8 |
+| 32 | **0** | 7 |
+| 1 | **0** | 14 |
+| 3 / 1 | 239 | 4 |
+
+Two independent defects, both in admission:
+
+1. **21 of 33 passes start with zero budget.** They enumerate groups, sort,
+   interleave and dispatch against a deadline that has already passed.
+2. **A pass that does have a budget admits 32 groups into it regardless.** With
+   `rewrite_permits = 10`, the log shows ~15 completions followed by a run of
+   ~17 timeouts — one wave finishes and the second wave dies wholesale.
+
+A timed-out probe is not free. Each builds a provider and an eager snapshot over
+a whole date's files, holds one of ten heavy rewrite permits for the duration,
+and leaves allocator churn jemalloc retains as RSS. And because dirty and
+certify-only groups are interleaved 1:1, roughly half the discarded probes are
+the certify-only ones — **the only class that can GRANT**, which is the
+documented blocker on the read path (`cert_granted_total=0` beside
+`dedup_probe_timeouts_total=40`, quoted in the code itself).
+
+### The change
+
+`probe_groups_for_budget(permits, budget, observed, cap)` sizes admission to
+what the deadline can finish, from a half-weight EMA of observed probe cost;
+`batch_probe_classify` returns immediately when the budget is already zero,
+leaving every bin queued for a tick that can afford it. Cold estimate ->
+unchanged behaviour, so the first pass measures itself. Floor of one wave, so a
+pessimistic estimate cannot wedge classification at zero.
+
+**What it does NOT claim.** This does not make probes faster and does not by
+itself certify one extra date. It stops ~17 of every 32 admitted probes from
+burning a permit to produce nothing, and it stops the certify-only class from
+being crowded out by work that cannot finish. Whether the freed permit-seconds
+convert into grants is the thing to measure, and the counters are already in
+place: `dedup_probe_timeouts_total` should fall toward zero and
+`cert_granted_total` is the outcome that matters. The new `probe_cost_ms` field
+on `dedup_batch_probe_start` says what sized each admission, so a wrong estimate
+is visible rather than silent.
+
+**Honest limits.** One process, six hours, and the process restarted partway
+(`work.*.worker_secs` reset), so I am quoting event COUNTS over the window and
+the admission/budget pairs — not rates, not shares. The 159s-per-probe figure
+used in the doctest is inferred from 15 completions in 239s at 10 permits, not
+directly measured; it is illustrative of the arithmetic, and the EMA measures
+the real value at runtime rather than trusting it.
