@@ -2725,6 +2725,14 @@ async fn a_chart_under_a_derived_table_routes_and_agrees_with_raw() -> Result<()
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     let today = chrono::Utc::now().date_naive();
+    // PIN THE CLOCK. The fixture's window is fixed relative to `today`, but how
+    // far rollup coverage extends is a function of `now`: run at 03:55 UTC the
+    // 1m tier's covered range stopped at yesterday 14:00, run at 12:00 it
+    // reached today 00:00. The 1h tier ends at 14:00 either way, leaving a
+    // single 1h bucket inside the window -- below `MIN_INTERIOR_BUCKETS` -- so
+    // the whole query's fate rests on the 1m tier, and therefore on the hour the
+    // suite happened to start. Freeze it; the guard restores wall time.
+    timefusion::support::set_micros(today.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros());
     let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
     let yesterday_noon = (today - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
 
