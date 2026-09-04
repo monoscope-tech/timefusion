@@ -3404,3 +3404,41 @@ instead be the enabler for the pack-target change.
 `COORDINATOR_HOT_TARGET_BYTES = 512 MiB` in staging, with
 `timefusion_dedup_bin_minutes` at 10 and 20, before touching prod. Assumption 1
 is the one that decides whether any of this holds.
+
+## Assumption 1 CONFIRMED: fan-in scales linearly with the bin target
+
+The 10x path rested on one unverified step — that doubling
+`COORDINATOR_HOT_TARGET_BYTES` doubles fan-in. `MAX_BIN_ROWS` or the row cap
+could have bound first. Driven through the **real `select_tail_bin`** with 40
+contiguous 16 MiB candidates (`fan_in_scales_with_the_bin_target`):
+
+```
+fan-in:  256 MiB -> 16    512 MiB -> 32    768 MiB -> 40 (fixture cap)
+```
+
+**Exactly linear.** And it calibrates against prod: observed fan-in 9 at a
+256 MiB target implies ~28 MiB average inputs, so 512 MiB should give ~18 —
+which is precisely the number the 10x simulation needed.
+
+### Every link in the 10x chain now has evidence
+
+| link | evidence | type |
+|---|---|---|
+| the guard raises fan-in 2-3 -> 9 | prod `unit_phase_timing` | **measured** |
+| that cuts unit count ~5.3x | sim: 211,356 -> 39,756 at 10x | **simulated** |
+| backlog is linear in unit count | sim streams sweep, 4 points | **measured (sim)** |
+| fan-in scales with bin target | real packer: 16 -> 32 -> 40 | **measured** |
+| guard + 512 MiB reaches the 1x backlog at 10x | sim: 18,285 vs 18,335 | **simulated** |
+
+**What is still NOT demonstrated, and it is the honest boundary:** every step is
+evidenced, but two are simulated on an IO-free model, and the model cannot see
+the cost of wider files on the dedup lane — a dedup unit reads every file
+overlapping its bin in full, so doubling file width widens that span. `timefusion_dedup_bin_minutes`
+is the offset and is already shipped, but the combination has never been run
+against real object storage.
+
+**So the state is: a complete, evidenced chain to 10x, with one unmodelled
+interaction (wider files vs dedup reads) that staging must price.** That is a
+materially different position from "the architecture cannot get there by
+tuning", which is where this document stood four hours ago — and the difference
+came from measuring the packer instead of trusting the arithmetic around it.
