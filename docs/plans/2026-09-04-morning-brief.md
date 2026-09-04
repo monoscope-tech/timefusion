@@ -49,8 +49,17 @@ from **45x read amplification to ~1x**. `--dry-run` is verified read-only
 **Trap:** `--consolidate --target-size-mb` looks right and is wrong — lowering
 the target makes wide files *more* skipped.
 
+**`--recompress` is not a preference — it is the ONLY design that survived
+measurement.** Four alternatives were simulated and refuted: time-ranged
+selection (identical), splitting compaction (those files are never selected),
+time-adjacent ordering (identical), and bin-boundary cutting in the writer
+(144 files of 1.4 MiB per merge). **All four are partial operations over a
+scattered subset, and under-target files span the whole day — so narrow output
+requires narrow INPUT, which only a full sorted rewrite provides.**
+
 **Then, so it does not refill:** bound **span** in the packer's candidate
-selection, the same shape as the byte and row budgets already there.
+selection, the same shape as the byte and row budgets already there. Note the
+four refutations above constrain what that rule can look like.
 
 **Merge-ready branches, none deploying:** `prep/bin-width` (single-sources
 `BIN_MICROS`, adds `compaction_unit_span` reporting), `prep/unit-phase-timers`
