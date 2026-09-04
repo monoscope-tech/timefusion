@@ -103,6 +103,12 @@ deploy. And it names the culprit precisely — **24 units over 60 minutes:**
 | `HotPacking` | 118 | **13** | 20 | 62.7 % |
 | `SealedConsolidation` | 179 | **84** | **144** | 4.5 % |
 
+**A lane consuming 4 % of maintenance capacity is manufacturing the cost driver
+for the lane consuming 76 %.** Measured worker time: `Dedup` **75.9 %**,
+`BaseRollup` 15.8 %, **`SealedConsolidation` 4.2 %**, `HotPacking` 0.4 %. Sealed
+consolidation emits many units because they are *cheap* — and each one leaves
+behind an object that 84–144 dedup bins must then read in full.
+
 **`SealedConsolidation` is the lane manufacturing the cost** — p50 **84 bins**
 against hot packing's **13**, and one unit produced an output spanning **144
 bins, an entire day.**
@@ -116,7 +122,11 @@ observed maximum of 20.)*
 **File count does not track span at all** (10 files → 8 bins, 2 files → 119), so
 a packer measuring count and bytes is blind to this by construction.
 
-**A 16-bin span bound would therefore touch only the guilty lane.** The
+**A ~22-bin span bound is precisely targeted.** Measured over 300 units:
+`HotPacking` keeps **100 %** of its 495 file retirements; `SealedConsolidation`
+keeps **4 %** of its 1,231. The cost of enabling it is 4.2 % of worker time plus
+~1,180 retirements per 90 minutes — **retirements the three-hour test showed buy
+0.007 % of cost reduction.** The
 uncomfortable part: since that lane cannot choose narrower inputs (three
 selection designs refuted), such a bound would effectively disable it — trading a
 file-count win for the read amplification it currently imposes on 74–144 dedup
