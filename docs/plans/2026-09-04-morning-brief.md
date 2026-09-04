@@ -16,7 +16,13 @@ dedup_bins_committed_total            20    -> ~58 worker-MINUTES per committed 
 ```
 
 **Dedup is using 98 % of the heavy maintenance pool to remove a hundred thousand
-rows.**
+rows.** And per cell it is worse than any average suggests: **an 85 GiB partition
+costs 3,867 GiB to sweep once — a 45x read amplification** — because a 10-minute
+bin sits inside 45-90-minute files and every bin re-reads all of them.
+
+**Six such cells, one tenant, six consecutive July days, are ~52 % of the entire
+fleet's maintenance read volume** (10,148 of 19,530 GiB). Widening the bin to
+60 minutes takes those six from 10,148 GiB to ~2,048 GiB.
 
 > **RETRACTION.** An earlier version of this section said "~182,000 rows read per
 > row removed", from `work.Dedup.progress_rows = 19,186,817,032`. **That is not a
