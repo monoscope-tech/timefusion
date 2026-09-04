@@ -3380,3 +3380,318 @@ mod dedup_needs_ordered_input_tests {
         assert!(child_name(&out).contains("SortPreservingMergeExec"));
     }
 }
+
+// ===== range_parallel_dedup =====
+
+use datafusion::logical_expr::{Filter, SubqueryAlias, utils::split_conjunction};
+
+/// Branches a wide aggregate window is split into. `<2` disables the rule.
+static RANGE_SPLIT_BRANCHES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub fn range_split_branches() -> usize {
+    *RANGE_SPLIT_BRANCHES.get_or_init(|| 4)
+}
+
+/// Set the range-split branch count. No-op after the first call (OnceLock).
+pub fn set_range_split_branches(branches: usize) {
+    let _ = RANGE_SPLIT_BRANCHES.set(branches);
+}
+
+/// Below this span one thread is comfortably inside the statement timeout, so
+/// splitting only adds planning work and re-opens files. Prod 2026-09-04:
+/// 14 d = 14.0 s, 30 d did not finish inside 60 s.
+const MIN_SPLIT_SPAN_MICROS: i64 = 8 * 24 * 3_600 * 1_000_000;
+
+/// `DedupExec` declares `Distribution::SinglePartition`, so every row of a window
+/// funnels through ONE thread beneath the `SortPreservingMerge`. Prod 2026-09-04,
+/// whale project: 14 d = 51.6 M rows in 24.6 s (2.1 M rows/s — a single-core
+/// rate), and 30 d could not finish inside the 60 s statement timeout, while the
+/// SAME 30 days issued as two 15 d queries CONCURRENTLY finished in **19.98 s**.
+/// The work fits the box; one query cannot use more than one core.
+///
+/// So split the window: N disjoint timestamp ranges, each with its own scan and
+/// its own `DedupExec`, unioned under the original aggregate.
+///
+/// **Why this is exact.** `timestamp` is the LEADING dedup key, so two versions of
+/// a row always carry the same timestamp and can never land either side of a
+/// boundary. Verified on prod before this was written: 6-hour slices of a day sum
+/// exactly to that day's count, and two 15 d halves sum exactly to the 30 d count.
+///
+/// **Why RANGE and not HASH.** Hashing the dedup key also keeps versions together,
+/// but it destroys the input ordering, forcing `DedupExec` into its unbounded
+/// `full-set` mode — total seen-set memory merely moves rather than shrinking,
+/// which is the `dedup exceeded its 2048 MiB per-query limit` failure. A range
+/// split keeps every branch ordered, so bounded dedup and its small seen-set
+/// survive.
+///
+/// **Why only under an aggregate.** A union of ranges advertises no ordering, so
+/// applying this beneath `ORDER BY timestamp DESC LIMIT n` would trade a streaming
+/// TopK for a blocking sort. Aggregates require no input ordering — and they are
+/// exactly the shape that was timing out.
+#[derive(Debug, Default)]
+pub struct RangeParallelDedup;
+
+impl OptimizerRule for RangeParallelDedup {
+    fn name(&self) -> &str {
+        "range_parallel_dedup"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        let branches = range_split_branches();
+        let LogicalPlan::Aggregate(aggregate) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        // A Union input is this rule's own output. The optimizer runs to a
+        // fixpoint, and re-splitting each branch would fan out geometrically.
+        if branches < 2 || matches!(aggregate.input.as_ref(), LogicalPlan::Union(_)) {
+            return Ok(Transformed::no(plan));
+        }
+        let Some((lo, hi)) = splittable_window(&aggregate.input) else {
+            return Ok(Transformed::no(plan));
+        };
+        if hi.saturating_sub(lo) < MIN_SPLIT_SPAN_MICROS {
+            return Ok(Transformed::no(plan));
+        }
+        let step = (hi - lo) / branches as i64;
+        let narrowed: Option<Vec<LogicalPlan>> = (0..branches)
+            .map(|i| {
+                // Half-open [lo, hi) per branch so a row on a boundary belongs to
+                // exactly one branch. The last branch takes `hi + 1` because the
+                // window `hi` is INCLUSIVE (`<=` folds into it upstream).
+                let branch_lo = lo + step * i as i64;
+                let branch_hi = if i + 1 == branches { hi.saturating_add(1) } else { lo + step * (i as i64 + 1) };
+                narrow_scan_window(&aggregate.input, branch_lo, branch_hi)
+            })
+            .collect();
+        let Some(narrowed) = narrowed else {
+            return Ok(Transformed::no(plan));
+        };
+        let union = narrowed[1..]
+            .iter()
+            .try_fold(LogicalPlanBuilder::new(narrowed[0].clone()), |builder, branch| builder.union(branch.clone()))?
+            .build()?;
+        // A UNION's output fields are UNQUALIFIED, so a parent expression like
+        // `t.id` stops resolving and the whole rule fails the query. Re-attach
+        // the scan's qualifier, and if that still does not reproduce the input's
+        // schema exactly, DECLINE — the replacement must be indistinguishable to
+        // every parent, or this is a rewrite that breaks queries rather than one
+        // that speeds them up.
+        let union = if union.schema() == aggregate.input.schema() {
+            union
+        } else {
+            let Some(qualifier) = scan_qualifier(&aggregate.input) else {
+                return Ok(Transformed::no(plan));
+            };
+            let aliased = LogicalPlanBuilder::new(union).alias(qualifier)?.build()?;
+            if aliased.schema() != aggregate.input.schema() {
+                return Ok(Transformed::no(plan));
+            }
+            aliased
+        };
+        Ok(Transformed::yes(LogicalPlan::Aggregate(datafusion::logical_expr::Aggregate::try_new(
+            Arc::new(union),
+            aggregate.group_expr.clone(),
+            aggregate.aggr_expr.clone(),
+        )?)))
+    }
+}
+
+/// The finite timestamp window of a subtree the split may pass through.
+///
+/// A WHITELIST, deliberately: the rewrite assumes "the rows of sub-range A" equals
+/// "the rows of the whole window restricted to A". A LIMIT, DISTINCT, JOIN, WINDOW
+/// or nested aggregate breaks that equality — `count(*)` over `(SELECT … LIMIT
+/// 100)` would become N x 100 rows. Only nodes that commute with a row filter are
+/// listed, so an unrecognised node declines rather than silently miscounting.
+fn splittable_window(plan: &LogicalPlan) -> Option<(i64, i64)> {
+    let mut predicates: Vec<Expr> = Vec::new();
+    let mut node = plan;
+    loop {
+        match node {
+            LogicalPlan::Filter(filter) => {
+                predicates.push(filter.predicate.clone());
+                node = &filter.input;
+            }
+            LogicalPlan::Projection(projection) => node = &projection.input,
+            LogicalPlan::SubqueryAlias(alias) => node = &alias.input,
+            LogicalPlan::TableScan(scan) => {
+                predicates.extend(scan.filters.iter().cloned());
+                let conjuncts: Vec<&Expr> = predicates.iter().flat_map(split_conjunction).collect();
+                return bounded_window(&conjuncts);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Both bounds of `timestamp` across `conjuncts`, or `None` if either is open.
+/// An unbounded side has no finite span to divide, and splitting on a guessed
+/// bound would drop every row outside it.
+fn bounded_window(conjuncts: &[&Expr]) -> Option<(i64, i64)> {
+    fn literal_micros(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
+            Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
+            Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
+            Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
+            _ => None,
+        }
+    }
+    let (lo, hi) = conjuncts.iter().fold((None::<i64>, None::<i64>), |acc @ (lo, hi), conjunct| {
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = conjunct else { return acc };
+        let (bound, op) = if is_col_through_cast(left, "timestamp") {
+            (literal_micros(right), *op)
+        } else if is_col_through_cast(right, "timestamp") {
+            (literal_micros(left), swap_comparison(*op))
+        } else {
+            return acc;
+        };
+        let Some(ts) = bound else { return acc };
+        match op {
+            Operator::Gt | Operator::GtEq => (Some(lo.map_or(ts, |l| l.max(ts))), hi),
+            Operator::Lt | Operator::LtEq => (lo, Some(hi.map_or(ts, |h| h.min(ts)))),
+            Operator::Eq => (Some(ts), Some(ts)),
+            _ => acc,
+        }
+    });
+    lo.zip(hi).filter(|(lo, hi)| lo < hi)
+}
+
+/// The scanned table's qualifier, used to restore the qualification a UNION drops.
+fn scan_qualifier(plan: &LogicalPlan) -> Option<datafusion::common::TableReference> {
+    match plan {
+        LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
+        LogicalPlan::Filter(filter) => scan_qualifier(&filter.input),
+        LogicalPlan::Projection(projection) => scan_qualifier(&projection.input),
+        LogicalPlan::SubqueryAlias(alias) => scan_qualifier(&alias.input),
+        _ => None,
+    }
+}
+
+/// Rebuild `plan` with `[lo, hi)` pinned directly above its TableScan, so the
+/// branch prunes to its own files rather than filtering a full-window scan.
+fn narrow_scan_window(plan: &LogicalPlan, lo: i64, hi: i64) -> Option<LogicalPlan> {
+    match plan {
+        LogicalPlan::TableScan(scan) => {
+            // Take the timezone from the scanned column rather than assuming
+            // UTC: a literal in the wrong timezone (or the wrong TimeUnit) makes
+            // the comparison a no-op or, worse, silently shifts the boundary.
+            // A non-microsecond timestamp declines the whole rewrite.
+            let field = scan.projected_schema.field_with_unqualified_name("timestamp").ok()?;
+            let timezone = match field.data_type() {
+                arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, timezone) => timezone.clone(),
+                _ => return None,
+            };
+            let literal = |micros| Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), timezone.clone()), None);
+            let timestamp = Expr::Column(Column::new(Some(scan.table_name.clone()), "timestamp"));
+            let window = timestamp.clone().gt_eq(literal(lo)).and(timestamp.lt(literal(hi)));
+            Filter::try_new(window, Arc::new(plan.clone())).ok().map(LogicalPlan::Filter)
+        }
+        LogicalPlan::Filter(filter) => Filter::try_new(filter.predicate.clone(), Arc::new(narrow_scan_window(&filter.input, lo, hi)?))
+            .ok()
+            .map(LogicalPlan::Filter),
+        LogicalPlan::Projection(projection) => Projection::try_new(projection.expr.clone(), Arc::new(narrow_scan_window(&projection.input, lo, hi)?))
+            .ok()
+            .map(LogicalPlan::Projection),
+        LogicalPlan::SubqueryAlias(alias) => SubqueryAlias::try_new(Arc::new(narrow_scan_window(&alias.input, lo, hi)?), alias.alias.clone())
+            .ok()
+            .map(LogicalPlan::SubqueryAlias),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod range_parallel_dedup_tests {
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema, TimeUnit},
+        datasource::MemTable,
+        execution::session_state::SessionStateBuilder,
+        prelude::SessionContext,
+    };
+
+    use super::*;
+
+    /// `timestamp` is `Timestamp(us, UTC)` exactly as `otel_logs_and_spans`
+    /// declares it — the rule reads the timezone off this field.
+    async fn optimized(sql: &str, with_rule: bool) -> String {
+        let builder = SessionStateBuilder::new().with_default_features();
+        let builder = if with_rule { builder.with_optimizer_rule(Arc::new(RangeParallelDedup)) } else { builder };
+        let ctx = SessionContext::new_with_state(builder.build());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+        ]));
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
+        ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap().display_indent().to_string()
+    }
+
+    const WIDE: &str = "timestamp >= '2026-08-05T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp";
+
+    /// THE fix: a 30-day aggregate becomes N independently-dedupable ranges.
+    /// Without it every row of the window funnels through one `DedupExec`
+    /// thread, which is why 30 d could not finish inside the statement timeout
+    /// while two concurrent 15 d halves took 19.98 s.
+    #[tokio::test]
+    async fn splits_a_wide_aggregate_window_into_branches() {
+        let plan = optimized(&format!("SELECT count(*) FROM t WHERE {WIDE}"), true).await;
+        assert!(plan.contains("Union"), "wide aggregate must split:\n{plan}");
+        assert_eq!(plan.matches("TableScan: t").count(), range_split_branches(), "one scan per branch:\n{plan}");
+        // Each branch must carry its OWN bound. A split that left every branch
+        // reading the whole window would be correct but pointless, and would
+        // multiply the work by the branch count.
+        assert!(plan.matches("timestamp >=").count() >= range_split_branches(), "each branch needs its own lower bound:\n{plan}");
+    }
+
+    /// The rewrite assumes "rows of sub-range A" == "the window's rows restricted
+    /// to A". Every shape here breaks that, or has nothing to gain, so each must
+    /// come back byte-identical to the un-ruled plan.
+    #[tokio::test]
+    async fn declines_where_a_split_would_change_the_answer() {
+        for (name, sql) in [
+            // count(*) over a LIMIT would become branches x limit rows.
+            ("limit under the aggregate", format!("SELECT count(*) FROM (SELECT * FROM t WHERE {WIDE} LIMIT 100)")),
+            // No aggregate: splitting costs the streaming TopK its ordering.
+            ("order by with limit", format!("SELECT id FROM t WHERE {WIDE} ORDER BY timestamp DESC LIMIT 5")),
+            // Narrow enough that one thread is comfortably inside the timeout.
+            ("span below the threshold", "SELECT count(*) FROM t WHERE timestamp >= '2026-09-01T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp".into()),
+            // An open upper bound has no finite span to divide.
+            ("half-open window", "SELECT count(*) FROM t WHERE timestamp >= '2026-08-05T00:00:00Z'::timestamp".into()),
+        ] {
+            assert_eq!(optimized(&sql, true).await, optimized(&sql, false).await, "{name}: must not rewrite");
+        }
+    }
+
+    /// A UNION emits UNQUALIFIED fields, so the parent's `t.id` stopped
+    /// resolving and the rule failed the whole query with `FieldNotFound`. The
+    /// rewrite must be indistinguishable to its parent, qualifier included.
+    ///
+    /// `SELECT DISTINCT` is itself an `Aggregate`, and splitting it IS sound —
+    /// the aggregate sits above the union and still sees every row of the
+    /// window — so this is the shape that exercises qualification.
+    #[tokio::test]
+    async fn split_preserves_the_scan_qualifier_a_union_would_drop() {
+        let plan = optimized(&format!("SELECT count(*) FROM (SELECT DISTINCT id FROM t WHERE {WIDE})"), true).await;
+        assert!(plan.contains("Union"), "distinct over a wide window should still split:\n{plan}");
+        assert!(plan.contains("SubqueryAlias: t"), "the union must be re-qualified as `t`:\n{plan}");
+        assert!(plan.contains("groupBy=[[t.id]]"), "the parent must still bind `t.id`:\n{plan}");
+    }
+
+    /// Splitting must partition the window, not resample it: the branch bounds
+    /// have to tile `[lo, hi]` with no gap and no overlap. A gap silently drops
+    /// rows; an overlap silently double-counts them, and both look like a
+    /// working query.
+    #[tokio::test]
+    async fn branch_bounds_tile_the_window_exactly() {
+        let plan = optimized(&format!("SELECT count(*) FROM t WHERE {WIDE}"), true).await;
+        let bounds: Vec<&str> = plan.matches("timestamp >=").collect();
+        assert_eq!(bounds.len(), range_split_branches(), "expected one lower bound per branch:\n{plan}");
+        // One upper bound per branch. The LAST branch is built as `< hi + 1`,
+        // which DataFusion's simplifier folds back to `<= hi` — so both forms
+        // count, and the total must still be exactly one per branch.
+        assert_eq!(plan.matches("timestamp <").count(), range_split_branches(), "one upper bound per branch:\n{plan}");
+    }
+}
