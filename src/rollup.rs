@@ -23,6 +23,20 @@ pub enum MissReason {
     /// `UnknownFilter` so that counter means "a filter we should have matched
     /// and didn't" — see the decline site for the prod evidence.
     FilterNotEligible,
+    /// The query carries NULL-guards on two different columns. A count measure
+    /// is a single measure by construction, so it cannot express both, and
+    /// guarding on one while ignoring the other would silently answer a
+    /// different question. Carved out of `FilterNotEligible` on 2026-09-04:
+    /// that label was returned from THREE sites, so 78 prod declines said a
+    /// filter was refused without saying which rule refused it — the same shape
+    /// as the tantivy prefilter label that hid four refusals until it was split.
+    #[strum(serialize = "filter_multiple_null_guards")]
+    FilterMultipleNullGuards,
+    /// The measure's column and the query's NULL-guard column disagree, so the
+    /// stored measure counts a different population than the query asks for.
+    /// Carved out of `FilterNotEligible` on 2026-09-04 — see above.
+    #[strum(serialize = "filter_null_guard_mismatch")]
+    FilterNullGuardMismatch,
     MissingMeasure,
     #[strum(serialize = "non_decomposable")]
     NonDecomposableAggregate,
@@ -2312,7 +2326,7 @@ async fn route_with_spec(
     // one and silently ignore the other.
     null_guards.dedup();
     if null_guards.len() > 1 {
-        return Err(MissReason::FilterNotEligible);
+        return Err(MissReason::FilterMultipleNullGuards);
     }
     let null_guard = null_guards.first().copied();
     // A query that neither pins nor groups by project_id would fold every
@@ -2577,7 +2591,7 @@ async fn route_with_spec(
             (column, _) => column,
         };
         if null_guard.is_some() && column.as_deref() != null_guard {
-            return Err(MissReason::FilterNotEligible);
+            return Err(MissReason::FilterNullGuardMismatch);
         }
         let measure = |aggregate: &str, column: Option<&str>| {
             configured_filters
@@ -2726,6 +2740,8 @@ mod tests {
                 "unknown_group_by",
                 "unknown_filter",
                 "filter_not_eligible",
+                "filter_multiple_null_guards",
+                "filter_null_guard_mismatch",
                 "missing_measure",
                 "non_decomposable",
                 "unaligned_bucket_width",
