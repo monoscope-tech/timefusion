@@ -260,6 +260,17 @@ fn run_sim_cli() -> anyhow::Result<()> {
     // preflight (a real journal carries estimates the sim would never read).
     let report = if let Some(shape) = input.strip_prefix("synth:") {
         anyhow::ensure!(shape == "whale", "the only synthetic queue is `synth:whale`");
+        // `--streams` scales the INGESTING streams discovered in a real
+        // journal. A synthetic queue has none and sets `mint_frontier = false`
+        // below, so the flag was silently inert — while the summary line still
+        // printed the count it was given. A "10x" run reported 260 streams and
+        // modelled 1x: `--streams 26` and `--streams 260` produced BYTE-IDENTICAL
+        // reports at the same seed (2026-09-04). Refuse it rather than answer a
+        // capacity question with the baseline.
+        anyhow::ensure!(
+            cfg.streams.is_none(),
+            "--streams has no effect on a synthetic queue: it scales the ingesting streams found in a REAL journal. Pass a journal path instead."
+        );
         let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100);
         cfg.mint_frontier = false;
         cfg.byte_model = Some(queue.model);
