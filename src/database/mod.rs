@@ -5462,6 +5462,10 @@ impl Database {
             // Appended after DataFusion's defaults so push_down_limit has
             // already folded LIMIT into Sort.fetch — see the rule's docs.
             .with_optimizer_rule(Arc::new(crate::read::optimizers::DeferExpensiveProjection))
+            // After the defaults so predicate pushdown has already placed the
+            // timestamp bounds this reads, and before the Variant restore below
+            // so the branches it clones are re-typed like any other scan.
+            .with_optimizer_rule(Arc::new(crate::read::optimizers::RangeParallelDedup))
             // Must run LAST: re-restores Variant scan types that
             // optimize_projections reverts to Utf8View when it rebuilds each
             // TableScan from the lying provider schema — see the rule's docs

@@ -812,6 +812,7 @@ impl BufferedWriteLayer {
         // Apply configurable bucket duration before MemBuffer reads it.
         crate::write::mem_buffer::set_bucket_duration_micros((cfg.buffer.bucket_duration_secs() as i64) * 1_000_000);
         crate::read::set_bounded_dedup_enabled(cfg.maintenance.timefusion_read_dedup_bounded);
+        crate::read::optimizers::set_range_split_branches(cfg.maintenance.timefusion_query_range_split_branches);
         // Text-index cache budget: 25% of the MemBuffer memory budget.
         // Rationale: indexed text is roughly 1.5–2x raw text in postings,
         // and indexed columns are a fraction of total row bytes. 25% is a

@@ -2593,6 +2593,19 @@ pub struct MaintenanceConfig {
     /// queries scan the whole window.
     #[serde_inline_default(true)]
     pub timefusion_read_dedup_bounded: bool,
+    /// Branches a wide AGGREGATE window is split into, so each range's
+    /// `DedupExec` runs on its own thread. `0`/`1` disables the split.
+    ///
+    /// `DedupExec` is `SinglePartition`, so one query gets one core: prod
+    /// 2026-09-04 measured 2.1 M rows/s on a 14 d window (24.6 s) and could not
+    /// finish 30 d inside the 60 s statement timeout — while the same 30 days
+    /// as two CONCURRENT 15 d queries took 19.98 s. Splitting is exact because
+    /// `timestamp` leads the dedup key, so no row's versions can straddle a
+    /// boundary. Applies only under an aggregate; a `ORDER BY … LIMIT` keeps its
+    /// streaming TopK. Each branch re-opens the files its range touches, so
+    /// raising this trades file opens for parallelism.
+    #[serde_inline_default(4)]
+    pub timefusion_query_range_split_branches: usize,
     /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only
     /// fires when the window is fully flushed, dedup-provably-clean, and
