@@ -1857,3 +1857,45 @@ outside the serving process:
 reading eight lines further into the same file.** That is the ninth or tenth time
 tonight that the answer was already written down next to the thing I was
 proposing to change.
+
+### What the `replace_where` deadlock would take to fix (not attempted)
+
+Since that deadlock is now the gate on ever running this in-process, here is what
+is established about it, and what is not.
+
+**The write is (`compact.rs:826-838`):**
+
+```rust
+let input_plan = ctx.sql("SELECT * FROM recompress_src WHERE date = '…' ORDER BY …")…;
+let replace_pred = format!("date = '{date_str}'");
+table.write(vec![])
+    .with_input_plan(input_plan)
+    .with_save_mode(SaveMode::Overwrite)
+    .with_replace_where(replace_pred)…
+```
+
+**Project-scoping changes only the two predicates** — both would gain
+`AND project_id = '…'`. Nothing else about the call differs.
+
+**The plausible mechanism, which I have NOT verified:** the input plan reads the
+same files `replace_where` is overwriting, on a runtime with a bounded thread
+pool and a maintenance memory pool. A narrower predicate changes which files
+delta-rs must open to evaluate the overwrite, and self-contention between the
+scan and the overwrite on a bounded pool is the classic shape of this hang.
+**That is a hypothesis from the call shape, nothing more** — the comment says
+"can deadlock", which is someone's hard-won experience, not a diagnosis I can
+reconstruct.
+
+**The experiment that would settle it costs nothing and needs no prod:** the
+sqllogictest/e2e harness already stands up local MinIO. Write one test that
+recompresses a two-project partition with a project-scoped predicate, run it
+under a small `target_partitions`, and see whether it hangs. If it does, the
+stack trace names the deadlock; if it does not, the restriction may be
+obsolete — the comment carries no date, and several things in this file have
+been rewritten since.
+
+**Worth doing, because the payoff is disproportionate:** project-scoping turns an
+85 GiB whole-date job into a few-GB partition job, which is the size `OPTIMIZE`
+already runs in-process. That single fix would collapse the infrastructure
+dependency, the OOM risk, and the blast radius all at once — the three objections
+that killed the in-process route above.
