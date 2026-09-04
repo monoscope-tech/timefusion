@@ -3618,3 +3618,46 @@ separate operations with separate pending counts (94 and 16 tonight), which
 suggests sealed carries the larger share — but the 5.3x unit-count reduction was
 measured across Pack as a whole, not split by lane. **That split is the next
 measurement, and it decides how much of the 10x path this variant delivers.**
+
+## RETRACTION: the lane split I used all night was from a PARTIAL instrument
+
+`work.<Op>.worker_secs` covers every coordinator unit. The phase timers only fire
+for units that reach `stage_hot_bin` / `stage_dedup_chunk`. **I built the lane
+shares from the phase timers, and they are biased.** The authoritative split, at
+1,837 s uptime:
+
+| lane | worker-secs | share |
+|---|---:|---:|
+| **Dedup** | 2,087 | **46.7%** |
+| **Repair** | 1,245 | **27.8%** |
+| SealedConsolidation | 729 | 16.3% |
+| HotPacking | 216 | 4.8% |
+| BaseRollup | 175 | 3.9% |
+| DerivedRollup | 21 | 0.5% |
+
+**Pack (Hot + Sealed) is 21.1%, not the 85.3% this document has used since the
+"quiet hour" section. Dedup is 46.7%, not 13.4%.** The two lanes I concluded
+were minor — dedup and repair — are together **74.5%** of maintenance.
+
+**What this does to the conclusions built on the wrong split:**
+
+| claim | status |
+|---|---|
+| packer floor fires, fan-in 2-3 -> 9, cuts Pack write volume | **stands** — measured directly |
+| guard gives 5.3x backlog reduction at 10x | **stands** — simulated on unit counts, not lane shares |
+| "Pack write is ~51% of maintenance, so the floor saves 33%" | **WRONG** — Pack is 21%, so the worker-time saving is ~12% |
+| "raise the sealed target" is the cheap 10x lever | **WEAKENED** — it touches 16.3%, not 85% |
+| dedup/bin-width ranks last | **WRONG** — dedup is the largest lane at 46.7% |
+
+**The bin-width lever I dismissed at ~3.7% was priced against a 13.4% dedup
+share. At 46.7% the same 5.1x read reduction is worth ~3.5x more than I said.**
+
+**Why this happened, and it is the session's recurring error in its purest form:**
+I had two instruments measuring the same thing and used the one that was easier
+to aggregate, without checking its coverage. `work.*.worker_secs` was in every
+`timefusion_stats` dump I read all night.
+
+**What is still true and load-bearing:** the packer floor is deployed, firing,
+and measurably raises fan-in — that was never a share-dependent claim. What is
+now open is whether it, or dedup work, is the better target. **On the corrected
+split, dedup is.**
