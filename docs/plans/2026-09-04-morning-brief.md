@@ -2408,3 +2408,48 @@ and the "after" numbers differ in at least three ways (config, process age,
 elapsed maintenance) and I changed all of them at once. That is the same
 attribution error as this morning's revert, and the only reason I caught it here
 is that I shipped a counter that could contradict me.
+
+## The age curve, and why the prime suspect is MY OWN mask fix
+
+Query latency against process age, same query, same project:
+
+| uptime | 3 days | 7 days | MemBuffer rows |
+|---|---|---|---|
+| 5 min | 213 ms | 227 ms | — |
+| 20 min | **475 ms** | **958 ms** | 143,000 |
+| ~95 min (the original failure) | **FAILED** | **FAILED** | 449,580 |
+
+**Latency rises with process age, and MemBuffer size rises with it too.** That is
+the shape the process-age hypothesis predicted, now with two independent
+quantities moving together.
+
+### The mechanism points at `b9fd6f28` — the mem-mask fix I shipped this morning
+
+The mask excludes, from the Delta leg, the time ranges the MemBuffer is
+authoritative for. My fix floors that exclusion at the bucket's flushed
+watermark, so **an instant the bucket has already flushed is no longer masked** —
+which is correct, and is what stopped `COUNT(*)` losing acked rows.
+
+But the consequence scales with age:
+
+- **fresh process** — nothing flushed yet, `flushed_max_ts` at its sentinel, every
+  bucket's mask intact, Delta leg tightly excluded, few rows into dedup;
+- **aged process** — many buckets have flushed, so their masks are floored away,
+  the Delta leg is admitted over those instants, and **every one of those rows
+  now flows through `DedupExec`** toward its 2 GiB unordered ceiling.
+
+**So the rows my fix correctly un-hid are the same rows now inflating the dedup
+buffer.** The fix is not wrong — those rows are real, committed, and were
+invisible before — but I priced it as "a duplicate read-side dedup collapses" and
+never measured what it does to dedup's working set. I flagged it as "plausibly
+making queries slower" hours ago and did not follow up.
+
+**This is a hypothesis with a mechanism and a matching age curve, not a
+conclusion.** What would confirm it: a counter for exclusion ranges dropped by
+the floor, rising with uptime alongside dedup buffer size. That counter does not
+exist — the same gap that made every other cliff tonight invisible.
+
+**If it is confirmed, the fix is not to revert** (that restores silent row loss)
+but to stop the un-masked rows reaching the unordered dedup path — i.e. the
+ordering repair, which is exactly what `pending_repair = 252` is blocking.
+**Everything converges on the repair backlog.**
