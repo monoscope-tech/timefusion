@@ -1980,3 +1980,52 @@ throughput win it does not deliver.**
 **Standing caveat:** one process, 95 minutes. But the direction has been
 consistent across four samples, and the two quantities that never moved are the
 per-unit read/write shapes and the presence of a dominating heavy tail.
+
+## THE COST DRIVER: maintenance writes ~36 rows for every row ingested
+
+Matched windows — 95 minutes of phase logs against a process at 5,817 s uptime:
+
+| | rows |
+|---|---:|
+| **Ingested** (`rows_ingested_total`) | **7,504,759** |
+| Pack staged (written) | **269,432,825** |
+| Dedup staged | 3,931,505 |
+| Repair staged | 726,064 |
+| **Maintenance total written** | **274,090,394** |
+
+**≈ 36.5 rows written per row ingested.** Pack alone is **35.9x**.
+
+`rows_staged` is a real count from the writer — not `progress_rows`, which is
+`plan_metric_sum` summing `output_rows` over every operator and has misled this
+document once already.
+
+**This is the cost driver, and it explains every share number above.** Pack is
+85.3% of maintenance worker time and 59.3% write-bound because it is rewriting
+the same data dozens of times. Dedup's read amplification is real but it is
+7.5% of the bill; **write amplification in packing is the other order of
+magnitude.**
+
+**It also explains the 10x result.** Completions stay flat under load because
+each ingested row drags ~36 rewrites behind it. At 10x ingest that is 10x the
+rewrite volume against a fixed pool — which is exactly the linear backlog growth
+the simulation showed.
+
+**Prior art names the fix.** ClickHouse's merge selection "prefer[s] to combine
+parts of similar size to avoid repeatedly rewriting large data" — the rule we do
+not have. Ours sorts candidates by size and skips `>= target`, which stops the
+largest files being rewritten but does nothing to stop near-target files being
+merged, re-merged and merged again on the way up.
+
+**Caveats, stated rather than buried:**
+- This includes draining historical backlog, not only steady-state amplification
+  of newly ingested rows. A system working through a backlog legitimately writes
+  more than it ingests. The ratio is an upper bound on steady-state.
+- One process, 97 minutes.
+- 36x is not absurd for tiered compaction — it is what log-structured merging
+  costs without a similar-size rule — but it is the largest single number in this
+  document and nothing in tonight's work reduces it.
+
+**Next investigation, and it now clearly outranks the bin-width soak:** measure
+Pack's amplification per merge level. If near-target files are being re-merged,
+the ClickHouse similar-size preference is a bounded, well-understood change with
+a much larger ceiling than the ~4% bin widening offers.
