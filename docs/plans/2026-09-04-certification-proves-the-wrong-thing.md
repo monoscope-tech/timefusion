@@ -1784,3 +1784,40 @@ One residual approximation remains, and it is small: the model divides a cell's
 span evenly across its pieces, whereas equal-BYTE pieces of a bursty cell span
 unequal time. The estimate is therefore an average. Since empty bins cost
 nothing (above), the error is bounded and does not favour the recommendation.
+
+## The in-region blocker has a small fix: expose recompress the way OPTIMIZE is
+
+`recompress_partition` has exactly one caller — `main.rs:973`, the CLI. pgwire's
+intercepted `OPTIMIZE <table> WHERE date = '…'` (`server/mod.rs:465`) routes to
+`compact_date`, the bin-packing path, which **skips over-target files** and
+therefore cannot touch the wide ones. **So there is no in-region way to run the
+night's top recommendation today.**
+
+That is the entire blocker, and it is smaller than it looks. **The admin-command
+interception already exists** — `OPTIMIZE <table> WHERE date = '…'` is parsed
+(`server/mod.rs:810`), routed, and returns a tag. A `RECOMPRESS <table> WHERE
+date = '…'` alongside it would:
+
+- run **inside the prod process**, which is already in-region, so the object-store
+  read is at datacenter speed rather than the **3.9 MiB/s** a laptop sees;
+- reuse the maintenance-rewrite permit `recompress_partition` already acquires,
+  so it queues against the existing lanes instead of competing blindly;
+- need no new machinery — the operation, its permit, and the command-interception
+  pattern all exist.
+
+**The trade to be explicit about:** it does the 85 GiB rewrite *inside* the
+serving process, on the same memory pool and the same permits as live
+maintenance. That is a real cost, and it is why this belongs behind an explicit
+admin command rather than the coordinator: an operator chooses when to pay it,
+which is exactly the property `--recompress` already has and the coordinator's
+900 s units cannot.
+
+**Recommended order, then:**
+1. Add `RECOMPRESS … WHERE date = …` as an intercepted admin command (small; the
+   pattern is `server/mod.rs:465` and `:810`).
+2. Run it on the worst cell, watch `compaction_unit_span` and re-run
+   `wide_rank.py` — the 8.5 % is checkable within one pass.
+3. Only then decide on the span budget, with the cost of a rewrite now known.
+
+**This also removes the last dependency on an in-region runner**, which was the
+only thing standing between the analysis and an experiment.
