@@ -52,6 +52,11 @@ use crate::{
 };
 
 mod compact;
+/// Re-exported so `storage.rs`'s serde default for a sidecar's recorded bin
+/// width has ONE definition — the last time this constant was copied it lived in
+/// three files that had to agree, and a bin marked at one width and looked up at
+/// another is never found.
+pub(crate) use compact::DEFAULT_BIN_MINUTES;
 mod maintain;
 mod write;
 
@@ -3434,8 +3439,28 @@ impl Database {
         // belong to dropped/idle tables and would otherwise accumulate forever.
         crate::storage::prune_stale(&Self::delta_snapshot_dir(&cfg), crate::storage::SNAPSHOT_MAX_AGE);
         let dedup_dirty_bins = Arc::new(dashmap::DashMap::new());
+        // Re-key any bin recorded at a different width. A width change is a
+        // config flip, not a migration: the queue is the ONLY record that a bin
+        // needs dedup, so it is remapped rather than discarded, and the remap
+        // over-approximates so nothing dirty can be dropped.
+        let width_micros = crate::database::compact::bin_micros();
+        let mut remapped = 0usize;
         for bin in crate::storage::load_sidecar::<crate::storage::DirtyBin>(&cfg.core.timefusion_data_dir, crate::storage::DIRTY_BINS) {
-            dedup_dirty_bins.insert((bin.project_id, bin.table_name, bin.date, bin.bin), ());
+            let was = bin.width_minutes.max(1) * 60 * 1_000_000;
+            if was != width_micros {
+                remapped += 1;
+            }
+            for id in crate::storage::remap_bin(bin.bin, was, width_micros) {
+                dedup_dirty_bins.insert((bin.project_id.clone(), bin.table_name.clone(), bin.date.clone(), id), ());
+            }
+        }
+        if remapped > 0 {
+            warn!(
+                remapped,
+                width_minutes = width_micros / 60_000_000,
+                event = "dirty_bins_rewidened",
+                "dedup bin width changed; the dirty-bin queue was re-keyed"
+            );
         }
         crate::observability::maintenance_stats().dirty_bin_queue_depth.store(dedup_dirty_bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let rollup_dirty = Arc::new(dashmap::DashMap::new());
@@ -7972,7 +7997,7 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
             && let Some((lo, hi)) = add.event_range
         {
             let (nlo, nhi) = span.map_or((lo, hi), |(l, h)| (l.min(lo), h.max(hi)));
-            if !selected.is_empty() && (nhi - nlo) / crate::database::compact::BIN_MICROS + 1 > span_cap {
+            if !selected.is_empty() && (nhi - nlo) / crate::database::compact::bin_micros() + 1 > span_cap {
                 continue;
             }
             span = Some((nlo, nhi));
@@ -16329,7 +16354,7 @@ mod tests {
     #[test]
     fn the_span_budget_rejects_wide_unions_and_is_off_by_default() {
         const MB: i64 = 1024 * 1024;
-        let bin = crate::database::compact::BIN_MICROS;
+        let bin = crate::database::compact::bin_micros();
         let f = |path: &str, at_bin: i64| super::TailAdd {
             path: path.into(),
             size: 10 * MB,

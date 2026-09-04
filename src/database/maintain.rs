@@ -5659,7 +5659,13 @@ impl Database {
             .iter()
             .map(|entry| {
                 let (project_id, table_name, date, bin) = entry.key();
-                crate::storage::DirtyBin { project_id: project_id.clone(), table_name: table_name.clone(), date: date.clone(), bin: *bin }
+                crate::storage::DirtyBin {
+                    project_id: project_id.clone(),
+                    table_name: table_name.clone(),
+                    date: date.clone(),
+                    bin: *bin,
+                    width_minutes: self.config.buffer.timefusion_dedup_bin_minutes,
+                }
             })
             .collect();
         bins.sort_by(|a, b| (&a.table_name, &a.project_id, &a.date, a.bin).cmp(&(&b.table_name, &b.project_id, &b.date, b.bin)));
@@ -5757,7 +5763,7 @@ impl Database {
             info!(table_name, event = "dedup_drain_flush_yield");
             return Ok(());
         }
-        use crate::database::compact::BIN_MICROS;
+        use crate::database::compact::bin_micros;
         // Eligible bins drained per table per tick. 8 couldn't keep up with the
         // enqueue rate (prod backlog 3341, 2026-07-20); 128 was sized for the
         // per-bin-probe cost model and drained a 22k backlog in ~a day. With
@@ -5790,7 +5796,7 @@ impl Database {
             .iter()
             .filter_map(|entry| {
                 let (project, name, date, bin) = entry.key();
-                (name == table_name && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
+                (name == table_name && (*bin + 1) * bin_micros() <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
             })
             .collect();
         let (ready, deferred) = Self::select_drain_bins(

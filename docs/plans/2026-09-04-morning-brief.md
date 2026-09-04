@@ -1172,6 +1172,265 @@ shape (`n == 2`) *before* the plan assertions — "3 files where 2 were intended
 is a different bug from "the claim was lost", and reading that off a physical
 plan cost hours — and the failure message carries the live-file inventory.
 
+## The 10x measurement: what I tried, what was wrong, and what it needs
+
+The goal asks for evidence that maintenance keeps up at 10x. `timefusion sim`
+carries `--streams`, documented for exactly this ("10x experiments: 260 streams
+at 130 projects"), so I swept it on `synth:whale` over 168 virtual hours:
+
+| streams | pending_end | max lag | executions |
+|---:|---:|---:|---:|
+| 26 | 3 | 44,022 | 4,398 |
+| 52 | 3 | 44,021 | 2,143 |
+| 130 | 2 | 44,022 | 4,207 |
+| 260 | 3 | 44,021 | 3,615 |
+
+**That table is worthless, twice over, and I nearly published it as headroom.**
+
+1. **The noise swamps it.** Varying only `--seed` on the SAME configuration:
+   executions **826 → 5,432** (6.6x), max frontier lag **5,327 → 44,017 s**
+   (8.3x), pending_end 1 → 8. Every difference in the sweep sits inside that
+   band. **Any sim comparison needs several seeds per point.**
+2. **`--streams` does nothing here.** At a fixed seed, `--streams 26` and
+   `--streams 260` produce **byte-identical** reports — every field. It scales
+   the *ingesting streams discovered in a real journal*; a synthetic queue has
+   none and sets `mint_frontier = false`. The summary line still printed
+   "260 streams", so the run *reported* 10x while modelling 1x.
+
+Fixed in `c48fe299`: the flag is now refused on a synthetic queue rather than
+ignored. A capacity question must not be answered with the baseline.
+
+**What a real 10x run needs, and why it is blocked.** `--streams` works against
+a real prod journal. Extracting one is currently impossible read-only: the
+container is distroless (no shell, so no `docker exec`), and the bind mount
+`/home/ubuntu/timefusion-wal` is `drwxr-x---` owned by uid 65532, unreadable as
+`ubuntu`. Options, in order of preference: (a) have the running process dump its
+own journal over pgwire/an endpoint, (b) copy it out with a one-off privileged
+command **on the user's say-so**, (c) build a synthetic multi-stream fixture so
+`--streams` applies. (c) is the only one needing no prod access and is the right
+next task.
+
+**What IS measured, and it is not nothing:** the read-amplification arithmetic
+(5.1x fleet-wide, 5.5x on `otel_metrics`) is a computation over a real Delta
+checkpoint, re-runnable in seconds, and does not depend on the simulator at all.
+That is the strongest 10x-relevant number available today, and
+`timefusion_dedup_bin_minutes` (`ab97d81a`) is now the knob that lets a staging
+soak test it without a code change.
+
+## CI's E2E job is red on master, and has been
+
+`0c667f8f` deployed cleanly (image live, no panic in the logs, process up). But
+its CI run shows **E2E: failure** — and so do the four commits before it:
+
+```
+0c667f8f E2E=failure   8859001f E2E=failure   c47a2a64 E2E=failure
+d7184417 E2E=failure   41093ba4 E2E=failure
+```
+
+It fails on tests that pass locally 8/8 (`bulk_alias_skips_membuffer_but_is_queryable`,
+`second_read_after_flush_hits_foyer`) — a different set from the local flakes, so
+it is environment-specific to CI's runner, not the same bug. **Clippy, Format,
+both test shards and the Gate are green**; only E2E is red.
+
+The consequence is what matters: **that job has been providing no signal for at
+least five commits.** A gate nobody can distinguish from broken is worse than no
+gate, because a real regression in it would look exactly like today. Triaging it
+is the next CI task, ahead of adding anything new to CI.
+
+## The 10x answer: completions are FLAT, so load becomes backlog 1:1
+
+With `--mint` (`626e3c2d`) a synthetic queue finally generates arrivals, so
+`--streams` scales load for real. 24 virtual hours, **three seeds per point**:
+
+| streams | vs base | pending_end (3 seeds) | executions (3 seeds) | max lag |
+|---:|---:|---|---|---:|
+| 74 | 1x | 18,029 / 18,403 / 18,015 | 5,376 / 5,045 / 5,307 | 83,09x |
+| 148 | 2x | 39,241 / 39,497 / 39,241 | 5,338 / 5,089 / 5,257 | 83,08x |
+| 370 | 5x | 102,635 / 102,979 / 102,757 | 5,333 / 5,106 / 5,319 | 83,07x |
+| 740 | **10x** | **208,532** (1 seed) | **5,347** | 83,084 |
+
+Seed spread is **~2%** on `pending_end` and **~5%** on `executions`, against
+**2.2x** and **5.7x** between configurations — so unlike the un-minted sweep,
+this is signal.
+
+**The result: `executions` does not move — 5,045 to 5,376 across a 5x increase
+in arrival rate — while `pending_end` grows 5.7x.** Completion throughput is
+independent of load. The coordinator is saturated at 1x, so every additional
+stream converts **1:1 into backlog**, and `frontier_lag_secs_max` is pinned at
+~83,000 s (23 h) in every single run. This is the same conclusion the prod
+counters reached from the other direction — dedup holding 9.76 of 10 heavy
+permits continuously — now reproduced locally, on demand, in a form that can be
+re-run against a candidate fix in minutes.
+
+**Read it as a shape, not as prod numbers.** `synth:whale` is deliberately the
+queue that shredded prod, so the absolute backlog is pathological by
+construction. What generalises is the flatness of `executions`: throughput is
+capped by per-unit cost, not by how much work is waiting, so **no scheduling
+change can create headroom — only making a unit cheaper can.** That is exactly
+what the bin-width lever does (5.1x less read per sweep), and it is the argument
+for prioritising it over any further scheduler tuning.
+
+**The 10x point landed** (it needed a 25-minute budget, not the sweep's 4 — the
+sim slows superlinearly with queue size). It is one seed, but it falls exactly on
+the line: **executions 5,347, inside the 5,045–5,376 band every other
+configuration produced, while backlog reached 208,532 — 11.6x the 1x run.**
+
+So across a **10x** increase in arrival rate, completion throughput moves by
+**under 6%**, which is within the seed noise. There is no headroom at all: the
+system is throughput-saturated at 1x and converts additional load into backlog
+essentially 1:1.
+
+**Honest limits of this measurement:** it is the IO-free coordinator sim, so it
+models unit durations from a byte model rather than real object-store latency —
+it answers "does the queue converge", not "what does a unit cost". Per-unit cost
+still needs the phase timers now deployed in `0c667f8f`, plus staging.
+
+## The phase timers work — and they miss the lane they were built for
+
+`0c667f8f` is live and emitting. 87 units in the first hour, aggregated:
+
+| pass | n | plan | read+sort | write | median unit | max |
+|---|---:|---:|---:|---:|---:|---:|
+| Pack | 86 | 2.2% | **61.0%** | 36.8% | 16.4 s | 253 s |
+| Repair | 1 | 0.0% | 60.2% | 39.8% | 1,337 s | 1,337 s |
+| **all** | 87 | 1.5% | **60.7%** | 37.8% | | |
+
+Two things follow.
+
+**1. Rewrite cost is read-and-sort bound, ~61% against 38% write.** That is the
+result the bin-width lever needs: widening bins removes READ (the same file is
+read once per bin it straddles), so it attacks the dominant phase. Had write
+dominated, widening would have bought much less. The single Repair unit at
+**1,337 s** also confirms the ~21-minute unit from the prod counters, from a
+direct measurement rather than a rate.
+
+**2. None of those 87 units is a dedup unit — and dedup is ~98% of the heavy
+pool.** The timers shipped in `prep/unit-phase-timers` instrument the Pack/Repair
+staging loop in `maintain.rs`; the dedup rewrite is a different function
+(`compact.rs::stage_dedup_chunk`) and was never touched. **The instrumentation
+built to price the dedup decision does not instrument dedup.** So the 61/38 split
+above describes compaction rewrites, and it must not be quoted for dedup.
+
+Fixed on the branch: `stage_dedup_chunk` now emits the same three phases under
+the same `unit_phase_timing` event with `pass=Dedup`, so both paths aggregate
+together and the next quiet hour answers the question for the lane that matters.
+
+## How much cheaper must a unit be? Sub-linear, and cost alone cannot fix it
+
+Same fixture at **5x load** (370 streams), 24 virtual hours, two seeds, sweeping
+`--scale` (unit duration — i.e. per-unit cost):
+
+| unit cost | executions | vs base | pending_end | vs base |
+|---|---|---:|---|---:|
+| 1x (base) | 5,342 / 5,100 | 1.00x | 102,721 / 103,027 | — |
+| **2x cheaper** | 5,818 / 5,566 | **1.09x** | 101,533 / 101,635 | −1% |
+| **4x cheaper** | 9,715 / 9,703 | **1.82x** | 96,681 / 96,689 | −6% |
+| **10x cheaper** | 23,028 / 23,137 | **4.32x** | 83,244 / 83,134 | −19% |
+
+Seeds agree to within 0.5% at every point.
+
+**Three results, and the first two temper what I wrote earlier.**
+
+1. **Throughput responds SUB-LINEARLY to unit cost**: 10x cheaper units buy only
+   **4.3x** the completions. Something else takes over as the constraint before
+   cost stops mattering.
+2. **A 2x-cheaper unit buys almost nothing (+9%).** There is a threshold between
+   2x and 4x — presumably units dropping under a deadline or permit boundary —
+   so a modest cost win can be worth approximately zero throughput.
+3. **Even 10x cheaper units do not drain a 5x queue**: backlog falls only 19%.
+
+**AMENDMENT to "only a cheaper unit can create headroom".** That was too strong.
+The first half stands — the streams sweep shows scheduling cannot help a
+saturated pool. But cheapness alone is *not sufficient*, and its returns are
+sub-linear and lumpy.
+
+**AND A TRAP I NEARLY WALKED INTO: `--scale` is NOT a model of bin widening.**
+It makes every unit uniformly cheaper. Bin widening does something different —
+it makes **~6x FEWER units, each ~18% bigger**. That is the *arrival* axis, not
+the cost axis. Mapping the 5.1x read reduction onto the `--scale` column would
+have put the lever at the "2x cheaper → +9%" row and argued *against* it, on a
+false equivalence.
+
+**Read the two sweeps together and they point the same way:**
+
+- streams sweep: **backlog is LINEAR in the number of units** (11.6x at 10x load)
+  while throughput is flat.
+- scale sweep: **backlog is barely sensitive to unit cost** (−19% for 10x
+  cheaper).
+
+**So the lever that matters is the one that reduces the NUMBER of units, not
+their cost — and bin widening is exactly that (~6x fewer dedup bins).** The 5.1x
+read reduction is a real IO/£ saving, but the *queue* argument for widening is
+the unit-count collapse, and that is the stronger argument.
+
+**Next experiment, and it is now well-posed:** teach the sim to model dedup bins
+so unit COUNT can be swept directly, rather than inferring it. That is the
+measurement that would justify flipping `timefusion_dedup_bin_minutes` in
+staging.
+
+## The sim cannot validate bin widening — and that closes the line, it does not stall it
+
+I said the next experiment was "teach the sim to model dedup bins so unit count
+is a direct input". I built that knob (`--debris-slice-minutes`, same total work
+as `600 / n` units of `n` minutes) and swept it. **Both configurations are null,
+for two different reasons:**
+
+| config | what moved | what did not |
+|---|---|---|
+| `--mint`, 5x load | nothing | 600 → 300 units changed `pending_end` by **0.1%** (102,696 → 102,804) — the debris is 0.6% of a ~102,000-unit queue |
+| no minting | `pending_start` **813 / 513 / 313 / 263** for n = 1/2/6/12, exactly as designed | `executions` and `pending_end` **IDENTICAL at every width** (1,774 and 2 on seed 1) |
+
+The second is the interesting one: the knob provably works — the starting queue
+collapses as intended — and the outcome does not change at all. **The
+coordinator's own coarsening already fuses those units, so pre-collapsing them
+buys nothing.**
+
+**The structural reason, which generalises past this fixture:** the simulator
+schedules rollup/compaction TASKS on virtual time. Widening `BIN_MICROS` pays off
+in **read bytes** — the same file read once per bin it straddles. An IO-free
+model cannot see bytes, so it cannot see the benefit *by construction*. No amount
+of extra modelling fixes that without making the sim do IO, at which point it is
+staging.
+
+**This is a conclusion, not a dead end.** It says: stop trying to price bin width
+locally; the repo's own ladder already said so — *"MinIO validates correctness,
+not cost, because per-unit cost is object-store round trips"*. The validated plan
+is therefore:
+
+1. `timefusion_dedup_bin_minutes = 60` in **staging**, on the seeded whale days.
+2. Watch `unit_phase_timing` with `pass=Dedup` (now emitted, `c5edeca6`) —
+   `upstream_secs` is the phase widening should collapse.
+3. Compare against prod's 10-minute baseline over the same cells.
+
+**What the local work DID establish, and it is the useful part:** backlog is
+linear in unit count and nearly insensitive to unit cost, throughput is flat
+under 10x load, and rewrite wall-clock is ~61% read+sort. Those bound what any
+fix must do. They just cannot score this particular fix.
+
+## The phase split is steady-state, and two units eat a third of the pool
+
+Re-read on a **2-hour-old process**, 205 units over 110 minutes:
+
+| pass | n | plan | read+sort | write | median | p90 | max | worker-min |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Pack | 203 | 1.5% | **61.2%** | 37.3% | 13.3 s | 85.7 s | 292 s | 95.8 |
+| Repair | 2 | 0.0% | 59.5% | 40.5% | 1,158 s | 1,337 s | 1,337 s | **38.6** |
+| **all** | 205 | 1.0% | **60.7%** | 38.3% | | | | 134 |
+
+**The split is identical to the 87-unit young sample** (60.7 / 37.8 / 1.5), so it
+is steady-state rather than a warm-up artefact — the first measurement here that
+survives the "quiet process" rule instead of needing a caveat.
+
+**And the heavy tail is right there in it: 2 Repair units consumed 38.6 of 134
+worker-minutes — 29% of everything measured — against 203 Pack units at 95.8.**
+Median Pack unit is 13 s, p90 is 86 s, max 292 s. Consistent with
+`tf_unit_size_heavy_tail_2026-09-02` (6.4% of units carried 67.1% of bytes),
+now confirmed on wall clock rather than bytes.
+
+Still no `pass=Dedup` row, because the deployed build does not emit one
+(`c5edeca6` is what fixes that).
+
+
 ## INCIDENT 09:58 — customer queries failing, and the revert I should not have made
 
 **Symptom:** monoscope-dev raising `SqlError XX000` — "Not enough memory to
@@ -1224,3 +1483,4 @@ the budget's own doc demands before anyone raises it.
 project's files conforming (a Repair/recompress pass, so the leg disappears), or
 raise the budget — noting the doc's warning that the ceiling is paid concurrently
 on EVERY Delta-reading query.
+||||||| 0c667f8f

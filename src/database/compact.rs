@@ -1152,7 +1152,7 @@ impl Database {
         let safe_pid = project_id.replace('\'', "''");
         let filter = format!("project_id = '{safe_pid}' AND date = DATE '{date_str}'");
         let keys_csv = schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ");
-        Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / BIN_MICROS).collect())
+        Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / bin_micros()).collect())
     }
 
     /// Probe one partition/bin for duplicates and STAGE (never commit) a
@@ -1425,6 +1425,8 @@ impl Database {
             // K = ceil(estimated decoded bytes / budget); the estimate is the
             // row-count-vs-inflation MAX ×2 documented on the config fields.
             let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
+            // Copied out because the per-shard closure below moves `targets`.
+            let target_files = targets.len();
             // Fail closed unless the provider's full-file re-read can be
             // checked against Delta's independent row-count metadata. This is
             // the invariant that would have stopped the 2026-08-03 loss: the
@@ -1663,7 +1665,10 @@ impl Database {
                                 // operators between the scan and the write loop, so the
                                 // loop's own progress bump cannot see most of the unit.
                                 // See `PlanProgress`.
+                                let planned_at = std::time::Instant::now();
                                 let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                                let t_plan = planned_at.elapsed();
+                                let (mut t_upstream, mut t_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
                                 // `RunCollapse` collapses ADJACENT runs, so it needs one ordered
                                 // stream. `execute_stream` merges a multi-partition plan with a
                                 // `CoalescePartitionsExec`, which does NOT preserve ordering —
@@ -1721,7 +1726,10 @@ impl Database {
                                 while !drained {
                                     // The run still open at end-of-stream is the last thing
                                     // written: it takes the same path as every other batch.
-                                    let batches = match stream.next().await {
+                                    let pulled_at = std::time::Instant::now();
+                                    let next = stream.next().await;
+                                    t_upstream += pulled_at.elapsed();
+                                    let batches = match next {
                                         Some(batch) => match &mut collapse {
                                             Some(collapse) => collapse.push(cast_variant_columns_to_binary(batch?)?)?,
                                             None => vec![cast_variant_columns_to_binary(batch?)?],
@@ -1741,14 +1749,36 @@ impl Database {
                                         crate::database::maintain::note_unit_progress(batch.num_rows());
                                         decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
                                         let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
+                                        let wrote_at = std::time::Instant::now();
                                         writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
                                         if writer.buffer_len() >= max_file_bytes {
                                             adds.extend(
                                                 writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add),
                                             );
                                         }
+                                        t_write += wrote_at.elapsed();
                                     }
                                 }
+                                // THE decomposition for the lane that uses ~98% of the heavy
+                                // pool. The timers shipped in `prep/unit-phase-timers` cover the
+                                // Pack/Repair staging path in `maintain.rs` and MISS dedup
+                                // entirely — 87 prod units on 2026-09-04 were 86 Pack and 1
+                                // Repair, and none of them was the operation the measurement
+                                // existed to price. Same three phases, same event, so both paths
+                                // aggregate together.
+                                info!(
+                                    table_name,
+                                    project_id,
+                                    pass = "Dedup",
+                                    files = target_files,
+                                    rows_staged = shard_after,
+                                    outputs = adds.len(),
+                                    plan_secs = t_plan.as_secs_f64(),
+                                    upstream_secs = t_upstream.as_secs_f64(),
+                                    write_secs = t_write.as_secs_f64(),
+                                    event = "unit_phase_timing",
+                                    "where a maintenance unit's wall clock went"
+                                );
                                 // Reported here rather than mid-stream so one run straddling a
                                 // batch boundary is counted once. Diagnostics must never fail the
                                 // rewrite that carries them, so there is nothing to propagate.
@@ -1957,10 +1987,21 @@ impl Database {
 /// | 60 min | 1,734 MiB (+18%) | 3,847 GiB (**5.1x less**) |
 ///
 /// Widening is therefore the cheapest known lever on dedup, which consumes ~98%
-/// of the heavy maintenance pool. It is NOT changed here: 6x fewer, larger units
-/// interact with the claim/lease/900s-deadline machinery in ways statistics
-/// cannot see, and that wants a soak.
-pub(crate) const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+/// of the heavy maintenance pool. The DEFAULT is still 10 minutes: 6x fewer,
+/// larger units interact with the claim/lease/900s-deadline machinery in ways
+/// statistics cannot see, and that wants a soak at real object-store latency.
+/// `timefusion_dedup_bin_minutes` is the knob that makes the soak possible
+/// without a code change.
+pub(crate) const DEFAULT_BIN_MINUTES: i64 = 10;
+
+/// The dedup bin width, in micros. Read through the config `OnceLock`, so it is
+/// fixed for the life of the process — a width that changed under a running
+/// coordinator would leave the dirty-bin queue keyed two ways at once.
+/// Falls back to the default before config init (unit tests, early boot).
+#[inline]
+pub(crate) fn bin_micros() -> i64 {
+    crate::config::try_config().map_or(DEFAULT_BIN_MINUTES, |c| c.buffer.timefusion_dedup_bin_minutes).max(1) * 60 * 1_000_000
+}
 
 pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> bool {
     !schema.dedup_keys.is_empty()

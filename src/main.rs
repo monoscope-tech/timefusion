@@ -224,11 +224,13 @@ fn init_cli_tracing() {
 fn run_sim_cli() -> anyhow::Result<()> {
     use timefusion::maintenance_sim::{SimConfig, load_sandboxed, run};
     let mut it = std::env::args().skip(2);
-    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--floorless] [--guard-off] [--json]";
+    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--json]";
     let input = it.next().context(usage)?;
     let mut cfg = SimConfig::default();
     let mut json = false;
     let mut floorless = false;
+    let mut mint = false;
+    let mut debris_slice = 1i64;
     while let Some(a) = it.next() {
         let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
         match a.as_str() {
@@ -246,6 +248,13 @@ fn run_sim_cli() -> anyhow::Result<()> {
                     Some((value("--restart-at-hours")?.parse::<f64>().context("--restart-at-hours must be a number")? * 3_600_000_000.0) as i64)
             }
             "--no-mint" => cfg.mint_frontier = false,
+            // `synth:whale` disables minting by default (below). `--mint`
+            // turns arrivals back on, which is what makes `--streams` — and so
+            // any capacity experiment — mean anything on a synthetic queue.
+            "--mint" => mint = true,
+            // The bin-width axis: same total debris work as `600 / n` units of
+            // `n` minutes. See `synthetic_whale_queue`.
+            "--debris-slice-minutes" => debris_slice = value("--debris-slice-minutes")?.parse().context("--debris-slice-minutes must be an integer")?,
             // The floorless control, and the pre-69e6503 behaviour, for
             // `synth:whale`.
             "--floorless" => floorless = true,
@@ -260,8 +269,23 @@ fn run_sim_cli() -> anyhow::Result<()> {
     // preflight (a real journal carries estimates the sim would never read).
     let report = if let Some(shape) = input.strip_prefix("synth:") {
         anyhow::ensure!(shape == "whale", "the only synthetic queue is `synth:whale`");
-        let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100);
-        cfg.mint_frontier = false;
+        // `--streams` scales the INGESTING streams discovered in a real
+        // journal. A synthetic queue has none and sets `mint_frontier = false`
+        // below, so the flag was silently inert — while the summary line still
+        // printed the count it was given. A "10x" run reported 260 streams and
+        // modelled 1x: `--streams 26` and `--streams 260` produced BYTE-IDENTICAL
+        // reports at the same seed (2026-09-04). Refuse it rather than answer a
+        // capacity question with the baseline.
+        // Without minting there are no arrivals, so extra streams change
+        // nothing: `--streams 26` and `--streams 260` produced BYTE-IDENTICAL
+        // reports at the same seed (2026-09-04) while the summary line still
+        // printed the count it was given — a "10x" run that modelled 1x.
+        anyhow::ensure!(
+            cfg.streams.is_none() || mint,
+            "--streams needs arrivals to scale: pass --mint (a synthetic queue disables minting by default), or use a real journal."
+        );
+        cfg.mint_frontier = mint;
+        let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100, debris_slice);
         cfg.byte_model = Some(queue.model);
         run(queue.journal, &cfg, now)?
     } else {
