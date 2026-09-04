@@ -3035,3 +3035,46 @@ is blocked by an untested interaction between two clamps, with a bench available
 to test it. That is a materially more hopeful position than "tuning is
 exhausted", and it is the first thing I would run on a machine that is not also
 serving prod.
+
+## 37-minute window: amplification 1.2x, fan-in 8 — and the caveat that matters
+
+Same measurement, longer window, guarded build live:
+
+| | pre-guard (95 min) | now (37 min) |
+|---|---:|---:|
+| Pack write rate | 170,168,000 rows/hr | **4,885,364 rows/hr** |
+| **write amplification** | **36.5x** | **1.2x** |
+| median fan-in | 2-3 | **8** |
+| Pack units | 164 | 10 |
+
+**The fan-in shift is the guard's mechanical signature.** It refuses low-fan-in
+bins, so the survivors are high-fan-in — 2-3 to 8 is exactly what the mechanism
+produces, and it is causal rather than merely correlated. 1.2x is at the floor
+of what is physically possible (1.0x = writing each byte once).
+
+**THE CAVEAT, and it is not small: Pack ran 10 units in 37 minutes, against 164
+in 95.** That is ~7x fewer units per minute. Two readings fit:
+
+1. **Efficiency** — the guard replaced many cheap-benefit merges with a few
+   high-benefit ones, which is exactly its design (fan-in 8 supports this).
+2. **Idleness** — this process simply has less to do than the backlogged one that
+   produced the 36.5x, and the guard is incidental.
+
+**Both are consistent with the data I have, and I cannot separate them without a
+matched-state comparison.** The honest claim is the one that does not depend on
+which is true: **the guard fires (verified counters), it shifts fan-in from 2-3
+to 8 (its designed mechanism), and Pack's write volume per unit of file
+reduction is far lower.** Whether steady-state amplification settles at 1.2x or
+drifts back toward 36.5x as backlog accumulates needs an aged, quiet process —
+the same conditions that produced the baseline.
+
+**What to check tomorrow, in one query:**
+
+```sql
+SELECT key, value FROM timefusion_stats
+WHERE key IN ('pack_value_refused','pack_value_refused_rows','uptime_seconds');
+```
+
+plus `median fan-in` from `unit_phase_timing`. If fan-in stays high and
+`pack_value_refused_rows` keeps climbing on a process that has been up for
+hours, the win is real and steady.
