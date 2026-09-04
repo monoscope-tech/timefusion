@@ -1663,3 +1663,46 @@ for that is not "before the 100x customer" but now.
    reservations by lane is the fix.
 2. `datafusion.runtime.memory_limit` vs the actual concurrent demand: how much of
    the pool does maintenance hold at steady state?
+
+### CORRECTION: the pools are NOT shared, and I published that they were
+
+The section above concludes "maintenance rewrites and customer queries draw on
+the same memory pool". **That is wrong.** Read the wiring rather than inferring
+it from two error classes appearing together:
+
+- queries reserve from `shared_runtime_env()` — `query_pool_bytes()`
+- maintenance reserves from `light_optimize_runtime_env()` and
+  `repair_runtime_env()`, tiled out of `maintenance_pool_bytes()`, and a test
+  asserts they are not the same env (*"sharing one RuntimeEnv is sharing one
+  pool"*)
+
+Measured from `timefusion_stats`:
+
+```
+budget.query_pool_mb       16384      memory.query_pool_pct        0
+budget.maintenance_pool_mb 16964      memory.maintenance_pool_pct  0
+                                      memory.coordinator_pool_pct  6
+```
+
+**So maintenance cannot starve queries, and the two exhaustion classes are
+independent.** I inferred a shared pool from the fact that both lanes were
+erroring — which is the same mistake as this morning's revert, made again six
+hours later: *co-occurrence is not a mechanism.*
+
+**What the numbers do say:** the query pool is **16 GB**, and one failing sort was
+reported consuming **5.5 GB**. Three concurrent sorts of that size exhaust it.
+The failure is concurrency against a per-query sort that is far too large — not
+contention with maintenance.
+
+**And one more attribution I should flag as weak:** I identified the failing
+statement as the log-explorer listing because its `INFO` span sat immediately
+before the `ERROR` line. In an interleaved multi-threaded log that is adjacency,
+not causation, and the two lines are on different threads. The listing may not be
+the query producing the 5.5 GB sort at all.
+
+**So the honest state of this incident:** the entire ordering-cliff family is
+excluded by measurement; the query pool is 16 GB; some query builds a 5.5 GB
+sort; concurrency of those exhausts the pool. **Which query, and why its sort is
+5.5 GB when the plan shape streams, is not yet established.** The next step is
+to label sort reservations with the statement that owns them, so the log names
+the query instead of leaving it to adjacency.
