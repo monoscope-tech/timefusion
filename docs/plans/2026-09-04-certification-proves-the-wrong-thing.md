@@ -1019,3 +1019,57 @@ these six cells alone would return ~8 TiB of read per sweep.
 **Caveat, and it is the same one as everywhere:** this is read *volume*, not wall
 clock. Whether 8 TiB of avoided reads is hours or days depends on the read/commit
 split that `prep/unit-phase-timers` measures and nothing currently emits.
+
+## The 45x outlier explained — a handful of WIDE files dominate everything
+
+Why does one cell cost 45x while its neighbour costs 15x, at the same size and
+file count? The two cells differ in one respect:
+
+| | `2026-07-22` (45x) | `2026-07-24` (15x) |
+|---|---|---|
+| files / size | 116 / 85.0 GiB | 121 / 87.0 GiB |
+| **files spanning >50 % of the day** | **11 (8.5 GiB)** | **1 (0.8 GiB)** |
+| widest file | 75.0 % of day, 1,011 MiB | 78.6 % of day, 850 MiB |
+
+**And the cost of a single wide file is enormous.** A 1,011 MiB file spanning
+75 % of a day covers ~108 ten-minute bins, and **every one of those bins must
+read it in full**:
+
+```
+108 bins x 1,011 MiB = ~107 GiB of sweep read, from ONE file
+```
+
+**One gigabyte of data costing a hundred gigabytes of reading.** Eleven such
+files is most of that cell's 3,867 GiB.
+
+### This reconciles my earlier contradiction, and it is the better lever
+
+Earlier I measured "files are narrow — p50 spans 1 % of a day" and used it to
+argue the wide-file hypothesis was wrong. **Both are true, and I drew the wrong
+conclusion from the first.** The median file is narrow; the COST is
+`span x size`, so it is dominated entirely by the tail. **1 % of files being wide
+is irrelevant to the median and decisive for the total.**
+
+**And it gives a cheaper, better-targeted fix than widening the bin:**
+
+- **It is a handful of files, not a global constant.** Eleven in the worst cell;
+  ~1 % fleet-wide.
+- **Splitting one is bounded work.** That 1,011 MiB / 75 %-of-a-day file, re-cut
+  into ~8 pieces of ~126 MiB each spanning ~9 %, drops from ~107 GiB of sweep
+  read to ~13 GiB. **One file rewrite, ~8x return, repeatable per file.**
+- **It needs no soak.** Splitting a file into time-contiguous pieces is what the
+  writer already does at `max_file_bytes`; there is no change to bins, claims,
+  leases or deadlines, and no interaction with the machinery that made bin
+  widening need a soak.
+- **It is measurable in advance.** `span x size` ranks every file in the fleet by
+  exactly how much sweep read it causes, from `Add.stats`, with no IO.
+
+**This should be evaluated before the bin widening.** Both attack the same
+ratio — bin widening raises the denominator globally, splitting wide files lowers
+the numerator where it is concentrated — but splitting is targeted, incremental,
+reversible in effect, and carries none of the claim/lease/deadline risk.
+
+**What I have not done:** ranked the fleet by `span x size` to see how few files
+carry the total, or checked why these files are wide in the first place (a
+compaction that merged across a wide range, most likely, since the writer cuts at
+512 MiB and these are ~1 GiB). Both are cheap and both are the obvious next step.
