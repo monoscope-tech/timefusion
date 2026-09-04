@@ -20,6 +20,25 @@ The wide-file *share* rose, because the files being retired are the narrow ones.
 and compaction improves its own number while the cost it drives stays flat.
 Scaling the fleet scales the wrong number.**
 
+**And here is what one command does instead** — modelled `--recompress` on the
+worst cells, against the same 44,127 GiB:
+
+| recompress top N cells | GiB rewritten (once) | fleet maintenance read |
+|---:|---:|---:|
+| **1** | **85 G** | **−8.5 %** |
+| 6 | 364 G | −23.7 % |
+| 20 | 732 G | **−40.4 %** |
+| 50 | 768 G | −45.6 % |
+
+**One cell, 85 GiB rewritten once, takes 8.5 % off the fleet's maintenance read
+permanently — roughly 1,200x what three hours of compaction achieved.** The cost
+column flattens after ~20 cells (732 G → 768 G buys thirty more cells), so that
+is the natural stopping point.
+
+**First move: one command, one cell, then re-run
+`scratchpad/wide_rank.py` to confirm the 8.5 %.** A two-hour experiment with an
+unambiguous success criterion.
+
 ## IF YOU READ ONE SCREEN
 
 **The answer to "can we handle 10x".** Dedup consumes **~98 % of the heavy
