@@ -325,6 +325,23 @@ pub struct MemBuffer {
     /// `take_bucket_for_flush` and bucket/table re-creation by later inserts.
     /// Pruned on drain and eviction.
     force_flushed: DashMap<TableKey, std::collections::HashSet<i64>>,
+    /// Per (table, bucket): the highest row timestamp that bucket has ever
+    /// handed to Delta. `get_bucket_ranges` floors its mask just above it.
+    ///
+    /// It lives HERE, not on the bucket, because both flush paths delete the
+    /// bucket the moment it empties (`remove_if` in `take_bucket_for_flush` and
+    /// `finish_flushed_snapshot`) — a per-bucket atomic is gone before the next
+    /// insert recreates the bucket under the same id, which is precisely the
+    /// case that loses rows.
+    ///
+    /// Nor can it be folded into `min_timestamp`: the prefix drain tried that
+    /// (`store(drained_max + 1)`) and the INSERT path `fetch_min`s the same
+    /// atomic, so one later row at the drained instant pulls the mask back over
+    /// rows that have left memory. The floor has to live outside the value
+    /// inserts maintain, and outside the bucket's lifetime.
+    ///
+    /// Bounded by `evict_old_data`, which drops an entry with its bucket.
+    flushed_max: DashMap<TableKey, std::collections::HashMap<i64, i64>>,
     /// GC-floor pins of buckets mid-take: `take_bucket_for_flush` removes a
     /// bucket (and its `first_wal_pin_micros`) from the tables map before the
     /// flush path registers its inflight pin; a GC sweep sampling the floor
@@ -1086,6 +1103,7 @@ impl MemBuffer {
             text_index_bytes: AtomicUsize::new(0),
             text_index_max_bytes,
             force_flushed: DashMap::new(),
+            flushed_max: DashMap::new(),
             taking_pins: DashMap::new(),
             taking_seq: AtomicU64::new(0),
             replay_dml_noops: AtomicU64::new(0),
@@ -1097,6 +1115,13 @@ impl MemBuffer {
     /// before the commit so no query can race into the masked window; a
     /// failed commit leaves a stale mark, which only costs that bucket the
     /// brief commit-then-drain exclusion at its eventual sealed flush.
+    /// Record that everything up to `ts` in this bucket is now Delta's.
+    /// Monotonic: a failed commit restores the rows, and an unfloored Delta leg
+    /// merely contributes nothing there — the safe direction.
+    fn note_flushed_through(&self, key: TableKey, bucket_id: i64, ts: i64) {
+        self.flushed_max.entry(key).or_default().entry(bucket_id).and_modify(|v| *v = (*v).max(ts)).or_insert(ts);
+    }
+
     pub fn mark_force_flushed(&self, project_id: &str, table_name: &str, bucket_id: i64) {
         self.force_flushed.entry(table_key(project_id, table_name)).or_default().insert(bucket_id);
     }
@@ -1628,12 +1653,23 @@ impl MemBuffer {
         };
         let current = Self::current_bucket_id();
         let force_flushed = self.force_flushed.get(&table_key(project_id, table_name));
+        let flushed_max = self.flushed_max.get(&table_key(project_id, table_name));
         let mut ranges: Vec<(i64, i64)> = table
             .buckets
             .iter()
             .filter(|b| *b.key() != current && !force_flushed.as_ref().is_some_and(|s| s.contains(b.key())))
             .filter_map(|b| {
                 let (min, max) = (b.min_timestamp.load(Ordering::Relaxed), b.max_timestamp.load(Ordering::Relaxed));
+                // Never mask an instant this bucket has already committed. See
+                // `flushed_max`: the mask's premise is "memory is authoritative
+                // here", and for anything at or below the flushed watermark that
+                // is simply false — those rows are in Delta and gone from memory,
+                // so masking them makes them answer no query at all.
+                //
+                // The cost is stated where the prefix drain first made this trade:
+                // an unmasked survivor can be double-counted, and a duplicate is
+                // collapsed by read-side dedup while a masked row is just wrong.
+                let min = flushed_max.as_ref().and_then(|m| m.get(b.key())).map_or(min, |hi| min.max(hi.saturating_add(1)));
                 (min <= max).then_some((min, max + 1))
             })
             .collect();
@@ -1716,6 +1752,7 @@ impl MemBuffer {
             return true;
         };
         let mut emptied = false;
+        let mut flushed_through: Option<i64> = None;
         if let Some(bucket_ref) = table.buckets.get(&b.bucket_id) {
             let bucket = bucket_ref.value();
             let mut g = bucket.batches.lock();
@@ -1735,6 +1772,11 @@ impl MemBuffer {
             let (freed, rows): (usize, usize) =
                 g.drain(..n).map(|batch| (estimate_batch_size(&batch), batch.num_rows())).fold((0, 0), |a, x| (a.0 + x.0, a.1 + x.1));
             emptied = g.is_empty();
+            // Recorded whether or not anything survived: a bucket drained CLEAN
+            // still takes later inserts, and the branch below never runs for it.
+            if let Some(hi) = b.batches.iter().filter_map(batch_timestamp_range).map(|(_, hi)| hi).max() {
+                flushed_through = Some(hi);
+            }
             if !emptied {
                 // Narrow the surviving bucket's time range to the remaining
                 // (late-arrival) rows: the old span still covered the DRAINED
@@ -1777,6 +1819,9 @@ impl MemBuffer {
             let applied = sub_saturating(&bucket.memory_bytes, freed);
             bucket.row_count.fetch_sub(rows.min(bucket.row_count.load(Ordering::Relaxed)), Ordering::Relaxed);
             sub_saturating(&self.estimated_bytes, applied);
+        }
+        if let Some(hi) = flushed_through {
+            self.note_flushed_through(key.clone(), b.bucket_id, hi);
         }
         self.cache_invalidate(&Self::cache_key(&b.project_id, &b.table_name, b.bucket_id));
         // remove_if re-checks under the shard lock (bucket_ref dropped above,
@@ -1894,6 +1939,12 @@ impl MemBuffer {
         // Delta commit failure) can replay it instead of guessing bucket-start.
         let min_timestamp = bucket.min_timestamp.swap(i64::MAX, Ordering::Relaxed);
         let max_timestamp = bucket.max_timestamp.swap(i64::MIN, Ordering::Relaxed);
+        // The bucket stays in the map and keeps taking inserts, so without this
+        // the next row at an already-flushed instant rebuilds the mask over the
+        // rows just taken. Set at TAKE, not at commit: if the commit fails the
+        // rows are restored and served by the mem leg, and an unfloored Delta
+        // leg simply contributes nothing there — the safe direction.
+        let flushed_through = bucket.row_max_ts.load(Ordering::Relaxed).max(max_timestamp);
         // Reset with them: a reused bucket that kept a drained tenant's row span would
         // survive pruning it should skip (wasteful, not wrong) and, worse, report a span
         // for rows it no longer holds.
@@ -1913,6 +1964,7 @@ impl MemBuffer {
         drop(batches_g);
         drop(bucket_ref);
         sub_saturating(&self.estimated_bytes, freed);
+        self.note_flushed_through(table_key(project_id, table_name), bucket_id, flushed_through);
         self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
 
         // Drop the now-empty bucket so stale empty shells don't accumulate.
@@ -2025,6 +2077,13 @@ impl MemBuffer {
                     self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, bucket_id));
                 }
             }
+            // The flushed watermarks outlive their buckets on purpose, but only
+            // until the window itself falls out of retention — past the cutoff
+            // no query can ask about that instant, so the floor has no reader.
+            if let Some(mut w) = self.flushed_max.get_mut(table_entry.key()) {
+                w.retain(|bucket_id, _| *bucket_id >= cutoff_bucket_id);
+            }
+            self.flushed_max.remove_if(table_entry.key(), |_, w| w.is_empty());
             if table.buckets.is_empty() {
                 empty_table_keys.push(table_entry.key().clone());
             }
@@ -3819,6 +3878,60 @@ mod tests {
             !ranges.iter().any(|&(start, end)| (start..end).contains(&ts)),
             "the survivor's mask covers the drained row's committed Delta copy, so that row is \
              invisible to every query until the survivor flushes: ranges={ranges:?}, drained ts={ts}"
+        );
+    }
+
+    /// The same disappearance, reached three more ways — and all three defeat
+    /// the narrowing above, because the narrowing `store`s into `min_timestamp`
+    /// and the INSERT path `fetch_min`s the very same atomic (`2857`). Any later
+    /// row at the flushed instant pulls the mask back down over rows that have
+    /// already left memory.
+    ///
+    /// - `Take`: `take_bucket_for_flush` empties the bucket and resets min/max to
+    ///   sentinels; the bucket stays in the map, so the next insert at the same
+    ///   instant rebuilds the mask from scratch over the flushed rows.
+    /// - `DrainToEmpty`: `finish_flushed_snapshot` narrows only under `!emptied`,
+    ///   so a bucket drained clean and then re-populated never narrows at all.
+    /// - `NarrowThenInsert`: the partial-drain narrowing runs and is then undone
+    ///   by one more row at the drained instant.
+    ///
+    /// This is why the floor belongs at READ time in `get_bucket_ranges` rather
+    /// than in a stored minimum: it has to live outside the value inserts maintain.
+    #[test_case::test_case("take"; "full take, then a row at the same instant")]
+    #[test_case::test_case("drain_to_empty"; "snapshot drained clean, then a row at the same instant")]
+    #[test_case::test_case("narrow_then_insert"; "partial-drain narrowing undone by a later row")]
+    fn a_flushed_instant_stays_visible_however_the_bucket_emptied(mode: &str) {
+        let buffer = MemBuffer::new();
+        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+
+        // The row that reaches Delta and leaves memory, in every mode.
+        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        match mode {
+            "take" => {
+                buffer.take_bucket_for_flush("project1", "table1", bucket_id).expect("bucket has rows");
+            }
+            "drain_to_empty" => {
+                let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
+                assert!(buffer.finish_flushed_snapshot(&snap), "nothing arrived mid-flight, so the bucket drains clean");
+            }
+            "narrow_then_insert" => {
+                let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
+                // A late arrival keeps the bucket alive so the narrowing runs...
+                buffer.insert("project1", "table1", create_test_batch(ts + 60_000_000), ts + 60_000_000).unwrap();
+                assert!(buffer.finish_flushed_snapshot(&snap));
+            }
+            other => unreachable!("unknown mode {other}"),
+        }
+        // ...and now one more row at the flushed instant, which is what the
+        // workload actually does: a batch of spans all stamped the same.
+        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+
+        let ranges = buffer.get_bucket_ranges("project1", "table1");
+        assert!(
+            !ranges.iter().any(|&(start, end)| (start..end).contains(&ts)),
+            "[{mode}] the mask covers an instant whose rows are committed to Delta and gone from \
+             memory, so those rows answer no query at all: ranges={ranges:?}, flushed ts={ts}"
         );
     }
 
