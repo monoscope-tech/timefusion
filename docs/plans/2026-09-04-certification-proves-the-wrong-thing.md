@@ -859,3 +859,44 @@ than "change the storage layout", and it is the first thing I would put in front
 of whoever picks this up — along with the caution that `BIN_MICROS` is
 copy-pasted in three places (`compact.rs:1150`, `write.rs:502`,
 `maintain.rs:5726`) and would need to move in all of them.
+
+## Bin widening, SIZED — 4.5-9x less read amplification from one constant
+
+`bins/file` is the read amplification of a bin-scoped rewrite: a dirty bin must
+rewrite every file covering it, and each such file carries `(bins/file - 1)`
+other bins' rows that are read and rewritten for nothing. Computed over 7,702
+live files from `Add.stats`:
+
+| `BIN_MICROS` | all files, mean bins/file | cells with 17+ files, mean |
+|---:|---:|---:|
+| **10 min (today)** | **27.77** | **11.35** |
+| 20 min | 14.20 | 6.02 |
+| 30 min | 9.69 | 4.26 |
+| 45 min | 6.68 | 3.09 |
+| 60 min | 5.20 | 2.52 |
+| 120 min | 2.97 | 1.68 |
+
+**Widening the bin from 10 to 60 minutes cuts mean amplification 27.8 → 5.2
+(5.3x) fleet-wide and 11.35 → 2.52 (4.5x) where the mass is. At 120 minutes it is
+9.4x and 6.8x.** From changing one constant, against an operation consuming ~98 %
+of the maintenance pool.
+
+**The tension I cannot resolve from statistics, and will not hand-wave:** a wider
+bin means each unit covers more time, so units get *bigger*. The offsetting
+argument is that a unit's cost is bounded by **the files it must read**, not by
+the bin's width — at 10-minute bins, six separate units each read the same ~45
+minute file; at 60 minutes, one unit reads it once for six times the benefit. If
+that holds, total work falls ~6x and unit size barely moves. If it does not — if
+a wider bin pulls in proportionally more files — units grow toward the 900 s
+deadline and the change makes things worse.
+
+**Which of those happens is exactly the read/sort/commit split that
+`prep/unit-phase-timers` emits, and it is why that branch is first.** The table
+above says the prize is 4.5–9x on the dominant consumer of the entire pool; the
+timers say whether it is collectable.
+
+**One caution if anyone acts on this:** `BIN_MICROS` is not a config value, it is
+a `const` copy-pasted into three files (`compact.rs:1150`, `write.rs:502`,
+`maintain.rs:5726`). Changing it also re-keys `dedup_dirty_bins`, so in-flight
+bin state from the old width would need to be discarded rather than
+reinterpreted.
