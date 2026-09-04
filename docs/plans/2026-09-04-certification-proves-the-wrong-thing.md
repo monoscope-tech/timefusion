@@ -1730,3 +1730,43 @@ inputs".
 So the sensitivity that remains is not burstiness. It is the two already stated:
 whether `--recompress` really emits contiguous sub-bin pieces (follows from the
 code, unobserved in prod), and its wall-clock cost on an 85 GiB cell.
+
+### Verified locally on real data — and the sub-bin claim depends on DENSITY
+
+Tested the "sorted rewrite + byte cut = narrow pieces" assumption on the real
+201.5 MiB / 2,023,604-row file `875ea2a1` produced, with whatever burstiness prod
+actually has:
+
+```
+file spans 405 min = 41 bins
+
+pieces   size each   bins/piece (min/p50/max)   sweep cost
+     1     202 MiB          41 / 41 / 41         8,282 MiB
+     2     101 MiB          19 / 23 / 23         4,242 MiB
+     3      67 MiB          12 / 14 / 16         2,814 MiB
+```
+
+**Two findings, and the second corrects my projection's wording.**
+
+**1. The mechanism works: cost falls roughly as 1/N.** Cutting the sorted stream
+into N pieces cuts sweep cost by about N (8,282 → 4,242 → 2,814 MiB). Each piece
+is read only by the bins its own rows occupy. That is the whole thesis, verified
+on real data.
+
+**2. But the pieces here are NOT sub-bin, and my payoff model said they would
+be.** Three 67 MiB pieces still span 12–16 bins each. **The sub-bin property is a
+function of DENSITY, not of the 512 MiB cut**: this file holds ~30 MiB per hour,
+so 512 MiB of it covers ~17 hours.
+
+**Why the payoff table is nevertheless sound: it targets only the densest cells.**
+The whale cell is 85 GiB in a day — about **3.5 GiB/hour, ~118x denser than this
+test file** — so 512 MiB of it is **~8.7 minutes**, genuinely sub-bin. The
+projection's assumption holds for exactly the cells it recompresses and would
+*not* hold for a sparse cell.
+
+**So the correct general statement is:** `--recompress` reduces sweep cost by
+roughly `pieces_produced`, i.e. by `cell_bytes / 512 MiB` — which is large
+precisely where the cell is large. On the whale that is ~170x and the sub-bin
+floor caps it at the cell's byte size; on a sparse cell it is a handful of x.
+**The lever scales with the problem, which is the property you want, but the
+"~1x amplification after" claim is specific to dense cells.**
