@@ -3530,3 +3530,41 @@ widening, never after.
 not from running anything.** The same 20 minutes spent earlier would have saved
 the detour where I ranked bin width last on throughput grounds; its real
 constraint was never throughput, it was the deadline.
+
+### Correcting the third constant: it is 35 minutes, not "10+", and it has a cost
+
+I wrote `timefusion_dedup_schedule` "5 min -> 10+ min". Worked out properly
+(`drain = period x 0.8 x 0.6`):
+
+| schedule | drain deadline | holds today's 502 s unit | holds 2x-widened (~1004 s) |
+|---|---:|---|---|
+| 5 min (today) | 144 s | no | no |
+| 10 min | 288 s | no | no |
+| 20 min | 576 s | **yes** | no |
+| **35 min** | **1008 s** | **yes** | **yes** |
+
+**The bin widening requires a 7x reduction in dedup cadence**, not the ~2x I
+implied. And that is not free: dedup running every 35 minutes instead of every 5
+means duplicates persist up to 7x longer before removal, which the READ path pays
+for in merge-on-read work on every query touching those windows.
+
+**So the 10x proposal's true shape is:**
+
+```
+COORDINATOR_HOT_TARGET_BYTES   256 MiB -> 512 MiB     (pack: 2x fan-in)
+timefusion_dedup_bin_minutes        10 -> 20          (dedup read: neutral)
+timefusion_dedup_schedule        5 min -> 35 min      (deadline: required)
+                                                       ^ costs read-path latency
+```
+
+**That third line is a genuine trade, not a technicality**, and it is the thing
+to weigh before adopting the path: pack throughput at 10x, bought partly with
+dedup latency. Whether that is the right trade depends on how much merge-on-read
+the query path can absorb — which is measurable (`DedupExec` mode and row counts
+per query) and has NOT been measured.
+
+**Alternative worth pricing first:** widen the pack target WITHOUT widening dedup
+bins, accepting 1.99x dedup read but keeping the 5-minute cadence. Dedup is
+7.5-13% of worker time, so 2x on that lane is 8-13% overall — possibly cheaper
+than a 7x cadence loss. **That variant needs no schedule change at all**, and the
+data to price it is already in this document.
