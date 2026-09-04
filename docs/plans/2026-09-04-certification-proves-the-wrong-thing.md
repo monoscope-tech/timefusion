@@ -289,3 +289,60 @@ theme, that unit size scales with tenant size and a bigger tenant puts a larger
 oversized components** — not a general re-layout, just the ability to cut one
 component into bin-sized time ranges. 71 % of components need nothing; 25 need
 this; and the 25 are where the bytes are.
+
+## The splitting primitive already exists — what is missing is unit SELECTION
+
+Before proposing new machinery, I checked what repair already does. It slices:
+`coordinator_slice_target` / `repair_slice_want` / `repair_slice_cuts` /
+`repair_slice_bounds` (`maintain.rs:7070-7120`) cut a bin into event-time slices
+along the lead sort column, and `repair_bin_sliced` logs how many. The bench's
+`PROD: b256 p1 x13 slices` row prices exactly this.
+
+But the staging loop says (`maintain.rs:7157`):
+
+> "One pass when not sliced; otherwise one pass per slice, **in sort order, all
+> feeding the SAME writer**."
+
+So slices are a *memory* device — they bound what one sort must hold — not a
+layout device. Output files are cut by `timefusion_writer_max_file_bytes`, not at
+slice boundaries. **That is fine, and in fact already gives the property we
+want**: rows arrive in timestamp order, so each output file covers a contiguous
+timestamp range and consecutive files are disjoint apart from ties.
+
+**Which means a single compaction unit already produces near-disjoint output.**
+The overlap does not come from the writer. It comes from **which files a unit
+selects**: `select_coordinator_compaction_candidates` bin-packs **smallest-first
+by size**, with no reference to time at all. Two units on the same cell therefore
+take arbitrary, interleaved subsets, and each emits files spanning the other's
+range. For a component too big for one unit — the 25 over 1 GiB — this is
+guaranteed, because no single unit can ever cover it.
+
+### So the change is smaller and better-targeted than "build splitting"
+
+Not a new layout, not a new writer, not even a new slicing primitive:
+
+> **For a component larger than one bin, select the unit by TIME RANGE rather
+> than by file size** — give each unit a disjoint slice of the component's span
+> and let it take every file overlapping that slice. Successive units then tile
+> the component instead of interleaving, and their outputs are disjoint by
+> construction.
+
+The pieces this needs already exist: the cut points (`repair_slice_cuts`), the
+time-bounded predicate (`repair_slice_bounds`), the sort-ordered writer, and the
+component boundaries themselves — computable from `Add.stats` with no IO, as
+`scratchpad/components.py` does in a few seconds for the whole fleet.
+
+The bin-packer's smallest-first rule stays exactly as it is for the 71 % of
+components that fit a bin; it is only the oversized ones that need the
+time-ranged variant. That also respects the reason smallest-first exists
+(prod 2026-08-23, one large file eating the budget and retiring nothing).
+
+**Caveat I cannot close from statistics:** files carry a timestamp min/max but a
+unit must also not split a *dedup key group* across two units, or two versions of
+one row land in different outputs and the dedup can never see them together.
+Since `timestamp` leads the dedup key, a cut strictly between two distinct
+timestamps is safe; a cut *inside* a run of equal timestamps is not.
+`repair_slice_bounds` already reasons about slice boundaries in the output's sort
+direction, so this is a question to settle against that code rather than a new
+problem — but it is the thing to get right, and it is exactly the class of bug
+that is invisible until someone trusts a wrong count.
