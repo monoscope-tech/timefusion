@@ -64,6 +64,24 @@ time-adjacent ordering (identical), and bin-boundary cutting in the writer
 scattered subset, and under-target files span the whole day — so narrow output
 requires narrow INPUT, which only a full sorted rewrite provides.**
 
+**Every precondition checked against the CODE, not the comments** — three of the
+seven would have been wrong from comments or assumed defaults, one of them
+fatally:
+
+| claim | status |
+|---|---|
+| `--recompress` is the only force-rewrite | ✅ `main.rs:956` |
+| skips only empty partitions | ✅ one skip condition, `compact.rs:691` |
+| `--dry-run` is read-only | ✅ returns at `main.rs:953` |
+| **`--project` works** | ❌ **DISABLED — `compact.rs:678`, drop the flag** |
+| sorts by the schema `ORDER BY` | ✅ gated on `timefusion_optimize_sort_by`, default **true** |
+| whole-date scope penalty | ✅ **+1.8 %** — the whale IS those dates |
+| does not start maintenance workers | ✅ `with_config` ≠ `start_maintenance_schedulers` |
+
+The sort one was the near-miss: had that flag defaulted `false`, the rewrite would
+have produced UNSORTED output, the writer's cut would not have been
+time-contiguous, and the entire 45x → ~1x benefit would have evaporated silently.
+
 **Then, so it does not refill:** bound **span** in the packer's candidate
 selection, the same shape as the byte and row budgets already there. Note the
 four refutations above constrain what that rule can look like.
