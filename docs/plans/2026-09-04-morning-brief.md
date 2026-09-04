@@ -133,6 +133,44 @@ not a broken mechanism: a query needs EVERY date it reads granted, and 32 grants
 against 1,209 fleet cells is ~2.6 %. That is hours of uninterrupted uptime away —
 which is exactly, and only, decision 2.
 
+## The coverage arithmetic, now that a process lived 82 minutes
+
+One process, sampled four times across its life — this is a within-lifetime
+series, not a cross-process comparison:
+
+| uptime | `cert_granted_total` | `cert_slice_files_proved` | `dedup_skipped` |
+|---:|---:|---:|---:|
+| 1,828 s | 27 | 78 | 0 |
+| 1,878 s | 29 | 78 | 0 |
+| 2,726 s | 32 | 78 | **1** |
+| **4,928 s** | **52** | **106** | 1 |
+
+**Grants accumulate steadily at roughly 0.6/min and do not plateau.** That is the
+mechanism working as designed, and it is the clearest single result of the night.
+
+**But the queue is not converging.** Over the same window
+`pending_dedup` went 2,169 → **2,223**, `pending_base_rollup` 257 → **337**,
+`pending_sealed_consolidation` flat at ~230. **Arrivals still exceed throughput
+even with all four fixes live and a process left alone for 82 minutes.**
+
+That is the honest answer to the 10x question, and it is not a comfortable one:
+
+- certification was **structurally dead** before tonight and is now **alive and
+  accruing** — that part is fixed;
+- but at ~0.6 grants/min against a fleet of **1,209 partition cells**, blanket
+  coverage is **~32 hours of uninterrupted uptime**, and cells are re-dirtied by
+  ingest far faster than that. Blanket coverage is therefore **not reachable by
+  waiting**; it needs either a much higher grant rate or a cheaper proof.
+- The cheaper proof is exactly what
+  `2026-09-04-certification-proves-the-wrong-thing.md` argues for: certify
+  **non-overlap from file statistics** rather than duplicate-freedom from a
+  content scan. That is no longer a nice-to-have — the arithmetic above is the
+  case for it.
+
+`dedup_skipped` reaching 1 and staying there is consistent with all of this: a
+query needs **every** date it reads granted, and scattered grants rarely complete
+a window.
+
 ## The first readable process of the night
 
 At 02:2x a process finally reached **1,828 s (30.5 min)** — the longest observed,
