@@ -448,7 +448,31 @@ behaviour change; 1132 lib tests green.
 day of maintenance" and "about a week", and no other decision here can be made
 without it.
 
-## Decisions that are yours
+## Decisions that are yours — REORDERED by the 90-minute test
+
+The disjointness test above changed this ranking after it was first written. The
+deploy cadence was top; it is now second, because more uptime alone converges to
+a tidier table rather than a faster one.
+
+1. **Merge `prep/unit-phase-timers`.** One number — where a unit's ~21 minutes
+   actually goes — decides whether tiling 4,857 units is a day of maintenance or
+   a week, and no other item here can be scheduled without it. Instrumentation
+   only, 1132 tests green.
+2. **Build time-ranged unit selection for oversized components.** The actual fix.
+   Not a re-layout: the cut points, time-bounded predicates and sort-ordered
+   writer all exist; what is missing is that units select by SIZE. **~58 % of the
+   oversized mass is ten cells of one tenant's late July**, so it can start
+   targeted and show a result early.
+3. **The deploy cadence.** Still real — units run ~21 min, nothing completes in a
+   20-minute lifetime, and the backlogs only began falling once a process passed
+   an hour. But demoted: it buys fragmentation, not disjointness.
+4. **`prep/otel-metrics-collapse`.** Independent of the above and already
+   verified — the window dedup path is 20-58x slower and OOMs at 8 partitions at
+   any pool size, and `otel_metrics` is on it permanently.
+5. **The monoscope `hashes` append-only contract** (below) — the only item here
+   that TimeFusion cannot decide for itself.
+
+## The original decision list, for detail
 
 1. **The monoscope `hashes` append-only contract.** If tags are *meant* to be
    append-only, that one replacement is a client bug worth finding — most likely
