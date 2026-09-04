@@ -438,3 +438,36 @@ be tiled independently, in priority order, and the fleet's remaining 298
 oversized components are comparatively small. A targeted paydown of one tenant's
 July is a far easier thing to schedule — and to measure — than "drain the
 backlog".
+
+### The one number needed to size this cannot be measured today
+
+The paydown estimate above turns on per-unit wall time, and specifically on where
+it goes. Two attempts, both worth recording:
+
+**1. Measuring object-store throughput from here is meaningless.** Reading three
+~300 MiB prod files end to end gave **3.9 MiB/s aggregate**, which would imply
+~66 s of pure read per 256 MiB unit. **That number must not be used.** It is this
+laptop's link to OVH over the public internet, not the datacenter-local path prod
+reads on. I include it only so nobody re-derives it and believes it.
+
+**2. Prod does not instrument the decomposition.** The only unit timing emitted
+is `maintenance_unit_slow` (`maintain.rs:3679`), which carries
+`elapsed_secs` / `deadline_secs` / `headroom_pct` and fires **only** when a unit
+uses more than a quarter of its deadline. There is no read/sort/write/commit
+split anywhere on the staging path.
+
+So the decisive question — *of the ~21 minutes a prod unit takes, how much is
+object-store read, how much is the sort, how much is the Delta commit?* — **has
+no answer available today**, and tonight's bench only rules the sort out
+(1.1–2.7 s for 211 MB / 2 M rows at prod's per-worker pool).
+
+**That makes phase timers the gate on this whole programme.** Not a nice-to-have:
+4,857 units is roughly a day of continuous maintenance if a unit is ~30 s of IO
+and commit, and roughly a week if it is ~21 minutes. Those are different
+decisions, and nothing currently distinguishes them.
+
+It is also, once again, the coverage-matrix pattern: compaction has a rich funnel
+for **which files a unit selects** — good enough that it exposed tonight's
+livelock — and **nothing at all for what a unit costs.** Adding four timers around
+the existing staging loop is a smaller change than any fix shipped tonight, and
+it is what converts "drain the backlog" from an aspiration into a schedule.
