@@ -1477,3 +1477,51 @@ because nothing is left out.
 that survived measurement**, and the four that did not are recorded above so
 nobody spends a day rediscovering them. Each took minutes to refute once the
 harness existed; the harnesses are in `scratchpad/` and take a partition path.
+
+## CORRECTION: `--recompress --project` is DISABLED. Drop the flag.
+
+The command I recommended would have failed on first use. `recompress_partition`
+begins (`compact.rs:678-681`):
+
+```rust
+if project.is_some() {
+    // Scoped `replace_where` can deadlock; reject it before reading the table.
+    anyhow::bail!("recompress --project is disabled: scoped replace_where deadlocks; re-run without --project");
+}
+```
+
+**And the `main.rs` comment I quoted to justify the flag is STALE.** It says
+"`--project` narrows the overwrite predicate … which is what makes the job small
+enough to run on an ordinary runner" — describing a capability that was later
+disabled for deadlocking. **That is the second time tonight a comment in this
+codebase overstated what the code does** (the first being `mergeable`'s "the same
+test the packer applies"). Checking rather than quoting is the reason this was
+caught before it reached an operator.
+
+**The correct command drops the flag:**
+
+```
+timefusion optimize --date 2026-07-22 --recompress --dry-run
+```
+
+**And the scope penalty is negligible, because the whale IS those dates:**
+
+| date | whole date | whale cell alone | other 13 projects |
+|---|---:|---:|---:|
+| 2026-07-22 | 86.0 GiB | 85.0 GiB | ~1.0 GiB |
+| 2026-07-24 | 87.9 GiB | 87.0 GiB | ~0.9 GiB |
+
+Six whole dates are **445.7 GiB** against **438 GiB** for the six whale cells —
+a **1.8 %** increase in bytes rewritten. The tenant that caused the problem is
+~99 % of the data on those dates.
+
+**What it does change is blast radius, not cost.** Dropping `--project` means the
+rewrite touches 13 other tenants' data for those dates — a small number of bytes,
+but their files are replaced too, so their Delta history gains a version and any
+concurrent maintenance on them can lose a commit. That is a fact to state before
+running, not a reason not to.
+
+**So the recommendation survives, with the flag removed and the blast radius
+named.** The one-line lesson is the same as everywhere in this document: the
+comment described intent, the code described behaviour, and only one of them was
+checkable.

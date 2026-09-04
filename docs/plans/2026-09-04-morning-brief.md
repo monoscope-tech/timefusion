@@ -36,8 +36,15 @@ an architectural one.**
 **Do this first — it is a command, not a project:**
 
 ```
-timefusion optimize --project 87576849-… --date 2026-07-22 --recompress --dry-run
+timefusion optimize --date 2026-07-22 --recompress --dry-run
 ```
+
+**NOTE `--project` is DISABLED for recompress** (`compact.rs:678`: scoped
+`replace_where` deadlocks) — the flag will error, and the `main.rs` comment
+describing it is stale. Dropping it costs almost nothing: the whole date is
+86.0 GiB against the whale cell's 85.0 GiB, because that tenant is ~99 % of the
+data on those dates. It does widen the blast radius to 13 other tenants' files
+for that date.
 
 `--recompress` is the **only force-rewrite** (`main.rs:956`) and has exactly one
 skip condition, "no files in partition" — **it will rewrite a whale cell**, where
@@ -111,7 +118,7 @@ times per sweep — **142 GiB of reading for 1 GiB of data.**
 1. **Split the widest files, worst-first — and it is a COMMAND, not a project:**
 
    ```
-   timefusion optimize --project 87576849-… --date 2026-07-22 --recompress --dry-run
+   timefusion optimize --date 2026-07-22 --recompress --dry-run
    ```
 
    `--recompress` is the documented **only force-rewrite** (`main.rs:956`): it
