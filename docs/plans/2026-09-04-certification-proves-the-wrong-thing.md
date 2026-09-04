@@ -1199,3 +1199,38 @@ better — the packer livelock, the planner budget, the probe ordering, the roll
 liveness. **Compaction working better means files merged wider, faster.** None of
 them is wrong, but the lane they accelerate is the one manufacturing the dominant
 cost, and that interaction is not visible from inside any of them.
+
+## Can the existing CLI do it? Probably not, and the reason is the same defect
+
+The top recommendation — split the ~500 widest files — would be an *operation*
+rather than a project if existing tooling could do it. It nearly can:
+
+```
+timefusion optimize --project X --date D --consolidate --target-size-mb N --dry-run
+```
+
+`--target-size-mb` exists (`main.rs:881`) and is validated as **"only applies to
+`--consolidate`"**. So the obvious move is to consolidate a wide-file cell with a
+small target and let the writer's cut produce narrow, time-contiguous pieces.
+
+**I do not think it will work, and the reason is worth stating because it is the
+same defect a third time.** Setting `--target-size-mb 128` LOWERS the target — and
+the packer's first act is `if add.size >= target { continue; }`. A 1 GiB wide file
+is *further* above a 128 MiB target than above a 256 MiB one, so lowering the
+target makes it **more** skipped, not less. **The knob that looks like "make files
+smaller" actually means "merge files smaller than this", and a wide file is never
+on the input side of that.**
+
+That is now the third distinct symptom of one root: **over-target files are
+invisible to compaction**, so nothing — not the packer, not the debt planner, not
+the CLI — can be pointed at them.
+
+**So this needs verifying, not assuming.** `--dry-run` answers it in one command
+against one cell, and it is the first thing I would run in the morning. If it does
+skip them, the smallest possible fix is a CLI path that treats over-target files
+as *inputs* when explicitly named — far narrower than a new compaction mode, and
+it would make the 500-file cleanup an operation after all.
+
+**I am flagging this rather than asserting either way.** I have been wrong nine
+times tonight and every one was reasoning past something I had not read. The
+`size >= target` skip is read; the CLI's behaviour under a lowered target is not.

@@ -3296,7 +3296,41 @@ impl Database {
             [a, b, ..] => a.saturating_add(*b),
             _ => -1,
         };
+        // Captured before the move: the packer takes `candidates` by value and
+        // returns paths, so the ranges must be kept to report the output's span.
+        let ranges_by_path: HashMap<String, (i64, i64)> = candidates.iter().filter_map(|add| add.event_range.map(|range| (add.path.clone(), range))).collect();
         let selected = select_coordinator_compaction_candidates(candidates, target);
+        // SPAN of what this unit is about to produce. Merging unions the inputs'
+        // time ranges, so a bin's output spans the union — and a dedup bin is
+        // 10 minutes, with a file read once per bin it touches. Compaction
+        // therefore manufactures the cost dedup pays, and nothing anywhere
+        // scored it: the packer's budgets are BYTES and ROWS only.
+        //
+        // Prod 2026-09-04: 500 files (6.5% of the table) cause 60% of all
+        // maintenance read, and a partition compacted down to 22 files was the
+        // most expensive cell in the fleet at 72.7% wide files
+        // (`docs/plans/2026-09-04-certification-proves-the-wrong-thing.md`).
+        //
+        // Reported, deliberately NOT enforced — a span budget is a real
+        // selection change and this is the measurement that should precede it.
+        if selected.len() >= 2 {
+            let ranges: Vec<(i64, i64)> = selected.iter().filter_map(|path| ranges_by_path.get(path).copied()).collect();
+            if let (Some(lo), Some(hi)) = (ranges.iter().map(|r| r.0).min(), ranges.iter().map(|r| r.1).max()) {
+                let bins = (hi - lo) / (10 * 60 * 1_000_000) + 1;
+                info!(
+                    operation = ?key.operation,
+                    project_id = %key.project_id,
+                    table = %key.physical_table,
+                    date = %date,
+                    files = selected.len(),
+                    span_secs = (hi - lo) / 1_000_000,
+                    dedup_bins_spanned = bins,
+                    with_ranges = ranges.len(),
+                    event = "compaction_unit_span",
+                    "the time span a compaction unit is about to union into one output"
+                );
+            }
+        }
         // Only when the unit will do NOTHING, so this cannot become chatter: a
         // selection of one file is a 1:1 rewrite and retires no files either.
         if selected.len() < 2 {
@@ -5723,7 +5757,7 @@ impl Database {
             info!(table_name, event = "dedup_drain_flush_yield");
             return Ok(());
         }
-        const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+        use crate::database::compact::BIN_MICROS;
         // Eligible bins drained per table per tick. 8 couldn't keep up with the
         // enqueue rate (prod backlog 3341, 2026-07-20); 128 was sized for the
         // per-bin-probe cost model and drained a 22k backlog in ~a day. With
