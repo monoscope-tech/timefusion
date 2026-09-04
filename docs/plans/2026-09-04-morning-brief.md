@@ -16,10 +16,26 @@ compacted to 22 files is excellent by compaction's definition and the most
 expensive thing in the fleet for dedup.
 
 **Now confirmed LIVE in prod**, by instrumentation that shipped in the accidental
-deploy: `compaction_unit_span` shows **two files merging into an output spanning
-119 bins — 20 hours**, minutes after boot, on ordinary `SealedConsolidation`
-units. And **file count does not track span at all**: 10 files → 8 bins, 2 files
-→ 119. A packer measuring count and bytes is blind to this by construction.
+deploy. And it names the culprit precisely — **24 units over 60 minutes:**
+
+| | n | p50 bins | max | ≤16 bins |
+|---|---:|---:|---:|---:|
+| `HotPacking` | 13 | 16 | 16 | **100 %** |
+| `SealedConsolidation` | 11 | 74 | **144** | **9 %** |
+
+**`SealedConsolidation` is the lane manufacturing the cost; `HotPacking` is
+essentially innocent.** Every hot unit stays within 16 bins; 10 of 11 sealed
+units exceed it, and one produced an output spanning **144 bins — an entire
+day.** More samples sharpened this separation rather than blurring it.
+
+**File count does not track span at all** (10 files → 8 bins, 2 files → 119), so
+a packer measuring count and bytes is blind to this by construction.
+
+**A 16-bin span bound would therefore touch only the guilty lane.** The
+uncomfortable part: since that lane cannot choose narrower inputs (three
+selection designs refuted), such a bound would effectively disable it — trading a
+file-count win for the read amplification it currently imposes on 74–144 dedup
+bins per output. `prep/unit-phase-timers` is what prices that trade.
 
 **It is concentrated.** **500 files — 6.5 % — cause 60 % of all maintenance
 read.** Several span 100 % of their day, so a 1 GiB file is read 144 times per
