@@ -1525,3 +1525,49 @@ running, not a reason not to.
 named.** The one-line lesson is the same as everywhere in this document: the
 comment described intent, the code described behaviour, and only one of them was
 checkable.
+
+## LIVE CONFIRMATION: `compaction_unit_span` in prod, within minutes
+
+The accidental deploy put `compaction_unit_span` into production hours earlier
+than planned. It confirms the entire theory immediately, with real units:
+
+```
+operation             table                 date        files  span      bins
+HotPacking            otel_logs_and_spans   2026-09-04     10  4,638s      8
+SealedConsolidation   otel_metrics          2026-08-24      9  15,895s    27
+HotPacking            otel_logs_and_spans   2026-09-04      2  9,075s     16
+SealedConsolidation   otel_metrics          2026-08-16      2  62,911s   105
+SealedConsolidation   otel_logs_and_spans   2026-08-24      3  50,102s    84
+SealedConsolidation   otel_logs_and_spans   2026-08-24      2  70,915s   119
+HotPacking            otel_logs_and_spans   2026-09-04      3  455s        1
+```
+
+**Merging TWO files routinely produces an output spanning 105-119 bins — 17 to
+20 hours.** Not a pathological case; those are ordinary `SealedConsolidation`
+units, on both tables, minutes apart.
+
+**Every prediction holds:**
+
+- **Tiny merges produce day-spanning outputs.** Two files → 119 bins. The unit
+  retires one file and creates an object that 119 future dedup bins must each
+  read in full.
+- **The count says nothing about the span.** 10 files → 8 bins; 2 files → 119.
+  The packer's only measures are count and bytes, and neither is even correlated
+  with the cost the output imposes.
+- **Sealed work is far worse than hot work**, exactly as the age analysis said:
+  today's `HotPacking` units span 1-16 bins; `SealedConsolidation` on August
+  dates spans 84-119.
+- **And the instrument is not merely printing large numbers** — `3 files → 455s
+  → 1 bin` is in the same window. When the inputs happen to be adjacent, the
+  output is local. That single line is what makes the others trustworthy.
+
+**This is the measurement that was missing.** It cost four lines around an
+existing loop, and it makes the defect visible continuously rather than through a
+night of statistics archaeology. A span budget in candidate selection can now be
+chosen from a histogram instead of a guess — and the histogram says a bound
+anywhere near a handful of bins would reject most of what compaction currently
+does.
+
+**Worth stating plainly:** these units are running right now, and each one is
+making the dedup lane's next pass more expensive. The `--recompress` cleanup
+addresses the accumulated damage; only a span bound stops it accumulating.
