@@ -2266,6 +2266,10 @@ pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_by
                 return Ok(Transformed::no(node));
             };
             let Some(req) = children.iter().find_map(|c| c.properties().output_ordering()).cloned() else {
+                // NO child declares an ordering, so there is nothing to give back.
+                // Distinct from the budget decline below and far worse: it means
+                // every file in the union is non-conforming.
+                metrics::counter!(crate::database::scan_metric_names::ORDERING_REPAIR_NO_CLAIM).increment(1);
                 return Ok(Transformed::no(node));
             };
             // `sortable` IS the byte budget. Sorting a whole-window parquet leg is
@@ -2274,8 +2278,40 @@ pub(crate) fn repair_isolated_scan_ordering(plan: Arc<dyn ExecutionPlan>, max_by
             // as soon as one over-budget child misses the ordering.
             let sortable: Vec<bool> = sizes.iter().map(|(_, bytes)| *bytes <= max_bytes).collect();
             Ok(match ordered_children(&children, &req, None, &sortable, true)? {
-                Some(ordered) => Transformed::yes(UnionExec::try_new(ordered)?),
-                None => Transformed::no(node),
+                Some(ordered) => {
+                    metrics::counter!(crate::database::scan_metric_names::ORDERING_REPAIR_APPLIED).increment(1);
+                    Transformed::yes(UnionExec::try_new(ordered)?)
+                }
+                None => {
+                    // THE CLIFF, and until now it was invisible. Declining here
+                    // costs the query its streaming top-N: the union advertises no
+                    // ordering, `DedupExec` falls to its unbounded `full-set` mode,
+                    // and `ORDER BY ts DESC LIMIT n` becomes a BLOCKING sort over
+                    // the whole window. Prod 2026-09-04: a monoscope log-explorer
+                    // listing on one project retried every ~15 s, each attempt
+                    // dying in `ExternalSorterMerge` — and nothing anywhere
+                    // recorded that the repair had stopped firing, so it read as
+                    // "queries that used to work fine no longer do".
+                    //
+                    // The over-budget leg bytes are the number
+                    // `timefusion_read_sort_unordered_leg_max_mb` must be set
+                    // against — its own doc says to raise it "only against a
+                    // measured distribution of isolated-leg sizes", which did not
+                    // exist because this site never emitted one.
+                    let over: u64 = sizes.iter().map(|(_, bytes)| *bytes).filter(|b| *b > max_bytes).sum();
+                    metrics::counter!(crate::database::scan_metric_names::ORDERING_REPAIR_DECLINED).increment(1);
+                    if crate::observability::sample_rollup_miss("ordering_repair_declined") {
+                        tracing::warn!(
+                            children = children.len(),
+                            unsortable = sortable.iter().filter(|s| !**s).count(),
+                            over_budget_bytes = over,
+                            max_bytes,
+                            event = "ordering_repair_declined",
+                            "the isolated leg exceeds the sort budget, so the union loses its ordering claim and ORDER BY ... LIMIT becomes a blocking sort"
+                        );
+                    }
+                    Transformed::no(node)
+                }
             })
         })?
         .data)

@@ -362,6 +362,19 @@ pub mod scan_metric_names {
         // this — a psql probe reads through `DedupExec` and sees them collapsed.
         CERT_DECLINED_DIRTY_BINS = "timefusion.scan.cert_declined_dirty_bins" as scan.cert_declined_dirty_bins;
         CERT_SLICE_FILES_UNPROVEN = "timefusion.scan.cert_slice_files_unproven" as scan.cert_slice_files_unproven;
+        // The ORDERING CLIFF, split three ways so a query that quietly stopped
+        // streaming is visible. `declined` means the isolated non-conforming leg
+        // exceeded `timefusion_read_sort_unordered_leg_max_mb`, so the union
+        // advertises no ordering, `DedupExec` falls to unbounded `full-set`, and
+        // `ORDER BY ts DESC LIMIT n` becomes a BLOCKING sort over the window.
+        // `no_claim` is worse — not one file in the union declares an ordering.
+        // Prod 2026-09-04: a log-explorer listing retried every ~15 s, each try
+        // dying in `ExternalSorterMerge`, and NOTHING recorded that the repair
+        // had stopped firing. Read `declined / (declined + applied)` as the share
+        // of Delta-reading queries paying a full sort they used to stream.
+        ORDERING_REPAIR_APPLIED = "timefusion.scan.ordering_repair_applied" as scan.ordering_repair_applied;
+        ORDERING_REPAIR_DECLINED = "timefusion.scan.ordering_repair_declined" as scan.ordering_repair_declined;
+        ORDERING_REPAIR_NO_CLAIM = "timefusion.scan.ordering_repair_no_claim" as scan.ordering_repair_no_claim;
         // Why a CERTIFIED file still could not skip. Two very different
         // refusals: one uncertified file with no statistics blocks the entire
         // scan, whereas overlap blocks only the files it touches. Prod
