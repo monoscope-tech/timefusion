@@ -224,12 +224,13 @@ fn init_cli_tracing() {
 fn run_sim_cli() -> anyhow::Result<()> {
     use timefusion::maintenance_sim::{SimConfig, load_sandboxed, run};
     let mut it = std::env::args().skip(2);
-    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--floorless] [--guard-off] [--json]";
+    let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--json]";
     let input = it.next().context(usage)?;
     let mut cfg = SimConfig::default();
     let mut json = false;
     let mut floorless = false;
     let mut mint = false;
+    let mut debris_slice = 1i64;
     while let Some(a) = it.next() {
         let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
         match a.as_str() {
@@ -251,6 +252,9 @@ fn run_sim_cli() -> anyhow::Result<()> {
             // turns arrivals back on, which is what makes `--streams` — and so
             // any capacity experiment — mean anything on a synthetic queue.
             "--mint" => mint = true,
+            // The bin-width axis: same total debris work as `600 / n` units of
+            // `n` minutes. See `synthetic_whale_queue`.
+            "--debris-slice-minutes" => debris_slice = value("--debris-slice-minutes")?.parse().context("--debris-slice-minutes must be an integer")?,
             // The floorless control, and the pre-69e6503 behaviour, for
             // `synth:whale`.
             "--floorless" => floorless = true,
@@ -281,7 +285,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
             "--streams needs arrivals to scale: pass --mint (a synthetic queue disables minting by default), or use a real journal."
         );
         cfg.mint_frontier = mint;
-        let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100);
+        let queue = timefusion::maintenance_sim::synthetic_whale_queue(now, !floorless, 100, debris_slice);
         cfg.byte_model = Some(queue.model);
         run(queue.journal, &cfg, now)?
     } else {

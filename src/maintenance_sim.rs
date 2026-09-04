@@ -982,7 +982,26 @@ pub struct SynthQueue {
 /// `parent_measured_bytes: None` except the deliberately stamped lineage, so
 /// the first split of each lineage is unconditional and the guard engages only
 /// from the second level down, which is the real sequence.
-pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64) -> SynthQueue {
+/// `debris_slice_minutes` varies unit COUNT at constant total work: the debris
+/// block carries the same bytes over the same window as `600 / n` units of `n`
+/// minutes. 1 = the historical fixture, so every prior result reproduces.
+///
+/// **It was built to test bin widening and it CANNOT — recorded here so nobody
+/// repeats the attempt.** Two configurations, both null:
+///
+/// - **With `--mint` at 5x load**: 600 debris units are 0.6% of a ~102,000-unit
+///   queue, so 600 -> 300 moved `pending_end` by 0.1% (102,696 -> 102,804).
+///   Swamped.
+/// - **Without minting**: `pending_start` falls exactly as designed
+///   (813/513/313/263 for n = 1/2/6/12) and **`executions` and `pending_end` are
+///   IDENTICAL at every width** (1,774 and 2 on seed 1). The coordinator's own
+///   coarsening already fuses the debris, so pre-collapsing it adds nothing.
+///
+/// The deeper reason is structural: this simulator schedules rollup/compaction
+/// TASKS on virtual time. Widening `BIN_MICROS` pays off in READ BYTES — the
+/// same file read once per bin it straddles — and an IO-free model cannot see
+/// bytes. **Validating bin width needs real object-store latency, i.e. staging.**
+pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64, debris_slice_minutes: i64) -> SynthQueue {
     let dir = tempfile::tempdir().expect("sim fixture tempdir");
     let mut journal = TaskJournal::load(dir.path()).expect("sim fixture journal");
     let mut model = ByteModel { floored, ..Default::default() };
@@ -1020,8 +1039,17 @@ pub fn synthetic_whale_queue(start_micros: i64, floored: bool, whale_x_max: u64)
     // Fusion can only rescue them once the partition ceiling is known.
     let debris_day = day(2);
     model.insert("debris", debris_day, 360_000_000);
-    for minute in 0..600 {
-        journal.enqueue(rollup_key("debris", debris_day + minute * MIN_SLICE_MICROS, MIN_SLICE_MICROS), start_micros, 4_466_185_462, 0);
+    let slice = debris_slice_minutes.max(1);
+    let debris_units = 600 / slice;
+    for unit in 0..debris_units {
+        // Bytes scale with the slice so total work is held constant: the knob
+        // must vary unit COUNT alone, or a sweep confounds count with cost.
+        journal.enqueue(
+            rollup_key("debris", debris_day + unit * slice * MIN_SLICE_MICROS, slice * MIN_SLICE_MICROS),
+            start_micros,
+            4_466_185_462u64.saturating_mul(slice as u64),
+            0,
+        );
     }
     SynthQueue { journal, model, whale_cell, stamped_cell, dir }
 }
@@ -1299,7 +1327,7 @@ mod tests {
 
     fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64) -> (SimReport, String, String) {
         let start = 100 * DAY_MICROS;
-        let queue = synthetic_whale_queue(start, floored, whale_x_max);
+        let queue = synthetic_whale_queue(start, floored, whale_x_max, 1);
         let cfg =
             SimConfig { mint_frontier: false, workers: 16, horizon_micros: 6 * HOUR, byte_model: Some(queue.model), split_guard: guard, ..Default::default() };
         let report = run(queue.journal, &cfg, start).unwrap();
@@ -1315,7 +1343,7 @@ mod tests {
     #[test]
     fn whale_lineage_trace() {
         let start = 100 * DAY_MICROS;
-        let queue = synthetic_whale_queue(start, true, 100);
+        let queue = synthetic_whale_queue(start, true, 100, 1);
         let (mut journal, model) = (queue.journal, queue.model);
         let mut report = SimReport::default();
         // Deep enough to reach the DECLINE, not just the splits above it — the
