@@ -2538,3 +2538,38 @@ something not in this session's changes at all.**
 process has been up for hours under load. If the wall never returns, the fix is
 real and mis-attributed; if it returns at high load rather than high age, the
 target is concurrency, not age or any of tonight's knobs.
+
+## CORRECTION: there are TWO repair lanes, and my fix is on the wrong one
+
+`pending_repair` is set from the maintenance JOURNAL —
+`per_operation[Operation::Repair]` in `maintenance_coordinator.rs:3341` — so the
+**252** is 252 coordinator Repair *tasks*, executed by
+`run_coordinator_compaction_once(Operation::Repair)`.
+
+`timefusion_footer_repair_files_per_pass`, which I raised 1 → 4 and shipped as
+"the fix for the query wall", changes `select_tail_bin`'s `TailPass::Repair` —
+the footer-repair CRON. **A different code path.**
+
+| lane | executed by | backlog | touched by my change? |
+|---|---|---|---|
+| Coordinator `Operation::Repair` | `run_coordinator_compaction_once` | **252 pending** | **NO** |
+| Tail-pass `TailPass::Repair` | footer-repair cron / `select_tail_bin` | unmeasured | yes (1 → 4) |
+
+**So the change cannot drain the 252, and `pending_repair` holding at 252 is not
+"the pass has not fired yet" — it is the wrong lane.** I asserted the opposite
+twice tonight.
+
+**What this means for the diagnosis.** The chain I proposed — unsorted files →
+unordered dedup → 2 GiB ceiling → wide queries fail — may still be right, but the
+throughput lever for it is the COORDINATOR repair lane, whose rate I never
+measured. The tail-pass rate (1-2 units/95 min, from the phase timers) describes
+the lane I did measure, which is not the one holding the backlog.
+
+**Next, and it is now well-posed:** measure the coordinator Repair lane's
+completion rate (`work.Repair.*` counters and journal task transitions), then
+decide whether 252 is draining at all. If it is not, that is the thing blocking
+wide queries, and neither knob shipped tonight addresses it.
+
+**The tail-pass change is not wasted** — 4 files per pass is still strictly more
+footer repair per pass than 1, and the pass's own budget bounds it. But it should
+not be described as draining the 252.
