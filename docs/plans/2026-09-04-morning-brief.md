@@ -80,6 +80,21 @@ at 85 GiB, several times what already OOM'd prod twice. **Do not re-propose it
 without first fixing the `replace_where` deadlock**, which would shrink the job
 to the few-GB partitions `OPTIMIZE` already tolerates.
 
+### It costs you TWO customer-facing symptoms, not one
+
+1. **`hashes` queries time out** on issues pages — dedup can never be skipped, so
+   the predicate is stranded above `DedupExec` and the query scans the window.
+2. **Dashboard queries miss their rollups** — `pending_base_rollup` 229 +
+   `pending_derived_rollup` 412 = **641 units behind**, and **171 of ~260 routing
+   misses are `not_built` or `stale_coverage`**: queries that could have used a
+   rollup and fell back to raw scans.
+
+Both trace to the same root — `Dedup` takes **76 %** of maintenance capacity
+because wide files make it re-read the same data once per bin, and every other
+lane divides what is left. **So the cleanup's return lands on dashboards too,
+which is where most queries actually go**, and that is not counted in the
+storage-read payoff table above.
+
 ## IF YOU READ ONE SCREEN
 
 **The answer to "can we handle 10x".** Dedup consumes **~98 % of the heavy
