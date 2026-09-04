@@ -3354,3 +3354,53 @@ remove work rather than schedule it faster: deletion vectors for dedup, and
 whatever further raises fan-in beyond 9 (the guard's floor is already at the
 measured knee, so this means changing how files are written, not how they are
 selected).
+
+## A MODELLED PATH TO 10x: the deployed guard + doubling the bin target
+
+The residual after the guard is 1.9x, and it has to come from unit COUNT (the sim
+proved worker count contributes nothing). Fan-in is bounded by
+`bin target / input file size`, so doubling `COORDINATOR_HOT_TARGET_BYTES`
+(256 MiB) roughly doubles fan-in, 9 -> ~18.
+
+Simulated at 10x load, 24 virtual hours:
+
+| scenario | pending_end |
+|---|---:|
+| **1x baseline — the keeping-up level** | **18,335** |
+| 10x + guard (fan-in 9) | 37,267 |
+| **10x + guard + 512 MiB target (fan-in ~18)** | **18,285** ✓ |
+| 10x + guard + 768 MiB target (fan-in ~27) | 18,001 |
+
+**At 10x load, the deployed guard plus a doubled bin target reaches the same
+backlog as 1x today.** That is the first modelled demonstration of keeping up at
+10x in this document, and it needs two constants, one of which is already shipped.
+
+### The assumptions, stated — this is a model, not a measurement
+
+1. **Fan-in scales linearly with the bin target.** Plausible (a bin fills to the
+   target, so twice the target holds twice the files) but not measured. The
+   packer's other budgets — `MAX_BIN_ROWS`, the row cap — may bind first.
+2. **Unit-count reduction is modelled as a stream-count reduction** (67 streams
+   ≈ 140 / 2.1). The sim has no bin-target input, so this is the closest
+   available proxy.
+3. **The sim is IO-free.** Larger files have real costs it cannot see.
+
+### The tension this creates, and it is the one to check first
+
+**Bigger files make dedup worse.** A dedup unit reads every file overlapping its
+bin, in full, so a file spanning more bins is read more times — the finding that
+opened this whole investigation. Doubling the pack target widens files and
+therefore widens that span.
+
+**But the ratio now favours it:** Pack is **85.3%** of maintenance worker time,
+dedup **7.5-13%**. Trading a worse 10% lane for a much better 85% lane is
+probably right — and **`timefusion_dedup_bin_minutes` (shipped, default 10) is
+the exact offset**: widening dedup bins to match the wider files restores the
+files-per-bin ratio. The two knobs are complements, which is not how I framed
+them earlier — I ranked bin width last on its own throughput merits, and it may
+instead be the enabler for the pack-target change.
+
+**Recommended next step:** measure fan-in and dedup read volume at
+`COORDINATOR_HOT_TARGET_BYTES = 512 MiB` in staging, with
+`timefusion_dedup_bin_minutes` at 10 and 20, before touching prod. Assumption 1
+is the one that decides whether any of this holds.
