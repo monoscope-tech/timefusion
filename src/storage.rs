@@ -3978,7 +3978,7 @@ mod bin_remap_tests {
         // the expected values: the new bins must cover every instant of the old.
         let (lo, hi) = (bin * from, (bin + 1) * from - 1);
         assert!(*got.start() * to <= lo, "first new bin must start at or before the old bin");
-        assert!((*got.end() + 1) * to - 1 >= hi, "last new bin must end at or after the old bin");
+        assert!((*got.end() + 1) * to > hi, "last new bin must end at or after the old bin");
     }
 }
 

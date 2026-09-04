@@ -1667,7 +1667,7 @@ impl Database {
                                 // See `PlanProgress`.
                                 let planned_at = std::time::Instant::now();
                                 let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
-                                let mut t_plan = planned_at.elapsed();
+                                let t_plan = planned_at.elapsed();
                                 let (mut t_upstream, mut t_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
                                 // `RunCollapse` collapses ADJACENT runs, so it needs one ordered
                                 // stream. `execute_stream` merges a multi-partition plan with a
