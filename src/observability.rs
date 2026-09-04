@@ -1316,7 +1316,7 @@ atomic_stats! {
         /// Packing bins whose bytes-per-file-eliminated exceeded the value floor
         /// (counted even when the floor is 0/off, so it can be chosen from data).
         pack_value_refused as "pack_value_refused",
-        pack_value_refused_bytes as "pack_value_refused_bytes",
+        pack_value_refused_rows as "pack_value_refused_rows",
         maintenance_cpu_tokens_used as "cpu_tokens_used",
         maintenance_decoded_bytes_used as "decoded_bytes_used",
         maintenance_object_read_tokens_used as "object_read_tokens_used",

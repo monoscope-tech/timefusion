@@ -8321,9 +8321,9 @@ impl HotBinPolicy<'_> {
 /// removed; cost is bytes rewritten. `floor` of 0 means "no floor configured",
 /// and the predicate then reports every bin so the refusal can be COUNTED
 /// without being applied — see `timefusion_pack_max_bytes_per_file_eliminated`.
-pub(crate) fn bin_exceeds_value_floor(bytes: i64, files: usize, floor: i64) -> bool {
-    let eliminated = (files.saturating_sub(1)) as i64;
-    bytes / eliminated.max(1) > floor.max(1)
+pub(crate) fn bin_exceeds_value_floor(rows: u64, files: usize, floor: u64) -> bool {
+    let eliminated = (files.saturating_sub(1)) as u64;
+    rows / eliminated.max(1) > floor.max(1)
 }
 
 pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass) -> Vec<String> {
@@ -8423,11 +8423,24 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     // the floor is chosen from `pack_value_refused_bytes` rather than by
     // argument — the same discipline the share numbers earned the hard way.
     if files.len() >= 2 {
-        let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_bytes_per_file_eliminated);
-        if bin_exceeds_value_floor(bytes, files.len(), floor) {
+        // Priced in ROWS, not bytes. `bytes` here is `add.size` — COMPRESSED —
+        // and the measurement that motivated this guard was in rows. Converting
+        // rows to bytes at 104 B/row DECODED put the floor 12x too high (the
+        // compression ratio), so a 100 MiB floor could never fire: prod's median
+        // 2-file merge is 3.77M rows = ~31 MiB compressed. `pack_value_refused`
+        // reading 0 on a live process is what exposed that.
+        //
+        // Rows are also the better cost proxy: `TailAdd::rows`' own doc says
+        // "Rows, not bytes, are what a staging rewrite actually costs", and the
+        // phase timers put 59% of Pack's wall clock in WRITE, which is encode
+        // (rows) before upload (bytes). Absent `numRecords` counts as zero, the
+        // same "unknown, do not count" the row cap uses — it can only admit.
+        let rows: u64 = files.iter().filter_map(|p| adds.iter().find(|a| &a.path == p).and_then(|a| a.rows)).sum();
+        let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated);
+        if bin_exceeds_value_floor(rows, files.len(), floor) {
             let stats = crate::observability::maintenance_stats();
             stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.pack_value_refused_bytes.fetch_add(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+            stats.pack_value_refused_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
             if floor > 0 {
                 files.clear();
             }
@@ -16167,7 +16180,7 @@ mod tests {
 
         // One partition: files arrive, the packer picks a bin, the bin becomes a
         // single larger file. Deterministic — no clock, no RNG.
-        let run = |floor: i64| -> (i64, i64, usize) {
+        let run = |floor: u64| -> (i64, i64, usize) {
             let (mut live, mut written, mut ingested, mut seq) = (Vec::<i64>::new(), 0i64, 0i64, 0i64);
             for _ in 0..ROUNDS {
                 live.push(ARRIVAL);
@@ -16189,8 +16202,11 @@ mod tests {
                 }
                 let idx: Vec<usize> = picked.iter().filter_map(|p| p.strip_prefix('f')?.parse().ok()).collect();
                 let bytes: i64 = idx.iter().map(|i| live[*i]).sum();
+                // Rows, at prod's ~12:1 compression and 104 B/row decoded — the
+                // guard prices rows, and a byte-priced floor was the bug it replaced.
+                let rows = (bytes as u64) * 12 / 104;
                 // The floor the guard applies, via the SAME predicate.
-                if super::bin_exceeds_value_floor(bytes, idx.len(), floor) && floor > 0 {
+                if super::bin_exceeds_value_floor(rows, idx.len(), floor) && floor > 0 {
                     seq += 1;
                     if seq > 3 {
                         break; // wedged: nothing admissible, stop rather than spin
@@ -16207,7 +16223,11 @@ mod tests {
         };
 
         let (w_off, ing, files_off) = run(0);
-        let (w_on, _, files_on) = run(100 * 1024 * 1024); // the recommended ~100 MiB/file floor
+        // 8M rows/file: above this fixture's 10-file merges (2.4M) so packing is
+        // NOT wedged, below its 2-file merges (4.35M) so the expensive shape is
+        // still refused. At 1M the floor refused EVERY bin and amplification
+        // went to 0.00x — nothing merged. That is why the shipped default is 0.
+        let (w_on, _, files_on) = run(4_000_000);
         let amp = |w: i64| w as f64 / ing as f64;
         println!("amplification: OFF {:.2}x  ON {:.2}x   |   live files: OFF {files_off}  ON {files_on}", amp(w_off), amp(w_on));
 
@@ -16246,9 +16266,10 @@ mod tests {
             event_range: Some((min, max)),
             rows: None,
         };
+        // Priced in ROWS per file eliminated, which is what the guard compares.
         let value = |files: &[(&str, i64)]| {
-            let bytes: i64 = files.iter().map(|(_, s)| *s).sum();
-            bytes / (files.len() as i64 - 1).max(1)
+            let rows: i64 = files.iter().map(|(_, s)| *s).sum();
+            rows / (files.len() as i64 - 1).max(1)
         };
 
         // THE EXPENSIVE SHAPE: two nearly-converged files fill the target and

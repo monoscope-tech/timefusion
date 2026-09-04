@@ -2022,37 +2022,38 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(5)]
     pub timefusion_compact_min_files: usize,
 
-    /// Refuse a packing bin that rewrites more than this many BYTES per file it
+    /// Refuse a packing bin that rewrites more than this many ROWS per file it
     /// eliminates. **0 = off; the refusal is counted either way.**
     ///
-    /// `min_files` cannot express this: it is tested against the candidate POOL,
-    /// so a pool of five can still emit a two-file bin once bytes reach the
-    /// target. A bin's benefit is files removed; its cost is bytes rewritten,
-    /// and the packer priced only the cost.
+    /// A bin's benefit is files removed; its cost is what the rewrite writes.
+    /// `min_files` cannot express that — it is tested against the candidate
+    /// POOL, so a pool of five still emits a two-file bin once the bytes reach
+    /// the target.
     ///
     /// Prod 2026-09-04, quiet 95 min: 2-file merges were **82.5% of packing
-    /// write volume** and **9.9% of the file reduction** — 3,129,141 rows per
-    /// file eliminated, against 27,098 for 9+-file merges. Maintenance wrote
-    /// ~36 rows per row ingested. A floor near the 5-8 file shape would move
-    /// most of that 82.5%.
-    /// **ENABLED at 100 MiB (2026-09-04)** after both the benefit and the risk
-    /// were measured, by two independent methods:
+    /// write volume** and **9.9% of the file reduction** — **3,129,141 rows per
+    /// file eliminated** against **27,098** for 9+-file merges, 115x worse.
+    /// Replaying 163 real units, a floor of 1M rows/file refuses **82.4%** of
+    /// the write volume for **8.8%** of the benefit, and the population is
+    /// bimodal (expensive bins ~3.77M, everything else under 1M) so anything
+    /// from ~1M to ~3M gives the same answer.
     ///
-    /// - replaying 163 real prod Pack units: refuses **82.4%** of packing write
-    ///   volume, deferring **8.8%** of file elimination;
-    /// - driving the real `select_tail_bin` for 400 rounds
-    ///   (`the_value_floor_lowers_steady_state_write_amplification`): steady-state
-    ///   amplification **6.73x -> 3.85x**, and live file count **31 -> 29** —
-    ///   *lower*, because refusing low-value merges redirects the packer to
-    ///   high-fan-in merges that remove more files each.
-    ///
-    /// The population is BIMODAL — expensive bins sit at ~3.77M rows per file
-    /// eliminated, everything else under 1M — so any floor between ~100 and
-    /// ~300 MiB gives the same result. This is a separator, not a tuned knob.
-    ///
-    /// Rollback: set to 0.
-    #[serde_inline_default(100 * MIB as i64)]
-    pub timefusion_pack_max_bytes_per_file_eliminated: i64,
+    /// **In ROWS, not bytes, and that distinction is the bug this replaces.**
+    /// The first version priced it in bytes at 100 MiB, converting the rows
+    /// measurement at 104 B/row DECODED — but the packer compares COMPRESSED
+    /// `add.size`, 12x smaller, so the floor could never fire. `pack_value_refused`
+    /// reading 0 on a live process is what caught it.
+    /// **SHIPPED AT 0 (shadow). A floor that bites can WEDGE packing entirely,
+    /// and the benchmark proves it:** at 18 MiB arrivals (~2.18M rows/file) even
+    /// a 10-file merge is 2.4M rows per file eliminated, so a 1M floor refuses
+    /// EVERY bin — steady-state amplification went to 0.00x because nothing
+    /// merged at all. Prod's small-file population (9+-file merges at 27,098
+    /// rows/file) is far below that, so the same floor is harmless there and
+    /// catastrophic on a partition of larger files. **The guard needs a
+    /// "never refuse the only available bin" escape before any non-zero
+    /// default is safe.**
+    #[serde_inline_default(0)]
+    pub timefusion_pack_max_rows_per_file_eliminated: u64,
     /// Five-minute hot-partition compaction is required to prevent a
     /// small-file backlog. Set false only as an incident kill switch.
     #[serde_inline_default(true)]
