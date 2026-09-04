@@ -1523,3 +1523,39 @@ sort — which blocks limit pushdown by construction, or (b) the projection
 **Next step is local, not prod:** reproduce this exact query shape against a
 seeded local table and `EXPLAIN` it. `dedup_keys_lead_the_sort` in `compact.rs`
 is the specific predicate to check for `otel_logs_and_spans`.
+
+## Narrowing the 09:58 incident: three causes eliminated, one candidate left
+
+Working the incident locally rather than on prod. Eliminated, cheapest first:
+
+1. **The Delta-side ordering repair.** `scan.ordering_repair_declined` = 0 across
+   6,020 prod queries while the incident fired. Not on the path.
+2. **`dedup_keys_lead_the_sort`.** Holds for `otel_logs_and_spans`: `dedup_keys`
+   are `[timestamp, resource___service___name, id]` and `sorting_columns` leads
+   with exactly those three. Dedup *can* run bounded — a schema fact, no run needed.
+3. **The projection.** New e2e test `the_monoscope_log_explorer_listing_streams`
+   runs monoscope's actual listing — `jsonb_build_array` over a dozen columns,
+   `to_jsonb(summary)`, the `extract(epoch ...)` cast and the `coalesce(... or ...)`
+   — against the same mem∪delta fixture. It **passes**:
+   `SortPreservingMergeExec`, `DedupExec mode=bounded[timestamp]`, `fetch=3`
+   propagating into the scan. The projection does not defeat the top-N.
+
+**What is left: the MEMORY leg.** The failing prod span carries
+`scan.uses_mem_buffer=true`. A union advertises an ordering only when EVERY child
+does, so if the in-memory leg cannot declare the table's `sorting_columns`, the
+union loses it, `DedupExec` drops to unbounded `full-set`, and the listing
+materialises the window.
+
+**And this was the least observable path in the whole read stack.**
+`declare_ordering` fell back on failure with a `debug!` line — which prod does not
+emit — under a comment saying an undeclared source is "merely slower". It is not:
+it costs the query its streaming merge. Instrumented in `b4a269a9`:
+`scan.mem_ordering_declared` / `_unsorted` / `_rejected`, the last also a `warn!`.
+
+`_unsorted` (the caller could not claim its partitions were ordered) and
+`_rejected` (it claimed and `try_with_sort_information` refused — the 2026-09-02
+projected-index bug's shape) are different defects, so they are counted apart.
+
+**Next:** deploy and read those three. If `_unsorted` dominates, the fix is to
+sort the mem partitions before exposing them; if `_rejected` does, it is an index
+or schema mismatch in the claim.
