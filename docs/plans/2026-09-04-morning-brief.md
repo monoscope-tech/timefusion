@@ -3,6 +3,31 @@
 Final state, not the journey. **Four fixes shipped**, one customer question
 answered with a "don't build this", and four decisions that are yours.
 
+## THE ANSWER TO THE 10x QUESTION
+
+Measured tonight, from Delta statistics alone:
+
+**Our compaction MERGES but never SPLITS. That is sufficient until a group of
+mutually-overlapping files outgrows a compaction bin — after which it is
+permanently unmergeable and permanently overlapping. That is the frozen mass, and
+it grows super-linearly with ingest volume.**
+
+The overlap graph's connected components, over the 107 cells holding 17+ files:
+**6,544 files form 206 components**; 71 % are under the 256 MiB target (median
+9.8 MiB) and merge trivially, while **25 exceed 1 GiB and the largest is 89 GiB
+across 328 files.** A component grows by chain-overlap — one file spanning two
+windows welds them, and everything in either window then joins it — so **higher
+ingest welds faster and pushes more components past the threshold.**
+
+IOx's compactor merges *and* splits, which is why it can hold non-overlap as an
+invariant at any scale. **The cheapest high-value change is a splitting
+compaction for oversized components**: not a re-layout, just the ability to cut
+one component into bin-sized time ranges. 71 % of components need nothing; 25
+need this; and the 25 are where the bytes are.
+
+Everything else below is either a fix that removed a blocker on the way to this,
+or a measurement that led to it.
+
 ## The headline
 
 **The customer-visible `hashes` timeout and the maintenance backlog are the same
