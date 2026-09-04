@@ -675,10 +675,8 @@ impl Database {
         use object_store::{ObjectStoreExt, path::Path as OsPath};
 
         let date_str = date.to_string();
-        if project.is_some() {
-            // Scoped `replace_where` can deadlock; reject it before reading the table.
-            anyhow::bail!("recompress --project is disabled: scoped replace_where deadlocks; re-run without --project");
-        }
+        // SCRATCH: guard lifted to test whether the deadlock still reproduces.
+        // NOT FOR MERGE.
         let date_marker = format!("date={date_str}");
 
         let (uris, log_store, table_uri) = {
@@ -823,9 +821,11 @@ impl Database {
         let ctx = datafusion::prelude::SessionContext::new_with_state(session);
         ctx.register_table("recompress_src", Arc::new(provider))?;
         // `date_str` is a parsed `NaiveDate`; `order_by` uses quoted identifiers.
-        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{order_by}")).await?.into_optimized_plan()?;
+        let proj_pred = project.map(|p| format!(" AND project_id = '{p}'")).unwrap_or_default();
+        let input_plan =
+            ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{proj_pred}{order_by}")).await?.into_optimized_plan()?;
 
-        let replace_pred = format!("date = '{date_str}'");
+        let replace_pred = format!("date = '{date_str}'{proj_pred}");
         let write_result = table_clone
             .write(Vec::<RecordBatch>::new())
             .with_input_plan(input_plan)

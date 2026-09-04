@@ -3870,3 +3870,66 @@ async fn a_pruned_to_nothing_delta_scan_does_not_panic() -> Result<()> {
     assert_eq!(found, 0, "the needle is in no file — and getting there must not panic");
     Ok(())
 }
+
+/// SCRATCH EXPERIMENT (2026-09-04): does a PROJECT-SCOPED `recompress_partition`
+/// still deadlock?
+///
+/// `compact.rs` rejects `--project` with "scoped replace_where deadlocks". That
+/// comment carries no date and much of the file has been rewritten since, so the
+/// restriction may be obsolete — and it matters a great deal: project-scoping
+/// turns an 85 GiB whole-date rewrite into a few-GB partition job, which is the
+/// size `OPTIMIZE` already runs in-process. That single fact would collapse the
+/// infrastructure dependency, the OOM risk and the blast radius of the
+/// wide-file cleanup (`docs/plans/2026-09-04-certification-proves-the-wrong-thing.md`).
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_recompress_does_not_deadlock() -> Result<()> {
+    let (db, p1) = buffered_db("scoped_recompress").await?;
+    let p2 = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ts = chrono::Utc::now().timestamp_micros();
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+
+    // Two projects in ONE date partition — the shape scoping has to survive.
+    for (pid, n) in [(&p1, 0u32), (&p2, 1u32)] {
+        let rows: Vec<_> = (0..40).map(|i| test_span_ts(&format!("r{n}-{i}"), "v", pid, ts + i as i64 * 1_000)).collect();
+        write(&db, pid, rows, true).await?;
+    }
+
+    let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        // level 9 != the level the test files were written at, so the
+        // "already at target tier" short-circuit cannot fire and the
+        // replace_where write actually runs — which is the point.
+        db.recompress_partition(&table_ref, "otel_logs_and_spans", date, 9, Some(p1.as_str())),
+    )
+    .await;
+
+    match out {
+        Err(_) => panic!("scoped recompress DEADLOCKED (no completion in 120s) — the restriction is real"),
+        Ok(r) => {
+            let outcome = r?;
+            println!("scoped recompress completed: {outcome:?}");
+            // A Skipped outcome means the replace_where write never ran and the
+            // test proved nothing — the first attempt at this test did exactly
+            // that ("already at target tier and every footer is sorted").
+            assert!(
+                matches!(outcome, timefusion::database::RecompressOutcome::Rewritten { .. }),
+                "the write must actually run for this test to mean anything, got {outcome:?}"
+            );
+        }
+    }
+
+    // The other project's rows must survive a scoped overwrite — the whole point
+    // of scoping, and the thing a wrong `replace_where` would silently destroy.
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let rows = ctx
+        .sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{p2}'"))
+        .await?
+        .collect()
+        .await?;
+    let n = rows[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
+    assert_eq!(n, 40, "a project-scoped recompress must not touch another project's rows");
+    Ok(())
+}
