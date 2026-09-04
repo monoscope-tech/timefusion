@@ -1481,15 +1481,23 @@ pub struct BufferConfig {
     /// A unit's output spans the union of what it merged, and a dedup bin must
     /// rewrite every file overlapping it — so a wide output is read once per bin
     /// it touches, forever. The packer's other budgets are BYTES and ROWS;
-    /// neither is even correlated with span. Prod 2026-09-04 measured 24 units:
-    /// `HotPacking` never exceeded **16 bins** (13 of 13) while
-    /// `SealedConsolidation` ran **p50 74, max 144** — a full day from one unit
-    /// (`docs/plans/2026-09-04-certification-proves-the-wrong-thing.md`).
+    /// neither is even correlated with span. Prod 2026-09-04, **297 units over
+    /// 90 minutes** (`docs/plans/2026-09-04-certification-proves-the-wrong-thing.md`):
     ///
-    /// **Off by default because the trade is real and unpriced.** At 16 this
-    /// leaves hot packing untouched and rejects essentially all sealed
-    /// consolidation — which cannot pick narrower inputs, so a bound effectively
-    /// disables that lane. Whether that is right depends on the file-count win
+    /// |                     |   n | p50 | max | <=16 bins |
+    /// |---------------------|-----|-----|-----|-----------|
+    /// | `HotPacking`        | 118 |  13 |  20 |    62.7 % |
+    /// | `SealedConsolidation` | 179 |  84 | 144 |     4.5 % |
+    ///
+    /// **Set it from that distribution, not from a guess — and not from 16.** An
+    /// earlier n=24 sample showed `HotPacking` 13 of 13 under 16 bins and made
+    /// 16 look like a clean separator; at n=297 it is 62.7 %, so 16 would reject
+    /// 37 % of hot packing too. **~20-24 spares hot packing (max observed 20)
+    /// while still rejecting the bulk of sealed consolidation.**
+    ///
+    /// **Off by default because the trade is real and unpriced.** Any bound that
+    /// bites rejects most sealed consolidation, which cannot pick narrower
+    /// inputs — so it effectively disables that lane. Whether that is right depends on the file-count win
     /// it gives up against the read amplification it stops, and that comparison
     /// needs the per-unit cost decomposition (`prep/unit-phase-timers`).
     ///
