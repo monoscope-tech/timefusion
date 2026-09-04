@@ -3470,10 +3470,7 @@ impl OptimizerRule for RangeParallelDedup {
         let Some(narrowed) = narrowed else {
             return Ok(Transformed::no(plan));
         };
-        let union = narrowed[1..]
-            .iter()
-            .try_fold(LogicalPlanBuilder::new(narrowed[0].clone()), |builder, branch| builder.union(branch.clone()))?
-            .build()?;
+        let union = narrowed[1..].iter().try_fold(LogicalPlanBuilder::new(narrowed[0].clone()), |builder, branch| builder.union(branch.clone()))?.build()?;
         // A UNION's output fields are UNQUALIFIED, so a parent expression like
         // `t.id` stops resolving and the whole rule fails the query. Re-attach
         // the scan's qualifier, and if that still does not reproduce the input's
@@ -3591,15 +3588,15 @@ fn narrow_scan_window(plan: &LogicalPlan, lo: i64, hi: i64) -> Option<LogicalPla
             let window = timestamp.clone().gt_eq(literal(lo)).and(timestamp.lt(literal(hi)));
             Filter::try_new(window, Arc::new(plan.clone())).ok().map(LogicalPlan::Filter)
         }
-        LogicalPlan::Filter(filter) => Filter::try_new(filter.predicate.clone(), Arc::new(narrow_scan_window(&filter.input, lo, hi)?))
-            .ok()
-            .map(LogicalPlan::Filter),
-        LogicalPlan::Projection(projection) => Projection::try_new(projection.expr.clone(), Arc::new(narrow_scan_window(&projection.input, lo, hi)?))
-            .ok()
-            .map(LogicalPlan::Projection),
-        LogicalPlan::SubqueryAlias(alias) => SubqueryAlias::try_new(Arc::new(narrow_scan_window(&alias.input, lo, hi)?), alias.alias.clone())
-            .ok()
-            .map(LogicalPlan::SubqueryAlias),
+        LogicalPlan::Filter(filter) => {
+            Filter::try_new(filter.predicate.clone(), Arc::new(narrow_scan_window(&filter.input, lo, hi)?)).ok().map(LogicalPlan::Filter)
+        }
+        LogicalPlan::Projection(projection) => {
+            Projection::try_new(projection.expr.clone(), Arc::new(narrow_scan_window(&projection.input, lo, hi)?)).ok().map(LogicalPlan::Projection)
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            SubqueryAlias::try_new(Arc::new(narrow_scan_window(&alias.input, lo, hi)?), alias.alias.clone()).ok().map(LogicalPlan::SubqueryAlias)
+        }
         _ => None,
     }
 }
@@ -3657,7 +3654,10 @@ mod range_parallel_dedup_tests {
             // No aggregate: splitting costs the streaming TopK its ordering.
             ("order by with limit", format!("SELECT id FROM t WHERE {WIDE} ORDER BY timestamp DESC LIMIT 5")),
             // Narrow enough that one thread is comfortably inside the timeout.
-            ("span below the threshold", "SELECT count(*) FROM t WHERE timestamp >= '2026-09-01T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp".into()),
+            (
+                "span below the threshold",
+                "SELECT count(*) FROM t WHERE timestamp >= '2026-09-01T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp".into(),
+            ),
             // An open upper bound has no finite span to divide.
             ("half-open window", "SELECT count(*) FROM t WHERE timestamp >= '2026-08-05T00:00:00Z'::timestamp".into()),
         ] {
