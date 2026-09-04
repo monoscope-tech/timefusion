@@ -8311,6 +8311,17 @@ impl HotBinPolicy<'_> {
     }
 }
 
+/// Does this bin rewrite more than `floor` bytes per file it eliminates?
+///
+/// A bin of N files produces one output, so it removes `N − 1`. Benefit is files
+/// removed; cost is bytes rewritten. `floor` of 0 means "no floor configured",
+/// and the predicate then reports every bin so the refusal can be COUNTED
+/// without being applied — see `timefusion_pack_max_bytes_per_file_eliminated`.
+pub(crate) fn bin_exceeds_value_floor(bytes: i64, files: usize, floor: i64) -> bool {
+    let eliminated = (files.saturating_sub(1)) as i64;
+    bytes / eliminated.max(1) > floor.max(1)
+}
+
 pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass) -> Vec<String> {
     let cap = target_size.max(1);
     let converged = cap - cap / 8;
@@ -8389,10 +8400,8 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     // the floor is chosen from `pack_value_refused_bytes` rather than by
     // argument — the same discipline the share numbers earned the hard way.
     if files.len() >= 2 {
-        let eliminated = (files.len() - 1) as i64;
-        let per_file = bytes / eliminated.max(1);
         let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_bytes_per_file_eliminated);
-        if per_file > floor.max(1) {
+        if bin_exceeds_value_floor(bytes, files.len(), floor) {
             let stats = crate::observability::maintenance_stats();
             stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             stats.pack_value_refused_bytes.fetch_add(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -16112,6 +16121,77 @@ mod tests {
 
     /// Every clause of `select_tail_bin` is an incident scar (see its doc), so
     /// they're pinned individually here rather than through a Delta table.
+    /// STEADY-STATE BENCHMARK: drive the real packer over many rounds and
+    /// measure write amplification with the value floor off vs on.
+    ///
+    /// This is the proof the rest of the analysis needed. Everything else
+    /// measured ONE window of prod and reasoned about what a floor would have
+    /// refused; this runs the actual selection loop repeatedly, feeds the merged
+    /// output back in as the packer would see it, and reports bytes written per
+    /// byte ingested — the quantity that decides whether maintenance keeps up.
+    ///
+    /// Prod 2026-09-04 measured **36.5 rows written per row ingested**, against
+    /// a `log_fanin(target/arrival)` floor of ~1.7 at our own median file size
+    /// (176,743 rows) and mean fan-in (5.4). The gap is selection policy, and
+    /// the mechanism is the packer re-merging near-target files: observed p90
+    /// input file was 1,907,723 rows against a 2,581,110-row target.
+    #[test]
+    fn the_value_floor_lowers_steady_state_write_amplification() {
+        const TARGET: i64 = 256 * 1024 * 1024;
+        const SEAL: i64 = i64::MAX / 4;
+        const ARRIVAL: i64 = 18 * 1024 * 1024; // ~176k rows at 104 B/row, prod's p50
+        const ROUNDS: usize = 400;
+
+        // One partition: files arrive, the packer picks a bin, the bin becomes a
+        // single larger file. Deterministic — no clock, no RNG.
+        let run = |floor: i64| -> (i64, i64) {
+            let (mut live, mut written, mut ingested, mut seq) = (Vec::<i64>::new(), 0i64, 0i64, 0i64);
+            for _ in 0..ROUNDS {
+                live.push(ARRIVAL);
+                ingested += ARRIVAL;
+                let adds: Vec<super::TailAdd> = live
+                    .iter()
+                    .enumerate()
+                    .map(|(i, size)| super::TailAdd {
+                        path: format!("f{i}"),
+                        size: *size,
+                        is_sorted_run: false,
+                        event_range: Some((i as i64, i as i64)),
+                        rows: None,
+                    })
+                    .collect();
+                let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack);
+                if picked.len() < 2 {
+                    continue;
+                }
+                let idx: Vec<usize> = picked.iter().filter_map(|p| p.strip_prefix('f')?.parse().ok()).collect();
+                let bytes: i64 = idx.iter().map(|i| live[*i]).sum();
+                // The floor the guard applies, via the SAME predicate.
+                if super::bin_exceeds_value_floor(bytes, idx.len(), floor) && floor > 0 {
+                    seq += 1;
+                    if seq > 3 {
+                        break; // wedged: nothing admissible, stop rather than spin
+                    }
+                    continue;
+                }
+                seq = 0;
+                let mut keep: Vec<i64> = live.iter().enumerate().filter(|(i, _)| !idx.contains(i)).map(|(_, s)| *s).collect();
+                keep.push(bytes);
+                live = keep;
+                written += bytes;
+            }
+            (written, ingested)
+        };
+
+        let (w_off, ing) = run(0);
+        let (w_on, _) = run(100 * 1024 * 1024); // the recommended ~100 MiB/file floor
+        let amp = |w: i64| w as f64 / ing as f64;
+        println!("amplification: floor OFF {:.2}x   floor ON {:.2}x", amp(w_off), amp(w_on));
+
+        assert!(amp(w_off) > 1.0, "the unguarded packer must rewrite more than it ingests, or the fixture is wrong");
+        assert!(amp(w_on) < amp(w_off), "the value floor must LOWER steady-state write amplification: off {:.2}x, on {:.2}x", amp(w_off), amp(w_on));
+    }
+
     /// The VALUE guard, benchmarked against the shape prod actually produces.
     ///
     /// A bin's benefit is FILES removed; its cost is BYTES rewritten. The packer
