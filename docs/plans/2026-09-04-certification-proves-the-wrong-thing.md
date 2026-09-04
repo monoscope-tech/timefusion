@@ -735,3 +735,40 @@ It also reframes everything shipped tonight. The four fixes were real and each
 removed a genuine defect — but they were tuning the allocation of a pool that is
 98 % consumed by an operation doing 182,000x more reading than removing. **The
 layout is the cost. Nothing scheduled on top of it can be cheap.**
+
+## The pruning lead, closed: there is no timestamp predicate, and there cannot be
+
+The dedup rewrite's row filter is built at `compact.rs:1569`:
+
+```rust
+let rows_filter = format!("{partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
+```
+
+Partition, a **file-ID list**, and a shard predicate. **No timestamp range.** So
+the scan is never given a reason to prune row groups, and the 20-row-group
+statistics measured above go unused.
+
+**But that is not a bug, and adding a predicate would be wrong.** The rewrite
+REPLACES the files it selects. To retire a file you must rewrite **every row in
+it**, not just the rows of the bin that made it dirty — otherwise the rest of the
+file is lost. File-granular replacement therefore *requires* reading selected
+files in full, and a timestamp predicate would silently drop rows.
+
+**So the amplification is structural, and it is the same fact from a third
+angle:** a bin becomes dirty, the bin maps to the ~9 files straddling it, and
+those files must be rewritten whole — dragging their other eight bins along. The
+read amplification is not a missing optimisation; it is the cost of using **whole
+files as the unit of replacement** when files span many bins.
+
+That closes the last cheap lead I had. **Ways out are all structural**, and each
+one is a real project: narrower files at write time so a file spans one bin;
+partial-file replacement (deletion vectors, so a rewrite can supersede part of a
+file); or a compaction that re-cuts files onto bin boundaries once so later
+dedups are bin-local.
+
+**I am stopping the analysis here.** Tonight has produced eight corrections, and
+the last three were each triggered by reading a definition I had assumed. The
+established facts are recorded above; the next person should start from
+`prep/unit-phase-timers` and a decomposition of that ~58 worker-minutes, because
+every option in the paragraph above trades differently against read, sort and
+commit, and nobody currently knows which one dominates.
