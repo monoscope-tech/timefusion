@@ -193,9 +193,36 @@ complete clean pass that the dedup lane cannot deliver.
 blanket coverage takes ~32 hours of uptime. It is that **coverage saturates well
 below what a query needs, and waiting does not fix it** — the remaining dates
 cannot be certified until they are cleaned, and cleaning is the backlog that is
-still growing. One interval is one interval, so treat the plateau as provisional
-until it is re-read; but it is the second reading in a row that contradicts a
-claim I made from a single sample, and the direction is unambiguous.
+still growing. **Confirmed on a third reading** (5,611 s: grants still 52, files proved 130),
+so the plateau is not a sampling artefact.
+
+**And one counter explains it completely:**
+
+```
+cert_declined_dirty_bins  11,329
+cert_granted_total             52      -> 218 declines per grant
+cert_refused_dropped            1
+```
+
+Certification is **running constantly and being refused almost every time,
+because the bins are dirty.** Not starved any more — tonight's `c627b356` gave
+the probes position and they are clearly executing — just unable to grant,
+because a grant needs a clean partition and the partitions are not clean.
+
+That is the diagnosis closed end to end:
+
+```
+merge-but-never-split  ->  oversized components permanently overlapping
+  ->  those partitions cannot be deduped within any unit budget
+  ->  bins stay dirty  ->  certification declines 218:1
+  ->  grants plateau at 52  ->  dedup_skipped stays at 1 of 7,266
+  ->  the `hashes` predicate stays above DedupExec  ->  the issues page times out
+```
+
+**Certification cannot lead here, and no amount of probe scheduling changes
+that** — which is the same conclusion the 2026-09-01 session reached ("duplicates
+sparse but spread, so certification CANNOT lead"), now with the mechanism traced
+to its architectural cause rather than inferred.
 
 **But the queue is not converging.** Over the same window
 `pending_dedup` went 2,169 → **2,223**, `pending_base_rollup` 257 → **337**,
