@@ -2029,3 +2029,53 @@ before that branch is read as authoritative.
 sample size as the weakness, said it was too small to set a constant, and the
 larger sample moved exactly the number I had been careful about. The discipline
 worked; the temptation to quote "100 %" was the part that nearly did not.
+
+## The span budget's trade, priced on both sides
+
+I said enabling a span bound gives up file-count work and that pricing it needed
+the phase timers. The timers price the *cost* side (worker seconds); the *benefit*
+side — how many file retirements are forgone — is measurable from the same 297
+units. A unit retires `files - 1` (N inputs become one output):
+
+```
+300 units in 90 min, 2,026 input files, 1,726 net file retirements
+
+ bound   units kept   retirements kept   % of retirement lost
+   12b           65                250                    86 %
+   16b           82                325                    81 %
+   20b          128                534                    69 %
+   22b            —                  —                    66 %
+   24b          133                579                    66 %
+   32b          145                631                    63 %
+```
+
+**And the per-lane split at 22 bins is the whole argument:**
+
+```
+HotPacking            retirements   495   kept at 22 bins   495  (100 %)
+SealedConsolidation   retirements 1,231   kept at 22 bins    51  (  4 %)
+```
+
+**A 22-bin bound costs `HotPacking` nothing at all — 100 % of its 495
+retirements survive — and removes 96 % of `SealedConsolidation`'s.** The
+targeting is exact, which is what the earlier 16-bin figure got wrong.
+
+**So the trade, stated in full:**
+
+- **Give up:** ~1,180 file retirements per 90 minutes, essentially all of
+  `SealedConsolidation`'s output.
+- **Gain:** stop creating the outputs that span 84–144 dedup bins.
+
+**And the three-hour measurement already tells us what those retirements are
+worth: nothing measurable.** File count fell 7.8 % over three hours while sweep
+read fell 0.007 %. **The retirements being given up are demonstrably not reducing
+maintenance cost** — they are the activity whose complete absence would have
+looked identical.
+
+**That is as close to a decision as this can get without the phase timers.** The
+remaining unknown is worker seconds: if `SealedConsolidation`'s 1,231 retirements
+consume a large share of the pool, disabling it also *frees* capacity, and the
+trade becomes strictly positive rather than a trade at all. Given it emitted 179
+of 300 units in that window, that is the likely outcome — but it is exactly the
+kind of "likely" this document has been wrong about eleven times, so it stays a
+prediction until `prep/unit-phase-timers` measures it.
