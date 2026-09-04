@@ -2079,3 +2079,44 @@ trade becomes strictly positive rather than a trade at all. Given it emitted 179
 of 300 units in that window, that is the likely outcome — but it is exactly the
 kind of "likely" this document has been wrong about eleven times, so it stays a
 prediction until `prep/unit-phase-timers` measures it.
+
+## Prediction wrong: `SealedConsolidation` is only 4.2 % of maintenance time
+
+I predicted that since `SealedConsolidation` emitted 179 of 300 units, disabling
+it would free meaningful capacity and make the span bound "strictly positive".
+**Measured, that is wrong:**
+
+```
+uptime 3,325 s, total maintenance 38,559 worker-secs = 11.6 workers continuously
+
+Dedup                  29,281   75.9 %
+BaseRollup              6,088   15.8 %
+SealedConsolidation     1,611    4.2 %
+Repair                  1,271    3.3 %
+DerivedRollup             167    0.4 %
+HotPacking                141    0.4 %
+```
+
+**`SealedConsolidation` is 4.2 % of maintenance worker time** — disabling it
+would free about **0.48 of 11.6 workers**. It emits many units because its units
+are *cheap*, not because it is expensive. **Dedup is 75.9 %**, consistent with the
+~98 % measured on an earlier process.
+
+**But this makes the case for the span bound simpler, not weaker.** The full trade
+is now:
+
+- **Cost:** 4.2 % of maintenance worker time, and ~1,180 file retirements per
+  90 minutes — retirements the three-hour measurement showed buy **0.007 %** of
+  cost reduction.
+- **Benefit:** stop creating outputs that span 84–144 dedup bins, which are what
+  make `Dedup`'s 75.9 % as large as it is.
+
+**A lane consuming 4 % of capacity is manufacturing the cost driver for the lane
+consuming 76 %.** That is a far better argument than the one I predicted — it
+does not need the capacity freed to be significant, because the capacity was
+never the point.
+
+**Twelfth correction, and the pattern is identical to the others:** I inferred
+cost from *unit count* without measuring worker time, exactly as I earlier
+inferred read volume from a counter without reading its definition. Unit count
+and unit cost are different quantities, and the codebase emits both.
