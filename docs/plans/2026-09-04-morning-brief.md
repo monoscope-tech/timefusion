@@ -1171,3 +1171,48 @@ Two guards added so this cannot silently return: the fixture now asserts its own
 shape (`n == 2`) *before* the plan assertions — "3 files where 2 were intended"
 is a different bug from "the claim was lost", and reading that off a physical
 plan cost hours — and the failure message carries the live-file inventory.
+
+## The 10x measurement: what I tried, what was wrong, and what it needs
+
+The goal asks for evidence that maintenance keeps up at 10x. `timefusion sim`
+carries `--streams`, documented for exactly this ("10x experiments: 260 streams
+at 130 projects"), so I swept it on `synth:whale` over 168 virtual hours:
+
+| streams | pending_end | max lag | executions |
+|---:|---:|---:|---:|
+| 26 | 3 | 44,022 | 4,398 |
+| 52 | 3 | 44,021 | 2,143 |
+| 130 | 2 | 44,022 | 4,207 |
+| 260 | 3 | 44,021 | 3,615 |
+
+**That table is worthless, twice over, and I nearly published it as headroom.**
+
+1. **The noise swamps it.** Varying only `--seed` on the SAME configuration:
+   executions **826 → 5,432** (6.6x), max frontier lag **5,327 → 44,017 s**
+   (8.3x), pending_end 1 → 8. Every difference in the sweep sits inside that
+   band. **Any sim comparison needs several seeds per point.**
+2. **`--streams` does nothing here.** At a fixed seed, `--streams 26` and
+   `--streams 260` produce **byte-identical** reports — every field. It scales
+   the *ingesting streams discovered in a real journal*; a synthetic queue has
+   none and sets `mint_frontier = false`. The summary line still printed
+   "260 streams", so the run *reported* 10x while modelling 1x.
+
+Fixed in `c48fe299`: the flag is now refused on a synthetic queue rather than
+ignored. A capacity question must not be answered with the baseline.
+
+**What a real 10x run needs, and why it is blocked.** `--streams` works against
+a real prod journal. Extracting one is currently impossible read-only: the
+container is distroless (no shell, so no `docker exec`), and the bind mount
+`/home/ubuntu/timefusion-wal` is `drwxr-x---` owned by uid 65532, unreadable as
+`ubuntu`. Options, in order of preference: (a) have the running process dump its
+own journal over pgwire/an endpoint, (b) copy it out with a one-off privileged
+command **on the user's say-so**, (c) build a synthetic multi-stream fixture so
+`--streams` applies. (c) is the only one needing no prod access and is the right
+next task.
+
+**What IS measured, and it is not nothing:** the read-amplification arithmetic
+(5.1x fleet-wide, 5.5x on `otel_metrics`) is a computation over a real Delta
+checkpoint, re-runnable in seconds, and does not depend on the simulator at all.
+That is the strongest 10x-relevant number available today, and
+`timefusion_dedup_bin_minutes` (`ab97d81a`) is now the knob that lets a staging
+soak test it without a code change.
