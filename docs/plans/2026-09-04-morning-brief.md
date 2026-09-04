@@ -3568,3 +3568,53 @@ bins, accepting 1.99x dedup read but keeping the 5-minute cadence. Dedup is
 7.5-13% of worker time, so 2x on that lane is 8-13% overall — possibly cheaper
 than a 7x cadence loss. **That variant needs no schedule change at all**, and the
 data to price it is already in this document.
+
+## The pack-target change would hit INTERACTIVE queries — so raise the SEALED target instead
+
+Before recommending Option A, I measured what doubling file width does to query
+pruning, from the same checkpoint (5,701 files, Delta min/max per file):
+
+| window | selected now | if files 2x wider | ratio |
+|---|---:|---:|---:|
+| **1 hour** | 0.2 GB | 0.6 GB | **2.59x** |
+| 24 hours | 4.2 GB | 4.5 GB | 1.05x |
+| 7 days | 25.2 GB | 26.0 GB | 1.03x |
+
+**Doubling file width costs 2.6x on one-hour queries and is free on wide ones.**
+Coarser min/max granularity only matters when the window is comparable to a
+file's span.
+
+**And `COORDINATOR_HOT_TARGET_BYTES` governs the HOT TAIL — recent data, which is
+exactly what short interactive queries read.** So Option A as written would put
+its entire cost on the most latency-sensitive path, in a product whose reported
+problem was slow queries. That is the wrong trade.
+
+**But the two targets are separate constants:**
+
+```rust
+pub(crate) const COORDINATOR_HOT_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+const COORDINATOR_SEALED_TARGET_BYTES:        i64 = 256 * 1024 * 1024;
+```
+
+**So raise the SEALED target and leave the hot tail alone.** Sealed partitions
+are read by wide-window queries, where the pruning cost is **1.03-1.05x** —
+negligible — and they hold the bulk of the data, so that is where the fan-in
+benefit mostly lives anyway.
+
+### The revised proposal
+
+```
+COORDINATOR_SEALED_TARGET_BYTES   256 MiB -> 512 MiB    (fan-in on the bulk)
+COORDINATOR_HOT_TARGET_BYTES      unchanged             (protects 1h queries)
+timefusion_dedup_bin_minutes      unchanged             (no schedule conflict)
+```
+
+**One constant, no deadline conflict, no dedup cadence loss, and the pruning cost
+lands on wide queries at 1.03x rather than on interactive ones at 2.6x.**
+
+**What is still unmeasured:** how much of the fan-in benefit is actually in the
+sealed lane rather than hot packing. `SealedConsolidation` and `HotPacking` are
+separate operations with separate pending counts (94 and 16 tonight), which
+suggests sealed carries the larger share — but the 5.3x unit-count reduction was
+measured across Pack as a whole, not split by lane. **That split is the next
+measurement, and it decides how much of the 10x path this variant delivers.**
