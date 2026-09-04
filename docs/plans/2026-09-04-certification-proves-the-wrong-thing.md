@@ -1073,3 +1073,70 @@ reversible in effect, and carries none of the claim/lease/deadline risk.
 carry the total, or checked why these files are wide in the first place (a
 compaction that merged across a wide range, most likely, since the writer cuts at
 512 MiB and these are ~1 GiB). Both are cheap and both are the obvious next step.
+
+## Ranked: 6.5 % of files cause 60 % of all maintenance read
+
+Every live file scored by the sweep read it causes — `bins_spanned x size`, since
+a file overlapping N bins is read N times per sweep. All 7,632 live files of
+`otel_logs_and_spans` (note: a wider denominator than the 5,966 used earlier,
+which counted only cells with 17+ files — hence the larger total):
+
+```
+total sweep read at 10-min bins: 44,130 GiB
+
+ top N files   % of files   GiB of sweep read   % of total
+           1        0.01%                213G         0.5%
+          10        0.13%              1,555G         3.5%
+          50        0.66%              5,574G        12.6%
+         100        1.31%              8,922G        20.2%
+         250        3.28%             17,018G        38.6%
+         500        6.55%             26,603G        60.3%
+```
+
+**500 files — 6.5 % of the table — cause 60 % of all maintenance read.**
+
+The worst offenders individually:
+
+```
+  bins      MiB  % of day   GiB of sweep read
+   119     1830     82.6%               213G
+   141     1237     97.7%               170G
+   144     1008    100.0%               142G   <- spans the ENTIRE day
+   144     1004    100.0%               141G
+   144      936    100.0%               132G
+```
+
+**Several files span 100 % of their day.** A 1 GiB file covering all 144 bins is
+read 144 times per sweep: **142 GiB of reading for 1 GiB of data.**
+
+### This is the fix, and it is small
+
+Splitting the top 500 files into time-contiguous pieces — which is what the
+writer already does at `max_file_bytes`, on an already-sorted stream — would cut
+maintenance read volume by ~60 %. The work is **rewriting ~500 files once**,
+against a saving of **~26,600 GiB per sweep**. The return is roughly two orders
+of magnitude on the first sweep alone.
+
+And unlike every other option in this document it needs **no new mechanism, no
+constant change, no protocol feature and no soak**:
+
+- the writer already emits time-contiguous, event-time-disjoint pieces;
+- the candidates are rankable exactly, from `Add.stats`, with no IO;
+- it is per-file and incremental — do ten, measure, do ninety more;
+- and it strictly *reduces* the quantity every other lever is fighting.
+
+**Ranked list of what to do, revised one final time:**
+
+1. **Split the widest files, worst-first.** ~500 files, ~60 % of maintenance read,
+   no new machinery. `scratchpad/wide_rank.py` produces the list.
+2. **`prep/unit-phase-timers`** — still worth it, now to measure the improvement
+   rather than to decide anything.
+3. **Bin widening** — the global version of the same fix; keep it in reserve, and
+   re-measure after (1), because (1) removes most of what it was going to buy.
+
+**Why this was not obvious earlier, and the lesson:** I measured file spans on
+the median (p50 = 1 % of a day) and concluded files were narrow. They are. But
+this cost function is `span x size`, and **a median tells you nothing about a
+tail-dominated total.** The right question was never "how wide is a typical
+file" but "which files cause the most reading" — and that one is answerable
+directly, in seconds, from statistics that were there all along.
