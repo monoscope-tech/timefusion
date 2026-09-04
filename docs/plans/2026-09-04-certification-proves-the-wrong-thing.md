@@ -633,3 +633,20 @@ at 04:00 is to record what is established and stop.
 ever enqueues those bins?* Facts 1–4 make both plausible, they imply completely
 different fixes, and the funnel to tell them apart does not exist — which is the
 same instrumentation gap that `prep/unit-phase-timers` opens.
+
+**Bin figure verified** (I checked because `mem_buffer.rs` uses 5 minutes and I
+did not want to quote the wrong constant). There are two distinct "bucket"
+concepts and they differ:
+
+- **MemBuffer flush bucket** — `DEFAULT_BUCKET_DURATION_MICROS = 5 * 60 * 1e6`
+  (`write/mem_buffer.rs:37`), i.e. **5 minutes**.
+- **Dedup bin** — `BIN_MICROS = 10 * 60 * 1e6`, defined identically in three
+  places (`database/compact.rs:1150`, `database/write.rs:502`,
+  `database/maintain.rs:5726`), i.e. **10 minutes**.
+
+The dedup bin is the 10-minute one, so "the whale's files straddle ~9 bins"
+stands. **Note for `CLAUDE.md`: it documents the MemBuffer as using "10-minute
+time buckets", which the code contradicts — that constant is 5 minutes.** A small
+thing, but it is exactly the sort of stale figure that produces a confidently
+wrong calculation, and `BIN_MICROS` being copy-pasted in three files is a second
+one waiting to happen.
