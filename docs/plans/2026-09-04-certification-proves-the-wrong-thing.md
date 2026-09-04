@@ -1574,23 +1574,29 @@ addresses the accumulated damage; only a span bound stops it accumulating.
 
 ## The span histogram, from live prod — and a candidate policy
 
-14 `compaction_unit_span` samples (small n, one process, ~10 minutes — treat as
-indicative, not settled):
+**24 samples over 60 minutes** (updated from an earlier n=14, which said the same
+thing less sharply):
 
 ```
-bins spanned: p10 3   p50 16   p90 105   max 119   mean 39
+bins spanned: p10 3   p50 16   p90 105   max 144   mean 37
 
-span bound -> units it would REJECT
-    1 bins:  93%        16 bins:  43%
-    4 bins:  86%        32 bins:  29%
-    8 bins:  79%       128 bins:   0%
+                     n     p50   p90   max    <= 16 bins
+HotPacking          13      16    16    16       100 %
+SealedConsolidation 11      74   119   144         9 %
 
-HotPacking           n=8   p50  16   p90  16   max  16
-SealedConsolidation  n=6   p50  92   p90 119   max 119
+otel_logs_and_spans 20      16     -   144
+otel_metrics         4      92     -   105
+
+a 16-bin bound would reject 10 of 24 units — essentially exactly the
+SealedConsolidation ones.
 ```
 
-**The two lanes separate almost perfectly at 16 bins.** Every `HotPacking` sample
-is exactly 16 bins or less; every `SealedConsolidation` sample is far above it.
+**`max = 144` is a full day** (144 ten-minute bins): one sealed unit produced an
+output spanning its entire partition.
+
+**The two lanes separate almost perfectly at 16 bins, and more data sharpened it
+rather than blurring it.** **100 % of `HotPacking` units are ≤16 bins (13 of 13);
+91 % of `SealedConsolidation` units are above it (10 of 11).**
 So a **16-bin span bound would leave hot packing entirely untouched and reject
 essentially all sealed consolidation.**
 
@@ -1607,7 +1613,8 @@ small file-count win for a very large read-amplification loss**, and nothing in
 the system was accounting for the second half of that trade.
 
 **What would settle it** — and what I am explicitly not concluding from n=6:
-1. more samples, over a longer window and several processes;
+1. more samples still, over several processes — n=24 in one hour on one process
+   is enough to see the separation but not to set a production constant;
 2. the per-unit cost decomposition from `prep/unit-phase-timers`, to price the
    file-count win against the read-amplification loss in the same units;
 3. whether sealed dates still *need* consolidation once `--recompress` has
