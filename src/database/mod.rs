@@ -18685,10 +18685,32 @@ mod tests {
     /// The logical-count fast path must cover the full merge-on-read lifecycle:
     /// build an exact snapshot base, resolve a newly appended tombstone as a
     /// narrow overlay, and replace DedupExec in the physical COUNT plan.
+    ///
+    /// `timefusion_count_pushdown` is turned ON here explicitly, because its
+    /// DEFAULT is now false — 2026-09-04 measured a 27% undercount on prod and
+    /// disabled it. The machinery still has to be exercised, and the condition
+    /// for re-enabling it is stated in that commit: "a test pinning it against a
+    /// scan of the same window". That is the `sum(1)` leg below. `sum(1)` is the
+    /// exact discriminator that found the prod bug — the pushdown gate declines
+    /// it, so it forces the scan over the identical window, and the two answers
+    /// disagreeing IS the defect.
+    ///
+    /// HONEST LIMIT: this fixture does NOT reproduce the prod undercount — both
+    /// legs agree here. It is a guard, not a reproducer, and re-enabling the
+    /// flag on the strength of it alone would be wrong. What the prod partition
+    /// has that this does not is fragmentation: 5.4M physical rows over many
+    /// files, where a partial or stale index still satisfies the gate. A
+    /// reproducer needs that shape.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn logical_count_build_and_append_overlay_are_exact_end_to_end() -> Result<()> {
-        let (db, ctx, prefix) = setup_test_database().await?;
+        let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let mut cfg = (*create_test_config(&prefix)).clone();
+        cfg.maintenance.timefusion_count_pushdown = true;
+        let db = Database::with_config(Arc::new(cfg)).await?;
+        let mut ctx = Arc::new(db.clone()).create_session_context();
+        datafusion_functions_json::register_all(&mut ctx)?;
+        db.setup_session_context(&mut ctx)?;
         let project_id = format!("logical_count_{prefix}");
         let timestamp = chrono::Utc::now().timestamp_micros() - 60_000_000;
         let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(timestamp).unwrap().date_naive();
@@ -18721,17 +18743,30 @@ mod tests {
         let tombstone = json_to_batch_for("mor_versioned", vec![row("gone", Some(true))])?;
         db.insert_records_batch(&project_id, "mor_versioned", vec![tombstone], true, None).await?;
 
-        let sql = format!(
-            "SELECT COUNT(*) FROM mor_versioned WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({timestamp}) AND timestamp < to_timestamp_micros({})",
+        let window = format!(
+            "FROM mor_versioned WHERE project_id = '{project_id}' AND timestamp >= to_timestamp_micros({timestamp}) AND timestamp < to_timestamp_micros({})",
             timestamp + 1
         );
-        let frame = ctx.sql(&sql).await?;
-        let plan = frame.create_physical_plan().await?;
-        let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+        let answer = |sql: String| {
+            let ctx = &ctx;
+            async move {
+                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                let rendered = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+                let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+                let value = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("an aggregate over Int64").value(0);
+                Ok::<_, anyhow::Error>((value, rendered))
+            }
+        };
+
+        let (count, rendered) = answer(format!("SELECT COUNT(*) {window}")).await?;
         assert!(!rendered.contains("DedupExec"), "logical-count pushdown did not fire:\n{rendered}");
-        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
-        let count = batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("COUNT returns Int64").value(0);
         assert_eq!(count, 1, "the appended tombstone must retire its base winner");
+
+        // The scan of the SAME window, over the same data, in the same process.
+        // Prod read 2,604,236 from the pushdown and 3,551,640 from this leg.
+        let (scanned, rendered) = answer(format!("SELECT SUM(1) {window}")).await?;
+        assert!(rendered.contains("DedupExec"), "`sum(1)` must decline the pushdown, or it is not a control:\n{rendered}");
+        assert_eq!(count, scanned, "the pushdown and a scan of the same window must agree");
         Ok(())
     }
 
