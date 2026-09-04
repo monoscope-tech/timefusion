@@ -391,6 +391,12 @@ pub mod scan_metric_names {
         MEM_ORDERING_DECLARED = "timefusion.scan.mem_ordering_declared" as scan.mem_ordering_declared;
         MEM_ORDERING_UNSORTED = "timefusion.scan.mem_ordering_unsorted" as scan.mem_ordering_unsorted;
         MEM_ORDERING_REJECTED = "timefusion.scan.mem_ordering_rejected" as scan.mem_ordering_rejected;
+        // WHY the leg was unsorted, emitted from `query_partitioned_with_text_match`.
+        // `schema_diverse` is the expected and most alarming reason: `insert_batch`
+        // accepts nullable field additions, so ONE new optional field in the ingest
+        // stream makes a bucket diverse and retracts the ordering for the whole query.
+        MEM_SORT_RETRACTED = "timefusion.scan.mem_sort_retracted" as scan.mem_sort_retracted;
+        MEM_SORT_RETRACTED_SCHEMA_DIVERSE = "timefusion.scan.mem_sort_retracted_schema_diverse" as scan.mem_sort_retracted_schema_diverse;
         // Why a CERTIFIED file still could not skip. Two very different
         // refusals: one uncertified file with no statistics blocks the entire
         // scan, whereas overlap blocks only the files it touches. Prod

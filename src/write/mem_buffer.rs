@@ -1620,7 +1620,35 @@ impl MemBuffer {
         let (partitions, sorted) = match schema {
             Some(s) => match partitions.iter().map(|p| sort_partition(s, p.clone())).collect::<Option<Vec<_>>>() {
                 Some(sorted) => (sorted, true),
-                None => (partitions, false),
+                None => {
+                    // WHY the whole leg lost its claim, because the consequence is
+                    // out of all proportion to the cause: ONE unsortable partition
+                    // retracts the ordering for every partition, the union then
+                    // advertises none, `DedupExec` falls to unbounded `full-set`,
+                    // and `ORDER BY ts DESC LIMIT n` materialises the window.
+                    //
+                    // Schema diversity is the expected reason and the alarming one:
+                    // `insert_batch` deliberately ACCEPTS nullable field additions,
+                    // so a single new optional field appearing in the ingest stream
+                    // is enough to make one bucket diverse and degrade every listing
+                    // query on that project. Counted apart from the other refusals
+                    // (sorting column absent, concat/lexsort failure) because it is
+                    // a different fix.
+                    let diverse = partitions.iter().filter(|p| p.first().is_some_and(|f| p.iter().any(|b| b.schema() != f.schema()))).count();
+                    metrics::counter!(crate::database::scan_metric_names::MEM_SORT_RETRACTED).increment(1);
+                    if diverse > 0 {
+                        metrics::counter!(crate::database::scan_metric_names::MEM_SORT_RETRACTED_SCHEMA_DIVERSE).increment(1);
+                    }
+                    warn!(
+                        table_name,
+                        project_id,
+                        partitions = partitions.len(),
+                        schema_diverse_partitions = diverse,
+                        event = "mem_sort_retracted",
+                        "the in-memory leg could not sort every partition, so the whole union loses its ordering claim"
+                    );
+                    (partitions, false)
+                }
             },
             None => (partitions, false),
         };
