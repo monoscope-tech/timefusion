@@ -2993,3 +2993,45 @@ constraint is the fixed 6-slot rewrite envelope, not the size of what goes in it
 get there by tuning. The measurements now say exactly which of the three
 structural options to price, and the counters to prove any of them exist and are
 deployed.
+
+## CORRECTION: the 6-slot envelope is pool-derived, not a law — and the pool is job-capped below its memory cap
+
+I wrote that "a bigger box makes each slot larger, not create a seventh." **That
+is wrong.** The bench the 6 comes from (`benches/rewrite_throughput.rs`,
+`TF_BENCH_FLEET=1`, N concurrent rewrites of a real 204 MB prod file):
+
+```
+4 workers  29.16 MB/s  0 failed
+5 workers  29.31 MB/s  0 failed
+6 workers  33.32 MB/s  0 failed   <- best
+8 workers  15.07 MB/s  4 FAILED   <- cliff
+```
+
+**The 8-worker cliff is 8 x ~1.33 GiB against a shared 8 GiB pool — it is an OOM,
+not a scheduling property.** So the envelope is `pool / per-sort footprint`, and
+more pool really does buy more slots.
+
+**And the coordinator's pool is capped below its memory ceiling by a JOB COUNT:**
+
+```
+coordinator_share = min(coordinator_jobs x MAX_DECODED_BYTES, maintenance_pool x 3/5)
+                  = min(16 x 512 MiB,  16.6 GiB x 3/5)
+                  = min(8 GiB,         9.9 GiB)        -> 8 GiB, job-bound
+```
+
+**There is 1.9 GiB of maintenance pool the coordinator is not allowed to use**,
+because `coordinator_jobs` is clamped at 16. At the 1.25 GiB slice that is
+**one and a half extra slots** — a 17-25% increase in concurrent rewrites, which
+on the bench's own curve is the direction that was still improving at 6.
+
+**Why the clamp exists, and what it would need:** 16 jobs against
+`HEAVY_REWRITE_PERMITS = 10` was chosen because "at a 6:1 job:permit ratio,
+completions collapsed from ~0.6/s to 0.035/s". Raising jobs alone worsens that
+ratio. **Raising jobs AND permits together is the untested combination**, and the
+bench harness to test it already exists.
+
+**So option 3 ("more slots") is NOT blocked by a measured law, as I claimed.** It
+is blocked by an untested interaction between two clamps, with a bench available
+to test it. That is a materially more hopeful position than "tuning is
+exhausted", and it is the first thing I would run on a machine that is not also
+serving prod.
