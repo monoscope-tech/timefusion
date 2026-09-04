@@ -979,3 +979,43 @@ evidence available that it is structural rather than an artefact of one shape.
 its improvement is larger, and it is already the table with the worst dedup path
 (`2026-09-04-otel-metrics-never-got-the-collapse.md` — it takes the window form
 on every rewrite). A soak there risks less and would show more.
+
+## Per-cell: SIX cells are half the fleet's read cost, and they gain the most
+
+Fleet averages hide where the cost is. Total read to sweep one cell once, by bin
+width, for the six largest:
+
+| cell | size | files | 10m | 30m | 60m | 120m | 240m |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `87576849/2026-07-24` | 87.0 GiB | 121 | 1,342 G | 509 G | 297 G | 195 G | 141 G |
+| `87576849/2026-07-22` | 85.0 GiB | 116 | **3,867 G** | 1,343 G | 713 G | 397 G | 236 G |
+| `87576849/2026-07-28` | 80.7 GiB | 104 | 1,248 G | 466 G | 273 G | 172 G | 126 G |
+| `87576849/2026-07-23` | 80.0 GiB | 114 | 1,083 G | 411 G | 247 G | 167 G | 117 G |
+| `87576849/2026-07-26` | 53.4 GiB | 76 | 1,267 G | 455 G | 253 G | 152 G | 99 G |
+| `87576849/2026-07-21` | 51.8 GiB | 70 | 1,341 G | 482 G | 266 G | 163 G | 110 G |
+
+**Read the first two columns against the third.** An 85 GiB cell costs
+**3,867 GiB** to sweep once at today's bin width — a **45x read amplification**.
+The others run 15–25x. These are not averages; they are what the dedup lane
+actually pays on the cells that matter.
+
+**Two conclusions, both sharper than anything from the fleet aggregate.**
+
+**1. Six cells are ~52 % of the entire fleet's sweep cost.** Their 10-minute
+total is **10,148 GiB** against the fleet's 19,530 GiB. Six cells, one tenant,
+six consecutive days in July. Everything else in `otel_logs_and_spans` — 1,200+
+cells — is the other half.
+
+**2. They gain the most from widening.** The largest cell's own curve: **2.6x at
+30 min, 4.5x at 60 min, 6.9x at 120 min, 9.5x at 240 min.** Those six cells fall
+from 10,148 GiB to ~2,048 GiB at 60 minutes.
+
+**So the targeting is unusually favourable.** The change is one constant, its
+benefit is largest exactly where the cost is concentrated, and the cells that
+gain are a single tenant's contiguous date range — which is also the smallest
+possible blast radius for a soak. If the widening were applied to nothing else,
+these six cells alone would return ~8 TiB of read per sweep.
+
+**Caveat, and it is the same one as everywhere:** this is read *volume*, not wall
+clock. Whether 8 TiB of avoided reads is hours or days depends on the read/commit
+split that `prep/unit-phase-timers` measures and nothing currently emits.
