@@ -1171,3 +1171,56 @@ Two guards added so this cannot silently return: the fixture now asserts its own
 shape (`n == 2`) *before* the plan assertions — "3 files where 2 were intended"
 is a different bug from "the claim was lost", and reading that off a physical
 plan cost hours — and the failure message carries the live-file inventory.
+
+## INCIDENT 09:58 — customer queries failing, and the revert I should not have made
+
+**Symptom:** monoscope-dev raising `SqlError XX000` — "Not enough memory to
+continue external sort", `ExternalSorterMerge` consuming 5.5 GB — from 09:58.
+
+**My first action was wrong and the user stopped me.** I reverted the membuffer
+masking fix (`b9fd6f28`) on a correlation. Two things I had not checked:
+
+1. **Timing.** The customer-facing pgwire failures start at **09:58:49 — over two
+   hours after that build deployed (~07:50)**. A change that widened Delta scans
+   would have bitten immediately, not after two quiet hours.
+2. **Population.** My "20 errors in the 08:00 hour, 29 in 09:00" counts were
+   `maintenance-worker` lines ("Light optimize staging failed") — a long-standing
+   condition on a different code path. Of 57 "resources exhausted" lines in the
+   window, only **4** are the query-side `ExternalSorterMerge` errors, all in
+   09:58–10:01.
+
+Reapplied as `c5fe29e3`. **The lesson is the one this document keeps re-learning:
+a correlation across a deploy boundary is not a cause, and I did not even confirm
+I was counting the right errors.**
+
+**What it actually is.** The failures are ONE query, retried every ~15 s by
+monoscope-dev on project `6297304f` — the log-explorer listing:
+
+```sql
+select jsonb_build_array(id, to_char(timestamp ...), ..., to_jsonb(summary), ...)
+from otel_logs_and_spans
+where project_id = ? and timestamp between ? and ? and (true)
+order by timestamp desc limit ?
+```
+
+with **`scan.has_limit=false scan.limit=0`** in the same span. The LIMIT never
+reaches the scan, so this is a blocking sort over the whole window instead of a
+streaming top-N — the 431 GB-for-251-rows cliff, and exactly what
+`one_unsorted_file_does_not_cost_the_majority_its_ordering` exists to guard.
+
+**Most likely trigger:** the project's isolated non-conforming leg grew past
+`timefusion_read_sort_unordered_leg_max_mb` (**64 MB compressed, ~0.8 GB
+decoded**), so `repair_isolated_scan_ordering` began declining. That fits a sharp
+onset at one minute rather than gradual decay.
+
+**THE REAL DEFECT IS THAT THIS IS INVISIBLE.** Nothing counted the decline, so a
+query silently dropping from streaming top-N to a full sort presents as "queries
+that used to work fine no longer do". Fixed in `7a9dea7c`:
+`scan.ordering_repair_applied` / `_declined` / `_no_claim`, with the over-budget
+leg bytes on the declining path — which is precisely the measured distribution
+the budget's own doc demands before anyone raises it.
+
+**Two candidate remedies, neither taken without the measurement:** make the
+project's files conforming (a Repair/recompress pass, so the leg disappears), or
+raise the budget — noting the doc's warning that the ceiling is paid concurrently
+on EVERY Delta-reading query.
