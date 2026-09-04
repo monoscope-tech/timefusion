@@ -3157,3 +3157,48 @@ TF_BENCH_FLEET=1 TF_BENCH_PARQUET=<204MB prod file> TF_BENCH_POOL_MB=8192 \
 # 8 workers to ~12, the envelope is pool-bound and `coordinator_jobs` (clamped
 # at 16, holding 1.9 GiB of maintenance pool unreachable) is the lever.
 ```
+
+## Prod-scale bench: the cliff does NOT reproduce, and concurrency scales to 16
+
+Re-fetched a 202 MB prod file (`project_id=dcad860a…/date=2026-06-17`) and ran
+the same fleet sweep:
+
+| workers | pool 2048 MB | pool 4096 MB | failed |
+|---:|---:|---:|---:|
+| 1 | 165.23 MB/s | 185.04 | 0 |
+| 6 | 831.35 | 817.30 | 0 |
+| 8 | 742.43 | 890.68 | 0 |
+| 12 | 873.65 | 893.71 | 0 |
+| 16 | **900.04** | 888.28 | **0** |
+
+**Zero failures at every concurrency up to 16, on a 2 GiB pool** — against the
+original bench's **4 failures at 8 workers on an 8 GiB pool**. Aggregate
+throughput *rises* from 831 to 900 MB/s between 6 and 16 workers; per-worker
+throughput falls (165 -> 56 MB/s), which is ordinary contention, not collapse.
+
+**So the "6 optimum / 8 cliff" does not reproduce at prod file size.** Combined
+with the earlier small-file run (also 0 failures to 16), the constant behind
+`COORDINATOR_PER_SORT_BUDGET_BYTES` and the whole 6-slot envelope is **not a
+portable law** — it described one file, one pool and one machine.
+
+**What this does and does not license:**
+- It DOES mean the envelope should be re-derived rather than trusted. The
+  `light_optimize_k + holdback == 6` invariant is asserted in a test as "the
+  bench's measured optimum"; that bench does not reproduce here.
+- It does NOT mean prod can run 16 concurrent rewrites. This laptop's NVMe spill
+  and CPU differ from the prod box, the file I fetched may differ in row-group
+  layout from the original, and prod's pool is shared with three other lanes.
+  **The number must be re-measured on prod hardware before anything is changed.**
+
+**Concretely, the follow-up is one command on a prod-like box**, with the file
+already identified:
+
+```bash
+TF_BENCH_FLEET=1 TF_BENCH_POOL_MB=8192 \
+  TF_BENCH_PARQUET=<202MB file> cargo bench --bench rewrite_throughput
+```
+
+If it shows what this run shows, `coordinator_jobs` (clamped at 16, holding
+1.9 GiB of maintenance pool unreachable) and the 6-slot split are both leaving
+throughput on the table — and that is the remaining structural path to 10x,
+alongside the packer floor already deployed.
