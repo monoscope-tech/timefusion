@@ -193,8 +193,30 @@ complete clean pass that the dedup lane cannot deliver.
 blanket coverage takes ~32 hours of uptime. It is that **coverage saturates well
 below what a query needs, and waiting does not fix it** — the remaining dates
 cannot be certified until they are cleaned, and cleaning is the backlog that is
-still growing. **Confirmed on a third reading** (5,611 s: grants still 52, files proved 130),
-so the plateau is not a sampling artefact.
+still growing. **And then it resumed.** At **6,471 s** grants are **61**. So the "plateau" was
+also wrong — the third claim I have made about this series and the third to be
+contradicted by the next reading:
+
+| uptime | grants | note |
+|---:|---:|---|
+| 1,828 s | 27 | |
+| 2,726 s | 32 | |
+| 4,928 s | 52 | I called this "0.6/min, no plateau" |
+| 5,556 s | 52 | |
+| 5,611 s | 52 | I called this "plateaued, saturating" |
+| **6,471 s** | **61** | resumed |
+
+**The honest characterisation is BURSTY, with stalls of ten minutes or more —
+and it took six samples over 108 minutes to see that.** Neither of my two earlier
+readings had enough of the series to support the claim I made from it. Any
+statement about this counter needs a series, not two points; I asserted a trend
+from two points twice tonight and was wrong both times.
+
+**More importantly, the backlogs have turned.** On this same long-lived process
+`pending_dedup` went 2,216 → **2,156** and `pending_base_rollup` 329 → **257**,
+where earlier in the night both were growing. That is the first sign of the queue
+draining rather than filling, and it appeared only once a process was left alone
+for well over an hour — which is precisely what decision 2 is about.
 
 **And one counter explains it completely:**
 
@@ -233,10 +255,11 @@ That is the honest answer to the 10x question, and it is not a comfortable one:
 
 - certification was **structurally dead** before tonight and is now **alive and
   accruing** — that part is fixed;
-- but grants **plateaued at 52** while file-level proofs kept climbing, so
-  coverage does not merely accrue slowly — it **saturates**, because the dates
-  that remain are dirty and a whole-date grant needs a clean pass the dedup lane
-  cannot deliver. Coverage is **not reachable by waiting at all.**
+- grants are **bursty** — 52 for eleven minutes, then 61 — so coverage does
+  accrue, but in fits, and the 218:1 decline ratio says why: a grant needs a
+  clean partition and most partitions are not clean. Whether coverage can reach
+  what a query needs is still open, and needs hours of uninterrupted uptime to
+  answer rather than another guess from two samples.
 - The cheaper proof is exactly what
   `2026-09-04-certification-proves-the-wrong-thing.md` argues for: certify
   **non-overlap from file statistics** rather than duplicate-freedom from a
