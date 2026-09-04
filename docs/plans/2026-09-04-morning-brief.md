@@ -2135,3 +2135,54 @@ units, but this changes the behaviour of the lane holding 85% of maintenance, th
 failure mode is a slow one (file counts drifting up over days, not an error), and
 I have been wrong repeatedly today on less. It wants a soak, not a flag flip at
 04:00.
+
+## The floor is robust (the population is bimodal), and it is worth ~1.7x — not 10x
+
+Extending the floor sweep upward makes the shape clear:
+
+| floor (rows/file eliminated) | ≈ MiB/file | % writes saved | % files lost | **maintenance worker-time saved** |
+|---:|---:|---:|---:|---:|
+| 1,000,000 | 99 | 82.4% | 8.8% | **41.7%** |
+| 2,000,000 | 198 | 81.8% | 8.6% | **41.4%** |
+| 4,000,000 | 397 | **0.0%** | 0.0% | 0.0% |
+| 8,000,000+ | 793+ | 0.0% | 0.0% | 0.0% |
+
+**It is a cliff, not a curve.** Everything expensive sits at ~3.77M rows per file
+eliminated (the 2-file merges); everything else is under 1M. So **any floor
+between ~1M and ~3M rows/file — roughly 100–300 MiB — gives the identical
+result**, and a floor mis-set by 2x still works. That is a wide safe band, and it
+substantially de-risks the choice: this is not a knob needing careful tuning, it
+is a separator between two populations that barely overlap.
+
+### What it is actually worth, in capacity terms
+
+```
+maintenance worker-time saved = Pack share 85.3%  x  write fraction 59.3%  x  writes saved 82.4%
+                              ≈ 41.7%
+```
+
+**Removing 41.7% of maintenance worker time is ~1.71x headroom** (`1 / (1 −
+0.417)`) at the same pool size.
+
+**So: this is the largest single lever measured tonight by a wide margin, and it
+is worth about 1.7x — not 10x.** The 10x requirement needs roughly a 90%
+reduction in work per ingested row; this delivers ~42%. Stated plainly so nobody
+reads the 82% as a capacity multiplier: **82% is of packing's WRITE VOLUME, and
+packing writing is ~51% of maintenance.**
+
+### What would have to follow it for 10x
+
+The 36x write amplification is the frame. After this change it becomes roughly
+21x (the refused 82% of Pack writes removed). Getting to "keeps up at 10x" means
+attacking what remains:
+
+1. **Deletion vectors for dedup** — removes the dedup rewrite entirely rather
+   than making it cheaper. Blocked on delta-rs `#4079`; we carry a fork.
+2. **Why 21x remains** — the surviving Pack volume is genuine multi-file merging,
+   which is the irreducible cost of tiered compaction *unless* the tiering itself
+   changes (levelled, key-range partitioned — the RocksDB/IOx shape this document
+   already identified as absent).
+3. **The ~4% bin-width lever** is now clearly last, not first.
+
+**This is the honest capacity ladder, and it is the thing I should have built at
+the start of the night instead of at the end.**
