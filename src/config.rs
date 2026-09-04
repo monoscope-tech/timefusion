@@ -2634,7 +2634,22 @@ pub struct MaintenanceConfig {
     /// path does not. Prod is the only instrument, so judge this ONLY on a warm
     /// process: the 2026-09-04 deploy churn made every cold reading look like a
     /// regression and every regression look like a cold reading.
-    #[serde_inline_default(4)]
+    /// **MEASURED OFF.** Fixing the over-read did NOT help — it made things worse:
+    ///
+    /// | build | 14 d | 30 d |
+    /// |---|---|---|
+    /// | no split (baseline, 7 runs) | 14-33 s | TIMEOUT 5/5 |
+    /// | split, unfixed 4x over-read | 34.2 s | 49.5 s (1 sample) |
+    /// | split, per-branch pruning FIXED | 43.4 / 48.6 / 59.1 s | TIMEOUT 3/3 |
+    ///
+    /// Pruning verifiably worked in the fixed build (four DISTINCT pushed
+    /// predicates; 40 file groups, down from 52) and it was still slower, so the
+    /// 4x over-read was NOT the cost. Something about four concurrent branches
+    /// dominates — `GatedScanExec` permit contention and per-branch snapshot and
+    /// planning work are the open suspects. Do not re-enable without measuring
+    /// THAT; the parallelism win seen from two hand-issued 15 d queries does not
+    /// survive being folded into one plan.
+    #[serde_inline_default(1)]
     pub timefusion_query_range_split_branches: usize,
     /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only
