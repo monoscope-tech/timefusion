@@ -4313,3 +4313,54 @@ query-latency path.
 
 **Still not the gate reading** (7200 s, ~02:17Z). Recorded now because it is a
 structural fact about zero, not a rate off a young process.
+
+## 02:11 — THE GATE READING (uptime 6862 s / 114 min, quiet process)
+
+| counter | 01:41 | **gate** | Δ/30 min |
+|---|---:|---:|---:|
+| `cert_granted_total` | 31 | **31** | **0 — fully flat** |
+| `cert_skip_files` | 0 | **0** | 0 |
+| `cert_skip_blocked_overlap` | 4264 | 4328 | +64 |
+| `dedup_skipped` / `dedup_eligible` | 25 / 3590 | 25 / 5058 | **0.49%** |
+| `dedup_probe_timeouts_total` | 64 | 66 | **+2** (was +14) |
+| `dirty_bin_batch_probe_clean_total` | 0 | **0** | 0 |
+| `cert_declined_dirty_bins` | 12,407 | 12,415 | +8 |
+| `pending_dedup` | 2344 | 2398 | +54 |
+
+### Verdict against the gate as WRITTEN
+
+- **Branch A** ("grants accumulate at a steady rate ... the shipped admission fix
+  suffices"): **REFUTED.** Grants flat at 31 for 30 minutes.
+- **Branch B** ("grants PLATEAU while timeouts stay LOW => budget starvation, and
+  the per-table cert bound ships"): matches on its face — timeouts fell to +2.
+- **Tripwire** (`dirty_bin_batch_probe_clean_total`, baseline 0): **0 across the
+  whole 114 minutes.** The new admission estimator is not over-throttling.
+
+### Why I am NOT executing branch B's prescription
+
+Branch B's fix raises GRANTS. `cert_skip_files` has been **0 for 114 minutes**
+against `cert_skip_blocked_overlap = 4328`, so grants are not what the read path
+is short of — contiguity is. **The gate was written before the two-constraint
+structure was understood** (production blocked by dirty bins; consumption blocked
+by overlap), and it offered no cell for "grants plateau AND the skip is
+structurally blocked". Following it mechanically would have shipped a fix for the
+constraint that is not binding.
+
+Recording this rather than quietly re-deciding: a pre-registration is there to
+stop motivated reasoning, not to override a fact discovered after it was written.
+What it correctly prevented was reading the 0→24 `dedup_skipped` blip as success.
+
+### What IS established
+
+1. **The probe admission fix works.** Timeouts decayed to +2/30 min and the
+   over-throttle tripwire never fired. Shipped `cdae044`, verified over 114
+   quiet minutes.
+2. **The read path is NOT unblocked.** 25 skips on 5058 eligible scans = 0.49%,
+   all per-DATE; the per-FILE skip is at zero.
+3. **Maintenance is still not keeping up.** `pending_dedup` 2275 -> 2398 over 90
+   quiet minutes, with no deploy to blame this time.
+
+### Freeze lifted
+
+Six commits pushed together — one code change (`3bd3c222`, per-table probe-cost
+EMA) and five docs. One deploy, one attributable change.
