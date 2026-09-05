@@ -1461,5 +1461,7 @@ impl Database {
 /// ```
 pub fn spill_disk_builder(spill_dir: std::path::PathBuf, max_gb: u64) -> datafusion::execution::disk_manager::DiskManagerBuilder {
     use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-    DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir])).with_max_temp_directory_size(max_gb.saturating_mul(1024 * 1024 * 1024))
+    DiskManagerBuilder::default()
+        .with_mode(DiskManagerMode::Directories(vec![spill_dir]))
+        .with_max_temp_directory_size(max_gb.saturating_mul(1024 * 1024 * 1024))
 }
