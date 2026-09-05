@@ -4059,3 +4059,78 @@ was concluding every candidate date was dirty. Some were merely never examined.
 
 **This does not change the caveat about 10x.** Eleven grants against
 `cert_slice_files_unproven = 3507` is a start, not a solved read path.
+
+## 00:20 — A PUSH FREEZE, because I was the one destroying the measurement
+
+`docker service ps` shows the deployed images: `cdae044` (2 min), `15895cb`
+(2 min), `9cc12bf` (15 min), `2f08c4a` (31 min), `9a112b5` (~1 h). Those are all
+MY pushes. `deploy.yml` fires on every non-docs push to master, and each deploy
+replaces the container.
+
+Heavy maintenance units run ~21 minutes. At a ~15-minute deploy cadence they
+cannot finish — they die to process exit, every time. Shorter units complete
+fine, so the completion counters are not zero and the effect is invisible in
+them; it is the long tail (repair, whole-date dedup on the big table) that never
+lands. This is `tf_deploy_cadence_starves_dedup_2026-08-18` reproduced by my own
+hand, and it is also why `cert_granted_total` has never been measurable: grants
+need sustained uptime and no process tonight has had it.
+
+**FREEZE: 2026-09-05T00:19:56Z.** No code pushes to master until a reading is
+taken at uptime >= 2h. `cdae044` already carries the probe-admission fix, so
+nothing needs to ship for that reading to be valid. `deploy.yml` `paths-ignore`
+covers `docs/**`, `**/*.md`, `bench/**`, so docs pushes are free; code commits
+are batched locally and pushed together after the reading.
+
+### Pre-registered decision gate (written BEFORE the reading)
+
+On a process with >= 2h uptime:
+
+- If `cert_granted_total` accumulates at a steady rate and
+  `cert_slice_files_proved` climbs against `unproven`, the shipped admission fix
+  suffices and no cert-lane change ships.
+- If grants PLATEAU while `dedup_probe_timeouts_total` stays low, probes are
+  finishing but there is no budget left to run them — budget starvation, not
+  probe death — and the per-table bound below is the fix.
+- `dirty_bin_batch_probe_clean_total` (baseline 0) is the tripwire for the new
+  estimator over-throttling.
+
+The current process reads `cert_granted_total = 0` at 124 s uptime. That is
+noise, not a result. Single-digit counters off young processes have already
+produced two retractions this week.
+
+## 00:35 — the shared probe-cost EMA was sized by the wrong table (3bd3c222)
+
+I inferred that certification was eating the dedup tick, because
+`run_certification_pass` is the newest consumer, runs FIRST in the per-table
+loop, and is handed `sweep_deadline` — the whole tick — while the drain and
+sweep split 0.6/1.0 between them. That inversion is real and worth remembering.
+
+**One tick of prod logs refuted it as the explanation.** Tick at 00:20:00,
+budget 239 s:
+
+| time | table | groups | probe_cost_ms | budget left |
+|---|---|---:|---:|---:|
+| :00.67 | rollup_dashboard_1h_v2 | 11 | 0 | 239 |
+| :01.61 | rollup_dashboard_1m_v3 | 9 | 482 | 239 |
+| :03.11 | metrics_rollup_1h_v2 | 5 | 1129 | 237 |
+| :03.43 | **otel_logs_and_spans** | **32** | **147** | 237 |
+| :22:19 | otel_metrics | 31 | 32118 | **100** |
+
+Certification on the rollup tables costs 1-2 s each. The cost is the
+**137-second gap** on `otel_logs_and_spans`: one table, 57% of the tick.
+
+And the reason it was admitted 32 groups is a defect in the fix I shipped four
+hours ago. `dedup_probe_cost_ms` was ONE `AtomicU64` for the whole database. At
+00:15 it held 226,882 ms — measured on `otel_logs_and_spans` itself — and
+correctly throttled that table to the 10-group floor. By 00:20 three cheap
+rollup probes had pulled the shared EMA to 147 ms, and the same table under the
+same conditions was admitted at the full cap. **The estimator was sized by other
+tables' work, and biased toward over-admitting on the one table every dashboard
+reads.**
+
+Now keyed per table. `note_probe_cost_into` is a free function with a doctest
+that replays exactly this sequence and asserts the big table's estimate survives
+three cheap probes on another table. Because the doctest reads the estimate by
+table name, a return to shared state cannot compile against it.
+
+Committed locally, NOT pushed — see the freeze above.
