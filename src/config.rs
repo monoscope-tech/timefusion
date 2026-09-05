@@ -1576,7 +1576,25 @@ pub struct BufferConfig {
     /// windows — clear `dedup_dirty_bins.json` when rolling back across a flip.
     #[serde_inline_default(10)]
     pub timefusion_dedup_bin_minutes: i64,
-    #[serde_inline_default(false)]
+    /// Decline a flush whose batch set provably already committed — the
+    /// duplicates WAL replay manufactures after an unclean exit (58% of
+    /// duplicate groups in a sampled prod file; see
+    /// `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
+    ///
+    /// ON by default since 2026-09-05. The "validate in staging" blocker was
+    /// stale: the whole cross-boot chain (flush commit writes
+    /// `timefusion.landed_digests` → boot history scan → replay re-inserts →
+    /// re-flush DECLINED, zero rows lost) is proven by
+    /// `replayed_rows_that_delta_already_holds_are_not_written_again`
+    /// (tests/e2e/restart_recovery.rs) against real Delta on real object
+    /// storage. Staging was only ever needed to OBSERVE it, not to validate it.
+    ///
+    /// Only ever ACTIVE on a DIRTY boot — a clean boot skips the Delta history
+    /// scan that loads the identities, so a graceful deploy pays nothing and
+    /// `wal.landed_skips` reading 0 for days is DORMANCY, not failure. The
+    /// counters to watch after the next unclean restart: `wal.landed_skips`
+    /// against `wal.replay_rows`.
+    #[serde_inline_default(true)]
     pub timefusion_landed_skip_enabled: bool,
 }
 
@@ -2125,6 +2143,26 @@ pub struct MaintenanceConfig {
     /// the pressure reading is noisy, and nothing has soaked this yet.
     #[serde_inline_default(false)]
     pub timefusion_maintenance_pressure_scaling: bool,
+    /// Per-runtime-env spill ceiling in GiB for the maintenance-family
+    /// `RuntimeEnv`s (`build_spill_runtime_env`: coordinator, maintenance,
+    /// light-optimize, repair spill dirs).
+    ///
+    /// DataFusion's `DiskManager` defaults to 100 GB, and the default was the
+    /// entire reason the repair backlog was FROZEN, not slow: sorting ONE
+    /// ~800 MB whale file (~17x decoded) spills past 100 GB, so every attempt
+    /// ran ~18 min and died at the cap — `retry_reason=compaction_incomplete`,
+    /// 650 of 662 repair WAL records in one night, attempts=1661 on one unit,
+    /// zero files repaired in 6 weeks (prod 2026-09-05, project 87576849,
+    /// slices Jul 21-28).
+    ///
+    /// 220 GiB: the prod host has ~390 GB free, the whole-budget clamp means
+    /// only ONE repair rewrite runs at a time, and dedup shards are bounded at
+    /// 512 MiB decoded — so one repair spill (220) plus incidental spill stays
+    /// under free space. Per ENV, not global: two envs spilling 220 GiB
+    /// simultaneously would exceed free space, but no two heavy spillers run
+    /// concurrently by construction (the clamp) — revisit if that changes.
+    #[serde_inline_default(220)]
+    pub timefusion_maintenance_spill_max_gb: u64,
     /// Byte ceiling for ONE output file from a rewrite that writes through
     /// `RecordBatchWriter`, which has no target-size support — `flush()` emits
     /// one file per partition regardless of buffer size — so rewrite paths cut

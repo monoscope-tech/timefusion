@@ -40,14 +40,13 @@ impl Database {
     /// and is sized from the budget left over the query pool.
     fn build_spill_runtime_env(&self, pool_size: usize, spill_subdir: &str) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         use datafusion::execution::{
-            disk_manager::{DiskManagerBuilder, DiskManagerMode},
             memory_pool::{FairSpillPool, TrackConsumersPool},
             runtime_env::RuntimeEnvBuilder,
         };
         let spill_dir = self.config.core.timefusion_data_dir.join(spill_subdir);
         let _ = std::fs::create_dir_all(&spill_dir);
         reap_orphaned_spill_dirs(&spill_dir);
-        let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
+        let disk = spill_disk_builder(spill_dir, self.config.maintenance.timefusion_maintenance_spill_max_gb);
         // Name holders, not merely the allocation victim, on exhaustion.
         let top = std::num::NonZeroUsize::new(5).expect("5 is non-zero");
         let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), top));
@@ -1438,4 +1437,29 @@ impl Database {
         }
         Ok(total_advanced)
     }
+}
+
+/// Spill `DiskManager` for one maintenance-family env: the explicit on-disk
+/// directory plus the configured byte ceiling.
+///
+/// The ceiling must be set HERE, on the builder — DataFusion's default is
+/// 100 GB, and that default is the entire reason the repair backlog was FROZEN
+/// rather than slow: sorting ONE ~800 MB whale file (~17x decoded) spills past
+/// 100 GB, so every attempt ran ~18 min, died at the cap, and requeued as
+/// `compaction_incomplete` — 650 of 662 repair WAL records in one night,
+/// attempts=1661 on one unit, zero files repaired in six weeks (prod
+/// 2026-09-05, project 87576849, slices Jul 21-28). See
+/// `timefusion_maintenance_spill_max_gb` for the sizing argument.
+///
+/// ```
+/// # use timefusion::database::spill_disk_builder;
+/// let dm = spill_disk_builder(std::env::temp_dir().join("tf-spill-doctest"), 220).build().unwrap();
+/// assert_eq!(dm.max_temp_directory_size(), 220 * 1024 * 1024 * 1024);
+/// // DataFusion's default — what every maintenance env silently ran with, and
+/// // what one whale-file sort exceeds — is far below the configured cap.
+/// assert!(datafusion::execution::disk_manager::DiskManagerBuilder::default().build().unwrap().max_temp_directory_size() < 110 * 1024 * 1024 * 1024);
+/// ```
+pub fn spill_disk_builder(spill_dir: std::path::PathBuf, max_gb: u64) -> datafusion::execution::disk_manager::DiskManagerBuilder {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir])).with_max_temp_directory_size(max_gb.saturating_mul(1024 * 1024 * 1024))
 }

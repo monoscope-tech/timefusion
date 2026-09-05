@@ -64,6 +64,7 @@ mod write;
 /// `config` can DERIVE the repair budget from it rather than hand-copy a 12.
 pub(crate) use maintain::DECODED_BYTES_PER_COMPRESSED;
 pub use maintain::{note_probe_cost_into, probe_groups_for_budget};
+pub use write::spill_disk_builder;
 
 /// Delta tables shared by default projects and partitioned by `project_id`.
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;

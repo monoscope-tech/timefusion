@@ -4975,3 +4975,61 @@ oscillates by +/-150 between adjacent readings.
 
 **Unchanged and still the headline blocker:** `dedup_skipped` **0 of 18,979** and
 `cert_skip_files` **0**. Five of fourteen days is not fourteen.
+
+## 10:20 — THE PIVOT: from diagnosis to shipping (user review, and they were right)
+
+The morning review's verdict: four days of diagnosis, top-line backlogs flat.
+Correct. Three levers had been sitting fully specified with no owner. Today each
+one ends in a ship or an honest blocker.
+
+### Shipped 1: landed-skip ON by default (stops manufacturing 58% of duplicates)
+
+The "needs staging" blocker was STALE: staging was only ever needed to OBSERVE
+the skip, not to validate it. The purpose-built seam test already existed
+(`replayed_rows_that_delta_already_holds_are_not_written_again`) and runs the
+whole cross-boot chain against real Delta on real MinIO: flush commit writes
+`timefusion.landed_digests` -> SIGKILL-shaped dirty boot -> WAL replay
+re-inserts -> the re-flush is DECLINED -> zero rows lost. It PASSES, plus 7 unit
+tests and the 4-test restart_recovery suite.
+
+**Dormancy warning, stated now so the morning-after reading does not "refute"
+it:** the skip only activates on a DIRTY boot. Deploys are graceful, so
+`wal.landed_skips` will read 0 until the next crash/OOM — that is dormancy, not
+failure. The local e2e is the verification.
+
+### Shipped 2: the repair lane was FROZEN by DataFusion's default 100 GB spill cap
+
+`pending_repair` = 252, exactly flat for days. The journal + WAL (pulled via
+read-only SSH, replayed locally) says they are NOT "never claimed" — that
+framing from 09-03 was wrong for this population:
+
+- All 251 retry-state units are ONE project (87576849) on `otel_logs_and_spans`,
+  slices June 19 + Jul 21-28 — dates holding 33-121 files at **p50 ~790 MB**
+  (pre-cut-era outputs; the writer now cuts at 512 MB).
+- 650 of 662 repair WAL records in one night are `compaction_incomplete`
+  churn; one unit is at **attempts = 1661**.
+- The ONE attempt that actually ran (`ran_secs=1070`) died at:
+  *"used disk space during the spilling process has exceeded the allowable
+  limit of 100.0 GB"* — `tf_spill_capped_by_a_datafusion_default_2026-09-03`,
+  diagnosed two days ago, never fixed.
+- While that doomed rewrite held the WHOLE 6144 MiB repair byte budget
+  (`want_mib=6144 budget_mib=6144`), every other claim bounced
+  `repair_rewrite_permit_busy` -> retry 30 s. That is the churn.
+
+**So the lane's throughput on these files was ZERO, not slow** — every attempt
+burned ~18 min + 100 GB of spill and died at the same wall. Fix:
+`timefusion_maintenance_spill_max_gb` (default 220), applied in
+`build_spill_runtime_env` so it covers every maintenance-family env. Sizing: the
+host has ~390 GB free, the whole-budget clamp means one repair rewrite at a
+time, dedup shards are bounded at 512 MiB decoded. Doctest pins both the
+configured cap and the fact that DataFusion's default is below 110 GiB.
+
+**What to watch after deploy:** repair `maintenance_task_finished` outcomes for
+87576849 flipping from `Retry ran_secs=0` churn to long-running completions, and
+`pending_repair` moving off 252 for the first time in days. If the sort dies
+again at 220 GB, the same log line names the new cap — perfectly attributable,
+and the next lever is known.
+
+**Not fixed tonight, named:** the permit-bounce stampede (attempts churn while
+the budget-holder runs) is noise, not damage; it resolves into real work once
+the budget-holder can finish.
