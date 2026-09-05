@@ -4585,3 +4585,51 @@ policy would produce — but the mapping is an assumption, not a measurement.
 improvement; `dirty_bin_batch_probe_clean_total` still **0**. `dedup_skipped` 0
 of 2604 eligible and `cert_skip_files` 0 — the read path remains blocked, exactly
 as the contiguity result predicts it must be.
+
+## 03:45 — WHERE the contiguity fix belongs (I had the lane wrong)
+
+Reading `uncertified_window_dates` (maintain.rs:6138-6186) corrects my 03:15
+recommendation. It ALREADY orders **project-major, busiest-first by file count**,
+with an explicit comment explaining why ("grants scattered one-per-project across
+many projects buy nothing while the same number concentrated on one project
+completes a window"). So "issue certification depth-first" is, at the
+PROJECT/DATE granularity, already implemented — and my recommendation as written
+would have been a no-op.
+
+**The real location is the SLICE path.** Both paths funnel through
+`record_certification`, which accumulates intervals per (project, table, date)
+via `merge_clean_interval` and grants only when the merged intervals cover the
+WHOLE day (maintain.rs:4994-5002):
+
+- the **whole-date probe** certifies a date all-or-nothing and is already
+  project-major;
+- **dedup rewrites** certify only the SLICE they happened to touch, and slice
+  work is ordered by AGE/starvation (`tf_ordering_ranks_age_not_benefit_2026-08-20`,
+  `tf_sealed_lane_pinned_by_metrics_2026-08-28`), not by position in time.
+
+Scattered slices never merge into one day-covering interval — which is exactly
+what the counters say on this quiet 77-minute process:
+
+| counter | value |
+|---|---:|
+| `cert_slice_partial` | **24** |
+| `cert_slice_day_covered` | **0** |
+| `cert_granted_total` | 2 |
+| `dedup_skipped` / `dedup_eligible` | 0 / 3887 |
+
+**24 days accumulating partial coverage and not one completed.** That is the
+scattered curve from the 03:15 simulation, observed directly rather than
+simulated.
+
+**Refined recommendation:** order SLICE-level certification work by time position
+within a (project, date) so `merge_clean_interval` grows ONE contiguous run
+toward day coverage, instead of depositing disjoint islands. The simulation says
+the first contiguous quarter of a day returns ~20% of its files, where the same
+quarter scattered returns ~0%.
+
+**Method note.** My 03:15 write-up named the fix without reading the function it
+would change, and the function already did the thing I was about to recommend.
+The finding (contiguity pays, scattered does not) survives intact; the
+PRESCRIPTION was aimed at the wrong lane. Read the code path you intend to
+change before naming the change — the same lesson as the phantom env knob at
+01:15, one level up.
