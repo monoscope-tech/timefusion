@@ -4531,3 +4531,57 @@ advisor's instruction to run the discriminating computation BEFORE writing the
 span_cap case is what stopped a deploy on the wrong lever. **A counterfactual —
 "if I removed the thing I blame, what changes?" — is worth more than any amount
 of mechanism narration.**
+
+## 03:15 — THE CONTIGUITY LEVER, QUANTIFIED (offline, same checkpoint)
+
+Simulation on the real file spans of `date=2026-09-02`: certify files in TIME
+ORDER (a contiguous prefix of the day) vs SCATTERED order, and count how many
+become skippable under `skippable_certified_files`' actual rule — a certified
+file is skippable only if NO uncertified file overlaps it.
+
+| project | order | 25% | 50% | 75% | 90% |
+|---|---|---:|---:|---:|---:|
+| 87576849 (n=201) | **contiguous** | 20.4% | 47.8% | 74.1% | 88.6% |
+| 87576849 | scattered | 1.0% | 1.0% | 10.0% | 14.9% |
+| **28f62f01** whale (n=153) | **contiguous** | 22.9% | 47.1% | 72.5% | 88.9% |
+| **28f62f01** whale | scattered | **0.0%** | **0.0%** | **0.0%** | 60.1% |
+| 00000000 (n=79) | contiguous | 20.3% | 46.8% | 72.2% | 88.6% |
+| 00000000 | scattered | 0.0% | 15.2% | 45.6% | 70.9% |
+| dcad860a (n=46) | contiguous | 17.4% | 45.7% | 71.7% | 87.0% |
+| dcad860a | scattered | 0.0% | 2.2% | 28.3% | 63.0% |
+
+**THE SAME CERTIFICATION WORK BUYS 47% SKIPPABLE CONTIGUOUSLY, OR 0% SCATTERED.**
+The contiguous curve is essentially LINEAR across all four projects — so partial
+credit is real and this is NOT an all-or-nothing target. The scattered curve is
+flat near zero until it approaches total coverage, which is the worst possible
+shape: it looks like no progress right up until the end.
+
+**This explains `cert_skip_files = 0` beside 31 grants on the previous process.**
+Grants were spread across dates and slices, and scattered grants buy nothing.
+`cert_slice_day_covered = 3` vs `cert_slice_partial = 49` is the same fact from
+the other side.
+
+### The recommendation
+
+**Order certification DEPTH-FIRST — finish a (project, date) before starting
+another — rather than breadth-first across dates.** No new mechanism is needed;
+the probe, the ledger and the read-path rule all already exist and work. What is
+wrong is the ORDER work is issued in, which is the cheapest class of fix there
+is, and the payoff curve says the first contiguous quarter of a day already
+returns ~20% of that day's files.
+
+This supersedes the span_cap direction (refuted at 03:05) and it is a strictly
+better target than raising grant VOLUME: at scattered order, even 75% coverage
+returns zero on the whale.
+
+**Caveat, stated plainly:** the simulation certifies FILES in time order; the
+real system certifies SLICES that map to files. Since I sorted by (min,max)
+timestamp, "contiguous files" == "contiguous time", which is what a slice-ordered
+policy would produce — but the mapping is an assumption, not a measurement.
+
+### Status of the quiet process (uptime 2795 s, no restart)
+
+`dedup_probe_timeouts_total` 9 in 46 min = **0.17/min**, holding the ~5x
+improvement; `dirty_bin_batch_probe_clean_total` still **0**. `dedup_skipped` 0
+of 2604 eligible and `cert_skip_files` 0 — the read path remains blocked, exactly
+as the contiguity result predicts it must be.
