@@ -4364,3 +4364,75 @@ What it correctly prevented was reading the 0→24 `dedup_skipped` blip as succe
 
 Six commits pushed together — one code change (`3bd3c222`, per-table probe-cost
 EMA) and five docs. One deploy, one attributable change.
+
+## 02:20 — the grant plateau is EXHAUSTION, and the span_cap case (do NOT enable tonight)
+
+### Correcting my own gate verdict
+
+I attributed the grant plateau to "the wrong constraint being fixed". The
+mechanism is cleaner and it is verifiable: the **decline memo** (maintain.rs
+~6355) memoizes every dirty date against its file set and never re-probes it, so
+a process consumes its 14-day candidate window and then has nothing left to
+probe. Between 01:41 and 02:14:
+
+| counter | 01:41 | 02:14 |
+|---|---:|---:|
+| `cert_granted_total` | 31 | 31 (+0) |
+| `cert_declined_dirty_bins` | 12,415 | **12,415 (+0)** |
+| `cert_probe_declined` | 198 | 200 (+2) |
+
+**ALL certification activity stopped together.** That is exhaustion of the
+candidate set, not budget starvation — so branch B's fix (bounding certification
+per table to free budget) would have bought nothing, and for a second, sharper
+reason than the one I gave. Neither pre-registered branch covers this cell.
+
+### The span_cap case — stronger than I thought, and NOT ready to enable
+
+`timefusion_compaction_span_budget_bins` already exists (mod.rs:8008-8032) and
+defaults to **0 = disabled**. I had read only the tail of its doc comment; the
+full comment carries a MEASURED distribution, prod 2026-09-04, 297 units/90 min:
+
+| lane | n | p50 span | max | <=16 bins |
+|---|---:|---:|---:|---:|
+| `HotPacking` | 118 | 13 | 20 | 62.7% |
+| `SealedConsolidation` | 179 | **84** | **144** | **4.5%** |
+
+At 10-minute bins, SealedConsolidation's p50 output spans **14 hours** — 58% of a
+144-bin day partition, in ONE file. A certified file in that day overlaps it
+unless it falls in the remaining 42%, which is a very plausible source of the
+4,328 overlap blocks. The doc already answers the VALUE question (~20-24 spares
+hot packing at max-observed 20, rejects the bulk of sealed consolidation); it
+leaves the TRADE open, calling it "real and unpriced".
+
+**What my overlap finding adds to that trade.** The doc weighs "file-count win
+given up" against "read amplification stopped". There is a THIRD term it does not
+consider: span is also what blocks `skippable_certified_files`, so bounding it is
+on the path to moving `cert_skip_files` off zero — the customer query goal, not
+just a maintenance-cost goal. That is a materially bigger prize than read
+amplification, whose own lever measured ~3.7%.
+
+**Three reasons not to enable it tonight, one of them disqualifying:**
+
+1. **It is PROSPECTIVE ONLY.** It shapes files the packer creates from now on.
+   The 4,328 blocks are EXISTING files; the counter cannot move until the wide
+   mass is rewritten (`optimize --date D --recompress`) or ages out. Enabling it
+   and watching `cert_skip_files` would show nothing and read as a refutation.
+   The correct order is recompress FIRST, then bound span.
+2. **The discriminating fact is missing.** `cert_slice_day_covered = 3` vs
+   `cert_slice_partial = 49` leaves open that the blocking is certification
+   INTERLEAVING within days rather than wide files. If interleaving dominates,
+   span_cap moves `cert_skip_files` by zero and certifying contiguous WHOLE DAYS
+   is the real lever. Classify the 4,328 by whether the blocking uncertified file
+   is WIDE or merely ADJACENT — a Delta checkpoint computation, offline, no prod
+   load. **Run that before spending a deploy on span_cap.**
+3. **It disables a lane.** Any biting bound rejects ~95% of SealedConsolidation,
+   which cannot pick narrower inputs — 16.3% of worker time, 108 pending. The
+   right shape is probably PER-LANE (bound hot packing, exempt sealed
+   consolidation), which is `tf_lane_coverage_gaps_2026-09-04` run in reverse.
+
+### Discipline: no more code pushes tonight
+
+The push at 02:11 should be the last. Any further default change is a new deploy
+and a new process, and a quiet process running to morning is a 4-6 HOUR reading —
+the rate data every retraction this week was missing. That is worth more than
+landing one more knob.
