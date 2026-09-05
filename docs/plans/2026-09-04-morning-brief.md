@@ -4007,3 +4007,55 @@ different semaphores, neither of which is the coordinator pool.
 from 4 to 6 and the envelope from 6 to 8 — a 1.25x within a range this ladder
 has now measured, not a leap. Validate on staging first, because the thing that
 must move is IO-bound throughput and this box cannot produce that number.
+
+---
+
+## Post-deploy: the probe admission change, measured
+
+Prod on `9cc12bf`. Twelve minutes of the new process:
+
+| | old build, 6 h | new build, 12 min |
+|---|---:|---:|
+| `dedup_batch_probe` completed | 40 | **59** |
+| `dedup_batch_probe_timeout` | 70 | **12** |
+| completion rate | **36%** | **83%** |
+
+The admission decisions are visible and sane:
+
+```
+groups=10  budget_secs=239  probe_cost_ms=0        <- cold, and only 10 groups existed
+groups=10  budget_secs=239  probe_cost_ms=226882   <- 227 s a probe -> floor of one wave
+groups=32  budget_secs=204  probe_cost_ms=22566    <- 23 s a probe -> cap
+groups=32  budget_secs=239  probe_cost_ms=61770    <- 62 s a probe -> cap
+groups=7   budget_secs=239  probe_cost_ms=416      <- only 7 groups existed
+```
+
+Both directions work: an expensive-probe regime throttles to one wave, a cheap
+one still fills the cap. The estimator spans 416 ms to 227 s across real
+partitions, which is the order-of-magnitude spread the half-weight EMA was
+chosen for.
+
+**Caveat, and it is not small.** These are different window lengths against
+different process ages — 12 minutes on a young process versus 6 hours on a
+mature one. The RATIO is the comparable quantity, and it is 36% -> 83%; the raw
+counts are not. A second reading on a quieter, older process is what would make
+this a rate rather than a ratio.
+
+### A prediction I got wrong, in the favourable direction
+
+I wrote above: "`cert_granted_total` stays 0, and that is not a failure." It is
+**11**, where the previous process granted 0 across its entire life.
+
+I underweighted my own argument. Dirty and certify-only groups interleave 1:1,
+and the certify-only class is the only one that can grant — so when the second
+wave was dying wholesale, roughly half of what died was the only work capable of
+producing a grant. Freeing that capacity let grants happen. I reasoned correctly
+about the mechanism and then predicted as if it did not exist, because
+`cert_declined_dirty_bins = 4917` had convinced me the outcome was
+removal-blocked in all cases.
+
+It is still removal-blocked for DIRTY dates — that part stands. What was wrong
+was concluding every candidate date was dirty. Some were merely never examined.
+
+**This does not change the caveat about 10x.** Eleven grants against
+`cert_slice_files_unproven = 3507` is a start, not a solved read path.
