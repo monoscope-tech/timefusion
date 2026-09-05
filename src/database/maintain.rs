@@ -3311,7 +3311,9 @@ impl Database {
     /// for these ~800 MB zstd files) as its floor, which no fair share of a
     /// contended pool guarantees. Serialization is already the byte-budget
     /// semaphore's job; the pool just has to stop being the lottery.
-    pub(crate) fn coordinator_compaction_runtime_env(&self, operation: crate::maintenance_coordinator::Operation) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+    pub(crate) fn coordinator_compaction_runtime_env(
+        &self, operation: crate::maintenance_coordinator::Operation,
+    ) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         match operation {
             crate::maintenance_coordinator::Operation::Repair => self.repair_runtime_env(),
             _ => self.coordinator_runtime_env(),
