@@ -3935,3 +3935,75 @@ Two changes so this cannot recur:
 prediction table no longer applies): measure the cliff rung at 8 GiB, call it
 `W8`, then linearity predicts `cliff(pool) = W8 x pool / 8`. Pools 2 / 4 / 8 GiB,
 rungs 1-24. A cliff that does not move with the pool refutes it.
+
+### RESULT: the 6-slot envelope is NOT a law — the cliff is pool-priced
+
+Fixture: 400,000 rows x 98 columns, row-shuffled, no footer `sorting_columns`
+(so the sort actually runs — 30 MB/s at one worker, against the original
+ladder's 29). Per-rung spill directory. **Free disk held at 99 GiB across every
+rung of every pool**, so no failure in this table is an ENOSPC.
+
+| pool | last passing rung | first failing rung |
+|---:|---:|---:|
+| 512 MB | **2** | 3 |
+| 1 GiB | **4** | 6 |
+| 2 GiB | **12** | 16 |
+| 4 GiB | **20** | 24 |
+
+**The cliff moves 2 -> 20 across an 8x pool range.** The prediction written
+before the run was strict proportionality (2, 4, 8, 16); measured is 2, 4, 12,
+20 — proportional at the low end and better than proportional above 1 GiB.
+Either reading refutes the same thing: **the concurrency ceiling is a function of
+pool size, not a fixed count of six.** `SAFE_DECODED_PER_POOL_BYTE`'s framing —
+a decoded-bytes-per-pool-byte RATIO — is the correct model, and the "8 workers"
+in the original ladder was that ratio evaluated at 8 GiB, not a scheduling law.
+
+That removes the assumption every ceiling note tonight rested on: *"10x needs the
+envelope to grow or the work to disappear, and the envelope is fixed."* The
+envelope is not fixed. It is a pool-allocation decision.
+
+### But this bench CANNOT say raising it raises throughput, and that matters
+
+Aggregate throughput saturates well before the cliff, at every pool:
+
+```
+2 GiB:   6w 94.15   8w 91.94   10w 92.59   12w 70.44  MB/s total
+4 GiB:   8w 91.47  10w 90.94   16w 77.22   20w 88.84  MB/s total
+```
+
+~90 MB/s is the ceiling on this 10-core box (1 worker is 46), and going from 6
+workers to 20 buys nothing. **On this machine the rewrite is CPU-bound, so extra
+concurrency only adds in-flight units, not bytes per second.**
+
+Prod is the opposite case and that is exactly why CLAUDE.md's ladder says local
+MinIO "validates correctness, not cost": prod's per-unit cost is dominated by
+object-store round trips, and concurrency is what hides IO latency. So:
+
+- **What is now established:** the ceiling scales with the pool. Verified over
+  512 MB - 4 GiB. Raising the envelope is a legitimate move rather than one that
+  walks into a known cliff.
+- **What is NOT established:** that raising it increases prod throughput. This
+  box cannot show that, and the honest place to measure it is staging, where
+  units are IO-bound and restarts are free.
+- **What is still unknown at the top:** at a 36 GiB pool, shared spill-disk
+  bandwidth is a plausible new binding constraint these rungs never reach.
+
+### The prod side of the argument, corrected
+
+`coordinator_share_bytes = min(16 jobs x 512 MiB, maintenance_pool x 3/5) =
+min(8192, 10178) = 8192 MiB` — the coordinator pool is capped by the JOB term,
+not by the maintenance pool, and it lands exactly on the 8 GiB the original
+ladder used. Prod RSS is 29 GB against a 120 GB cgroup, and
+`light_optimize_memory_brakes_total` has never fired.
+
+I am NOT quoting `coordinator_pool_pct = 15` as evidence that permits bind while
+memory idles — that reads an instantaneous gauge against a cumulative counter,
+and (third time tonight) `compaction_permits_unavailable` is incremented from two
+different semaphores, neither of which is the coordinator pool.
+
+**The concrete next step, one knob and one deploy:** raise the
+`coordinator_jobs` cap so `coordinator_share_bytes` reaches its
+`maintenance_pool x 3/5` ceiling of 10,178 MiB, which takes `light_optimize_k`
+from 4 to 6 and the envelope from 6 to 8 — a 1.25x within a range this ladder
+has now measured, not a leap. Validate on staging first, because the thing that
+must move is IO-bound throughput and this box cannot produce that number.
