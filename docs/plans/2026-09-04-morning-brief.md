@@ -5184,3 +5184,33 @@ GITHUB_TOKEN pushes cannot trigger workflows. Every prod restart today was one
 of my four pushes. And CI's red on `7ad77c6`/`7e97ce0` is the Format job only
 (`cargo lint` does not run rustfmt); the bot's fmt commit already healed the
 tip. `cargo fmt --check` joins my pre-push gate.
+
+## 15:57 — `pending_repair` = 1. The six-week backlog is drained.
+
+| time | pending_repair |
+|---|---:|
+| Jul-Sep 5 morning | 251-252, frozen |
+| 13:34 | 251 |
+| 13:55 | 219 |
+| 14:12 | 128 |
+| 14:47 | 93 |
+| 15:14 | 52 |
+| 15:40 | 26 |
+| **15:57** | **1** (the in-flight unit) |
+
+Verified clean drain, not bookkeeping: every repair record in the journal WAL
+tail is `state=complete` (166/166 — zero superseded, zero removed), backed by
+91 staged+committed rewrite bins in 2 h and a verified-sorted ledger of 132k
+footer proofs. The queue was substantially VERIFICATION DEBT (files fine,
+footers never probed) plus a core of real rewrites — and for six weeks neither
+could run because one doomed 818 MB sort held the entire byte budget around
+the clock, dying at DataFusion's default 100 GB spill cap every ~18 minutes.
+
+Two fixes released it: the spill cap (`00f94d15`) let the sort survive, and
+the dedicated repair pool (`7e97ce04`) let it fit in memory. One committed
+whale rewrite later, the budget cycled and 250 units cleared themselves.
+
+Downstream, same afternoon: base rollups 248 -> ~150, derived 207 -> 121,
+certified day coverage 3 -> 78, cert grants 0-7/process -> 69. Still zero:
+`dedup_skipped` (needs a full 14-day window granted) — the last domino for
+the customer-query chain.
