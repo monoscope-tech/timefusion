@@ -4723,3 +4723,46 @@ which is currently **0 of 47 partials** over 137 quiet minutes.
 First sustained drain of the night: `pending_dedup` 2384 -> 2330, `tasks_pending`
 2708 -> 2650 over 30 min. Small, but it is the first decline I have seen that is
 not inside run-to-run noise, and it is on a process with no deploy interference.
+
+## 05:12 — 2.8 h quiet: coverage moves off zero, and the backlog is genuinely draining
+
+| counter | 107 min | 137 min | **167 min** |
+|---|---:|---:|---:|
+| `cert_slice_day_covered` | 0 | 0 | **3** |
+| `cert_granted_total` | 2 | 2 | 5 |
+| `cert_slice_partial` | 43 | 47 | 148 |
+| `dedup_probe_timeouts_total` | 10 | 10 | **10 (zero new in 90 min)** |
+| `dirty_bin_batch_probe_clean_total` | 0 | 0 | **0** |
+| `tasks_pending` | 2708 | 2650 | **2501** |
+| `pending_dedup` | 2384 | 2330 | 2296 |
+| `dedup_skipped` / eligible | 0 / 5373 | 0 / 7084 | 0 / 9148 |
+
+**Three findings, in descending confidence.**
+
+1. **The shipped EMA fix is decisively good.** Ten probe timeouts total, none in
+   the last 90 minutes, against 34 in the first 28 minutes of the pre-fix build.
+   The over-throttle tripwire never left 0 across 167 minutes. This is the
+   night's one code change and it is verified in steady state, not on a young
+   process.
+2. **The backlog IS draining, on a process with no deploy interference.**
+   `tasks_pending` 2793 -> 2501 over ~2 h. Small against the goal, but it is the
+   first sustained decline I have measured all night, and every previous
+   "maintenance is not keeping up" reading was taken on a process I was
+   restarting every 15 minutes.
+3. **Certification coverage moved off zero** — `day_covered` 0 -> 3, grants
+   2 -> 5. Slow, and 148 partials against 3 completions is still the scattered
+   shape the contiguity work targets.
+
+**Why `dedup_skipped` is STILL 0 despite 3 covered days,** and it is not a
+contradiction: the code's own rule is that *"a scan sheds `DedupExec` only when
+EVERY date in its window is granted"* (maintain.rs:6163). A dashboard window is
+14 days, so 3 of 14 buys nothing at the SCAN level. That is the same contiguity
+argument one level up — **contiguity in TIME within a day for `cert_skip_files`,
+and contiguity across the WHOLE 14-day window for `dedup_skipped`.** Partial
+coverage is worth zero at both levels until it closes.
+
+At ~3 covered days per 2.8 h, a 14-day window is ~13 h away IF the rate holds and
+nothing invalidates — and new commits move fingerprints, which is exactly what
+invalidates. That is the strongest argument yet for the contiguity ordering fix:
+**the current policy is in a race against its own invalidation, and it is not
+obviously winning.**
