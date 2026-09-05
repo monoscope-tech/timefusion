@@ -4178,3 +4178,30 @@ moment the reading lands. CI on master is green including E2E — the previously
 red gate is resolved. No prod queries during the freeze: heavy ad-hoc SELECTs can
 OOM the memory-tight instance, and an OOM restart would destroy the very window
 being protected.
+
+## 00:44 — INTERIM liveness check (uptime 1661s). NOT the gate reading.
+
+The gate is 2h uptime (~02:17Z); this is 28 min in. Recorded because one counter
+changed KIND, not degree:
+
+| counter | prior | 00:44 |
+|---|---:|---:|
+| `dedup_skipped` | **0 in every reading ever taken** | **24** |
+| `cert_granted_total` | 0 across whole process lifetimes | 23 |
+| `cert_slice_files_proved` / `unproven` | 14 / 340 | 56 / 1360 |
+| `dedup_denied_never_certified_pct` | 94.8 | 86.6 |
+| `dirty_bin_batch_probe_clean_total` | 0 | 0 (tripwire clean) |
+| `pending_dedup` | 2292 | 2275 |
+
+`dedup_skipped` moving off zero is the READ-PATH SKIP FIRING FOR THE FIRST TIME.
+`tf_certification_probes_starved_2026-09-04` recorded it as 0 in every reading
+and concluded "the customer chain is NOT unblocked". It is now firing.
+
+**What this does and does not support.** Zero-to-nonzero is an EXISTENCE claim —
+the mechanism can fire, which a 28-minute process can establish. It is NOT a
+rate, and 24 skips against `unproven = 1360` is not a solved read path. Every
+prior attempt to read direction from young-process counters here has been
+retracted; the 2h gate stands unchanged.
+
+`pending_dedup` down 17 in 28 min is NOT evidence of draining — it is inside the
+run-to-run noise this queue has always shown.
