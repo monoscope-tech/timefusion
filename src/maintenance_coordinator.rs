@@ -773,6 +773,12 @@ pub struct TaskJournal {
     /// reservation can still be afforded. Atomic because `publish_statistics`
     /// takes `&self`; runtime only, never journalled.
     frontier_lag_secs: std::sync::atomic::AtomicU64,
+    /// Boundary micros of COMPLETED Dedup slices, per project then source, so
+    /// `rank` can prefer the pending slice that EXTENDS a completed run.
+    /// Runtime only — rebuilt from the snapshot at load, maintained by
+    /// `note_dedup_edges`; never journalled. Nested maps (not a tuple key) so
+    /// the per-task lookup in `rank` borrows `&str` and allocates nothing.
+    dedup_complete_edges: HashMap<String, HashMap<String, HashSet<i64>>>,
 }
 
 /// Ensures a claimed task cannot remain stuck in `Running` when its worker
@@ -965,7 +971,7 @@ impl TaskJournal {
                 }
             }
         }
-        Ok(Self {
+        let mut journal = Self {
             path,
             wal_path,
             snapshot,
@@ -979,7 +985,40 @@ impl TaskJournal {
             untagged_cells: HashSet::new(),
             claim_tick: 0,
             frontier_lag_secs: std::sync::atomic::AtomicU64::new(0),
-        })
+            dedup_complete_edges: HashMap::new(),
+        };
+        journal.rebuild_dedup_edges();
+        Ok(journal)
+    }
+
+    /// Rebuild the completed-dedup boundary index from the snapshot. Called
+    /// once at load; `note_dedup_edges` maintains it incrementally after that.
+    fn rebuild_dedup_edges(&mut self) {
+        self.dedup_complete_edges.clear();
+        let keys: Vec<TaskKey> = self
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.key.operation == Operation::Dedup && task.state == TaskState::Complete)
+            .map(|task| task.key.clone())
+            .collect();
+        for key in keys {
+            self.note_dedup_edges(&key);
+        }
+    }
+
+    /// Record a completed Dedup slice's boundaries so `rank` can prefer the
+    /// pending slice that EXTENDS a completed run. Insert-only and advisory: a
+    /// removed or compacted-away completion leaves a stale edge, which merely
+    /// biases a future claim toward a slice that no longer extends anything —
+    /// an ordering preference, never a correctness input.
+    fn note_dedup_edges(&mut self, key: &TaskKey) {
+        if key.operation != Operation::Dedup {
+            return;
+        }
+        let edges = self.dedup_complete_edges.entry(key.project_id.clone()).or_default().entry(key.source.clone()).or_default();
+        edges.insert(key.slice.start_micros);
+        edges.insert(key.slice.end_micros);
     }
 
     /// Early coordinator builds journaled the one-hour tier in ten-minute
@@ -1806,7 +1845,35 @@ impl TaskJournal {
         let (class, starved, width, benefit, order) = scheduling_class(task, now_micros);
         let hole = self.hole_rank(task);
         let (width, order) = if hole == 0 { (0, 0) } else { (width, order) };
-        (class, u8::from(hole > 0), starved, hole, width, benefit, order)
+        // CONTIGUITY for the Dedup lane — the exact role `hole_rank` plays for
+        // rollups ("newest-first is right for FRESHNESS and wrong for
+        // CONTIGUITY"), which the dedup lane never got. Certification grants a
+        // (project, date) only when `merge_clean_interval` covers the WHOLE
+        // day, and slice completions were landing as disjoint islands: prod
+        // 2026-09-05, 303 day-cells in the certify window held a MODE of 20-24
+        // islands each (worst 32 islands / 71 slices / 34.7% covered) — 25% of
+        // a day as 25 islands certifies nothing, where 25% as one run is a
+        // quarter of a grant. Measured offline first: certifying a day's files
+        // contiguously makes 29.1% of them read-path-skippable at 50% coverage
+        // vs 1.8% scattered, 16 of 16 project-dates.
+        //
+        // A slice sharing a boundary with a COMPLETED dedup slice ranks ahead
+        // of one seeding a new island; with no adjacent candidate every task
+        // ties at 1 and the established order (starved, width, recency, the
+        // `fair_cursors` rotation) is untouched. Positioned AFTER `starved` so
+        // it cannot re-starve what the horizon machinery escalates, and it is
+        // NOT folded into `hole` because `damaged = hole > 0` outranks
+        // `starved` — a slot this term must never touch. Sealed class only:
+        // class 0 keeps its frontier tuple unchanged.
+        let adjacent = class != 0
+            && task.key.operation == Operation::Dedup
+            && crate::config::try_config().is_none_or(|cfg| cfg.maintenance.timefusion_dedup_contiguity_rank)
+            && self
+                .dedup_complete_edges
+                .get(&task.key.project_id)
+                .and_then(|by_source| by_source.get(&task.key.source))
+                .is_some_and(|edges| edges.contains(&task.key.slice.start_micros) || edges.contains(&task.key.slice.end_micros));
+        (class, u8::from(hole > 0), starved, hole, u8::from(!adjacent), width, benefit, order)
     }
 
     /// The unit holding the most DEBT that is not being claimed, and why.
@@ -2108,6 +2175,9 @@ impl TaskJournal {
         // through here, so this is the one place it needs saying.
         self.removed_tasks.remove(&task.key);
         self.dirty_tasks.insert(task.key.clone());
+        if task.state == TaskState::Complete {
+            self.note_dedup_edges(&task.key);
+        }
         if let Some(index) = self.task_indices.get(&task.key).copied() {
             self.snapshot.tasks[index] = task;
         } else {
@@ -2845,6 +2915,7 @@ impl TaskJournal {
         task.state = TaskState::Complete;
         task.retry_reason = None;
         self.dirty_tasks.insert(key.clone());
+        self.note_dedup_edges(key);
         true
     }
 
@@ -2855,6 +2926,7 @@ impl TaskJournal {
         task.retry_reason = None;
         task.publication = Some(publication);
         self.dirty_tasks.insert(key.clone());
+        self.note_dedup_edges(key);
         true
     }
 
@@ -3460,7 +3532,7 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// is bounding how much of the claim budget the starved lane may take, the way
 /// `claim_next` already reserves one claim in two for sealed work.
 /// The claim-order tuple `claim_next` minimises: see `TaskJournal::rank`.
-type Rank = (u8, u8, u8, u8, i64, i64, i64);
+type Rank = (u8, u8, u8, u8, u8, i64, i64, i64);
 
 const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 /// The window dashboards actually read, and therefore the window maintenance has
@@ -4307,6 +4379,45 @@ mod tests {
         // And the unstarved days lose to ALL of it: u8::MAX is the worst value,
         // which is why raising the threshold cannot be the fix.
         assert!(day4 < day2, "an in-window starved date still outranks an unstarved newer one");
+    }
+
+    /// The contiguity term: a pending Dedup slice that EXTENDS a completed run
+    /// outranks the one that would seed a new island — certification grants a
+    /// (project, date) only when the merged intervals cover the WHOLE day, and
+    /// prod 2026-09-05 measured day-cells holding a mode of 20-24 disjoint
+    /// islands each (worst 32), so 25% coverage certified nothing. Named after
+    /// the mechanism, guarded against the regression where the pre-term
+    /// oldest-first order picked the island seed.
+    #[test]
+    fn a_dedup_slice_extending_a_completed_run_outranks_an_island_seed() {
+        const DAY: i64 = 24 * 60 * 60 * 1_000_000;
+        const TEN_MIN: i64 = 10 * 60 * 1_000_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("fresh journal");
+        let now = 400 * DAY;
+        // Sealed and inside the [3d, 31d] starved band, where the whole band
+        // TIES on `starved` and the order used to fall through to oldest-first.
+        let day = now - 10 * DAY;
+        let mut done = task("p", day + 2 * TEN_MIN, day + 3 * TEN_MIN, Operation::Dedup);
+        done.state = TaskState::Complete;
+        journal.upsert(done);
+
+        // The island seed carries the OLDER end, so the pre-term order picked
+        // it; the extender shares a boundary with the completed run.
+        let seed = task("p", day, day + TEN_MIN, Operation::Dedup);
+        let extend = task("p", day + 3 * TEN_MIN, day + 4 * TEN_MIN, Operation::Dedup);
+        assert!(journal.rank(&extend, now) < journal.rank(&seed, now), "the run-extending slice must outrank the island seed");
+
+        // With no adjacent candidate in play the established order is
+        // untouched: oldest-first still decides among non-adjacent slices.
+        let later_island = task("p", day + 5 * TEN_MIN, day + 6 * TEN_MIN, Operation::Dedup);
+        assert!(journal.rank(&seed, now) < journal.rank(&later_island, now), "non-adjacent slices keep the oldest-first order");
+
+        // Another project's completed run must not vouch for this one: same
+        // slice as `extend`, different project, and the adjacency slot reads 1.
+        let other_project = task("q", day + 3 * TEN_MIN, day + 4 * TEN_MIN, Operation::Dedup);
+        assert_eq!(journal.rank(&other_project, now).4, 1, "adjacency is per (project, source)");
+        assert_eq!(journal.rank(&extend, now).4, 0, "the extender is adjacent in its own project");
     }
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {

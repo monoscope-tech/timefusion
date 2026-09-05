@@ -2163,6 +2163,12 @@ pub struct MaintenanceConfig {
     /// concurrently by construction (the clamp) — revisit if that changes.
     #[serde_inline_default(220)]
     pub timefusion_maintenance_spill_max_gb: u64,
+    /// Emergency kill switch for the Dedup contiguity rank term (prefer the
+    /// slice that EXTENDS a completed run — see `TaskJournal::rank`). ON by
+    /// default; set `=false` only to revert the ordering in prod without a
+    /// build, the same contract as `timefusion_plan_cache_time_fns`.
+    #[serde_inline_default(true)]
+    pub timefusion_dedup_contiguity_rank: bool,
     /// Byte ceiling for ONE output file from a rewrite that writes through
     /// `RecordBatchWriter`, which has no target-size support — `flush()` emits
     /// one file per partition regardless of buffer size — so rewrite paths cut

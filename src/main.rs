@@ -223,6 +223,15 @@ fn init_cli_tracing() {
 /// `ssh ubuntu@captain.s.past3.tech 'docker cp <container>:/data/.timefusion_meta/maintenance_tasks.json -'`.
 fn run_sim_cli() -> anyhow::Result<()> {
     use timefusion::maintenance_sim::{SimConfig, load_sandboxed, run};
+    // The sim stays config-free by default (that's what lets it answer
+    // scheduler questions without a deploy) — but rank() reads its emergency
+    // kill switches through the global config, which is None here, so their
+    // defaults apply. Installing the config ONLY when such a switch is
+    // explicitly set keeps the default path config-free while letting an A/B
+    // arm exercise the switched-off ordering.
+    if std::env::var_os("TIMEFUSION_DEDUP_CONTIGUITY_RANK").is_some() {
+        timefusion::config::init_config().map_err(|e| anyhow::anyhow!("kill-switch env set but config failed to load: {e}"))?;
+    }
     let mut it = std::env::args().skip(2);
     let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--json]";
     let input = it.next().context(usage)?;

@@ -266,6 +266,16 @@ pub struct SimReport {
     /// population that carries the queue's bytes.
     pub claims_day_wide: u64,
     pub narrowest_sharded_run_micros: i64,
+    /// Contiguity outcome at sim end: completed sub-day Dedup slices merged
+    /// into runs per (project, source, day) inside the certify window.
+    /// `islands_total / island_cells` near 1.0 is the goal; prod 2026-09-05
+    /// measured a mode of 20-24 — partial coverage that certifies nothing.
+    pub dedup_island_cells: usize,
+    pub dedup_islands_total: usize,
+    /// Cells whose completed-dedup runs merge into ONE interval covering the
+    /// whole day — the shape certification grants on. The FLOW metric; the
+    /// island count above is stock.
+    pub dedup_cells_day_covered: usize,
     /// The most any single execution decoded, after runtime sharding. Above
     /// `MAX_DECODED_BYTES` means the memory bound was broken.
     pub max_run_bytes: u64,
@@ -941,6 +951,48 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     }
     if let Some((cell, units)) = report.units_per_cell.iter().max_by_key(|(_, units)| **units) {
         (report.max_cell, report.max_cell_units) = (cell.clone(), *units);
+    }
+    // The contiguity outcome: completed sub-day Dedup slices merged into runs,
+    // per (project, source, day) cell inside the 14-day certify window.
+    // Certification grants only when the merged runs cover the WHOLE day, so
+    // MANY islands at partial coverage is the shape that certifies nothing —
+    // prod 2026-09-05 measured a mode of 20-24 islands per cell.
+    {
+        let mut by_cell: HashMap<(String, String, i64), Vec<(i64, i64)>> = HashMap::new();
+        for task in journal.tasks() {
+            let slice = &task.key.slice;
+            if task.key.operation != Operation::Dedup || task.state != TaskState::Complete {
+                continue;
+            }
+            let age = now.saturating_sub(slice.end_micros);
+            if !(0..=14 * DAY_MICROS).contains(&age) {
+                continue;
+            }
+            by_cell
+                .entry((task.key.project_id.clone(), task.key.source.clone(), slice.start_micros.div_euclid(DAY_MICROS)))
+                .or_default()
+                .push((slice.start_micros, slice.end_micros));
+        }
+        let mut islands_total = 0usize;
+        for ((_, _, day), slices) in by_cell.iter_mut() {
+            slices.sort_unstable();
+            let mut runs = 0usize;
+            let mut open_end = i64::MIN;
+            for &(start, end) in slices.iter() {
+                runs += usize::from(start > open_end);
+                open_end = open_end.max(end);
+            }
+            islands_total += runs;
+            // The grant-relevant outcome: ONE run covering the whole day. The
+            // island count is stock (dominated by pre-sim state); this is the
+            // conversion that certification actually pays on. `open_end` is the
+            // union's max end — with runs == 1 the union is one interval from
+            // the first start to `open_end`.
+            let day_start = day * DAY_MICROS;
+            report.dedup_cells_day_covered += usize::from(runs == 1 && slices.first().is_some_and(|&(s, _)| s <= day_start) && open_end >= day_start + DAY_MICROS);
+        }
+        report.dedup_island_cells = by_cell.len();
+        report.dedup_islands_total = islands_total;
     }
     Ok(report)
 }

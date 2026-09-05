@@ -5075,3 +5075,34 @@ OFF, seeds 7 and 11.
 - The 12h islands/cell readout (13.79 vs 13.84) is STOCK dominated by pre-sim
   state and is not evidence either way — that was a metric-design error, caught
   before it decided anything.
+
+## 09:45 — the contiguity term PASSES its pre-registered gate; shipping
+
+24-hour A/B on the merged prod journal (89,542 tasks), release build, term
+toggled by the kill-switch env, both seeds:
+
+| metric | s7 OFF | s7 ON | s11 OFF | s11 ON |
+|---|---:|---:|---:|---:|
+| **`dedup_cells_day_covered`** (primary) | 40 | **43** | 15 | **22** |
+| `dedup_islands_total` | 3796 | 3735 | 4012 | 3951 |
+| `frontier_lag_secs_max` (guard) | 84451 | 84451 | 84752 | 84751 |
+| `claims_privileged` (guard) | 376 | 375 | 376 | 377 |
+| `completions.DerivedRollup` (guard) | 515 | 515 | 480 | 470 |
+| executions | 4631 | 4631 | 4470 | 4422 |
+
+Primary up in BOTH seeds (+7.5%, +47%); every guard inside its threshold
+(worst: DerivedRollup -2.1% on seed 11 vs a -10% bar). Same total work,
+better arranged — which is exactly what an ordering term should look like.
+
+**Two experiment errors caught before they decided anything, on the record:**
+the first islands metric was STOCK (dominated by 4k pre-sim islands — 12h
+verdict read "no effect" from an underpowered readout), and the first
+"refuted" reading nearly stuck before a 3-line check showed the term fires on
+50.3% of pending slices (not vacuous). The fix both times was a sharper metric
+(`day_covered`, the FLOW the grant pays on), not a bigger run.
+
+Mechanism note for the morning: adjacency is exact-boundary against completed
+slices; `coarsen_sealed_slices`' fused units share boundaries with completed
+10-min slices at their aligned edges, which is why the term fires at 50%, not
+~0%. Kill switch: `TIMEFUSION_DEDUP_CONTIGUITY_RANK=false`, the
+plan-cache-style emergency contract.
