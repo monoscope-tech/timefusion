@@ -4205,3 +4205,57 @@ retracted; the 2h gate stands unchanged.
 
 `pending_dedup` down 17 in 28 min is NOT evidence of draining — it is inside the
 run-to-run noise this queue has always shown.
+
+## 01:15 — defining the gate reading before taking it
+
+Uptime 3261 s (54 min). Gate is 7200 s (~02:17Z). Deltas over 26 min:
+
+| counter | 00:44 | 01:10 |
+|---|---:|---:|
+| `cert_granted_total` | 23 | 30 |
+| `cert_slice_files_proved` | 56 | 250 |
+| `cert_slice_files_unproven` | 1360 | 1874 |
+| `dedup_skipped` | 24 | **24 (flat)** |
+| `pending_dedup` | 2275 | **2364 (grew)** |
+| `dedup_probe_timeouts_total` | 34 | 50 |
+
+**`unproven` growing is NOT coverage going backward.** A 54-minute process is
+still ENUMERATING its 14-day window (`CERTIFY_WINDOW_DAYS = 14`,
+`uncertified_window_dates`), so the denominator is being DISCOVERED, not created.
+The comparable quantity is the ratio: `proved/(proved+unproven)` went
+**4.0% -> 11.8%**. Quote the ratio; the absolutes are not comparable at this age.
+
+**The read path, full surface at 01:10** — this is the number that matters for
+the customer query goal:
+
+| scan outcome | count | share of eligible |
+|---|---:|---:|
+| `dedup_eligible` | 2395 | — |
+| `dedup_skipped` | 24 | **1.0%** |
+| `dedup_denied_never_certified` | 1919 | **89.9%** |
+| `dedup_denied_fp_moved` | 215 | 9.0% |
+| `dedup_denied_no_window` | 236 | — |
+
+So the skip mechanism works and coverage is the constraint, at ~90% — which is
+exactly what `tf_certification_coverage_is_the_blocker_2026-09-01` said. Grants
+run ~33/hr. **`dedup_skipped` being FLAT at 24 across 26 minutes is the honest
+counterweight to last hour's "it fires for the first time".** It fired, then
+stopped.
+
+### Counter semantics, pinned so the gate reading is not improvised
+
+I nearly retracted the 36% -> 83% probe result on a suspected denominator defect.
+Checked the code instead:
+
+- `event="dedup_batch_probe_start"` — logged once per PASS, carries `groups=N`.
+  **Not a probe count.** My first grep counted these (23) and they do not
+  compare to `dedup_probe_timeouts_total` (50).
+- `event="dedup_batch_probe"` (maintain.rs:6324) — logged on EVERY successful
+  probe, dirty and certify-only alike (a certify-only group logs `queued=0`).
+  **This is the completion counter, and it is the right denominator.**
+- `event="dedup_batch_probe_timeout"` (maintain.rs:6398) — per probe, and the
+  only thing incrementing `dedup_probe_timeouts_total`.
+
+So completion rate = `dedup_batch_probe` / (`dedup_batch_probe` + `_timeout`),
+both from logs over one process's life. The earlier 83% used exactly this pair
+and stands.
