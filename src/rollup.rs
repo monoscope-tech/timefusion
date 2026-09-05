@@ -1489,6 +1489,57 @@ fn coalesced_column(expr: &datafusion::logical_expr::Expr) -> Option<(&str, &str
     }
 }
 
+/// A retained dimension filter can prove a COALESCE fallback unreachable.
+/// Only top-level AND terms establish this fact; an OR or a nullable comparison
+/// must keep its fallback and decline if that column is absent from the rollup.
+fn simplify_filtered_group(
+    expression: &datafusion::logical_expr::Expr, predicates: &[datafusion::logical_expr::Expr], dimensions: &[String],
+) -> datafusion::common::Result<datafusion::logical_expr::Expr> {
+    use datafusion::{
+        common::tree_node::{Transformed, TreeNode},
+        logical_expr::{Expr, Operator, utils::split_conjunction},
+    };
+    let non_null: std::collections::HashSet<_> = predicates
+        .iter()
+        .flat_map(split_conjunction)
+        .filter_map(|term| match term {
+            Expr::IsNotNull(expr) => match expr.as_ref() {
+                Expr::Column(column) => Some(column.name.as_str()),
+                _ => None,
+            },
+            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => match (binary.left.as_ref(), binary.right.as_ref()) {
+                (Expr::Column(column), Expr::Literal(value, _)) | (Expr::Literal(value, _), Expr::Column(column)) if !value.is_null() => {
+                    Some(column.name.as_str())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .filter(|column| dimensions.iter().any(|dimension| dimension == column))
+        .collect();
+    expression
+        .clone()
+        .transform_up(|node| {
+            let replacement = match &node {
+                Expr::ScalarFunction(function) if function.name() == "coalesce" => {
+                    function.args.first().filter(|first| column_name(first).is_some_and(|column| non_null.contains(column))).cloned()
+                }
+                Expr::Case(case) if case.expr.is_none() && case.when_then_expr.len() == 1 => {
+                    let (when, then) = &case.when_then_expr[0];
+                    match when.as_ref() {
+                        Expr::IsNotNull(probed) if matches!(probed.as_ref(), Expr::Column(column) if non_null.contains(column.name.as_str())) => {
+                            Some(then.as_ref().clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            Ok(replacement.map_or_else(|| Transformed::no(node), Transformed::yes))
+        })
+        .map(|result| result.data)
+}
+
 /// `extract(epoch from X)` — which DataFusion plans as `date_part('EPOCH', X)`
 /// — optionally under an integer cast, returning `X` and the cast's SQL type.
 ///
@@ -2471,6 +2522,8 @@ async fn route_with_spec(
     let mut groups = Vec::new();
     for (index, expression) in aggregate.group_expr.iter().enumerate() {
         let alias = aggregate.schema.field(index).name();
+        let simplified = simplify_filtered_group(expression, predicates, &spec.dimensions).map_err(|_| MissReason::UnsupportedShape)?;
+        let expression = &simplified;
         // monoscope's chart SQL groups by `extract(epoch from time_bucket(w,
         // timestamp))::integer`, never by the bare bucket, so every percentile
         // and grouped panel declined as `unsupported_shape` and scanned raw —
@@ -3612,6 +3665,26 @@ mod tests {
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
         );
         assert!(route_for(&state, &sql).await.is_err(), "an unservable group-by must report a reason, not fall through silently");
+    }
+
+    #[test_case::test_case("status_code = 'pickup_accepted'", true)]
+    #[test_case::test_case("status_code IS NOT NULL", true)]
+    #[test_case::test_case("status_code IS NULL", false)]
+    #[test_case::test_case("status_code = 'pickup_accepted' OR status_code IS NULL", false)]
+    #[tokio::test]
+    async fn filtered_chart_only_drops_an_unreachable_level_fallback(predicate: &str, routes: bool) {
+        let state = session().await;
+        let sql = format!(
+            "SELECT extract(epoch from time_bucket('2 hours', timestamp))::integer, \
+            COALESCE(coalesce(status_code, level)::text, 'null'), count(*)::float AS count_ \
+            FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND ({predicate}) \
+            GROUP BY time_bucket('2 hours', timestamp), COALESCE(coalesce(status_code, level)::text, 'null')"
+        );
+        let route = route_for(&state, &sql).await;
+        assert_eq!(matches!(route, Ok(Some(_))), routes, "{route:?}");
+        if routes {
+            assert_substitutes(&state, &sql, None).await;
+        }
     }
 
     /// The shapes that make `source_and_filters` refuse, each with the real
