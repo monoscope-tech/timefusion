@@ -5214,3 +5214,10 @@ Downstream, same afternoon: base rollups 248 -> ~150, derived 207 -> 121,
 certified day coverage 3 -> 78, cert grants 0-7/process -> 69. Still zero:
 `dedup_skipped` (needs a full 14-day window granted) — the last domino for
 the customer-query chain.
+
+## 17:11 — `pending_repair` = 0.
+
+252 in July. 251 at dawn. Zero tonight. The lane that could not complete one
+unit in six weeks cleared itself in under four hours once the sort could
+survive (220 GB spill cap), fit (its own reserved pool), and cycle (the first
+commit releasing the byte budget). Every exit verified `state=complete`.
