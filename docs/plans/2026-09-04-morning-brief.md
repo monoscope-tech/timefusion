@@ -4898,3 +4898,45 @@ the fingerprint) but it means the two lanes actively cannot help each other.
 `day_covered` 3 and grants 5 — **flat for 90 minutes**. `dedup_probe_timeouts_total`
 **11, flat for 2 hours**; tripwire **0**. `tasks_pending` 2459 -> 2305.
 `dedup_skipped` **0 of 15,281**.
+
+## 07:12 — 4.8 h: the stall BROKE. "Ceiling" was too strong; it is BURSTY.
+
+| counter | 197 | 227 | 257 | **287 min** |
+|---|---:|---:|---:|---:|
+| `cert_slice_day_covered` | 3 | 3 | 3 | **5** |
+| `cert_granted_total` | 5 | 5 | 5 | **7** |
+| `cert_refused_dropped` | — | — | 62 | **76** |
+| `dedup_probe_timeouts_total` | 11 | 11 | 11 | **11** |
+| `dirty_bin_batch_probe_clean_total` | 0 | 0 | 0 | **0** |
+| `tasks_pending` | 2400 | 2459 | 2305 | 2416 |
+| `dedup_skipped` / eligible | 0/11069 | 0/13088 | 0/15281 | **0/17301** |
+
+**Correction.** At 05:42 and again at 06:12 I described certification as
+"exhausted" and called candidate supply a **ceiling**. Over the full 4.8 h the
+series is **0 -> 3 -> 3 -> 3 -> 5**: bursty progress, not a ceiling. Ninety
+minutes of flat was not enough to call it exhaustion — **the same short-series
+error in a third costume**, after I had already named the rule twice tonight.
+
+The supply constraint is real; my characterisation of its SHAPE was wrong.
+Certification advances in bursts separated by long flats, which is exactly what a
+"prove what dedup happens to have cleaned" policy would produce.
+
+**What is stable across readings** — and it is a computation over a snapshot, not
+a delta:
+
+```
+cert_declined_dirty_bins / cert_probe_declined
+  06:45  10,662 / 170 = 62.7
+  07:12  10,805 / 171 = 63.2      of 144 bins
+```
+
+**~63 of 144 bins (44%) duplicate-bearing on a declined date, stable to within
+1%.** That is a structural constant of the data, and it is the one quantity
+tonight that has reproduced across independent readings.
+
+**`cert_refused_dropped` 62 -> 76** in 30 minutes: fourteen more dedup passes
+that removed duplicates and were refused a grant for having done so. The lanes
+continue to actively cancel each other.
+
+**`dedup_skipped` remains 0 of 17,301.** Five of fourteen days covered still buys
+nothing at the scan level — that requires all fourteen.
