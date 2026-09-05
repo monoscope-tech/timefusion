@@ -4259,3 +4259,57 @@ Checked the code instead:
 So completion rate = `dedup_batch_probe` / (`dedup_batch_probe` + `_timeout`),
 both from logs over one process's life. The earlier 83% used exactly this pair
 and stands.
+
+## 01:45 — the file-level skip has fired ZERO times, and overlap is why
+
+Uptime 5064 s. Grants have PLATEAUED: `cert_granted_total` +1 in 31 min, against
++7 in the 26 min before. My pre-registered gate assumed a clean split (plateau +
+LOW timeouts => budget starvation); timeouts kept climbing (+14), so this is the
+mixed case the pre-registration did not anticipate. The full certification
+surface resolves it, and into something better than either branch:
+
+| counter | value | against |
+|---|---:|---|
+| `cert_declined_dirty_bins` | **12,407** | 31 grants — **400:1** |
+| `cert_skip_blocked_overlap` | **4,264** | — |
+| **`cert_skip_files`** | **0** | — |
+| `dedup_skipped_per_file` | **0** | `dedup_skipped_per_date` = 1 |
+| `cert_slice_day_covered` / `partial` | 3 / 26 | slices rarely cover a day |
+| `cert_refused_dropped` | 20 | = dedup did work, refused by construction |
+
+**The per-FILE certification skip has fired exactly ZERO times in this process.**
+Every one of the 25 `dedup_skipped` came from the per-DATE path. `skippable_certified_files`
+(`src/read/mod.rs:200`) partitions certified files by whether any uncertified file
+OVERLAPS them in time, and 4,264 fell on the blocked side while 0 fell on the
+skippable side.
+
+The code's own comment already names the mechanism: *"overlap says certification
+is too SPARSE (a certified file still has an uncertified neighbour, so contiguous
+runs are what pay)"*. This is `tf_cert_works_contiguity_blocks_2026-08-22`
+measured again, a fortnight on, at a harder ratio.
+
+### Why this matters for the goal, and it joins the two halves
+
+The chain is now measured end to end:
+
+1. Compaction MERGES files, and merging UNIONS their time ranges
+   (`tf_compaction_and_dedup_fight_2026-09-04`) — the packer scores COUNT and
+   BYTES, never SPAN.
+2. Wider spans overlap more neighbours.
+3. More overlap => `skippable_certified_files` blocks => `cert_skip_files = 0`.
+4. No skip => every wide query pays full `DedupExec` => 30 d sits at ~45 s against
+   a 60 s cap (`tf_dedup_is_single_threaded_2026-09-04`).
+
+So **bounding file SPAN is not only a maintenance-cost lever, it is the unlock for
+the read-path skip** — the same fix serves "maintenance keeps up" and "customer
+queries stop timing out". That is a stronger reason to bound span than the
+maintenance-cost argument alone, which measured only 0.007%.
+
+**Two independent constraints, not one.** Certification PRODUCTION is blocked by
+dirty bins (12,407 declines); certification CONSUMPTION is blocked by overlap
+(4,264). Raising grants alone would not move `cert_skip_files` off zero while
+contiguity fails — the two need separate fixes, and only the second is on the
+query-latency path.
+
+**Still not the gate reading** (7200 s, ~02:17Z). Recorded now because it is a
+structural fact about zero, not a rate off a young process.
