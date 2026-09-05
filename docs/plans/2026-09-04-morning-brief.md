@@ -4475,3 +4475,59 @@ rate comparison at similar age, not a steady-state claim; the process now runs
 quiet to morning and that will give the steady-state figure.
 
 This closes the loop on the night's one code change.
+
+## 03:05 — THE SPAN_CAP CASE IS REFUTED, by the computation that was meant to support it
+
+Offline Delta-checkpoint audit (`v522002`, 25,614 rows), partition
+`date=2026-09-02`, 596 live files, all with timestamp stats. Read-only against
+object storage; no prod DB load. Checkpoint downloaded WHOLE before reading —
+OVH breaks pyarrow's ranged footer reads
+(`tf_ovh_checksum_breaks_pyarrow_footers_2026-08-19`).
+
+**First cut was wrong and I caught it:** I filtered on `date=` alone, mixing all
+11 projects, and got "p50 overlap 23". The partition key is
+`[project_id, date]`, so files in different projects never overlap in a scan.
+Corrected, per project:
+
+| project | n | p50 span | p90 span | max | p50 overlap | overlap=0 | drop >p90 -> overlap=0 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 87576849 | 201 | 1 | 3 | 112 | 6 | 4.0% | 18.2% |
+| **28f62f01** (whale) | 153 | 1 | 3 | 138 | 5 | **0.0%** | **1.4%** |
+| 00000000 | 79 | 1 | 3 | 133 | 3 | 1.3% | 5.6% |
+| dcad860a | 46 | 1 | 2 | 128 | 3 | 0.0% | **0.0%** |
+| 98fdd4f3 | 44 | 1 | 2 | 82 | 3 | 0.0% | 5.1% |
+| be87ebc1 | 36 | 1 | 2 | 59 | 2 | 0.0% | **0.0%** |
+| 6297304f | 30 | 1 | **78** | 101 | 2 | 0.0% | **66.7%** |
+
+**Files are NARROW.** p50 span is ONE bin; p90 is 2-3. Only 3.2% of the partition
+exceeds 20 bins. Yet essentially nothing is independently skippable, and the
+counterfactual settles it: **removing every file wider than p90 takes the whale
+project from 0.0% to 1.4%**, and two projects from 0.0% to 0.0%.
+
+**So `span_cap` would NOT unblock the read path**, and my 02:20 case for it —
+"bounding span is the unlock for the read path" — is REFUTED. The overlap is
+produced by many NARROW files piled on the same time ranges, not by wide ones.
+That is exactly what `skippable_certified_files`'s own comment says: certification
+is too SPARSE, and *"contiguous runs are what pay"*. I read that sentence twice
+tonight and still built the wide-file story on top of it.
+
+**What survives.** Wide files are real (2.9% > 48 bins; sealed consolidation's
+p50-84 outputs are in that tail) and one project — 6297304f — is genuinely
+span-blocked at 66.7%. So span_cap is a targeted fix for a MINORITY of the fleet,
+not the general unlock. Its maintenance-cost case (read amplification, ~3.7%
+ceiling) stands on its own merits and is unchanged.
+
+**The real lever is contiguity: certify whole days, not scattered slices.**
+`cert_slice_day_covered = 3` against `cert_slice_partial = 49` says days are
+almost never fully covered, and with p50 overlap of 3-6 among narrow neighbours,
+a file becomes skippable only when its whole neighbourhood is certified together.
+That reframes the target from "make files narrower" to "make certification
+CONTIGUOUS" — a different fix in a different lane.
+
+**METHOD.** This is the second time tonight a strong causal story survived
+several reasoning steps and died to one cheap measurement (the first was
+"certification is eating the dedup tick", killed by one tick of logs). The
+advisor's instruction to run the discriminating computation BEFORE writing the
+span_cap case is what stopped a deploy on the wrong lever. **A counterfactual —
+"if I removed the thing I blame, what changes?" — is worth more than any amount
+of mechanism narration.**
