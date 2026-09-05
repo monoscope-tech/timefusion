@@ -141,7 +141,7 @@ async fn main() {
     };
 
     if std::env::var("TF_BENCH_FLEET").is_ok() {
-        fleet(&path, pool_mb, bytes, spill.path()).await;
+        fleet(&path, pool_mb, bytes).await;
         return;
     }
 
@@ -320,7 +320,7 @@ async fn slice_floor(path: &str, bytes: u64, spill: &std::path::Path) {
 
 /// TF_BENCH_FLEET=1 TF_BENCH_PARQUET=… TF_BENCH_POOL_MB=8192 cargo bench --bench rewrite_throughput
 /// ```
-async fn fleet(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) {
+async fn fleet(path: &str, pool_mb: usize, bytes: u64) {
     println!(
         "
 {:<22} {:>8} {:>12} {:>12} {:>9}",
@@ -345,8 +345,14 @@ async fn fleet(path: &str, pool_mb: usize, bytes: u64, spill: &std::path::Path) 
         .filter(|rungs: &Vec<usize>| !rungs.is_empty())
         .unwrap_or_else(|| vec![1, 2, 4, 5, 6, 8, 10, 12, 16]);
     for workers in rungs {
+        // A FRESH spill directory per rung, dropped with the rung. The shared
+        // one accumulated every rung's spill for the whole ladder: 2026-09-05
+        // a 0.1 GB fixture took 60 GiB of free disk to 2.7 GiB by rung ten,
+        // after which every later rung failed on ENOSPC and read as a memory
+        // cliff. Spill is per-rung state; the pool is what the ladder varies.
+        let rung_spill = tempfile::tempdir().expect("spill dir");
         // ONE pool for all of them, sized as prod sizes the coordinator's.
-        let shared = runtime(pool_mb * 1024 * 1024, spill);
+        let shared = runtime(pool_mb * 1024 * 1024, rung_spill.path());
         let started = Instant::now();
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..workers {
