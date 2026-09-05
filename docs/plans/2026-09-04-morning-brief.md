@@ -5033,3 +5033,25 @@ and the next lever is known.
 **Not fixed tonight, named:** the permit-bounce stampede (attempts churn while
 the budget-holder runs) is noise, not damage; it resolves into real work once
 the budget-holder can finish.
+
+## 09:15 — post-deploy: the spill wall is GONE, and the next wall behind it is named
+
+`00f94d1` live at 08:35Z. Verdict at ~40 min:
+
+- **Zero `100.0 GB` spill-cap deaths** — the error that killed every whale
+  repair attempt for six weeks has not fired once post-deploy (5+/night
+  before). The fix works at its layer.
+- **The sorts now die one wall down**: `Not enough memory to continue external
+  sort`, every few minutes — allocations of ~640 MB failing with ~580 MB left
+  in the 8 GB fair pool while an unspillable `ExternalSorterMerge` holds its
+  peak. This is the KNOWN Aug-9 shape (`tf_repair_merge_unspillable`), most
+  likely the rewrite's own sort partitions contending inside its pool
+  (`tf_row_cap_guards_wrong_cost`: p8 OOMs where p1 takes 1 s).
+- `pending_repair` still 251. Attempts are now minutes-cheap instead of
+  18 min + 100 GB of disk each — strictly less waste, still zero completions.
+
+**Named, not attempted today:** the next lever is the sort-partition ladder /
+merge reservation sizing for the repair rewrite. That is DataFusion
+memory-tuning with its own scar tissue, and it deserves a rested session with
+`run-unit` and the phase timers, not a same-day third fix stacked on two
+unverified ones.
