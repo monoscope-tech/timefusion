@@ -5147,3 +5147,40 @@ is today's behaviour in a different pool name). The counter that decides it:
 repair `maintenance_task_finished` with a long `ran_secs` and `pending_repair`
 below 251 — or the same memory error naming the REPAIR pool, which would be
 the refutation, cleanly attributed.
+
+## 13:45 — THE FIRST WHALE FILE IS IN DELTA. The six-week-frozen lane moves.
+
+Under `7e97ce04` (repair in its own pool), the full path completed end-to-end
+for the first time since July:
+
+```
+13:07:24  wave_bin_staging_started   1 file, 818,071,104 bytes
+13:25:15  wave_bin_staged            rows_staged=915,691  outputs=2
+                                     upstream 540 s + write 514 s (~18 min)
+13:25:15.798  wave_committed         attempt=1  (commit itself: 368 ms)
+```
+
+An 818 MB pre-cut whale file, 915,691 rows, re-sorted into 2 outputs (the
+512 MB writer cut working as designed) and durably committed. During the same
+window the process logged ZERO memory errors and ZERO spill errors — under the
+old pool the identical sort died within minutes, every attempt, for six weeks.
+Peak observed spill for the day's big attempt: ~95 GB, inside the new 220 GB
+cap with ~300 GB host headroom.
+
+**What the counters will and won't show:** `pending_repair` counts UNITS
+(12-hour slices, ~4 suspect files each), so it stays 251 until a slice fully
+clears — expect the first decrement to 250 within ~an hour, and quote the drain
+RATE only from several readings. The projection to state honestly: rewrites
+cost ~18 min/file through one slot; probe-clears cost seconds; the mix decides
+whether the backlog drains in days or hours, and it is now measurable instead
+of frozen.
+
+Also confirmed in the same logs: with the repair sort out of the shared pool,
+Pack/dedup staging failures went to ZERO (previously one every 2-5 minutes),
+and `pending_dedup` hit a session low (2068).
+
+Correction for the record: the autoformat bot's pushes do NOT deploy —
+GITHUB_TOKEN pushes cannot trigger workflows. Every prod restart today was one
+of my four pushes. And CI's red on `7ad77c6`/`7e97ce0` is the Format job only
+(`cargo lint` does not run rustfmt); the bot's fmt commit already healed the
+tip. `cargo fmt --check` joins my pre-push gate.
