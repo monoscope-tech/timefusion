@@ -3586,6 +3586,23 @@ impl Database {
             }
             Ok(BinOutcome::Converged) => true,
             Ok(BinOutcome::Retry) => false,
+            // The repair byte budget is held by another rewrite, which runs
+            // 20-50 minutes. Requeue on THAT clock, under its own label — this
+            // case used to fall into the `compaction_incomplete` +30s arm
+            // below, which (a) re-claimed the unit ~10x per holder and paid a
+            // snapshot clone + file mapping + an `attempts` increment per spin,
+            // and (b) made `compaction_incomplete` unreadable: 142/h of it was
+            // this, not units that ran and died (prod 2026-09-05, 19 spins vs
+            // ZERO completions in 10 minutes, `pending_repair` frozen at 251).
+            // 300s not-before ≈ a tenth of the holder's runtime: late enough to
+            // kill the spin, early enough that a freed budget is picked up
+            // within minutes.
+            Ok(BinOutcome::BudgetBusy) => {
+                let mut journal = self.journal();
+                journal.retry(&key, "repair_budget_busy".to_owned(), crate::support::now_micros().saturating_add(300 * 1_000_000));
+                journal.checkpoint()?;
+                return Ok(true);
+            }
             Err(error) => {
                 let mut journal = self.journal();
                 journal.retry_or_split(&key, format!("compaction: {error:#}"), crate::support::now_micros().saturating_add(30 * 1_000_000), task.attempts);
@@ -7060,7 +7077,9 @@ impl Database {
     /// table lock, so waves parallelize instead of serializing behind the log. Uncommitted parquet is
     /// invisible to readers, and failures clean up their own staged files. `Retry` means the bin's
     /// files were rewritten concurrently; the project stays in rotation and the next re-plan serves
-    /// a fresh bin. `Converged` means nothing worth staging.
+    /// a fresh bin. `Converged` means nothing worth staging. `BudgetBusy` means another repair
+    /// rewrite holds the byte budget — re-approach on the holder's clock (minutes), not the
+    /// stale-selection clock.
     /// `pub(crate)` for the starvation regression test in `mod.rs` — the one
     /// that pins that a busy repair permit hands its worker back.
     pub(crate) async fn stage_hot_bin(
@@ -7155,7 +7174,7 @@ impl Database {
                             event = "repair_rewrite_permit_busy",
                             "other repair rewrites hold the byte budget; requeueing rather than parking a worker"
                         );
-                        return Ok(BinOutcome::Retry);
+                        return Ok(BinOutcome::BudgetBusy);
                     }
                 }
             }

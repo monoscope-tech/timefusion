@@ -1289,6 +1289,9 @@ impl Database {
                 // The chunk's rows vanished / were rewritten concurrently:
                 // nothing was verified, so the partition stays uncertified.
                 Ok(BinOutcome::Retry) => all_complete = false,
+                // Unreachable here (only `stage_hot_bin`'s repair arm produces
+                // it), but if it ever arrives the partition was not verified.
+                Ok(BinOutcome::BudgetBusy) => all_complete = false,
                 // Probe false-positive: verified duplicate-free, nothing to commit.
                 Ok(BinOutcome::Converged) => {}
                 Err(e) => {

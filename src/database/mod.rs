@@ -8775,6 +8775,15 @@ pub(crate) enum BinOutcome<T> {
     /// Selection went stale (concurrent rewrite); keep the project pending so
     /// the next round's re-plan serves it a fresh bin.
     Retry,
+    /// The repair byte budget is held by another rewrite. Distinct from `Retry`
+    /// because the two need OPPOSITE cadences: a stale selection is re-servable
+    /// immediately, but the budget holder is a 20-50 minute rewrite — prod
+    /// 2026-09-05 measured six claim→requeue cycles on the SAME slice inside
+    /// 240ms and 19 spins against ZERO repair completions in 10 minutes,
+    /// because this case was folded into `Retry` and re-queued at +30s under
+    /// the `compaction_incomplete` label (also poisoning that counter, which
+    /// is supposed to mean "ran and could not finish").
+    BudgetBusy,
 }
 
 /// Parallelism for one packing sort, bound by the tighter of two independent limits.
@@ -8924,6 +8933,10 @@ where
                     }
                 }
                 Ok(BinOutcome::Retry) => pending.push(project_id),
+                // The budget holder runs 20-50 minutes; keeping the project in
+                // rotation would spin every remaining round of this tick against
+                // the same held budget. Drop it — the next tick re-plans it.
+                Ok(BinOutcome::BudgetBusy) => {}
                 Ok(BinOutcome::Converged) => {}
                 // A dropped bin is the one outcome that always wants a reason —
                 // the aggregate "failed for N bins" names no project or cause.
@@ -20750,11 +20763,25 @@ mod tests {
         let cfg = create_test_config(&format!("repair-park-{}", uuid::Uuid::new_v4().simple()));
         let db = Database::with_config(cfg).await?;
         let schema = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").cloned();
-        let Some(table) = table else { return Ok(()) };
 
-        // Hold the only repair permit, as a live rewrite would.
-        let held = Arc::clone(&db.repair_rewrite_sem).try_acquire_owned().expect("the permit starts free");
+        // A REAL committed file, so the bin survives the vanished-selection
+        // check and actually reaches the permit. The first version of this test
+        // passed a nonexistent path, exited at that earlier branch, and pinned
+        // nothing about the permit at all — while prod spun on the branch it
+        // thought it covered (2026-09-05: 19 spins, zero completions, 10 min).
+        let project = format!("repair_busy_{}", uuid::Uuid::new_v4().simple());
+        let ts = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("r1", "op", &project, ts)])?], true, None).await?;
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").cloned().expect("table created");
+        let file = {
+            let t = table.read().await;
+            t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).find(|p| p.contains(&project)).expect("the committed file")
+        };
+
+        // Hold the WHOLE byte budget, as a live oversized rewrite does (the
+        // clamp prices prod's worst bins onto everything).
+        let budget = db.repair_rewrite_sem.available_permits();
+        let held = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(u32::try_from(budget).unwrap()).expect("the budget starts free");
 
         let started = std::time::Instant::now();
         let outcome = db
@@ -20762,14 +20789,31 @@ mod tests {
                 &table,
                 "otel_logs_and_spans",
                 schema,
-                "p",
-                vec!["nonexistent.parquet".to_owned()],
+                &project,
+                vec![file],
                 HotStageOptions { pass: TailPass::Repair, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None },
             )
             .await;
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "it must return immediately, not wait for the permit");
-        assert!(matches!(outcome, Ok(BinOutcome::Retry)), "and hand the worker back by requeueing");
+        // `BudgetBusy`, not `Retry`: the coordinator paces the two differently
+        // (+300s on the holder's clock vs +30s), and folding this into `Retry`
+        // is what produced the claim spin AND inflated `compaction_incomplete`.
+        assert!(matches!(outcome, Ok(BinOutcome::BudgetBusy)), "a held budget must report BudgetBusy, and hand the worker back");
         drop(held);
+
+        // The stale-selection outcome is unchanged: a vanished file still
+        // reports `Retry` (re-servable immediately), even with the budget free.
+        let outcome = db
+            .stage_hot_bin(
+                &table,
+                "otel_logs_and_spans",
+                schema,
+                &project,
+                vec!["nonexistent.parquet".to_owned()],
+                HotStageOptions { pass: TailPass::Repair, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None },
+            )
+            .await;
+        assert!(matches!(outcome, Ok(BinOutcome::Retry)), "a vanished selection stays Retry");
         Ok(())
     }
 
