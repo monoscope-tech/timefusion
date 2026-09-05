@@ -3297,6 +3297,27 @@ impl Database {
         Ok(true)
     }
 
+    /// The `RuntimeEnv` a coordinator compaction unit stages under.
+    ///
+    /// Repair gets its OWN pool (`repair_runtime_env`, `repair_pool_bytes` —
+    /// ~7.6 GB on prod), not the shared coordinator pool. That pool was reserved
+    /// all along and had NO callers on the coordinator path
+    /// (`tf_maintenance_pool_census_2026-09-01`), while the whale repair sort
+    /// died in the SHARED pool on memory that concurrent dedup/pack units held:
+    /// prod 2026-09-05, allocations of ~640 MB refused with ~580 MB remaining in
+    /// the 8 GB coordinator pool, 7.4 GB held by neighbours — and locally the
+    /// same sort's first ~690 MB allocation cannot fit the 614 MB local share at
+    /// all. A whole-file rewrite needs roughly one decoded row group (~700 MB
+    /// for these ~800 MB zstd files) as its floor, which no fair share of a
+    /// contended pool guarantees. Serialization is already the byte-budget
+    /// semaphore's job; the pool just has to stop being the lottery.
+    pub(crate) fn coordinator_compaction_runtime_env(&self, operation: crate::maintenance_coordinator::Operation) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+        match operation {
+            crate::maintenance_coordinator::Operation::Repair => self.repair_runtime_env(),
+            _ => self.coordinator_runtime_env(),
+        }
+    }
+
     async fn coordinator_compaction_files(&self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey) -> Result<Vec<String>> {
         use crate::maintenance_coordinator::Operation;
         let date = chrono::DateTime::from_timestamp_micros(key.slice.start_micros)
@@ -3552,7 +3573,7 @@ impl Database {
             // The resume lost its race (inputs no longer live). Fall through and
             // stage normally rather than failing the unit.
         }
-        let runtime = self.coordinator_runtime_env();
+        let runtime = self.coordinator_compaction_runtime_env(operation);
         let outcome = self
             .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
             .await;
@@ -8096,7 +8117,7 @@ impl Database {
     /// Load the persisted verified-sorted paths at boot, compacting the file if
     /// it has grown past [`REPAIR_VERIFIED_PERSIST_CAP`]. Newest entries win: the
     /// tail of the file is the most recently probed.
-    pub(crate) fn load_verified_sorted(&self) {
+    pub fn load_verified_sorted(&self) {
         let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (kept, dropped) = self.truncate_verified_file_locked();
         for path in &kept {

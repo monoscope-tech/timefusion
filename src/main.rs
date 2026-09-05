@@ -387,6 +387,12 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let project = project.context("--project is required")?;
     let date = date.unwrap_or_else(|| support::today_utc() - chrono::Duration::days(1));
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
+    // The server loads this in `start_maintenance_schedulers`, which run-unit
+    // deliberately skips — without it every invocation starts with an empty
+    // verified-sorted set, re-selects the same already-probed file, and a
+    // repeated run-unit loop never advances past it (12 identical iterations,
+    // 2026-09-05, before this line existed).
+    db.load_verified_sorted();
     let report = db.run_unit_once(&source, &project, date, operation, slice_hours, offset_hours).await?;
     println!("{report}");
     Ok(())

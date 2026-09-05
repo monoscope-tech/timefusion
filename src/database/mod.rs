@@ -18877,6 +18877,20 @@ mod tests {
         );
         assert_eq!(db.heavy_pool_bytes(), db.config.derived.heavy_share_bytes(), "the heavy pool must be the budget tree's heavy share, not a second opinion");
         assert!(!Arc::ptr_eq(&db.light_optimize_runtime_env(), &db.repair_runtime_env()), "sharing one RuntimeEnv is sharing one pool");
+        // The coordinator's Repair units must stage under repair's OWN pool.
+        // They ran in the shared coordinator pool until 2026-09-05, where the
+        // whale sort's ~650 MB allocations lost a lottery against whatever
+        // dedup/pack happened to hold — while `repair_pool_bytes` sat reserved
+        // with no coordinator-path caller (the 2026-09-01 pool census).
+        use crate::maintenance_coordinator::Operation;
+        assert!(
+            Arc::ptr_eq(&db.coordinator_compaction_runtime_env(Operation::Repair), &db.repair_runtime_env()),
+            "coordinator Repair must use the dedicated repair pool"
+        );
+        assert!(
+            Arc::ptr_eq(&db.coordinator_compaction_runtime_env(Operation::HotPacking), &db.coordinator_runtime_env()),
+            "non-repair coordinator work keeps the shared coordinator pool"
+        );
 
         // The brake must be blind to repair: an in-flight repair bin is exactly
         // the state that used to zero packing's throughput.

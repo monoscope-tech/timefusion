@@ -5106,3 +5106,44 @@ slices; `coarsen_sealed_slices`' fused units share boundaries with completed
 10-min slices at their aligned edges, which is why the term fires at 50%, not
 ~0%. Kill switch: `TIMEFUSION_DEDUP_CONTIGUITY_RANK=false`, the
 plan-cache-style emergency contract.
+
+## 11:05 — the repair memory wall, root-caused by run-unit and fixed
+
+The user pushed back on deferring this, correctly. The `run-unit` loop (the
+documented no-deploy iteration path) turned a 6-week prod mystery into a
+30-second local reproducer, and the reproducer named the defect:
+
+**The coordinator's Repair units staged under the SHARED coordinator pool while
+their own reserved pool sat caller-less.** The `2026-09-01` pool census had
+already found it — *"7.6 GB reserved, NO callers"* — without knowing what it
+meant. Evidence chain:
+
+- prod: repair sort allocations of ~640 MB refused with ~580 MB remaining in
+  the 8 GB coordinator pool — **7.4 GB held by concurrent dedup/pack units**;
+- local (uncontended coordinator share): the same sort's FIRST allocation
+  (~690 MB, roughly one decoded row group of an ~800 MB zstd whale file)
+  exceeds the entire local share — the ask has a hard floor no fair slice of a
+  contended pool guarantees;
+- switching the runtime env selection moved the failure pool from the
+  coordinator share to the repair pool in the error message — the selection
+  fix verified at the mechanism level.
+
+**Fix: `coordinator_compaction_runtime_env(operation)`** — Repair stages under
+`repair_runtime_env` (own pool, own spill dir, and it inherits the new 220 GB
+spill cap); everything else keeps the coordinator pool. Unit tests pin both
+selections by pointer identity.
+
+**Also fixed, found the same way:** `run-unit` never called
+`load_verified_sorted`, so a run-unit loop re-probed the same already-sorted
+file forever (12 identical iterations before the fix; the sidecar held the same
+path 13 times). One line — the server always did this at boot, the harness
+didn't.
+
+**Honest limits:** local completion of a whale rewrite is NOT proven — macOS
+memory detection clamps the budget to 8 GB (`effective_limit` is min-clamped),
+so the local repair pool tops out at ~435 MB vs prod's 7.6 GB. Shipping on:
+mechanism verified + pool reserved-and-idle + failure mode bounded (worst case
+is today's behaviour in a different pool name). The counter that decides it:
+repair `maintenance_task_finished` with a long `ran_secs` and `pending_repair`
+below 251 — or the same memory error naming the REPAIR pool, which would be
+the refutation, cleanly attributed.
