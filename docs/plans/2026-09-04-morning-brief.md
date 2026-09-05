@@ -5055,3 +5055,23 @@ merge reservation sizing for the repair rewrite. That is DataFusion
 memory-tuning with its own scar tissue, and it deserves a rested session with
 `run-unit` and the phase timers, not a same-day third fix stacked on two
 unverified ones.
+
+## 09:12 — pre-registered gate for the contiguity term (written BEFORE the 24h A/B lands)
+
+Primary: `dedup_cells_day_covered` (cells whose completed-dedup runs merge into
+ONE interval covering the whole day — the shape certification grants on), ON vs
+OFF, seeds 7 and 11.
+
+- **Ship default-ON** iff covered-cells improves in BOTH seeds and no guard
+  degrades.
+- **Guards:** `frontier_lag_secs_max` not >10% worse; `DerivedRollup`
+  completions not down >10%; `claims_privileged` (starvation rescue lane) not
+  down >20%. These are the three documented starvation scars, stated as
+  numbers.
+- **Mixed cells, enumerated:** primary up + any guard down => NO-SHIP, record
+  the trade. Primary flat/down => no-ship regardless of secondaries (a
+  throughput side-benefit is not what this term is for). Primary up in one
+  seed only => run seed 13; 2-of-3 decides.
+- The 12h islands/cell readout (13.79 vs 13.84) is STOCK dominated by pre-sim
+  state and is not evidence either way — that was a metric-design error, caught
+  before it decided anything.
