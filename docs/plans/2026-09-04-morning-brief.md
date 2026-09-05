@@ -4690,3 +4690,36 @@ is a real trade against the starvation guarantees those three regressions bought
 So: specified, evidenced, and left for a rested decision with a simulation
 backtest (`timefusion sim`) before it goes near prod. The evidence for it is
 strong — 47% vs 0% skippable, 43-vs-0 observed — and it will keep.
+
+## 04:45 — the contiguity result GENERALISES, and my headline number was the best case
+
+Same offline method, widened from one date to **16 project-dates** spanning
+2026-07-20 to 2026-08-31 (every project-date in the checkpoint with >=30 files):
+
+| | contiguous @50% | scattered @50% | contiguous @75% | scattered @75% |
+|---|---:|---:|---:|---:|
+| **mean, n=16** | **29.1%** | **1.8%** | **46.3%** | **9.0%** |
+| best (`2026-08-31`) | 45.2% | 9.7% | 71.0% | 41.9% |
+| worst (`2026-07-29`) | 1.9% | 0.0% | 7.5% | 0.0% |
+
+**The DIRECTION is robust: contiguous beats scattered in 16 of 16 project-dates,
+and scattered is exactly 0.0% in 13 of them.**
+
+**The MAGNITUDE was overstated.** My 03:15 headline — "the same work buys 47%
+skippable contiguously or 0% scattered" — came from `date=2026-09-02`, which is
+near the top of the distribution. The honest figures are **~29% at half coverage
+and ~46% at three-quarters**, with real variance: one date returns only 1.9% even
+perfectly ordered. Contiguity is a large, consistent multiplier (~16x at 50%
+coverage, ~5x at 75%), not a guarantee of a specific yield.
+
+That variance matters for how the fix should be judged: a per-date success
+criterion would fail on `2026-07-29` and look like a regression. The right
+criterion is the FLEET mean and the count of days reaching `day_covered > 0` —
+which is currently **0 of 47 partials** over 137 quiet minutes.
+
+### Quiet process, 137 minutes
+
+`dedup_probe_timeouts_total` **still 10 — zero new in a full hour**; tripwire 0.
+First sustained drain of the night: `pending_dedup` 2384 -> 2330, `tasks_pending`
+2708 -> 2650 over 30 min. Small, but it is the first decline I have seen that is
+not inside run-to-run noise, and it is on a process with no deploy interference.
