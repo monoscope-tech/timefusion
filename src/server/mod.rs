@@ -295,6 +295,30 @@ impl LoggingHandlerFactory {
         ]
     }
 
+    fn simple_for(&self, session_context: Arc<SessionContext>) -> Arc<LoggingSimpleQueryHandler> {
+        let _t = crate::observability::BlockWatch::new("pgwire_simple_handler_build");
+        Arc::new(
+            LoggingSimpleQueryHandler::builder()
+                .session_context(session_context)
+                .hooks(self.hooks())
+                .max_statement_secs(self.max_statement_secs)
+                .maybe_scan_metrics(self.scan_metrics.clone())
+                .maybe_db(self.db.clone())
+                .build(),
+        )
+    }
+
+    fn extended_for(&self, session_context: Arc<SessionContext>) -> Arc<LoggingExtendedQueryHandler> {
+        let _t = crate::observability::BlockWatch::new("pgwire_extended_handler_build");
+        Arc::new(
+            LoggingExtendedQueryHandler::builder()
+                .session_context(session_context)
+                .hooks(self.hooks())
+                .max_statement_secs(self.max_statement_secs)
+                .maybe_scan_metrics(self.scan_metrics.clone())
+                .build(),
+        )
+    }
     pub fn plan_cache(&self) -> Arc<PlanCacheHook> {
         self.plan_cache.clone()
     }
@@ -316,29 +340,20 @@ impl LoggingHandlerFactory {
 /// `TimedSection`. Auth itself is a string compare (`ConfigAuthSource`), which
 /// is why it is not separately timed.
 impl PgWireServerHandlers for LoggingHandlerFactory {
+    fn query_handlers(&self) -> (Arc<impl SimpleQueryHandler>, Arc<impl ExtendedQueryHandler>) {
+        // SessionContext::clone shares its mutable state. Clone the SessionState
+        // into a new context instead: catalogs/runtime/cache stay shared, while
+        // SET changes remain local to this connection and both protocol paths.
+        let session_context = Arc::new(SessionContext::new_with_state(self.session_context.state()));
+        (self.simple_for(session_context.clone()), self.extended_for(session_context))
+    }
+
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        let _t = crate::observability::BlockWatch::new("pgwire_simple_handler_build");
-        Arc::new(
-            LoggingSimpleQueryHandler::builder()
-                .session_context(self.session_context.clone())
-                .hooks(self.hooks())
-                .max_statement_secs(self.max_statement_secs)
-                .maybe_scan_metrics(self.scan_metrics.clone())
-                .maybe_db(self.db.clone())
-                .build(),
-        )
+        self.simple_for(self.session_context.clone())
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        let _t = crate::observability::BlockWatch::new("pgwire_extended_handler_build");
-        Arc::new(
-            LoggingExtendedQueryHandler::builder()
-                .session_context(self.session_context.clone())
-                .hooks(self.hooks())
-                .max_statement_secs(self.max_statement_secs)
-                .maybe_scan_metrics(self.scan_metrics.clone())
-                .build(),
-        )
+        self.extended_for(self.session_context.clone())
     }
 
     fn cancel_handler(&self) -> Arc<impl datafusion_postgres::pgwire::api::cancel::CancelHandler> {
@@ -1871,7 +1886,7 @@ mod streaming_tests {
         };
         use datafusion::{catalog::streaming::StreamingTable, execution::context::SessionContext};
         use tokio_postgres::NoTls;
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_target_partitions(4));
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let release = Arc::new(tokio::sync::Notify::new());
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])?;
@@ -1899,6 +1914,18 @@ mod streaming_tests {
         tasks.spawn(async move {
             let _ = connection.await;
         });
+        let (other, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
+        tasks.spawn(async move {
+            let _ = connection.await;
+        });
+        let explain = "EXPLAIN SELECT n, count(*) FROM gated GROUP BY n";
+        client.batch_execute("SET datafusion.execution.target_partitions = 1").await?;
+        let plan = |rows: Vec<tokio_postgres::Row>| rows.iter().map(|row| row.get::<_, String>(1)).collect::<Vec<_>>().join("\n");
+        assert!(plan(client.query(explain, &[]).await?).contains("mode=Single"), "extended queries must see this connection's simple SET");
+        assert!(plan(other.query(explain, &[]).await?).contains("RepartitionExec"), "another connection must retain its own settings");
+        other.batch_execute("SET datafusion.execution.target_partitions = 8").await?;
+        assert!(plan(client.query(explain, &[]).await?).contains("mode=Single"), "another connection's SET must not leak back");
+
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let rows = client.query_raw("SELECT n FROM gated", std::iter::empty::<&i32>()).await?;
             futures::pin_mut!(rows);

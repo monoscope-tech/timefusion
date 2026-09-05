@@ -545,8 +545,7 @@ pub async fn negotiate_tls<S>(
 macro_rules! process_socket_messages {
     ($socket:expr, $startup_timeout:expr, $handlers:expr) => {{
         let startup_handler = $handlers.startup_handler();
-        let simple_query_handler = $handlers.simple_query_handler();
-        let extended_query_handler = $handlers.extended_query_handler();
+        let (simple_query_handler, extended_query_handler) = $handlers.query_handlers();
         let copy_handler = $handlers.copy_handler();
         let cancel_handler = $handlers.cancel_handler();
         let error_handler = $handlers.error_handler();

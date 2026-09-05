@@ -551,6 +551,14 @@ pub trait PgWireServerHandlers: 'static {
         Arc::new(NoopHandler)
     }
 
+    /// Builds both query handlers for one connection. Override this to give
+    /// simple and extended queries shared connection-local state.
+    fn query_handlers(
+        &self,
+    ) -> (Arc<impl query::SimpleQueryHandler>, Arc<impl query::ExtendedQueryHandler>) {
+        (self.simple_query_handler(), self.extended_query_handler())
+    }
+
     /// Returns the handler for the startup/authentication phase.
     fn startup_handler(&self) -> Arc<impl auth::StartupHandler> {
         Arc::new(NoopHandler)
@@ -582,6 +590,12 @@ where
 
     fn extended_query_handler(&self) -> Arc<impl query::ExtendedQueryHandler> {
         (**self).extended_query_handler()
+    }
+
+    fn query_handlers(
+        &self,
+    ) -> (Arc<impl query::SimpleQueryHandler>, Arc<impl query::ExtendedQueryHandler>) {
+        (**self).query_handlers()
     }
 
     fn startup_handler(&self) -> Arc<impl auth::StartupHandler> {
