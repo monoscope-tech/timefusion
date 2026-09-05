@@ -4436,3 +4436,42 @@ The push at 02:11 should be the last. Any further default change is a new deploy
 and a new process, and a quiet process running to morning is a 4-6 HOUR reading —
 the rate data every retraction this week was missing. That is worth more than
 landing one more knob.
+
+## 02:45 — the per-table EMA fix VERIFIED in prod (`2602a6d`, uptime 998 s)
+
+The predicted signature, and it is unambiguous. TWO TABLES IN ONE TICK carrying
+DIFFERENT estimates — structurally impossible under the shared `AtomicU64`:
+
+| time | table | `probe_cost_ms` | groups |
+|---|---|---:|---:|
+| 02:30:00 | `otel_metrics` | 52,822 | 6 |
+| 02:30:58 | `otel_logs_and_spans` | 92,643 | 19 |
+
+And the per-table series for `otel_logs_and_spans` alone, learning its own cost
+and throttling monotonically as it does:
+
+| time | `probe_cost_ms` | groups |
+|---|---:|---:|
+| 02:26 | 0 (cold) | 32 |
+| 02:30 | 92,643 | 19 |
+| 02:35 | 137,855 | 17 |
+| 02:40 | 206,016 | 11 |
+
+**Contrast with the defect this replaced:** on the old build the same table sat at
+`probe_cost_ms=147` — dragged there by three cheap rollup probes — and was
+admitted the full cap of 32, whose wave then ate 137 s of a 239 s tick. It now
+converges to ~206,000 ms, which is its REAL cost, and takes 11.
+
+**Timeout rate, at comparable process age:**
+
+| build | timeouts | uptime | rate |
+|---|---:|---:|---:|
+| `9cc12bf` (shared EMA) | 34 | 1661 s | 1.23/min |
+| `2602a6d` (per-table) | 4 | 998 s | **0.24/min** |
+
+**~5x fewer probe timeouts**, with `dirty_bin_batch_probe_clean_total` still **0**
+— the estimator is not over-throttling. Both are young processes, so this is a
+rate comparison at similar age, not a steady-state claim; the process now runs
+quiet to morning and that will give the steady-state figure.
+
+This closes the loop on the night's one code change.
