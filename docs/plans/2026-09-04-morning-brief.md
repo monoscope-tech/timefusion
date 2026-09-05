@@ -5221,3 +5221,10 @@ the customer-query chain.
 unit in six weeks cleared itself in under four hours once the sort could
 survive (220 GB spill cap), fit (its own reserved pool), and cycle (the first
 commit releasing the byte budget). Every exit verified `state=complete`.
+
+## 19:41 — `dedup_skipped` fires: 4 scans shed their dedup work
+
+Zero on every reading all week (0 of 19,000+ eligible). Now nonzero — and on a
+19-minute process, so the PERSISTED certification ledger alone covers full scan
+windows. The whole chain the goal named, each link measured: repair unfrozen ->
+footers verified -> days certified -> windows granted -> scans skip DedupExec.
