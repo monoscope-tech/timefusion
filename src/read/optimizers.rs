@@ -3720,3 +3720,136 @@ mod range_parallel_dedup_tests {
         assert!(bounds[0].1 > bounds[0].0, "each branch must be non-empty:\n{plan}");
     }
 }
+
+/// Storage ordering is not sufficient evidence for closing aggregate groups.
+/// Older Parquet files can advertise sorted row groups without being sorted
+/// across row-group boundaries. Dedup preserves that order; it cannot repair it.
+/// Keep scan/LIMIT execution unchanged, but require aggregates to retain every
+/// group until completion unless a real sort establishes the input order.
+#[derive(Debug)]
+pub struct AggregateInputOrdering;
+
+#[derive(Debug)]
+struct UnorderedAggregateInput {
+    input: Arc<dyn ExecutionPlan>,
+    properties: Arc<datafusion::physical_plan::PlanProperties>,
+}
+
+impl UnorderedAggregateInput {
+    fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let mut properties = input.properties().as_ref().clone();
+        properties.eq_properties.clear_orderings();
+        Self { input, properties: Arc::new(properties) }
+    }
+}
+
+impl datafusion::physical_plan::DisplayAs for UnorderedAggregateInput {
+    fn fmt_as(&self, _: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "UnorderedAggregateInput")
+    }
+}
+
+impl ExecutionPlan for UnorderedAggregateInput {
+    fn name(&self) -> &'static str {
+        "UnorderedAggregateInput"
+    }
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] =
+            children.try_into().map_err(|_| datafusion::common::DataFusionError::Internal("UnorderedAggregateInput requires one child".into()))?;
+        Ok(Arc::new(Self::new(input)))
+    }
+    fn execute(&self, partition: usize, context: Arc<datafusion::execution::TaskContext>) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        self.input.execute(partition, context)
+    }
+}
+
+impl PhysicalOptimizerRule for AggregateInputOrdering {
+    fn name(&self) -> &str {
+        "AggregateInputOrdering"
+    }
+    fn schema_check(&self) -> bool {
+        true
+    }
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        fn relies_on_storage_order(plan: &Arc<dyn ExecutionPlan>) -> bool {
+            if downcast::<SortExec>(plan.as_ref()).is_some() || downcast::<UnorderedAggregateInput>(plan.as_ref()).is_some() {
+                return false;
+            }
+            downcast::<DedupExec>(plan.as_ref()).is_some() || plan.children().iter().any(|child| relies_on_storage_order(child))
+        }
+        plan.transform_up(|node| {
+            if downcast::<datafusion::physical_plan::aggregates::AggregateExec>(node.as_ref()).is_some() {
+                let input = node.children()[0];
+                if relies_on_storage_order(input) {
+                    let input = Arc::new(UnorderedAggregateInput::new(Arc::clone(input)));
+                    return Ok(Transformed::yes(node.with_new_children(vec![input])?));
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .data()
+    }
+}
+
+#[cfg(test)]
+mod aggregate_input_ordering_tests {
+    use super::*;
+    use datafusion::{
+        arrow::{
+            array::{Int64Array, TimestampMicrosecondArray},
+            datatypes::{DataType, Field, TimeUnit},
+            record_batch::RecordBatch,
+        },
+        datasource::{MemTable, source::DataSourceExec},
+        physical_plan::collect,
+        prelude::{SessionConfig, SessionContext},
+    };
+
+    #[tokio::test]
+    async fn aggregate_does_not_close_groups_on_untrusted_storage_order() -> Result<()> {
+        // A repeated bucket arrives after an older one, including across batches.
+        // This is the historical-file shape observed by the production probe.
+        for batches in [vec![vec![2, 1, 2, 0]], vec![vec![2, 1], vec![2, 0]]] {
+            let mut ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            crate::read::functions::register_custom_functions(&mut ctx).unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
+            let batches = batches
+                .into_iter()
+                .map(|values| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(TimestampMicrosecondArray::from(values.into_iter().map(|v| v * 1_000_000).collect::<Vec<_>>()).with_timezone("UTC"))],
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ctx.register_table("events", Arc::new(MemTable::try_new(schema, vec![batches])?.with_sort_order(vec![vec![col("ts").sort(false, false)]])))?;
+            let plan = ctx
+                .sql("SELECT time_bucket('1 second', ts) AS bucket, count(*) AS n FROM events GROUP BY 1 ORDER BY 1 DESC")
+                .await?
+                .create_physical_plan()
+                .await?;
+            // Use the real merge-on-read operator. A unique row key is not needed
+            // here: the repeated timestamp is in a later run, just like the scan.
+            let plan = plan
+                .transform_up(|node| {
+                    if downcast::<DataSourceExec>(node.as_ref()).is_some() {
+                        return Ok(Transformed::yes(Arc::new(DedupExec::new(node, vec!["ts".into()], None)?) as Arc<dyn ExecutionPlan>));
+                    }
+                    Ok(Transformed::no(node))
+                })
+                .data()?;
+            let plan = AggregateInputOrdering.optimize(plan, ctx.state().config_options())?;
+            let rows = collect(plan, ctx.task_ctx()).await?;
+            let mut counts = rows.iter().flat_map(|batch| batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect::<Vec<_>>();
+            counts.sort();
+            assert_eq!(counts, vec![1, 1, 2], "a bucket must be emitted once with its full count");
+        }
+        Ok(())
+    }
+}
