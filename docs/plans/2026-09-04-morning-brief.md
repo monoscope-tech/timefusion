@@ -4633,3 +4633,60 @@ The finding (contiguity pays, scattered does not) survives intact; the
 PRESCRIPTION was aimed at the wrong lane. Read the code path you intend to
 change before naming the change — the same lesson as the phantom env knob at
 01:15, one level up.
+
+## 04:15 — the fix has a PRECEDENT in the same function (and I am not shipping it tonight)
+
+Two-hour quiet reading first (uptime 6398 s):
+
+| counter | 77 min | 107 min |
+|---|---:|---:|
+| `dedup_probe_timeouts_total` | 10 | **10 — ZERO in 30 min** |
+| `dirty_bin_batch_probe_clean_total` | 0 | 0 |
+| `cert_slice_partial` | 24 | **43** |
+| `cert_slice_day_covered` | 0 | **0** |
+| `dedup_skipped` / `dedup_eligible` | 0 / 3887 | 0 / 5373 |
+
+Probe timeouts have effectively STOPPED — none in the last half hour, against 34
+in 28 minutes on the pre-fix build. That is the night's one code change, holding
+over two hours. **43 partial slice coverages and still zero completed days** is
+the contiguity failure, observed rather than simulated.
+
+### Where the contiguity fix belongs, exactly
+
+`MaintenanceCoordinator::rank` (`maintenance_coordinator.rs:1805`) returns
+`(class, damaged, starved, hole, width, benefit, recency)`. Its own doc says:
+
+> `hole_rank` orders WITHIN a class: a cell whose tier output is missing
+> outranks one that already has output ... **Newest-first is right for FRESHNESS
+> and wrong for CONTIGUITY, and 30 contiguous days is a contiguity goal.**
+
+**The coordinator ALREADY HAS a contiguity term — `hole_rank` — and it was built
+for the ROLLUP lane for precisely this reason.** The dedup lane has no analogue:
+nothing in `rank` prefers a slice ADJACENT to the already-certified run in its
+(project, date). So dedup slices are claimed by age/starvation and deposit
+disjoint islands, which is what `cert_slice_partial=43, day_covered=0` records.
+
+This is `tf_lane_coverage_gaps_2026-09-04` again — one mechanism, applied to one
+lane and not the other.
+
+**The specified change:** add a contiguity term to `rank` for Dedup units that
+prefers the slice extending the existing certified interval in its
+(project, date), mirroring `hole_rank`'s role for rollups.
+
+### Why I am NOT implementing it at 04:15
+
+That rank tuple is the most scarred code in the repo, and its own comment
+documents THREE separate starvation regressions caused by reordering it:
+`-width` buried narrow repair units (2026-08-23, three units nine hours past
+deadline); reversing width starved the opposite end because "the selection loop
+matches the winning tuple EXACTLY"; and damage had to be tied deliberately so
+`fair_cursors` could rotate. A new term inserted casually into that tuple starves
+something, and the failure mode is invisible for hours.
+
+It also needs a decision I should not make unilaterally: contiguity competes with
+`starved`, and preferring adjacency BY CONSTRUCTION delays the oldest work. That
+is a real trade against the starvation guarantees those three regressions bought.
+
+So: specified, evidenced, and left for a rested decision with a simulation
+backtest (`timefusion sim`) before it goes near prod. The evidence for it is
+strong — 47% vs 0% skippable, 43-vs-0 observed — and it will keep.
