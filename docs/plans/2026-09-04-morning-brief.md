@@ -4808,3 +4808,46 @@ at 3.**
 2793 -> 2400 over 2.5 h (~157/h). The maintenance backlog drains steadily on a
 quiet process even while certification stalls — the two lanes are decoupled, and
 only one of them is stuck.
+
+## 06:12 — 3.8 h: the stall holds, and my SECOND extrapolation also failed
+
+| counter | 167 | 197 | **227 min** |
+|---|---:|---:|---:|
+| `cert_slice_day_covered` | 3 | 3 | **3** |
+| `cert_granted_total` | 5 | 5 | **5** |
+| `cert_declined_dirty_bins` | — | — | **10,628** |
+| `cert_slice_partial` | 148 | 152 | 164 |
+| `dedup_probe_timeouts_total` | 10 | 11 | **11** |
+| `dirty_bin_batch_probe_clean_total` | 0 | 0 | **0** |
+| `tasks_pending` | 2501 | 2400 | **2459** |
+| `dedup_skipped` / eligible | 0/9148 | 0/11069 | **0/13088** |
+
+**Certification is flat for a full hour** — 3 covered days, 5 grants, against
+**10,628 dirty-bin declines**. A 2126:1 decline-to-grant ratio is the candidate-supply
+ceiling stated as a number: the provable set is tiny and already consumed.
+
+**The backlog drain I quoted at "~157/h" REVERSED.** Series: 2793 -> 2501 -> 2400
+-> **2459**. Net down 334 over ~2 h, but NOT monotonic. **That is the second rate
+I extrapolated from a short series tonight that did not hold, and I did it AFTER
+correcting the first one** (the 13-hour coverage projection at 05:12). The lesson
+did not transfer because I treated it as being about coverage specifically rather
+than about short series generally.
+
+**Standing rule for the morning reader: nothing in tonight's notes that is quoted
+as a RATE survived contact with the next reading. What survived is COUNTS and
+STRUCTURAL facts** — `cert_skip_files = 0`, `dedup_skipped = 0 of 13,088`, the
+2126:1 decline ratio, the per-table `probe_cost_ms` divergence, the 16-of-16
+contiguity direction. This matches
+`tf_what_survived_and_what_did_not_2026-09-04` exactly: computations over
+checkpoints survive, deltas over time do not.
+
+### What IS solid after 3.8 quiet hours
+
+| claim | evidence | confidence |
+|---|---|---|
+| Per-table EMA fix eliminates probe timeouts | 11 total in 227 min, flat 90+ min; pre-fix 34 in 28 min | **high** — steady state, one code change, verified signature |
+| It does not over-throttle | `dirty_bin_batch_probe_clean_total` = 0 across 227 min | **high** |
+| Read path is fully blocked | `dedup_skipped` 0 of 13,088; `cert_skip_files` 0 | **high** — a zero, not a trend |
+| Coverage ceiling is candidate SUPPLY | grants flat 60 min; 10,628 declines vs 5 grants | **high** |
+| Contiguity beats scattered ordering | 16 of 16 project-dates; 29.1% vs 1.8% at 50% | **high** for direction, medium for magnitude |
+| Backlog drains on a quiet process | 2793 -> 2459 net over 2 h, non-monotonic | **low** — direction only, no rate |
