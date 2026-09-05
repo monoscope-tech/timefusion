@@ -989,7 +989,8 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             // union's max end — with runs == 1 the union is one interval from
             // the first start to `open_end`.
             let day_start = day * DAY_MICROS;
-            report.dedup_cells_day_covered += usize::from(runs == 1 && slices.first().is_some_and(|&(s, _)| s <= day_start) && open_end >= day_start + DAY_MICROS);
+            report.dedup_cells_day_covered +=
+                usize::from(runs == 1 && slices.first().is_some_and(|&(s, _)| s <= day_start) && open_end >= day_start + DAY_MICROS);
         }
         report.dedup_island_cells = by_cell.len();
         report.dedup_islands_total = islands_total;
