@@ -4134,3 +4134,47 @@ three cheap probes on another table. Because the doctest reads the estimate by
 table name, a return to shared state cannot compile against it.
 
 Committed locally, NOT pushed — see the freeze above.
+
+## 01:15 — three wrong env knobs in CLAUDE.md, found by nearly reasoning from one
+
+Following the "today's partition holds ~467 files vs 2-5 on sealed dates" lead, I
+went to read `TIMEFUSION_LIGHT_OPTIMIZE_HOT_HOURS` — documented in CLAUDE.md with
+a default of 3 and a described behaviour ("hot-tail compaction only bin-packs
+today's sub-target files modified within this window; sealed files are the dedup
+cron's job"). **It does not exist anywhere in `src/`.** It was introduced in
+`8c6a32f3` and reverted the same day in `515a37b6`, 2026-07-19. The doc has
+described a live knob for ~7 weeks. I was one step from building an argument on
+it.
+
+Sweeping every `TIMEFUSION_*` name in CLAUDE.md against `src/` found two more:
+
+| documented | actual | effect if set |
+|---|---|---|
+| `TIMEFUSION_BUFFER_FLUSH_INTERVAL_SECS` | `TIMEFUSION_FLUSH_INTERVAL_SECS` | parses as nothing, default silently kept |
+| `TIMEFUSION_BUFFER_FLUSH_IMMEDIATELY` | `TIMEFUSION_FLUSH_IMMEDIATELY` | same |
+
+`envy` derives each env name from the STRUCT FIELD name, so the `BUFFER_` segment
+exists only where the field carries it — `timefusion_buffer_retention_mins` and
+`timefusion_buffer_max_memory_mb` do (those two entries were correct);
+`timefusion_flush_interval_secs` does not. **Nothing is misconfigured**: `.env`
+line 70 has always used `TIMEFUSION_FLUSH_INTERVAL_SECS=300`, the correct
+spelling. The defect is documentation-only — but CLAUDE.md is what a session
+reads first, and a knob that parses as nothing fails silently in the direction of
+"I set it, so it is on".
+
+Corrected locally. **NOTE FOR THE MORNING: `CLAUDE.md` is untracked here** — it
+is ignored by the user's global `~/.gitignore` (line 37), so this fix cannot be
+committed and will not reach anyone else's checkout. Worth deciding whether the
+project's own instructions should be excluded from the project's history.
+
+This is the same shape as "capabilities described by COMMENTS all failed"
+(2026-09-04), extended one level out: capabilities described by the PROJECT
+INSTRUCTIONS also fail. Read the code before quoting the doc.
+
+### Status at the freeze midpoint
+
+Full suite **1388/1388 green** on the frozen commits, so they are push-ready the
+moment the reading lands. CI on master is green including E2E — the previously
+red gate is resolved. No prod queries during the freeze: heavy ad-hoc SELECTs can
+OOM the memory-tight instance, and an OOM restart would destroy the very window
+being protected.
