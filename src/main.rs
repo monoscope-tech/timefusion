@@ -100,6 +100,7 @@ fn main() -> anyhow::Result<()> {
         Some("optimize") => rt.block_on(run_optimize_cli(cfg)),
         Some("migrate-columns") => rt.block_on(run_migrate_columns_cli(cfg)),
         Some("run-unit") => rt.block_on(run_unit_cli(cfg)),
+        Some("retention") => rt.block_on(run_retention_cli(cfg)),
         _ => {
             let result = rt.block_on(async_main(cfg));
             // Must END THE PROCESS here: dropping the runtime waits on
@@ -897,6 +898,114 @@ async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> 
         _ => println!("migrated: stored schema now has {} columns", report.stored_after),
     }
     Ok(())
+}
+
+/// Retention CLI (`timefusion retention --older-than-days N --table A,B [--dry-run] [--yes]`).
+///
+/// Drops whole `date=` partitions older than the cutoff via the fork's
+/// PARTITION-ONLY delete: the predicate references only the `date` partition
+/// column, so the builder evaluates it against `partitionValues_parsed` and
+/// commits pure Remove actions — no data scan, no rewrite, no deletion
+/// vectors. Meant to run OFF-BOX against prod storage like `optimize`;
+/// commits OCC-retry against the live server safely.
+///
+/// **Never route retention through pgwire `DELETE`**: on a `version_append`
+/// table that path APPENDS a full-row tombstone per deleted row — for a
+/// retention sweep that is billions of appended rows, the opposite of cleanup.
+///
+/// **Scope: unified tables ONLY — bring-your-own-bucket projects are exempt
+/// from the 30-day promise and are structurally unreachable here.** Every
+/// table is resolved via `get_or_create_unified_table`, whose root is the
+/// default bucket/prefix; custom-storage projects live in their own Delta
+/// tables at their own bucket (`get_or_create_custom_table`) and this command
+/// never opens those. Keep it that way — a `--project` flag pointed at a
+/// custom table would silently break that contract.
+///
+/// Physical bytes are reclaimed by the existing vacuum cron only after
+/// `timefusion_vacuum_retention_hours` (default 72 — a floor with a data-loss
+/// incident behind it; see the config doc). This command deliberately does NOT
+/// vacuum early: the delete makes the data invisible and unmaintained
+/// immediately, which is the part that matters, and the 72h window keeps one
+/// bad cutoff recoverable via time travel.
+async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
+    init_cli_tracing();
+
+    let mut tables: Vec<String> = Vec::new();
+    let mut older_than_days: Option<i64> = None;
+    let mut dry_run = false;
+    let mut yes = false;
+    let mut it = std::env::args().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--table" => tables.extend(it.next().context("--table needs a value")?.split(',').map(str::to_owned)),
+            "--older-than-days" => {
+                older_than_days = Some(it.next().context("--older-than-days needs a value")?.parse().context("--older-than-days must be an integer")?)
+            }
+            "--dry-run" => dry_run = true,
+            "--yes" => yes = true,
+            other => anyhow::bail!("unknown argument: {other} (usage: timefusion retention --older-than-days N --table A[,B,...] [--dry-run] [--yes])"),
+        }
+    }
+    let days = older_than_days.context("--older-than-days is required")?;
+    anyhow::ensure!(days >= 7, "refusing a cutoff under 7 days — that is not retention, that is data loss");
+    anyhow::ensure!(!tables.is_empty(), "--table is required; retention never guesses at a table list");
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).date_naive();
+    let predicate = format!("date < '{cutoff}'");
+
+    let db = Database::with_config(Arc::new(cfg.clone())).await?;
+    println!("retention cutoff: {predicate}  (today - {days}d)\n");
+
+    // Inventory first, from the same snapshot the delete will run against.
+    let mut plan: Vec<(String, usize, i64, usize)> = Vec::new();
+    for t in &tables {
+        let table_ref = db.get_or_create_unified_table(t).await?;
+        let (old_files, old_bytes, total) = {
+            let table = table_ref.read().await;
+            let mut old_files = 0usize;
+            let mut old_bytes = 0i64;
+            let mut total = 0usize;
+            for f in table.snapshot()?.log_data().iter() {
+                total += 1;
+                let path = f.path();
+                let Some(date) = path.split("date=").nth(1).and_then(|s| s.split('/').next()) else { continue };
+                if date < cutoff.to_string().as_str() {
+                    old_files += 1;
+                    old_bytes += f.size();
+                }
+            }
+            (old_files, old_bytes, total)
+        };
+        println!("  {t:52} {old_files:>6}/{total:<6} files past cutoff, {:.2} GB", old_bytes as f64 / 1e9);
+        plan.push((t.clone(), old_files, old_bytes, total));
+    }
+    let (files, bytes): (usize, i64) = plan.iter().fold((0, 0), |(f, b), p| (f + p.1, b + p.2));
+    println!("\nTOTAL: {files} files, {:.2} GB across {} table(s)", bytes as f64 / 1e9, plan.len());
+
+    if dry_run {
+        println!("DRY RUN — no changes made");
+        return db.shutdown().await;
+    }
+    anyhow::ensure!(yes, "pass --yes to commit the deletion (or --dry-run to stop here)");
+
+    for (t, old_files, _, _) in &plan {
+        if *old_files == 0 {
+            println!("  {t}: nothing past cutoff, skipping");
+            continue;
+        }
+        let table_ref = db.get_or_create_unified_table(t).await?;
+        // Snapshot clone, no lock across the commit — the same shape as DML.
+        let table = { table_ref.read().await.clone() };
+        let (new_table, metrics) = table.delete().with_predicate(predicate.as_str()).await.with_context(|| format!("retention delete on {t}"))?;
+        anyhow::ensure!(
+            metrics.num_added_files == 0,
+            "{t}: retention delete REWROTE {} files — the predicate was not partition-only; aborting",
+            metrics.num_added_files
+        );
+        println!("  {t}: removed {} files (version {})", metrics.num_removed_files, new_table.version().unwrap_or(0));
+        *table_ref.write().await = new_table;
+    }
+    println!("\ndone — physical bytes reclaim via the vacuum cron after the {}h retention window", cfg.maintenance.timefusion_vacuum_retention_hours);
+    db.shutdown().await
 }
 
 /// One-off compaction CLI (`timefusion optimize [...]`): compacts old `date=`
