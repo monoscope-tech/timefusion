@@ -63,7 +63,7 @@ mod write;
 /// The decode ratio every sort budget is denominated in — re-exported so
 /// `config` can DERIVE the repair budget from it rather than hand-copy a 12.
 pub(crate) use maintain::DECODED_BYTES_PER_COMPRESSED;
-pub use maintain::probe_groups_for_budget;
+pub use maintain::{note_probe_cost_into, probe_groups_for_budget};
 
 /// Delta tables shared by default projects and partitioned by `project_id`.
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
@@ -2874,10 +2874,11 @@ pub struct Database {
     /// Last Tantivy coverage census. Metadata-only, so it is throttled by time
     /// rather than by admission.
     tantivy_census_at: Arc<std::sync::atomic::AtomicI64>,
-    /// Milliseconds one dedup batch probe has been observed to take, as an EMA.
-    /// Zero means nothing has completed yet. Sizes probe admission — see
-    /// [`crate::database::probe_groups_for_budget`].
-    dedup_probe_cost_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Milliseconds one dedup batch probe has been observed to take, as an EMA
+    /// PER TABLE — cost spans ~1500x between tables, so one shared figure sizes
+    /// admission by whichever table probed last. Absent means nothing has
+    /// completed yet. See [`crate::database::probe_groups_for_budget`].
+    dedup_probe_cost_ms: Arc<dashmap::DashMap<String, u64>>,
     maintenance_schedule_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Bounded exponential retry state for failed source-partition rollup builds.
     rollup_backoff: Arc<dashmap::DashMap<RollupCoverageKey, (u32, std::time::Instant)>>,
@@ -3675,7 +3676,7 @@ impl Database {
             maintenance_admission,
             maintenance_debt_planned_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             tantivy_census_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
-            dedup_probe_cost_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dedup_probe_cost_ms: Arc::new(dashmap::DashMap::new()),
             maintenance_schedule_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rollup_backoff: Arc::new(dashmap::DashMap::new()),
             logical_count_cache,

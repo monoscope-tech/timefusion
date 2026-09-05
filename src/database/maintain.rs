@@ -445,6 +445,46 @@ pub fn probe_groups_for_budget(permits: usize, budget: std::time::Duration, obse
     fit.clamp(permits.min(cap), cap)
 }
 
+/// Fold one probe's wall clock into the admission estimate, as a half-weight EMA.
+///
+/// Half weight because probe cost varies by an order of magnitude with a date's
+/// file count, so admission must track it without chasing a single outlier into
+/// either a wedged pass or another doomed wave.
+///
+/// Keyed PER TABLE because cost varies ~1500x BETWEEN tables, and one shared
+/// figure is then sized by whichever table probed last. Prod 2026-09-05, one
+/// dedup tick: `otel_logs_and_spans` was correctly throttled to the 10-group
+/// floor at 226,882 ms, then three rollup-table probes (482, 1129, 148 ms)
+/// dragged the shared EMA to 147 ms and the SAME table was admitted at the full
+/// cap of 32. Its wave then ate 137 s of a 239 s tick.
+///
+/// ```
+/// # use timefusion::database::{note_probe_cost_into, probe_groups_for_budget as fit};
+/// # use std::time::Duration;
+/// let costs = dashmap::DashMap::new();
+/// note_probe_cost_into(&costs, "otel_logs_and_spans", 226_882);
+/// // Three cheap probes on OTHER tables must not move the big table's estimate.
+/// for ms in [482, 1129, 148] {
+///     note_probe_cost_into(&costs, "rollup_1h", ms);
+/// }
+/// let observed = |t: &str| costs.get(t).map(|ms| Duration::from_millis(*ms));
+/// assert_eq!(observed("otel_logs_and_spans"), Some(Duration::from_millis(226_882)));
+/// assert_eq!(fit(10, Duration::from_secs(239), observed("otel_logs_and_spans"), 32), 10);
+/// assert_eq!(fit(10, Duration::from_secs(239), observed("rollup_1h"), 32), 32);
+///
+/// // A second sample on the same table moves it half way, not all the way.
+/// note_probe_cost_into(&costs, "otel_logs_and_spans", 100_000);
+/// assert_eq!(observed("otel_logs_and_spans"), Some(Duration::from_millis(163_441)));
+/// ```
+pub fn note_probe_cost_into(costs: &dashmap::DashMap<String, u64>, table_name: &str, ms: u64) {
+    match costs.get_mut(table_name) {
+        Some(mut prior) => *prior = (*prior + ms) / 2,
+        None => {
+            costs.insert(table_name.to_string(), ms);
+        }
+    }
+}
+
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
 pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
@@ -6170,16 +6210,8 @@ impl Database {
         self.batch_probe_classify(table, table_name, Vec::new(), candidates, deadline).await;
     }
 
-    /// Fold one probe's wall clock into the admission estimate.
-    ///
-    /// Half-weight EMA: probe cost varies by an order of magnitude with a date's
-    /// file count, so admission must track it without chasing a single outlier
-    /// into either a wedged pass or another doomed wave.
-    fn note_probe_cost(&self, elapsed: std::time::Duration) {
-        let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        let _ = self.dedup_probe_cost_ms.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |prior| {
-            Some(if prior == 0 { ms } else { (prior + ms) / 2 })
-        });
+    fn note_probe_cost(&self, table_name: &str, elapsed: std::time::Duration) {
+        note_probe_cost_into(&self.dedup_probe_cost_ms, table_name, u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
     }
 
     /// Runs the batch probe over each (project, date) with ≥2 queued bins and
@@ -6244,10 +6276,7 @@ impl Database {
         // this changes ORDER, not how much bin classification gets done — while
         // the certify-only class gets an equal share instead of the remainder.
         let certify_only: Vec<_> = certify_only.into_iter().map(|group| (group, Vec::new())).collect();
-        let observed = match self.dedup_probe_cost_ms.load(Relaxed) {
-            0 => None,
-            ms => Some(std::time::Duration::from_millis(ms)),
-        };
+        let observed = self.dedup_probe_cost_ms.get(table_name).map(|ms| std::time::Duration::from_millis(*ms));
         let groups = interleave_probe_groups(groups, certify_only, probe_groups_for_budget(permits, budget, observed, 2 * BATCH_PROBE_GROUPS));
         // BEFORE the probes, not only after each one. Every other line in this
         // phase is emitted on completion, so a phase that does not complete
@@ -6257,9 +6286,9 @@ impl Database {
             table_name,
             groups = groups.len(),
             budget_secs = deadline.saturating_duration_since(std::time::Instant::now()).as_secs(),
-            // What sized the admission. `probe_cost_ms=0` means the estimate is
-            // still cold and `groups` is the old fixed cap.
-            probe_cost_ms = self.dedup_probe_cost_ms.load(Relaxed),
+            // What sized the admission, for THIS table. `probe_cost_ms=0` means
+            // the estimate is still cold and `groups` is the old fixed cap.
+            probe_cost_ms = self.dedup_probe_cost_ms.get(table_name).map_or(0, |ms| *ms),
             event = "dedup_batch_probe_start"
         );
         let clean: HashSet<(String, String, i64)> = futures::stream::iter(groups.into_iter().map(|((project, date), bins)| async move {
@@ -6287,7 +6316,7 @@ impl Database {
             let started = std::time::Instant::now();
             match tokio::time::timeout(remaining, self.probe_dup_bins(table, table_name, &project, &date)).await {
                 Ok(Ok(dup_bins)) => {
-                    self.note_probe_cost(started.elapsed());
+                    self.note_probe_cost(table_name, started.elapsed());
                     let stats = crate::observability::maintenance_stats();
                     let cleared: Vec<_> = bins.iter().filter(|b| !dup_bins.contains(b)).map(|b| (project.clone(), date.clone(), *b)).collect();
                     stats.dirty_bin_processed.fetch_add(cleared.len() as u64, Relaxed);
@@ -6364,7 +6393,7 @@ impl Database {
                     // once admission stops creating late starters, the timeouts
                     // that remain are genuinely expensive dates that ran most of
                     // a budget.
-                    self.note_probe_cost(started.elapsed());
+                    self.note_probe_cost(table_name, started.elapsed());
                     crate::observability::maintenance_stats().dedup_probe_timeouts.fetch_add(1, Relaxed);
                     warn!(project, table_name, date, event = "dedup_batch_probe_timeout");
                     Vec::new()
