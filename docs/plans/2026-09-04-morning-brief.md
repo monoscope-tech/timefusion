@@ -4851,3 +4851,50 @@ checkpoints survive, deltas over time do not.
 | Coverage ceiling is candidate SUPPLY | grants flat 60 min; 10,628 declines vs 5 grants | **high** |
 | Contiguity beats scattered ordering | 16 of 16 project-dates; 29.1% vs 1.8% at 50% | **high** for direction, medium for magnitude |
 | Backlog drains on a quiet process | 2793 -> 2459 net over 2 h, non-monotonic | **low** — direction only, no rate |
+
+## 06:45 — the supply constraint, QUANTIFIED (and my 2126:1 ratio was a unit error)
+
+**Correction first.** I quoted "`cert_declined_dirty_bins` 10,628 against 5
+grants — a 2126:1 decline-to-grant ratio". That is a UNIT MISMATCH:
+`cert_declined_dirty_bins` is *"summed dirty BINS across declined dates"*
+(mod.rs:363), while `cert_granted_total` counts DATES. The ratio is meaningless
+and I should not have quoted it. This is precisely the "ratios from undefined
+counters" failure in my own `tf_what_survived_and_what_did_not_2026-09-04`, and
+it is the THIRD time tonight I have quoted a number without reading its
+definition.
+
+**The ratio the code actually names**, and it is the useful one:
+
+```
+cert_declined_dirty_bins / cert_probe_declined = 10,662 / 170 = 62.7
+```
+
+**62.7 dirty bins per declined date, out of 144 — 43.5% of a day's 10-minute
+bins are duplicate-bearing.** The counter's own doc states the interpretation:
+*"A low ratio means duplicates are CONCENTRATED and bin-scoped removal cleans a
+date in minutes; a high one means they are spread and the full-date unit is
+unavoidable. Nothing outside the process can measure this."*
+
+**This is the supply constraint as a number.** Making ONE date provable costs
+~63 bin rewrites, and the full-date unit — the expensive, timeout-prone one — is
+unavoidable. It confirms `tf_dedup_removal_is_the_constraint_2026-09-01`
+("duplicates SPARSE but SPREAD, so certification CANNOT lead") with a precise
+figure instead of an adjective.
+
+**Consequence for the contiguity fix.** It is now conclusively
+necessary-but-not-sufficient: ordering slices cannot help when 43.5% of every
+candidate day must be rewritten before that day can be granted at all. The
+ordering fix improves what happens to the dates you CAN prove; it does nothing
+about a supply of 3 in 14.
+
+**Also visible:** `cert_refused_dropped = 62` — 62 dedup passes that successfully
+REMOVED duplicates and were refused a grant by construction, because
+`record_certification` grants only when `dropped == 0`. Work that fixes the
+problem cannot prove the problem is fixed. That rule is sound (a rewrite moves
+the fingerprint) but it means the two lanes actively cannot help each other.
+
+### 4.3 h quiet-process state
+
+`day_covered` 3 and grants 5 — **flat for 90 minutes**. `dedup_probe_timeouts_total`
+**11, flat for 2 hours**; tripwire **0**. `tasks_pending` 2459 -> 2305.
+`dedup_skipped` **0 of 15,281**.
