@@ -5,23 +5,22 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::channel::oneshot;
-use futures::future::{Either, select};
+use futures::future::{select, Either};
 use futures::sink::{Sink, SinkExt};
 use futures::stream::StreamExt;
 
 use super::portal::Portal;
-use super::results::{Tag, into_row_description};
+use super::results::{into_row_description, Tag};
 use super::stmt::{NoopQueryParser, QueryParser, StoredStatement};
 use super::store::PortalStore;
-use super::{ClientInfo, ClientPortalStore, ConnectionHandle, DEFAULT_NAME, copy};
-use crate::api::PgWireConnectionState;
-use crate::api::Type;
+use super::{copy, ClientInfo, ClientPortalStore, ConnectionHandle, DEFAULT_NAME};
 use crate::api::portal::PortalExecutionState;
 use crate::api::results::{
     DescribePortalResponse, DescribeResponse, DescribeStatementResponse, QueryResponse, Response,
 };
+use crate::api::PgWireConnectionState;
+use crate::api::Type;
 use crate::error::{ErrorInfo, PgWireError, PgWireResult};
-use crate::messages::PgWireBackendMessage;
 use crate::messages::data::{NoData, ParameterDescription};
 use crate::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Describe, Execute, Flush, Parse, ParseComplete,
@@ -29,6 +28,7 @@ use crate::messages::extendedquery::{
 };
 use crate::messages::response::{EmptyQueryResponse, ReadyForQuery, TransactionStatus};
 use crate::messages::simplequery::Query;
+use crate::messages::PgWireBackendMessage;
 
 fn is_empty_query(q: &str) -> bool {
     let trimmed_query = q.trim();
@@ -90,8 +90,8 @@ pub trait SimpleQueryHandler: Send + Sync {
                 .feed(PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse))
                 .await?;
         } else {
-            let cancel_rx = get_cancel_receiver(client).await;
-            let resp = if let Some(cancel_rx) = cancel_rx {
+            let mut cancel_rx = get_cancel_receiver(client).await;
+            let resp = if let Some(cancel_rx) = cancel_rx.as_mut() {
                 match select(self.do_query(client, &query_string), cancel_rx).await {
                     Either::Left((result, _)) => result,
                     Either::Right(_) => Err(PgWireError::QueryCanceled),
@@ -107,7 +107,15 @@ pub trait SimpleQueryHandler: Send + Sync {
                             .await?;
                     }
                     Response::Query(results) => {
-                        send_query_response(client, results, true).await?;
+                        let send = send_query_response(client, results, true);
+                        if let Some(cancel_rx) = cancel_rx.as_mut() {
+                            match select(Box::pin(send), cancel_rx).await {
+                                Either::Left((result, _)) => result?,
+                                Either::Right(_) => return Err(PgWireError::QueryCanceled),
+                            }
+                        } else {
+                            send.await?;
+                        }
                     }
                     Response::Execution(tag) => {
                         send_execution_response(client, tag).await?;
@@ -267,13 +275,13 @@ pub trait ExtendedQueryHandler: Send + Sync {
         let Some(portal) = client.portal_store().get_portal(portal_name) else {
             return Err(PgWireError::PortalNotFound(portal_name.to_owned()));
         };
+        let mut cancel_rx = get_cancel_receiver(client).await;
         // Execute query if the portal hasn't been started yet
         let needs_fetch = if matches!(
             portal.state().lock().await.deref(),
             PortalExecutionState::Initial
         ) {
-            let cancel_rx = get_cancel_receiver(client).await;
-            let resp = if let Some(cancel_rx) = cancel_rx {
+            let resp = if let Some(cancel_rx) = cancel_rx.as_mut() {
                 match select(self.do_query(client, portal.as_ref(), max_rows), cancel_rx).await {
                     Either::Left((result, _)) => result,
                     Either::Right(_) => Err(PgWireError::QueryCanceled),
@@ -338,26 +346,34 @@ pub trait ExtendedQueryHandler: Send + Sync {
             true
         };
 
-        // Fetch rows from the portal and send to client
+        // Keep the stream in the portal between finite Execute requests. An
+        // unlimited Execute must not materialize it through fetch(0).
         if needs_fetch {
-            let fetch_result = portal.fetch(max_rows).await?;
-            let mut response = fetch_result.response;
-            let command_tag = response.command_tag().to_owned();
-            let mut row_count = 0;
-            while let Some(row) = response.data_rows().next().await {
-                client.feed(PgWireBackendMessage::DataRow(row?)).await?;
-                row_count += 1;
-            }
-            if fetch_result.suspended {
-                client
-                    .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
-                    .await?;
+            let mut state = portal.state.lock().await;
+            let previous = std::mem::take(&mut *state);
+            let mut response = match previous {
+                PortalExecutionState::Suspended(response)
+                | PortalExecutionState::Finished(response) => response,
+                PortalExecutionState::Initial => return Err(PgWireError::PortalNotStarted),
+            };
+            let result = {
+                let send = send_partial_query_response(client, &mut response, max_rows);
+                if let Some(cancel_rx) = cancel_rx.as_mut() {
+                    match select(Box::pin(send), cancel_rx).await {
+                        Either::Left((result, _)) => result,
+                        Either::Right(_) => Err(PgWireError::QueryCanceled),
+                    }
+                } else {
+                    send.await
+                }
+            };
+            if matches!(result, Ok(true)) {
+                *state = PortalExecutionState::Suspended(response);
             } else {
-                let tag = Tag::new(&command_tag).with_rows(row_count);
-                client
-                    .send(PgWireBackendMessage::CommandComplete(tag.into()))
-                    .await?;
+                response.data_rows = Box::pin(futures::stream::empty());
+                *state = PortalExecutionState::Finished(response);
             }
+            result?;
         }
 
         if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
@@ -550,6 +566,28 @@ pub trait ExtendedQueryHandler: Send + Sync {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>;
 }
 
+/// Flush available rows before waiting for another execution batch. This keeps
+/// small charts progressive without a syscall for every row in a ready batch.
+async fn next_row_flushed<C>(
+    client: &mut C,
+    rows: &mut super::results::SendableRowStream,
+) -> PgWireResult<Option<PgWireResult<crate::messages::data::DataRow>>>
+where
+    C: Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<C::Error>,
+{
+    let next = rows.next();
+    futures::pin_mut!(next);
+    match futures::poll!(&mut next) {
+        std::task::Poll::Ready(row) => Ok(row),
+        std::task::Poll::Pending => {
+            client.flush().await?;
+            Ok(next.await)
+        }
+    }
+}
+
 /// Helper function to send `QueryResponse` and optional `RowDescription` to client
 ///
 /// For most cases in extended query implementation, `send_describe` is set to
@@ -581,7 +619,7 @@ where
     }
 
     let mut rows = 0;
-    while let Some(row) = data_rows.next().await {
+    while let Some(row) = next_row_flushed(client, &mut data_rows).await? {
         let row = row?;
         rows += 1;
         client.feed(PgWireBackendMessage::DataRow(row)).await?;
@@ -612,7 +650,7 @@ where
     let mut rows = 0;
     let mut suspended = true;
     while max_rows == 0 || rows < max_rows {
-        if let Some(row) = data_rows.next().await {
+        if let Some(row) = next_row_flushed(client, data_rows).await? {
             let row = row?;
             client.feed(PgWireBackendMessage::DataRow(row)).await?;
             rows += 1;

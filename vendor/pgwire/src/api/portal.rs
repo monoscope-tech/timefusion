@@ -7,17 +7,17 @@ use futures::stream::StreamExt;
 use postgres_types::FromSqlOwned;
 use tokio::sync::Mutex;
 
-use crate::api::Type;
 use crate::api::results::QueryResponse;
+use crate::api::Type;
 use crate::error::{PgWireError, PgWireResult};
 use crate::messages::data::FORMAT_CODE_BINARY;
 use crate::messages::extendedquery::Bind;
-use crate::types::FromSqlText;
 use crate::types::format::FormatOptions;
+use crate::types::FromSqlText;
 
-use super::DEFAULT_NAME;
 use super::results::FieldFormat;
 use super::stmt::StoredStatement;
+use super::DEFAULT_NAME;
 
 /// Represent a prepared sql statement and its parameters bound by a `Bind`
 /// request.
@@ -39,7 +39,7 @@ pub enum PortalExecutionState {
     Initial,
     // tag and data stream
     Suspended(QueryResponse),
-    Finished,
+    Finished(QueryResponse),
 }
 
 /// Result of fetching rows from a portal in `Suspended` state.
@@ -208,8 +208,12 @@ impl<S: Clone> Portal<S> {
 
         match state.deref_mut() {
             PortalExecutionState::Initial => Err(PgWireError::PortalNotStarted),
-            PortalExecutionState::Finished => Ok(FetchResult {
-                response: QueryResponse::new(Arc::new(vec![]), futures::stream::empty()),
+            PortalExecutionState::Finished(response) => Ok(FetchResult {
+                response: QueryResponse {
+                    command_tag: response.command_tag.clone(),
+                    row_schema: response.row_schema(),
+                    data_rows: Box::pin(futures::stream::empty()),
+                },
                 suspended: false,
             }),
             PortalExecutionState::Suspended(response) => {
@@ -229,7 +233,11 @@ impl<S: Clone> Portal<S> {
                 }
 
                 if !suspended {
-                    *state = PortalExecutionState::Finished;
+                    *state = PortalExecutionState::Finished(QueryResponse {
+                        command_tag: command_tag.clone(),
+                        row_schema: row_schema.clone(),
+                        data_rows: Box::pin(futures::stream::empty()),
+                    });
                 }
 
                 let result_response = QueryResponse {

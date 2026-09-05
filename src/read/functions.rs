@@ -22,6 +22,7 @@ use datafusion::{
         TypeSignature, Volatility, create_udaf, create_udf,
         expr::{Alias, ScalarFunction},
         planner::{ExprPlanner, PlannerResult, RawBinaryExpr, TypePlanner},
+        sort_properties::{ExprProperties, SortProperties},
     },
     prelude::lit,
     sql::sqlparser::ast::{BinaryOperator, DataType as SqlDataType},
@@ -1197,6 +1198,15 @@ impl TimeBucketUDF {
 impl ScalarUDFImpl for TimeBucketUDF {
     scalar_udf_boilerplate!("time_bucket");
 
+    fn output_ordering(&self, inputs: &[ExprProperties]) -> datafusion::error::Result<SortProperties> {
+        // Like date_bin, a constant positive width preserves timestamp ordering.
+        // A row-dependent width does not establish an ordering of the buckets.
+        Ok(match inputs {
+            [width, timestamp] if width.sort_properties == SortProperties::Singleton => timestamp.sort_properties,
+            _ => SortProperties::Unordered,
+        })
+    }
+
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))))
     }
@@ -1255,15 +1265,20 @@ fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64
             return Err(DataFusionError::Execution(format!("Unsupported time unit: {unit}. Supported units: second(s), minute(s), hour(s), day(s), week(s)")));
         }
     };
-    value.checked_mul(micros_per_unit).ok_or_else(|| DataFusionError::Execution(format!("Interval '{interval_str}' overflows")))
+    value
+        .checked_mul(micros_per_unit)
+        .filter(|width| *width > 0)
+        .ok_or_else(|| DataFusionError::Execution(format!("Interval '{interval_str}' must be positive and representable")))
 }
 
 /// Bucket timestamps to the nearest bucket boundary
 fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> datafusion::error::Result<ArrayRef> {
     // floor(timestamp / bucket_size) * bucket_size, in the array's own unit.
     map_timestamps(timestamp_array, Some("UTC"), "Argument", |v, per_sec| {
-        let size = bucket_size_micros * (per_sec / 1_000_000);
-        Ok((v / size) * size)
+        let size = bucket_size_micros
+            .checked_mul(per_sec / 1_000_000)
+            .ok_or_else(|| DataFusionError::Execution("time_bucket width overflows the timestamp unit".into()))?;
+        v.div_euclid(size).checked_mul(size).ok_or_else(|| DataFusionError::Execution("time_bucket result is outside the timestamp range".into()))
     })
 }
 
@@ -2507,5 +2522,84 @@ mod row_to_json_tests {
         register_custom_functions(&mut ctx).unwrap();
         let error = ctx.sql("SELECT row_to_json(t) FROM (SELECT 1 AS total) t").await.unwrap_err().to_string();
         assert!(error.contains("No field named t"), "unexpected error: {error}");
+    }
+}
+
+#[cfg(test)]
+mod time_bucket_streaming_tests {
+    use super::*;
+    use datafusion::{
+        arrow::{
+            datatypes::{Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        catalog::streaming::StreamingTable,
+        execution::{TaskContext, context::SessionContext},
+        physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter, streaming::PartitionStream},
+        prelude::{SessionConfig, col},
+    };
+    use futures::{StreamExt, stream};
+
+    #[derive(Debug)]
+    struct PausedInput {
+        batch: RecordBatch,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl PartitionStream for PausedInput {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+        fn execute(&self, _: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batch = self.batch.clone();
+            let release = self.release.clone();
+            let rows = stream::once(async move { Ok(batch) }).chain(stream::once(async move {
+                release.notified().await;
+                Ok(RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]))))
+            }));
+            Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), rows))
+        }
+    }
+
+    #[tokio::test]
+    async fn time_bucket_emits_completed_groups_before_input_finishes() -> Result<()> {
+        let mut ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        register_custom_functions(&mut ctx)?;
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(TimestampMicrosecondArray::from(vec![0, 500_000, 1_000_000, 2_000_000]).with_timezone("UTC"))])?;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let source = Arc::new(PausedInput { batch, release: release.clone() });
+        ctx.register_table("ordered_input", Arc::new(StreamingTable::try_new(schema, vec![source])?.with_sort_order(vec![col("ts").sort(true, false)])))?;
+        let mut rows = ctx.sql("SELECT time_bucket('1 second', ts), count(*) FROM ordered_input GROUP BY 1 ORDER BY 1").await?.execute_stream().await?;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), rows.next()).await?.expect("first completed group")?;
+        assert!(first.num_rows() > 0);
+        assert_eq!(first.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 2);
+        release.notify_one();
+        let mut count = first.num_rows();
+        while let Some(batch) = rows.next().await {
+            count += batch?.num_rows();
+        }
+        assert_eq!(count, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn time_bucket_matches_date_bin_and_rejects_invalid_widths() -> Result<()> {
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx)?;
+        let rows = ctx.sql("SELECT time_bucket('1 second', to_timestamp_micros(n)) IS NOT DISTINCT FROM date_bin(INTERVAL '1 second', to_timestamp_micros(n), TIMESTAMP '1970-01-01') FROM (VALUES (-1000001), (-1), (0), (999999), (1000000), (NULL)) t(n)").await?.collect().await?;
+        for batch in rows {
+            let equal = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert!(equal.iter().all(|value| value == Some(true)));
+        }
+        for width in ["'0 seconds'", "'-1 second'", "'9223372036854775807 weeks'", "INTERVAL '0 seconds'", "INTERVAL '1 month'"] {
+            let result = ctx.sql(&format!("SELECT time_bucket({width}, TIMESTAMP '2026-01-01')")).await;
+            let failed = match result {
+                Ok(frame) => frame.collect().await.is_err(),
+                Err(_) => true,
+            };
+            assert!(failed, "invalid width {width}");
+        }
+        Ok(())
     }
 }

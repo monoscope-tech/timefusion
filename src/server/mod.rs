@@ -261,6 +261,7 @@ pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
     auth_config: AuthConfig,
     plan_cache: Arc<PlanCacheHook>,
+    connections: Arc<datafusion_postgres::pgwire::api::ConnectionManager>,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
     db: Option<Arc<Database>>,
     max_statement_secs: u64,
@@ -278,7 +279,7 @@ impl LoggingHandlerFactory {
     ) -> Self {
         let plan_cache = Arc::new(PlanCacheHook::default());
         crate::read::plan_cache::set_global(plan_cache.clone());
-        Self { session_context, auth_config, plan_cache, scan_metrics, db, max_statement_secs }
+        Self { session_context, auth_config, plan_cache, connections: Arc::default(), scan_metrics, db, max_statement_secs }
     }
 
     /// Hook list passed to every `DfSessionService` instance the factory
@@ -340,9 +341,16 @@ impl PgWireServerHandlers for LoggingHandlerFactory {
         )
     }
 
+    fn cancel_handler(&self) -> Arc<impl datafusion_postgres::pgwire::api::cancel::CancelHandler> {
+        Arc::new(datafusion_postgres::pgwire::api::cancel::DefaultCancelHandler::new(self.connections.clone()))
+    }
+
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         let _t = crate::observability::BlockWatch::new("pgwire_startup_handler_build");
-        Arc::new(CleartextPasswordAuthStartupHandler::new(ConfigAuthSource::new(self.auth_config.clone()), TimeFusionServerParameterProvider::default()))
+        Arc::new(
+            CleartextPasswordAuthStartupHandler::new(ConfigAuthSource::new(self.auth_config.clone()), TimeFusionServerParameterProvider::default())
+                .with_connection_manager(self.connections.clone()),
+        )
     }
 
     fn error_handler(&self) -> Arc<impl ErrorHandler> {
@@ -1788,5 +1796,175 @@ mod pgwire_early_bind_tests {
         assert_eq!(n, 0, "server must drop connection on oversized startup");
         shutdown.cancel();
         let _ = task.await;
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use datafusion_postgres::pgwire::messages::data::DataRow;
+    use datafusion_postgres::pgwire::{
+        api::{query::send_partial_query_response, results::QueryResponse},
+        error::PgWireError,
+        messages::PgWireBackendMessage,
+    };
+    use futures::{SinkExt, StreamExt, channel::mpsc};
+    use std::sync::Arc;
+
+    // The upstream stays open until the receiver sees a row. Collecting the
+    // stream, or deferring the socket flush until completion, deadlocks here.
+    #[tokio::test]
+    async fn streams_before_completion_and_resumes_finite_fetches() {
+        let (mut input, rows) = mpsc::channel(1);
+        let (output, mut received) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let mut output = output.sink_map_err(|_: mpsc::SendError| PgWireError::QueryCanceled);
+            let mut response = QueryResponse::new(Arc::new(vec![]), rows);
+            assert!(send_partial_query_response(&mut output, &mut response, 1).await.unwrap());
+            assert!(!send_partial_query_response(&mut output, &mut response, 0).await.unwrap());
+        });
+        input.send(Ok(DataRow::new(bytes::BytesMut::new(), 0))).await.unwrap();
+        assert!(matches!(tokio::time::timeout(std::time::Duration::from_secs(2), received.next()).await.unwrap(), Some(PgWireBackendMessage::DataRow(_))));
+        assert!(matches!(received.next().await, Some(PgWireBackendMessage::PortalSuspended(_))));
+        input.send(Ok(DataRow::new(bytes::BytesMut::new(), 0))).await.unwrap();
+        assert!(matches!(tokio::time::timeout(std::time::Duration::from_secs(2), received.next()).await.unwrap(), Some(PgWireBackendMessage::DataRow(_))));
+        drop(input);
+        assert!(matches!(received.next().await, Some(PgWireBackendMessage::CommandComplete(_))));
+        task.await.unwrap();
+    }
+    #[derive(Debug)]
+    struct GatedInput {
+        batch: arrow::record_batch::RecordBatch,
+        release: Arc<tokio::sync::Notify>,
+        fail_after: bool,
+    }
+
+    impl datafusion::physical_plan::streaming::PartitionStream for GatedInput {
+        fn schema(&self) -> &arrow::datatypes::SchemaRef {
+            self.batch.schema_ref()
+        }
+        fn execute(&self, _: Arc<datafusion::execution::TaskContext>) -> datafusion::physical_plan::SendableRecordBatchStream {
+            let batch = self.batch.clone();
+            let schema = batch.schema();
+            let release = self.release.clone();
+            let fail_after = self.fail_after;
+            let rows = futures::stream::once(async move { Ok(batch) }).chain(futures::stream::once(async move {
+                release.notified().await;
+                if fail_after {
+                    Err(datafusion::error::DataFusionError::Execution("late input failure".into()))
+                } else {
+                    Ok(arrow::record_batch::RecordBatch::new_empty(schema))
+                }
+            }));
+            Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(self.batch.schema(), rows))
+        }
+    }
+
+    // Uses production authentication, handlers, DataFusion execution, encoding,
+    // and TCP. The input cannot finish until a row has reached the client.
+    #[tokio::test]
+    async fn wire_streams_cancels_and_reuses_connection() -> anyhow::Result<()> {
+        use super::{AuthConfig, handler_factory};
+        use arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+        use datafusion::{catalog::streaming::StreamingTable, execution::context::SessionContext};
+        use tokio_postgres::NoTls;
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])?;
+        ctx.register_table(
+            "gated_error",
+            Arc::new(StreamingTable::try_new(schema.clone(), vec![Arc::new(GatedInput { batch: batch.clone(), release: release.clone(), fail_after: true })])?),
+        )?;
+        ctx.register_table(
+            "gated",
+            Arc::new(StreamingTable::try_new(schema, vec![Arc::new(GatedInput { batch, release: release.clone(), fail_after: false })])?),
+        )?;
+        let handlers = handler_factory(Arc::new(ctx), AuthConfig { username: "postgres".into(), password: Some("test".into()) }, None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let handlers = handlers.clone();
+                connections.spawn(async move { datafusion_postgres::pgwire::tokio::process_socket(socket, None, handlers).await });
+            }
+        });
+        let (mut client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
+        tasks.spawn(async move {
+            let _ = connection.await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let rows = client.query_raw("SELECT n FROM gated", std::iter::empty::<&i32>()).await?;
+            futures::pin_mut!(rows);
+            assert_eq!(rows.next().await.unwrap()?.get::<_, i64>(0), 1);
+            client.cancel_token().cancel_query(NoTls).await?;
+            let mut canceled = false;
+            while let Some(row) = rows.next().await {
+                if let Err(error) = row {
+                    assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::QUERY_CANCELED));
+                    canceled = true;
+                    break;
+                }
+            }
+            assert!(canceled);
+            assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42);
+            let tx = client.transaction().await?;
+            let stmt = tx.prepare("SELECT n FROM gated").await?;
+            let portal = tx.bind(&stmt, &[]).await?;
+            assert_eq!(tx.query_portal(&portal, 1).await?[0].get::<_, i64>(0), 1);
+            release.notify_one();
+            assert_eq!(tx.query_portal(&portal, 0).await?.len(), 2);
+            assert!(tx.query_portal(&portal, 1).await?.is_empty());
+            tx.commit().await?;
+            let failed = client.query_raw("SELECT n FROM gated_error", std::iter::empty::<&i32>()).await?;
+            futures::pin_mut!(failed);
+            assert_eq!(failed.next().await.unwrap()?.get::<_, i64>(0), 1);
+            release.notify_one();
+            let mut saw_error = false;
+            while let Some(row) = failed.next().await {
+                if row.is_err() {
+                    saw_error = true;
+                    break;
+                }
+            }
+            assert!(saw_error);
+            client.batch_execute("DECLARE exhausted CURSOR FOR SELECT 42::BIGINT AS n").await?;
+            assert_eq!(client.query("FETCH ALL FROM exhausted", &[]).await?.len(), 1);
+            for _ in 0..2 {
+                let empty = client.simple_query("FETCH ALL FROM exhausted").await?;
+                assert!(empty.iter().any(
+                    |message| matches!(message, tokio_postgres::SimpleQueryMessage::RowDescription(columns) if columns.len() == 1 && columns[0].name() == "n")
+                ));
+            }
+            client.batch_execute("CLOSE exhausted").await?;
+            // The simple protocol must also flush and remain cancellable.
+            let rows = client.simple_query_raw("SELECT n FROM gated").await?;
+            futures::pin_mut!(rows);
+            loop {
+                if matches!(rows.next().await.unwrap()?, tokio_postgres::SimpleQueryMessage::Row(_)) {
+                    break;
+                }
+            }
+            client.cancel_token().cancel_query(NoTls).await?;
+            let mut canceled = false;
+            while let Some(row) = rows.next().await {
+                if row.is_err() {
+                    canceled = true;
+                    break;
+                }
+            }
+            assert!(canceled);
+            assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42);
+            anyhow::Ok(())
+        })
+        .await??;
+        drop(tasks);
+        Ok(())
     }
 }
