@@ -4940,3 +4940,38 @@ continue to actively cancel each other.
 
 **`dedup_skipped` remains 0 of 17,301.** Five of fourteen days covered still buys
 nothing at the scan level — that requires all fourteen.
+
+## 07:42 — 5.3 h: the removal -> re-probe loop is turning, and the mechanism is confirmed
+
+| counter | 287 | **317 min** |
+|---|---:|---:|
+| `cert_slice_day_covered` | 5 | 5 (flat — bursty, as established) |
+| `cert_granted_total` | 7 | 7 |
+| `cert_refused_dropped` | 76 | **91** |
+| `dedup_probe_timeouts_total` | 11 | **11** (3 h without a new one) |
+| `dirty_bin_batch_probe_clean_total` | 0 | **0** |
+| `tasks_pending` | 2416 | **2281** |
+| `dedup_skipped` / eligible | 0/17301 | **0/18979** |
+
+**The refusal is not terminal, and this closes a gap in the 02:20 story.** I
+described the decline memo as meaning a dirty date "is never re-probed". Reading
+it properly: `known_dirty = dedup_probe_declined.get(&key) == fp`
+(maintain.rs:6155) — it compares the memoised FINGERPRINT to the current one. A
+dedup rewrite CHANGES the file set, which moves the fingerprint, so the memo
+stops matching and the date becomes re-probeable. The memo suppresses re-probing
+only while nothing has changed, which is exactly right.
+
+So the loop is: **dedup removes duplicates (`cert_refused_dropped` 62 -> 76 ->
+91, and each is refused a grant BY CONSTRUCTION) -> fingerprint moves -> memo no
+longer matches -> date re-probed -> granted.** That is what produced
+`day_covered` 0 -> 5 over 5.3 h. The two lanes do cooperate; they just cannot do
+it in a single pass, and every unit of removal costs one refused grant first.
+
+**Backlog trend, now on 7 readings rather than 2:** `tasks_pending` 2793 -> 2501
+-> 2400 -> 2459 -> 2305 -> 2416 -> **2281**. Net **-512 over 5.3 h**, oscillating
+throughout. Stated as a direction with its variance visible, NOT as a rate — the
+two rates I quoted tonight from short series were both falsified, and this series
+oscillates by +/-150 between adjacent readings.
+
+**Unchanged and still the headline blocker:** `dedup_skipped` **0 of 18,979** and
+`cert_skip_files` **0**. Five of fourteen days is not fourteen.
