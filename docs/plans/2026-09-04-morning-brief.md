@@ -4766,3 +4766,45 @@ nothing invalidates — and new commits move fingerprints, which is exactly what
 invalidates. That is the strongest argument yet for the contiguity ordering fix:
 **the current policy is in a race against its own invalidation, and it is not
 obviously winning.**
+
+## 05:42 — my 13-hour projection was falsified by the NEXT reading
+
+| counter | 167 min | **197 min** |
+|---|---:|---:|
+| `cert_slice_day_covered` | 3 | **3 — STALLED** |
+| `cert_granted_total` | 5 | **5 — STALLED** |
+| `cert_slice_partial` | 148 | 152 (+4, was +101) |
+| `dedup_probe_timeouts_total` | 10 | 11 |
+| `dirty_bin_batch_probe_clean_total` | 0 | **0** |
+| `tasks_pending` | 2501 | **2400** |
+| `pending_dedup` | 2296 | 2237 |
+| `dedup_skipped` / eligible | 0 / 9148 | 0 / 11069 |
+
+Thirty minutes ago I wrote: *"at ~3 covered days per 2.8 h, a 14-day window is
+~13 h away IF the rate holds"*. **The rate did not hold — it went to zero in the
+next 30 minutes.** That was a linear extrapolation from a SINGLE interval, hedged
+with an "if" that does not repair it. I should not have offered the number.
+
+**What the stall actually shows, and it is more useful than the projection.**
+Certification does not accumulate steadily; it proceeds in a BURST and then
+exhausts — the same decline-memo mechanism identified at 02:20, where every dirty
+date is memoised against its file set and never re-probed. Two independent
+observations of the same shape now:
+
+| window | grants | mechanism |
+|---|---|---|
+| prior process, 01:41 -> 02:14 | 31 -> 31 | all cert activity stopped together |
+| this process, 167 -> 197 min | 5 -> 5 | `day_covered` and grants both flat |
+
+**So the ceiling on coverage is not throughput, it is CANDIDATE SUPPLY.** A
+process certifies what it can prove clean, exhausts the provable set, and stops
+— at 3 of 14 days. No amount of extra budget or concurrency moves that; only
+making more dates PROVABLE (which is the dedup lane's job) or re-probing on
+fingerprint change does. **This is why `dedup_skipped` cannot reach non-zero on
+the current design: a 14-day scan needs 14 granted dates, and the supply stops
+at 3.**
+
+**What is still improving,** and it is on the other lane: `tasks_pending`
+2793 -> 2400 over 2.5 h (~157/h). The maintenance backlog drains steadily on a
+quiet process even while certification stalls — the two lanes are decoupled, and
+only one of them is stuck.
