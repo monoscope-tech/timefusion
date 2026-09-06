@@ -65,6 +65,81 @@ async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Res
     Ok(())
 }
 
+/// DV-DEDUP: maintenance dedup drops a physical duplicate that spans two files by
+/// masking the loser with a deletion vector — NOT by rewriting the files. Then
+/// OPTIMIZE consolidates the DV without resurrecting the dropped row. This is the
+/// 100x lever: a whole-file rewrite to drop 0.0008% of rows becomes a bitmap.
+///
+/// Uses a PAST partition (real now − ≫2h) so the public `dedup_partition`
+/// (slice=None) clears the 2h sealed-chunk guard, which the future-dated
+/// `FROZEN_START_MICROS` fixtures never would.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let client = env.pg_client().await?;
+
+    let past = 1_735_689_600_000_000i64; // 2025-01-01, sealed relative to real now
+    let sec = 1_000_000i64;
+    // File 1: three unique rows + the row we will duplicate.
+    for i in 0..3 {
+        insert_dormant_at(&client, &format!("u-{i}"), past + i * sec).await?;
+    }
+    insert_dormant_at(&client, "dup", past + 100 * sec).await?;
+    env.force_flush().await?;
+    // File 2: the DUPLICATE (identical timestamp+id dedup key) + one more unique.
+    insert_dormant_at(&client, "dup", past + 100 * sec).await?;
+    insert_dormant_at(&client, "u-3", past + 3 * sec).await?;
+    env.force_flush().await?;
+
+    let files_before = parquet_files(&env).await?;
+    assert_eq!(files_before.len(), 2, "expected two flushed files, got {files_before:?}");
+
+    // Read-time DedupExec already hides the physical duplicate, so the logical
+    // count is 5 before dedup runs — dedup's job is to make that physical.
+    let count_before: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(count_before, 5, "read-time dedup already resolves the duplicate");
+
+    // DV-dedup the partition.
+    let table_ref = env.db().resolve_table("e2e_project", "mor_dormant").await?;
+    let date = chrono::DateTime::from_timestamp_micros(past).unwrap().date_naive();
+    let (dropped, complete) = env.db().dedup_partition(&table_ref, "mor_dormant", "e2e_project", date).await?;
+    assert_eq!(dropped, 1, "exactly one physical duplicate dropped");
+    assert!(complete, "partition must certify clean");
+
+    // The two source files are NOT rewritten (same paths) and exactly one now
+    // carries a deletion vector — the whole point of the lever.
+    let files_after = parquet_files(&env).await?;
+    assert_eq!(
+        files_after.iter().collect::<HashSet<_>>(),
+        files_before.iter().collect::<HashSet<_>>(),
+        "DV-dedup must mask, not rewrite — file paths must be unchanged"
+    );
+    let dv_files = {
+        let t = table_ref.read().await;
+        t.snapshot()?.snapshot().log_data().iter().filter(|f| f.deletion_vector_descriptor().is_some()).count()
+    };
+    assert_eq!(dv_files, 1, "exactly one file must carry a deletion vector, got {dv_files}");
+
+    let count_after: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(count_after, 5, "count unchanged by DV-dedup");
+
+    // No resurrection: OPTIMIZE reads DV-masked, drops the loser physically, and
+    // writes DV-free files.
+    let unified = timefusion::database::get_unified_delta_table(env.db().unified_tables(), "mor_dormant")
+        .await
+        .ok_or_else(|| anyhow::anyhow!("unified table not found"))?;
+    env.db().optimize_table(&unified, "mor_dormant", None).await?;
+    let count_final: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(count_final, 5, "OPTIMIZE must not resurrect the DV-dropped duplicate");
+    let dup_final: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1 AND id = 'dup'", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(dup_final, 1, "the duplicate must resolve to exactly one row");
+
+    Ok(())
+}
+
 /// Deletion vectors live in the Delta log, not the WAL. A full crash-restart must
 /// reload them from the committed log so masked rows stay masked and updates persist —
 /// guards the snapshot-reload / checkpoint-replay path against dropping DV descriptors.
