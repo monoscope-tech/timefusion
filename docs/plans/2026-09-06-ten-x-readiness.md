@@ -59,3 +59,53 @@ ceiling is CAPACITY: per-unit cost x slots. Derived rollups are the first
 casualty (the freshness product), while the frontier lane itself keeps up.
 A `--workers 32` arm is running to separate "scales with slots" from "capped
 elsewhere"; its answer prices the envelope raise vs the DV writer.
+
+## Envelope raise (item 4) — it is a STAGING ENV VAR, not a code change
+
+`coordinator_jobs()` already honors `TIMEFUSION_COORDINATOR_JOB_WORKERS` (env
+override, bypasses the cores/3-capped-at-16 default). So "envelope 6→8" needs no
+deploy of new code — a staging env var does it. Two cautions the code states:
+
+1. **The `coordinator_jobs` doc already warns against it.** Slots past the inner
+   `HEAVY_REWRITE_PERMITS` (10) "just convert coordinator slots into queueing —
+   at a 6:1 job:permit ratio, completions collapsed ~0.6/s → 0.035/s". Prod is
+   already at 16 jobs : 10 permits (1.6:1); pushing to 20 (to reach the
+   `pool×3/5` = 10,178 MiB coordinator ceiling) is 2:1, deeper into that regime.
+2. **The pools TILE, so the raise SHRINKS repair.** `coordinator_share` up
+   ~2 GB means `maintenance_split` down ~2 GB, and pack+repair split the loss.
+   Repair is the pool that unfroze the whale lane yesterday; its post-raise size
+   must still clear the ~690 MB first-allocation floor with margin. State it
+   explicitly before any staging run; the tiling test holds the arithmetic.
+
+The `--workers 32` sim arm (w16 vs w32 at 10x) is the discriminator: if
+completions stay flat, the raise is refuted in-model and it becomes a
+repair/pack drain-quality change, not a 10x lever — matching the doc's own
+queueing warning. [result pending]
+
+## DV writer (item 2) — GO, as a bounded 2-3 day Phase 0, because it is the ONLY lever the 10x sim leaves
+
+Today's 10x result (executions flat, backlog +14x, DerivedRollup completions
+208→48) proves the ceiling is per-unit cost × slots — and the envelope arm tests
+"more slots" while DV is the only "cheaper unit" on the table. Dedup rewrites
+whole files to drop 0.0008% of rows; a DV write emits a bitmap instead.
+
+Phase 0 deliverable = design doc + measured numbers, then go/kill:
+1. **Read-path proof FIRST (the correctness trap).** DV-deleted duplicates are
+   masked by `DedupExec` today — but certification exists to DROP `DedupExec`,
+   so a scan that ignores DVs would resurface deleted rows on exactly the
+   certified windows. Write a DV'd file into a staging table, read it through
+   OUR scan path with dedup skipped, assert the deleted row is absent. This seam
+   is verified first, not last.
+2. **Stats-consumer audit.** add-action `numRecords` ignores DVs, so it
+   over-counts on DV'd files — enumerate every reader (`estimated_decoded_bytes`,
+   repair reach, witness, count paths) and note tolerance per site.
+3. **Cost spike.** Prototype the commit shape (new `add` with DV descriptor
+   superseding the old) in the delta-rs fork; `run-unit --op dedup` on a whale
+   date, DV-write vs rewrite. That number is the 100x-customer business case.
+
+Note: DV changes the COST of removal, not certification logic — a DV dedup still
+has `dropped > 0`, still refused a grant, so the one-pass-delay loop persists.
+
+Carried finding: **DerivedRollup completions collapse first under 10x load**
+(208→48 while every other lane holds) — the freshness product dies first, and
+derived rollups read exactly what dedup gates, which is the DV motivation too.
