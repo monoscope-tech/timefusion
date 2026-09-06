@@ -1990,6 +1990,7 @@ impl Database {
     /// not resurrect. Sharded by dedup-key hash (a dup group shares one bucket, so
     /// no group splits) to bound decode memory on whale chunks.
     /// See docs/plans/2026-09-06-dv-dedup-phase1-design.md.
+    #[allow(clippy::too_many_arguments)]
     async fn stage_dedup_chunk_dv(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, chunk_filter: &str, label: &str,
         date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
