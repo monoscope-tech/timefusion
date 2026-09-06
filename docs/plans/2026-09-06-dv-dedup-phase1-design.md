@@ -167,6 +167,32 @@ Insertion: inline in `stage_dedup_chunk` after `expected_logical_rows`, gated on
    delete's mask. Verify Delta's conflict checker fires remove-remove on the old
    add.
 
+## IMPLEMENTATION STATUS (2026-09-06) + DEPLOY RUNBOOK
+
+Implemented + locally tested on branches (master untouched). Commits on `dv-dedup`:
+`811a0f8a` scaffolding, `3def3e05` DV core + reconcile fix, `b28af0d9` e2e test,
+`37fa4809` consolidation. Fork branch `timefusion-dv-physical-row-index` @ `a0f68b0c`.
+
+DONE: fork physical-row-index fix (6/6+55/55), DV core, boot-reconcile `.bin`
+liveness, packer DV-consolidation (Pack lane), e2e `dv_dedup_drops_cross_file_duplicate`,
+packer unit test.
+
+OWED before merge/deploy:
+1. Concurrent-DML-DELETE race test (see §5 above).
+2. `cargo lint` + `make test` + `make test-e2e` green.
+3. Staging cost ratio: `run-unit --op dedup` DV vs rewrite on a whale date (real R2).
+4. **Deploy** — ONE deploy carrying BOTH the fork pin bump (Cargo.toml/lock →
+   `a0f68b0c`) AND the TF `dv-dedup` changes (the pin bump alone is behavior-inert;
+   two restarts cost more than one — deploy-cadence starves dedup). Revert =
+   `TIMEFUSION_USE_DELETION_VECTORS=false` (no redeploy). After deploy: ≥2h quiet,
+   then watch `timefusion_stats` — dedup unit wall-time ↓, `pending_dedup` drain
+   slope ↑, AND a read-side p95 flat (the win is void if reads regress from DV'd
+   files losing pushdown faster than consolidation restores it).
+
+Note: the fork fix (`044f7c98`) is independently deploy-worthy — it corrects a
+live DML-DV corruption path regardless of DV-dedup. If DV-dedup slips, that fix +
+pin bump alone justifies a deploy.
+
 ## Risks / standing caveats
 
 - **THE BIG ONE — DV-bearing files lose per-file parquet predicate pushdown.**
