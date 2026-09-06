@@ -3356,7 +3356,13 @@ impl Database {
                         return None;
                     }
                     after_project += 1;
-                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), file.deletion_vector_descriptor().is_some(), file.stats().as_deref());
+                    let add = TailAdd::from_stats(
+                        path.to_string(),
+                        file.size(),
+                        is_sorted_run(&file.tags()),
+                        file.deletion_vector_descriptor().is_some(),
+                        file.stats().as_deref(),
+                    );
                     if add.event_range.is_some_and(|(start, end)| start >= key.slice.end_micros || end < key.slice.start_micros) {
                         return None;
                     }
@@ -7602,7 +7608,17 @@ impl Database {
                 self.repair_degradation.remove(path);
             }
         }
-        Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, discardable_paths: Vec::new(), dedup: None, sorted }))
+        Ok(BinOutcome::Staged(StagedBin {
+            project_id: project_id.to_string(),
+            wave_id,
+            target_paths: files,
+            removes,
+            adds,
+            stage_store,
+            discardable_paths: Vec::new(),
+            dedup: None,
+            sorted,
+        }))
     }
 
     /// Commit one WAVE: every staged unit's Remove+Add in a single transaction.
