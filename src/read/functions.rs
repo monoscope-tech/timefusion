@@ -9,8 +9,8 @@ use chrono_tz::Tz;
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
-            TimestampNanosecondArray,
+            Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+            StringArray, StringViewArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         },
         datatypes::{DataType, Field, FieldRef, IntervalUnit, TimeUnit},
     },
@@ -1076,10 +1076,29 @@ impl ScalarUDFImpl for ExtractEpochUDF {
 /// Downcast `array` to a primitive Arrow array and map each element to
 /// `json!(value)`, nulls to `JsonValue::Null`.
 macro_rules! json_primitives {
-    ($array:expr, $ty:ty) => {{
+    ($array:expr, $ty:ty) => {
+        json_primitives!($array, $ty, |x| json!(x))
+    };
+    ($array:expr, $ty:ty, $convert:expr) => {{
         let arr = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| DataFusionError::Execution(format!("Failed to downcast to {}", stringify!($ty))))?;
-        arr.iter().map(|v| v.map_or(JsonValue::Null, |x| json!(x))).collect()
+        arr.iter().map(|v| v.map_or(JsonValue::Null, $convert)).collect()
     }};
+}
+
+// JSON has no non-finite numbers. PostgreSQL retains them as strings, unlike
+// serde_json's default float serializer, which converts them to null.
+macro_rules! json_floats {
+    ($array:expr, $ty:ty) => {
+        json_primitives!($array, $ty, |x| {
+            if x.is_nan() {
+                json!("NaN")
+            } else if x.is_infinite() {
+                json!(if x.is_sign_positive() { "Infinity" } else { "-Infinity" })
+            } else {
+                json!(x)
+            }
+        })
+    };
 }
 
 /// Convert Arrow array to JSON values
@@ -1110,8 +1129,16 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
                 })
                 .collect()
         }
+        DataType::Int8 => json_primitives!(array, Int8Array),
+        DataType::Int16 => json_primitives!(array, Int16Array),
+        DataType::Int32 => json_primitives!(array, Int32Array),
         DataType::Int64 => json_primitives!(array, Int64Array),
-        DataType::Float64 => json_primitives!(array, Float64Array),
+        DataType::UInt8 => json_primitives!(array, UInt8Array),
+        DataType::UInt16 => json_primitives!(array, UInt16Array),
+        DataType::UInt32 => json_primitives!(array, UInt32Array),
+        DataType::UInt64 => json_primitives!(array, UInt64Array),
+        DataType::Float32 => json_floats!(array, Float32Array),
+        DataType::Float64 => json_floats!(array, Float64Array),
         DataType::Boolean => json_primitives!(array, BooleanArray),
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let ts = array
