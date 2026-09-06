@@ -177,8 +177,23 @@ DONE: fork physical-row-index fix (6/6+55/55), DV core, boot-reconcile `.bin`
 liveness, packer DV-consolidation (Pack lane), e2e `dv_dedup_drops_cross_file_duplicate`,
 packer unit test.
 
+### Concurrent-DML-DELETE race — SOUND BY CONSTRUCTION (verify test still owed)
+
+The race (§5): a DML DELETE DVs file F between DV-dedup's stage and commit. It is
+safe by the existing machinery: the DML commits `Remove(F_old_add) + Add(F+DV_a)`
+first, so `F_old_add` is no longer live. DV-dedup's staged commit does
+`Remove(F_old_add)` — which `commit_wave` RE-VERIFIES live under the commit lock
+before committing (the same liveness guard copy-on-write dedup relies on). The
+target is gone → the bin fails/retries against the fresh snapshot, re-scans the
+now-`DV_a` file (physical row indexes correct on a DV'd file via fork fix
+`044f7c98`), and unions its losers onto `DV_a`. No clobber, no resurrection. A
+deterministic test is still owed (racing two commits is flaky to force), but the
+guard that makes it safe already exists and is exercised by the copy-on-write
+path today.
+
 OWED before merge/deploy:
-1. Concurrent-DML-DELETE race test (see §5 above).
+1. Concurrent-DML-DELETE race test (sound by construction above; deterministic
+   test owed).
 2. `cargo lint` + `make test` + `make test-e2e` green.
 3. Staging cost ratio: `run-unit --op dedup` DV vs rewrite on a whale date (real R2).
 4. **Deploy** — ONE deploy carrying BOTH the fork pin bump (Cargo.toml/lock →
