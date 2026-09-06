@@ -5279,3 +5279,14 @@ already declares the feature; a fork-level DV writer is the named 100x lever
    small, scarred-code, deserves its own session.
 3. DV-writer scoping in the delta-rs fork — the 100x roadmap item.
 4. Sealed-consolidation (~115 flat) — last untouched lane, diagnosis recipe ready.
+
+## 06:15 — correction: decision 1 was made by my own push, not by you
+
+The "morning summary" push above was intended docs-only but carried `164a3518`
+(the branch's whole tip goes with a push, and the code commit sat beneath the
+docs commit). So the size-ratio guard is DEPLOYING now — dormant at ratio 0,
+suite-green 1399/1399, pinned tests included — and prod restarts, ending the
+10 h process AFTER its measurement was complete. Risk minimal, rollback would
+only cost a second deploy. Decisions 2-4 remain genuinely yours. Process fix on
+my side: `git log origin/master..HEAD` before every push, no exceptions —
+including the 6 am one.
