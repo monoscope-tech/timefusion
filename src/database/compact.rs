@@ -1342,6 +1342,14 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, scan_name: &str,
         partition_filter: &str, chunk_filter: &str, label: &str, date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
     ) -> Result<BinOutcome<StagedBin>> {
+        // DV-dedup: drop losers with a deletion vector rather than a whole-file
+        // rewrite. Same gate (and table DV feature, ensured by the same flag) as
+        // the DML DV path. `partition_filter`/`scan_name` are unused by the DV
+        // path — it builds its own row-index provider.
+        if self.config.maintenance.timefusion_use_deletion_vectors {
+            let _ = (partition_filter, scan_name);
+            return self.stage_dedup_chunk_dv(table_ref, table_name, project_id, schema, chunk_filter, label, date_str, key, limits).await;
+        }
         use deltalake::{kernel::Action, writer::DeltaWriter};
         use futures::StreamExt;
         let read_string_column = |batches: Vec<RecordBatch>| -> Result<Vec<String>> {
@@ -1970,6 +1978,227 @@ impl Database {
             }));
         }
         anyhow::bail!("dedup rewrite: re-plan attempts exhausted for table={} chunk=[{}]", table_name, label)
+    }
+
+    /// DV-dedup: mark loser rows deleted via a deletion vector instead of
+    /// rewriting whole files to drop them. Same survivor rule as copy-on-write
+    /// (`dedup_batches`); commit shape `Remove(old) + Add(same path, +DV)`. A
+    /// DV-bearing file reads DV-masked automatically, so a later Pack/repair does
+    /// not resurrect. Sharded by dedup-key hash (a dup group shares one bucket, so
+    /// no group splits) to bound decode memory on whale chunks.
+    /// See docs/plans/2026-09-06-dv-dedup-phase1-design.md.
+    async fn stage_dedup_chunk_dv(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema::TableSchema, chunk_filter: &str, label: &str,
+        date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
+    ) -> Result<BinOutcome<StagedBin>> {
+        use datafusion::arrow::array::{RecordBatch, StringArray, UInt64Array};
+        use datafusion::arrow::datatypes::DataType;
+        use deltalake::kernel::Action;
+        use deltalake::operations::deletion_vectors::{FileDeletion, dv_object_store_relative_path, write_deletion_vectors};
+        const DV_ROW_INDEX_COL: &str = "__tf_dv_row_index";
+        const MAX_REPLANS: usize = 3;
+
+        let tiebreak = schema.dedup_tiebreak.as_deref();
+        let mut proj_cols = vec![format!("\"{DEDUP_FILE_COL}\""), format!("\"{DV_ROW_INDEX_COL}\"")];
+        proj_cols.extend(schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)));
+        if let Some(tb) = tiebreak {
+            proj_cols.push(crate::rollup::quoted(tb));
+        }
+        let proj_csv = proj_cols.join(", ");
+
+        // (file path, 0-based physical row index) for every row of a projected
+        // batch list. The scan exposes a 1-based physical row number; DV indexes
+        // are 0-based (`v - 1`), and physical even on an already-DV'd file (fork
+        // fix `044f7c98`).
+        let pairs_of = |batches: &[RecordBatch]| -> Result<Vec<(String, u64)>> {
+            let mut out = Vec::new();
+            for b in batches {
+                let files = datafusion::arrow::compute::cast(b.column(0), &DataType::Utf8)?;
+                let files = files.as_any().downcast_ref::<StringArray>().expect("file column casts to Utf8");
+                let idxs = b.column(1).as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("dv-dedup row-index column is not UInt64"))?;
+                for i in 0..b.num_rows() {
+                    out.push((files.value(i).to_string(), idxs.value(i).saturating_sub(1)));
+                }
+            }
+            Ok(out)
+        };
+
+        for replan in 0..MAX_REPLANS {
+            let (chunk_snapshot, chunk_log_store) = {
+                let table = table_ref.read().await;
+                (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
+            };
+            let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
+            let provider = Self::narrow_provider(chunk_log_store.clone(), Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL), Some(DV_ROW_INDEX_COL))
+                .await
+                .map_err(|e| anyhow::anyhow!("dv-dedup provider: {e}"))?;
+            let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
+                limits.map_or(self.config.memory.timefusion_query_partitions, |l| l.sort_partitions),
+                self.maintenance_runtime_env(),
+            ));
+            ctx.register_table(DEDUP_SCAN_NAME, provider)?;
+
+            // Files holding the chunk's rows → Add targets, from THIS snapshot.
+            let files_sql = format!("SELECT DISTINCT \"{DEDUP_FILE_COL}\" FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter}");
+            let file_ids: Vec<String> = {
+                let mut v = Vec::new();
+                for b in crate::database::maintain::collect_watched(&ctx, &files_sql).await? {
+                    let col = datafusion::arrow::compute::cast(b.column(0), &DataType::Utf8)?;
+                    let col = col.as_any().downcast_ref::<StringArray>().expect("cast to Utf8");
+                    v.extend((0..col.len()).filter(|&i| !col.is_null(i)).map(|i| col.value(i).to_string()));
+                }
+                v
+            };
+            if file_ids.is_empty() {
+                return Ok(BinOutcome::Retry);
+            }
+            let targets = dedup_adds_by_path(
+                chunk_snapshot
+                    .log_data()
+                    .iter()
+                    .filter(|f| {
+                        let p = f.path();
+                        file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
+                    })
+                    .map(|f| {
+                        #[allow(deprecated)]
+                        f.add_action()
+                    }),
+                table_name,
+            );
+            if targets.len() != file_ids.len() {
+                warn!("dv-dedup: mapped {}/{} files for table={} chunk=[{}], re-planning", targets.len(), file_ids.len(), table_name, label);
+                tokio::time::sleep(occ_backoff(replan)).await;
+                continue;
+            }
+
+            // Same-snapshot count oracle guards CERTIFICATION (not the commit): a
+            // truncated read can only MISS dupes, never mask unique data — a loser
+            // is marked only when scanned beside a same-key row that beat it.
+            let oracle = Self::scalar_i64(&ctx, &format!("SELECT COUNT(*) FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter}")).await?.unwrap_or(0).max(0) as u64;
+
+            // Shard the chunk by dedup-key hash so decode memory is bounded; a dup
+            // group shares one bucket and is never split.
+            let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
+            let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
+            let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
+            let est_decoded = oracle.saturating_mul(bytes_per_row).saturating_mul(2);
+            let decoded_budget =
+                limits.map_or(self.config.maintenance.timefusion_dedup_max_decoded_bytes, |l| self.config.maintenance.timefusion_dedup_max_decoded_bytes.min(l.max_decoded_bytes));
+            let shards = dedup_shard_count(limits.is_some(), est_decoded, 0, decoded_budget, u64::MAX).max(1);
+
+            let mut losers_by_file: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+            let mut survivors_total: u64 = 0;
+            let mut scanned_total: u64 = 0;
+            {
+                let _permit =
+                    self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+                for shard in 0..shards {
+                    let shard_pred = if shards > 1 {
+                        let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
+                        let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < {hi}") } else { String::new() };
+                        format!(" AND {bucket_expr} >= {lo}{upper}")
+                    } else {
+                        String::new()
+                    };
+                    let sql = format!("SELECT {proj_csv} FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter}{shard_pred}");
+                    let batches = crate::database::maintain::collect_watched(&ctx, &sql).await?;
+                    let all_pairs = pairs_of(&batches)?;
+                    scanned_total += all_pairs.len() as u64;
+                    let survivors = crate::write::mem_buffer::dedup_batches(batches.clone(), &schema.dedup_keys, tiebreak, None)?;
+                    let survivor_set: std::collections::HashSet<(String, u64)> = pairs_of(&survivors)?.into_iter().collect();
+                    survivors_total += survivor_set.len() as u64;
+                    for pair in all_pairs {
+                        if !survivor_set.contains(&pair) {
+                            losers_by_file.entry(pair.0).or_default().push(pair.1);
+                        }
+                    }
+                }
+            }
+
+            // The scan and the oracle share one snapshot/ctx, so a mismatch is a
+            // truncated re-read (concurrent rewrite) — retry, don't certify.
+            if scanned_total != oracle {
+                warn!("dv-dedup: scan saw {scanned_total} rows vs oracle {oracle} for table={table_name} chunk=[{label}] — retry");
+                return Ok(BinOutcome::Retry);
+            }
+            let losers_total: u64 = losers_by_file.values().map(|v| v.len() as u64).sum();
+            if survivors_total + losers_total != scanned_total {
+                anyhow::bail!("dv-dedup accounting for table={table_name} chunk=[{label}]: survivors {survivors_total} + losers {losers_total} != scanned {scanned_total}");
+            }
+            if losers_total == 0 {
+                return Ok(BinOutcome::Converged);
+            }
+
+            // Attach each loser set to its Add (scan file paths are store paths;
+            // the Add carries a log-relative path — suffix-match either way).
+            let mut deletions: Vec<FileDeletion> = Vec::new();
+            for add in &targets {
+                let idxs: Vec<u64> = losers_by_file
+                    .iter()
+                    .filter(|(fpath, _)| fpath.ends_with(add.path.as_str()) || add.path.as_str().ends_with(fpath.as_str()))
+                    .flat_map(|(_, positions)| positions.iter().copied())
+                    .collect();
+                if !idxs.is_empty() {
+                    deletions.push(FileDeletion { add: add.clone(), deleted_indexes: idxs });
+                }
+            }
+            let n_files = deletions.len();
+
+            let root = url::Url::parse(table_ref.read().await.table_url().as_ref()).map_err(|e| anyhow::anyhow!("dv-dedup table url: {e}"))?;
+            let actions = write_deletion_vectors(chunk_log_store.as_ref(), &root, deletions).await.map_err(|e| anyhow::anyhow!("dv-dedup write: {e}"))?;
+            // Every index was already deleted (idempotent re-run) — nothing staged.
+            if actions.is_empty() {
+                return Ok(BinOutcome::Converged);
+            }
+
+            let (mut removes, mut adds, mut discardable_paths) = (Vec::new(), Vec::new(), Vec::new());
+            for action in actions {
+                match &action {
+                    Action::Remove(_) => removes.push(action),
+                    Action::Add(add) => {
+                        if let Some(rel) = add.deletion_vector.as_ref().and_then(dv_object_store_relative_path) {
+                            discardable_paths.push(rel);
+                        }
+                        adds.push(action);
+                    }
+                    _ => {}
+                }
+            }
+
+            let stage_store = chunk_log_store.object_store(None);
+            let wave_id = uuid::Uuid::new_v4().to_string();
+            // Crash-before-commit cleanup: the fresh-UUID `.bin` sidecars. (Boot
+            // reconcile must treat a COMMITTED `.bin` as live via the descriptor
+            // rule — see the reconcile liveness fix.)
+            self.record_staged_intent(StagedIntent {
+                wave_id: wave_id.clone(),
+                table_name: table_name.to_string(),
+                project_id: project_id.to_string(),
+                recorded_at: crate::support::now_secs(),
+                paths: discardable_paths.clone(),
+                target_paths: Vec::new(),
+                adds: Vec::new(),
+                rollup: None,
+                instance: None,
+            });
+            debug!(table_name, project_id, chunk = label, files = n_files, scanned_total, losers_total, event = "dv_dedup_chunk_staged");
+            return Ok(BinOutcome::Staged(StagedBin {
+                project_id: project_id.to_string(),
+                wave_id,
+                target_paths: targets.iter().map(|t| t.path.clone()).collect(),
+                removes,
+                adds,
+                stage_store,
+                discardable_paths,
+                dedup: Some(DedupUnit { key: key.clone(), date: date_str.to_string(), label: label.to_string(), before: scanned_total, after: survivors_total }),
+                // Same-path files: sortedness is unchanged, so DON'T claim it here
+                // (false only costs a footer probe; true on a file we didn't write
+                // is a wrong exoneration).
+                sorted: false,
+            }));
+        }
+        anyhow::bail!("dv-dedup: re-plan attempts exhausted for table={} chunk=[{}]", table_name, label)
     }
 
     /// Live parquet files of one `date=` partition, grouped by the

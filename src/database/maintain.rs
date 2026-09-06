@@ -8491,7 +8491,17 @@ impl Database {
                 warn!("staged-intent reconcile skipped for '{table_name}': no snapshot loaded");
                 return;
             };
-            (snapshot.log_data().iter().map(|f| f.path().into_owned()).collect::<HashSet<String>>(), table.log_store().object_store(None))
+            let mut referenced: HashSet<String> = snapshot.log_data().iter().map(|f| f.path().into_owned()).collect();
+            // A committed deletion-vector `.bin` is NOT a log_data path, so without
+            // this a crash-after-commit reconcile would delete a live DV sidecar
+            // and resurrect the masked rows. Treat any `.bin` referenced by a live
+            // Add's DV descriptor as live (the same rule VACUUM applies).
+            for f in snapshot.log_data().iter() {
+                if let Some(rel) = f.deletion_vector_descriptor().as_ref().and_then(deltalake::operations::deletion_vectors::dv_object_store_relative_path) {
+                    referenced.insert(rel);
+                }
+            }
+            (referenced, table.log_store().object_store(None))
         };
         let now_secs = crate::support::now_secs();
         let orphans = staged_orphan_deletions(&entries, table_name, now_secs, &referenced);
