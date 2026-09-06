@@ -5228,3 +5228,54 @@ Zero on every reading all week (0 of 19,000+ eligible). Now nonzero — and on a
 19-minute process, so the PERSISTED certification ledger alone covers full scan
 windows. The whole chain the goal named, each link measured: repair unfrozen ->
 footers verified -> days certified -> windows granted -> scans skip DedupExec.
+
+# MORNING SUMMARY — 2026-09-06, ~06:10Z
+
+## The headline: the system now CYCLES its own work
+
+Ten hours of uninterrupted process (the week's longest), through the midnight
+day-seal and ten hourly mint waves. The maintenance total oscillates in a
+STABLE BAND — lows 1747-2107, mint peaks 2160-2344 — and returns to its band
+after every wave. `pending_repair` sat at **0 the entire night** (251 and
+frozen 24 hours ago). That is "keeping up at 1x", demonstrated rather than
+argued: the daily wave is absorbed by the daily capacity.
+
+Honest bounds on that claim: dedup's ~1,800 and derived's ~350 are steady-state
+STOCK levels, not zero — the flow balances, the stock isn't shrinking fast.
+`never_certified_pct` reads ~44% each morning because the freshly sealed day
+cannot certify until its dedup passes run — that is pipeline latency, not
+regression; it settled to 3-5% within hours yesterday and should again.
+`dedup_skipped` sat flat at 204 overnight — skips track QUERY traffic, and the
+overnight lull sends few eligible scans; the daytime rate is the real one.
+
+## Customer queries (the goal's origin), re-measured on the real shape
+
+| window | 09-03 | now |
+|---|---|---|
+| hashes @> 7d | 42-60 s | **16.6 s** |
+| hashes @> 14d | TIMEOUT | **57.5 s** |
+
+Still window-bound (filter above single-threaded DedupExec); every certified
+window converts these directly — coverage is the multiplier now.
+
+## Overnight work product (committed locally, NOT pushed — your call)
+
+`164a3518` — the ClickHouse/RocksDB similar-size admission guard, implemented
+in both selectors, measured on the 400-round harness, and **shipped OFF because
+composition with the value floor WEDGES**: refusal returns empty instead of
+resuming the walk, and the refused [output,output] pair is the walker's fixed
+first pick — the row-cap-livelock family, caught in a fixture instead of prod.
+The floor carries this hazard LATENTLY today. Unblock: resume-past-refusal in
+selection (worth doing regardless), then flip the pinned test arm, then sim A/B.
+Prior art + DV scoping: `docs/plans/2026-09-06-merge-policy-prior-art.md` —
+notably delta-rs cannot WRITE deletion vectors yet (#4079) while our table
+already declares the feature; a fork-level DV writer is the named 100x lever
+(dedup stops rewriting files entirely).
+
+## Decisions waiting for you
+
+1. Push `164a3518` (guard dormant at ratio 0 + the pinned livelock tests)?
+2. Resume-past-refusal selection fix — de-fangs the floor's latent livelock;
+   small, scarred-code, deserves its own session.
+3. DV-writer scoping in the delta-rs fork — the 100x roadmap item.
+4. Sealed-consolidation (~115 flat) — last untouched lane, diagnosis recipe ready.
