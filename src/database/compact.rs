@@ -363,7 +363,15 @@ impl Database {
             // target size — it is not converged until rewritten DV-free (pushdown
             // is disabled per-file while a DV is present).
             .filter(|add| add.size() < target_size.max(1) || add.deletion_vector_descriptor().is_some())
-            .map(|add| TailAdd::from_stats(add.path().to_string(), add.size(), is_sorted_run(&add.tags()), add.deletion_vector_descriptor().is_some(), add.stats().as_deref()))
+            .map(|add| {
+                TailAdd::from_stats(
+                    add.path().to_string(),
+                    add.size(),
+                    is_sorted_run(&add.tags()),
+                    add.deletion_vector_descriptor().is_some(),
+                    add.stats().as_deref(),
+                )
+            })
             .collect();
         Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), TailPass::Pack, pack_size_ratio(), pack_value_floor()))
     }
@@ -395,7 +403,10 @@ impl Database {
                 // `stats()` is reached only past both tag/size exclusions.
                 let path = file.path();
                 let project_id = path_partition_value(&path, "project_id").filter(|p| !p.is_empty()).map(str::to_owned)?;
-                Some((project_id, TailAdd::from_stats(path.into_owned(), size, sorted_run, file.deletion_vector_descriptor().is_some(), file.stats().as_deref())))
+                Some((
+                    project_id,
+                    TailAdd::from_stats(path.into_owned(), size, sorted_run, file.deletion_vector_descriptor().is_some(), file.stats().as_deref()),
+                ))
             })
             .fold(HashMap::<String, Vec<TailAdd>>::new(), |mut per_project, (project_id, add)| {
                 per_project.entry(project_id).or_default().push(add);
@@ -1015,7 +1026,8 @@ impl Database {
         // Probe-only provider (chunk detection). The rewrite builds its own
         // provider per attempt — from a FRESH snapshot, with the synthetic
         // source-file column — in `dedup_rewrite_chunk`.
-        let provider = Self::narrow_provider(log_store, snapshot, partition_files, None, None).await.map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
+        let provider =
+            Self::narrow_provider(log_store, snapshot, partition_files, None, None).await.map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
         // A fresh state is intentional: SessionState clones retain mutable
         // catalog/execution internals and can resolve the scan name to an older
         // eager snapshot. FileSelection above removes the expensive all-table
@@ -1353,13 +1365,8 @@ impl Database {
         // `partition_filter`/`scan_name` are unused by the DV path — it builds
         // its own row-index provider.
         if self.config.maintenance.timefusion_use_deletion_vectors {
-            let dv_enabled = table_ref
-                .read()
-                .await
-                .snapshot()
-                .ok()
-                .map(|s| s.snapshot().table_properties().enable_deletion_vectors == Some(true))
-                .unwrap_or(false);
+            let dv_enabled =
+                table_ref.read().await.snapshot().ok().map(|s| s.snapshot().table_properties().enable_deletion_vectors == Some(true)).unwrap_or(false);
             if dv_enabled {
                 let _ = (partition_filter, scan_name);
                 return self.stage_dedup_chunk_dv(table_ref, table_name, project_id, schema, chunk_filter, label, date_str, key, limits).await;
@@ -2045,9 +2052,10 @@ impl Database {
                 (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
             };
             let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
-            let provider = Self::narrow_provider(chunk_log_store.clone(), Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL), Some(DV_ROW_INDEX_COL))
-                .await
-                .map_err(|e| anyhow::anyhow!("dv-dedup provider: {e}"))?;
+            let provider =
+                Self::narrow_provider(chunk_log_store.clone(), Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL), Some(DV_ROW_INDEX_COL))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("dv-dedup provider: {e}"))?;
             let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
                 limits.map_or(self.config.memory.timefusion_query_partitions, |l| l.sort_partitions),
                 self.maintenance_runtime_env(),
@@ -2099,8 +2107,9 @@ impl Database {
             let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
             let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
             let est_decoded = oracle.saturating_mul(bytes_per_row).saturating_mul(2);
-            let decoded_budget =
-                limits.map_or(self.config.maintenance.timefusion_dedup_max_decoded_bytes, |l| self.config.maintenance.timefusion_dedup_max_decoded_bytes.min(l.max_decoded_bytes));
+            let decoded_budget = limits.map_or(self.config.maintenance.timefusion_dedup_max_decoded_bytes, |l| {
+                self.config.maintenance.timefusion_dedup_max_decoded_bytes.min(l.max_decoded_bytes)
+            });
             let shards = dedup_shard_count(limits.is_some(), est_decoded, 0, decoded_budget, u64::MAX).max(1);
 
             // A single dedup-key group cannot be split (all copies share one hash
@@ -2110,8 +2119,10 @@ impl Database {
             // copy-on-write path. Cheaper here (narrow projection), so it fires
             // only on a genuinely enormous single key.
             if limits.is_none() && shards > 1 && decoded_budget > 0 {
-                let max_group_sql =
-                    format!("SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter} GROUP BY {})", schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", "));
+                let max_group_sql = format!(
+                    "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter} GROUP BY {})",
+                    schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ")
+                );
                 let max_group = Self::scalar_i64(&ctx, &max_group_sql).await?.unwrap_or(0);
                 if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
                     crate::observability::record_dedup_chunk_skipped();
@@ -2127,8 +2138,7 @@ impl Database {
             let mut survivors_total: u64 = 0;
             let mut scanned_total: u64 = 0;
             {
-                let _permit =
-                    self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+                let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
                 for shard in 0..shards {
                     let shard_pred = if shards > 1 {
                         let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
@@ -2160,7 +2170,9 @@ impl Database {
             }
             let losers_total: u64 = losers_by_file.values().map(|v| v.len() as u64).sum();
             if survivors_total + losers_total != scanned_total {
-                anyhow::bail!("dv-dedup accounting for table={table_name} chunk=[{label}]: survivors {survivors_total} + losers {losers_total} != scanned {scanned_total}");
+                anyhow::bail!(
+                    "dv-dedup accounting for table={table_name} chunk=[{label}]: survivors {survivors_total} + losers {losers_total} != scanned {scanned_total}"
+                );
             }
             if losers_total == 0 {
                 return Ok(BinOutcome::Converged);
@@ -2227,7 +2239,13 @@ impl Database {
                 adds,
                 stage_store,
                 discardable_paths,
-                dedup: Some(DedupUnit { key: key.clone(), date: date_str.to_string(), label: label.to_string(), before: scanned_total, after: survivors_total }),
+                dedup: Some(DedupUnit {
+                    key: key.clone(),
+                    date: date_str.to_string(),
+                    label: label.to_string(),
+                    before: scanned_total,
+                    after: survivors_total,
+                }),
                 // Same-path files: sortedness is unchanged, so DON'T claim it here
                 // (false only costs a footer probe; true on a file we didn't write
                 // is a wrong exoneration).
