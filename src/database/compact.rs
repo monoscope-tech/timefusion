@@ -359,8 +359,11 @@ impl Database {
         let adds: Vec<_> = table.get_active_add_actions_by_partitions(filters).try_collect::<Vec<_>>().await?;
         let tail: Vec<TailAdd> = adds
             .iter()
-            .filter(|add| add.size() < target_size.max(1)) // cheap gate before the stats parse
-            .map(|add| TailAdd::from_stats(add.path().to_string(), add.size(), is_sorted_run(&add.tags()), add.stats().as_deref()))
+            // Cheap gate before the stats parse. A DV-bearing file passes even at
+            // target size — it is not converged until rewritten DV-free (pushdown
+            // is disabled per-file while a DV is present).
+            .filter(|add| add.size() < target_size.max(1) || add.deletion_vector_descriptor().is_some())
+            .map(|add| TailAdd::from_stats(add.path().to_string(), add.size(), is_sorted_run(&add.tags()), add.deletion_vector_descriptor().is_some(), add.stats().as_deref()))
             .collect();
         Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), TailPass::Pack, pack_size_ratio(), pack_value_floor()))
     }
@@ -392,7 +395,7 @@ impl Database {
                 // `stats()` is reached only past both tag/size exclusions.
                 let path = file.path();
                 let project_id = path_partition_value(&path, "project_id").filter(|p| !p.is_empty()).map(str::to_owned)?;
-                Some((project_id, TailAdd::from_stats(path.into_owned(), size, sorted_run, file.stats().as_deref())))
+                Some((project_id, TailAdd::from_stats(path.into_owned(), size, sorted_run, file.deletion_vector_descriptor().is_some(), file.stats().as_deref())))
             })
             .fold(HashMap::<String, Vec<TailAdd>>::new(), |mut per_project, (project_id, add)| {
                 per_project.entry(project_id).or_default().push(add);

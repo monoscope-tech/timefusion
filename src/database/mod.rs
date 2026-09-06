@@ -7916,6 +7916,13 @@ pub(crate) struct TailAdd {
     /// rewrite actually costs — see [`MAX_BIN_ROWS`]. `None` means the stats were
     /// absent, which the row cap treats as "unknown, do not count".
     pub rows: Option<u64>,
+    /// The file carries a deletion vector. A DV-bearing file is NEVER converged
+    /// even at target size: reading it disables per-file parquet predicate
+    /// pushdown (fork guard), so it must be rewritten (DV-free) to restore the
+    /// read fast path. DV-dedup writes DVs at fleet scale, so consolidating them
+    /// back out is what keeps reads healthy — the pack rewrite is DV's deferred,
+    /// batched cost. `false` when the source had no DV (or is a synthetic test).
+    pub has_dv: bool,
 }
 
 impl TailAdd {
@@ -7925,11 +7932,11 @@ impl TailAdd {
     /// `stat_min_i64`/`stat_max_i64` accessors return `None` for every file. Event-time binning
     /// previously trusted those accessors and silently selected nothing, so it now parses the raw
     /// stats JSON instead.
-    fn from_stats(path: String, size: i64, is_sorted_run: bool, stats: Option<&str>) -> Self {
+    fn from_stats(path: String, size: i64, is_sorted_run: bool, has_dv: bool, stats: Option<&str>) -> Self {
         let range = stats.and_then(Database::event_time_range_from_stats);
         // Same JSON blob the range comes from, so this costs nothing extra.
         let rows = stats.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
-        Self { path, size, is_sorted_run, event_range: range, rows }
+        Self { path, size, is_sorted_run, event_range: range, rows, has_dv }
     }
 }
 
@@ -8033,8 +8040,9 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
             // be unconditional: it once sat behind `!has_unsorted`, and since the
             // sorted-run tag is written only by OPTIMIZE, it effectively never
             // ran and units re-rewrote converged half-GB files past every
-            // deadline.
-            if add.size >= target {
+            // deadline. EXCEPTION: a DV-bearing file is not converged at any size
+            // — it must be rewritten DV-free to restore per-file parquet pushdown.
+            if add.size >= target && !add.has_dv {
                 continue;
             }
             if has_unsorted && add.is_sorted_run {
@@ -8452,10 +8460,16 @@ pub(crate) fn select_tail_bin(
     // disables the reader's all-or-nothing footer ordering for the whole scan.
     // Exactly one is admitted per bin (`repair_budget`) so a backlog of
     // hundred-megabyte files drains across ticks rather than in one rewrite.
-    let is_repair = |add: &TailAdd| add.size >= converged && !add.is_sorted_run;
+    // An oversized file needs a SOLO rewrite (admitted one per bin via
+    // `repair_budget`) when it is either an unsorted run OR carries a deletion
+    // vector — a DV disables per-file parquet pushdown until the file is rewritten
+    // DV-free, and an oversized DV'd file never packs with others under the target
+    // budget, so the repair lane is what actually consolidates it. A SMALL DV'd
+    // file packs normally (it is already under `converged`).
+    let is_repair = |add: &TailAdd| add.size >= converged && (!add.is_sorted_run || add.has_dv);
     let mut fresh: Vec<(&str, i64, i64, bool)> = adds
         .iter()
-        .filter(|add| add.size < sorted_run_cap || !add.is_sorted_run)
+        .filter(|add| add.size < sorted_run_cap || !add.is_sorted_run || add.has_dv)
         .filter(|add| add.size < converged || is_repair(add))
         .filter_map(|add| match add.event_range {
             Some((min, max)) if max <= seal_micros => Some((add.path.as_str(), min, add.size, is_repair(add))),
@@ -16304,6 +16318,7 @@ mod tests {
             is_sorted_run: false,
             event_range: Some((i as i64, i as i64)),
             rows: Some(10_000),
+            has_dv: false,
         };
         // 40 candidate files of 16 MiB, contiguous in event time.
         let adds: Vec<_> = (0..40).map(|i| f(i, 16 * 1024 * 1024)).collect();
@@ -16361,6 +16376,7 @@ mod tests {
                         is_sorted_run: false,
                         event_range: Some((i as i64, i as i64)),
                         rows: Some((*size as u64) * 12 / 104),
+                        has_dv: false,
                     })
                     .collect();
                 let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack, ratio, floor);
@@ -16471,8 +16487,7 @@ mod tests {
             size,
             is_sorted_run: false,
             event_range: Some((min, max)),
-            rows: None,
-        };
+            rows: None, has_dv: false };
         // Priced in ROWS per file eliminated, which is what the guard compares.
         let value = |files: &[(&str, i64)]| {
             let rows: i64 = files.iter().map(|(_, s)| *s).sum();
@@ -16512,8 +16527,7 @@ mod tests {
             size,
             is_sorted_run: sorted,
             event_range: Some((min, max)),
-            rows: None,
-        };
+            rows: None, has_dv: false };
         // Seal lag: a file whose newest event is past the seal is still filling
         // (prod 2026-07-20: compacting it lost every OCC race).
         let unsealed = vec![f("a", 10, false, 1, 1), f("b", 10, false, 2, SEAL + 1)];
@@ -16556,6 +16570,16 @@ mod tests {
         let healthy = vec![f("big_sorted", 900, true, 1, 2)];
         assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0).is_empty(), "a converged sorted run is never re-selected");
 
+        // ...but the SAME converged sorted run carrying a deletion vector IS
+        // re-selected: a DV disables per-file parquet pushdown, so it must be
+        // rewritten DV-free (via the repair lane — a solo consolidation).
+        let dv_sorted = vec![super::TailAdd { path: "big_dv".into(), size: 900, is_sorted_run: true, event_range: Some((1, 2)), rows: None, has_dv: true }];
+        assert_eq!(
+            super::select_tail_bin(&dv_sorted, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
+            vec!["big_dv"],
+            "a DV-bearing converged file must be consolidated (rewritten DV-free) to restore pushdown"
+        );
+
         // Sorted runs fold only while under the cap; an over-cap run is excluded.
         let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
         assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["run_small", "a"], "only the sub-cap run folds");
@@ -16582,7 +16606,7 @@ mod tests {
 
         // Files with no event-time stats can't be binned disjointly (the
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
-        let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None, rows: None }, f("a", 10, false, 1, 2)];
+        let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None, rows: None, has_dv: false }, f("a", 10, false, 1, 2)];
         assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), Vec::<String>::new());
     }
 
@@ -16602,8 +16626,7 @@ mod tests {
             size,
             is_sorted_run: false,
             event_range: Some((min, max)),
-            rows: None,
-        };
+            rows: None, has_dv: false };
         // Smalls first, whale later in time: ratio off admits all three (the
         // measured 82.5%-write-volume shape); ratio 4 keeps the small pair and
         // leaves the whale for its own generation.
@@ -16629,8 +16652,7 @@ mod tests {
             size: size_mb * MB,
             is_sorted_run: sorted,
             event_range: None,
-            rows: None,
-        };
+            rows: None, has_dv: false };
 
         // Sorted runs are still excluded while any L0 file is present, but the two
         // L0 files now share one unit instead of taking a unit each.
@@ -16862,8 +16884,7 @@ mod tests {
             size: 10 * MB,
             is_sorted_run: true,
             event_range: Some((at_bin * bin, at_bin * bin + bin / 2)),
-            rows: Some(1_000),
-        };
+            rows: Some(1_000), has_dv: false };
         // Two files 100 bins apart: a merge of them spans ~101 bins.
         let far = vec![f("a", 0), f("b", 100)];
 
@@ -16903,8 +16924,7 @@ mod tests {
             size: size_mb * MB,
             is_sorted_run: true,
             event_range: None,
-            rows: Some(rows),
-        };
+            rows: Some(rows), has_dv: false };
 
         // Metrics shape: 47 B/row, so 256 MB of these is ~5.5 M rows. The byte
         // budget alone would take them all; the row cap stops first.
@@ -16922,7 +16942,7 @@ mod tests {
 
         // Absent stats must never make the cap stricter than bytes alone.
         let unknown: Vec<_> =
-            (0..23).map(|i| super::TailAdd { path: format!("u{i:02}"), size: 11 * MB, is_sorted_run: true, event_range: None, rows: None }).collect();
+            (0..23).map(|i| super::TailAdd { path: format!("u{i:02}"), size: 11 * MB, is_sorted_run: true, event_range: None, rows: None, has_dv: false }).collect();
         assert_eq!(
             super::select_coordinator_compaction_candidates(unknown, super::COORDINATOR_SEALED_TARGET_BYTES).len(),
             23,
@@ -16946,7 +16966,7 @@ mod tests {
     #[test]
     fn a_pair_that_fits_the_byte_budget_is_never_blocked_by_the_row_cap() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd { path: path.into(), size: bytes, is_sorted_run: true, event_range: None, rows: Some(rows) };
+        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd { path: path.into(), size: bytes, is_sorted_run: true, event_range: None, rows: Some(rows), has_dv: false };
 
         // The exact prod cell, sizes and row counts as measured.
         let cell = vec![
@@ -16981,7 +17001,7 @@ mod tests {
     #[test]
     fn the_planner_admits_exactly_what_the_packer_can_bin() {
         let target = super::COORDINATOR_SEALED_TARGET_BYTES;
-        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd { path: path.into(), size: bytes, is_sorted_run: true, event_range: None, rows: Some(rows) };
+        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd { path: path.into(), size: bytes, is_sorted_run: true, event_range: None, rows: Some(rows), has_dv: false };
 
         // Both cells read off prod 2026-09-03. Bytes fit in BOTH — 82% and 81% of
         // the budget — so a bytes-only planner queues both; the packer bins only
@@ -17013,7 +17033,7 @@ mod tests {
     #[test]
     fn an_unsorted_bin_is_budgeted_in_decoded_bytes() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: false, event_range: None, rows: None };
+        let f = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: false, event_range: None, rows: None, has_dv: false };
         let budget = super::unsorted_bin_budget_bytes();
 
         // The invariant the value is chosen from, stated as a test so a future
@@ -17104,8 +17124,7 @@ mod tests {
             size: size_mb * MB,
             is_sorted_run: sorted,
             event_range: None,
-            rows: None,
-        };
+            rows: None, has_dv: false };
 
         // The whale/07-30 shape: converged files carrying no sorted-run tag, beside real small debt.
         let whale = vec![f("converged-a", 520, false), f("converged-b", 512, false), f("small-a", 6, false), f("small-b", 6, false)];
@@ -17139,7 +17158,7 @@ mod tests {
     #[test]
     fn packing_takes_the_small_files_even_when_a_large_one_sorts_first() {
         const MB: i64 = 1024 * 1024;
-        let run = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: true, event_range: None, rows: None };
+        let run = |path: &str, size_mb: i64| super::TailAdd { path: path.into(), size: size_mb * MB, is_sorted_run: true, event_range: None, rows: None, has_dv: false };
 
         // Event-time order puts the 252 MB file first; the rest are tiny.
         let cell = vec![run("big-252", 252), run("t-a", 14), run("t-b", 14), run("t-c", 14)];
@@ -17186,7 +17205,7 @@ mod tests {
             super::COORDINATOR_FILE_REWRITE_TIMEOUT
         );
 
-        let run = |name: &str, mib: i64| super::TailAdd { path: name.into(), size: mib * MIB, is_sorted_run: true, event_range: None, rows: None };
+        let run = |name: &str, mib: i64| super::TailAdd { path: name.into(), size: mib * MIB, is_sorted_run: true, event_range: None, rows: None, has_dv: false };
         assert_eq!(
             super::select_coordinator_compaction_candidates(vec![run("a", 128), run("b", 128), run("c", 128)], super::COORDINATOR_SEALED_TARGET_BYTES),
             vec!["a", "b"],
@@ -17205,7 +17224,7 @@ mod tests {
         const TARGET: i64 = 1000;
         const SEAL: i64 = 10_000;
         let f =
-            |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)), rows: None };
+            |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)), rows: None, has_dv: false };
         let backlog = vec![f("may", 900, 10), f("july", 900, 500), f("june", 950, 100)];
         assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0, 0), vec!["july"], "newest poisoned file first");
 
@@ -18355,7 +18374,7 @@ mod tests {
     #[test]
     fn converged_sorted_runs_are_a_counterexample_to_compaction_dedup_convergence() {
         const TARGET: i64 = 1000;
-        let run = |path: &str, min: i64| super::TailAdd { path: path.into(), size: 900, is_sorted_run: true, event_range: Some((min, min + 1)), rows: None };
+        let run = |path: &str, min: i64| super::TailAdd { path: path.into(), size: 900, is_sorted_run: true, event_range: Some((min, min + 1)), rows: None, has_dv: false };
         let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
 
         assert!(

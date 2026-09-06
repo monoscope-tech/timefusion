@@ -3356,7 +3356,7 @@ impl Database {
                         return None;
                     }
                     after_project += 1;
-                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), file.stats().as_deref());
+                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), file.deletion_vector_descriptor().is_some(), file.stats().as_deref());
                     if add.event_range.is_some_and(|(start, end)| start >= key.slice.end_micros || end < key.slice.start_micros) {
                         return None;
                     }
