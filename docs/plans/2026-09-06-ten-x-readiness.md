@@ -109,3 +109,39 @@ has `dropped > 0`, still refused a grant, so the one-pass-delay loop persists.
 Carried finding: **DerivedRollup completions collapse first under 10x load**
 (208→48 while every other lane holds) — the freshness product dies first, and
 derived rollups read exactly what dedup gates, which is the DV motivation too.
+
+## Envelope verdict (item 4, CLOSED) — a real but bounded multiplier, not a 10x lever
+
+Matched 6h pair, 10x load (170 streams), seed 7:
+
+| metric (6h, 10x) | w16 | w32 |
+|---|---:|---:|
+| completions TOTAL | 638 | **1317 (2.06x)** |
+| executions | 882 | 1784 |
+| pending_end | 13,619 | **13,014 (−4%)** |
+| frontier_lag_secs_max | 67,750 | 67,854 |
+
+**Overturns my prior.** I expected the `coordinator_jobs` doc's queueing
+collapse; instead completions scale ~linearly to 32 workers. BUT two facts bound
+it:
+
+1. **The sim has NO rewrite-permit semaphore** (grepped: no `HEAVY_REWRITE_PERMITS`,
+   no `rewrite_sem`). Its `--workers` models the claim/schedule path only, so
+   2.06x is what the SCHEDULER permits — an upper bound. Prod's real cap is the
+   10-permit inner pool + real sort CPU/IO per unit, which the sim cannot see.
+   The doc's "6:1 job:permit collapse" lives entirely in that unmodeled layer.
+2. **Even at 2x completions the backlog barely moves** (13,619→13,014) — at 10x
+   arrivals, doubling maintenance throughput dents pending by 4%. Arrivals
+   dominate; a throughput multiplier cannot close a 10x arrival gap.
+
+**Decision:** the envelope raise is worth a STAGING test (free via the existing
+`TIMEFUSION_COORDINATOR_JOB_WORKERS` env var) as a general maintenance-throughput
+win where the box has CPU headroom — but it must raise `HEAVY_REWRITE_PERMITS`
+in step (else jobs queue on permits) and it is NOT a path to 10x. Staging watch:
+`light_optimize_memory_brakes_total`, the 08-17 OOM shape, and the tiling-shrunk
+repair pool clearing the ~690 MB floor.
+
+**The only structural 10x/100x lever remains the cheaper unit (DV writer).**
+Item 4's throughput multiplier and item 2's cheaper unit are complementary:
+2x from slots × ~Nx from DV (dedup stops rewriting files) is how the arithmetic
+reaches 10x, and only DV supplies the large factor.
