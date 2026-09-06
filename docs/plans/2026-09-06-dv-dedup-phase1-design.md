@@ -125,6 +125,48 @@ Gate on the EXISTING `timefusion_use_deletion_vectors` (default true) — no new
   Delta's conflict checker should fire remove-remove on the old add — verify with
   a targeted test.
 
+## DV-core design — SETTLED (advisor-reviewed), on branch `dv-dedup`
+
+Insertion: inline in `stage_dedup_chunk` after `expected_logical_rows`, gated on
+`use_deletion_vectors` (+ table DV feature). Reuses the in-scope resolved
+`chunk_snapshot`/`chunk_log_store`/`targets`; on stale mapping `continue` (replan).
+
+1. **Loser selection**: shard the CHUNK by the same `hash_bucket` predicate the
+   copy-on-write path uses (dup groups never split — complete-key hash). Per
+   shard: scan via a row-index provider projecting
+   `(DEDUP_FILE_COL, DV_ROW_INDEX_COL, keys, tiebreak)` over `chunk_filter`;
+   `dedup_batches` → survivors; losers = scanned `(file,row_idx)` − survivor
+   `(file,row_idx)`. Accumulate losers per file across shards. **Shard from day
+   one** — the whale (8.7M-row cell) is the target workload; a whole-chunk
+   collect is the anon-RSS OOM shape. Narrow bytes-per-row estimate for
+   `dedup_shard_count` (path+u64+keys+tiebreak, not fat-row).
+2. **Guards** (safety ≠ certification — DV's data-loss direction is NOT scan
+   completeness): a truncated read can only MISS dupes, never mask unique data,
+   because a loser is only marked when scanned alongside a same-key row that beat
+   it. Real data-loss directions: (a) `(file,row_index)` attribution — pinned by
+   the fork gate test; (b) concurrent-DML-DELETE race — needs a test.
+   - Count oracle guards CERTIFICATION: `COUNT(*) WHERE chunk_filter` on the SAME
+     ctx/snapshot as the DV scan (not the probe ctx — cross-snapshot late flushes
+     differ legitimately). `scanned != count` → Retry, don't certify.
+   - `losers + survivors == scanned`; `survivors == chunk-scoped distinct-key
+     count`; `losers == 0` → `Converged`.
+   - `DedupUnit{before: scanned, after: survivors}` (chunk-scoped, fine for
+     `wave_dropped_rows`).
+3. **Commit** via `commit_wave`; DV StagedBin: `removes`/`adds` split from
+   `write_deletion_vectors`, `discardable_paths` = `.bin` sidecars (via
+   `dv_object_store_relative_path`), `stage_store` = table object store,
+   `sorted` unchanged (skip `mark_written_sorted`).
+4. **BOOT-RECONCILE .bin LIVENESS (critical, must fix before deploy)**: a
+   committed `.bin` is NOT in `log_data` paths, so reconcile's parquet-path
+   liveness check reads a live sidecar as dead and deletes it (crash-after-commit
+   window) → resurrection/read errors. Extend the reconcile liveness set with
+   `.bin` paths derived from live Adds' DV descriptors (`dv_object_store_relative_path`
+   — the same rule VACUUM uses). Read the boot-reconcile path first.
+5. **Concurrent-DML-DELETE race test**: DML DELETE DVs a file between stage and
+   commit; staged Add merged from the OLD descriptor would clobber the concurrent
+   delete's mask. Verify Delta's conflict checker fires remove-remove on the old
+   add.
+
 ## Risks / standing caveats
 
 - **THE BIG ONE — DV-bearing files lose per-file parquet predicate pushdown.**
