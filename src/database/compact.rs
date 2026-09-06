@@ -1346,12 +1346,24 @@ impl Database {
         partition_filter: &str, chunk_filter: &str, label: &str, date_str: &str, key: Option<DirtyBinKey>, limits: Option<DedupExecutionLimits>,
     ) -> Result<BinOutcome<StagedBin>> {
         // DV-dedup: drop losers with a deletion vector rather than a whole-file
-        // rewrite. Same gate (and table DV feature, ensured by the same flag) as
-        // the DML DV path. `partition_filter`/`scan_name` are unused by the DV
-        // path — it builds its own row-index provider.
+        // rewrite. Gated on the flag AND the table actually declaring the DV
+        // feature — writing a DV to a table without `enableDeletionVectors` is a
+        // protocol violation, so a table created before the flag was on (its
+        // properties not yet reconciled) correctly falls back to copy-on-write.
+        // `partition_filter`/`scan_name` are unused by the DV path — it builds
+        // its own row-index provider.
         if self.config.maintenance.timefusion_use_deletion_vectors {
-            let _ = (partition_filter, scan_name);
-            return self.stage_dedup_chunk_dv(table_ref, table_name, project_id, schema, chunk_filter, label, date_str, key, limits).await;
+            let dv_enabled = table_ref
+                .read()
+                .await
+                .snapshot()
+                .ok()
+                .map(|s| s.snapshot().table_properties().enable_deletion_vectors == Some(true))
+                .unwrap_or(false);
+            if dv_enabled {
+                let _ = (partition_filter, scan_name);
+                return self.stage_dedup_chunk_dv(table_ref, table_name, project_id, schema, chunk_filter, label, date_str, key, limits).await;
+            }
         }
         use deltalake::{kernel::Action, writer::DeltaWriter};
         use futures::StreamExt;
@@ -2090,6 +2102,26 @@ impl Database {
             let decoded_budget =
                 limits.map_or(self.config.maintenance.timefusion_dedup_max_decoded_bytes, |l| self.config.maintenance.timefusion_dedup_max_decoded_bytes.min(l.max_decoded_bytes));
             let shards = dedup_shard_count(limits.is_some(), est_decoded, 0, decoded_budget, u64::MAX).max(1);
+
+            // A single dedup-key group cannot be split (all copies share one hash
+            // bucket), so if the largest group alone would blow the decode budget
+            // even at the narrow projection width, no shard count helps — skip and
+            // let compaction shrink the file set first, exactly like the
+            // copy-on-write path. Cheaper here (narrow projection), so it fires
+            // only on a genuinely enormous single key.
+            if limits.is_none() && shards > 1 && decoded_budget > 0 {
+                let max_group_sql =
+                    format!("SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter} GROUP BY {})", schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", "));
+                let max_group = Self::scalar_i64(&ctx, &max_group_sql).await?.unwrap_or(0);
+                if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
+                    crate::observability::record_dedup_chunk_skipped();
+                    error!(
+                        "dv-dedup SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] — duplicates persist until compaction shrinks the file set",
+                        max_group, table_name, label
+                    );
+                    return Ok(BinOutcome::Retry);
+                }
+            }
 
             let mut losers_by_file: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
             let mut survivors_total: u64 = 0;

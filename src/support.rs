@@ -201,11 +201,12 @@ pub mod test_helpers {
         test_name: String,
         buffer_mode: BufferMode,
         rollups: bool,
+        deletion_vectors: bool,
     }
 
     impl TestConfigBuilder {
         pub fn new(test_name: &str) -> Self {
-            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled, rollups: false }
+            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled, rollups: false, deletion_vectors: true }
         }
 
         pub fn with_buffer_mode(mut self, mode: BufferMode) -> Self {
@@ -218,10 +219,21 @@ pub mod test_helpers {
             self
         }
 
+        /// Force the COPY-ON-WRITE dedup path (whole-file rewrite) instead of the
+        /// default deletion-vector path. For tests that assert copy-on-write
+        /// mechanics — file replacement, sharded rewrite output — which DV
+        /// deliberately does not do (it masks the same file in place). DV is the
+        /// prod default; this pins the revert path that must keep working.
+        pub fn without_deletion_vectors(mut self) -> Self {
+            self.deletion_vectors = false;
+            self
+        }
+
         pub fn build(self) -> Arc<AppConfig> {
             let id = format!("{}-{}", self.test_name, &uuid::Uuid::new_v4().to_string()[..8]);
             let mut cfg = minio_base_config(&id, &format!("/tmp/timefusion-{id}"));
             cfg.buffer.timefusion_flush_immediately = self.buffer_mode == BufferMode::FlushImmediately;
+            cfg.maintenance.timefusion_use_deletion_vectors = self.deletion_vectors;
             // Rollups are unconditional now, so `with_rollups()` no longer gates
             // anything — it stays as a declaration of intent at the call sites.
             let _ = self.rollups;
@@ -253,16 +265,27 @@ pub mod test_helpers {
         Arc::new(minio_base_config(table_id, data_dir))
     }
 
-    /// Physical row count from the Delta log's `num_records` stats, summed over
-    /// all active files. Bypasses the routed scan path entirely — unlike a
-    /// `query_delta_only` COUNT, it is NOT collapsed by the read-side `DedupExec`,
-    /// so it reflects on-disk duplicates (what the dedup *sweep* tests assert).
+    /// LIVE row count from the Delta log: `sum(num_records) − sum(deletion-vector
+    /// cardinality)`, over all active files. Bypasses the routed scan path — unlike
+    /// a `query_delta_only` COUNT it is NOT collapsed by the read-side `DedupExec`,
+    /// so it reflects rows still LIVE on disk (what the dedup *sweep* tests assert).
+    ///
+    /// DV-aware so it means the same thing under both dedup strategies: a
+    /// copy-on-write sweep drops the loser row (num_records falls); a DV sweep
+    /// masks it (num_records unchanged, but its deletion-vector cardinality rises).
+    /// Either way a collapsed duplicate stops counting here, and a sweep that was
+    /// budget-blocked (no DV written, no rewrite) still counts both copies.
     pub async fn delta_physical_row_count(table_ref: &tokio::sync::RwLock<deltalake::DeltaTable>) -> anyhow::Result<i64> {
-        use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
         let guard = table_ref.read().await;
-        let batch = guard.snapshot()?.add_actions_table(true)?;
-        let arr = batch.column_by_name("num_records").ok_or_else(|| anyhow::anyhow!("add_actions_table missing num_records"))?.as_primitive::<Int64Type>();
-        Ok(arr.iter().flatten().sum())
+        let snapshot = guard.snapshot()?.snapshot().clone();
+        // Per active file: numRecords minus its deletion-vector cardinality (the
+        // masked rows), same accounting as the dedup verify path in maintain.rs.
+        let live = snapshot.log_data().iter().fold(0i64, |acc, f| {
+            let records = f.num_records().and_then(|n| i64::try_from(n).ok()).unwrap_or(0);
+            let masked = f.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality);
+            acc + records - masked
+        });
+        Ok(live)
     }
 
     /// Build a BufferedWriteLayer for tests/benches without repeating the registry boilerplate.
