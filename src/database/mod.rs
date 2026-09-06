@@ -7552,6 +7552,15 @@ pub(crate) struct StagedBin {
     adds: Vec<deltalake::kernel::Action>,
     /// Store the staged parquet was written to, for `cleanup_orphaned_parquet`.
     stage_store: Arc<dyn object_store::ObjectStore>,
+    /// Paths (relative to `stage_store`) to delete when this bin is DISCARDED,
+    /// beyond the live-checked `adds` cleanup. Empty for copy-on-write bins
+    /// (their new-file `adds` are cleaned by the live check in
+    /// `discard_bin_parquet`). A DV-dedup bin's `adds` are SAME-PATH live files
+    /// that must never be deleted; its discardable set is instead the fresh-UUID
+    /// `.bin` deletion-vector sidecars `write_deletion_vectors` wrote — always
+    /// safe to delete on discard because a discarded commit references none of
+    /// them.
+    discardable_paths: Vec<String>,
     /// Whether this bin's `adds` were written with a declared `sorting_columns`
     /// footer — see [`Database::mark_written_sorted`], which `commit_wave` calls
     /// once the bin lands. False is always SAFE: it costs a footer probe later,
@@ -8814,10 +8823,18 @@ fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
 /// re-read shrinks the window from "any time since we staged" to the few
 /// milliseconds between the read and the delete.
 async fn discard_bin_parquet(bins: &[StagedBin], live: &HashSet<String>) {
+    use object_store::ObjectStoreExt; // dyn-safe `delete`
     for bin in bins {
         let orphans: Vec<deltalake::kernel::Action> =
             bin.adds.iter().filter(|a| !matches!(a, deltalake::kernel::Action::Add(add) if live.contains(add.path.as_str()))).cloned().collect();
         Database::cleanup_orphaned_parquet(&bin.stage_store, &orphans).await;
+        // DV-dedup sidecars: fresh-UUID `.bin` files a discarded commit never
+        // references, so unconditional delete is safe (never a live data file).
+        for rel in &bin.discardable_paths {
+            if let Err(e) = bin.stage_store.delete(&object_store::path::Path::from(rel.as_str())).await {
+                warn!("orphaned DV sidecar (manual cleanup needed): {rel} — delete failed: {e}");
+            }
+        }
     }
 }
 
@@ -17368,6 +17385,7 @@ mod tests {
         let (removes, adds) = super::staged_actions(&targets, staged, dedup.is_some());
         super::StagedBin {
             sorted: false,
+            discardable_paths: Vec::new(),
             project_id: project.to_string(),
             wave_id: format!("wave-{project}"),
             target_paths: paths.iter().map(|p| p.to_string()).collect(),
@@ -18807,7 +18825,7 @@ mod tests {
         };
         assert!(!files.is_empty(), "the insert must have committed a file, or this test proves nothing");
 
-        let provider = Database::narrow_provider(log_store, snapshot, files, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let provider = Database::narrow_provider(log_store, snapshot, files, None, None).await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let ctx = SessionContext::new();
         ctx.register_table("scan", provider)?;
         let schema = get_schema("otel_logs_and_spans").expect("shipped schema");

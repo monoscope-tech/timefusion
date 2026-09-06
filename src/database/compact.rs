@@ -976,12 +976,19 @@ impl Database {
     /// file-identity passthrough column dedup rewrites key on.
     pub(crate) async fn narrow_provider(
         log_store: deltalake::logstore::LogStoreRef, snapshot: Arc<deltalake::kernel::EagerSnapshot>, files: Vec<String>, file_col: Option<&str>,
+        row_index_col: Option<&str>,
     ) -> Result<Arc<dyn TableProvider>, deltalake::DeltaTableError> {
         use deltalake::delta_datafusion::{FileSelection, TableProviderBuilder};
         let mut builder =
             TableProviderBuilder::default().with_log_store(log_store).with_eager_snapshot(snapshot).with_file_selection(FileSelection::from_file_paths(files));
         if let Some(col) = file_col {
             builder = builder.with_file_column(col);
+        }
+        // A row-index column makes the fork disable parquet predicate pushdown
+        // (positions must not shift), so request it only when DV-dedup needs
+        // physical loser positions.
+        if let Some(col) = row_index_col {
+            builder = builder.with_row_index_column(col);
         }
         Ok(Arc::new(builder.build().await?))
     }
@@ -1005,7 +1012,7 @@ impl Database {
         // Probe-only provider (chunk detection). The rewrite builds its own
         // provider per attempt — from a FRESH snapshot, with the synthetic
         // source-file column — in `dedup_rewrite_chunk`.
-        let provider = Self::narrow_provider(log_store, snapshot, partition_files, None).await.map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
+        let provider = Self::narrow_provider(log_store, snapshot, partition_files, None, None).await.map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
         // A fresh state is intentional: SessionState clones retain mutable
         // catalog/execution internals and can resolve the scan name to an older
         // eager snapshot. FileSelection above removes the expensive all-table
@@ -1368,7 +1375,7 @@ impl Database {
                 (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
             };
             let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
-            let provider = Self::narrow_provider(chunk_log_store, Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL))
+            let provider = Self::narrow_provider(chunk_log_store, Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL), None)
                 .await
                 .map_err(|e| anyhow::anyhow!("dedup rewrite provider: {e}"))?;
             // Sort parallelism descends on retry: the merge exec is unspillable
@@ -1957,6 +1964,7 @@ impl Database {
                 removes,
                 adds,
                 stage_store,
+                discardable_paths: Vec::new(),
                 dedup: Some(DedupUnit { key: key.clone(), date: date_str.to_string(), label: label.to_string(), before: before as u64, after: after as u64 }),
                 sorted,
             }));

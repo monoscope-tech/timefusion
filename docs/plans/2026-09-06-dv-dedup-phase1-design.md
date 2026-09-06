@@ -75,6 +75,56 @@ whale date in `timefusion-staging` (real R2 latency; MinIO under-measures the
 fixed per-unit object-store cost). Deliverable: the DV/rewrite wall-clock and
 bytes-written ratio.
 
+## IMPLEMENTATION LOG (in progress, ON-by-default per user directive)
+
+Gate on the EXISTING `timefusion_use_deletion_vectors` (default true) — no new knob.
+
+**Fork branch `timefusion-dv-physical-row-index`** (off pinned `cb04a41e`):
+- `6e9244fe` test: pins per-file + physical row-index semantics (reproduce).
+- `044f7c98` **fix: a LIVE prod bug** — `with_row_index_column` returned post-mask
+  LOGICAL ordinals on DV'd files, corrupting `deletion_vector_delete` +
+  `merge_update_with_deletion_vectors` (both default-on) on a 2nd delete/update
+  over an already-DV'd file. Fixed in `append_row_index` (physical index over the
+  RAW batch, filtered by the DV selection). 6/6 DV + 55/55 exec tests green.
+  **Independently deploy-worthy regardless of DV-dedup.**
+- visibility (uncommitted, building): `with_row_index_column`,
+  `write_deletion_vectors`, `FileDeletion`, `dv_object_store_relative_path`,
+  `pub mod deletion_vectors` — so TF can call the writer + derive `.bin` paths.
+
+**TF-side plan (verified against the code):**
+- Insertion: `compact.rs::stage_dedup_chunk`, after `targets` (the Add actions)
+  are mapped. Uniform DV path — the fork fix makes multi-pass DV on an
+  already-DV'd file correct, so NO copy-on-write fallback is needed for
+  correctness (consolidation is separate, task 13).
+- Loser selection (option D): scan the chunk via `narrow_provider` with
+  `with_file_column(DEDUP_FILE_COL)` + `with_row_index_column` +
+  `with_pushdown_with_deletion_vectors(true)`, projected to
+  `(file, row_index, dedup keys, tiebreak)`, `ORDER BY dedup key`
+  (SortPreservingMerge; key == sort prefix so no real sort). Stream run-by-run:
+  per equal-key run pick the winner via the shared `beats()` comparator (task 10),
+  emit the rest as `(file, row_index-1)` losers. Group by file → `FileDeletion`
+  → `write_deletion_vectors` (writes `.bin`, returns Remove(old)+Add(same,+DV)).
+- Commit via existing `commit_wave` with the swapped action set. Keep the
+  fail-closed count guard (`before == expected_live_rows`, `after = before −
+  losers`, `before == after → Converged`).
+- **Staging-machinery reconciliation** (the structural conflict caught + resolved
+  with the advisor): `cleanup_orphaned_parquet` deletes add paths
+  UNCONDITIONALLY — fatal for DV bins whose adds are same-path LIVE files. Fix:
+  add `StagedBin.discardable_paths` (explicit cleanup set). Copy-on-write bins:
+  empty (their existing live-checked `discard_bin_parquet` add-logic is unchanged
+  and already skips live paths). DV bins: the `.bin` sidecar paths (fresh UUIDs,
+  always safe to delete on discard), with `stage_store` = the live table store
+  where `write_deletion_vectors` put them. `record_staged_intent.paths` = the
+  `.bin`s (boot-reconcile crash safety, same mechanism as staged parquet).
+- Skip `mark_written_sorted` for DV bins (same-path files, sortedness unchanged,
+  `repair_verified_sorted` path-keyed stays valid). Passing `sorted=true` on files
+  we didn't write is how a wrong seed enters.
+- **One race to test (pre-existing, DV multiplies it):** a concurrent DML DELETE
+  can DV the same file between stage and commit; path-based liveness passes but
+  the staged Add merged from the OLD descriptor would drop the concurrent delete.
+  Delta's conflict checker should fire remove-remove on the old add — verify with
+  a targeted test.
+
 ## Risks / standing caveats
 
 - **THE BIG ONE — DV-bearing files lose per-file parquet predicate pushdown.**
