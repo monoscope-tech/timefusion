@@ -1,3 +1,14 @@
+# Incident 2026-09-06: float4 and narrow integers were emitted as JSON strings.
+query T
+SELECT jsonb_build_array(80::real, -7::smallint, 17::integer, NULL::real)
+----
+[80.0,-7,17,null]
+
+query T
+SELECT jsonb_build_array('NaN'::real, 'Infinity'::real, '-Infinity'::double precision)
+----
+["NaN","Infinity","-Infinity"]
+
 # Test JSON functions in TimeFusion
 # This file combines all JSON-specific tests from:
 # - available_json_functions.slt
