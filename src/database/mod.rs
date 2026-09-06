@@ -8002,12 +8002,13 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     candidates.sort_by_key(|add| add.size);
     let mut bytes = 0i64;
     let mut rows = 0u64;
-    let mut selected = Vec::new();
+    let mut selected: Vec<TailAdd> = Vec::new();
     // SPAN budget, off unless configured. The output spans the UNION of what is
     // merged, and every dedup bin overlapping it must read it in full — so an
     // unbounded union is what makes a merge expensive for the read path. See
     // `timefusion_compaction_span_budget_bins`.
     let span_cap = crate::config::try_config().map_or(0, |c| c.buffer.timefusion_compaction_span_budget_bins);
+    let pack_size_ratio = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_size_ratio);
     let mut span: Option<(i64, i64)> = None;
     for add in candidates {
         // A file at or above target is converged and never packing's work,
@@ -8020,6 +8021,13 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
         }
         if has_unsorted && add.is_sorted_run {
             continue;
+        }
+        // BREAK, not skip: candidates are size-ASCENDING here, so the first
+        // violator and everything after it is even larger. The same predicate
+        // as `select_tail_bin`'s guard — the floor's lesson was that a guard on
+        // one lane is inert, both selectors feed `stage_hot_bin` as `pass=Pack`.
+        if !selected.is_empty() && bin_breaks_size_ratio(selected[0].size, add.size, pack_size_ratio) {
+            break;
         }
         // SKIP, not break: candidates are ordered by SIZE, so a later one may
         // still sit inside the accumulated range even when this one does not.
@@ -8356,7 +8364,35 @@ pub(crate) fn bin_exceeds_value_floor(rows: u64, files: usize, floor: u64) -> bo
     rows / eliminated.max(1) > floor.max(1)
 }
 
-pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass) -> Vec<String> {
+/// Would admitting `candidate` into a bin whose smallest member is `smallest`
+/// break the similar-size rule?
+///
+/// The rule every mature merge policy carries (ClickHouse's selector,
+/// RocksDB universal compaction's `size_ratio`) and this packer lacked: never
+/// rewrite a large file to absorb small ones. The value floor prices FAN-IN;
+/// this prices SIMILARITY — a bin of nine tiny files plus one huge one passes
+/// the floor and is still the shape prior art refuses. `ratio` of 0 disables.
+/// See `docs/plans/2026-09-06-merge-policy-prior-art.md`.
+///
+/// ```
+/// # use timefusion::database::bin_breaks_size_ratio as breaks;
+/// const MB: i64 = 1024 * 1024;
+/// // The measured pathology: a tiny file dragging a whale into its bin.
+/// assert!(breaks(1 * MB, 790 * MB, 4));
+/// // The measured good shape: near-peers merge freely.
+/// assert!(!breaks(95 * MB, 114 * MB, 4));
+/// // Boundary is inclusive: exactly ratio-times is still similar enough.
+/// assert!(!breaks(10 * MB, 40 * MB, 4) && breaks(10 * MB, 41 * MB, 4));
+/// // 0 = off.
+/// assert!(!breaks(1, i64::MAX, 0));
+/// ```
+pub fn bin_breaks_size_ratio(smallest: i64, candidate: i64, ratio: i64) -> bool {
+    ratio > 0 && candidate > smallest.max(1).saturating_mul(ratio)
+}
+
+pub(crate) fn select_tail_bin(
+    adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass, size_ratio: i64,
+) -> Vec<String> {
     let cap = target_size.max(1);
     let converged = cap - cap / 8;
     // An oversized file that is NOT a sorted run is a REPAIR candidate, not a
@@ -8414,20 +8450,29 @@ pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usi
     // per tick. Small commit converges quickly and shrinks the conflict window;
     // later ticks pack the next (strictly later) slice.
     let mut bytes = 0i64;
+    let (mut run_min, mut run_max) = (i64::MAX, 0i64);
     let mut files: Vec<String> = vec![];
     for (path, _, size, _) in fresh.iter().filter(|(_, _, _, r)| !*r) {
         let (path, size) = (*path, *size);
-        if !files.is_empty() && bytes + size > cap {
+        // Same treatment as blowing the byte cap, and for the same reason: the
+        // slice is time-ordered, so a violator either ends a viable bin or
+        // restarts the slice AT itself — never a hole in the middle, which is
+        // what keeps the output a time-disjoint run. A dissimilar file ending
+        // the bin protects whichever side is LARGE: tiny files never drag a
+        // whale into their bin, and a whale's bin never absorbs stragglers.
+        if !files.is_empty() && (bytes + size > cap || bin_breaks_size_ratio(run_min.min(size), run_max.max(size), size_ratio)) {
             // A lone-file slice is already a run — rewriting it is pure churn.
             // Skip past it to the next time slice instead of wedging the pass
             // behind it.
             if files.len() >= 2 {
                 break;
             }
-            bytes = 0;
+            (bytes, run_min, run_max) = (0, i64::MAX, 0);
             files.clear();
         }
         bytes += size;
+        run_min = run_min.min(size);
+        run_max = run_max.max(size);
         files.push(path.to_string());
     }
     if files.len() < 2 {
@@ -16235,7 +16280,7 @@ mod tests {
         // 40 candidate files of 16 MiB, contiguous in event time.
         let adds: Vec<_> = (0..40).map(|i| f(i, 16 * 1024 * 1024)).collect();
 
-        let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack).len();
+        let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack, 0).len();
         let (at256, at512, at768) = (fan_in(256 * 1024 * 1024), fan_in(512 * 1024 * 1024), fan_in(768 * 1024 * 1024));
         println!("fan-in: 256 MiB -> {at256}   512 MiB -> {at512}   768 MiB -> {at768}");
 
@@ -16270,7 +16315,7 @@ mod tests {
 
         // One partition: files arrive, the packer picks a bin, the bin becomes a
         // single larger file. Deterministic — no clock, no RNG.
-        let run = |floor: u64| -> (i64, i64, usize) {
+        let run = |floor: u64, ratio: i64| -> (i64, i64, usize) {
             let (mut live, mut written, mut ingested, mut seq) = (Vec::<i64>::new(), 0i64, 0i64, 0i64);
             for _ in 0..ROUNDS {
                 live.push(ARRIVAL);
@@ -16286,7 +16331,7 @@ mod tests {
                         rows: None,
                     })
                     .collect();
-                let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack);
+                let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack, ratio);
                 if picked.len() < 2 {
                     continue;
                 }
@@ -16312,12 +16357,12 @@ mod tests {
             (written, ingested, live.len())
         };
 
-        let (w_off, ing, files_off) = run(0);
+        let (w_off, ing, files_off) = run(0, 0);
         // 8M rows/file: above this fixture's 10-file merges (2.4M) so packing is
         // NOT wedged, below its 2-file merges (4.35M) so the expensive shape is
         // still refused. At 1M the floor refused EVERY bin and amplification
         // went to 0.00x — nothing merged. That is why the shipped default is 0.
-        let (w_on, _, files_on) = run(1_000_000); // the measured knee; the fan-in escape makes it safe
+        let (w_on, _, files_on) = run(1_000_000, 0); // the measured knee; the fan-in escape makes it safe
         let amp = |w: i64| w as f64 / ing as f64;
         println!("amplification: OFF {:.2}x  ON {:.2}x   |   live files: OFF {files_off}  ON {files_on}", amp(w_off), amp(w_on));
 
@@ -16328,6 +16373,41 @@ mod tests {
         // for the READER's file count. A floor that halves writes but doubles
         // files per partition is a bad trade — every query opens every file.
         assert!(files_on <= files_off * 2, "the floor must not blow up the live file count: off {files_off}, on {files_on}");
+
+        // The similar-size rule, same harness. Uniform arrivals make each merge
+        // OUTPUT the dissimilar giant among fresh arrivals, so the ratio guard
+        // stops outputs re-absorbing every new file — the generational
+        // stratification ClickHouse/RocksDB buy with the same rule. Outputs
+        // still merge with their own generation once peers exist.
+        let (w_ratio, _, files_ratio) = run(0, 4);
+        println!(
+            "amplification: OFF {:.2}x  FLOOR {:.2}x  RATIO {:.2}x   |   live files: OFF {files_off}  FLOOR {files_on}  RATIO {files_ratio}",
+            amp(w_off),
+            amp(w_on),
+            amp(w_ratio)
+        );
+        assert!(amp(w_ratio) < amp(w_off), "the size-ratio guard must lower steady-state amplification: off {:.2}x, ratio {:.2}x", amp(w_off), amp(w_ratio));
+        assert!(files_ratio <= files_off * 2, "the ratio guard must not blow up the live file count: off {files_off}, ratio {files_ratio}");
+
+        // COMPOSITION — and the reason the ratio ships OFF. With both guards
+        // on, the walker's first viable pick becomes a second-generation pair
+        // ([output, output]) that the FLOOR then refuses — and refusal returns
+        // an empty selection instead of resuming the walk past the refused
+        // bin, so the admissible small-file bin behind it is never reached.
+        // The fixture wedges at ~round 13 (its wedge-detector fires), which a
+        // naive amplification read mistakes for a win (0.03x on a corpse).
+        // This is the row-cap livelock shape through a new door
+        // (`tf_row_cap_livelock_2026-09-03`): a guard that refuses without a
+        // RESUME manufactures a livelock whenever its refused bin is the
+        // walker's fixed first choice. Until selection resumes past a floor
+        // refusal, the pair is unsafe and `timefusion_pack_max_size_ratio`
+        // defaults to 0.
+        let (w_both, ing_both, files_both) = run(1_000_000, 4);
+        println!("amplification: BOTH {:.2}x   |   live files: BOTH {files_both}   |   ingested {:.0}% of baseline", amp(w_both), 100.0 * ing_both as f64 / ing as f64);
+        assert!(
+            ing_both < ing,
+            "the floor+ratio pair is EXPECTED to wedge this fixture (see comment); if it now completes all rounds, the resume-past-refusal fix has landed — flip this assertion and re-run the default-ON case"
+        );
     }
 
     /// The VALUE guard, benchmarked against the shape prod actually produces.
@@ -16366,7 +16446,7 @@ mod tests {
         // remove ONE file between them.
         let pair = vec![f("p0", 430, 1, 2), f("p1", 430, 3, 4)];
         assert_eq!(
-            super::select_tail_bin(&pair, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack),
+            super::select_tail_bin(&pair, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
             vec!["p0", "p1"],
             "unguarded, the packer takes the pair: it only asks whether the bytes fit"
         );
@@ -16374,7 +16454,7 @@ mod tests {
 
         // THE CHEAP SHAPE: ten small files, same partition, remove NINE.
         let many: Vec<_> = (0..10).map(|i| f(&format!("s{i}"), 20, i * 2 + 1, i * 2 + 2)).collect();
-        let picked = super::select_tail_bin(&many, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack);
+        let picked = super::select_tail_bin(&many, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0);
         assert_eq!(picked.len(), 10, "all ten fit under the target");
         assert_eq!(value(&[("s", 20); 10]), 22, "22 bytes per file eliminated — 39x better value");
 
@@ -16400,12 +16480,12 @@ mod tests {
         // Seal lag: a file whose newest event is past the seal is still filling
         // (prod 2026-07-20: compacting it lost every OCC race).
         let unsealed = vec![f("a", 10, false, 1, 1), f("b", 10, false, 2, SEAL + 1)];
-        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new(), "unsealed files leave < min_files");
+        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), Vec::<String>::new(), "unsealed files leave < min_files");
 
         // Converged (>= 7/8 target) files are never re-selected: rewriting one
         // alone is a 1→1 rewrite forever.
         let converged = vec![f("big", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["a", "b"]);
 
         // REPAIR: an oversized file that is NOT a sorted run declares no
         // `sorting_columns`, and one of those disables the reader's
@@ -16416,49 +16496,84 @@ mod tests {
         // packable slice, that slice wins.
         let poisoned = vec![f("big_unsorted", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
         assert_eq!(
-            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack),
+            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
             vec!["a", "b"],
             "normal packing must not be starved by a pending repair"
         );
         let only_poison = vec![f("big_unsorted", 900, false, 1, 2)];
         assert_eq!(
-            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack),
+            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
             vec!["big_unsorted"],
             "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files (the gap rule: today's poisoned file still gets repaired even though `TailPass::Repair` excludes today)"
         );
         // ...and exactly one per bin, so a backlog drains across ticks instead
         // of rewriting several hundred-megabyte files in a single pass.
         let many_poison = vec![f("p1", 900, false, 1, 2), f("p2", 950, false, 3, 4), f("p3", 800, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack).len(), 1, "one repair per bin");
+        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0).len(), 1, "one repair per bin");
         // A converged file that IS a sorted run stays done — repairing it would
         // be a 1->1 rewrite forever.
         let healthy = vec![f("big_sorted", 900, true, 1, 2)];
-        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack).is_empty(), "a converged sorted run is never re-selected");
+        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0).is_empty(), "a converged sorted run is never re-selected");
 
         // Sorted runs fold only while under the cap; an over-cap run is excluded.
         let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["run_small", "a"], "only the sub-cap run folds");
+        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["run_small", "a"], "only the sub-cap run folds");
 
         // Earliest contiguous slice up to cap, ordered by EVENT time (input
         // order is deliberately scrambled) — this is what makes runs disjoint.
         let pack = vec![f("third", 600, false, 30, 31), f("first", 600, false, 10, 11), f("second", 300, false, 20, 21)];
-        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["first", "second"], "packs earliest slice, stops at cap");
+        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["first", "second"], "packs earliest slice, stops at cap");
 
         // min_files gate.
         assert_eq!(
-            super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack),
+            super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack, 0),
             Vec::<String>::new()
         );
 
         // A lone over-cap-adjacent file must not wedge the pass: selection skips
         // past it to the next slice rather than returning a 1-file bin.
         let lone = vec![f("lone", 800, false, 1, 2), f("a", 300, false, 10, 11), f("b", 300, false, 12, 13)];
-        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["a", "b"]);
 
         // Files with no event-time stats can't be binned disjointly (the
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
         let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None, rows: None }, f("a", 10, false, 1, 2)];
-        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack), Vec::<String>::new());
+        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), Vec::<String>::new());
+    }
+
+    /// The similar-size rule (`bin_breaks_size_ratio`) inside the tail packer:
+    /// a dissimilar file ends a viable bin or restarts the slice at itself,
+    /// exactly like blowing the byte cap — so tiny files never drag a whale
+    /// into their bin, a whale's bin never absorbs stragglers, and the output
+    /// stays a time-disjoint run. The coordinator selector applies the SAME
+    /// predicate (config-read, so unit tests exercise it via the doctest, the
+    /// same arrangement as the span budget and the value floor).
+    #[test]
+    fn a_dissimilar_file_ends_the_bin_instead_of_joining_it() {
+        const TARGET: i64 = 1000;
+        const SEAL: i64 = 10_000;
+        let f = |path: &str, size: i64, min: i64, max: i64| super::TailAdd {
+            path: path.into(),
+            size,
+            is_sorted_run: false,
+            event_range: Some((min, max)),
+            rows: None,
+        };
+        // Smalls first, whale later in time: ratio off admits all three (the
+        // measured 82.5%-write-volume shape); ratio 4 keeps the small pair and
+        // leaves the whale for its own generation.
+        let smalls_then_whale = vec![f("a", 5, 1, 2), f("b", 5, 3, 4), f("whale", 100, 5, 6)];
+        assert_eq!(super::select_tail_bin(&smalls_then_whale, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["a", "b", "whale"]);
+        assert_eq!(super::select_tail_bin(&smalls_then_whale, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4), vec!["a", "b"]);
+
+        // Whale first in time: the guard restarts the slice at the smalls
+        // rather than wedging behind the whale — smalls still merge.
+        let whale_then_smalls = vec![f("whale", 100, 1, 2), f("a", 5, 3, 4), f("b", 5, 5, 6)];
+        assert_eq!(super::select_tail_bin(&whale_then_smalls, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4), vec!["a", "b"]);
+
+        // Near-peers are untouched at the default ratio.
+        let peers = vec![f("p", 95, 1, 2), f("q", 114, 3, 4)];
+        assert_eq!(super::select_tail_bin(&peers, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4), vec!["p", "q"]);
     }
 
     #[test]
@@ -17047,18 +17162,18 @@ mod tests {
         let f =
             |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)), rows: None };
         let backlog = vec![f("may", 900, 10), f("july", 900, 500), f("june", 950, 100)];
-        assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["july"], "newest poisoned file first");
+        assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0), vec!["july"], "newest poisoned file first");
 
         // Same date: take the smallest, so one un-finishable giant cannot
         // head-of-line block everything behind it.
         let same_day = vec![f("huge", 999, 500), f("small", 880, 500)];
-        assert_eq!(super::select_tail_bin(&same_day, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["small"], "smallest first within a date");
+        assert_eq!(super::select_tail_bin(&same_day, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0), vec!["small"], "smallest first within a date");
 
         // A repair pass NEVER packs — it returns ONE file, never a bin, even
         // when several candidates could be packed together. Packing is the other
         // cron's job and a multi-file bin would spend the repair budget on it.
         let mixed = vec![f("poison", 900, 500), f("a", 10, 600), f("b", 10, 700)];
-        assert_eq!(super::select_tail_bin(&mixed, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair), vec!["b"], "one file, the newest");
+        assert_eq!(super::select_tail_bin(&mixed, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0), vec!["b"], "one file, the newest");
         // A SMALL sealed footer-less file is repair work too. `hot_bin_admits`
         // has already established these are sealed and untagged, and one small
         // unsorted file voids its date's scan ordering exactly like a 1 GiB one
@@ -17067,11 +17182,11 @@ mod tests {
         // scope, so nothing would ever have rewritten them.
         let small_only = vec![f("tiny_old", 10, 100), f("tiny_new", 10, 900)];
         assert_eq!(
-            super::select_tail_bin(&small_only, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair),
+            super::select_tail_bin(&small_only, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0),
             vec!["tiny_new"],
             "a small sealed footer-less file is still repair work, newest first"
         );
-        assert!(super::select_tail_bin(&[], TARGET, 2, TARGET / 4, SEAL, TailPass::Repair).is_empty(), "nothing admitted => no work");
+        assert!(super::select_tail_bin(&[], TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0).is_empty(), "nothing admitted => no work");
     }
 
     /// Scope admission for the hot tail. Sealed-date repair exists because an unsorted file that
@@ -18198,7 +18313,7 @@ mod tests {
         let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
 
         assert!(
-            super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack).is_empty(),
+            super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack, 0).is_empty(),
             "target-sized runs are terminal, even when their key/time domains overlap"
         );
     }

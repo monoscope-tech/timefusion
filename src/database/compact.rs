@@ -362,7 +362,7 @@ impl Database {
             .filter(|add| add.size() < target_size.max(1)) // cheap gate before the stats parse
             .map(|add| TailAdd::from_stats(add.path().to_string(), add.size(), is_sorted_run(&add.tags()), add.stats().as_deref()))
             .collect();
-        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), TailPass::Pack))
+        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now(), TailPass::Pack, pack_size_ratio()))
     }
 
     /// Plan one hot-optimize bin per hot project for `date=today` in a single snapshot walk.
@@ -402,7 +402,7 @@ impl Database {
             .into_iter()
             .map(|(project_id, adds)| {
                 let debt = adds.len();
-                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal, policy.pass), debt)
+                (project_id, select_tail_bin(&adds, policy.target_size, policy.min_files, policy.sorted_run_cap, seal, policy.pass, pack_size_ratio()), debt)
             })
             .filter(|(_, bin, _)| !bin.is_empty())
             .collect();
@@ -2002,6 +2002,12 @@ pub(crate) const DEFAULT_BIN_MINUTES: i64 = 10;
 /// coordinator would leave the dirty-bin queue keyed two ways at once.
 /// Falls back to the default before config init (unit tests, early boot).
 #[inline]
+/// The similar-size admission ratio for packing bins, from config (0 = off in
+/// processes with no config, e.g. unit tests). See `bin_breaks_size_ratio`.
+pub(crate) fn pack_size_ratio() -> i64 {
+    crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_size_ratio)
+}
+
 pub(crate) fn bin_micros() -> i64 {
     crate::config::try_config().map_or(DEFAULT_BIN_MINUTES, |c| c.buffer.timefusion_dedup_bin_minutes).max(1) * 60 * 1_000_000
 }

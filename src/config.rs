@@ -2169,6 +2169,38 @@ pub struct MaintenanceConfig {
     /// build, the same contract as `timefusion_plan_cache_time_fns`.
     #[serde_inline_default(true)]
     pub timefusion_dedup_contiguity_rank: bool,
+    /// Refuse to admit a file into a packing bin more than this many times the
+    /// size of the bin's smallest member. **0 = off.**
+    ///
+    /// The similar-size rule every mature merge policy carries and ours lacked:
+    /// ClickHouse's selector merges parts of comparable size explicitly "to
+    /// avoid repeatedly rewriting large data", and RocksDB's universal
+    /// compaction gates admission on `size_ratio` outright. The value floor
+    /// (`timefusion_pack_max_rows_per_file_eliminated`) prices FAN-IN but not
+    /// SIMILARITY — a bin of nine tiny files plus one huge one passes the floor
+    /// easily while still paying the huge rewrite, which is the exact shape
+    /// both prior arts refuse. See
+    /// `docs/plans/2026-09-06-merge-policy-prior-art.md`.
+    ///
+    /// A refused large file is not stranded: only similar sizes merge, so the
+    /// pool stratifies into size generations and the large file merges with its
+    /// peers once they exist — implicit tiering, the cheap approximation of
+    /// levelled compaction.
+    ///
+    /// **OFF (0) — measured unsafe in composition, 2026-09-06.** Alone, ratio 4
+    /// cut the 400-round harness's steady-state amplification 6.73x -> 3.96x;
+    /// but combined with the value floor it WEDGES: the walker's first viable
+    /// pick becomes a second-generation `[output, output]` pair, the floor
+    /// refuses it, and refusal returns empty instead of resuming past the
+    /// refused bin — so the admissible small-file bin behind it is never
+    /// reached (the row-cap livelock shape through a new door). The floor alone
+    /// also outperforms ratio alone on that fixture (2.06x). UNBLOCK: make
+    /// selection resume past a floor refusal, then re-run the pinned
+    /// composition arm in `the_value_floor_lowers_steady_state_write_amplification`
+    /// (its assertion says exactly what to flip) and consider 4 — our bad
+    /// shapes are ratio 8-800, our good ones ~1.2, so 3-8 all separate them.
+    #[serde_inline_default(0)]
+    pub timefusion_pack_max_size_ratio: i64,
     /// Byte ceiling for ONE output file from a rewrite that writes through
     /// `RecordBatchWriter`, which has no target-size support — `flush()` emits
     /// one file per partition regardless of buffer size — so rewrite paths cut
