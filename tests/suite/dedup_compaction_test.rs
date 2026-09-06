@@ -543,7 +543,12 @@ async fn optimize_preserves_all_partition_values() -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
-    let cfg = TestConfigBuilder::new("dedup_targeted").with_buffer_mode(BufferMode::Enabled).build();
+    // Copy-on-write mode: this test asserts file REPLACEMENT (a duplicate-bearing
+    // file is rewritten to a new path, bystanders untouched). DV masks in place —
+    // same path — so file-targeting is a copy-on-write-only property. The DV
+    // equivalent (bystanders untouched, same paths) is covered by the e2e
+    // `dv_dedup_drops_cross_file_duplicate`.
+    let cfg = TestConfigBuilder::new("dedup_targeted").with_buffer_mode(BufferMode::Enabled).without_deletion_vectors().build();
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 

@@ -2695,7 +2695,7 @@ impl Database {
         // throughput zero, because the constraint is per-unit cost.
         let unit_started = std::time::Instant::now();
         let ctx = self.bounded_rollup_maintenance_context()?;
-        let provider = Self::narrow_provider(log_store, snapshot, selected, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
+        let provider = Self::narrow_provider(log_store, snapshot, selected, None, None).await.map_err(|error| anyhow::anyhow!("slice provider: {error}"))?;
         const RAW: &str = "__maintenance_slice_raw";
         // What the PHYSICAL table has, which is not what the spec declares — see
         // `slice_input_sql`.
@@ -3356,7 +3356,7 @@ impl Database {
                         return None;
                     }
                     after_project += 1;
-                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), file.stats().as_deref());
+                    let add = TailAdd::from_stats(path.to_string(), file.size(), is_sorted_run(&file.tags()), file.deletion_vector_descriptor().is_some(), file.stats().as_deref());
                     if add.event_range.is_some_and(|(start, end)| start >= key.slice.end_micros || end < key.slice.start_micros) {
                         return None;
                     }
@@ -5372,7 +5372,7 @@ impl Database {
             return Ok(Vec::new());
         }
         let provider =
-            Self::narrow_provider(log_store, snapshot, files, None).await.map_err(|error| anyhow::anyhow!("logical-count overlay provider: {error}"))?;
+            Self::narrow_provider(log_store, snapshot, files, None, None).await.map_err(|error| anyhow::anyhow!("logical-count overlay provider: {error}"))?;
         let context = SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env()));
         context.register_table("__logical_count_overlay", provider)?;
         Ok(context
@@ -5434,7 +5434,7 @@ impl Database {
         let mut index = crate::read::LogicalCountIndex::new();
 
         if !files.is_empty() {
-            let provider = Self::narrow_provider(log_store, eager_snapshot, files.clone(), None)
+            let provider = Self::narrow_provider(log_store, eager_snapshot, files.clone(), None, None)
                 .await
                 .map_err(|error| anyhow::anyhow!("logical-count provider: {error}"))?;
             let context =
@@ -7602,7 +7602,7 @@ impl Database {
                 self.repair_degradation.remove(path);
             }
         }
-        Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, dedup: None, sorted }))
+        Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, discardable_paths: Vec::new(), dedup: None, sorted }))
     }
 
     /// Commit one WAVE: every staged unit's Remove+Add in a single transaction.
@@ -8454,6 +8454,7 @@ impl Database {
                         removes,
                         adds,
                         stage_store: Arc::clone(&store),
+                        discardable_paths: Vec::new(),
                         dedup: None,
                         // A resumed bin's staged parquet was written by an
                         // earlier PROCESS and the intent manifest does not
@@ -8490,7 +8491,17 @@ impl Database {
                 warn!("staged-intent reconcile skipped for '{table_name}': no snapshot loaded");
                 return;
             };
-            (snapshot.log_data().iter().map(|f| f.path().into_owned()).collect::<HashSet<String>>(), table.log_store().object_store(None))
+            let mut referenced: HashSet<String> = snapshot.log_data().iter().map(|f| f.path().into_owned()).collect();
+            // A committed deletion-vector `.bin` is NOT a log_data path, so without
+            // this a crash-after-commit reconcile would delete a live DV sidecar
+            // and resurrect the masked rows. Treat any `.bin` referenced by a live
+            // Add's DV descriptor as live (the same rule VACUUM applies).
+            for f in snapshot.log_data().iter() {
+                if let Some(rel) = f.deletion_vector_descriptor().as_ref().and_then(deltalake::operations::deletion_vectors::dv_object_store_relative_path) {
+                    referenced.insert(rel);
+                }
+            }
+            (referenced, table.log_store().object_store(None))
         };
         let now_secs = crate::support::now_secs();
         let orphans = staged_orphan_deletions(&entries, table_name, now_secs, &referenced);
