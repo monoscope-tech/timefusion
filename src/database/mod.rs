@@ -16403,7 +16403,11 @@ mod tests {
         // refusal, the pair is unsafe and `timefusion_pack_max_size_ratio`
         // defaults to 0.
         let (w_both, ing_both, files_both) = run(1_000_000, 4);
-        println!("amplification: BOTH {:.2}x   |   live files: BOTH {files_both}   |   ingested {:.0}% of baseline", amp(w_both), 100.0 * ing_both as f64 / ing as f64);
+        println!(
+            "amplification: BOTH {:.2}x   |   live files: BOTH {files_both}   |   ingested {:.0}% of baseline",
+            amp(w_both),
+            100.0 * ing_both as f64 / ing as f64
+        );
         assert!(
             ing_both < ing,
             "the floor+ratio pair is EXPECTED to wedge this fixture (see comment); if it now completes all rounds, the resume-past-refusal fix has landed — flip this assertion and re-run the default-ON case"
@@ -16522,7 +16526,11 @@ mod tests {
         // Earliest contiguous slice up to cap, ordered by EVENT time (input
         // order is deliberately scrambled) — this is what makes runs disjoint.
         let pack = vec![f("third", 600, false, 30, 31), f("first", 600, false, 10, 11), f("second", 300, false, 20, 21)];
-        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["first", "second"], "packs earliest slice, stops at cap");
+        assert_eq!(
+            super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
+            vec!["first", "second"],
+            "packs earliest slice, stops at cap"
+        );
 
         // min_files gate.
         assert_eq!(
