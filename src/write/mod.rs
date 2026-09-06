@@ -446,6 +446,44 @@ pub fn landed_digest(batches: &[RecordBatch]) -> Option<LandedDigest> {
     })
 }
 
+/// Per-row (key_hash, content_hash) for ingest-time client-retry dedup — the
+/// core of the content-identity ingest filter (design:
+/// docs/plans/2026-09-07-ingest-dedup-prevention-design.md). `key_idxs` are the
+/// schema's dedup-key columns; `content_idxs` are ALL columns EXCEPT the
+/// TF-stamped tiebreak (for a `version_append` table `stamp_version` overwrites
+/// it per batch, so a retry never matches on it). A row is a client-retry
+/// duplicate iff BOTH hashes match a previously-flushed row.
+///
+/// Uses Arrow's `RowConverter` for the byte encoding: its row format delimits
+/// variable-length fields, so `("ab","c")` and `("a","bc")` encode differently —
+/// the length-prefixing the design requires, for free and type-correct. 128-bit
+/// hashes; the only unique-row-loss path is a double collision (~6e-25/window,
+/// the shipped `LandedDigest` bar). Returns `None` on any encoding failure
+/// (fail-open: decline the drop, keep the row — a duplicate at worst).
+pub(crate) fn per_row_identities(batch: &RecordBatch, key_idxs: &[usize], content_idxs: &[usize]) -> Option<Vec<(u128, u128)>> {
+    use datafusion::arrow::row::{RowConverter, SortField};
+    if batch.num_rows() == 0 {
+        return Some(Vec::new());
+    }
+    let encode = |idxs: &[usize]| -> Option<datafusion::arrow::row::Rows> {
+        let fields: Vec<SortField> = idxs.iter().map(|&i| SortField::new(batch.column(i).data_type().clone())).collect();
+        let cols: Vec<_> = idxs.iter().map(|&i| batch.column(i).clone()).collect();
+        let conv = RowConverter::new(fields).ok()?;
+        conv.convert_columns(&cols).ok()
+    };
+    let key_rows = encode(key_idxs)?;
+    let content_rows = encode(content_idxs)?;
+    Some(
+        (0..batch.num_rows())
+            .map(|r| {
+                let k = twox_hash::XxHash3_128::oneshot(key_rows.row(r).as_ref());
+                let c = twox_hash::XxHash3_128::oneshot(content_rows.row(r).as_ref());
+                (k, c)
+            })
+            .collect(),
+    )
+}
+
 /// One (project, table) group of a single flush tick, handed to the coalescing
 /// writer so all of them can share ONE Delta commit per physical table.
 pub struct FlushUnit {
@@ -3829,6 +3867,45 @@ mod tests {
         assert_ne!(landed_digest(&[a.clone(), a.clone()]), landed_digest(std::slice::from_ref(&a)));
         // No identity for an empty set — nothing to skip.
         assert_eq!(landed_digest(&[]), None);
+    }
+
+    /// The content-identity core for ingest-time client-retry dedup: a retry is a
+    /// duplicate iff BOTH the key hash and the content hash match. A new version
+    /// (different content) must NOT match, and distinct multi-column keys must not
+    /// collide (the `("ab","c")` vs `("a","bc")` trap the design flags).
+    #[test]
+    fn per_row_identities_key_and_content_are_length_safe() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        // cols: [service(0), id(1), body(2)] — key = [service,id], content = all.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service", DataType::Utf8, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("body", DataType::Int64, false),
+        ]));
+        let batch = |svc: Vec<&str>, id: Vec<&str>, body: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(svc)), Arc::new(StringArray::from(id)), Arc::new(Int64Array::from(body))])
+                .unwrap()
+        };
+        let key_idxs = &[0usize, 1];
+        let content_idxs = &[0usize, 1, 2];
+
+        // Row0 and Row1 share the key but differ in content (a new version).
+        let b = batch(vec!["svc", "svc"], vec!["x", "x"], vec![1, 2]);
+        let ids = per_row_identities(&b, key_idxs, content_idxs).unwrap();
+        assert_eq!(ids[0].0, ids[1].0, "same key => same key_hash");
+        assert_ne!(ids[0].1, ids[1].1, "different content => different content_hash (a version, not a dup)");
+
+        // An exact retry: identical key AND content => both hashes equal.
+        let b2 = batch(vec!["svc"], vec!["x"], vec![1]);
+        let retry = per_row_identities(&b2, key_idxs, content_idxs).unwrap();
+        assert_eq!(retry[0], ids[0], "byte-identical row => identical (key_hash, content_hash)");
+
+        // The concatenation trap: ("ab","c") and ("a","bc") must NOT collide.
+        let split = batch(vec!["ab", "a"], vec!["c", "bc"], vec![0, 0]);
+        let s = per_row_identities(&split, key_idxs, content_idxs).unwrap();
+        assert_ne!(s[0].0, s[1].0, "('ab','c') and ('a','bc') must have distinct key hashes");
     }
 
     /// The compaction brake must read the flush BACKLOG, not the WAL directory
