@@ -8000,97 +8000,111 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     // the file is internally ordered; only its min/max widens. A partition that
     // never compacts prunes worse than one whose runs overlap slightly.
     candidates.sort_by_key(|add| add.size);
-    let mut bytes = 0i64;
-    let mut rows = 0u64;
-    let mut selected: Vec<TailAdd> = Vec::new();
     // SPAN budget, off unless configured. The output spans the UNION of what is
     // merged, and every dedup bin overlapping it must read it in full — so an
     // unbounded union is what makes a merge expensive for the read path. See
     // `timefusion_compaction_span_budget_bins`.
     let span_cap = crate::config::try_config().map_or(0, |c| c.buffer.timefusion_compaction_span_budget_bins);
     let pack_size_ratio = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_size_ratio);
-    let mut span: Option<(i64, i64)> = None;
-    for add in candidates {
-        // A file at or above target is converged and never packing's work,
-        // whatever its tags say — sortedness is Repair's job. This skip must be
-        // unconditional: it once sat behind `!has_unsorted`, and since the
-        // sorted-run tag is written only by OPTIMIZE, it effectively never ran
-        // and units re-rewrote converged half-GB files past every deadline.
-        if add.size >= target {
-            continue;
-        }
-        if has_unsorted && add.is_sorted_run {
-            continue;
-        }
-        // BREAK, not skip: candidates are size-ASCENDING here, so the first
-        // violator and everything after it is even larger. The same predicate
-        // as `select_tail_bin`'s guard — the floor's lesson was that a guard on
-        // one lane is inert, both selectors feed `stage_hot_bin` as `pass=Pack`.
-        if !selected.is_empty() && bin_breaks_size_ratio(selected[0].size, add.size, pack_size_ratio) {
-            break;
-        }
-        // SKIP, not break: candidates are ordered by SIZE, so a later one may
-        // still sit inside the accumulated range even when this one does not.
-        if span_cap > 0
-            && let Some((lo, hi)) = add.event_range
-        {
-            let (nlo, nhi) = span.map_or((lo, hi), |(l, h)| (l.min(lo), h.max(hi)));
-            if !selected.is_empty() && (nhi - nlo) / crate::database::compact::bin_micros() + 1 > span_cap {
+    // RESUME loop, mirroring `select_tail_bin`: when the value guard refuses
+    // the accumulated bin, selection advances past the refused bin's smallest
+    // member and re-packs, instead of returning empty — a terminal refusal
+    // makes the refused bin the fixed first pick of every claim forever (the
+    // pinned floor+ratio wedge; the row-cap livelock family). The skipped
+    // smallest file stays live for a future higher-fan-in bin.
+    let mut resume_at = 0usize;
+    loop {
+        let mut bytes = 0i64;
+        let mut rows = 0u64;
+        let mut selected: Vec<&TailAdd> = Vec::new();
+        let mut span: Option<(i64, i64)> = None;
+        for add in candidates.iter().skip(resume_at) {
+            // A file at or above target is converged and never packing's work,
+            // whatever its tags say — sortedness is Repair's job. This skip must
+            // be unconditional: it once sat behind `!has_unsorted`, and since the
+            // sorted-run tag is written only by OPTIMIZE, it effectively never
+            // ran and units re-rewrote converged half-GB files past every
+            // deadline.
+            if add.size >= target {
                 continue;
             }
-            span = Some((nlo, nhi));
+            if has_unsorted && add.is_sorted_run {
+                continue;
+            }
+            // BREAK, not skip: candidates are size-ASCENDING here, so the first
+            // violator and everything after it is even larger. The same
+            // predicate as `select_tail_bin`'s guard — the floor's lesson was
+            // that a guard on one lane is inert, both selectors feed
+            // `stage_hot_bin` as `pass=Pack`.
+            if !selected.is_empty() && bin_breaks_size_ratio(selected[0].size, add.size, pack_size_ratio) {
+                break;
+            }
+            // SKIP, not break: candidates are ordered by SIZE, so a later one
+            // may still sit inside the accumulated range even when this one does
+            // not.
+            if span_cap > 0
+                && let Some((lo, hi)) = add.event_range
+            {
+                let (nlo, nhi) = span.map_or((lo, hi), |(l, h)| (l.min(lo), h.max(hi)));
+                if !selected.is_empty() && (nhi - nlo) / crate::database::compact::bin_micros() + 1 > span_cap {
+                    continue;
+                }
+                span = Some((nlo, nhi));
+            }
+            // ROWS, not just bytes. A byte budget prices a bin by how much it
+            // will read; a rewrite costs what it must SORT AND WRITE, which is
+            // rows. See `MAX_BIN_ROWS`. Unknown row counts (absent stats) do not
+            // accumulate, so this can never be stricter than the byte budget
+            // alone.
+            let next_rows = rows.saturating_add(add.rows.unwrap_or(0));
+            // The row cap must not be what reduces a bin to ONE file. A one-file
+            // bin retires nothing — the `< 2` guard below discards it and the
+            // cell is re-claimed immediately, forever. Prod 2026-09-03
+            // `dcad860a/2026-06-17`: 95.4 MiB (915,417 rows) + 114.8 MiB
+            // (1,108,187) is 82% of the BYTE budget but 2,023,604 rows, 1.18%
+            // over the cap — claimed 8+ times an hour for hours, never losing a
+            // file.
+            //
+            // So the SECOND file may pass the row cap, bounded at twice it:
+            // making progress beats livelocking, but not unboundedly. The cap
+            // was written for a table whose 256 MB bins hold 5.58 M rows and
+            // blew the 900 s deadline 9 times out of 9 (2026-08-28), and that
+            // shape stays excluded. Bytes still bind unconditionally, so such a
+            // pair is never bigger than one converged file.
+            let pair_exemption = selected.len() == 1 && next_rows <= 2 * MAX_BIN_ROWS;
+            if !selected.is_empty() && (bytes.saturating_add(add.size) > limit || (next_rows > MAX_BIN_ROWS && !pair_exemption)) {
+                break;
+            }
+            bytes = bytes.saturating_add(add.size);
+            rows = next_rows;
+            selected.push(add);
         }
-        // ROWS, not just bytes. A byte budget prices a bin by how much it will
-        // read; a rewrite costs what it must SORT AND WRITE, which is rows. See
-        // `MAX_BIN_ROWS`. Unknown row counts (absent stats) do not accumulate, so
-        // this can never be stricter than the byte budget alone.
-        let next_rows = rows.saturating_add(add.rows.unwrap_or(0));
-        // The row cap must not be what reduces a bin to ONE file. A one-file bin
-        // retires nothing — the `< 2` guard below discards it and the cell is
-        // re-claimed immediately, forever. Prod 2026-09-03 `dcad860a/2026-06-17`:
-        // 95.4 MiB (915,417 rows) + 114.8 MiB (1,108,187) is 82% of the BYTE
-        // budget but 2,023,604 rows, 1.18% over the cap — claimed 8+ times an
-        // hour for hours, never losing a file.
-        //
-        // So the SECOND file may pass the row cap, bounded at twice it: making
-        // progress beats livelocking, but not unboundedly. The cap was written
-        // for a table whose 256 MB bins hold 5.58 M rows and blew the 900 s
-        // deadline 9 times out of 9 (2026-08-28), and that shape stays excluded.
-        // Bytes still bind unconditionally, so such a pair is never bigger than
-        // one converged file.
-        let pair_exemption = selected.len() == 1 && next_rows <= 2 * MAX_BIN_ROWS;
-        if !selected.is_empty() && (bytes.saturating_add(add.size) > limit || (next_rows > MAX_BIN_ROWS && !pair_exemption)) {
-            break;
-        }
-        bytes = bytes.saturating_add(add.size);
-        rows = next_rows;
-        selected.push(add);
-    }
-    if !has_unsorted && selected.len() < 2 {
-        return Vec::new();
-    }
-    // THE SAME VALUE GUARD as `select_tail_bin`, because BOTH selectors feed
-    // `stage_hot_bin` and both emit `pass=Pack` — so the phase timings that
-    // measured the problem cannot tell them apart, and putting the guard on one
-    // lane left it inert. Prod 2026-09-04: 14 two-file Pack units in 15 minutes,
-    // 11 of them above the floor, and `pack_value_refused` stayed 0 because the
-    // work was coming through HERE.
-    //
-    // Same rule, same escape: a bin of `min_files` or more is never refused
-    // (high fan-in is the remedy, not the problem), so this can only remove the
-    // low-fan-in bins that were 82.5% of packing write volume for 9.9% of the
-    // file reduction.
-    let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated);
-    let low_fan_in = selected.len() < 5;
-    if !has_unsorted && low_fan_in && bin_exceeds_value_floor(rows, selected.len(), floor) {
-        let stats = crate::observability::maintenance_stats();
-        stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        stats.pack_value_refused_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
-        if floor > 0 {
+        if !has_unsorted && selected.len() < 2 {
             return Vec::new();
         }
+        // THE SAME VALUE GUARD as `select_tail_bin` (see `refuse_low_value_bin`
+        // — one predicate, both lanes, because both emit `pass=Pack` and a guard
+        // on one lane is inert). L0 sweeps (`has_unsorted`) are exempt as
+        // before: merging unsorted arrivals is packing's core duty at any price.
+        if !has_unsorted
+            && refuse_low_value_bin(
+                &candidates,
+                selected.iter().map(|add| add.path.as_str()),
+                selected.len(),
+                5,
+                crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated),
+            )
+        {
+            // The smallest member anchors the refused bin; resume past it.
+            let head = selected.first().map(|add| add.path.clone());
+            match candidates.iter().skip(resume_at).position(|add| Some(&add.path) == head.as_ref()) {
+                Some(position) => resume_at += position + 1,
+                None => return Vec::new(),
+            }
+            continue;
+        }
+        return selected.into_iter().map(|add| add.path.clone()).collect();
     }
-    selected.into_iter().map(|add| add.path).collect()
 }
 
 /// Per-slice budget, in **DECODED** bytes — the unit the sort actually allocates.
@@ -8390,8 +8404,37 @@ pub fn bin_breaks_size_ratio(smallest: i64, candidate: i64, ratio: i64) -> bool 
     ratio > 0 && candidate > smallest.max(1).saturating_mul(ratio)
 }
 
+/// The VALUE GUARD, shared by both packers via the resume loops that call it.
+///
+/// A bin's benefit is the FILES it removes; its cost is what the rewrite must
+/// encode, which is ROWS (COMPRESSED bytes under-price it 12x — the bug the
+/// first floor shipped with; `pack_value_refused` reading 0 live exposed it).
+/// Prod 2026-09-04, quiet 95 min: 2-file merges were 82.5% of packing write
+/// volume for 9.9% of the file reduction — 115x worse per file eliminated than
+/// 9+-file merges. ClickHouse's selector refuses the same shape.
+///
+/// THE ESCAPE: a bin of `min_files.max(3)` or more is never refused — high
+/// fan-in is the remedy, and an unescaped floor refused EVERY bin at 18 MiB
+/// arrivals (steady-state amplification 0.00x, nothing merged).
+///
+/// Returns whether the caller must DROP the bin. Floor 0 counts the refusal
+/// (shadow mode) but admits. Absent `numRecords` counts zero rows — unknown
+/// can only admit, the row cap's own rule.
+fn refuse_low_value_bin<'bin>(adds: &[TailAdd], bin: impl Iterator<Item = &'bin str>, files: usize, min_files: usize, floor: u64) -> bool {
+    let rows: u64 = bin.filter_map(|path| adds.iter().find(|add| add.path == path).and_then(|add| add.rows)).sum();
+    let low_fan_in = files < min_files.max(3);
+    if low_fan_in && bin_exceeds_value_floor(rows, files, floor) {
+        let stats = crate::observability::maintenance_stats();
+        stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats.pack_value_refused_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        return floor > 0;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)] // packer knobs are positional by design; a struct would just rename them
 pub(crate) fn select_tail_bin(
-    adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass, size_ratio: i64,
+    adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64, pass: TailPass, size_ratio: i64, value_floor: u64,
 ) -> Vec<String> {
     let cap = target_size.max(1);
     let converged = cap - cap / 8;
@@ -8449,89 +8492,57 @@ pub(crate) fn select_tail_bin(
     // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
     // per tick. Small commit converges quickly and shrinks the conflict window;
     // later ticks pack the next (strictly later) slice.
-    let mut bytes = 0i64;
-    let (mut run_min, mut run_max) = (i64::MAX, 0i64);
-    let mut files: Vec<String> = vec![];
-    for (path, _, size, _) in fresh.iter().filter(|(_, _, _, r)| !*r) {
-        let (path, size) = (*path, *size);
-        // Same treatment as blowing the byte cap, and for the same reason: the
-        // slice is time-ordered, so a violator either ends a viable bin or
-        // restarts the slice AT itself — never a hole in the middle, which is
-        // what keeps the output a time-disjoint run. A dissimilar file ending
-        // the bin protects whichever side is LARGE: tiny files never drag a
-        // whale into their bin, and a whale's bin never absorbs stragglers.
-        if !files.is_empty() && (bytes + size > cap || bin_breaks_size_ratio(run_min.min(size), run_max.max(size), size_ratio)) {
-            // A lone-file slice is already a run — rewriting it is pure churn.
-            // Skip past it to the next time slice instead of wedging the pass
-            // behind it.
-            if files.len() >= 2 {
-                break;
+    //
+    // The packing runs inside a RESUME loop over starting offsets: when the
+    // value guard below refuses a packed bin, selection advances past the
+    // refused bin's head and packs the next slice, instead of returning empty.
+    // Without the resume, a refusal is terminal and the refused bin — being the
+    // walker's fixed first choice — is re-selected on every claim forever: the
+    // measured floor+ratio wedge (2026-09-06, the pinned composition arm in
+    // `the_value_floor_lowers_steady_state_write_amplification`), and the
+    // row-cap livelock family before it. The refused head stays live for a
+    // future higher-fan-in bin; termination is by strictly advancing offset.
+    let nonrepair: Vec<(&str, i64)> = fresh.iter().filter(|(_, _, _, r)| !*r).map(|(path, _, size, _)| (*path, *size)).collect();
+    let mut resume_at = 0usize;
+    let files: Vec<String> = loop {
+        let mut bytes = 0i64;
+        let (mut run_min, mut run_max) = (i64::MAX, 0i64);
+        let mut packed: Vec<(usize, &str)> = vec![];
+        for (offset, (path, size)) in nonrepair[resume_at..].iter().enumerate() {
+            let (path, size) = (*path, *size);
+            // Same treatment for the byte cap and the size-ratio guard: the
+            // slice is time-ordered, so a violator either ends a viable bin or
+            // restarts the slice AT itself — never a hole in the middle, which
+            // is what keeps the output a time-disjoint run. A dissimilar file
+            // ending the bin protects whichever side is LARGE: tiny files never
+            // drag a whale into their bin, and a whale's bin never absorbs
+            // stragglers.
+            if !packed.is_empty() && (bytes + size > cap || bin_breaks_size_ratio(run_min.min(size), run_max.max(size), size_ratio)) {
+                // A lone-file slice is already a run — rewriting it is pure
+                // churn. Skip past it to the next time slice instead of wedging
+                // the pass behind it.
+                if packed.len() >= 2 {
+                    break;
+                }
+                (bytes, run_min, run_max) = (0, i64::MAX, 0);
+                packed.clear();
             }
-            (bytes, run_min, run_max) = (0, i64::MAX, 0);
-            files.clear();
+            bytes += size;
+            run_min = run_min.min(size);
+            run_max = run_max.max(size);
+            packed.push((resume_at + offset, path));
         }
-        bytes += size;
-        run_min = run_min.min(size);
-        run_max = run_max.max(size);
-        files.push(path.to_string());
-    }
-    if files.len() < 2 {
-        files.clear();
-    }
-    // VALUE GUARD. A bin's benefit is the FILES it removes; its cost is the
-    // BYTES it rewrites. Those are wildly different trades and the packer priced
-    // only the second: it fills to `cap` and stops, so two nearly-converged files
-    // are a valid bin — 256 MiB rewritten to remove ONE file.
-    //
-    // Measured on prod 2026-09-04 over a quiet 95 minutes: 2-file merges were
-    // 82.5% of all packing WRITE volume (222.2M of 269.4M rows) and delivered
-    // 9.9% of the file reduction (71 of 720), costing 3,129,141 rows per file
-    // eliminated — against 27,098 for merges of 9+ files. **115x worse per unit
-    // of benefit, for four-fifths of the budget.** Maintenance wrote ~36 rows
-    // per row ingested over that window, and this is where it went.
-    //
-    // ClickHouse's merge selection prefers parts of similar size explicitly "to
-    // avoid repeatedly rewriting large data"; `min_files` here cannot express
-    // that, because it is tested against the CANDIDATE POOL, not the bin.
-    //
-    // SHADOW BY DEFAULT (floor 0 = off): the refusal is counted either way, so
-    // the floor is chosen from `pack_value_refused_bytes` rather than by
-    // argument — the same discipline the share numbers earned the hard way.
-    if files.len() >= 2 {
-        // Priced in ROWS, not bytes. `bytes` here is `add.size` — COMPRESSED —
-        // and the measurement that motivated this guard was in rows. Converting
-        // rows to bytes at 104 B/row DECODED put the floor 12x too high (the
-        // compression ratio), so a 100 MiB floor could never fire: prod's median
-        // 2-file merge is 3.77M rows = ~31 MiB compressed. `pack_value_refused`
-        // reading 0 on a live process is what exposed that.
-        //
-        // Rows are also the better cost proxy: `TailAdd::rows`' own doc says
-        // "Rows, not bytes, are what a staging rewrite actually costs", and the
-        // phase timers put 59% of Pack's wall clock in WRITE, which is encode
-        // (rows) before upload (bytes). Absent `numRecords` counts as zero, the
-        // same "unknown, do not count" the row cap uses — it can only admit.
-        let rows: u64 = files.iter().filter_map(|p| adds.iter().find(|a| &a.path == p).and_then(|a| a.rows)).sum();
-        let floor = crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated);
-        // THE ESCAPE, without which a floor can stop compaction dead. A bin that
-        // already merges `min_files` or more is never refused, however expensive:
-        // high fan-in IS the shape we are steering toward, and refusing it leaves
-        // the partition unpacked forever. Measured: at 18 MiB arrivals even a
-        // 10-file merge exceeds 1M rows/file, so an unescaped floor refused EVERY
-        // bin and steady-state amplification fell to 0.00x — nothing merged.
-        //
-        // With the escape the guard only ever removes LOW-fan-in bins, which is
-        // exactly the measured problem (2-file merges: 82.5% of packing write
-        // volume for 9.9% of the file reduction) and never the remedy.
-        let low_fan_in = files.len() < min_files.max(3);
-        if low_fan_in && bin_exceeds_value_floor(rows, files.len(), floor) {
-            let stats = crate::observability::maintenance_stats();
-            stats.pack_value_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.pack_value_refused_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
-            if floor > 0 {
-                files.clear();
-            }
+        if packed.len() < 2 {
+            break vec![];
         }
-    }
+        match refuse_low_value_bin(adds, packed.iter().map(|(_, path)| *path), packed.len(), min_files, value_floor) {
+            // Refused with the floor ENFORCING: resume past the refused bin's
+            // head. (`floor == 0` counts the refusal but admits the bin — the
+            // shadow mode the floor shipped with.)
+            true => resume_at = packed.first().map_or(usize::MAX, |(index, _)| index + 1),
+            false => break packed.into_iter().map(|(_, path)| path.to_string()).collect(),
+        }
+    };
     // Gap rule, for TODAY only: once a project has no packable slice left, spend
     // the tick rewriting one oversized unsorted file instead. Today's partition
     // does converge, so the gap reliably appears — which is why this works here
@@ -16280,7 +16291,7 @@ mod tests {
         // 40 candidate files of 16 MiB, contiguous in event time.
         let adds: Vec<_> = (0..40).map(|i| f(i, 16 * 1024 * 1024)).collect();
 
-        let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack, 0).len();
+        let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack, 0, 0).len();
         let (at256, at512, at768) = (fan_in(256 * 1024 * 1024), fan_in(512 * 1024 * 1024), fan_in(768 * 1024 * 1024));
         println!("fan-in: 256 MiB -> {at256}   512 MiB -> {at512}   768 MiB -> {at768}");
 
@@ -16314,9 +16325,13 @@ mod tests {
         const ROUNDS: usize = 400;
 
         // One partition: files arrive, the packer picks a bin, the bin becomes a
-        // single larger file. Deterministic — no clock, no RNG.
+        // single larger file. Deterministic — no clock, no RNG. The floor and
+        // ratio are PARAMETERS into the real selector (refusal + resume happen
+        // inside it) — this closure no longer re-implements the floor, which is
+        // what once let the fixture wedge while a naive read scored it 0.03x.
+        // Rows are set at prod's ~12:1 compression and 104 B/row decoded.
         let run = |floor: u64, ratio: i64| -> (i64, i64, usize) {
-            let (mut live, mut written, mut ingested, mut seq) = (Vec::<i64>::new(), 0i64, 0i64, 0i64);
+            let (mut live, mut written, mut ingested) = (Vec::<i64>::new(), 0i64, 0i64);
             for _ in 0..ROUNDS {
                 live.push(ARRIVAL);
                 ingested += ARRIVAL;
@@ -16328,27 +16343,15 @@ mod tests {
                         size: *size,
                         is_sorted_run: false,
                         event_range: Some((i as i64, i as i64)),
-                        rows: None,
+                        rows: Some((*size as u64) * 12 / 104),
                     })
                     .collect();
-                let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack, ratio);
+                let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack, ratio, floor);
                 if picked.len() < 2 {
                     continue;
                 }
                 let idx: Vec<usize> = picked.iter().filter_map(|p| p.strip_prefix('f')?.parse().ok()).collect();
                 let bytes: i64 = idx.iter().map(|i| live[*i]).sum();
-                // Rows, at prod's ~12:1 compression and 104 B/row decoded — the
-                // guard prices rows, and a byte-priced floor was the bug it replaced.
-                let rows = (bytes as u64) * 12 / 104;
-                // The floor the guard applies, via the SAME predicate.
-                if idx.len() < 5 && super::bin_exceeds_value_floor(rows, idx.len(), floor) && floor > 0 {
-                    seq += 1;
-                    if seq > 3 {
-                        break; // wedged: nothing admissible, stop rather than spin
-                    }
-                    continue;
-                }
-                seq = 0;
                 let mut keep: Vec<i64> = live.iter().enumerate().filter(|(i, _)| !idx.contains(i)).map(|(_, s)| *s).collect();
                 keep.push(bytes);
                 live = keep;
@@ -16408,10 +16411,23 @@ mod tests {
             amp(w_both),
             100.0 * ing_both as f64 / ing as f64
         );
-        assert!(
-            ing_both < ing,
-            "the floor+ratio pair is EXPECTED to wedge this fixture (see comment); if it now completes all rounds, the resume-past-refusal fix has landed — flip this assertion and re-run the default-ON case"
-        );
+        // RESUME-PAST-REFUSAL landed: a floor refusal now advances selection
+        // past the refused bin instead of returning empty, so the composed
+        // guards must complete every round — the wedge this arm used to pin.
+        assert_eq!(ing_both, ing, "floor+ratio must no longer wedge: the run stopped early, so a refusal is still terminal somewhere");
+        assert!(amp(w_both) <= amp(w_on) * 1.10, "floor+ratio must not materially regress the floor alone: floor {:.2}x, both {:.2}x", amp(w_on), amp(w_both));
+        // THE PAIR'S TRADE, measured: amplification 1.00x (every byte written
+        // once — refusing both low-fan-in AND dissimilar merges leaves almost
+        // only optimal bins) against 80 live files vs the floor's 32 — the
+        // second-generation outputs' merges are refused and, with resume,
+        // SKIPPED rather than wedged, so they never consolidate. Fewer writes,
+        // more files for every reader. That is why `timefusion_pack_max_size_ratio`
+        // stays 0 by default: the floor alone (2.06x, 32 files) is the better
+        // balance while per-file read cost dominates (500 files cause 60% of
+        // maintenance read, 2026-09-04). The bound below is the measured level
+        // plus margin — a future change pushing it past 3x is a new trade that
+        // must be re-argued, not inherited.
+        assert!(files_both <= files_off * 3, "the pair's file-count trade moved: off {files_off}, both {files_both} (measured 80 vs 31)");
     }
 
     /// The VALUE guard, benchmarked against the shape prod actually produces.
@@ -16450,7 +16466,7 @@ mod tests {
         // remove ONE file between them.
         let pair = vec![f("p0", 430, 1, 2), f("p1", 430, 3, 4)];
         assert_eq!(
-            super::select_tail_bin(&pair, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
+            super::select_tail_bin(&pair, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
             vec!["p0", "p1"],
             "unguarded, the packer takes the pair: it only asks whether the bytes fit"
         );
@@ -16458,7 +16474,7 @@ mod tests {
 
         // THE CHEAP SHAPE: ten small files, same partition, remove NINE.
         let many: Vec<_> = (0..10).map(|i| f(&format!("s{i}"), 20, i * 2 + 1, i * 2 + 2)).collect();
-        let picked = super::select_tail_bin(&many, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0);
+        let picked = super::select_tail_bin(&many, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0);
         assert_eq!(picked.len(), 10, "all ten fit under the target");
         assert_eq!(value(&[("s", 20); 10]), 22, "22 bytes per file eliminated — 39x better value");
 
@@ -16484,12 +16500,16 @@ mod tests {
         // Seal lag: a file whose newest event is past the seal is still filling
         // (prod 2026-07-20: compacting it lost every OCC race).
         let unsealed = vec![f("a", 10, false, 1, 1), f("b", 10, false, 2, SEAL + 1)];
-        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), Vec::<String>::new(), "unsealed files leave < min_files");
+        assert_eq!(
+            super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
+            Vec::<String>::new(),
+            "unsealed files leave < min_files"
+        );
 
         // Converged (>= 7/8 target) files are never re-selected: rewriting one
         // alone is a 1→1 rewrite forever.
         let converged = vec![f("big", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["a", "b"]);
 
         // REPAIR: an oversized file that is NOT a sorted run declares no
         // `sorting_columns`, and one of those disables the reader's
@@ -16500,53 +16520,53 @@ mod tests {
         // packable slice, that slice wins.
         let poisoned = vec![f("big_unsorted", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
         assert_eq!(
-            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
+            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
             vec!["a", "b"],
             "normal packing must not be starved by a pending repair"
         );
         let only_poison = vec![f("big_unsorted", 900, false, 1, 2)];
         assert_eq!(
-            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
+            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
             vec!["big_unsorted"],
             "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files (the gap rule: today's poisoned file still gets repaired even though `TailPass::Repair` excludes today)"
         );
         // ...and exactly one per bin, so a backlog drains across ticks instead
         // of rewriting several hundred-megabyte files in a single pass.
         let many_poison = vec![f("p1", 900, false, 1, 2), f("p2", 950, false, 3, 4), f("p3", 800, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0).len(), 1, "one repair per bin");
+        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0).len(), 1, "one repair per bin");
         // A converged file that IS a sorted run stays done — repairing it would
         // be a 1->1 rewrite forever.
         let healthy = vec![f("big_sorted", 900, true, 1, 2)];
-        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0).is_empty(), "a converged sorted run is never re-selected");
+        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0).is_empty(), "a converged sorted run is never re-selected");
 
         // Sorted runs fold only while under the cap; an over-cap run is excluded.
         let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["run_small", "a"], "only the sub-cap run folds");
+        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["run_small", "a"], "only the sub-cap run folds");
 
         // Earliest contiguous slice up to cap, ordered by EVENT time (input
         // order is deliberately scrambled) — this is what makes runs disjoint.
         let pack = vec![f("third", 600, false, 30, 31), f("first", 600, false, 10, 11), f("second", 300, false, 20, 21)];
         assert_eq!(
-            super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0),
+            super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
             vec!["first", "second"],
             "packs earliest slice, stops at cap"
         );
 
         // min_files gate.
         assert_eq!(
-            super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack, 0),
+            super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
             Vec::<String>::new()
         );
 
         // A lone over-cap-adjacent file must not wedge the pass: selection skips
         // past it to the next slice rather than returning a 1-file bin.
         let lone = vec![f("lone", 800, false, 1, 2), f("a", 300, false, 10, 11), f("b", 300, false, 12, 13)];
-        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["a", "b"]);
 
         // Files with no event-time stats can't be binned disjointly (the
         // 2026-07-20 silent no-op read them as None and selected NOTHING).
         let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None, rows: None }, f("a", 10, false, 1, 2)];
-        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), Vec::<String>::new());
+        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), Vec::<String>::new());
     }
 
     /// The similar-size rule (`bin_breaks_size_ratio`) inside the tail packer:
@@ -16571,17 +16591,17 @@ mod tests {
         // measured 82.5%-write-volume shape); ratio 4 keeps the small pair and
         // leaves the whale for its own generation.
         let smalls_then_whale = vec![f("a", 5, 1, 2), f("b", 5, 3, 4), f("whale", 100, 5, 6)];
-        assert_eq!(super::select_tail_bin(&smalls_then_whale, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0), vec!["a", "b", "whale"]);
-        assert_eq!(super::select_tail_bin(&smalls_then_whale, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&smalls_then_whale, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["a", "b", "whale"]);
+        assert_eq!(super::select_tail_bin(&smalls_then_whale, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4, 0), vec!["a", "b"]);
 
         // Whale first in time: the guard restarts the slice at the smalls
         // rather than wedging behind the whale — smalls still merge.
         let whale_then_smalls = vec![f("whale", 100, 1, 2), f("a", 5, 3, 4), f("b", 5, 5, 6)];
-        assert_eq!(super::select_tail_bin(&whale_then_smalls, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4), vec!["a", "b"]);
+        assert_eq!(super::select_tail_bin(&whale_then_smalls, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4, 0), vec!["a", "b"]);
 
         // Near-peers are untouched at the default ratio.
         let peers = vec![f("p", 95, 1, 2), f("q", 114, 3, 4)];
-        assert_eq!(super::select_tail_bin(&peers, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4), vec!["p", "q"]);
+        assert_eq!(super::select_tail_bin(&peers, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 4, 0), vec!["p", "q"]);
     }
 
     #[test]
@@ -17170,18 +17190,18 @@ mod tests {
         let f =
             |path: &str, size: i64, min: i64| super::TailAdd { path: path.into(), size, is_sorted_run: false, event_range: Some((min, min + 1)), rows: None };
         let backlog = vec![f("may", 900, 10), f("july", 900, 500), f("june", 950, 100)];
-        assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0), vec!["july"], "newest poisoned file first");
+        assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0, 0), vec!["july"], "newest poisoned file first");
 
         // Same date: take the smallest, so one un-finishable giant cannot
         // head-of-line block everything behind it.
         let same_day = vec![f("huge", 999, 500), f("small", 880, 500)];
-        assert_eq!(super::select_tail_bin(&same_day, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0), vec!["small"], "smallest first within a date");
+        assert_eq!(super::select_tail_bin(&same_day, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0, 0), vec!["small"], "smallest first within a date");
 
         // A repair pass NEVER packs — it returns ONE file, never a bin, even
         // when several candidates could be packed together. Packing is the other
         // cron's job and a multi-file bin would spend the repair budget on it.
         let mixed = vec![f("poison", 900, 500), f("a", 10, 600), f("b", 10, 700)];
-        assert_eq!(super::select_tail_bin(&mixed, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0), vec!["b"], "one file, the newest");
+        assert_eq!(super::select_tail_bin(&mixed, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0, 0), vec!["b"], "one file, the newest");
         // A SMALL sealed footer-less file is repair work too. `hot_bin_admits`
         // has already established these are sealed and untagged, and one small
         // unsorted file voids its date's scan ordering exactly like a 1 GiB one
@@ -17190,11 +17210,11 @@ mod tests {
         // scope, so nothing would ever have rewritten them.
         let small_only = vec![f("tiny_old", 10, 100), f("tiny_new", 10, 900)];
         assert_eq!(
-            super::select_tail_bin(&small_only, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0),
+            super::select_tail_bin(&small_only, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0, 0),
             vec!["tiny_new"],
             "a small sealed footer-less file is still repair work, newest first"
         );
-        assert!(super::select_tail_bin(&[], TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0).is_empty(), "nothing admitted => no work");
+        assert!(super::select_tail_bin(&[], TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0, 0).is_empty(), "nothing admitted => no work");
     }
 
     /// Scope admission for the hot tail. Sealed-date repair exists because an unsorted file that
@@ -18321,7 +18341,7 @@ mod tests {
         let versions_in_different_runs = vec![run("older-version", 1), run("newer-version", 1)];
 
         assert!(
-            super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack, 0).is_empty(),
+            super::select_tail_bin(&versions_in_different_runs, TARGET, 2, i64::MAX, 10_000, TailPass::Pack, 0, 0).is_empty(),
             "target-sized runs are terminal, even when their key/time domains overlap"
         );
     }
