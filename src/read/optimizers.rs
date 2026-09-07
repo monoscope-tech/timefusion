@@ -1719,7 +1719,10 @@ pub struct PgCoalesceUdf {
 /// workspace pin, or this check would pass against the wrong version. By the
 /// same token, fork upgrades that keep the version string still need the
 /// manual audit — the tripwire only catches plain `cargo update`s.
-const AUDITED_DATAFUSION_VERSION: &str = "54.0.0";
+// 54.1.0 audit: ScalarUDFImpl and the built-in coalesce implementation are
+// byte-identical to 54.0.0. The audit also restored the missing conditional-
+// argument and documentation forwarding from the previous wrapper.
+const AUDITED_DATAFUSION_VERSION: &str = "54.1.0";
 // Byte loop because `&str` equality (PartialEq) isn't const-callable on
 // stable — assert!(a == b) won't compile in a const block.
 const _: () = {
@@ -1754,8 +1757,14 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
     fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> Result<datafusion::logical_expr::ColumnarValue> {
         self.inner.inner().invoke_with_args(args)
     }
+    fn conditional_arguments<'a>(&self, args: &'a [Expr]) -> Option<(Vec<&'a Expr>, Vec<&'a Expr>)> {
+        self.inner.inner().conditional_arguments(args)
+    }
     fn short_circuits(&self) -> bool {
         self.inner.inner().short_circuits()
+    }
+    fn documentation(&self) -> Option<&datafusion::logical_expr::Documentation> {
+        self.inner.inner().documentation()
     }
     fn simplify(
         &self, args: Vec<Expr>, info: &datafusion::logical_expr::simplify::SimplifyContext,

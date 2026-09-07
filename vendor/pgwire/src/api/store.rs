@@ -43,6 +43,16 @@ pub struct MemPortalStore<S> {
     portals: RwLock<BTreeMap<String, Arc<Portal<S>>>>,
 }
 
+impl<S> MemPortalStore<S> {
+    /// Remove every prepared statement, retaining already-bound portals.
+    ///
+    /// This supports SQL `DEALLOCATE ALL`: existing portals keep their own
+    /// statement references, but new binds can no longer find the statements.
+    pub fn clear_statements(&self) {
+        self.statements.write().unwrap().clear();
+    }
+}
+
 impl<S: Clone + Send + Sync + 'static> PortalStore for MemPortalStore<S> {
     type Statement = S;
 
@@ -83,5 +93,35 @@ impl<S: Clone + Send + Sync + 'static> PortalStore for MemPortalStore<S> {
     fn get_portal(&self, name: &str) -> Option<Arc<Portal<Self::Statement>>> {
         let guard = self.portals.read().unwrap();
         guard.get(name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::DEFAULT_NAME;
+
+    #[test]
+    fn clearing_statements_preserves_bound_portals() {
+        let store = MemPortalStore::<String>::new();
+        for name in ["named", DEFAULT_NAME] {
+            store.put_statement(Arc::new(StoredStatement::new(
+                name.to_owned(),
+                "SELECT 1".to_owned(),
+                vec![],
+            )));
+        }
+        let portal = Arc::new(Portal {
+            name: "bound".to_owned(),
+            statement: store.get_statement("named").unwrap(),
+            ..Default::default()
+        });
+        store.put_portal(portal.clone());
+        store.clear_statements();
+        store.clear_statements();
+        for name in ["named", DEFAULT_NAME] {
+            assert!(store.get_statement(name).is_none());
+        }
+        assert!(Arc::ptr_eq(&store.get_portal("bound").unwrap(), &portal));
     }
 }

@@ -248,6 +248,7 @@ strip = "none"
 [patch.crates-io]
 # libpq 18 requires a ProtocolVersionNegotiation response that reports every
 # unsupported `_pq_.*` startup option, even when protocol 3.2 itself matches.
+# MemPortalStore also exposes statement cleanup for SQL DEALLOCATE ALL.
 pgwire = { path = "vendor/pgwire" }
 # datafusion-postgres ecosystem on our fork's DataFusion 54 branch
 # (apitoolkit/datafusion-postgres @ timefusion-df54, off v0.16.0). Includes
@@ -256,12 +257,41 @@ pgwire = { path = "vendor/pgwire" }
 # arrow-pg/datafusion-pg-catalog from the same git workspace, so those need no
 # separate patch.
 datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", branch = "timefusion-df54" }
-# datafusion-sql on our fork (tonyalaribe/datafusion @ timefusion-update-from-54,
-# off tag 54.0.0): removes the SQL planner's defensive
-# `not_impl_err!("UPDATE ... FROM is not supported")` guard so `UPDATE ... FROM`
-# reaches TF's DmlQueryPlanner (Delta MergeBuilder / MemBuffer hash-join).
-# Mirrors apache/datafusion#21530; drop once upstream merges #19950.
-datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", branch = "timefusion-update-from-54" }
+# DataFusion 54.1 with SQL DEALLOCATE ALL and the existing UPDATE FROM support.
+# Keep the workspace crates on one source so their public Rust types agree.
+datafusion = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-catalog = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-catalog-listing = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-common = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-common-runtime = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-datasource = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-datasource-arrow = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-datasource-csv = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-datasource-json = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-datasource-parquet = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-doc = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-execution = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-expr = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-expr-common = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-functions = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-functions-aggregate = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-functions-aggregate-common = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-functions-nested = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-functions-table = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-functions-window = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-functions-window-common = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-macros = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-optimizer = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-physical-expr = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-physical-expr-adapter = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-physical-expr-common = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-physical-optimizer = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-physical-plan = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-proto = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-proto-common = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-pruning = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-session = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
+datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", rev = "a442435c7a4781ea4cc5b9043e2f0634d603705a" }
 # tikv-jemalloc-sys 0.6.1 vendored with a single build.rs delta: honour
 # `JEMALLOC_SYS_PROF_BACKTRACE` so the heap profiler can be built with a working
 # unwinder (`--enable-prof-libunwind`). Upstream passes `--enable-prof` alone and
