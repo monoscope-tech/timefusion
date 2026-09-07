@@ -463,7 +463,8 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
                         None => rows.next().await.map(|row| (row, Some(rows))),
                     };
                     if let Some((Err(error), _)) = &next {
-                        warn!(event = "pgwire.stream_failed", error = %error, "PostgreSQL row stream failed");
+                        // Escape multiline causes so line-based collectors retain the query context with the full error.
+                        warn!(event = "pgwire.stream_failed", error = ?error.to_string(), "PostgreSQL row stream failed");
                     }
                     next
                 }
@@ -1356,7 +1357,9 @@ mod pgwire_handlers_tests {
                     futures::stream::pending().boxed()
                 } else {
                     futures::stream::iter([if fails {
-                        Err(PgWireError::ApiError(anyhow::anyhow!("late input failure").into()))
+                        Err(PgWireError::ApiError(Box::new(
+                            datafusion::error::DataFusionError::ResourcesExhausted("sort reservation detail".into()).context("outer sort context"),
+                        )))
                     } else {
                         Ok(DataRow::new(bytes::BytesMut::new(), 0))
                     }])
@@ -1382,6 +1385,7 @@ mod pgwire_handlers_tests {
         let failures: Vec<_> = output.lines().filter(|line| line.contains("pgwire.stream_failed")).collect();
         assert_eq!(failures.len(), 3, "late failures must be attributed: {output}");
         assert!(failures.iter().all(|line| line.contains("query_context") && line.contains("query.text")));
+        assert_eq!(failures.iter().filter(|line| line.contains("sort reservation detail")).count(), 2, "resource cause must stay on the event line: {output}");
         assert!(!output.contains("private-literal-canary"));
         Ok(())
     }
