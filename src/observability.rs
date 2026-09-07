@@ -1021,6 +1021,11 @@ atomic_stats! {
         /// light_optimize_* counters mean pure compaction only.
         dedup_bins_committed as "dedup_bins_committed_total",
         dedup_waves_committed as "dedup_waves_committed_total",
+        /// Dedup bins STAGED via the deletion-vector path (marks losers with a
+        /// DV bitmap instead of rewriting whole files). Direct proof the DV lever
+        /// is engaging — without it, confirming DV vs copy-on-write dedup in prod
+        /// meant grepping S3 for `.bin` sidecars (the 2026-09-06 deploy).
+        dv_dedup_bins_staged as "dv_dedup_bins_staged_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.

@@ -2249,6 +2249,7 @@ impl Database {
                 rollup: None,
                 instance: None,
             });
+            crate::observability::maintenance_stats().dv_dedup_bins_staged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!(table_name, project_id, chunk = label, files = n_files, scanned_total, losers_total, event = "dv_dedup_chunk_staged");
             return Ok(BinOutcome::Staged(StagedBin {
                 project_id: project_id.to_string(),

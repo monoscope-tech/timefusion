@@ -1621,6 +1621,15 @@ where
 /// drift, and the roundtrip test below pins the format.
 const WAL_WATERMARK_KEY: &str = "timefusion.wal_watermark";
 
+/// `commitInfo.info` marker on a wave commit composed ENTIRELY of in-place
+/// DV-dedup bins (every Add re-adds a live path with a deletion vector — see
+/// [`StagedBin::masked_in_place`]). Such a commit adds no rows, so
+/// `reconcile_maintenance_task_cursors` skips re-minting Dedup for it while
+/// still re-minting rollups (the DV changes the file set rollup generations
+/// fingerprint). Written by `commit_wave`, read by reconcile — one constant so
+/// they can't drift. Any commit WITHOUT the marker fails toward minting.
+pub(crate) const DV_DEDUP_COMMIT_KEY: &str = "timefusion.dv_dedup";
+
 /// Serialize a per-shard watermark to the JSON map shape we store in
 /// `commitInfo.info[WAL_WATERMARK_KEY]`. Only shards with a position are
 /// included — absent shards mean "no constraint from this commit", which is
@@ -4920,7 +4929,7 @@ impl Database {
                                     for entry in db.rollup_dirty.iter() {
                                         let ((project, source, date), hours) = (entry.key(), *entry.value());
                                         if hours != 0 {
-                                            match db.enqueue_maintenance_hours(project, source, date, hours) {
+                                            match db.enqueue_maintenance_hours(project, source, date, hours, true) {
                                                 Ok(()) => requeued_dirty_partitions = requeued_dirty_partitions.saturating_add(1),
                                                 Err(error) => warn!(%error, project, source, date, event = "maintenance_dirty_partition_requeue_failed"),
                                             }
@@ -15515,6 +15524,78 @@ mod tests {
             "every reconciled task must lie inside the touched hour; day {day} starts {day_start}"
         );
         assert_eq!(queued, rollups.len(), "one dirty hour x one enqueue per declared rollup spec");
+        Ok(())
+    }
+
+    /// A self-authored DV-dedup commit must re-mint ROLLUPS but never DEDUP.
+    ///
+    /// DV-dedup carries `data_change=true` (it masks rows), so reconcile
+    /// re-minted Dedup from dedup's own output on every restart, upserting
+    /// already-Complete slices back to Pending — the self-feeding prod
+    /// `pending_dedup` floor (~500). Rollup re-mint must SURVIVE: the DV commit
+    /// changes the live file set rollup build generations fingerprint.
+    /// Untagged (ingest) commits still mint Dedup — the control half below.
+    #[tokio::test]
+    async fn reconcile_skips_dedup_remint_for_tagged_dv_dedup_commits() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskState};
+        let db = Database::with_config(create_test_config("reconcile-dv-dedup-skip")).await?;
+        let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
+        assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0, "first reconcile baselines the cursor");
+
+        let project = format!("dvskip_{}", uuid::Uuid::new_v4().simple());
+        // Sealed (>2h old) so the public dedup_partition clears the sealed-chunk
+        // guard; same-day so one date partition holds both files.
+        let ts = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+        // Cross-commit duplicate: identical dedup key flushed twice.
+        insert_a_span(&db, &project, "dup", ts).await?;
+        insert_a_span(&db, &project, "dup", ts).await?;
+
+        // CONTROL: ingest commits are untagged, so reconcile mints Dedup.
+        db.reconcile_maintenance_task_cursors().await?;
+        let project_keys: Vec<_> = {
+            let journal = db.maintenance_tasks.lock().unwrap();
+            journal.tasks().filter(|t| t.key.project_id == project).map(|t| t.key.clone()).collect()
+        };
+        assert!(project_keys.iter().any(|k| k.operation == Operation::Dedup), "untagged ingest commits must still mint Dedup");
+
+        // Mark everything Complete — the state a restart must not undo.
+        {
+            let mut journal = db.maintenance_tasks.lock().unwrap();
+            for key in &project_keys {
+                journal.complete(key);
+            }
+        }
+
+        // The DV-dedup pass masks the loser in place and commits tagged.
+        let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
+        let (dropped, _) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project, date).await?;
+        assert_eq!(dropped, 1, "the DV pass must mask exactly the cross-file duplicate");
+
+        // Tag round-trip through the real Delta log.
+        let (version, log_store) = {
+            let table = table_ref.read().await;
+            (table.version().unwrap_or_default(), table.log_store())
+        };
+        let bytes = log_store.read_commit_entry(version).await?.expect("dv-dedup commit entry");
+        let tagged = deltalake::logstore::get_actions(version, &bytes)?.iter().any(
+            |a| matches!(a, deltalake::kernel::Action::CommitInfo(ci) if ci.info.get(DV_DEDUP_COMMIT_KEY).and_then(serde_json::Value::as_bool) == Some(true)),
+        );
+        assert!(tagged, "the DV-dedup wave commit must carry {DV_DEDUP_COMMIT_KEY}");
+
+        db.reconcile_maintenance_task_cursors().await?;
+        let journal = db.maintenance_tasks.lock().unwrap();
+        let repended: Vec<_> = journal
+            .tasks()
+            .filter(|t| t.key.project_id == project && t.key.operation == Operation::Dedup && t.state != TaskState::Complete)
+            .map(|t| t.key.clone())
+            .collect();
+        assert!(repended.is_empty(), "a self-authored DV-dedup commit re-pended Complete Dedup slices (the floor mechanism): {repended:?}");
+        assert!(
+            journal.tasks().any(|t| t.key.project_id == project
+                && matches!(t.key.operation, Operation::BaseRollup | Operation::DerivedRollup)
+                && t.state == TaskState::Pending),
+            "rollup re-mint must survive the Dedup skip"
+        );
         Ok(())
     }
 

@@ -837,7 +837,10 @@ impl Database {
         crate::rollup_journal::store(&self.config.core.timefusion_data_dir, &entries)
     }
 
-    pub(crate) fn enqueue_maintenance_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
+    /// `mint_dedup=false` only for hours touched EXCLUSIVELY by self-authored
+    /// DV-dedup commits (see [`DV_DEDUP_COMMIT_KEY`]); everything else must
+    /// pass true.
+    pub(crate) fn enqueue_maintenance_hours(&self, project_id: &str, source: &str, date: &str, hours: u32, mint_dedup: bool) -> std::io::Result<()> {
         let Some(schema) = get_schema(source) else { return Ok(()) };
         if schema.rollups.is_empty() || hours == 0 {
             return Ok(());
@@ -859,6 +862,7 @@ impl Database {
                         end_micros: end,
                         observed_at_micros: observed_at,
                         derived: spec.derive_from.is_some(),
+                        mint_dedup,
                     })
                     .map_err(std::io::Error::other)?;
             }
@@ -882,6 +886,7 @@ impl Database {
                 end_micros: start.saturating_add(DAY_MICROS),
                 observed_at_micros,
                 derived: spec.derive_from.is_some(),
+                mint_dedup: true,
             })?;
         }
         journal.checkpoint()
@@ -934,14 +939,39 @@ impl Database {
             // queue's dominant growth source under deploy churn.
             let mut partition_hours: HashMap<(String, String), u32> = HashMap::new();
             let mut missing_commit = None;
+            // Hours needing a Dedup re-mint: accumulated from UNTAGGED commits
+            // only. A commit tagged `DV_DEDUP_COMMIT_KEY` is our own DV-dedup
+            // wave — it adds no rows, only masks losers in place, so re-minting
+            // Dedup from it upserts already-Complete slices back to Pending
+            // (the self-feeding `pending_dedup` floor). Rollups still re-mint
+            // from EVERY commit via `partition_hours` (the DV changes the file
+            // set their build generation fingerprints). Any untagged commit
+            // touching an hour puts it back in this map — fail toward minting.
+            let mut dedup_hours: HashMap<(String, String), u32> = HashMap::new();
             for commit_version in cursor.saturating_add(1)..=version {
                 let Some(bytes) = log_store.read_commit_entry(commit_version).await? else {
                     missing_commit = Some(commit_version);
                     break;
                 };
+                let actions = deltalake::logstore::get_actions(commit_version, &bytes)?;
+                let dv_dedup_commit = actions.iter().any(
+                    |action| matches!(action, deltalake::kernel::Action::CommitInfo(ci) if ci.info.get(DV_DEDUP_COMMIT_KEY).and_then(serde_json::Value::as_bool) == Some(true)),
+                );
+                eprintln!(
+                    "RECONCILE-DBG {cursor_key} v{commit_version} tagged={dv_dedup_commit} actions={:?}",
+                    actions
+                        .iter()
+                        .map(|a| match a {
+                            deltalake::kernel::Action::Add(x) => format!("Add({},dc={})", x.path, x.data_change),
+                            deltalake::kernel::Action::Remove(x) => format!("Rm({},dc={})", x.path, x.data_change),
+                            deltalake::kernel::Action::CommitInfo(ci) => format!("CI({:?})", ci.info.keys().collect::<Vec<_>>()),
+                            other => format!("{other:?}").chars().take(30).collect(),
+                        })
+                        .collect::<Vec<_>>()
+                );
                 let mut partitions_with_adds = HashSet::new();
                 let mut remove_only: HashSet<(String, String)> = HashSet::new();
-                for action in deltalake::logstore::get_actions(commit_version, &bytes)? {
+                for action in actions {
                     match action {
                         deltalake::kernel::Action::Add(add) if add.data_change => {
                             let Some(partition) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default") else { continue };
@@ -953,6 +983,9 @@ impl Database {
                                 })
                                 .unwrap_or(crate::rollup::ALL_HOURS);
                             partitions_with_adds.insert(partition.clone());
+                            if !dv_dedup_commit {
+                                *dedup_hours.entry(partition.clone()).or_insert(0) |= mask;
+                            }
                             *partition_hours.entry(partition).or_insert(0) |= mask;
                         }
                         // A Remove carries no stats; in a rewrite commit its
@@ -970,6 +1003,10 @@ impl Database {
                 }
                 for partition in remove_only {
                     if !partitions_with_adds.contains(&partition) {
+                        // Conservative day regardless of the tag: a tagged
+                        // commit never removes without a paired Add, so if one
+                        // somehow does, mint EVERYTHING for it.
+                        dedup_hours.insert(partition.clone(), crate::rollup::ALL_HOURS);
                         partition_hours.insert(partition, crate::rollup::ALL_HOURS);
                     }
                 }
@@ -1024,12 +1061,14 @@ impl Database {
                 );
             }
             for ((partition_project, date), hours) in partition_hours {
-                let project = if storage_project.is_empty() { partition_project } else { storage_project.clone() };
+                let project = if storage_project.is_empty() { partition_project.clone() } else { storage_project.clone() };
                 if missing_commit.is_some() {
                     self.enqueue_maintenance_partition(&project, source, &date)?;
                     queued = queued.saturating_add(schema.rollups.len());
                 } else {
-                    self.enqueue_maintenance_hours(&project, source, &date, hours)?;
+                    let with_dedup = dedup_hours.get(&(partition_project, date.clone())).copied().unwrap_or(0) & hours;
+                    self.enqueue_maintenance_hours(&project, source, &date, with_dedup, true)?;
+                    self.enqueue_maintenance_hours(&project, source, &date, hours & !with_dedup, false)?;
                     queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
                 }
                 tokio::task::yield_now().await;
@@ -4030,7 +4069,7 @@ impl Database {
         // Checkpoint slice work before the legacy journal and before the write
         // is acknowledged. A crash at any later point can only leave redundant
         // tasks; it cannot leave a mutation with no maintenance record.
-        self.enqueue_maintenance_hours(project_id, source, date, affected_hours)?;
+        self.enqueue_maintenance_hours(project_id, source, date, affected_hours, true)?;
         self.persist_rollup_journal()?;
         Ok(())
     }
@@ -4071,7 +4110,7 @@ impl Database {
             self.rollup_source_epochs.entry(key.clone()).and_modify(|epoch| *epoch = epoch.saturating_add(1));
             self.rollup_dirty.insert(key.clone(), crate::rollup::ALL_HOURS);
             self.rollup_invalidated_at.entry(key.clone()).or_insert_with(crate::storage::now_unix_ms);
-            self.enqueue_maintenance_hours(&key.0, &key.1, &key.2, crate::rollup::ALL_HOURS)?;
+            self.enqueue_maintenance_hours(&key.0, &key.1, &key.2, crate::rollup::ALL_HOURS, true)?;
         }
         self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source);
         self.rollup_slice_coverage.retain(|(project, table, ..), _| project != project_id || table != source);
@@ -7927,15 +7966,23 @@ impl Database {
                     return WaveResult { landed: carried, failed };
                 }
             };
+            // Tag a wave composed ENTIRELY of in-place DV-dedup bins so
+            // reconcile can skip re-minting Dedup from it (rollups still
+            // re-mint). A mixed/CoW/compaction wave stays untagged and fails
+            // toward minting. Recomputed per attempt from post-split `fresh`
+            // (non-empty here); ONE `with_metadata` call only — it REPLACES
+            // the map rather than extending it.
+            let mut commit_props = incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot);
+            if data_change && fresh.iter().all(StagedBin::masked_in_place) {
+                commit_props = commit_props.with_metadata([(DV_DEDUP_COMMIT_KEY.to_string(), serde_json::Value::Bool(true))]);
+            }
             // Bounded: the proven prod hang (2026-07-30) was HERE — one R2
             // request pinned this lock and every committer on the table stalled.
             let commit_res = bounded_commit_await(
                 COMMIT_LOCK_OP_TIMEOUT,
                 "wave_commit",
                 table_name,
-                deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                    .with_actions(actions)
-                    .build(Some(snapshot_ref), new_table.log_store(), op),
+                deltalake::kernel::transaction::CommitBuilder::from(commit_props).with_actions(actions).build(Some(snapshot_ref), new_table.log_store(), op),
             )
             .await;
             match commit_res {
