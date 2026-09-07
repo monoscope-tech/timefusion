@@ -826,7 +826,7 @@ async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
             // sizes must scale with their member rows for the size-based
             // convergence assertions below; 1-row files are otherwise pure
             // footer overhead and merging wouldn't grow them.
-            let blob: String = (0..4000).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            let blob: String = (0..40000).map(|_| uuid::Uuid::new_v4().to_string()).collect();
             row["summary"] = serde_json::json!([blob]);
             let batch = json_to_batch(vec![row])?;
             // flush_immediately → each insert flushes as its own Delta commit.
@@ -3910,5 +3910,74 @@ async fn dv_window_filters_before_read_dedup() -> Result<()> {
     let dedup = find_node(&plan, "DedupExec").expect("fixture must exercise read-side dedup");
     let input_rows = dedup.metrics().unwrap().sum_by_name("input_rows").unwrap().as_usize();
     assert_eq!(input_rows, 4, "out-of-window rows reached dedup: {}", rendered(&plan));
+    Ok(())
+}
+
+/// Regression for the dv-dedup COUNT oracle (fork fix `3b43e646`): DV keep-mask
+/// cursors are per-stream and positional, so when DataFusion byte-range-splits a
+/// DV'd file across partitions each stream applies the mask's FRONT to whichever
+/// range it owns — survivor identity scrambles and counts corrupt in both
+/// directions (prod: "dv-dedup: scan saw N vs oracle M — retry", looping forever).
+/// Fork `f9dac466` (#218) meant to force whole-file scans under DVs, but its
+/// per-file DV condition is vacuous in the main scan path (masks live in the
+/// `dvs` map; the per-file Option is hard-coded None), so any DV'd scan not
+/// projecting `__tf_dv_row_index` — the oracle shape — still split (RED here:
+/// count 10000 vs 20000). The fix keys whole-file scanning and
+/// benefits_from_input_partitioning on actual mask presence; whole-file groups
+/// still parallelize across files.
+///
+/// NOTE the 40k-row fixture is load-bearing: below ~batch_size (8192) rows,
+/// `roundrobin_beneficial_stats` stops EnforceDistribution from ever calling
+/// `repartitioned()`, and this test can no longer fail.
+#[tokio::test]
+async fn dv_masked_count_survives_byte_range_repartitioning() -> Result<()> {
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use deltalake::datafusion::parquet::file::properties::WriterProperties;
+    use deltalake::kernel::{DataType as KernelType, PrimitiveType};
+
+    let dir = tempfile::tempdir()?;
+    let table = deltalake::DeltaTableBuilder::from_url(url::Url::from_directory_path(dir.path()).unwrap())?.build()?;
+    let table = table
+        .create()
+        .with_column("id", KernelType::Primitive(PrimitiveType::Long), false, None)
+        .with_configuration_property(deltalake::TableProperty::EnableDeletionVectors, Some("true"))
+        .await?;
+
+    // One file, four ~10k-row row groups, so a byte-range split lands whole
+    // groups in different partitions.
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..40000))])?;
+    let table = table.write(vec![batch]).with_writer_properties(WriterProperties::builder().set_max_row_group_row_count(Some(10000)).build()).await?;
+    // DV-mask the front half: mask = [delete x20k, keep x20k]. A stream that
+    // starts mid-file but consumes the mask from offset 0 then drops keepers.
+    let (table, _) = table.delete().with_predicate("id < 20000").with_deletion_vectors(true).await?;
+    assert!(table.snapshot()?.snapshot().log_data().iter().any(|f| f.deletion_vector_descriptor().is_some()), "fixture must carry a real deletion vector");
+
+    // The oracle's shape: >1 target partitions and a file over the repartition
+    // floor (forced here by dropping the floor to 1 byte instead of a >10MB file).
+    let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(2);
+    config.options_mut().optimizer.repartition_file_min_size = 1;
+    let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+    table.update_datafusion_session(&ctx.state())?;
+    ctx.register_table("dv_t", table.table_provider().await?)?;
+
+    let plan = ctx.sql("SELECT COUNT(*) FROM dv_t WHERE id >= 0").await?.create_physical_plan().await?;
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+    let count = batches[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+    assert_eq!(count, 20000, "DV mask drained out of order across partitions");
+    let scan = find_node(&plan, "DeltaScanExec").expect("count must scan through DeltaScanExec");
+    assert_eq!(scan.properties().output_partitioning().partition_count(), 1, "a DV-masked scan must not be byte-range split: {}", rendered(&plan));
+
+    // The PROD shape (stage_dedup_chunk_dv, compact.rs): ONE provider registered
+    // once, then MULTIPLE separate query executions against it — the COUNT
+    // oracle and the shard scans. With a destructively-drained shared keep-mask,
+    // the first execution consumes the mask and every later one sees a drained
+    // (or partially drained) mask — the bidirectional "scan saw N vs oracle M"
+    // prod signature. Masks must be immutable with per-execution cursors.
+    for pass in 2..=4 {
+        let n = ctx.sql("SELECT COUNT(*) FROM dv_t WHERE id >= 0").await?.collect().await?[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(n, 20000, "repeat execution #{pass} against the same provider saw a drained/corrupt DV mask");
+    }
     Ok(())
 }

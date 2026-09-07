@@ -2181,8 +2181,11 @@ impl Database {
                 }
             }
 
-            // The scan and the oracle share one snapshot/ctx, so a mismatch is a
-            // truncated re-read (concurrent rewrite) — retry, don't certify.
+            // The scan and the oracle share one snapshot/ctx, so a persistent
+            // mismatch is a scan/planner defect, not data churn (2026-09-07: DV'd
+            // files byte-range-split across partitions scrambled the positional
+            // keep-mask — fork fix 3b43e646). Keep the retry as a cheap guard;
+            // it firing repeatedly means a bug, and it must never certify.
             if scanned_total != oracle {
                 warn!("dv-dedup: scan saw {scanned_total} rows vs oracle {oracle} for table={table_name} chunk=[{label}] — retry");
                 return Ok(BinOutcome::Retry);
