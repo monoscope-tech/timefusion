@@ -446,6 +446,135 @@ pub fn landed_digest(batches: &[RecordBatch]) -> Option<LandedDigest> {
     })
 }
 
+/// Per-row (key_hash, content_hash) for ingest-time client-retry dedup — the
+/// core of the content-identity ingest filter (design:
+/// docs/plans/2026-09-07-ingest-dedup-prevention-design.md). `key_idxs` are the
+/// schema's dedup-key columns; `content_idxs` are ALL columns EXCEPT the
+/// TF-stamped tiebreak (for a `version_append` table `stamp_version` overwrites
+/// it per batch, so a retry never matches on it). A row is a client-retry
+/// duplicate iff BOTH hashes match a previously-flushed row.
+///
+/// Uses Arrow's `RowConverter` for the byte encoding: its row format delimits
+/// variable-length fields, so `("ab","c")` and `("a","bc")` encode differently —
+/// the length-prefixing the design requires, for free and type-correct. 128-bit
+/// hashes; the only unique-row-loss path is a double collision (~6e-25/window,
+/// the shipped `LandedDigest` bar). Returns `None` on any encoding failure
+/// (fail-open: decline the drop, keep the row — a duplicate at worst).
+pub(crate) fn per_row_identities(batch: &RecordBatch, key_idxs: &[usize], content_idxs: &[usize]) -> Option<Vec<(u128, u128)>> {
+    use datafusion::arrow::row::{RowConverter, SortField};
+    if batch.num_rows() == 0 {
+        return Some(Vec::new());
+    }
+    let encode = |idxs: &[usize]| -> Option<datafusion::arrow::row::Rows> {
+        let fields: Vec<SortField> = idxs.iter().map(|&i| SortField::new(batch.column(i).data_type().clone())).collect();
+        let cols: Vec<_> = idxs.iter().map(|&i| batch.column(i).clone()).collect();
+        let conv = RowConverter::new(fields).ok()?;
+        conv.convert_columns(&cols).ok()
+    };
+    let key_rows = encode(key_idxs)?;
+    let content_rows = encode(content_idxs)?;
+    Some(
+        (0..batch.num_rows())
+            .map(|r| {
+                let k = twox_hash::XxHash3_128::oneshot(key_rows.row(r).as_ref());
+                let c = twox_hash::XxHash3_128::oneshot(content_rows.row(r).as_ref());
+                (k, c)
+            })
+            .collect(),
+    )
+}
+
+/// Bounded recently-flushed content-identity index for ingest-time client-retry
+/// dedup (design: docs/plans/2026-09-07-ingest-dedup-prevention-design.md). Two
+/// epochs so eviction is O(1): a probe checks both `current` and `previous`; a
+/// populate writes `current`; a rotation drops `previous`, moves `current` there,
+/// and starts a fresh `current`. Coverage oscillates between window/2 and window.
+///
+/// The `RwLock` guards only the two `Arc<DashMap>` handles (a read-lock clones an
+/// Arc; DashMap is internally sharded/lock-free, so concurrent probe/populate do
+/// not serialize). Only the rare rotation takes the brief write lock.
+///
+/// NOT wired to the ingest path yet — the hot-path probe (in `insert_bounded`
+/// pre-WAL, gated `bound==true`) and flush-time populate are the next careful,
+/// benchmarked pass. This is the standalone, tested data structure.
+pub(crate) struct IngestDedupIndex {
+    epochs: std::sync::RwLock<IngestEpochs>,
+    /// Rotate when `current` reaches this many entries (~half the byte cap at
+    /// ~50 B/entry) OR when it is this old.
+    rotate_at_entries: usize,
+    rotate_at_micros: i64,
+}
+
+struct IngestEpochs {
+    current: std::sync::Arc<dashmap::DashMap<u128, u128>>,
+    previous: std::sync::Arc<dashmap::DashMap<u128, u128>>,
+    current_started_micros: i64,
+}
+
+impl IngestDedupIndex {
+    /// `max_bytes` is the index's own budget (outside the MemBuffer cap);
+    /// `window_micros` is the retry-coverage window (epochs rotate at window/2).
+    pub(crate) fn new(max_bytes: usize, window_micros: i64, now_micros: i64) -> Self {
+        const BYTES_PER_ENTRY: usize = 50; // 32 B payload + DashMap overhead
+        Self {
+            epochs: std::sync::RwLock::new(IngestEpochs {
+                current: std::sync::Arc::new(dashmap::DashMap::new()),
+                previous: std::sync::Arc::new(dashmap::DashMap::new()),
+                current_started_micros: now_micros,
+            }),
+            rotate_at_entries: (max_bytes / 2 / BYTES_PER_ENTRY).max(1),
+            rotate_at_micros: (window_micros / 2).max(1),
+        }
+    }
+
+    /// True iff `(key_hash, content_hash)` matches a previously-populated row — a
+    /// client-retry duplicate. A key hit with DIFFERENT content is a new version,
+    /// NOT a duplicate (returns false, so it passes through to be resolved by
+    /// keep-greatest downstream).
+    pub(crate) fn is_duplicate(&self, key_hash: u128, content_hash: u128) -> bool {
+        let (current, previous) = {
+            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (std::sync::Arc::clone(&e.current), std::sync::Arc::clone(&e.previous))
+        };
+        current.get(&key_hash).is_some_and(|c| *c == content_hash) || previous.get(&key_hash).is_some_and(|c| *c == content_hash)
+    }
+
+    /// Record a flushed row's identity (last write wins on `key_hash`, so a newer
+    /// version overwrites — fail-open: a stale retry then key-hits with mismatched
+    /// content, passes, and maintenance dedup resolves it).
+    pub(crate) fn populate(&self, key_hash: u128, content_hash: u128) {
+        let current = {
+            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::sync::Arc::clone(&e.current)
+        };
+        current.insert(key_hash, content_hash);
+    }
+
+    /// Rotate epochs if `current` is over its size or age bound. Cheap and
+    /// idempotent under contention (a double rotation only shrinks coverage).
+    pub(crate) fn maybe_rotate(&self, now_micros: i64) {
+        let needs = {
+            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros
+        };
+        if !needs {
+            return;
+        }
+        let mut e = self.epochs.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-check under the write lock (another thread may have rotated).
+        if e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros {
+            e.previous = std::mem::replace(&mut e.current, std::sync::Arc::new(dashmap::DashMap::new()));
+            e.current_started_micros = now_micros;
+        }
+    }
+
+    /// Total live entries across both epochs (for the `index_entries` metric).
+    pub(crate) fn entries(&self) -> usize {
+        let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        e.current.len() + e.previous.len()
+    }
+}
+
 /// One (project, table) group of a single flush tick, handed to the coalescing
 /// writer so all of them can share ONE Delta commit per physical table.
 pub struct FlushUnit {
@@ -3829,6 +3958,76 @@ mod tests {
         assert_ne!(landed_digest(&[a.clone(), a.clone()]), landed_digest(std::slice::from_ref(&a)));
         // No identity for an empty set — nothing to skip.
         assert_eq!(landed_digest(&[]), None);
+    }
+
+    /// The content-identity core for ingest-time client-retry dedup: a retry is a
+    /// duplicate iff BOTH the key hash and the content hash match. A new version
+    /// (different content) must NOT match, and distinct multi-column keys must not
+    /// collide (the `("ab","c")` vs `("a","bc")` trap the design flags).
+    #[test]
+    fn per_row_identities_key_and_content_are_length_safe() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        // cols: [service(0), id(1), body(2)] — key = [service,id], content = all.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service", DataType::Utf8, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("body", DataType::Int64, false),
+        ]));
+        let batch = |svc: Vec<&str>, id: Vec<&str>, body: Vec<i64>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(svc)), Arc::new(StringArray::from(id)), Arc::new(Int64Array::from(body))])
+                .unwrap()
+        };
+        let key_idxs = &[0usize, 1];
+        let content_idxs = &[0usize, 1, 2];
+
+        // Row0 and Row1 share the key but differ in content (a new version).
+        let b = batch(vec!["svc", "svc"], vec!["x", "x"], vec![1, 2]);
+        let ids = per_row_identities(&b, key_idxs, content_idxs).unwrap();
+        assert_eq!(ids[0].0, ids[1].0, "same key => same key_hash");
+        assert_ne!(ids[0].1, ids[1].1, "different content => different content_hash (a version, not a dup)");
+
+        // An exact retry: identical key AND content => both hashes equal.
+        let b2 = batch(vec!["svc"], vec!["x"], vec![1]);
+        let retry = per_row_identities(&b2, key_idxs, content_idxs).unwrap();
+        assert_eq!(retry[0], ids[0], "byte-identical row => identical (key_hash, content_hash)");
+
+        // The concatenation trap: ("ab","c") and ("a","bc") must NOT collide.
+        let split = batch(vec!["ab", "a"], vec!["c", "bc"], vec![0, 0]);
+        let s = per_row_identities(&split, key_idxs, content_idxs).unwrap();
+        assert_ne!(s[0].0, s[1].0, "('ab','c') and ('a','bc') must have distinct key hashes");
+    }
+
+    #[test]
+    fn ingest_dedup_index_matches_retries_versions_and_rotates() {
+        // 3 entries per epoch (rotate_at_entries = max_bytes/2/50). max_bytes=300 -> 3.
+        let idx = IngestDedupIndex::new(300, 1_000_000, 0);
+        idx.populate(1, 100); // key 1, content 100
+        assert!(idx.is_duplicate(1, 100), "exact (key,content) => duplicate");
+        assert!(!idx.is_duplicate(1, 999), "same key, different content => a version, not a dup");
+        assert!(!idx.is_duplicate(2, 100), "unseen key => not a dup");
+        assert_eq!(idx.entries(), 1);
+
+        // Last-write-wins on key: a newer version overwrites; the stale content no
+        // longer matches (fail-open — passes to keep-greatest).
+        idx.populate(1, 200);
+        assert!(idx.is_duplicate(1, 200));
+        assert!(!idx.is_duplicate(1, 100), "overwritten content no longer matches");
+
+        // Fill current to the entry cap, then rotate: current's entries survive in
+        // `previous` and are still probeable.
+        idx.populate(2, 20);
+        idx.populate(3, 30); // current now has keys {1,2,3} = 3 >= cap
+        idx.maybe_rotate(1); // over size -> rotate
+        assert!(idx.is_duplicate(1, 200), "post-rotation, previous epoch is still probed");
+        assert!(idx.is_duplicate(3, 30));
+
+        // A second rotation drops the oldest epoch entirely.
+        idx.populate(4, 40);
+        idx.maybe_rotate(2_000_000); // over age -> rotate again; the {1,2,3} epoch falls off
+        assert!(idx.is_duplicate(4, 40), "newest still present");
+        assert!(!idx.is_duplicate(1, 200), "two rotations => oldest epoch evicted (coverage bound)");
     }
 
     /// The compaction brake must read the flush BACKLOG, not the WAL directory
