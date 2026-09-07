@@ -3,6 +3,12 @@
 use super::*;
 use tap::Tap;
 
+#[derive(Clone, Copy, Debug)]
+enum RollupRebuildReason {
+    MissingRowWitness,
+    ObsoleteGeneration,
+}
+
 /// Estimated decoded (in-memory) bytes for a Parquet file of `compressed_size` on
 /// disk — a fixed 12x compression-ratio guess used for budgeting, not measurement.
 /// One tier's contribution to a fleet contiguity gauge, or `None` to abstain.
@@ -2517,6 +2523,7 @@ impl Database {
         // Tagged base files the derived selection loop refuses, by reason. See
         // the counters' declarations and the skip site below.
         let (mut skipped_tag_project, mut skipped_tag_range) = (0u64, 0u64);
+        let mut skipped_generation = 0u64;
         // Read STRICTLY BEFORE the snapshot below, and evaluated after it — see
         // the derived base-coverage gate. Coverage is inserted only AFTER the
         // base unit's Delta commit and only ever grows, so a range collected
@@ -2532,15 +2539,24 @@ impl Database {
         // only claim a measure its base cells proved — see
         // `materialized_measures`.
         let mut base_evidence = None;
+        let mut base_generations = HashSet::new();
         let base_covered: Vec<(i64, i64)> = if derived {
             let cells = self
                 .rollup_slice_coverage
                 .iter()
                 .filter(|entry| {
                     let (project, source, table, start, end) = entry.key();
-                    *project == key.project_id && *source == key.source && *table == from && key.slice.overlaps(*start, *end)
+                    *project == key.project_id
+                        && *source == key.source
+                        && *table == from
+                        && key.slice.overlaps(*start, *end)
+                        && chrono::DateTime::from_timestamp_micros(*start)
+                            .is_some_and(|time| Self::rollup_generation_current(source, table, project, &time.date_naive().to_string(), entry.value()))
                 })
-                .map(|entry| ((entry.key().3, entry.key().4), entry.value().measures.clone()))
+                .map(|entry| {
+                    base_generations.insert(entry.value().generation.clone());
+                    ((entry.key().3, entry.key().4), entry.value().measures.clone())
+                })
                 .collect::<Vec<_>>();
             base_evidence = crate::rollup::base_measure_evidence(spec, cells.iter().map(|(_, measures)| measures.as_ref()));
             cells.into_iter().map(|(span, _)| span).collect()
@@ -2601,6 +2617,18 @@ impl Database {
                     continue;
                 }
                 if derived {
+                    // A current coverage range cannot authorize files from an
+                    // older materialization generation that overlap that range.
+                    if !add
+                        .tags
+                        .as_ref()
+                        .and_then(|tags| tags.get(crate::maintenance_coordinator::TAG_GENERATION))
+                        .and_then(Option::as_ref)
+                        .is_some_and(|generation| base_generations.contains(generation))
+                    {
+                        skipped_generation += 1;
+                        continue;
+                    }
                     // OVERLAP, not containment. A base file is tagged with the
                     // slice of the UNIT that wrote it, and that unit's width is
                     // unrelated to this one's: the backfill writes day-wide base
@@ -2714,6 +2742,10 @@ impl Database {
             let stats = crate::observability::maintenance_stats();
             stats.rollup_base_file_skipped_tag_project.fetch_add(skipped_tag_project, Relaxed);
             stats.rollup_base_file_skipped_tag_range.fetch_add(skipped_tag_range, Relaxed);
+        }
+        if skipped_generation > 0 {
+            warn!(source = %key.source, target = %key.physical_table, project_id = %key.project_id, skipped_generation,
+                event = "maintenance_rollup_obsolete_inputs", "derived rollup refused obsolete base materializations");
         }
         if untagged_inputs > 0 {
             crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
@@ -4567,8 +4599,9 @@ impl Database {
     /// fully-covered day says "republish me" — the claim is unverifiable, not
     /// missing. Enqueue is idempotent (keyed), so re-running hourly re-queues only
     /// what has not drained.
-    fn enqueue_witnessless_rebuilds(
-        &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, slices: &[(String, crate::maintenance_coordinator::TimeSlice)],
+    fn enqueue_unverifiable_rebuilds(
+        &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, reason: RollupRebuildReason,
+        slices: &[(String, crate::maintenance_coordinator::TimeSlice)],
     ) {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey};
         if slices.is_empty() {
@@ -4605,8 +4638,9 @@ impl Database {
             // Named, never silent: a cap that does not say what it dropped reads
             // as "everything is queued" and hides the real size of the backlog.
             deferred = slices.len().saturating_sub(queued),
-            event = "rollup_witnessless_rebuild_queued",
-            "slices predating the row witness cannot be verified and were queued for republish, newest first"
+            ?reason,
+            event = "rollup_unverifiable_rebuild_queued",
+            "unverifiable slices queued for republish, newest first"
         );
     }
 
@@ -4627,28 +4661,27 @@ impl Database {
     /// attempt to route at all. The ledger already holds that answer durably, so
     /// routing can be correct from the first query after boot.
     ///
-    /// Sound only because the ledger records exactly the slices that passed the
-    /// read path's own filters — see `record_readable_coverage`. It seeds rather
-    /// than replaces: the replay still runs, still verifies, and overwrites
-    /// anything here, so a stale ledger costs one interval of narrower coverage
-    /// and never a wrong answer.
+    /// Revalidate materialization generations before restoring coverage: a
+    /// ledger accepted by an older reader does not prove the current semantics.
+    /// Delta tag recovery still runs and replaces the restored evidence.
     pub fn seed_routing_from_ledger(&self) -> usize {
         use crate::storage::CoverageLedger as _;
         let mut seeded = 0usize;
         for cell in self.coverage_ledger.cells() {
-            let (source, project_id, table_name, _date) = cell.clone();
+            let (source, project_id, table_name, date) = cell.clone();
             for entry in self.coverage_ledger.coverage(&cell) {
-                self.rollup_slice_coverage.insert(
-                    (project_id.clone(), source.clone(), table_name.clone(), entry.start_micros, entry.end_micros),
-                    RollupCoverage {
-                        source_fp: entry.source_fingerprint,
-                        source_epoch: None,
-                        generation: entry.generation.clone(),
-                        source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
-                        covered_through: entry.end_micros,
-                        measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
-                    },
-                );
+                let coverage = RollupCoverage {
+                    source_fp: entry.source_fingerprint,
+                    source_epoch: None,
+                    generation: entry.generation.clone(),
+                    source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                    covered_through: entry.end_micros,
+                    measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
+                };
+                if !Self::rollup_generation_current(&source, &table_name, &project_id, &date, &coverage) {
+                    continue;
+                }
+                self.rollup_slice_coverage.insert((project_id.clone(), source.clone(), table_name.clone(), entry.start_micros, entry.end_micros), coverage);
                 seeded += 1;
             }
         }
@@ -4946,6 +4979,7 @@ impl Database {
             // the general queue they compete with ~7,000 other units behind a restart
             // cadence measured in tens of minutes. Queue them explicitly instead.
             let mut witnessless: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
+            let mut obsolete_generations = Vec::new();
             // The BACKLOG comes from the Delta tags, which are durable and unaffected
             // by journal state. Counting it from `published_rollups` instead made the
             // gauge lie the moment it worked: enqueueing a slice flips its task off
@@ -5067,6 +5101,7 @@ impl Database {
                     if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp, restrict.as_deref()) != generation {
                         fate(UnverifiableFate::StaleGeneration);
                         stale_generation += 1;
+                        obsolete_generations.push((project_id.clone(), slice));
                         continue;
                     }
                     if source_rows.is_none() {
@@ -5105,11 +5140,13 @@ impl Database {
                     recovered += 1;
                 }
                 self.record_readable_coverage(source, &target, readable);
-                self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
+                self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
+                self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
                 self.recover_date_coverage(source, &target).await;
                 continue;
             }
-            self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
+            self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
+            self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
             self.recover_date_coverage(source, &target).await;
             if !published.is_empty() {
                 continue;

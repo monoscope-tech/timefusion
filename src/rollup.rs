@@ -113,11 +113,10 @@ fn sql_literal(value: &str) -> String {
 /// that does not hold a measure is refused for queries needing it and serves
 /// every other query unchanged.
 ///
-/// Restricting rather than dropping measures from the hash is what keeps the
-/// change backward compatible: measures are appended, so the restricted spec's
-/// `Debug` is byte-identical to the spec that was live when the cell was built,
-/// and the generation already on S3 still matches. `None` — a cell with no tag,
-/// which proves nothing — keeps the old whole-spec comparison.
+/// Within one materialization version, restricting the spec preserves the
+/// generation when measures are appended. Redefined measures and source-read
+/// semantic changes require a new generation. `None` uses the whole spec;
+/// measure availability remains a separate proof at read time.
 pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64, measures: Option<&[String]>) -> String {
     use std::hash::{Hash, Hasher};
     let restricted;
@@ -129,6 +128,11 @@ pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &s
         None => spec,
     };
     let mut hasher = fnv::FnvHasher::default();
+    // Materialized aggregates depend on source-read semantics as well as the
+    // SQL spec. Older generations may contain results from incorrect physical
+    // deletion-vector row positions and must be rebuilt from the fixed reader.
+    const MATERIALIZATION_VERSION: u8 = 1;
+    MATERIALIZATION_VERSION.hash(&mut hasher);
     format!("{spec:?}").hash(&mut hasher);
     (source, project_id, date).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
