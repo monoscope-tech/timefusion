@@ -899,7 +899,7 @@ impl Database {
         // replay while Docker health checks remained green.
         let mut queued = 0usize;
         let tables = self.all_tables().await;
-        for (storage_project, source, table_ref) in &tables {
+        'sources: for (storage_project, source, table_ref) in &tables {
             let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { continue };
             let (version, log_store) = {
                 let table = table_ref.read().await;
@@ -986,8 +986,26 @@ impl Database {
                     }
                     let table = handle.read().await;
                     for file in table.snapshot()?.log_data().iter() {
-                        let partition = Self::maintenance_partition_from_action(&file.path(), None, "default")
-                            .ok_or_else(|| anyhow::anyhow!("cannot reconcile partition for {} in {name}", file.path()))?;
+                        // A valid Delta file need not use Hive directory labels.
+                        // Read only partition scalars, without materializing file statistics.
+                        let values = file.partition_values().map(|values| {
+                            values
+                                .fields()
+                                .iter()
+                                .zip(values.values())
+                                .map(|(field, value)| {
+                                    (field.name().to_owned(), (!value.is_null()).then(|| deltalake::kernel::scalars::ScalarExt::serialize(value)))
+                                })
+                                .collect::<HashMap<_, _>>()
+                        });
+                        let Some(partition) = Self::maintenance_partition_from_action(&file.path(), values.as_ref(), "default")
+                            .filter(|(_, date)| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
+                        else {
+                            // Do not advance past unknown data, but do not let this
+                            // source prevent healthy sources reconciling their cursors.
+                            warn!(source, storage_project, cursor, table = name, path = %file.path(), event = "maintenance_partition_reconcile_failed");
+                            continue 'sources;
+                        };
                         partition_hours.insert(partition, crate::rollup::ALL_HOURS);
                     }
                 }

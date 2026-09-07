@@ -15379,13 +15379,18 @@ mod tests {
     /// Retained Delta history may start after a durable maintenance cursor.
     /// Reconstruct conservative work from the live metadata before advancing,
     /// rather than failing every restart on the same expired commit.
+    #[test_case::test_case(true; "partition metadata without directory labels")]
+    #[test_case::test_case(false; "malformed source leaves healthy sources running")]
     #[tokio::test]
-    async fn maintenance_reconciliation_recovers_expired_history() -> Result<()> {
+    async fn maintenance_reconciliation_recovers_expired_history(valid_partition_metadata: bool) -> Result<()> {
         use object_store::ObjectStoreExt;
         let db = Database::with_config(create_test_config("reconcile-expired-history")).await?;
         let source = "otel_logs_and_spans";
         let table = db.get_or_create_unified_table(source).await?;
         db.reconcile_maintenance_task_cursors().await?;
+        // A malformed source must not prevent a healthy source establishing its cursor.
+        let healthy = db.get_or_create_unified_table("otel_metrics").await?;
+        let healthy_version = healthy.read().await.version().unwrap();
         let project = format!("recon_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::days(2)).timestamp_micros();
         insert_a_span(&db, &project, "a", ts).await?;
@@ -15401,23 +15406,49 @@ mod tests {
         let target_ref = db.get_or_create_unified_table(&target_name).await?;
         {
             let mut target = target_ref.read().await.clone();
-            let add = deltalake::kernel::Add {
-                path: format!("project_id={removed_project}/date={date}/metadata-only.parquet"),
+            let mut actions = Vec::new();
+            if !valid_partition_metadata {
+                use deltalake::kernel::MetadataExt;
+                // A legacy layout can store date in the rows rather than partition metadata.
+                let metadata = deltalake::kernel::Metadata::try_new(
+                    None,
+                    None,
+                    target.snapshot()?.schema(),
+                    vec!["project_id".into()],
+                    Utc::now().timestamp_millis(),
+                    target.snapshot()?.metadata().configuration().clone(),
+                )?
+                .with_table_id(target.snapshot()?.metadata().id().to_owned())?;
+                actions.push(deltalake::kernel::Action::Metadata(metadata));
+            }
+            let mut add = deltalake::kernel::Add {
+                path: "metadata-only.parquet".into(),
                 partition_values: HashMap::from([("project_id".into(), Some(removed_project.clone())), ("date".into(), Some(date))]),
                 size: 1,
                 data_change: false,
                 ..Default::default()
             };
+            if !valid_partition_metadata {
+                add.partition_values.remove("date");
+            }
+            actions.push(deltalake::kernel::Action::Add(add));
             let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
             let committed = deltalake::kernel::transaction::CommitBuilder::default()
-                .with_actions(vec![deltalake::kernel::Action::Add(add)])
+                .with_actions(actions)
                 .build(Some(target.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), target.log_store(), op)
                 .await?;
             target.state = Some(committed.snapshot());
             *target_ref.write().await = target;
         }
         store.delete(&object_store::path::Path::from(format!("_delta_log/{version:020}.json"))).await?;
-        assert!(db.reconcile_maintenance_task_cursors().await? > 0);
+        let queued = db.reconcile_maintenance_task_cursors().await?;
+        assert_eq!(db.journal().source_cursor(":otel_metrics"), Some(healthy_version));
+        if !valid_partition_metadata {
+            assert_eq!(queued, 0);
+            assert_eq!(db.journal().source_cursor(":otel_logs_and_spans"), Some(0), "an unknown partition must never be skipped past");
+            return Ok(());
+        }
+        assert!(queued > 0);
         let day_start = midnight_micros(chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive());
         {
             let journal = crate::maintenance_coordinator::TaskJournal::load(&db.config.core.timefusion_data_dir)?;
