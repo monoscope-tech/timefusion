@@ -863,6 +863,12 @@ pub struct Invalidation<'a> {
     pub end_micros: i64,
     pub observed_at_micros: i64,
     pub derived: bool,
+    /// False ONLY when every commit behind this invalidation is a self-authored
+    /// DV-dedup wave (tagged `DV_DEDUP_COMMIT_KEY`): such a commit adds no rows,
+    /// so re-minting Dedup from it would upsert already-Complete slices back to
+    /// Pending forever (the prod ~500 `pending_dedup` floor). Rollups always
+    /// mint. Every other caller passes true — fail toward minting.
+    pub mint_dedup: bool,
 }
 
 impl TaskJournal {
@@ -2393,7 +2399,7 @@ impl TaskJournal {
     /// invalidations are idempotent by `TaskKey`; an already-complete slice is
     /// made pending again and its quiet-period deadline moves forward.
     pub fn invalidate(&mut self, invalidation: Invalidation<'_>) -> anyhow::Result<()> {
-        let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived } = invalidation;
+        let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived, mint_dedup } = invalidation;
         // Round up, never down: a bucket can delay eligibility slightly but
         // can never publish before the full quiet period. High-rate ingest
         // then journals one deadline extension per bucket rather than one full
@@ -2435,6 +2441,12 @@ impl TaskJournal {
         for (operation, slices) in
             [(Operation::Dedup, normal_slices.as_slice()), (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices.as_slice())]
         {
+            // The skip fires HERE, per-operation, never per-commit upstream:
+            // a commit-level skip in reconcile would silently drop the rollup
+            // re-mint too (see `Invalidation::mint_dedup`).
+            if operation == Operation::Dedup && !mint_dedup {
+                continue;
+            }
             for &slice in slices {
                 let key = TaskKey {
                     physical_table: match operation {
@@ -5082,6 +5094,7 @@ mod tests {
                 end_micros: 2 * NORMAL_SLICE_MICROS,
                 observed_at_micros: 0,
                 derived: true,
+                mint_dedup: true,
             })
             .expect("invalidate");
         let derived = journal.tasks().find(|task| task.key.operation == Operation::DerivedRollup).expect("derived task");
@@ -5347,6 +5360,7 @@ mod tests {
                 end_micros: NORMAL_SLICE_MICROS,
                 observed_at_micros: 10,
                 derived: false,
+                mint_dedup: true,
             })
             .expect("invalidate");
         journal.checkpoint().expect("first invalidation checkpoint");
@@ -5361,6 +5375,7 @@ mod tests {
                 end_micros: NORMAL_SLICE_MICROS,
                 observed_at_micros: 20,
                 derived: false,
+                mint_dedup: true,
             })
             .expect("invalidate again");
         journal.checkpoint().expect("same-bucket checkpoint");
@@ -5375,6 +5390,7 @@ mod tests {
                 end_micros: NORMAL_SLICE_MICROS,
                 observed_at_micros: INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
                 derived: false,
+                mint_dedup: true,
             })
             .expect("invalidate in next bucket");
         // Two, not three: Dedup and the rollup. HotPacking is planned by DEBT
