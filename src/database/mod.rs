@@ -2258,8 +2258,8 @@ pub(crate) enum CommitProbe {
     Landed,
     /// Confirmed the commit did not land; the staged parquet is safe to delete.
     NotLanded,
-    /// Could not confirm (snapshot refresh / read failed) — leak the staged
-    /// parquet rather than risk deleting files a landed commit references.
+    /// Could not confirm: refresh failed, only some Adds landed, or an active
+    /// path has a different DV. Preserve staged parquet because it may be live.
     Inconclusive,
 }
 
@@ -7546,8 +7546,9 @@ pub(crate) struct StagedBin {
     project_id: String,
     /// Manifest key for this bin's staged files (see `record_staged_intent`).
     wave_id: String,
-    /// The files this bin replaces — re-verified live under the commit lock.
-    target_paths: Vec<String>,
+    /// All files read while staging, including DV dedup survivors that need no
+    /// Remove. Re-verify their exact logical identities under the commit lock.
+    targets: Vec<deltalake::kernel::Add>,
     removes: Vec<deltalake::kernel::Action>,
     adds: Vec<deltalake::kernel::Action>,
     /// Store the staged parquet was written to, for `cleanup_orphaned_parquet`.
@@ -7557,9 +7558,8 @@ pub(crate) struct StagedBin {
     /// (their new-file `adds` are cleaned by the live check in
     /// `discard_bin_parquet`). A DV-dedup bin's `adds` are SAME-PATH live files
     /// that must never be deleted; its discardable set is instead the fresh-UUID
-    /// `.bin` deletion-vector sidecars `write_deletion_vectors` wrote — always
-    /// safe to delete on discard because a discarded commit references none of
-    /// them.
+    /// `.bin` deletion-vector sidecars `write_deletion_vectors` wrote. Cleanup
+    /// preserves any sidecar already referenced by a landed part of the wave.
     discardable_paths: Vec<String>,
     /// Whether this bin's `adds` were written with a declared `sorting_columns`
     /// footer — see [`Database::mark_written_sorted`], which `commit_wave` calls
@@ -8797,27 +8797,53 @@ mod repair_batch_tests {
     }
 }
 
-/// Split staged bins into (committable, stale) against the live file set of the
-/// refreshed snapshot. One conflicting file used to fail one commit of one bin;
-/// with a batched wave commit, dropping only the stale bin's actions keeps the
-/// blast radius identical to the per-bin path (the dropped bin's files are just
-/// re-selected next tick). Pure + generic so the wave-assembly test needs no
-/// object store.
-fn split_live_bins<T>(bins: Vec<T>, targets: impl Fn(&T) -> &[String], live: &HashSet<String>) -> (Vec<T>, Vec<T>) {
-    bins.into_iter().partition(|bin| targets(bin).iter().all(|t| live.contains(t)))
+/// Logical file identities in a snapshot. A DV update preserves the parquet path;
+/// a path alone therefore proves neither target freshness nor commit landing.
+/// Keep all entries so an already-ambiguous path cannot authorize another rewrite.
+struct ActiveFiles(HashMap<String, Vec<Option<deltalake::kernel::DeletionVectorDescriptor>>>);
+
+impl ActiveFiles {
+    fn from_snapshot(snapshot: &deltalake::table::state::DeltaTableState) -> Self {
+        let mut files = HashMap::<_, Vec<_>>::new();
+        for file in snapshot.log_data().iter() {
+            files.entry(file.path().into_owned()).or_default().push(file.deletion_vector_descriptor());
+        }
+        Self(files)
+    }
+
+    fn matches(&self, path: &str, dv: &Option<deltalake::kernel::DeletionVectorDescriptor>) -> bool {
+        self.0.get(path).is_some_and(|entries| matches!(entries.as_slice(), [entry] if entry == dv))
+    }
+
+    fn adds_live(&self, actions: &[deltalake::kernel::Action]) -> bool {
+        let mut adds = actions.iter().filter_map(|action| match action {
+            deltalake::kernel::Action::Add(add) => Some(add),
+            _ => None,
+        });
+        adds.next().is_some_and(|first| self.matches(&first.path, &first.deletion_vector) && adds.all(|add| self.matches(&add.path, &add.deletion_vector)))
+    }
+
+    /// Physical objects referenced by any active entry, including every DV when
+    /// a damaged snapshot contains several logical entries for the same parquet.
+    fn referenced_paths(&self) -> HashSet<String> {
+        self.0
+            .keys()
+            .cloned()
+            .chain(self.0.values().flatten().filter_map(|dv| dv.as_ref().and_then(deltalake::operations::deletion_vectors::dv_object_store_relative_path)))
+            .collect()
+    }
 }
 
-/// Whether a bin's OWN staged Adds are active in the snapshot — i.e. its commit
-/// landed. Distinguishes "another writer rewrote my targets" (staged parquet is
-/// garbage) from "my own earlier attempt landed and then errored" (staged
-/// parquet is LIVE DATA). See the self-landed split in `commit_wave`.
-/// A bin with no Adds can't have landed anything.
-fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
-    let mut adds = bin.adds.iter().filter_map(|a| match a {
-        deltalake::kernel::Action::Add(add) => Some(add.path.as_str()),
-        _ => None,
-    });
-    adds.next().is_some_and(|first| live.contains(first) && adds.all(|p| live.contains(p)))
+/// Reject only the bin whose planned input has changed. DV dedup can read a
+/// survivor without removing its file, so verify every input, not only Removes.
+fn split_live_bins(bins: Vec<StagedBin>, live: &ActiveFiles) -> (Vec<StagedBin>, Vec<StagedBin>) {
+    bins.into_iter().partition(|bin| bin.targets.iter().all(|add| live.matches(&add.path, &add.deletion_vector)))
+}
+
+/// Exact staged Adds distinguish a prior successful commit from another writer
+/// changing our targets. An empty set cannot prove that a commit landed.
+fn bin_adds_live(bin: &StagedBin, live: &ActiveFiles) -> bool {
+    live.adds_live(&bin.adds)
 }
 
 /// Delete the staged parquet of bins leaving a wave uncommitted — MINUS anything
@@ -8827,10 +8853,8 @@ fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
 /// this filters per ADD because the cost is asymmetric. Deleting a live object is
 /// data loss; leaking a dead one costs pennies until VACUUM/boot reconcile. The
 /// difference matters because a resuming instance commits our staging BIN BY BIN,
-/// so a wave can be part-live, and `probe_commit_landed` is all-or-nothing over
-/// the whole wave's Adds — one resumed bin makes it report `NotLanded` for all of
-/// them (49bf7f9 replaced the resume age gate with an ownership gate, which is
-/// what made another instance's commit reachable at any moment).
+/// so a wave can be part-live. The landing probe cannot credit that whole wave;
+/// cleanup must still spare the objects belonging to its landed bins.
 ///
 /// Not a lock: the other instance can still commit between the caller's snapshot
 /// read and these deletes. Closing that needs cross-instance coordination; the
@@ -8842,9 +8866,9 @@ async fn discard_bin_parquet(bins: &[StagedBin], live: &HashSet<String>) {
         let orphans: Vec<deltalake::kernel::Action> =
             bin.adds.iter().filter(|a| !matches!(a, deltalake::kernel::Action::Add(add) if live.contains(add.path.as_str()))).cloned().collect();
         Database::cleanup_orphaned_parquet(&bin.stage_store, &orphans).await;
-        // DV-dedup sidecars: fresh-UUID `.bin` files a discarded commit never
-        // references, so unconditional delete is safe (never a live data file).
-        for rel in &bin.discardable_paths {
+        // A partial wave can contain an already-committed DV. Preserve its
+        // sidecar just as we preserve referenced parquet.
+        for rel in bin.discardable_paths.iter().filter(|path| !live.contains(*path)) {
             if let Err(e) = bin.stage_store.delete(&object_store::path::Path::from(rel.as_str())).await {
                 warn!("orphaned DV sidecar (manual cleanup needed): {rel} — delete failed: {e}");
             }
@@ -17413,18 +17437,18 @@ mod tests {
     #[test]
     fn wave_drops_only_the_stale_bin() {
         let live: HashSet<String> = ["f1", "f2", "f4"].iter().map(|s| s.to_string()).collect();
-        let bins = vec![
-            ("alpha", vec!["f1".to_string()]),
-            ("beta", vec!["f3".to_string()]), // f3 rewritten concurrently
-            ("gamma", vec!["f2".to_string(), "f4".to_string()]),
-        ];
-        let (fresh, stale) = super::split_live_bins(bins, |(_, t)| t.as_slice(), &live);
-        assert_eq!(fresh.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec!["alpha", "gamma"], "surviving bins still commit together");
-        assert_eq!(stale.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec!["beta"]);
+        let bins = vec![staged_unit("alpha", &["f1"], None), staged_unit("beta", &["f3"], None), staged_unit("gamma", &["f2", "f4"], None)];
+        let (fresh, stale) = super::split_live_bins(bins, &active_without_dvs(live));
+        assert_eq!(fresh.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["alpha", "gamma"], "surviving bins still commit together");
+        assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
         // And the surviving bins' actions concatenate in removes-then-adds order
         // per bin, which is what the single CommitBuilder receives.
-        let actions: Vec<&str> = fresh.iter().flat_map(|(n, _)| [*n, *n]).collect();
-        assert_eq!(actions.len(), 4);
+        let actions: Vec<_> = fresh.iter().flat_map(|b| b.removes.iter().chain(&b.adds)).collect();
+        assert_eq!(actions.len(), 5);
+    }
+
+    fn active_without_dvs(paths: HashSet<String>) -> super::ActiveFiles {
+        super::ActiveFiles(paths.into_iter().map(|path| (path, vec![None])).collect())
     }
 
     fn test_add(path: &str) -> deltalake::kernel::Add {
@@ -17458,7 +17482,7 @@ mod tests {
             discardable_paths: Vec::new(),
             project_id: project.to_string(),
             wave_id: format!("wave-{project}"),
-            target_paths: paths.iter().map(|p| p.to_string()).collect(),
+            targets,
             removes,
             adds,
             stage_store: Arc::new(object_store::memory::InMemory::new()),
@@ -17555,7 +17579,7 @@ mod tests {
             staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 5, 4))), // f2 gone
             staged_unit("gamma", &["f4"], Some(dedup_unit("2026-07-27", 8, 8))),
         ];
-        let (fresh, stale) = super::split_live_bins(units, |b| &b.target_paths, &live);
+        let (fresh, stale) = super::split_live_bins(units, &active_without_dvs(live));
         assert_eq!(fresh.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["alpha", "gamma"]);
         assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
     }
@@ -17572,16 +17596,16 @@ mod tests {
         // alpha's commit LANDED: its target is gone AND its staged file is now
         // active. beta's target was rewritten by someone else.
         let live: HashSet<String> = ["alpha-new.parquet"].iter().map(|s| s.to_string()).collect();
-        let (fresh, stale) = super::split_live_bins(vec![alpha, beta], |b| &b.target_paths, &live);
+        let (fresh, stale) = super::split_live_bins(vec![alpha, beta], &active_without_dvs(live.clone()));
         assert!(fresh.is_empty(), "neither bin's targets survive");
-        let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| super::bin_adds_live(b, &live));
+        let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| super::bin_adds_live(b, &active_without_dvs(live.clone())));
         assert_eq!(self_landed.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["alpha"], "a landed bin must never be discarded");
         assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
         // Its rows really were dropped from the table, so they count.
         assert_eq!(super::wave_dropped_rows(&self_landed), 4);
         // And a bin whose targets ARE live is never mistaken for self-landed.
         let live_targets: HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
-        assert!(!super::bin_adds_live(&staged_unit("alpha", &["f1"], None), &live_targets));
+        assert!(!super::bin_adds_live(&staged_unit("alpha", &["f1"], None), &active_without_dvs(live_targets)));
     }
 
     /// A commit-lock holder must free the lock on a bounded schedule even when
@@ -17644,7 +17668,7 @@ mod tests {
             staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6))), // drops 4
             staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 100, 1))), // never lands
         ];
-        let (fresh, stale) = super::split_live_bins(units, |b| &b.target_paths, &live);
+        let (fresh, stale) = super::split_live_bins(units, &active_without_dvs(live));
         assert_eq!(super::wave_dropped_rows(&fresh), 4);
         assert_eq!(super::wave_dropped_rows(&stale), 99, "the stale unit's rewrite is real but uncommitted — never added to the metric");
         // Hot bins carry no dedup accounting at all.
@@ -19165,6 +19189,100 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b), "default projects on a unified table must share one commit lock");
         assert!(!Arc::ptr_eq(&a, &c), "different tables must get independent commit locks");
         assert!(!Arc::ptr_eq(&a, &db.dml_lock("proj_a", "otel_logs_and_spans").await), "commit and DML locks must be distinct");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wave_rejects_a_superseded_deletion_vector() -> Result<()> {
+        use datafusion::arrow::{
+            array::Int32Array,
+            datatypes::{DataType as ArrowType, Field, Schema},
+        };
+        use deltalake::kernel::{Action, DataType, PrimitiveType, StructField, transaction::CommitBuilder};
+        use deltalake::operations::deletion_vectors::{FileDeletion, dv_object_store_relative_path, write_deletion_vectors};
+        use object_store::ObjectStoreExt;
+
+        let db = Database::with_config(create_test_config("wave-dv-liveness")).await?;
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///wave_dv_liveness")?;
+        let mut table = DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_backend(store.clone(), url)
+            .build()?
+            .create()
+            .with_columns(vec![StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true)])
+            .with_configuration(HashMap::from([("delta.enableDeletionVectors".to_string(), Some("true".to_string()))]))
+            .await?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", ArrowType::Int32, true)]));
+        table = table.write(vec![RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as _])?]).await?;
+        let table_ref = Arc::new(RwLock::new(table));
+        let target = live_adds(&table_ref).await.into_iter().next().expect("one written file");
+        let mut table = table_ref.read().await.clone();
+        let log_store = table.log_store();
+        let stage_store = log_store.object_store(None);
+        let stale_actions =
+            write_deletion_vectors(log_store.as_ref(), log_store.root_url(), vec![FileDeletion { add: target.clone(), deleted_indexes: vec![0] }]).await?;
+        let committed_actions =
+            write_deletion_vectors(log_store.as_ref(), log_store.root_url(), vec![FileDeletion { add: target.clone(), deleted_indexes: vec![1] }]).await?;
+        let committed = CommitBuilder::default()
+            .with_actions(committed_actions.clone())
+            .build(Some(table.snapshot()?), log_store.clone(), super::wave_operation(true, 256, None))
+            .await?;
+        table.state = Some(committed.snapshot().clone());
+        let version = table.version();
+        let table_ref = Arc::new(RwLock::new(table));
+        let bin = |actions: Vec<Action>| {
+            let discardable_paths = actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Add(add) => add.deletion_vector.as_ref().and_then(dv_object_store_relative_path),
+                    _ => None,
+                })
+                .collect();
+            let (removes, adds) = actions.into_iter().partition(|a| matches!(a, Action::Remove(_)));
+            super::StagedBin {
+                project_id: "alpha".into(),
+                wave_id: "dv-liveness".into(),
+                targets: vec![target.clone()],
+                removes,
+                adds,
+                stage_store: stage_store.clone(),
+                discardable_paths,
+                sorted: false,
+                dedup: Some(dedup_unit("2026-09-07", 4, 3)),
+            }
+        };
+        // A survivor read can change without appearing in our Remove actions.
+        let mut read_only = bin(stale_actions.clone());
+        read_only.removes.clear();
+        let active = super::ActiveFiles::from_snapshot(table_ref.read().await.snapshot()?);
+        assert!(super::split_live_bins(vec![read_only], &active).0.is_empty(), "changed read-only inputs also invalidate staging");
+        let stale = bin(stale_actions);
+        let stale_sidecar = object_store::path::Path::from(stale.discardable_paths[0].as_str());
+        assert!(stage_store.head(&stale_sidecar).await.is_ok(), "staging wrote the orphan candidate");
+        let probe = db.probe_commit_landed(&table_ref, &stale.adds).await;
+        assert!(matches!(probe, super::CommitProbe::Inconclusive), "a changed DV cannot authorize deleting live parquet");
+        let reported_landed = matches!(probe, super::CommitProbe::Landed);
+        let result = db.commit_wave(&table_ref, "otel_logs_and_spans", &[], true, vec![stale], 0).await;
+        assert_eq!(
+            (reported_landed, result.landed.len(), result.failed.len(), table_ref.read().await.version()),
+            (false, 0, 1, version),
+            "same path with a different DV is a stale target, not a landed commit"
+        );
+        assert!(stage_store.head(&stale_sidecar).await.is_err(), "uncommitted sidecar is reclaimed");
+        let committed_bin = bin(committed_actions);
+        let committed_sidecar = object_store::path::Path::from(committed_bin.discardable_paths[0].as_str());
+        assert!(matches!(db.probe_commit_landed(&table_ref, &committed_bin.adds).await, super::CommitProbe::Landed));
+        assert!(stage_store.head(&committed_sidecar).await.is_ok(), "committed sidecar exists before cleanup");
+        // Cleanup can see a partially landed wave: preserve the exact live DV.
+        db.discard_bins(&table_ref, std::slice::from_ref(&committed_bin), None).await;
+        assert!(stage_store.head(&committed_sidecar).await.is_ok(), "committed DV must survive cleanup");
+        assert!(stage_store.head(&object_store::path::Path::from(target.path.as_str())).await.is_ok(), "same-path parquet remains live");
+        let landed = db.commit_wave(&table_ref, "otel_logs_and_spans", &[], true, vec![committed_bin], 0).await;
+        assert_eq!(
+            (landed.landed.len(), landed.failed.len(), table_ref.read().await.version()),
+            (1, 0, version),
+            "an exact DV match recognizes our prior commit without repeating it"
+        );
         Ok(())
     }
 

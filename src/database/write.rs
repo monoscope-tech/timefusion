@@ -1186,9 +1186,9 @@ impl Database {
     ///
     /// Refresh the snapshot and check that every Add we tried to commit is now active. `Landed`
     /// means treat as success; `NotLanded` means it is safe to delete staged parquet; `Inconclusive`
-    /// means the refresh itself failed, so leak the parquet rather than risk deleting files a
-    /// landed commit references. Bounded by the same last-resort timeout; a probe that times out
-    /// is `Inconclusive` by construction, never `NotLanded`.
+    /// means refresh failed or only part of the expected state is visible. Preserve parquet
+    /// in either case: a matching path with a different DV is still a live physical object.
+    /// A probe that exceeds the last-resort timeout is also `Inconclusive`.
     pub(crate) async fn probe_commit_landed_bounded(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
         match tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, self.probe_commit_landed(table_ref, adds)).await {
             Ok(probe) => probe,
@@ -1200,26 +1200,23 @@ impl Database {
     }
 
     pub(crate) async fn probe_commit_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
-        use deltalake::kernel::Action;
         if refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await.is_err() {
             return CommitProbe::Inconclusive;
-        }
-        let our_paths: Vec<&str> = adds
-            .iter()
-            .filter_map(|a| match a {
-                Action::Add(add) => Some(add.path.as_str()),
-                _ => None,
-            })
-            .collect();
-        if our_paths.is_empty() {
-            return CommitProbe::NotLanded;
         }
         let guard = table_ref.read().await;
         let Ok(snap) = guard.snapshot() else {
             return CommitProbe::Inconclusive;
         };
-        let active: HashSet<String> = snap.log_data().iter().map(|f| f.path().into_owned()).collect();
-        if our_paths.iter().all(|p| active.contains(*p)) { CommitProbe::Landed } else { CommitProbe::NotLanded }
+        let active = ActiveFiles::from_snapshot(snap);
+        if active.adds_live(adds) {
+            CommitProbe::Landed
+        } else if adds.iter().any(|action| matches!(action, deltalake::kernel::Action::Add(add) if active.0.contains_key(&add.path))) {
+            // A partial landing or a later DV update cannot authorize deleting
+            // the still-referenced parquet, even though the exact Adds differ.
+            CommitProbe::Inconclusive
+        } else {
+            CommitProbe::NotLanded
+        }
     }
 
     /// Best-effort delete of staged-but-uncommitted parquet after a terminal
