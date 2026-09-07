@@ -13614,7 +13614,7 @@ mod tests {
                 "fixture must persist an obsolete generation"
             );
             publication.generation = coverage.generation.clone();
-            assert!(db.journal().publish(&key, publication));
+            assert!(db.journal().publish(&key, publication.clone()));
             let mut actions = Vec::new();
             for mut add in adds {
                 actions.push(Action::Remove(remove_for_add(&add, false)));
@@ -13654,6 +13654,49 @@ mod tests {
             4,
             "rebuilt rollup agrees with the four source rows"
         );
+
+        // A rewrite that loses all tags cannot turn a nonempty base into a
+        // trusted empty derived publication. It must request a base rebuild.
+        {
+            let mut table = tier.read().await.clone();
+            let store = table.log_store().object_store(None);
+            #[allow(deprecated)]
+            let adds: Vec<_> = table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect();
+            let file_count = adds.len();
+            assert!(file_count > 0);
+            let mut actions = Vec::new();
+            for mut add in adds {
+                actions.push(Action::Remove(remove_for_add(&add, false)));
+                let path = format!("{}-untagged.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                add.path = path;
+                add.tags = None;
+                add.data_change = false;
+                actions.push(Action::Add(add));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            assert_eq!(table.snapshot()?.log_data().iter().count(), file_count);
+            *tier.write().await = table;
+        }
+        let missing_tags = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+        assert_eq!(missing_tags.state, Some(TaskState::Retry), "missing generation evidence must not silently drop base rows");
+        assert_eq!(db.journal().tasks().find(|task| task.key == key).unwrap().state, TaskState::Pending, "the refused input must trigger base rebuilding");
+        assert!(db.journal().publish(&key, publication));
+        assert_eq!(db.journal().tasks().find(|task| task.key == key).unwrap().state, TaskState::Complete);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert_eq!(
+            db.journal().tasks().find(|task| task.key == key).unwrap().state,
+            TaskState::Pending,
+            "an obsolete journal-only publication must also be requeued"
+        );
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+        let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+        assert_eq!(repaired.state, Some(TaskState::Complete), "base rebuilding must unblock the derived tier");
+        let derived_table = schema.rollups.iter().find(|spec| spec.derive_from.is_some()).unwrap().table_name("otel_logs_and_spans");
+        let batches = ctx.sql(&format!("SELECT SUM(request_count) FROM {derived_table} WHERE project_id='{project}'")).await?.collect().await?;
+        assert_eq!(batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 4);
 
         Ok(())
     }
