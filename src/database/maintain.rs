@@ -897,6 +897,18 @@ impl Database {
                 let dv_dedup_commit = actions.iter().any(
                     |action| matches!(action, deltalake::kernel::Action::CommitInfo(ci) if ci.info.get(DV_DEDUP_COMMIT_KEY).and_then(serde_json::Value::as_bool) == Some(true)),
                 );
+                eprintln!(
+                    "RECONCILE-DBG {cursor_key} v{commit_version} tagged={dv_dedup_commit} actions={:?}",
+                    actions
+                        .iter()
+                        .map(|a| match a {
+                            deltalake::kernel::Action::Add(x) => format!("Add({},dc={})", x.path, x.data_change),
+                            deltalake::kernel::Action::Remove(x) => format!("Rm({},dc={})", x.path, x.data_change),
+                            deltalake::kernel::Action::CommitInfo(ci) => format!("CI({:?})", ci.info.keys().collect::<Vec<_>>()),
+                            other => format!("{other:?}").chars().take(30).collect(),
+                        })
+                        .collect::<Vec<_>>()
+                );
                 let mut partitions_with_adds = HashSet::new();
                 let mut remove_only: HashSet<(String, String)> = HashSet::new();
                 for action in actions {
