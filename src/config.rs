@@ -1656,6 +1656,7 @@ impl BufferConfig {
     pub fn landed_skip_enabled(&self) -> bool {
         self.timefusion_landed_skip_enabled
     }
+
     pub fn delta_scan_depth(&self) -> usize {
         self.timefusion_delta_scan_depth.max(1)
     }

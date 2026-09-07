@@ -752,18 +752,10 @@ pub async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64
 /// `version_append`: under merge-on-read an UPDATE appends a row version rather
 /// than masking-and-rewriting, so DV behaviour needs a non-versioned subject.
 pub async fn insert_dormant_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> Result<()> {
-    insert_dormant_named(client, id, ts_micros, "span").await
-}
-
-/// Like [`insert_dormant_at`] but with an explicit `name`: a row that shares a
-/// dedup KEY with an earlier one but differs in content passes the always-on
-/// ingest-time content-identity filter (an exact re-send would be dropped
-/// there and never become a physical duplicate for maintenance dedup to find).
-pub async fn insert_dormant_named(client: &tokio_postgres::Client, id: &str, ts_micros: i64, name: &str) -> Result<()> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
     let sql = format!(
         "INSERT INTO mor_dormant (project_id, date, timestamp, id, name, status_code, level) \
-         VALUES ($1, '{}', '{}', $2, '{name}', 'OK', 'INFO')",
+         VALUES ($1, '{}', '{}', $2, 'span', 'OK', 'INFO')",
         dt.date_naive(),
         dt.format("%Y-%m-%d %H:%M:%S%.f"),
     );

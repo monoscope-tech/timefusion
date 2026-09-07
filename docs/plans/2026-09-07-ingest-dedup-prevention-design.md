@@ -97,3 +97,15 @@ construction throughout, DV-dedup backstop, and the post-deploy health read on
 ## OLD STATUS (2026-09-07): DESIGNED + CORE BUILT. Committed on branch ingest-dedup: per_row_identities hashing (928647f5) + IngestDedupIndex epoch-rotation struct (6f9b2797), both tested. REMAINING (careful hot-path pass, benchmark first): config (off/shadow/enforce + max_mb + window), pre-WAL probe in insert_bounded gated bound==true, flush-time populate post-commit, ingest_dedup.* metrics, membuffer_concurrency_bench p99 arm. Then SHADOW-mode first (safe, off by default),
 deploy AFTER DV-dedup validates + the observability batch, validate shadow rate >=24h,
 then enforce.
+
+## OUTCOME (2026-09-07, reverted): SHIPPED ENFORCE-DIRECT, MEASURED INERT, REVERTED
+Deployed flag-free (no shadow phase, per no-knobs directive). Prod @48min mature:
+ingest_dedup_index_entries=2,240,468 (fully populated) but key_hits_total=0 across 3M
+rows → probe-time key-hash NEVER matches populate-time key-hash (risk #3, "silent
+inertness = likeliest failure", realized exactly as predicted — and the shadow-rate
+band check this design mandated was the detector we skipped). Safe (0 drops = no loss)
+but zero value at real hot-path + ~2.2M-entry index cost → REVERTED. Branch
+ingest-noflag retains the implementation. If revived: diagnose the hash-point mismatch
+(probe hashes the pre-WAL batch, populate hashes post-flush batches — suspect physical
+encoding/schema-order divergence between the two sites feeding RowConverter), and ship
+SHADOW-FIRST as this design originally required.
