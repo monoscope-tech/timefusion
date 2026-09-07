@@ -7611,7 +7611,7 @@ impl Database {
         Ok(BinOutcome::Staged(StagedBin {
             project_id: project_id.to_string(),
             wave_id,
-            target_paths: files,
+            targets,
             removes,
             adds,
             stage_store,
@@ -7717,8 +7717,8 @@ impl Database {
                 debug!("{engine} wave pre-commit refresh failed (attempt {}): {}", attempt + 1, e.message);
             }
             let mut new_table = { table_ref.read().await.clone() };
-            let live: HashSet<String> = match new_table.snapshot() {
-                Ok(s) => s.log_data().iter().map(|f| f.path().into_owned()).collect(),
+            let active = match new_table.snapshot() {
+                Ok(s) => ActiveFiles::from_snapshot(s),
                 Err(e) => {
                     drop(commit_guard);
                     error!("{engine} wave: no snapshot for {table_name}: {e}");
@@ -7727,7 +7727,8 @@ impl Database {
                     return WaveResult { landed: carried, failed };
                 }
             };
-            let (fresh, stale) = split_live_bins(bins, |b| &b.target_paths, &live);
+            let live = active.referenced_paths();
+            let (fresh, stale) = split_live_bins(bins, &active);
             // SELF-LANDED SPLIT — do not remove. A bin is "stale" because its
             // target files left the snapshot, and the normal cause is a
             // concurrent rewrite, whose staged parquet nothing references (safe
@@ -7738,10 +7739,9 @@ impl Database {
             // the very files the landed commit now references (dangling Adds,
             // the 2026-07-09 incident shape).
             //
-            // The Adds settle it: staged parquet is uuid-named by the writer, so
-            // nobody else can produce those paths. Present in the snapshot ⇒ our
-            // commit landed.
-            let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| bin_adds_live(b, &live));
+            // The exact Adds settle it: a DV update reuses its parquet path,
+            // so its deletion vector must also match before crediting a commit.
+            let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| bin_adds_live(b, &active));
             for bin in &stale {
                 debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit");
             }
@@ -7768,10 +7768,10 @@ impl Database {
             // the next tick. This is also required for Delta action validity.
             let mut claimed_targets = HashSet::new();
             let (fresh, overlapping): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|bin| {
-                if bin.target_paths.iter().any(|path| claimed_targets.contains(path)) {
+                if bin.targets.iter().any(|add| claimed_targets.contains(&add.path)) {
                     false
                 } else {
-                    claimed_targets.extend(bin.target_paths.iter().cloned());
+                    claimed_targets.extend(bin.targets.iter().map(|add| add.path.clone()));
                     true
                 }
             });
@@ -7922,7 +7922,8 @@ impl Database {
             if for_bin.is_empty() {
                 continue;
             }
-            match svc.carry_forward_after_compaction(table_name, &bin.project_id, &bin.target_paths, &for_bin).await {
+            let target_paths: Vec<_> = bin.targets.iter().map(|add| add.path.clone()).collect();
+            match svc.carry_forward_after_compaction(table_name, &bin.project_id, &target_paths, &for_bin).await {
                 Ok(true) => carried.extend(for_bin),
                 Ok(false) => {}
                 Err(error) => warn!(table_name, %error, event = "tantivy_wave_carry_forward_failed"),
@@ -8006,11 +8007,7 @@ impl Database {
                     tokio::time::timeout(COMMIT_LOCK_OP_TIMEOUT, refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot))
                         .await
                         .is_ok_and(|r| r.is_ok());
-                let fresh = if ok {
-                    table_ref.read().await.snapshot().ok().map(|s| s.log_data().iter().map(|f| f.path().into_owned()).collect::<HashSet<_>>())
-                } else {
-                    None
-                };
+                let fresh = if ok { table_ref.read().await.snapshot().ok().map(|s| ActiveFiles::from_snapshot(s).referenced_paths()) } else { None };
                 let Some(fresh) = fresh else {
                     warn!("wave discard: no fresh snapshot — leaving {} bins' staged parquet AND intents for boot reconcile", bins.len());
                     return;
@@ -8466,7 +8463,7 @@ impl Database {
                     return Some(StagedBin {
                         project_id: project_id.to_string(),
                         wave_id: entry.wave_id.clone(),
-                        target_paths: entry.target_paths.clone(),
+                        targets,
                         removes,
                         adds,
                         stage_store: Arc::clone(&store),

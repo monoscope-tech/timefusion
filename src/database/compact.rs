@@ -1990,7 +1990,7 @@ impl Database {
             return Ok(BinOutcome::Staged(StagedBin {
                 project_id: project_id.to_string(),
                 wave_id,
-                target_paths: targets.iter().map(|t| t.path.clone()).collect(),
+                targets,
                 removes,
                 adds,
                 stage_store,
@@ -2234,7 +2234,7 @@ impl Database {
             return Ok(BinOutcome::Staged(StagedBin {
                 project_id: project_id.to_string(),
                 wave_id,
-                target_paths: targets.iter().map(|t| t.path.clone()).collect(),
+                targets,
                 removes,
                 adds,
                 stage_store,
