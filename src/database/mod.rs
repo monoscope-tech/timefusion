@@ -19482,26 +19482,34 @@ mod tests {
         config.options_mut().optimizer.repartition_file_min_size = 0;
         let ctx = datafusion::prelude::SessionContext::new_with_config(config);
         ctx.register_table("dv", Arc::new(provider))?;
-        let plan = ctx.sql("SELECT id, row_ordinal FROM dv").await?.create_physical_plan().await?;
-        let mut pending = vec![Arc::clone(&plan)];
-        let mut files = 0;
-        while let Some(node) = pending.pop() {
-            if let Some(source) = node.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
-                && let Some(scan) = source.data_source().downcast_ref::<datafusion_datasource::file_scan_config::FileScanConfig>()
-            {
-                for file in scan.file_groups.iter().flat_map(|group| group.iter()) {
-                    assert!(file.range.is_none(), "deletion masks and physical ordinals require whole-file scans");
-                    files += 1;
+        for (query, expected) in [
+            ("SELECT id FROM dv", "+----+\n| id |\n+----+\n| 1  |\n| 3  |\n| 4  |\n+----+"),
+            (
+                "SELECT id, row_ordinal FROM dv",
+                "+----+-------------+\n| id | row_ordinal |\n+----+-------------+\n| 1  | 1           |\n| 3  | 3           |\n| 4  | 4           |\n+----+-------------+",
+            ),
+        ] {
+            let plan = ctx.sql(query).await?.create_physical_plan().await?;
+            let mut pending = vec![Arc::clone(&plan)];
+            let mut files = 0;
+            while let Some(node) = pending.pop() {
+                if let Some(source) = node.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
+                    && let Some(scan) = source.data_source().downcast_ref::<datafusion_datasource::file_scan_config::FileScanConfig>()
+                {
+                    for file in scan.file_groups.iter().flat_map(|group| group.iter()) {
+                        assert!(file.range.is_none(), "deletion masks and physical ordinals require whole-file scans");
+                        files += 1;
+                    }
                 }
+                pending.extend(node.children().into_iter().cloned());
             }
-            pending.extend(node.children().into_iter().cloned());
+            assert!(files > 0, "must inspect the actual Parquet scan");
+            let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+            assert_eq!(datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(), expected);
         }
-        assert!(files > 0, "must inspect the actual Parquet scan");
-        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
-        assert_eq!(
-            datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
-            "+----+-------------+\n| id | row_ordinal |\n+----+-------------+\n| 1  | 1           |\n| 3  | 3           |\n| 4  | 4           |\n+----+-------------+"
-        );
+        let count = ctx.sql("SELECT COUNT(*) FROM dv WHERE id >= 2").await?.collect().await?;
+        let count = count[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().expect("count is int64");
+        assert_eq!(count.value(0), 2, "filtered count must exclude the deleted row");
         Ok(())
     }
 
