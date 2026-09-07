@@ -5012,7 +5012,7 @@ impl Database {
     /// final time — so the rule cannot drift from the sweep/backfill paths.
     async fn record_clean_slice(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
-        (slice, dropped, masked): (crate::maintenance_coordinator::TimeSlice, u64, Option<(&HashSet<DvEntry>, &[DvEntry])>), pre: &[String],
+        (slice, dropped, masked): (crate::maintenance_coordinator::TimeSlice, u64, Option<MaskedPass<'_>>), pre: &[String],
     ) -> Result<Option<u64>> {
         let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
         let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
@@ -9354,6 +9354,10 @@ impl Database {
         Ok(())
     }
 }
+
+/// A masked pass's evidence for the DV-visibility guard: the pre-pass live
+/// `(path, dv_id)` set and the pass's own committed DV attachments.
+type MaskedPass<'a> = (&'a HashSet<DvEntry>, &'a [DvEntry]);
 
 /// Dirty verdict for one completed dedup pass folding into clean-slice coverage.
 ///
