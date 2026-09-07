@@ -219,6 +219,24 @@ mod liveness_clock_tests {
         assert_eq!(progress.load(Relaxed), 5_000, "the task-local reached the counter the clock reads");
     }
 
+    /// Completing many plans faster than the sampling tick is still progress.
+    #[tokio::test(start_paused = true)]
+    async fn short_queries_keep_the_unit_alive_between_watcher_ticks() -> anyhow::Result<()> {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let progress = Arc::new(AtomicU64::new(0));
+        let work = async {
+            for _ in 0..40 {
+                let batches = super::collect_watched(&ctx, "SELECT 1").await?;
+                assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Ok::<_, anyhow::Error>("committed")
+        };
+        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, work).await??;
+        assert_eq!(result, "committed", "completed short queries must prevent a false idle timeout");
+        Ok(())
+    }
+
     #[test]
     fn note_unit_progress_outside_a_unit_is_a_no_op() {
         super::note_unit_progress(1);
@@ -236,10 +254,13 @@ mod liveness_clock_tests {
             .scope(Arc::clone(&progress), async {
                 let ctx = SessionContext::new();
                 let plan = ctx.sql("SELECT 1 AS a UNION ALL SELECT 2 ORDER BY a").await.expect("plan").create_physical_plan().await.expect("physical");
-                let _watch = super::PlanProgress::watch(Arc::clone(&plan));
+                let watch = super::PlanProgress::watch(Arc::clone(&plan));
                 datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("collect");
                 // One tick past the watcher's interval.
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                let sampled = progress.load(Relaxed);
+                drop(watch);
+                assert_eq!(progress.load(Relaxed), sampled, "the final sample must not count previously sampled rows twice");
             })
             .await;
         assert!(progress.load(Relaxed) > 0, "the plan's own row counters must reach the clock the unit is judged by");
@@ -539,35 +560,50 @@ pub(crate) fn note_unit_progress(rows: usize) {
 /// DRIVEN. That holds end-to-end because the caller polls the output stream
 /// immediately and polling a blocking operator is what drives its children — but
 /// a watcher held over a plan nobody polls reports nothing, correctly.
-pub(crate) struct PlanProgress(Option<tokio::task::JoinHandle<()>>);
+pub(crate) struct PlanProgress(Option<(tokio::task::JoinHandle<()>, Arc<PlanProgressState>)>);
+
+struct PlanProgressState {
+    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    progress: Arc<std::sync::atomic::AtomicU64>,
+    last_rows: std::sync::atomic::AtomicU64,
+}
+
+impl PlanProgressState {
+    fn sample(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let rows = plan_output_rows(self.plan.as_ref());
+        // The periodic sample and final sample may race. Each observed row
+        // contributes once even if the background task is still unwinding.
+        let previous = self.last_rows.fetch_max(rows, Relaxed);
+        self.progress.fetch_add(rows.saturating_sub(previous), Relaxed);
+    }
+}
 
 impl PlanProgress {
     pub(crate) fn watch(plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Self {
-        /// Long enough to cost nothing against an hour-scale window, short
-        /// enough that a stalled plan is still detected inside it.
         const TICK: std::time::Duration = std::time::Duration::from_secs(15);
         let Ok(progress) = UNIT_PROGRESS.try_with(Arc::clone) else {
-            // Not inside a unit (cron paths, tests): nothing to keep alive.
             return Self(None);
         };
-        Self(Some(tokio::spawn(async move {
-            let mut last = 0u64;
+        let state = Arc::new(PlanProgressState { plan, progress, last_rows: std::sync::atomic::AtomicU64::new(0) });
+        let periodic = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TICK).await;
-                let rows = plan_output_rows(plan.as_ref());
-                // The counter is monotonic and read as "has it moved", so feed
-                // it the DELTA rather than the total.
-                progress.fetch_add(rows.saturating_sub(last), std::sync::atomic::Ordering::Relaxed);
-                last = rows;
+                periodic.sample();
             }
-        })))
+        });
+        Self(Some((handle, state)))
     }
 }
 
 impl Drop for PlanProgress {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
+        if let Some((handle, state)) = self.0.take() {
             handle.abort();
+            // A sequence of queries shorter than TICK must still keep its unit
+            // alive. The old guard discarded all their completed work.
+            state.sample();
         }
     }
 }
@@ -834,6 +870,28 @@ impl Database {
         journal.checkpoint().map_err(std::io::Error::other)
     }
 
+    fn enqueue_maintenance_partition(&self, project_id: &str, source: &str, date: &str) -> Result<()> {
+        let Some(schema) = get_schema(source) else { return Ok(()) };
+        let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
+        let start = day.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid maintenance date"))?.and_utc().timestamp_micros();
+        let observed_at_micros = crate::support::now_micros();
+        let mut journal = self.journal();
+        for spec in &schema.rollups {
+            journal.invalidate_coarse(crate::maintenance_coordinator::Invalidation {
+                source_table: source,
+                rollup_table: &spec.table_name(source),
+                source,
+                project_id,
+                start_micros: start,
+                end_micros: start.saturating_add(DAY_MICROS),
+                observed_at_micros,
+                derived: spec.derive_from.is_some(),
+                mint_dedup: true,
+            })?;
+        }
+        journal.checkpoint()
+    }
+
     /// Reconcile the durable task cursor with each live Delta snapshot. This is
     /// intentionally metadata-only and conservative: commits after the cursor
     /// contribute only the partitions named by data-changing Add/Remove actions.
@@ -845,8 +903,9 @@ impl Database {
         // foreground reader and ingest writer behind a multi-minute Delta-log
         // replay while Docker health checks remained green.
         let mut queued = 0usize;
-        for (storage_project, source, table_ref) in self.all_tables().await {
-            let Some(schema) = get_schema(&source).filter(|schema| !schema.rollups.is_empty()) else { continue };
+        let tables = self.all_tables().await;
+        'sources: for (storage_project, source, table_ref) in &tables {
+            let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { continue };
             let (version, log_store) = {
                 let table = table_ref.read().await;
                 (table.version().unwrap_or_default(), table.log_store())
@@ -879,6 +938,7 @@ impl Database {
             // +5,876 pending base rollups in one hour from ONE restart — the
             // queue's dominant growth source under deploy churn.
             let mut partition_hours: HashMap<(String, String), u32> = HashMap::new();
+            let mut missing_commit = None;
             // Hours needing a Dedup re-mint: accumulated from UNTAGGED commits
             // only. A commit tagged `DV_DEDUP_COMMIT_KEY` is our own DV-dedup
             // wave — it adds no rows, only masks losers in place, so re-minting
@@ -889,10 +949,10 @@ impl Database {
             // touching an hour puts it back in this map — fail toward minting.
             let mut dedup_hours: HashMap<(String, String), u32> = HashMap::new();
             for commit_version in cursor.saturating_add(1)..=version {
-                let bytes = log_store
-                    .read_commit_entry(commit_version)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("source commit {commit_version} is unavailable for {cursor_key}; cursor remains at {cursor}"))?;
+                let Some(bytes) = log_store.read_commit_entry(commit_version).await? else {
+                    missing_commit = Some(commit_version);
+                    break;
+                };
                 let actions = deltalake::logstore::get_actions(commit_version, &bytes)?;
                 let dv_dedup_commit = actions.iter().any(
                     |action| matches!(action, deltalake::kernel::Action::CommitInfo(ci) if ci.info.get(DV_DEDUP_COMMIT_KEY).and_then(serde_json::Value::as_bool) == Some(true)),
@@ -939,12 +999,67 @@ impl Database {
                     }
                 }
             }
+            if let Some(missing) = missing_commit {
+                // A current snapshot replaces unavailable change history only
+                // after ALL known source and output partitions are invalidated.
+                // Output-only partitions matter: a missed DELETE can leave no
+                // active source Add while its old aggregate still exists.
+                let targets: HashSet<_> = schema.rollups.iter().map(|spec| spec.table_name(source)).collect();
+                for (project, name, handle) in &tables {
+                    if project != storage_project || (name != source && !targets.contains(name)) {
+                        continue;
+                    }
+                    let table = handle.read().await;
+                    for file in table.snapshot()?.log_data().iter() {
+                        // A valid Delta file need not use Hive directory labels.
+                        // Read only partition scalars, without materializing file statistics.
+                        let values = file.partition_values().map(|values| {
+                            values
+                                .fields()
+                                .iter()
+                                .zip(values.values())
+                                .map(|(field, value)| {
+                                    (field.name().to_owned(), (!value.is_null()).then(|| deltalake::kernel::scalars::ScalarExt::serialize(value)))
+                                })
+                                .collect::<HashMap<_, _>>()
+                        });
+                        let Some(partition) = Self::maintenance_partition_from_action(&file.path(), values.as_ref(), "default")
+                            .filter(|(_, date)| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
+                        else {
+                            // Do not advance past unknown data, but do not let this
+                            // source prevent healthy sources reconciling their cursors.
+                            warn!(source, storage_project, cursor, table = name, path = %file.path(), event = "maintenance_partition_reconcile_failed");
+                            continue 'sources;
+                        };
+                        partition_hours.insert(partition, crate::rollup::ALL_HOURS);
+                    }
+                }
+                // Keep any remove-only partitions already observed before the
+                // gap as well. The missing commits make every bound uncertain.
+                partition_hours.values_mut().for_each(|hours| *hours = crate::rollup::ALL_HOURS);
+                warn!(
+                    source,
+                    storage_project,
+                    cursor,
+                    missing,
+                    version,
+                    partitions = partition_hours.len(),
+                    event = "maintenance_history_gap_recovery",
+                    "requeueing whole partitions from live metadata before advancing an expired cursor"
+                );
+            }
             for ((partition_project, date), hours) in partition_hours {
                 let project = if storage_project.is_empty() { partition_project.clone() } else { storage_project.clone() };
-                let with_dedup = dedup_hours.get(&(partition_project, date.clone())).copied().unwrap_or(0) & hours;
-                self.enqueue_maintenance_hours(&project, &source, &date, with_dedup, true)?;
-                self.enqueue_maintenance_hours(&project, &source, &date, hours & !with_dedup, false)?;
-                queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
+                if missing_commit.is_some() {
+                    self.enqueue_maintenance_partition(&project, source, &date)?;
+                    queued = queued.saturating_add(1 + schema.rollups.len());
+                } else {
+                    let with_dedup = dedup_hours.get(&(partition_project, date.clone())).copied().unwrap_or(0) & hours;
+                    self.enqueue_maintenance_hours(&project, source, &date, with_dedup, true)?;
+                    self.enqueue_maintenance_hours(&project, source, &date, hours & !with_dedup, false)?;
+                    queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
+                }
+                tokio::task::yield_now().await;
             }
             let mut journal = self.journal();
             journal.set_source_cursor(cursor_key, version);

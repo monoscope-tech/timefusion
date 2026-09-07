@@ -5002,19 +5002,21 @@ impl Database {
                             if !reconcile_db.wait_for_preload(&reconcile_cancel).await {
                                 return;
                             }
-                            match reconcile_db.reconcile_maintenance_task_cursors().await {
-                                Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
-                                Err(error) => {
-                                    warn!(%error, event = "maintenance_task_reconcile_failed");
+                            loop {
+                                tokio::select! {
+                                    () = reconcile_cancel.cancelled() => return,
+                                    result = reconcile_db.reconcile_maintenance_task_cursors() => match result {
+                                        Ok(reconciled_tasks) => info!(reconciled_tasks, event = "maintenance_task_reconcile_complete"),
+                                        Err(error) => warn!(%error, event = "maintenance_task_reconcile_failed"),
+                                    }
+                                }
+                                // Keep the durable cursor within Delta log retention
+                                // during long uptimes, not only across frequent deploys.
+                                tokio::select! {
+                                    () = reconcile_cancel.cancelled() => return,
+                                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                                 }
                             }
-                            // Do not discover fresh file-rewrite debt in the
-                            // boot burst. Durable journal work is already being
-                            // drained above; the coordinator's normal 60-second
-                            // planner tick discovers new debt after preload and
-                            // PGWire handoff have settled. Planning here raced
-                            // repair/resume staging and recreated the exact
-                            // startup contention this runtime isolates.
                         });
 
                         let coverage_db = Arc::clone(&db);
@@ -15380,6 +15382,103 @@ mod tests {
 
         assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0);
         assert_eq!(db.maintenance_tasks.lock().unwrap().source_cursor(cursor_key), Some(version));
+        Ok(())
+    }
+
+    /// Retained Delta history may start after a durable maintenance cursor.
+    /// Reconstruct conservative work from the live metadata before advancing,
+    /// rather than failing every restart on the same expired commit.
+    #[test_case::test_case(true; "partition metadata without directory labels")]
+    #[test_case::test_case(false; "malformed source leaves healthy sources running")]
+    #[tokio::test]
+    async fn maintenance_reconciliation_recovers_expired_history(valid_partition_metadata: bool) -> Result<()> {
+        use object_store::ObjectStoreExt;
+        let db = Database::with_config(create_test_config("reconcile-expired-history")).await?;
+        let source = "otel_logs_and_spans";
+        let table = db.get_or_create_unified_table(source).await?;
+        db.reconcile_maintenance_task_cursors().await?;
+        // A malformed source must not prevent a healthy source establishing its cursor.
+        let healthy = db.get_or_create_unified_table("otel_metrics").await?;
+        let healthy_version = healthy.read().await.version().unwrap();
+        let project = format!("recon_{}", uuid::Uuid::new_v4().simple());
+        let ts = (Utc::now() - chrono::Duration::days(2)).timestamp_micros();
+        insert_a_span(&db, &project, "a", ts).await?;
+        let (version, store) = {
+            let table = table.read().await;
+            (table.version().unwrap(), table.log_store().object_store(None))
+        };
+        // An output-only partition models a missed DELETE. Its intentionally
+        // unreadable parquet proves this recovery uses metadata, not row scans.
+        let removed_project = format!("{project}_removed");
+        let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+        let target_name = crate::schema::get_schema(source).unwrap().rollups[0].table_name(source);
+        let target_ref = db.get_or_create_unified_table(&target_name).await?;
+        {
+            let mut target = target_ref.read().await.clone();
+            let mut actions = Vec::new();
+            if !valid_partition_metadata {
+                use deltalake::kernel::MetadataExt;
+                // A legacy layout can store date in the rows rather than partition metadata.
+                let metadata = deltalake::kernel::Metadata::try_new(
+                    None,
+                    None,
+                    target.snapshot()?.schema(),
+                    vec!["project_id".into()],
+                    Utc::now().timestamp_millis(),
+                    target.snapshot()?.metadata().configuration().clone(),
+                )?
+                .with_table_id(target.snapshot()?.metadata().id().to_owned())?;
+                actions.push(deltalake::kernel::Action::Metadata(metadata));
+            }
+            let mut add = deltalake::kernel::Add {
+                path: "metadata-only.parquet".into(),
+                partition_values: HashMap::from([("project_id".into(), Some(removed_project.clone())), ("date".into(), Some(date))]),
+                size: 1,
+                data_change: false,
+                ..Default::default()
+            };
+            if !valid_partition_metadata {
+                add.partition_values.remove("date");
+            }
+            actions.push(deltalake::kernel::Action::Add(add));
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let committed = deltalake::kernel::transaction::CommitBuilder::default()
+                .with_actions(actions)
+                .build(Some(target.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), target.log_store(), op)
+                .await?;
+            target.state = Some(committed.snapshot());
+            *target_ref.write().await = target;
+        }
+        store.delete(&object_store::path::Path::from(format!("_delta_log/{version:020}.json"))).await?;
+        let queued = db.reconcile_maintenance_task_cursors().await?;
+        assert_eq!(db.journal().source_cursor(":otel_metrics"), Some(healthy_version));
+        if !valid_partition_metadata {
+            assert_eq!(queued, 0);
+            assert_eq!(db.journal().source_cursor(":otel_logs_and_spans"), Some(0), "an unknown partition must never be skipped past");
+            return Ok(());
+        }
+        assert_eq!(queued, 2 * (1 + crate::schema::get_schema(source).unwrap().rollups.len()), "one dedup and every rollup tier for both partitions");
+        let day_start = midnight_micros(chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive());
+        {
+            let journal = crate::maintenance_coordinator::TaskJournal::load(&db.config.core.timefusion_data_dir)?;
+            assert_eq!(journal.source_cursor(":otel_logs_and_spans"), Some(version));
+            for project_id in [&project, &removed_project] {
+                let coarse = journal
+                    .tasks()
+                    .filter(|task| {
+                        &task.key.project_id == project_id
+                            && task.key.slice.start_micros == day_start
+                            && task.key.slice.end_micros == day_start + 86_400_000_000
+                    })
+                    .count();
+                assert_eq!(
+                    coarse,
+                    1 + crate::schema::get_schema(source).unwrap().rollups.len(),
+                    "durable dedup and one task per tier, including output-only partitions"
+                );
+            }
+        }
+        assert_eq!(db.reconcile_maintenance_task_cursors().await?, 0, "recovery is durable and idempotent");
         Ok(())
     }
 
