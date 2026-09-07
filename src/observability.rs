@@ -1467,6 +1467,18 @@ atomic_stats! {
         // Runs exceeding the long-running warning threshold. Slow progress
         // is allowed; sustained nonzero with no completion = wedged.
         cron_long_running as "cron_long_running_total",
+        /// Ingest-time client-retry dedup, SHADOW this pass — counts only, the
+        /// batch is NEVER filtered
+        /// (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`). The
+        /// rollout gate reads would_drop/rows_ingested against the known
+        /// 0.0004–0.0008% retry band before enforce is ever wired.
+        ingest_dedup_would_drop as "ingest_dedup_would_drop_total",
+        /// Probes whose dedup KEY matched a flushed row (content match or not).
+        /// key_hits >> would_drop = version traffic, not retries.
+        ingest_dedup_key_hits as "ingest_dedup_key_hits_total",
+        /// Gauge: live identity entries across every per-table index (both epochs).
+        ingest_dedup_index_entries,
+        ingest_dedup_epoch_rotations as "ingest_dedup_epoch_rotations_total",
     }
 }
 

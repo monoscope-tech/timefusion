@@ -1596,6 +1596,22 @@ pub struct BufferConfig {
     /// against `wal.replay_rows`.
     #[serde_inline_default(true)]
     pub timefusion_landed_skip_enabled: bool,
+    /// Ingest-time client-retry dedup
+    /// (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`):
+    /// `off` (default) | `shadow` (count would-drops, never filter) | `enforce`.
+    /// Enforce is NOT wired yet — it deliberately falls back to shadow counting
+    /// until the shadow rate validates in prod (design's rollout gate).
+    #[serde_inline_default("off".to_string())]
+    pub timefusion_ingest_dedup_mode: String,
+    /// Byte budget per-table for the ingest-dedup index — its own budget,
+    /// OUTSIDE the MemBuffer cap. Too small degrades retry coverage, never
+    /// correctness (an evicted identity costs a duplicate, not a loss).
+    #[serde_inline_default(1024)]
+    pub timefusion_ingest_dedup_max_mb: usize,
+    /// Retry-coverage window; the index's epoch pair rotates at window/2, so
+    /// effective coverage oscillates between window/2 and window.
+    #[serde_inline_default(21600)]
+    pub timefusion_ingest_dedup_window_secs: u64,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
@@ -1655,6 +1671,17 @@ impl BufferConfig {
     }
     pub fn landed_skip_enabled(&self) -> bool {
         self.timefusion_landed_skip_enabled
+    }
+    /// True when the ingest-dedup probe runs at all (`shadow` or `enforce` —
+    /// both shadow-count this pass; nothing is ever filtered yet).
+    pub fn ingest_dedup_active(&self) -> bool {
+        !matches!(self.timefusion_ingest_dedup_mode.to_ascii_lowercase().as_str(), "off" | "")
+    }
+    pub fn ingest_dedup_max_bytes(&self) -> usize {
+        self.timefusion_ingest_dedup_max_mb.max(1).saturating_mul(MIB)
+    }
+    pub fn ingest_dedup_window_micros(&self) -> i64 {
+        (self.timefusion_ingest_dedup_window_secs.max(1) as i64).saturating_mul(1_000_000)
     }
 
     pub fn delta_scan_depth(&self) -> usize {
