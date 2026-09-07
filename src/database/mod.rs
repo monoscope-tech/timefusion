@@ -19439,6 +19439,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dv_scan_preserves_physical_positions_under_file_repartitioning() -> Result<()> {
+        use datafusion::arrow::{
+            array::Int32Array,
+            datatypes::{DataType as ArrowType, Field, Schema},
+        };
+        use deltalake::delta_datafusion::TableProviderBuilder;
+        use deltalake::kernel::{DataType, PrimitiveType, StructField, transaction::CommitBuilder};
+        use deltalake::operations::deletion_vectors::{FileDeletion, write_deletion_vectors};
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///dv_physical_positions")?;
+        let mut table = DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_backend(store, url)
+            .build()?
+            .create()
+            .with_columns(vec![StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true)])
+            .with_configuration(HashMap::from([("delta.enableDeletionVectors".to_string(), Some("true".to_string()))]))
+            .await?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", ArrowType::Int32, true)]));
+        table = table.write(vec![RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as _])?]).await?;
+        let table_ref = Arc::new(RwLock::new(table.clone()));
+        let targets = live_adds(&table_ref).await;
+        assert_eq!(targets.len(), 1);
+        let log_store = table.log_store();
+        let actions =
+            write_deletion_vectors(log_store.as_ref(), log_store.root_url(), vec![FileDeletion { add: targets[0].clone(), deleted_indexes: vec![1] }]).await?;
+        let committed = CommitBuilder::default()
+            .with_actions(actions)
+            .build(Some(table.snapshot()?), log_store.clone(), deltalake::protocol::DeltaOperation::Delete { predicate: Some("id = 2".into()) })
+            .await?;
+        table.state = Some(committed.snapshot().clone());
+        let provider = TableProviderBuilder::default()
+            .with_log_store(log_store)
+            .with_eager_snapshot(Arc::new(table.snapshot()?.snapshot().clone()))
+            .with_file_column("file_id")
+            .with_row_index_column("row_ordinal")
+            .build()
+            .await?;
+        // Force the optimizer's splitting threshold below this tiny fixture.
+        let mut config = datafusion::prelude::SessionConfig::new().with_batch_size(1).with_target_partitions(4);
+        config.options_mut().optimizer.repartition_file_min_size = 0;
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        ctx.register_table("dv", Arc::new(provider))?;
+        let plan = ctx.sql("SELECT id, row_ordinal FROM dv").await?.create_physical_plan().await?;
+        let mut pending = vec![Arc::clone(&plan)];
+        let mut files = 0;
+        while let Some(node) = pending.pop() {
+            if let Some(source) = node.downcast_ref::<datafusion_datasource::source::DataSourceExec>()
+                && let Some(scan) = source.data_source().downcast_ref::<datafusion_datasource::file_scan_config::FileScanConfig>()
+            {
+                for file in scan.file_groups.iter().flat_map(|group| group.iter()) {
+                    assert!(file.range.is_none(), "deletion masks and physical ordinals require whole-file scans");
+                    files += 1;
+                }
+            }
+            pending.extend(node.children().into_iter().cloned());
+        }
+        assert!(files > 0, "must inspect the actual Parquet scan");
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        assert_eq!(
+            datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+            "+----+-------------+\n| id | row_ordinal |\n+----+-------------+\n| 1  | 1           |\n| 3  | 3           |\n| 4  | 4           |\n+----+-------------+"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn wave_rejects_a_superseded_deletion_vector() -> Result<()> {
         use datafusion::arrow::{
             array::Int32Array,
