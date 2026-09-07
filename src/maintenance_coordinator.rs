@@ -866,9 +866,23 @@ pub struct Invalidation<'a> {
     /// False ONLY when every commit behind this invalidation is a self-authored
     /// DV-dedup wave (tagged `DV_DEDUP_COMMIT_KEY`): such a commit adds no rows,
     /// so re-minting Dedup from it would upsert already-Complete slices back to
-    /// Pending forever (the prod ~500 `pending_dedup` floor). Rollups always
-    /// mint. Every other caller passes true — fail toward minting.
+    /// Pending forever (the prod ~500 `pending_dedup` floor). Every other caller
+    /// passes true — fail toward minting.
     pub mint_dedup: bool,
+    /// False on the SAME condition as `mint_dedup=false` (a DV-dedup-only hour),
+    /// for a symmetric reason. A DV-dedup wave masks losers in place: physical
+    /// `numRecords` is unchanged, so the partition fingerprint `(rows, min_ts,
+    /// max_ts, stamp)` cannot move, and no maintenance commit bumps
+    /// `rollup_source_epochs` — both identities the read path gates rollup
+    /// coverage on (`ProjectRoutingTable`: `coverage.source_fp != source_fp ||
+    /// source_epoch`) therefore hold. AND the base rollup build reads its raw
+    /// input through `SliceDedup` on `source_schema.dedup_keys` — the same keys
+    /// the DV wave used — so a rebuild produces byte-identical aggregates.
+    /// Re-minting a rollup from a DV-dedup commit is pure redundant work:
+    /// measured 2026-09-07 as a continuous tax (BaseRollup +111 in 100 min
+    /// within one process while dedup was quiet). Every other caller passes
+    /// true — fail toward minting.
+    pub mint_rollup: bool,
 }
 
 impl TaskJournal {
@@ -2419,7 +2433,7 @@ impl TaskJournal {
     }
 
     fn invalidate_slices(&mut self, invalidation: Invalidation<'_>, normal_slices: &[TimeSlice], rollup_slices: &[TimeSlice]) -> anyhow::Result<()> {
-        let Invalidation { source_table, rollup_table, source, project_id, observed_at_micros, derived, mint_dedup, .. } = invalidation;
+        let Invalidation { source_table, rollup_table, source, project_id, observed_at_micros, derived, mint_dedup, mint_rollup, .. } = invalidation;
         // Round up, never down: a bucket can delay eligibility slightly but
         // can never publish before the full quiet period. High-rate ingest
         // then journals one deadline extension per bucket rather than one full
@@ -2452,13 +2466,18 @@ impl TaskJournal {
         // collapsing them afterwards.
         for (operation, slices) in [(Operation::Dedup, normal_slices), (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices)]
         {
-            // The skip fires HERE, per-operation, never per-commit upstream:
-            // a commit-level skip in reconcile would silently drop the rollup
-            // re-mint too (see `Invalidation::mint_dedup`).
+            // The skip fires HERE, per-operation. Dedup skips on `!mint_dedup`;
+            // BaseRollup/DerivedRollup skip on `!mint_rollup`. Both are set false
+            // only for a DV-dedup-only hour, and for the same underlying fact:
+            // the wave changed no logical content the operation would observe.
             if operation == Operation::Dedup && !mint_dedup {
-                // Instrument #4's direct effect: count the Dedup slices this
-                // self-authored DV-dedup commit did NOT re-pend (the floor lever).
+                // Count the Dedup slices this self-authored DV-dedup commit did
+                // NOT re-pend (the floor lever).
                 crate::observability::maintenance_stats().dedup_remint_skipped.fetch_add(slices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            if matches!(operation, Operation::BaseRollup | Operation::DerivedRollup) && !mint_rollup {
+                crate::observability::maintenance_stats().rollup_remint_skipped.fetch_add(slices.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
             for &slice in slices {
@@ -5109,6 +5128,7 @@ mod tests {
                 observed_at_micros: 0,
                 derived: true,
                 mint_dedup: true,
+                mint_rollup: true,
             })
             .expect("invalidate");
         let derived = journal.tasks().find(|task| task.key.operation == Operation::DerivedRollup).expect("derived task");
@@ -5375,6 +5395,7 @@ mod tests {
                 observed_at_micros: 10,
                 derived: false,
                 mint_dedup: true,
+                mint_rollup: true,
             })
             .expect("invalidate");
         journal.checkpoint().expect("first invalidation checkpoint");
@@ -5390,6 +5411,7 @@ mod tests {
                 observed_at_micros: 20,
                 derived: false,
                 mint_dedup: true,
+                mint_rollup: true,
             })
             .expect("invalidate again");
         journal.checkpoint().expect("same-bucket checkpoint");
@@ -5405,6 +5427,7 @@ mod tests {
                 observed_at_micros: INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
                 derived: false,
                 mint_dedup: true,
+                mint_rollup: true,
             })
             .expect("invalidate in next bucket");
         // Two, not three: Dedup and the rollup. HotPacking is planned by DEBT

@@ -512,6 +512,7 @@ fn mint_stream(journal: &mut TaskJournal, stream: &Stream, start_micros: i64, en
             observed_at_micros,
             derived,
             mint_dedup: true,
+            mint_rollup: true,
         });
     }
 }

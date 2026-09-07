@@ -1033,6 +1033,14 @@ atomic_stats! {
         /// (the ~500 `pending_dedup` floor). Rollup re-mint is untouched. 0 with the
         /// lever off or no DV-dedup commits since the cursor.
         dedup_remint_skipped as "dedup_remint_skipped_total",
+        /// Rollup slices NOT re-minted because the only commits touching the hour
+        /// were self-authored DV-dedup waves. Symmetric to `dedup_remint_skipped`:
+        /// a DV wave moves neither the partition stats fingerprint nor
+        /// `rollup_source_epochs`, so existing rollup coverage stays valid, and
+        /// the base build already reads its raw input deduped — a rebuild would be
+        /// byte-identical. This is the direct measure of the wasted rollup rebuild
+        /// tax removed (prod 2026-09-07: BaseRollup +111 in 100 min from this).
+        rollup_remint_skipped as "rollup_remint_skipped_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.

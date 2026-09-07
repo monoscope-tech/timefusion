@@ -863,6 +863,12 @@ impl Database {
                         observed_at_micros: observed_at,
                         derived: spec.derive_from.is_some(),
                         mint_dedup,
+                        // The ONLY caller passing `mint_dedup=false` is the
+                        // reconciler's DV-dedup-only hours (`hours & !with_dedup`);
+                        // every other caller passes true. A DV-dedup-only hour needs
+                        // no rollup rebuild either (see `Invalidation::mint_rollup`),
+                        // so the two flags move together here.
+                        mint_rollup: mint_dedup,
                     })
                     .map_err(std::io::Error::other)?;
             }
@@ -887,6 +893,7 @@ impl Database {
                 observed_at_micros,
                 derived: spec.derive_from.is_some(),
                 mint_dedup: true,
+                mint_rollup: true,
             })?;
         }
         journal.checkpoint()

@@ -15527,16 +15527,21 @@ mod tests {
         Ok(())
     }
 
-    /// A self-authored DV-dedup commit must re-mint ROLLUPS but never DEDUP.
+    /// A self-authored DV-dedup commit must re-mint NEITHER Dedup NOR Rollup.
     ///
     /// DV-dedup carries `data_change=true` (it masks rows), so reconcile
-    /// re-minted Dedup from dedup's own output on every restart, upserting
-    /// already-Complete slices back to Pending — the self-feeding prod
-    /// `pending_dedup` floor (~500). Rollup re-mint must SURVIVE: the DV commit
-    /// changes the live file set rollup build generations fingerprint.
-    /// Untagged (ingest) commits still mint Dedup — the control half below.
+    /// re-minted work from dedup's own output on every restart, upserting
+    /// already-Complete slices back to Pending. For Dedup that was the
+    /// self-feeding `pending_dedup` floor (~500). For Rollup it was a continuous
+    /// rebuild tax (prod 2026-09-07: BaseRollup +111 in 100 min within one
+    /// process while dedup was quiet) — and the rebuild is provably redundant: a
+    /// DV wave moves neither the partition stats fingerprint nor
+    /// `rollup_source_epochs` (the two identities the read path gates coverage
+    /// on), AND the base build reads its raw input through `SliceDedup` on the
+    /// same keys the wave used, so a rebuild is byte-identical. Untagged (ingest)
+    /// commits still mint both — the control half below.
     #[tokio::test]
-    async fn reconcile_skips_dedup_remint_for_tagged_dv_dedup_commits() -> Result<()> {
+    async fn reconcile_skips_dedup_and_rollup_remint_for_tagged_dv_dedup_commits() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskState};
         let db = Database::with_config(create_test_config("reconcile-dv-dedup-skip")).await?;
         let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
@@ -15557,6 +15562,10 @@ mod tests {
             journal.tasks().filter(|t| t.key.project_id == project).map(|t| t.key.clone()).collect()
         };
         assert!(project_keys.iter().any(|k| k.operation == Operation::Dedup), "untagged ingest commits must still mint Dedup");
+        assert!(
+            project_keys.iter().any(|k| matches!(k.operation, Operation::BaseRollup | Operation::DerivedRollup)),
+            "untagged ingest commits must still mint Rollup — the control the DV skip is measured against"
+        );
 
         // Mark everything Complete — the state a restart must not undo.
         {
@@ -15590,11 +15599,17 @@ mod tests {
             .map(|t| t.key.clone())
             .collect();
         assert!(repended.is_empty(), "a self-authored DV-dedup commit re-pended Complete Dedup slices (the floor mechanism): {repended:?}");
+        let rollup_repended: Vec<_> = journal
+            .tasks()
+            .filter(|t| {
+                t.key.project_id == project && matches!(t.key.operation, Operation::BaseRollup | Operation::DerivedRollup) && t.state != TaskState::Complete
+            })
+            .map(|t| t.key.clone())
+            .collect();
         assert!(
-            journal.tasks().any(|t| t.key.project_id == project
-                && matches!(t.key.operation, Operation::BaseRollup | Operation::DerivedRollup)
-                && t.state == TaskState::Pending),
-            "rollup re-mint must survive the Dedup skip"
+            rollup_repended.is_empty(),
+            "a self-authored DV-dedup commit re-pended Complete Rollup slices (the continuous rebuild tax) — \
+             but the base build already reads raw deduped and coverage identities do not move, so the rebuild is redundant: {rollup_repended:?}"
         );
         Ok(())
     }
