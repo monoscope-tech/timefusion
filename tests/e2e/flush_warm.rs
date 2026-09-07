@@ -56,6 +56,9 @@ async fn body_read_cost(env: &E2eEnv) -> anyhow::Result<(u64, u64, usize)> {
 #[tokio::test(flavor = "multi_thread")]
 async fn evicted_hot_tail_body_read_served_from_foyer_not_s3() -> anyhow::Result<()> {
     let env = E2eEnv::builder().with_foyer_enabled().with_warm_full_files().start().await?;
+    // Measure this read's cache traffic, without the boot preloader issuing
+    // unrelated GETs against tables that do not exist in the fresh bucket.
+    env.db().cancel_maintenance();
     insert_and_flush(&env).await?;
 
     // While still in the MemBuffer, the read touches neither parquet nor Foyer.

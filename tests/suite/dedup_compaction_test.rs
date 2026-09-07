@@ -3883,3 +3883,32 @@ async fn a_pruned_to_nothing_delta_scan_does_not_panic() -> Result<()> {
     assert_eq!(found, 0, "the needle is in no file — and getting there must not panic");
     Ok(())
 }
+
+/// A DV scan must retain physical row positions until its mask is consumed,
+/// then discard out-of-window rows before the read-side dedup buffers them.
+#[serial]
+#[tokio::test]
+async fn dv_window_filters_before_read_dedup() -> Result<()> {
+    let (db, project_id) = buffered_db("dv_window_filter").await?;
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    write_to(&db, "mor_dormant", &project_id, (0..30).map(|i| mor_row(&format!("k{i}"), "v", &project_id, ts + i * 1_000_000, None)).collect(), true).await?;
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    ctx.sql(&format!("DELETE FROM mor_dormant WHERE project_id = '{project_id}' AND id IN ('k2', 'k12')")).await?.collect().await?;
+    let table = db.resolve_table(&project_id, "mor_dormant").await?;
+    assert!(
+        table.read().await.snapshot()?.snapshot().log_data().iter().any(|f| f.deletion_vector_descriptor().is_some()),
+        "fixture must contain a real deletion vector"
+    );
+    let at = |offset: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts + offset * 1_000_000).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string();
+    let sql = format!("SELECT id FROM mor_dormant WHERE project_id = '{project_id}' AND timestamp >= '{}' AND timestamp < '{}'", at(10), at(15));
+    let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+    let mut ids: Vec<_> = batches.iter().flat_map(|b| (0..b.num_rows()).map(|i| array_get_str(b.column(0).as_ref(), i))).collect();
+    ids.sort();
+    assert_eq!(ids, ["k10", "k11", "k13", "k14"], "filtering must not shift deletion-vector row positions");
+    let dedup = find_node(&plan, "DedupExec").expect("fixture must exercise read-side dedup");
+    let input_rows = dedup.metrics().unwrap().sum_by_name("input_rows").unwrap().as_usize();
+    assert_eq!(input_rows, 4, "out-of-window rows reached dedup: {}", rendered(&plan));
+    Ok(())
+}
