@@ -511,7 +511,7 @@ pub fn ingest_dedup_filter_batch(idx: &IngestDedupIndex, table_name: &str, batch
     let pass = |b: RecordBatch, hits: u64| (Some(b), hits, 0);
     let Some((key_idxs, content_idxs)) = ingest_identity_idxs(table_name, &batch.schema()) else { return pass(batch, 0) };
     let Some(key_hashes) = row_hashes(&batch, &key_idxs) else { return pass(batch, 0) };
-    let hits: Vec<(usize, (Option<u128>, Option<u128>))> = key_hashes
+    let hits: Vec<_> = key_hashes
         .iter()
         .enumerate()
         .filter_map(|(r, &k)| {
@@ -1528,7 +1528,7 @@ impl BufferedWriteLayer {
         // it re-enters the rejected replay-time-skip design that silently
         // reverts acked DML
         // (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
-        let batches = if bound { self.filter_ingest_dedup(project_id, table_name, batches) } else { batches };
+        let batches = if bound && landed_identity_applies(table_name) { self.filter_ingest_dedup(project_id, table_name, batches) } else { batches };
         if batches.is_empty() {
             return Ok(());
         }
@@ -4903,19 +4903,23 @@ mod tests {
         assert_eq!(layer.snapshot_stats().landed_skipped_rows_total, 2);
         assert_eq!(layer.snapshot_stats().mem_total_rows, 0, "a declined flush must still DRAIN — otherwise the rows replay forever");
 
-        // Same rows again, then a DML that changes what the bucket holds. The
-        // identity no longer matches, so this one must reach Delta.
+        // Fresh rows (the declined batch's identities are now in the ingest-
+        // dedup index, so re-sending a/b would be dropped at ingest — the new
+        // correct behavior), then a DML that changes what the bucket holds.
+        // The noted identity no longer matches, so this one must reach Delta.
         let batch = crate::support::test_helpers::json_to_batch(vec![
-            crate::support::test_helpers::test_span_ts("a", "s", &project, ts),
-            crate::support::test_helpers::test_span_ts("b", "s", &project, ts),
+            crate::support::test_helpers::test_span_ts("c", "s", &project, ts),
+            crate::support::test_helpers::test_span_ts("d", "s", &project, ts),
         ])
         .unwrap();
         layer.insert(&project, &table, vec![batch]).await.unwrap();
+        let staged = layer.mem_buffer.query(&project, &table, &[]).unwrap();
+        layer.note_landed_digests(&project, &table, landed_digest(&staged));
         let deleted = layer
             .delete(
                 &project,
                 &table,
-                Some(&datafusion::prelude::col("id").eq(datafusion::prelude::lit(datafusion::scalar::ScalarValue::Utf8View(Some("a".into()))))),
+                Some(&datafusion::prelude::col("id").eq(datafusion::prelude::lit(datafusion::scalar::ScalarValue::Utf8View(Some("c".into()))))),
             )
             .unwrap();
         assert_eq!(deleted, 1, "the DML must actually change the bucket, or the assertion below proves nothing");
