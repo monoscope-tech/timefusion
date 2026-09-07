@@ -445,21 +445,35 @@ async fn run_with_statement_timeout<T>(
 }
 
 fn with_response_deadline(response: Response, deadline: Option<tokio::time::Instant>) -> Response {
-    match (response, deadline) {
-        (Response::Query(QueryResponse { command_tag, row_schema, data_rows, .. }), Some(deadline)) => {
-            let data_rows = stream::unfold(Some(data_rows), move |rows| async move {
-                let mut rows = rows?;
-                match tokio::time::timeout_at(deadline, rows.next()).await {
-                    Ok(Some(row)) => Some((row, Some(rows))),
-                    Ok(None) => None,
-                    Err(_) => Some((Err(statement_timeout_error()), None)),
+    match response {
+        Response::Query(QueryResponse { command_tag, row_schema, data_rows, .. }) => {
+            // do_query returns before rows are consumed. Keep its scrubbed query
+            // context for failures raised during execution, including timeouts.
+            let span = tracing::Span::current();
+            let data_rows = stream::unfold(Some(data_rows), move |rows| {
+                let span = span.clone();
+                async move {
+                    let mut rows = rows?;
+                    let next = match deadline {
+                        Some(deadline) => match tokio::time::timeout_at(deadline, rows.next()).await {
+                            Ok(Some(row)) => Some((row, Some(rows))),
+                            Ok(None) => None,
+                            Err(_) => Some((Err(statement_timeout_error()), None)),
+                        },
+                        None => rows.next().await.map(|row| (row, Some(rows))),
+                    };
+                    if let Some((Err(error), _)) = &next {
+                        warn!(event = "pgwire.stream_failed", error = %error, "PostgreSQL row stream failed");
+                    }
+                    next
                 }
+                .instrument(span)
             });
             let mut response = QueryResponse::new(row_schema, data_rows);
             response.set_command_tag(&command_tag);
             Response::Query(response)
         }
-        (response, _) => response,
+        response => response,
     }
 }
 
@@ -1322,6 +1336,54 @@ mod pgwire_handlers_tests {
             panic!("expected query response");
         };
         assert!(matches!(response.data_rows.next().await, Some(Err(PgWireError::UserError(_)))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_stream_failures_keep_scrubbed_query_context() -> anyhow::Result<()> {
+        use tracing::instrument::WithSubscriber;
+
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(std::sync::Mutex::new(log.reopen()?)).finish();
+        async {
+            for (case, deadline, fails, stalls) in [
+                ("error", false, true, false),
+                ("bounded_error", true, true, false),
+                ("timeout", true, true, true),
+                ("success", false, false, false),
+                ("bounded_success", true, false, false),
+            ] {
+                let rows = if stalls {
+                    futures::stream::pending().boxed()
+                } else {
+                    futures::stream::iter([if fails {
+                        Err(PgWireError::ApiError(anyhow::anyhow!("late input failure").into()))
+                    } else {
+                        Ok(DataRow::new(bytes::BytesMut::new(), 0))
+                    }])
+                    .boxed()
+                };
+                let span = tracing::info_span!("query_context", case, query.text = tracing::field::Empty);
+                super::record_query_span(&span, "SELECT 'private-literal-canary' AS value");
+                let response = span.in_scope(|| {
+                    with_response_deadline(
+                        Response::Query(QueryResponse::new(Arc::new(vec![]), rows)),
+                        deadline.then(|| tokio::time::Instant::now() + Duration::from_secs(1)),
+                    )
+                });
+                drop(span);
+                let Response::Query(mut response) = response else { panic!("expected query response") };
+                assert_eq!(response.data_rows.next().await.unwrap().is_err(), fails, "{case}");
+                assert!(response.data_rows.next().await.is_none(), "{case}");
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let output = std::fs::read_to_string(log.path())?;
+        let failures: Vec<_> = output.lines().filter(|line| line.contains("pgwire.stream_failed")).collect();
+        assert_eq!(failures.len(), 3, "late failures must be attributed: {output}");
+        assert!(failures.iter().all(|line| line.contains("query_context") && line.contains("query.text")));
+        assert!(!output.contains("private-literal-canary"));
+        Ok(())
     }
 
     /// The deadline is enforced by dropping the in-flight future, and the DML
