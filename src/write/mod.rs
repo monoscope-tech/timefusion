@@ -460,28 +460,22 @@ pub fn landed_digest(batches: &[RecordBatch]) -> Option<LandedDigest> {
 /// hashes; the only unique-row-loss path is a double collision (~6e-25/window,
 /// the shipped `LandedDigest` bar). Returns `None` on any encoding failure
 /// (fail-open: decline the drop, keep the row — a duplicate at worst).
-pub(crate) fn per_row_identities(batch: &RecordBatch, key_idxs: &[usize], content_idxs: &[usize]) -> Option<Vec<(u128, u128)>> {
+pub fn per_row_identities(batch: &RecordBatch, key_idxs: &[usize], content_idxs: &[usize]) -> Option<Vec<(u128, u128)>> {
+    Some(row_hashes(batch, key_idxs)?.into_iter().zip(row_hashes(batch, content_idxs)?).collect())
+}
+
+/// One 128-bit hash per row over the given column subset, via Arrow's row
+/// format (the delimited encoding [`per_row_identities`] requires). `None` on
+/// any encoding failure — fail-open, the caller declines the drop.
+pub fn row_hashes(batch: &RecordBatch, idxs: &[usize]) -> Option<Vec<u128>> {
     use datafusion::arrow::row::{RowConverter, SortField};
     if batch.num_rows() == 0 {
         return Some(Vec::new());
     }
-    let encode = |idxs: &[usize]| -> Option<datafusion::arrow::row::Rows> {
-        let fields: Vec<SortField> = idxs.iter().map(|&i| SortField::new(batch.column(i).data_type().clone())).collect();
-        let cols: Vec<_> = idxs.iter().map(|&i| batch.column(i).clone()).collect();
-        let conv = RowConverter::new(fields).ok()?;
-        conv.convert_columns(&cols).ok()
-    };
-    let key_rows = encode(key_idxs)?;
-    let content_rows = encode(content_idxs)?;
-    Some(
-        (0..batch.num_rows())
-            .map(|r| {
-                let k = twox_hash::XxHash3_128::oneshot(key_rows.row(r).as_ref());
-                let c = twox_hash::XxHash3_128::oneshot(content_rows.row(r).as_ref());
-                (k, c)
-            })
-            .collect(),
-    )
+    let fields: Vec<SortField> = idxs.iter().map(|&i| SortField::new(batch.column(i).data_type().clone())).collect();
+    let cols: Vec<_> = idxs.iter().map(|&i| batch.column(i).clone()).collect();
+    let rows = RowConverter::new(fields).ok()?.convert_columns(&cols).ok()?;
+    Some((0..batch.num_rows()).map(|r| twox_hash::XxHash3_128::oneshot(rows.row(r).as_ref())).collect())
 }
 
 /// Column indices feeding [`per_row_identities`] for one batch of `table_name`:
@@ -491,7 +485,7 @@ pub(crate) fn per_row_identities(batch: &RecordBatch, key_idxs: &[usize], conten
 /// (the pivot in `docs/plans/2026-09-07-ingest-dedup-prevention-design.md`).
 /// `None` when the identity is undefined for this batch (no schema, no
 /// `dedup_keys`, or a key column absent) — the probe/populate is then skipped.
-fn ingest_identity_idxs(table_name: &str, schema: &arrow::datatypes::Schema) -> Option<(Vec<usize>, Vec<usize>)> {
+pub fn ingest_identity_idxs(table_name: &str, schema: &arrow::datatypes::Schema) -> Option<(Vec<usize>, Vec<usize>)> {
     let spec = crate::schema::get_schema(table_name)?;
     if spec.dedup_keys.is_empty() {
         return None;
@@ -500,6 +494,51 @@ fn ingest_identity_idxs(table_name: &str, schema: &arrow::datatypes::Schema) -> 
     let tiebreak = if spec.version_append { spec.dedup_tiebreak.as_deref() } else { None };
     let content_idxs = (0..schema.fields().len()).filter(|&i| Some(schema.field(i).name().as_str()) != tiebreak).collect();
     Some((key_idxs, content_idxs))
+}
+
+/// Two-stage enforce filter for ONE batch against the recently-flushed index:
+/// `(kept_batch, key_hits, dropped_rows)`; `None` when every row was a dup.
+///
+/// Stage 1 hashes ONLY the dedup-key columns (3 narrow columns on otel) and
+/// probes keys — in steady state nothing hits and the batch passes through
+/// UNTOUCHED with zero content-hash work. Stage 2 gathers just the key-hit
+/// rows and hashes their full content; a row is dropped iff its content hash
+/// equals what a flushed row with the same key recorded (an exact client
+/// retry). Every failure direction — no schema identity, encoding error,
+/// gather error — fails OPEN (keep the row: a duplicate at worst, resolved by
+/// DV-dedup downstream; never a loss).
+pub fn ingest_dedup_filter_batch(idx: &IngestDedupIndex, table_name: &str, batch: RecordBatch) -> (Option<RecordBatch>, u64, u64) {
+    let pass = |b: RecordBatch, hits: u64| (Some(b), hits, 0);
+    let Some((key_idxs, content_idxs)) = ingest_identity_idxs(table_name, &batch.schema()) else { return pass(batch, 0) };
+    let Some(key_hashes) = row_hashes(&batch, &key_idxs) else { return pass(batch, 0) };
+    let hits: Vec<(usize, (Option<u128>, Option<u128>))> = key_hashes
+        .iter()
+        .enumerate()
+        .filter_map(|(r, &k)| {
+            let c = idx.key_contents(k);
+            (c.0.is_some() || c.1.is_some()).then_some((r, c))
+        })
+        .collect();
+    if hits.is_empty() {
+        return pass(batch, 0);
+    }
+    let key_hits = hits.len() as u64;
+    let indices = arrow::array::UInt64Array::from(hits.iter().map(|&(r, _)| r as u64).collect::<Vec<_>>());
+    let Ok(sub) = datafusion::arrow::compute::take_record_batch(&batch, &indices) else { return pass(batch, key_hits) };
+    let Some(content_hashes) = row_hashes(&sub, &content_idxs) else { return pass(batch, key_hits) };
+    let dropped: std::collections::HashSet<usize> =
+        hits.iter().zip(&content_hashes).filter(|&(&(_, (cur, prev)), &c)| cur == Some(c) || prev == Some(c)).map(|(&(r, _), _)| r).collect();
+    if dropped.is_empty() {
+        return pass(batch, key_hits);
+    }
+    if dropped.len() == batch.num_rows() {
+        return (None, key_hits, dropped.len() as u64);
+    }
+    let keep = arrow::array::BooleanArray::from((0..batch.num_rows()).map(|r| !dropped.contains(&r)).collect::<Vec<bool>>());
+    match datafusion::arrow::compute::filter_record_batch(&batch, &keep) {
+        Ok(kept) => (Some(kept), key_hits, dropped.len() as u64),
+        Err(_) => pass(batch, key_hits),
+    }
 }
 
 /// Bounded recently-flushed content-identity index for ingest-time client-retry
@@ -512,10 +551,10 @@ fn ingest_identity_idxs(table_name: &str, schema: &arrow::datatypes::Schema) -> 
 /// Arc; DashMap is internally sharded/lock-free, so concurrent probe/populate do
 /// not serialize). Only the rare rotation takes the brief write lock.
 ///
-/// NOT wired to the ingest path yet — the hot-path probe (in `insert_bounded`
-/// pre-WAL, gated `bound==true`) and flush-time populate are the next careful,
-/// benchmarked pass. This is the standalone, tested data structure.
-pub(crate) struct IngestDedupIndex {
+/// Always on, sized by internal constants — no env knobs. Both bound coverage,
+/// never correctness: past either, an evicted identity costs a duplicate
+/// (DV-dedup backstop), never a loss.
+pub struct IngestDedupIndex {
     epochs: std::sync::RwLock<IngestEpochs>,
     /// Rotate when `current` reaches this many entries (~half the byte cap at
     /// ~50 B/entry) OR when it is this old.
@@ -529,10 +568,20 @@ struct IngestEpochs {
     current_started_micros: i64,
 }
 
+/// Per-(project, table) byte budget for the ingest-dedup index — its own
+/// budget, OUTSIDE the MemBuffer cap. The AGGREGATE across topics is bounded
+/// by ingest rate × window (each row populates exactly one topic): at prod's
+/// ~3.8M rows/h total, ~50 B/entry × 6h ≈ 1.1 GB worst case process-wide.
+const INGEST_DEDUP_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Retry-coverage window; the epoch pair rotates at window/2, so effective
+/// coverage oscillates between window/2 and window. Client retries arrive in
+/// seconds-to-minutes; hours of slack costs only memory already capped above.
+const INGEST_DEDUP_WINDOW_MICROS: i64 = 6 * 3600 * 1_000_000;
+
 impl IngestDedupIndex {
     /// `max_bytes` is the index's own budget (outside the MemBuffer cap);
     /// `window_micros` is the retry-coverage window (epochs rotate at window/2).
-    pub(crate) fn new(max_bytes: usize, window_micros: i64, now_micros: i64) -> Self {
+    pub fn new(max_bytes: usize, window_micros: i64, now_micros: i64) -> Self {
         const BYTES_PER_ENTRY: usize = 50; // 32 B payload + DashMap overhead
         Self {
             epochs: std::sync::RwLock::new(IngestEpochs {
@@ -556,23 +605,30 @@ impl IngestDedupIndex {
     }
 
     /// `(key_hit, duplicate)`. `key_hit` counts version traffic apart from
-    /// retries (the shadow metrics need both); a duplicate is always a key hit.
-    pub(crate) fn probe(&self, key_hash: u128, content_hash: u128) -> (bool, bool) {
+    /// retries (the metrics need both); a duplicate is always a key hit.
+    pub fn probe(&self, key_hash: u128, content_hash: u128) -> (bool, bool) {
+        let (cur, prev) = self.key_contents(key_hash);
+        (cur.is_some() || prev.is_some(), cur == Some(content_hash) || prev == Some(content_hash))
+    }
+
+    /// Stage-1 lookup: the content hashes recorded for `key_hash` in the
+    /// (current, previous) epochs, if any. Both are returned — a key
+    /// re-populated in `current` with newer content must not shadow the
+    /// flushed original still sitting in `previous` (a retry of that original
+    /// is a dup). `(None, None)` — the steady state for ~all rows — lets the
+    /// caller skip stage-2 content hashing entirely.
+    pub fn key_contents(&self, key_hash: u128) -> (Option<u128>, Option<u128>) {
         let (current, previous) = {
             let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             (std::sync::Arc::clone(&e.current), std::sync::Arc::clone(&e.previous))
         };
-        // Check BOTH epochs for the content match — a key re-populated in
-        // `current` with newer content must not shadow the flushed original
-        // still sitting in `previous` (a retry of that original is a dup).
-        let (cur, prev) = (current.get(&key_hash).map(|c| *c), previous.get(&key_hash).map(|c| *c));
-        (cur.is_some() || prev.is_some(), cur == Some(content_hash) || prev == Some(content_hash))
+        (current.get(&key_hash).map(|c| *c), previous.get(&key_hash).map(|c| *c))
     }
 
     /// Record a flushed row's identity (last write wins on `key_hash`, so a newer
     /// version overwrites — fail-open: a stale retry then key-hits with mismatched
     /// content, passes, and maintenance dedup resolves it).
-    pub(crate) fn populate(&self, key_hash: u128, content_hash: u128) {
+    pub fn populate(&self, key_hash: u128, content_hash: u128) {
         let current = {
             let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             std::sync::Arc::clone(&e.current)
@@ -583,7 +639,7 @@ impl IngestDedupIndex {
     /// Rotate epochs if `current` is over its size or age bound; true iff this
     /// call rotated (for the rotations counter). Cheap and idempotent under
     /// contention (a double rotation only shrinks coverage).
-    pub(crate) fn maybe_rotate(&self, now_micros: i64) -> bool {
+    pub fn maybe_rotate(&self, now_micros: i64) -> bool {
         let needs = {
             let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros
@@ -602,7 +658,7 @@ impl IngestDedupIndex {
     }
 
     /// Total live entries across both epochs (for the `index_entries` metric).
-    pub(crate) fn entries(&self) -> usize {
+    pub fn entries(&self) -> usize {
         let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         e.current.len() + e.previous.len()
     }
@@ -884,8 +940,7 @@ pub struct BufferedWriteLayer {
     /// which costs duplicates, never a loss.
     landed_digests: dashmap::DashMap<(String, String), std::collections::HashSet<LandedDigest>>,
     /// Per-(project, table) recently-flushed content-identity index for
-    /// ingest-time client-retry dedup — SHADOW-only this pass (counts
-    /// would-drops, never filters; see `shadow_probe_ingest_dedup`). Arc so a
+    /// ingest-time client-retry dedup (see `filter_ingest_dedup`). Arc so a
     /// probe clones the handle out instead of holding a DashMap shard guard
     /// across its per-row loop.
     ingest_dedup: dashmap::DashMap<(String, String), Arc<IngestDedupIndex>>,
@@ -1445,8 +1500,6 @@ impl BufferedWriteLayer {
             self.pressure_notify.notify_one();
         }
 
-        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-
         // Compact before reservation AND WAL serialization: scan-backed DML
         // batches and IPC-decoded inputs otherwise reserve at phantom size
         // and serialize entire inherited buffers into the WAL (2026-06-11:
@@ -1465,17 +1518,21 @@ impl BufferedWriteLayer {
             return Ok(());
         }
 
-        // Ingest-time client-retry dedup — SHADOW ONLY this pass: count what
-        // the index would drop, filter NOTHING. Gated to live bounded ingest:
-        // DML re-appends (bound=false) legitimately re-state row content. WAL
-        // replay never reaches this probe — `recover_from_wal` re-inserts via
-        // `mem_buffer.insert` directly, not `insert_bounded` — and filtering
-        // replay is FORBIDDEN: it re-enters the rejected replay-time-skip
-        // design that silently reverts acked DML
+        // Ingest-time client-retry dedup: drop rows whose exact client-visible
+        // content a recent flush already committed (query-invisible under
+        // keep-greatest; a fully-dropped insert is still Ok — its content IS
+        // durable). Gated to live bounded ingest: DML re-appends (bound=false)
+        // legitimately re-state row content. WAL replay never reaches this
+        // probe — `recover_from_wal` re-inserts via `mem_buffer.insert`
+        // directly, not `insert_bounded` — and filtering replay is FORBIDDEN:
+        // it re-enters the rejected replay-time-skip design that silently
+        // reverts acked DML
         // (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
-        if bound && self.config.buffer.ingest_dedup_active() && landed_identity_applies(table_name) {
-            self.shadow_probe_ingest_dedup(project_id, table_name, &batches);
+        let batches = if bound { self.filter_ingest_dedup(project_id, table_name, batches) } else { batches };
+        if batches.is_empty() {
+            return Ok(());
         }
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
 
         // Reserve memory atomically before writing - prevents race condition.
         // Applies backpressure (synchronous flush-to-Delta + retry) instead of
@@ -1596,37 +1653,40 @@ impl BufferedWriteLayer {
     /// Get-or-create the ingest-dedup index for one (project, table), cloned
     /// OUT of the map so no shard guard is held across per-row work.
     fn ingest_dedup_index(&self, project_id: &str, table_name: &str) -> Arc<IngestDedupIndex> {
-        Arc::clone(&self.ingest_dedup.entry((project_id.to_string(), table_name.to_string())).or_insert_with(|| {
-            Arc::new(IngestDedupIndex::new(
-                self.config.buffer.ingest_dedup_max_bytes(),
-                self.config.buffer.ingest_dedup_window_micros(),
-                crate::support::now_micros(),
-            ))
-        }))
+        Arc::clone(
+            &self
+                .ingest_dedup
+                .entry((project_id.to_string(), table_name.to_string()))
+                .or_insert_with(|| Arc::new(IngestDedupIndex::new(INGEST_DEDUP_MAX_BYTES, INGEST_DEDUP_WINDOW_MICROS, crate::support::now_micros()))),
+        )
     }
 
-    /// SHADOW probe of the ingest-dedup index: count the client-retry
-    /// duplicates it WOULD drop, filter NOTHING. Enforce mode is deliberately
-    /// not wired — it shadow-counts too until the would_drop rate validates
-    /// against the known retry band
-    /// (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`).
-    fn shadow_probe_ingest_dedup(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) {
+    /// Drop exact client-retry duplicates (rows whose full client-visible
+    /// content a recent flush provably committed) before they are reserved or
+    /// made durable. See [`ingest_dedup_filter_batch`] for the two-stage
+    /// probe and its fail-open construction.
+    fn filter_ingest_dedup(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
         let idx = self.ingest_dedup_index(project_id, table_name);
         let stats = crate::observability::maintenance_stats();
-        let (mut key_hits, mut would_drop) = (0u64, 0u64);
-        for batch in batches {
-            let Some((key_idxs, content_idxs)) = ingest_identity_idxs(table_name, &batch.schema()) else { continue };
-            for (k, c) in per_row_identities(batch, &key_idxs, &content_idxs).unwrap_or_default() {
-                let (key_hit, dup) = idx.probe(k, c);
-                key_hits += key_hit as u64;
-                would_drop += dup as u64;
-            }
-        }
+        let (mut key_hits, mut dropped) = (0u64, 0u64);
+        let kept: Vec<RecordBatch> = batches
+            .into_iter()
+            .filter_map(|batch| {
+                let (kept, h, d) = ingest_dedup_filter_batch(&idx, table_name, batch);
+                key_hits += h;
+                dropped += d;
+                kept
+            })
+            .collect();
         stats.ingest_dedup_key_hits.fetch_add(key_hits, Ordering::Relaxed);
-        stats.ingest_dedup_would_drop.fetch_add(would_drop, Ordering::Relaxed);
+        stats.ingest_dedup_dropped_rows.fetch_add(dropped, Ordering::Relaxed);
+        if dropped > 0 {
+            debug!("ingest dedup dropped {dropped} exact client-retry rows: project={project_id}, table={table_name}");
+        }
         if idx.maybe_rotate(crate::support::now_micros()) {
             stats.ingest_dedup_epoch_rotations.fetch_add(1, Ordering::Relaxed);
         }
+        kept
     }
 
     /// Record flushed rows' content identities in the ingest-dedup index. Runs
@@ -3139,6 +3199,12 @@ impl BufferedWriteLayer {
     /// is the point: it is what stops the next boot from replaying these rows
     /// again.
     fn note_landed_skip(&self, bucket: &FlushableBucket, batches: &[RecordBatch]) {
+        // A declined flush never reaches `index_flushed_files`, but its rows
+        // are provably in Delta already — exactly what the ingest-dedup index
+        // exists to know about.
+        if landed_identity_applies(&bucket.table_name) {
+            self.populate_ingest_dedup(&bucket.project_id, &bucket.table_name, batches);
+        }
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         self.landed_skips_total.fetch_add(1, Ordering::Relaxed);
         self.landed_skipped_rows_total.fetch_add(rows as u64, Ordering::Relaxed);
@@ -3171,8 +3237,8 @@ impl BufferedWriteLayer {
             self.note_landed_digests(&bucket.project_id, &bucket.table_name, landed_digest(&batches));
         }
         // Same post-commit placement for the per-row ingest-dedup identities:
-        // only rows Delta provably holds may ever shadow-count a retry.
-        if self.config.buffer.ingest_dedup_active() && landed_identity_applies(&bucket.table_name) {
+        // only rows Delta provably holds may ever drop a retry.
+        if landed_identity_applies(&bucket.table_name) {
             self.populate_ingest_dedup(&bucket.project_id, &bucket.table_name, &batches);
         }
         if self.recovery_active.load(Ordering::Relaxed) {
@@ -4872,15 +4938,15 @@ mod tests {
         assert_eq!(writes.load(Ordering::Relaxed), 2, "a keyless table's duplicate rows are DISTINCT DATA — declining them would lose acked writes");
     }
 
-    /// SHADOW-mode ingest dedup: a re-sent identical row is COUNTED as a
-    /// would-drop but NEVER filtered; the same key with different content is a
-    /// version, not a retry
-    /// (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`).
+    /// Always-on ingest dedup: an exact-content retry re-sent after its flush
+    /// drained the buffer is DROPPED (the insert still acks Ok — the content
+    /// IS durable); the same key with different content is a version and is
+    /// KEPT (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`).
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn ingest_dedup_shadow_counts_a_retry_but_never_filters() {
+    async fn ingest_dedup_drops_an_exact_retry_but_keeps_a_new_version() {
         let dir = tempdir().unwrap();
-        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_ingest_dedup_mode = "shadow".into());
+        let cfg = create_test_config(dir.path().to_path_buf());
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let (project, table) = (format!("sd{test_id}"), "otel_logs_and_spans".to_string());
 
@@ -4888,7 +4954,8 @@ mod tests {
         layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _w| Box::pin(async { Ok(Vec::new()) })));
         let layer = Arc::new(layer);
         let stats = crate::observability::maintenance_stats();
-        let (drop0, hits0) = (stats.ingest_dedup_would_drop.load(Ordering::Relaxed), stats.ingest_dedup_key_hits.load(Ordering::Relaxed));
+        let (drop0, hits0) = (stats.ingest_dedup_dropped_rows.load(Ordering::Relaxed), stats.ingest_dedup_key_hits.load(Ordering::Relaxed));
+        let rows_in = |layer: &BufferedWriteLayer| -> usize { layer.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows()).sum() };
 
         let ts = crate::support::now_micros();
         let row = |name: &str| crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span_ts("a", name, &project, ts)]).unwrap();
@@ -4897,34 +4964,42 @@ mod tests {
         layer.flush_all_now().await.unwrap(); // populate runs POST-COMMIT
         assert!(stats.ingest_dedup_index_entries.load(Ordering::Relaxed) >= 1, "a landed flush must populate the index");
 
-        // The client-retry: identical content re-sent after the flush drained it.
+        // The client-retry: identical content re-sent after the flush drained
+        // it. Must be dropped BEFORE the buffer (and before the WAL), yet ack.
         layer.insert(&project, &table, vec![row("s")]).await.unwrap();
-        assert_eq!(stats.ingest_dedup_would_drop.load(Ordering::Relaxed) - drop0, 1, "a re-sent identical row must shadow-count as a would-drop");
+        assert_eq!(rows_in(&layer), 0, "an exact retry of committed content must be dropped, not buffered again");
+        assert_eq!(stats.ingest_dedup_dropped_rows.load(Ordering::Relaxed) - drop0, 1);
         assert_eq!(stats.ingest_dedup_key_hits.load(Ordering::Relaxed) - hits0, 1);
-        let rows: usize = layer.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows, 1, "SHADOW must never filter — the counted retry row still lands in the buffer");
 
-        // Same key, different content: a new version — key hit, NOT a would-drop.
+        // Same key, different content: a new version — key hit, KEPT.
         layer.insert(&project, &table, vec![row("edited")]).await.unwrap();
-        assert_eq!(stats.ingest_dedup_would_drop.load(Ordering::Relaxed) - drop0, 1, "different content must not count as a retry");
+        assert_eq!(rows_in(&layer), 1, "a new version (same key, different content) must pass through");
+        assert_eq!(stats.ingest_dedup_dropped_rows.load(Ordering::Relaxed) - drop0, 1, "a version is not a retry");
         assert_eq!(stats.ingest_dedup_key_hits.load(Ordering::Relaxed) - hits0, 2, "its key hit is version traffic, counted apart");
+
+        // A DML re-append (bound=false) legitimately re-states row content and
+        // must BYPASS the filter even when the index knows the identity.
+        layer.flush_all_now().await.unwrap();
+        assert_eq!(rows_in(&layer), 0);
+        layer.insert_bounded(&project, &table, vec![row("edited")], false).await.unwrap();
+        assert_eq!(rows_in(&layer), 1, "bound=false (DML re-append) must never be filtered — dropping it silently reverts acked DML");
+        assert_eq!(stats.ingest_dedup_dropped_rows.load(Ordering::Relaxed) - drop0, 1);
     }
 
-    /// The default mode "off" is fully inert: no probe, no populate, no index.
+    /// A table with no schema/dedup_keys has NO content identity: nothing is
+    /// filtered, and no per-table index is even built.
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn ingest_dedup_off_probes_and_populates_nothing() {
+    async fn ingest_dedup_leaves_a_keyless_table_untouched() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        assert!(!cfg.buffer.ingest_dedup_active(), "ingest dedup must default OFF");
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let (project, table) = (format!("od{test_id}"), "otel_logs_and_spans".to_string());
+        let (project, table) = (format!("od{test_id}"), format!("kl{test_id}"));
+        assert!(!landed_identity_applies(&table), "premise: no schema => no identity");
 
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
         layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _w| Box::pin(async { Ok(Vec::new()) })));
         let layer = Arc::new(layer);
-        let stats = crate::observability::maintenance_stats();
-        let (drop0, hits0) = (stats.ingest_dedup_would_drop.load(Ordering::Relaxed), stats.ingest_dedup_key_hits.load(Ordering::Relaxed));
 
         let ts = crate::support::now_micros();
         let batch = || crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span_ts("a", "s", &project, ts)]).unwrap();
@@ -4932,9 +5007,89 @@ mod tests {
         layer.flush_all_now().await.unwrap();
         layer.insert(&project, &table, vec![batch()]).await.unwrap();
 
-        assert_eq!(stats.ingest_dedup_would_drop.load(Ordering::Relaxed), drop0, "off must count nothing");
-        assert_eq!(stats.ingest_dedup_key_hits.load(Ordering::Relaxed), hits0);
-        assert!(layer.ingest_dedup.is_empty(), "off must not even build an index");
+        let rows: usize = layer.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "a keyless table's byte-identical re-send is DISTINCT DATA and must land");
+        assert!(layer.ingest_dedup.is_empty(), "no identity => no index built");
+    }
+
+    /// WAL replay must re-insert rows freely even when the ingest-dedup index
+    /// holds their exact identities — replay goes through `mem_buffer.insert`
+    /// directly, never the probe. This guard fails only if someone reroutes
+    /// replay through `insert_bounded`, which is exactly the rejected
+    /// replay-time-skip design that silently reverts acked DML
+    /// (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wal_replay_reinserts_rows_the_ingest_dedup_index_knows() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("rp{test_id}"), "otel_logs_and_spans".to_string());
+        let ts = crate::support::now_micros();
+        let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span_ts("a", "s", &project, ts)]).unwrap();
+
+        // Unclean exit: the row is in the WAL, never flushed.
+        {
+            let layer = Arc::new(crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+            layer.insert(&project, &table, vec![batch.clone()]).await.unwrap();
+        }
+
+        // Next boot, with the row's identity ALREADY in the index (the
+        // adversarial case a rerouted replay would wrongly filter).
+        let layer = Arc::new(crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+        let compacted = crate::write::mem_buffer::compact_batch(batch);
+        let (key_idxs, content_idxs) = ingest_identity_idxs(&table, &compacted.schema()).unwrap();
+        let idx = layer.ingest_dedup_index(&project, &table);
+        for (k, c) in per_row_identities(&compacted, &key_idxs, &content_idxs).unwrap() {
+            idx.populate(k, c);
+        }
+        let stats = crate::observability::maintenance_stats();
+        let drop0 = stats.ingest_dedup_dropped_rows.load(Ordering::Relaxed);
+
+        layer.recover_from_wal().await.unwrap();
+        let rows: usize = layer.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "replay must re-insert acked rows even when the index knows their identity");
+        assert_eq!(stats.ingest_dedup_dropped_rows.load(Ordering::Relaxed), drop0, "replay must never take the drop path");
+    }
+
+    /// The two-stage filter on a MIXED batch: the dup row is dropped, the new
+    /// row and the new-version row survive in one filtered batch.
+    #[test]
+    fn ingest_dedup_filter_batch_drops_only_the_exact_retry_rows() {
+        let table = "otel_logs_and_spans";
+        let ts = crate::support::now_micros();
+        let mk = |rows: Vec<(&str, &str)>| {
+            crate::write::mem_buffer::compact_batch(
+                crate::support::test_helpers::json_to_batch(
+                    rows.into_iter().map(|(id, name)| crate::support::test_helpers::test_span_ts(id, name, "p", ts)).collect(),
+                )
+                .unwrap(),
+            )
+        };
+        let idx = IngestDedupIndex::new(INGEST_DEDUP_MAX_BYTES, INGEST_DEDUP_WINDOW_MICROS, 0);
+
+        // Nothing flushed yet: the whole batch passes through untouched.
+        let first = mk(vec![("a", "s"), ("b", "t")]);
+        let (kept, hits, dropped) = ingest_dedup_filter_batch(&idx, table, first.clone());
+        assert_eq!((kept.as_ref().unwrap().num_rows(), hits, dropped), (2, 0, 0));
+
+        // "Flush" both rows into the index.
+        let (key_idxs, content_idxs) = ingest_identity_idxs(table, &first.schema()).unwrap();
+        for (k, c) in per_row_identities(&first, &key_idxs, &content_idxs).unwrap() {
+            idx.populate(k, c);
+        }
+
+        // Mixed retry: row "a" is an exact retry (drop), row "b" arrives
+        // edited (a version — keep), row "c" is new (keep).
+        let mixed = mk(vec![("a", "s"), ("b", "edited"), ("c", "u")]);
+        let (kept, hits, dropped) = ingest_dedup_filter_batch(&idx, table, mixed);
+        assert_eq!((hits, dropped), (2, 1), "two key hits, only the exact-content one drops");
+        assert_eq!(kept.as_ref().unwrap().num_rows(), 2);
+
+        // An all-dup batch collapses to None (the insert acks and stops).
+        let (kept, _, dropped) = ingest_dedup_filter_batch(&idx, table, mk(vec![("a", "s"), ("b", "t")]));
+        assert!(kept.is_none(), "an all-retry batch must vanish entirely");
+        assert_eq!(dropped, 2);
     }
 
     /// Regression: prod 2026-07-08 OOM crash loop. WAL replay loaded the whole

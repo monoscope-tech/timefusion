@@ -81,6 +81,19 @@ drop previous, current->previous, fresh current.
 4. Semantic delta: survivor keeps ORIGINAL updated_at (vs today's retry's fresher stamp).
    Content identical. Flag so a future updated_at investigation isn't surprised.
 
-## STATUS (2026-09-07): DESIGNED + CORE BUILT. Committed on branch ingest-dedup: per_row_identities hashing (928647f5) + IngestDedupIndex epoch-rotation struct (6f9b2797), both tested. REMAINING (careful hot-path pass, benchmark first): config (off/shadow/enforce + max_mb + window), pre-WAL probe in insert_bounded gated bound==true, flush-time populate post-commit, ingest_dedup.* metrics, membuffer_concurrency_bench p99 arm. Then SHADOW-mode first (safe, off by default),
+## STATUS (2026-09-07, later): REWORKED TO NO-FLAG, ALWAYS-ON ENFORCE (branch ingest-noflag).
+The off/shadow/enforce mode and both env knobs are REMOVED by directive — the
+filter always runs and actually drops. Cap/window are internal constants in
+write/mod.rs (`INGEST_DEDUP_MAX_BYTES` 256 MiB/table, `INGEST_DEDUP_WINDOW_MICROS`
+6h; aggregate bounded by ingest rate × window ≈ 1.1 GB at prod rate). The probe
+is now genuinely TWO-STAGE: stage 1 hashes ONLY the dedup-key columns and probes
+keys; content hashing runs only on key-hit rows (`ingest_dedup_filter_batch`).
+Landed-skip declines also populate the index. What the flag removal deletes: the
+shadow-validation rollout gate and the kill switch. Compensations: fail-open
+construction throughout, DV-dedup backstop, and the post-deploy health read on
+`ingest_dedup_dropped_rows_total` / rows_ingested vs the 0.0004–0.0008% band
+(higher = misfiring on versions; ~0 forever = drifted inert).
+
+## OLD STATUS (2026-09-07): DESIGNED + CORE BUILT. Committed on branch ingest-dedup: per_row_identities hashing (928647f5) + IngestDedupIndex epoch-rotation struct (6f9b2797), both tested. REMAINING (careful hot-path pass, benchmark first): config (off/shadow/enforce + max_mb + window), pre-WAL probe in insert_bounded gated bound==true, flush-time populate post-commit, ingest_dedup.* metrics, membuffer_concurrency_bench p99 arm. Then SHADOW-mode first (safe, off by default),
 deploy AFTER DV-dedup validates + the observability batch, validate shadow rate >=24h,
 then enforce.

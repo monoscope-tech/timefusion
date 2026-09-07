@@ -1487,14 +1487,15 @@ atomic_stats! {
         // Runs exceeding the long-running warning threshold. Slow progress
         // is allowed; sustained nonzero with no completion = wedged.
         cron_long_running as "cron_long_running_total",
-        /// Ingest-time client-retry dedup, SHADOW this pass — counts only, the
-        /// batch is NEVER filtered
-        /// (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`). The
-        /// rollout gate reads would_drop/rows_ingested against the known
-        /// 0.0004–0.0008% retry band before enforce is ever wired.
-        ingest_dedup_would_drop as "ingest_dedup_would_drop_total",
+        /// Ingest-time client-retry dedup: rows DROPPED because their exact
+        /// client-visible content was provably already committed
+        /// (`docs/plans/2026-09-07-ingest-dedup-prevention-design.md`).
+        /// Post-deploy health read: dropped/rows_ingested should sit in the
+        /// known ~0.0004–0.0008% retry band — far higher = misfiring on
+        /// version traffic; ~zero forever = the hash-point drifted inert.
+        ingest_dedup_dropped_rows as "ingest_dedup_dropped_rows_total",
         /// Probes whose dedup KEY matched a flushed row (content match or not).
-        /// key_hits >> would_drop = version traffic, not retries.
+        /// key_hits >> dropped_rows = version traffic, not retries.
         ingest_dedup_key_hits as "ingest_dedup_key_hits_total",
         /// Gauge: live identity entries across every per-table index (both epochs).
         ingest_dedup_index_entries,
