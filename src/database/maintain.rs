@@ -957,18 +957,6 @@ impl Database {
                 let dv_dedup_commit = actions.iter().any(
                     |action| matches!(action, deltalake::kernel::Action::CommitInfo(ci) if ci.info.get(DV_DEDUP_COMMIT_KEY).and_then(serde_json::Value::as_bool) == Some(true)),
                 );
-                eprintln!(
-                    "RECONCILE-DBG {cursor_key} v{commit_version} tagged={dv_dedup_commit} actions={:?}",
-                    actions
-                        .iter()
-                        .map(|a| match a {
-                            deltalake::kernel::Action::Add(x) => format!("Add({},dc={})", x.path, x.data_change),
-                            deltalake::kernel::Action::Remove(x) => format!("Rm({},dc={})", x.path, x.data_change),
-                            deltalake::kernel::Action::CommitInfo(ci) => format!("CI({:?})", ci.info.keys().collect::<Vec<_>>()),
-                            other => format!("{other:?}").chars().take(30).collect(),
-                        })
-                        .collect::<Vec<_>>()
-                );
                 let mut partitions_with_adds = HashSet::new();
                 let mut remove_only: HashSet<(String, String)> = HashSet::new();
                 for action in actions {
@@ -1064,7 +1052,7 @@ impl Database {
                 let project = if storage_project.is_empty() { partition_project.clone() } else { storage_project.clone() };
                 if missing_commit.is_some() {
                     self.enqueue_maintenance_partition(&project, source, &date)?;
-                    queued = queued.saturating_add(schema.rollups.len());
+                    queued = queued.saturating_add(1 + schema.rollups.len());
                 } else {
                     let with_dedup = dedup_hours.get(&(partition_project, date.clone())).copied().unwrap_or(0) & hours;
                     self.enqueue_maintenance_hours(&project, source, &date, with_dedup, true)?;

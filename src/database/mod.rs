@@ -15457,7 +15457,7 @@ mod tests {
             assert_eq!(db.journal().source_cursor(":otel_logs_and_spans"), Some(0), "an unknown partition must never be skipped past");
             return Ok(());
         }
-        assert!(queued > 0);
+        assert_eq!(queued, 2 * (1 + crate::schema::get_schema(source).unwrap().rollups.len()), "one dedup and every rollup tier for both partitions");
         let day_start = midnight_micros(chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive());
         {
             let journal = crate::maintenance_coordinator::TaskJournal::load(&db.config.core.timefusion_data_dir)?;
