@@ -348,6 +348,12 @@ pub mod scan_metric_names {
         // read these before attempting a fourth.
         CERT_SLICE_OUTSIDE_DAY = "timefusion.scan.cert_slice_outside_day" as scan.cert_slice_outside_day;
         CERT_SLICE_DIRTY = "timefusion.scan.cert_slice_dirty" as scan.cert_slice_dirty;
+        // The DV-visibility guard: a masked-in-place pass whose live (path,
+        // dv_unique_id) set differs from pre + its own committed attachments —
+        // a foreign same-path DV commit the URI fingerprint cannot see. Counted
+        // separately from `cert_slice_dirty` (which it also feeds) or a fired
+        // guard would masquerade as an ordinary dirty pass.
+        CERT_SLICE_DV_MOVED = "timefusion.scan.cert_slice_dv_moved" as scan.cert_slice_dv_moved;
         CERT_SLICE_PARTIAL = "timefusion.scan.cert_slice_partial" as scan.cert_slice_partial;
         CERT_SLICE_DAY_COVERED = "timefusion.scan.cert_slice_day_covered" as scan.cert_slice_day_covered;
         // Files a clean SLICE proved, and files it could not: the second is what
@@ -7579,6 +7585,32 @@ impl StagedBin {
     fn data_change(&self) -> bool {
         self.dedup.is_some()
     }
+
+    /// A DV-dedup bin masks its losers IN PLACE: every Add re-adds a live path
+    /// with a deletion vector attached, so the committed post-state is
+    /// byte-for-byte the state the pass just proved duplicate-free. A CoW
+    /// rewrite's adds never carry a DV. Derived, never stored — same rule as
+    /// [`Self::data_change`]: a second field could disagree.
+    fn masked_in_place(&self) -> bool {
+        self.dedup.is_some()
+            && !self.adds.is_empty()
+            && self.adds.iter().all(|a| matches!(a, deltalake::kernel::Action::Add(add) if add.deletion_vector.is_some()))
+    }
+}
+
+/// One live file-action identity: `(path, dv_unique_id)` — the pair Delta log
+/// replay keys file actions on. The certification fingerprint hashes URIs only
+/// (FROZEN, see `partition_file_fp`), so it is blind to a same-path DV commit;
+/// the DV-visibility guard compares sets of these instead. Computed live,
+/// never persisted.
+pub(crate) type DvEntry = (String, Option<String>);
+
+/// Identity of one DV attachment, per the protocol's uniqueId derivation
+/// (storageType + pathOrInlineDv + offset — the fork's descriptor exposes no
+/// `unique_id()`, so it is derived from the same fields here). Two distinct DV
+/// writes always differ: the DV blob is a fresh UUID-named file.
+fn dv_identity(d: &deltalake::kernel::DeletionVectorDescriptor) -> String {
+    format!("{}{}@{}", d.storage_type, d.path_or_inline_dv, d.offset.unwrap_or(0))
 }
 
 /// Per-unit outcome of one wave commit. Per-unit (not a count) because dedup
@@ -8812,12 +8844,30 @@ fn split_live_bins<T>(bins: Vec<T>, targets: impl Fn(&T) -> &[String], live: &Ha
 /// garbage) from "my own earlier attempt landed and then errored" (staged
 /// parquet is LIVE DATA). See the self-landed split in `commit_wave`.
 /// A bin with no Adds can't have landed anything.
-fn bin_adds_live(bin: &StagedBin, live: &HashSet<String>) -> bool {
+///
+/// Keyed on the (path, dv_id) PAIR, not the path: a DV-dedup bin's adds are
+/// SAME-PATH re-adds, so under a path key every dv-stale bin would read as
+/// self-landed and be credited for a commit that never happened. Its own dv_id
+/// is a fresh UUID sidecar, so the pair is live iff OUR commit landed. CoW/hot
+/// adds carry no DV — `(path, None)` — and behave exactly as before.
+fn bin_adds_live(bin: &StagedBin, live: &HashSet<DvEntry>) -> bool {
     let mut adds = bin.adds.iter().filter_map(|a| match a {
-        deltalake::kernel::Action::Add(add) => Some(add.path.as_str()),
+        deltalake::kernel::Action::Add(add) => Some((add.path.clone(), add.deletion_vector.as_ref().map(dv_identity))),
         _ => None,
     });
-    adds.next().is_some_and(|first| live.contains(first) && adds.all(|p| live.contains(p)))
+    adds.next().is_some_and(|first| live.contains(&first) && adds.all(|p| live.contains(&p)))
+}
+
+/// Are the bin's Removes still exactly what the live snapshot holds, keyed on
+/// the (path, dv_id) pair? Complements the path-level `split_live_bins` check:
+/// a foreign same-path DV commit keeps every path live but moves its dv_id, and
+/// committing over it clobbers the foreign deletions. Fail-closed — a moved
+/// pair takes the stale route and the unit re-stages from a fresh snapshot.
+fn bin_removes_live(bin: &StagedBin, live: &HashSet<DvEntry>) -> bool {
+    bin.removes.iter().all(|a| match a {
+        deltalake::kernel::Action::Remove(r) => live.contains(&(r.path.clone(), r.deletion_vector.as_ref().map(dv_identity))),
+        _ => true,
+    })
 }
 
 /// Delete the staged parquet of bins leaving a wave uncommitted — MINUS anything
@@ -17572,15 +17622,16 @@ mod tests {
         // alpha's commit LANDED: its target is gone AND its staged file is now
         // active. beta's target was rewritten by someone else.
         let live: HashSet<String> = ["alpha-new.parquet"].iter().map(|s| s.to_string()).collect();
+        let live_dv: HashSet<super::DvEntry> = live.iter().map(|p| (p.clone(), None)).collect();
         let (fresh, stale) = super::split_live_bins(vec![alpha, beta], |b| &b.target_paths, &live);
         assert!(fresh.is_empty(), "neither bin's targets survive");
-        let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| super::bin_adds_live(b, &live));
+        let (self_landed, stale): (Vec<_>, Vec<_>) = stale.into_iter().partition(|b| super::bin_adds_live(b, &live_dv));
         assert_eq!(self_landed.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["alpha"], "a landed bin must never be discarded");
         assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
         // Its rows really were dropped from the table, so they count.
         assert_eq!(super::wave_dropped_rows(&self_landed), 4);
         // And a bin whose targets ARE live is never mistaken for self-landed.
-        let live_targets: HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
+        let live_targets: HashSet<super::DvEntry> = [("f1".to_string(), None)].into();
         assert!(!super::bin_adds_live(&staged_unit("alpha", &["f1"], None), &live_targets));
     }
 

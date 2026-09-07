@@ -2108,15 +2108,19 @@ impl Database {
         // union covers the UTC day over one unmoved file fingerprint,
         // `record_clean_slice` grants the certification. A day-wide unit is the
         // degenerate single-slice case.
-        let pre_files = {
+        let (pre_files, pre_dv) = {
             let table = table.read().await;
-            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default()
+            (
+                Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(&key.project_id).unwrap_or_default(),
+                Self::partition_dv_state(&table, &key.project_id, &format!("date={date}"))?,
+            )
         };
         match self.dedup_partition_range_limited(&table, &key.source, &key.project_id, date, Some(key.slice), Some(limits)).await {
-            Ok((dropped, true)) => {
+            Ok((dropped, true, masked)) => {
                 // Before the journal lock: `record_clean_slice` awaits, and the
                 // journal guard is a std Mutex.
-                match self.record_clean_slice(&table, &key.physical_table, &key.project_id, date, (key.slice, dropped), &pre_files).await {
+                let masked = masked.as_deref().map(|attachments| (&pre_dv, attachments));
+                match self.record_clean_slice(&table, &key.physical_table, &key.project_id, date, (key.slice, dropped, masked), &pre_files).await {
                     // Coordinator-owned tables are excluded from `dedup_sweep`,
                     // whose end-of-tick snapshot was otherwise the only
                     // persistence site for this cache.
@@ -2129,7 +2133,7 @@ impl Database {
                 journal.checkpoint()?;
                 crate::observability::maintenance_stats().maintenance_processed_bytes.fetch_add(task.estimated_decoded_bytes, Relaxed);
             }
-            Ok((_, false)) => retry("dedup_incomplete".to_owned(), std::time::Duration::from_secs(30))?,
+            Ok((_, false, _)) => retry("dedup_incomplete".to_owned(), std::time::Duration::from_secs(30))?,
             Err(error) => {
                 let delay = std::time::Duration::from_secs(1u64 << task.attempts.min(8));
                 let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
@@ -4997,7 +5001,10 @@ impl Database {
     /// granting certification once the accumulated slices cover the whole UTC day.
     ///
     /// A slice counts as clean evidence only when the pass dropped nothing AND the partition's
-    /// file fingerprint did not move across it. Evidence is per-fingerprint: a slice observed
+    /// file fingerprint did not move across it — or when it dropped losers by MASKING them in
+    /// place (DV-dedup): that commit is `Remove(old) + Add(same path, +DV)`, so the post-state
+    /// is byte-for-byte what the pass just proved duplicate-free (see `slice_pass_dirty` and
+    /// `dv_visibility_moved`). Evidence is per-fingerprint: a slice observed
     /// under a different fp than the accumulation resets it to just that slice — a moved file
     /// set (new write, compaction) voids what was proved over the old one. A dirty pass resets
     /// coverage and voids any existing certification via `record_certification`'s removal arm.
@@ -5005,7 +5012,7 @@ impl Database {
     /// final time — so the rule cannot drift from the sweep/backfill paths.
     async fn record_clean_slice(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
-        (slice, dropped): (crate::maintenance_coordinator::TimeSlice, u64), pre: &[String],
+        (slice, dropped, masked): (crate::maintenance_coordinator::TimeSlice, u64, Option<(&HashSet<DvEntry>, &[DvEntry])>), pre: &[String],
     ) -> Result<Option<u64>> {
         let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
         let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
@@ -5015,12 +5022,22 @@ impl Database {
             return Ok(None); // a slice outside the day proves nothing about it
         }
         let key = (project_id.to_string(), table_name.to_string(), date.to_string());
-        let post = {
+        let (post, post_dv) = {
             let table = table_ref.read().await;
-            Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()
+            (
+                Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default(),
+                masked.map(|_| Self::partition_dv_state(&table, project_id, &format!("date={date}"))).transpose()?,
+            )
         };
         let fp = partition_file_fp(post.clone());
-        if dropped != 0 || post.is_empty() || partition_file_fp(pre.to_vec()) != fp {
+        // DV-visibility guard, masked arm only: the URI fp cannot see a foreign
+        // same-path DV commit (DML DELETE/UPDATE write DVs too), so compare the
+        // live (path, dv_unique_id) set instead — fail-closed, like fp_moved.
+        let dv_moved = masked.zip(post_dv.as_ref()).is_some_and(|((pre_dv, attachments), live)| dv_visibility_moved(pre_dv, attachments, live));
+        if dv_moved {
+            metrics::counter!(scan_metric_names::CERT_SLICE_DV_MOVED).increment(1);
+        }
+        if slice_pass_dirty(dropped, masked.is_some(), post.is_empty(), partition_file_fp(pre.to_vec()) != fp, dv_moved) {
             metrics::counter!(scan_metric_names::CERT_SLICE_DIRTY).increment(1);
             if self.dedup_slice_coverage.remove(&key).is_some() {
                 self.persist_slice_coverage();
@@ -7717,8 +7734,16 @@ impl Database {
                 debug!("{engine} wave pre-commit refresh failed (attempt {}): {}", attempt + 1, e.message);
             }
             let mut new_table = { table_ref.read().await.clone() };
-            let live: HashSet<String> = match new_table.snapshot() {
-                Ok(s) => s.log_data().iter().map(|f| f.path().into_owned()).collect(),
+            let (live, live_dv): (HashSet<String>, HashSet<DvEntry>) = match new_table.snapshot() {
+                Ok(s) => s
+                    .log_data()
+                    .iter()
+                    .map(|f| {
+                        let path = f.path().into_owned();
+                        let dv = f.deletion_vector_descriptor().map(|d| dv_identity(&d));
+                        (path.clone(), (path, dv))
+                    })
+                    .unzip(),
                 Err(e) => {
                     drop(commit_guard);
                     error!("{engine} wave: no snapshot for {table_name}: {e}");
@@ -7728,6 +7753,16 @@ impl Database {
                 }
             };
             let (fresh, stale) = split_live_bins(bins, |b| &b.target_paths, &live);
+            // DV-VISIBILITY at commit time. A same-path DV commit (DML
+            // DELETE/UPDATE) between staging and commit leaves every target
+            // PATH live while invalidating what the bin read: committing the
+            // stale Remove+Add replaces the foreign DV attachment and
+            // RESURRECTS its deleted rows (proved by
+            // `a_dml_dv_landing_between_staging_and_commit_is_not_clobbered`).
+            // Re-key the bin's own Removes on the (path, dv_id) pair; a moved
+            // pair is exactly a rewritten target, so it takes the stale route.
+            let (fresh, dv_stale): (Vec<StagedBin>, Vec<StagedBin>) = fresh.into_iter().partition(|b| bin_removes_live(b, &live_dv));
+            let stale: Vec<StagedBin> = stale.into_iter().chain(dv_stale).collect();
             // SELF-LANDED SPLIT — do not remove. A bin is "stale" because its
             // target files left the snapshot, and the normal cause is a
             // concurrent rewrite, whose staged parquet nothing references (safe
@@ -7741,7 +7776,7 @@ impl Database {
             // The Adds settle it: staged parquet is uuid-named by the writer, so
             // nobody else can produce those paths. Present in the snapshot ⇒ our
             // commit landed.
-            let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| bin_adds_live(b, &live));
+            let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| bin_adds_live(b, &live_dv));
             for bin in &stale {
                 debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit");
             }
@@ -9341,6 +9376,34 @@ impl Database {
     }
 }
 
+/// Dirty verdict for one completed dedup pass folding into clean-slice coverage.
+///
+/// A masked-in-place (DV) pass may drop rows and stay CLEAN: its commit is
+/// `Remove(old) + Add(same path, +DV)`, so the post-state is exactly what it
+/// just proved duplicate-free. A CoW pass that dropped rows rewrote files and
+/// proves nothing about the result — that conjunct is unchanged. `dv_moved` is
+/// the masked arm's own fail-closed check (see [`dv_visibility_moved`]).
+fn slice_pass_dirty(dropped: u64, masked: bool, post_empty: bool, fp_moved: bool, dv_moved: bool) -> bool {
+    (!masked && dropped != 0) || post_empty || fp_moved || dv_moved
+}
+
+/// DV-visibility guard for the masked arm: has the live `(path, dv_unique_id)`
+/// set diverged from the EXPECTED post-state — `pre` with THIS pass's own
+/// committed DV attachments applied?
+///
+/// NOT a naive pre-vs-post compare: the pass's own commit replaces the dv_id of
+/// every file it touched, so that would decline every masked pass with losers
+/// and ship the feature dead. Anything live beyond the expected set is a
+/// foreign interleaved same-path DV commit the URI fingerprint cannot see ⇒
+/// dirty, exactly like fp_moved. Sets, not a path-keyed map: Delta replay keys
+/// file actions on the (path, dv_id) PAIR, so a stale Remove can leave TWO live
+/// adds for one path — a map would collapse that to one entry and go blind.
+fn dv_visibility_moved(pre: &HashSet<DvEntry>, attachments: &[DvEntry], live: &HashSet<DvEntry>) -> bool {
+    let touched: HashSet<&str> = attachments.iter().map(|(p, _)| p.as_str()).collect();
+    let expected: HashSet<DvEntry> = pre.iter().filter(|(p, _)| !touched.contains(p.as_str())).cloned().chain(attachments.iter().cloned()).collect();
+    expected != *live
+}
+
 #[cfg(test)]
 mod pressure_scaling_tests {
     use super::Database;
@@ -9496,5 +9559,231 @@ mod date_coverage_recovery_tests {
             "these run a maintenance SQL to completion without a liveness watcher — use `collect_watched`:\n{}",
             unwatched.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod certify_on_completion_tests {
+    use serial_test::serial;
+
+    use super::*;
+    use crate::support::test_helpers::{TestConfigBuilder, delta_physical_row_count, json_to_batch, test_span_ts};
+
+    /// The new dirty test (docs/plans/2026-09-07-certify-on-completion-design.md).
+    /// Can-fail proofs, each run red then restored:
+    /// - case 1 went red with the masked exemption reverted to plain `dropped != 0`;
+    /// - case 2 went red with the `dropped != 0` conjunct dropped entirely;
+    /// - case 3 went red with the `|| dv_moved` term removed.
+    #[test_case::test_case(3, true, false, false, false, false; "masked fp-stable complete pass is CLEAN despite drops")]
+    #[test_case::test_case(3, false, false, false, false, true; "CoW pass that dropped rows stays DIRTY")]
+    #[test_case::test_case(3, true, false, false, true, true; "masked pass with a foreign DV in live-post is DIRTY")]
+    #[test_case::test_case(0, false, false, false, false, false; "zero-drop clean pass is unchanged")]
+    #[test_case::test_case(3, true, false, true, false, true; "fp movement still declines a masked pass")]
+    #[test_case::test_case(0, true, true, false, false, true; "an empty partition proves nothing, masked or not")]
+    fn slice_dirty_cases(dropped: u64, masked: bool, post_empty: bool, fp_moved: bool, dv_moved: bool, dirty: bool) {
+        assert_eq!(slice_pass_dirty(dropped, masked, post_empty, fp_moved, dv_moved), dirty);
+    }
+
+    fn e(p: &str, dv: Option<&str>) -> DvEntry {
+        (p.into(), dv.map(Into::into))
+    }
+
+    /// The guard applies THIS pass's own attachments before comparing — a naive
+    /// pre-vs-post compare would decline every masked pass with losers and ship
+    /// the feature dead. Can-fail proof: stubbing `dv_visibility_moved` to
+    /// `false` turned the three dirty assertions red; restored, all pass.
+    #[test]
+    fn dv_guard_expects_own_attachments_and_declines_foreign_ones() {
+        let pre: HashSet<DvEntry> = [e("a", None), e("b", None)].into();
+        let atts = vec![e("a", Some("dv1"))];
+        // Exactly our commit: clean.
+        assert!(!dv_visibility_moved(&pre, &atts, &[e("a", Some("dv1")), e("b", None)].into()));
+        // A foreign DV on an untouched file: dirty.
+        assert!(dv_visibility_moved(&pre, &atts, &[e("a", Some("dv1")), e("b", Some("dvX"))].into()));
+        // A foreign replacement of our own attachment: dirty.
+        assert!(dv_visibility_moved(&pre, &atts, &[e("a", Some("dvX")), e("b", None)].into()));
+        // The stale-Remove double-add shape: BOTH (a,dv1) and (a,dvX) live. A
+        // path-keyed map would collapse this to one entry; the set compare must not.
+        assert!(dv_visibility_moved(&pre, &atts, &[e("a", Some("dv1")), e("a", Some("dvX")), e("b", None)].into()));
+    }
+
+    /// Cross-file duplicate on a sealed past day, two Delta commits → two files.
+    async fn seed_dup_day(db: &Database, project_id: &str) -> Result<(Arc<RwLock<DeltaTable>>, chrono::NaiveDate)> {
+        let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        let row = |name: &str| json_to_batch(vec![test_span_ts("dup_id", name, project_id, ts)]);
+        db.insert_records_batch(project_id, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+        db.insert_records_batch(project_id, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
+        Ok((table_ref, date))
+    }
+
+    async fn pre_state(table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, date: chrono::NaiveDate) -> Result<(Vec<String>, HashSet<DvEntry>)> {
+        let table = table_ref.read().await;
+        let marker = format!("date={date}");
+        Ok((
+            Database::partition_files_by_pid(&table, &marker)?.remove(project_id).unwrap_or_default(),
+            Database::partition_dv_state(&table, project_id, &marker)?,
+        ))
+    }
+
+    fn day_slice(date: chrono::NaiveDate) -> crate::maintenance_coordinator::TimeSlice {
+        let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        crate::maintenance_coordinator::TimeSlice { start_micros: start, end_micros: start + crate::maintenance_coordinator::DAY_MICROS }
+    }
+
+    /// Item (a) at the real path: a masked (DV) pass that dropped a duplicate,
+    /// completed, and left the URI set unmoved GRANTS certification in the SAME
+    /// pass, and the read-side gate turns Granted. Can-fail proof: reverting the
+    /// dirty test's masked exemption to plain `dropped != 0` sent this red
+    /// (grant was None); restored, it passes.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_masked_dv_pass_certifies_the_day_in_the_same_pass() -> Result<()> {
+        let mut cfg = (*TestConfigBuilder::new("certify_same_pass").build()).clone();
+        cfg.maintenance.timefusion_read_dedup_skip_swept = true;
+        let db = Database::with_config(Arc::new(cfg)).await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let (table_ref, date) = seed_dup_day(&db, &project_id).await?;
+        let (pre_files, pre_dv) = pre_state(&table_ref, &project_id, date).await?;
+
+        let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, "otel_logs_and_spans", &project_id, date, None, None).await?;
+        assert_eq!((dropped, complete), (1, true), "expected one duplicate dropped in a complete pass");
+        let atts = masked.expect("a DV-dedup pass must report its masked attachments");
+
+        let grant =
+            db.record_clean_slice(&table_ref, "otel_logs_and_spans", &project_id, date, (day_slice(date), dropped, Some((&pre_dv, &atts))), &pre_files).await?;
+        assert!(grant.is_some(), "a masked, complete, fp-stable pass must certify the day in the SAME pass");
+
+        let key = (project_id.clone(), "otel_logs_and_spans".to_string(), date.to_string());
+        assert!(db.dedup_clean_fp.get(&key).is_some_and(|c| !c.stale), "the grant must be a live whole-day certification");
+
+        // The read-side gate the planner consults must turn Granted for a
+        // window inside the certified day.
+        let slice = day_slice(date);
+        let verdict = {
+            let table = table_ref.read().await;
+            db.dedup_window_clean(&table, &project_id, "otel_logs_and_spans", (slice.start_micros, slice.end_micros - 1))
+        };
+        assert_eq!(verdict, DedupSkipVerdict::Granted, "the same-pass certification must reach the read-side skip");
+        Ok(())
+    }
+
+    /// Item (b) at the real path: a masked pass whose live post `(path, dv)` set
+    /// holds a DV beyond `pre` + its OWN attachments (here: attachments withheld,
+    /// so this pass's committed DV reads as foreign) must DECLINE, fail-closed.
+    /// Can-fail proof: stubbing `dv_visibility_moved` to `false` sent this red
+    /// (the decline became a grant); restored, it passes.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreign_dv_in_live_post_declines_the_masked_pass() -> Result<()> {
+        let cfg = TestConfigBuilder::new("certify_foreign_dv").build();
+        let db = Database::with_config(cfg).await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let (table_ref, date) = seed_dup_day(&db, &project_id).await?;
+        let (pre_files, pre_dv) = pre_state(&table_ref, &project_id, date).await?;
+
+        let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, "otel_logs_and_spans", &project_id, date, None, None).await?;
+        assert_eq!((dropped, complete), (1, true));
+        assert!(masked.is_some(), "precondition: the pass took the DV path");
+
+        // Withhold the attachments: expected post = pre, so the pass's own
+        // committed DV is indistinguishable from a foreign interleaved one.
+        let grant =
+            db.record_clean_slice(&table_ref, "otel_logs_and_spans", &project_id, date, (day_slice(date), dropped, Some((&pre_dv, &[]))), &pre_files).await?;
+        assert!(grant.is_none(), "a DV the pass cannot account for must decline certification");
+        let key = (project_id.clone(), "otel_logs_and_spans".to_string(), date.to_string());
+        assert!(db.dedup_clean_fp.get(&key).is_none_or(|c| c.stale), "no live certification may survive the decline");
+        Ok(())
+    }
+
+    /// Item (c): the CoW path is UNCHANGED — a rewrite that dropped rows still
+    /// declines (its post-state is new files the pass never re-verified).
+    ///
+    /// HONESTY NOTE on the can-fail proof: deleting the `dropped != 0` conjunct
+    /// from `slice_pass_dirty` did NOT turn this test red — a CoW rewrite also
+    /// moves the URI fingerprint, so the decline here is over-determined
+    /// (dropped AND fp_moved both fire). The conjunct itself is pinned by the
+    /// `cow_pass_that_dropped_rows_stays_dirty` unit case, which DID go red
+    /// under that revert. What this test uniquely pins is the plumbing: a CoW
+    /// pass reports `masked = None` end-to-end and never takes the exemption.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cow_pass_that_dropped_rows_still_declines() -> Result<()> {
+        let cfg = TestConfigBuilder::new("certify_cow_declines").without_deletion_vectors().build();
+        let db = Database::with_config(cfg).await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let (table_ref, date) = seed_dup_day(&db, &project_id).await?;
+        let (pre_files, pre_dv) = pre_state(&table_ref, &project_id, date).await?;
+        assert!(pre_dv.iter().all(|(_, dv)| dv.is_none()), "CoW setup must start DV-free");
+
+        let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, "otel_logs_and_spans", &project_id, date, None, None).await?;
+        assert_eq!((dropped, complete), (1, true));
+        assert!(masked.is_none(), "a CoW rewrite must NOT report masked attachments");
+
+        let grant = db.record_clean_slice(&table_ref, "otel_logs_and_spans", &project_id, date, (day_slice(date), dropped, None), &pre_files).await?;
+        assert!(grant.is_none(), "a row-dropping CoW pass must not certify");
+        Ok(())
+    }
+
+    /// The owed concurrent-DML race (design "Risks"): a DML DELETE writes a DV
+    /// to the same file BETWEEN dedup's DV staging and its wave commit. The
+    /// commit must decline/retry rather than clobber: the DML's deletion must
+    /// survive, and no path may end up with two live adds (the stale-Remove
+    /// double-add shape Delta replay permits, since it keys file actions on the
+    /// (path, dv_id) pair).
+    ///
+    /// This test found a REAL clobber: before `bin_removes_live` the wave
+    /// landed over the DML's DV (path-keyed liveness saw every target live) and
+    /// the deleted row RESURRECTED. Can-fail proof: it was red before that fix
+    /// existed, and stubbing `bin_removes_live`'s Remove arm to `true` turns it
+    /// red again; restored, it passes (the dv-stale unit declines and requeues).
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dml_dv_landing_between_staging_and_commit_is_not_clobbered() -> Result<()> {
+        let cfg = TestConfigBuilder::new("certify_dml_race").build();
+        let db = Database::with_config(cfg).await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
+        // File 1 holds the duplicate AND the row the DML will delete.
+        let b1 = json_to_batch(vec![test_span_ts("dup_id", "first", &project_id, ts), test_span_ts("victim", "extra", &project_id, ts)])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b1], true, None).await?;
+        let b2 = json_to_batch(vec![test_span_ts("dup_id", "second", &project_id, ts)])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b2], true, None).await?;
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
+        assert_eq!(delta_physical_row_count(&table_ref).await?, 3);
+
+        // Stage (but do not commit) the DV-dedup wave.
+        let options = DedupRangeOptions { slice: None, dirty_key: None, limits: None };
+        let (units, complete) = db.stage_dedup_partition_range(&table_ref, "otel_logs_and_spans", &project_id, date, options).await?;
+        assert!(complete && !units.is_empty(), "expected a staged DV unit");
+
+        // Foreign DML-DV interleaves: delete the victim via the delta
+        // DeleteBuilder directly (the same primitive dml.rs uses), masking a
+        // row in the very file the staged unit targets.
+        let dt = { table_ref.read().await.clone() };
+        let (dt, metrics) = dt.delete().with_predicate(format!("id = 'victim' and project_id = '{project_id}'")).with_deletion_vectors(true).await?;
+        assert_eq!(metrics.num_deleted_rows, Some(1), "the DML DV delete must land");
+        *table_ref.write().await = dt;
+
+        let markers = vec![format!("date={date}/")];
+        let result = db.commit_wave(&table_ref, "otel_logs_and_spans", &markers, true, units, 0).await;
+
+        // Either outcome is acceptable — landed against the fresh state, or
+        // declined — but NEVER a clobber:
+        let live: Vec<String> = {
+            let table = table_ref.read().await;
+            table.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).collect()
+        };
+        let unique: HashSet<&String> = live.iter().collect();
+        assert_eq!(live.len(), unique.len(), "no path may have two live adds (stale-Remove double-add clobber): {live:?}");
+        let victims: i64 = {
+            let batches = db.query_delta_only(&format!("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'victim'")).await?;
+            use datafusion::arrow::array::AsArray;
+            batches[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0)
+        };
+        assert_eq!(victims, 0, "the DML's deletion must survive the dedup wave (landed={}, failed={})", result.landed.len(), result.failed.len());
+        Ok(())
     }
 }
