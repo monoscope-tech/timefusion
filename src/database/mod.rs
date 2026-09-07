@@ -348,6 +348,12 @@ pub mod scan_metric_names {
         // read these before attempting a fourth.
         CERT_SLICE_OUTSIDE_DAY = "timefusion.scan.cert_slice_outside_day" as scan.cert_slice_outside_day;
         CERT_SLICE_DIRTY = "timefusion.scan.cert_slice_dirty" as scan.cert_slice_dirty;
+        // The DV-visibility guard: a masked-in-place pass whose live (path,
+        // dv_unique_id) set differs from pre + its own committed attachments —
+        // a foreign same-path DV commit the URI fingerprint cannot see. Counted
+        // separately from `cert_slice_dirty` (which it also feeds) or a fired
+        // guard would masquerade as an ordinary dirty pass.
+        CERT_SLICE_DV_MOVED = "timefusion.scan.cert_slice_dv_moved" as scan.cert_slice_dv_moved;
         CERT_SLICE_PARTIAL = "timefusion.scan.cert_slice_partial" as scan.cert_slice_partial;
         CERT_SLICE_DAY_COVERED = "timefusion.scan.cert_slice_day_covered" as scan.cert_slice_day_covered;
         // Files a clean SLICE proved, and files it could not: the second is what
@@ -7579,6 +7585,32 @@ impl StagedBin {
     fn data_change(&self) -> bool {
         self.dedup.is_some()
     }
+
+    /// A DV-dedup bin masks its losers IN PLACE: every Add re-adds a live path
+    /// with a deletion vector attached, so the committed post-state is
+    /// byte-for-byte the state the pass just proved duplicate-free. A CoW
+    /// rewrite's adds never carry a DV. Derived, never stored — same rule as
+    /// [`Self::data_change`]: a second field could disagree.
+    fn masked_in_place(&self) -> bool {
+        self.dedup.is_some()
+            && !self.adds.is_empty()
+            && self.adds.iter().all(|a| matches!(a, deltalake::kernel::Action::Add(add) if add.deletion_vector.is_some()))
+    }
+}
+
+/// One live file-action identity: `(path, dv_unique_id)` — the pair Delta log
+/// replay keys file actions on. The certification fingerprint hashes URIs only
+/// (FROZEN, see `partition_file_fp`), so it is blind to a same-path DV commit;
+/// the DV-visibility guard compares sets of these instead. Computed live,
+/// never persisted.
+pub(crate) type DvEntry = (String, Option<String>);
+
+/// Identity of one DV attachment, per the protocol's uniqueId derivation
+/// (storageType + pathOrInlineDv + offset — the fork's descriptor exposes no
+/// `unique_id()`, so it is derived from the same fields here). Two distinct DV
+/// writes always differ: the DV blob is a fresh UUID-named file.
+fn dv_identity(d: &deltalake::kernel::DeletionVectorDescriptor) -> String {
+    format!("{}{}@{}", d.storage_type, d.path_or_inline_dv, d.offset.unwrap_or(0))
 }
 
 /// Per-unit outcome of one wave commit. Per-unit (not a count) because dedup

@@ -954,17 +954,23 @@ impl Database {
     pub async fn dedup_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
     ) -> Result<(u64, bool)> {
-        self.dedup_partition_range_limited(table_ref, table_name, project_id, date, None, None).await
+        self.dedup_partition_range_limited(table_ref, table_name, project_id, date, None, None).await.map(|(dropped, complete, _)| (dropped, complete))
     }
 
+    /// Third element: `Some(attachments)` iff every LANDED bin masked its
+    /// losers in place (DV-dedup) — the `(path, dv_unique_id)` pairs this
+    /// pass's commit attached, which is what the certification path needs to
+    /// build the EXPECTED post-state for the DV-visibility guard. `None` for a
+    /// CoW pass (or one that landed nothing), which keeps today's
+    /// dropped-rows-means-dirty rule.
     pub(crate) async fn dedup_partition_range_limited(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
         slice: Option<crate::maintenance_coordinator::TimeSlice>, limits: Option<DedupExecutionLimits>,
-    ) -> Result<(u64, bool)> {
+    ) -> Result<(u64, bool, Option<Vec<DvEntry>>)> {
         let options = DedupRangeOptions { slice, dirty_key: None, limits };
         let (units, complete) = self.stage_dedup_partition_range(table_ref, table_name, project_id, date, options).await?;
         if units.is_empty() {
-            return Ok((0, complete));
+            return Ok((0, complete, None));
         }
         let markers = vec![format!("date={date}/")];
         let result = self.commit_wave(table_ref, table_name, &markers, true, units, 0).await;
@@ -979,9 +985,22 @@ impl Database {
                 info!("dedup rewrite: table={} chunk=[{}] dropped={} (before={} after={})", table_name, d.label, d.dropped(), d.before, d.after);
             }
         }
+        // LANDED bins only (incl. self-landed carries): a failed bin's DV was
+        // never committed and must not enter the guard's expected set.
+        let masked = (!result.landed.is_empty() && result.landed.iter().all(StagedBin::masked_in_place)).then(|| {
+            result
+                .landed
+                .iter()
+                .flat_map(|b| &b.adds)
+                .filter_map(|a| match a {
+                    deltalake::kernel::Action::Add(add) => Some((add.path.clone(), add.deletion_vector.as_ref().map(dv_identity))),
+                    _ => None,
+                })
+                .collect()
+        });
         // A unit that didn't land left its duplicates in place — the partition
         // must NOT be certified clean (2026-07-05 review).
-        Ok((dropped, complete && result.failed.is_empty()))
+        Ok((dropped, complete && result.failed.is_empty(), masked))
     }
 
     /// Builds a `TableProviderBuilder` scoped to exactly `files` off
@@ -2264,6 +2283,24 @@ impl Database {
             files.entry(path_partition_value(&uri, "project_id").unwrap_or("default").to_string()).or_default().push(uri);
             files
         }))
+    }
+
+    /// Live `(path, dv_unique_id)` set of one project's `date=` partition — the
+    /// DV-visibility guard's view of it. The certification fingerprint hashes
+    /// URIs only (FROZEN), so a same-path DV commit is invisible to it; this is
+    /// not. Same project grouping rule as [`Self::partition_files_by_pid`].
+    pub(crate) fn partition_dv_state(table: &DeltaTable, project_id: &str, date_marker: &str) -> Result<HashSet<DvEntry>> {
+        Ok(table
+            .snapshot()?
+            .snapshot()
+            .log_data()
+            .iter()
+            .filter(|f| {
+                let p = f.path();
+                p.contains(date_marker) && path_partition_value(&p, "project_id").unwrap_or("default") == project_id
+            })
+            .map(|f| (f.path().into_owned(), f.deletion_vector_descriptor().map(|d| dv_identity(&d))))
+            .collect())
     }
 }
 
