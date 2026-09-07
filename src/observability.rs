@@ -1026,6 +1026,13 @@ atomic_stats! {
         /// is engaging — without it, confirming DV vs copy-on-write dedup in prod
         /// meant grepping S3 for `.bin` sidecars (the 2026-09-06 deploy).
         dv_dedup_bins_staged as "dv_dedup_bins_staged_total",
+        /// Dedup slices NOT re-pended at reconcile because their commit was a
+        /// self-authored DV-dedup wave (`timefusion.dv_dedup`) — the companion
+        /// floor-lever. This is #4's DIRECT effect: sum of Dedup slices skipped,
+        /// i.e. re-mints the boot reconcile would otherwise upsert Complete→Pending
+        /// (the ~500 `pending_dedup` floor). Rollup re-mint is untouched. 0 with the
+        /// lever off or no DV-dedup commits since the cursor.
+        dedup_remint_skipped as "dedup_remint_skipped_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.

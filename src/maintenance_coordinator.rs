@@ -2445,6 +2445,9 @@ impl TaskJournal {
             // a commit-level skip in reconcile would silently drop the rollup
             // re-mint too (see `Invalidation::mint_dedup`).
             if operation == Operation::Dedup && !mint_dedup {
+                // Instrument #4's direct effect: count the Dedup slices this
+                // self-authored DV-dedup commit did NOT re-pend (the floor lever).
+                crate::observability::maintenance_stats().dedup_remint_skipped.fetch_add(slices.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
             for &slice in slices {
