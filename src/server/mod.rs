@@ -1991,6 +1991,30 @@ mod streaming_tests {
             anyhow::Ok(())
         })
         .await??;
+        // Driver cleanup must invalidate both SQL PREPARE and protocol Parse
+        // statements, whether sent through the simple or extended protocol.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let peer_statement = other.prepare("SELECT 77::BIGINT").await?;
+            for extended in [false, true] {
+                let statement = client.prepare("SELECT 42::BIGINT").await?;
+                client.batch_execute("PREPARE sql_statement AS SELECT 42::BIGINT").await?;
+                client.simple_query("EXECUTE sql_statement").await?;
+                if extended {
+                    client.execute("DEALLOCATE ALL", &[]).await?;
+                } else {
+                    client.batch_execute("DEALLOCATE ALL").await?;
+                }
+                let error = client.query(&statement, &[]).await.unwrap_err();
+                assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME));
+                let error = client.simple_query("EXECUTE sql_statement").await.unwrap_err();
+                assert!(error.as_db_error().unwrap().message().contains("does not exist"));
+                assert_eq!(other.query_one(&peer_statement, &[]).await?.get::<_, i64>(0), 77);
+            }
+            client.batch_execute("DEALLOCATE ALL; DEALLOCATE PREPARE ALL").await?;
+            assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42);
+            anyhow::Ok(())
+        })
+        .await??;
         drop(tasks);
         Ok(())
     }

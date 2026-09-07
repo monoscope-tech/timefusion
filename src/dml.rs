@@ -201,6 +201,10 @@ pub(crate) fn substitute(plan: &LogicalPlan, matched: &LogicalPlan, replacement:
 
 #[async_trait]
 impl QueryPlanner for DmlQueryPlanner {
+    fn supports_update_from(&self) -> bool {
+        true
+    }
+
     #[instrument(
         name = "dml.create_physical_plan",
         skip_all,

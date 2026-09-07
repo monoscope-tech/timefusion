@@ -29,7 +29,7 @@ use datafusion_postgres::{
         api::{
             ClientInfo, Type,
             auth::{DefaultServerParameterProvider, ServerParameterProvider},
-            results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response},
+            results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag},
         },
         error::{PgWireError, PgWireResult},
     },
@@ -313,8 +313,11 @@ impl PgCompatibilityHook {
 #[async_trait]
 impl QueryHook for PgCompatibilityHook {
     async fn handle_simple_query(
-        &self, statement: &Statement, _session_context: &SessionContext, client: &mut dyn HookClient,
+        &self, statement: &Statement, session_context: &SessionContext, client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        if let Some(result) = deallocate_all(statement, session_context, client).await {
+            return Some(result);
+        }
         if let Some(fields) = self.role_probe(statement) {
             return Some(role_probe_response(&fields).map(Response::Query));
         }
@@ -331,9 +334,14 @@ impl QueryHook for PgCompatibilityHook {
     }
 
     async fn handle_extended_query(
-        &self, statement: Option<&Statement>, _logical_plan: &LogicalPlan, _params: &datafusion::common::ParamValues, _session_context: &SessionContext,
+        &self, statement: Option<&Statement>, _logical_plan: &LogicalPlan, _params: &datafusion::common::ParamValues, session_context: &SessionContext,
         client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        if let Some(statement) = statement
+            && let Some(result) = deallocate_all(statement, session_context, client).await
+        {
+            return Some(result);
+        }
         // Deliberately NOT intercepted for the role probe: `handle_extended_parse_query`
         // already returned a plan that produces the row, and letting the normal
         // executor run it is what encodes the columns in the result format the
@@ -341,6 +349,24 @@ impl QueryHook for PgCompatibilityHook {
         // client requesting binary cannot decode for int4/bool.
         statement.and_then(|statement| self.show(statement, client)).map(|(name, value)| show_response(&name, &value).map(Response::Query))
     }
+}
+
+/// SQL and wire-protocol prepares have separate stores. Clear both on this
+/// connection, preserving session settings and already-bound portals.
+async fn deallocate_all(statement: &Statement, session_context: &SessionContext, client: &mut dyn HookClient) -> Option<PgWireResult<Response>> {
+    let Statement::Deallocate { name, .. } = statement else {
+        return None;
+    };
+    if name.quote_style.is_some() || !name.value.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    Some(match session_context.sql(&statement.to_string()).await {
+        Ok(_) => {
+            client.portal_store().clear_statements();
+            Ok(Response::Execution(Tag::new("DEALLOCATE")))
+        }
+        Err(error) => Err(PgWireError::ApiError(Box::new(error))),
+    })
 }
 
 fn is_pg_roles(relation: &TableFactor) -> bool {
