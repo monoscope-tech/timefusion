@@ -81,6 +81,6 @@ drop previous, current->previous, fresh current.
 4. Semantic delta: survivor keeps ORIGINAL updated_at (vs today's retry's fresher stamp).
    Content identical. Flag so a future updated_at investigation isn't surprised.
 
-## STATUS: designed 2026-09-07. Implement SHADOW-mode first (safe, off by default),
+## STATUS (2026-09-07): DESIGNED + CORE BUILT. Committed on branch ingest-dedup: per_row_identities hashing (928647f5) + IngestDedupIndex epoch-rotation struct (6f9b2797), both tested. REMAINING (careful hot-path pass, benchmark first): config (off/shadow/enforce + max_mb + window), pre-WAL probe in insert_bounded gated bound==true, flush-time populate post-commit, ingest_dedup.* metrics, membuffer_concurrency_bench p99 arm. Then SHADOW-mode first (safe, off by default),
 deploy AFTER DV-dedup validates + the observability batch, validate shadow rate >=24h,
 then enforce.
