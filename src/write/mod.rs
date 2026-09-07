@@ -484,6 +484,97 @@ pub(crate) fn per_row_identities(batch: &RecordBatch, key_idxs: &[usize], conten
     )
 }
 
+/// Bounded recently-flushed content-identity index for ingest-time client-retry
+/// dedup (design: docs/plans/2026-09-07-ingest-dedup-prevention-design.md). Two
+/// epochs so eviction is O(1): a probe checks both `current` and `previous`; a
+/// populate writes `current`; a rotation drops `previous`, moves `current` there,
+/// and starts a fresh `current`. Coverage oscillates between window/2 and window.
+///
+/// The `RwLock` guards only the two `Arc<DashMap>` handles (a read-lock clones an
+/// Arc; DashMap is internally sharded/lock-free, so concurrent probe/populate do
+/// not serialize). Only the rare rotation takes the brief write lock.
+///
+/// NOT wired to the ingest path yet — the hot-path probe (in `insert_bounded`
+/// pre-WAL, gated `bound==true`) and flush-time populate are the next careful,
+/// benchmarked pass. This is the standalone, tested data structure.
+pub(crate) struct IngestDedupIndex {
+    epochs: std::sync::RwLock<IngestEpochs>,
+    /// Rotate when `current` reaches this many entries (~half the byte cap at
+    /// ~50 B/entry) OR when it is this old.
+    rotate_at_entries: usize,
+    rotate_at_micros: i64,
+}
+
+struct IngestEpochs {
+    current: std::sync::Arc<dashmap::DashMap<u128, u128>>,
+    previous: std::sync::Arc<dashmap::DashMap<u128, u128>>,
+    current_started_micros: i64,
+}
+
+impl IngestDedupIndex {
+    /// `max_bytes` is the index's own budget (outside the MemBuffer cap);
+    /// `window_micros` is the retry-coverage window (epochs rotate at window/2).
+    pub(crate) fn new(max_bytes: usize, window_micros: i64, now_micros: i64) -> Self {
+        const BYTES_PER_ENTRY: usize = 50; // 32 B payload + DashMap overhead
+        Self {
+            epochs: std::sync::RwLock::new(IngestEpochs {
+                current: std::sync::Arc::new(dashmap::DashMap::new()),
+                previous: std::sync::Arc::new(dashmap::DashMap::new()),
+                current_started_micros: now_micros,
+            }),
+            rotate_at_entries: (max_bytes / 2 / BYTES_PER_ENTRY).max(1),
+            rotate_at_micros: (window_micros / 2).max(1),
+        }
+    }
+
+    /// True iff `(key_hash, content_hash)` matches a previously-populated row — a
+    /// client-retry duplicate. A key hit with DIFFERENT content is a new version,
+    /// NOT a duplicate (returns false, so it passes through to be resolved by
+    /// keep-greatest downstream).
+    pub(crate) fn is_duplicate(&self, key_hash: u128, content_hash: u128) -> bool {
+        let (current, previous) = {
+            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (std::sync::Arc::clone(&e.current), std::sync::Arc::clone(&e.previous))
+        };
+        current.get(&key_hash).is_some_and(|c| *c == content_hash) || previous.get(&key_hash).is_some_and(|c| *c == content_hash)
+    }
+
+    /// Record a flushed row's identity (last write wins on `key_hash`, so a newer
+    /// version overwrites — fail-open: a stale retry then key-hits with mismatched
+    /// content, passes, and maintenance dedup resolves it).
+    pub(crate) fn populate(&self, key_hash: u128, content_hash: u128) {
+        let current = {
+            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::sync::Arc::clone(&e.current)
+        };
+        current.insert(key_hash, content_hash);
+    }
+
+    /// Rotate epochs if `current` is over its size or age bound. Cheap and
+    /// idempotent under contention (a double rotation only shrinks coverage).
+    pub(crate) fn maybe_rotate(&self, now_micros: i64) {
+        let needs = {
+            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros
+        };
+        if !needs {
+            return;
+        }
+        let mut e = self.epochs.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-check under the write lock (another thread may have rotated).
+        if e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros {
+            e.previous = std::mem::replace(&mut e.current, std::sync::Arc::new(dashmap::DashMap::new()));
+            e.current_started_micros = now_micros;
+        }
+    }
+
+    /// Total live entries across both epochs (for the `index_entries` metric).
+    pub(crate) fn entries(&self) -> usize {
+        let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        e.current.len() + e.previous.len()
+    }
+}
+
 /// One (project, table) group of a single flush tick, handed to the coalescing
 /// writer so all of them can share ONE Delta commit per physical table.
 pub struct FlushUnit {
@@ -3906,6 +3997,37 @@ mod tests {
         let split = batch(vec!["ab", "a"], vec!["c", "bc"], vec![0, 0]);
         let s = per_row_identities(&split, key_idxs, content_idxs).unwrap();
         assert_ne!(s[0].0, s[1].0, "('ab','c') and ('a','bc') must have distinct key hashes");
+    }
+
+    #[test]
+    fn ingest_dedup_index_matches_retries_versions_and_rotates() {
+        // 3 entries per epoch (rotate_at_entries = max_bytes/2/50). max_bytes=300 -> 3.
+        let idx = IngestDedupIndex::new(300, 1_000_000, 0);
+        idx.populate(1, 100); // key 1, content 100
+        assert!(idx.is_duplicate(1, 100), "exact (key,content) => duplicate");
+        assert!(!idx.is_duplicate(1, 999), "same key, different content => a version, not a dup");
+        assert!(!idx.is_duplicate(2, 100), "unseen key => not a dup");
+        assert_eq!(idx.entries(), 1);
+
+        // Last-write-wins on key: a newer version overwrites; the stale content no
+        // longer matches (fail-open — passes to keep-greatest).
+        idx.populate(1, 200);
+        assert!(idx.is_duplicate(1, 200));
+        assert!(!idx.is_duplicate(1, 100), "overwritten content no longer matches");
+
+        // Fill current to the entry cap, then rotate: current's entries survive in
+        // `previous` and are still probeable.
+        idx.populate(2, 20);
+        idx.populate(3, 30); // current now has keys {1,2,3} = 3 >= cap
+        idx.maybe_rotate(1); // over size -> rotate
+        assert!(idx.is_duplicate(1, 200), "post-rotation, previous epoch is still probed");
+        assert!(idx.is_duplicate(3, 30));
+
+        // A second rotation drops the oldest epoch entirely.
+        idx.populate(4, 40);
+        idx.maybe_rotate(2_000_000); // over age -> rotate again; the {1,2,3} epoch falls off
+        assert!(idx.is_duplicate(4, 40), "newest still present");
+        assert!(!idx.is_duplicate(1, 200), "two rotations => oldest epoch evicted (coverage bound)");
     }
 
     /// The compaction brake must read the flush BACKLOG, not the WAL directory
