@@ -10019,7 +10019,26 @@ impl ProjectRoutingTable {
         };
 
         let coerced = Self::coerce_plan_to_schema(delta_plan, &target_schema)?;
-        self.gate_if_wide(coerced, filters)
+        // Delta may leave predicates inexact, especially when a deletion vector
+        // prevents Parquet filtering. Apply immutable predicates AFTER its row
+        // masks, but BEFORE dedup has to retain every row in the selected files.
+        let mutable = Self::version_mutable_columns(&self.table_name);
+        let schema = coerced.schema();
+        let predicate = filters
+            .iter()
+            .filter(|f| {
+                !Self::references_tombstone(&self.table_name, f)
+                    && f.column_refs().iter().all(|c| schema.index_of(&c.name).is_ok() && !mutable.as_ref().is_some_and(|m| m.contains(&c.name)))
+            })
+            .cloned()
+            .reduce(Expr::and);
+        let filtered: Arc<dyn ExecutionPlan> = if let Some(predicate) = predicate {
+            let predicate = state.create_physical_expr(predicate, &schema.as_ref().clone().try_into()?)?;
+            Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(predicate, coerced)?)
+        } else {
+            coerced
+        };
+        self.gate_if_wide(filtered, filters)
     }
 
     /// How far back a scan reaches (`now - min_ts`), in micros. `None` = no
