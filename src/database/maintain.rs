@@ -5518,10 +5518,21 @@ impl Database {
         }
     }
 
-    pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, Vec<String>)> {
+    pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, crate::read::CountFiles)> {
         let snapshot = table.snapshot()?.snapshot();
         let files = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), project_id, date);
-        Ok((partition_file_fp(files.clone()), files))
+        let paths: HashSet<_> = files.into_iter().collect();
+        let mut files = crate::read::CountFiles::new();
+        for file in snapshot.log_data().iter().filter(|file| paths.contains(file.path().as_ref())) {
+            anyhow::ensure!(
+                files.insert(file.path().into_owned(), file.deletion_vector_descriptor()).is_none(),
+                "logical-count snapshot has multiple active entries for one Parquet path"
+            );
+        }
+        let encoded = serde_json::to_vec(&files)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&encoded, &mut hasher);
+        Ok((std::hash::Hasher::finish(&hasher), files))
     }
 
     /// Memory-only lookup for a base whose files are all present in the table
@@ -5529,7 +5540,7 @@ impl Database {
     /// narrow overlay; any removal/rewrite declines. Filesystem IO is forbidden
     /// on this query path.
     pub(crate) fn logical_count_memory_for_files(
-        &self, project_id: &str, table_name: &str, date: &str, files: &HashSet<String>,
+        &self, project_id: &str, table_name: &str, date: &str, files: &crate::read::CountFiles,
     ) -> Option<(Arc<crate::read::LogicalCountIndex>, Vec<String>)> {
         let key = crate::read::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
         self.logical_count_cache.get_memory_appendable(&key, files)
@@ -5588,7 +5599,7 @@ impl Database {
         // worker. A valid file installs its memory front without scanning Delta.
         let cache = Arc::clone(&self.logical_count_cache);
         let disk_key = key.clone();
-        let current_files = files.iter().cloned().collect();
+        let current_files = files.clone();
         if !force_refresh
             && let Some(added_files) = tokio::task::spawn_blocking(move || cache.load_appendable(&disk_key, &current_files)).await?
             && added_files <= crate::read::MAX_APPEND_OVERLAY_FILES
@@ -5605,7 +5616,7 @@ impl Database {
         let mut index = crate::read::LogicalCountIndex::new();
 
         if !files.is_empty() {
-            let provider = Self::narrow_provider(log_store, eager_snapshot, files.clone(), None, None)
+            let provider = Self::narrow_provider(log_store, eager_snapshot, files.keys().cloned().collect(), None, None)
                 .await
                 .map_err(|error| anyhow::anyhow!("logical-count provider: {error}"))?;
             let context =
@@ -5662,9 +5673,9 @@ impl Database {
         // in the table, so refuse publication and let the next miss rebuild.
         let current_files = {
             let table = table_ref.read().await;
-            Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?.1.into_iter().collect::<HashSet<_>>()
+            Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?.1
         };
-        anyhow::ensure!(files.iter().all(|file| current_files.contains(file)), "logical-count partition was rewritten during build");
+        anyhow::ensure!(files.iter().all(|(path, dv)| current_files.get(path) == Some(dv)), "logical-count partition was rewritten during build");
 
         let physical_keys = index.physical_keys();
         let logical_rows = index.logical_rows();
@@ -5903,7 +5914,14 @@ impl Database {
             .iter()
             .map(|entry| {
                 let ((project_id, table_name, date), cov) = (entry.key().clone(), entry.value().clone());
-                crate::storage::StoredSliceCoverage { project_id, table_name, date, fp: cov.fp, intervals: cov.intervals }
+                crate::storage::StoredSliceCoverage {
+                    proof_version: crate::storage::DedupProofVersion::PhysicalRowOrderV1,
+                    project_id,
+                    table_name,
+                    date,
+                    fp: cov.fp,
+                    intervals: cov.intervals,
+                }
             })
             .collect();
         entries.truncate(crate::storage::PERSIST_CAP);
@@ -5922,6 +5940,7 @@ impl Database {
             .map(|entry| {
                 let ((project_id, table_name, date), cert) = (entry.key().clone(), entry.value().clone());
                 crate::storage::StoredCertification {
+                    proof_version: crate::storage::DedupProofVersion::PhysicalRowOrderV1,
                     project_id,
                     table_name,
                     date,
