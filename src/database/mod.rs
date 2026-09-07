@@ -19258,8 +19258,7 @@ mod tests {
         let (index, added) = {
             let table = table_ref.read().await;
             let (_, files) = Database::logical_count_partition_snapshot(&table, &project_id, &date.to_string())?;
-            db.logical_count_memory_for_files(&project_id, "mor_versioned", &date.to_string(), &files.into_iter().collect())
-                .expect("built index must be memory-resident")
+            db.logical_count_memory_for_files(&project_id, "mor_versioned", &date.to_string(), &files).expect("built index must be memory-resident")
         };
         assert!(added.is_empty());
         assert_eq!(index.count(timestamp, timestamp + 1), 2);

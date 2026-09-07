@@ -2408,15 +2408,13 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
     let (indexes, missing, added_files, stale_dates, delta_snapshot, log_store) = {
         let table = table_ref.read().await;
         let delta_snapshot = Arc::new(table.snapshot().ok()?.snapshot().clone());
-        let paths: Vec<String> = delta_snapshot.log_data().iter().map(|file| file.path().to_string()).collect();
         let mut indexes = Vec::with_capacity(dates.len());
         let mut missing = Vec::new();
         let mut added_files = Vec::new();
         let mut stale_dates = Vec::new();
         for date in &dates {
             let date_string = date.to_string();
-            let files: std::collections::HashSet<_> =
-                crate::database::dedup_partition_paths(paths.iter().cloned(), &q.project_id, &date_string).into_iter().collect();
+            let (_, files) = Database::logical_count_partition_snapshot(&table, &q.project_id, &date_string).ok()?;
             match database.logical_count_memory_for_files(&q.project_id, &q.table_name, &date_string, &files) {
                 Some((index, mut added)) => {
                     indexes.push((*date, index));
@@ -2554,7 +2552,9 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 // "2": the key tail became the FULL dedup key (see `KeyTail`). A "1" file
 // encodes `id` alone, so appending "2" keys to it would count one logical row
 // per (timestamp, id) and one per (timestamp, service, id) in the same index.
-const FORMAT_VERSION: &str = "2";
+// Version 3 binds cached winners to complete DV descriptors and rejects indexes
+// built before physical row ordering was fixed.
+const FORMAT_VERSION: &str = "3";
 const META_VERSION: &str = "tf.logical_count.version";
 const META_FINGERPRINT: &str = "tf.logical_count.fingerprint";
 const META_FILES: &str = "tf.logical_count.files";
@@ -2627,10 +2627,17 @@ pub struct CountPartition {
     pub date: String,
 }
 
+/// Exact visibility of every immutable Parquet file used to build an index.
+pub type CountFiles = std::collections::BTreeMap<String, Option<deltalake::kernel::DeletionVectorDescriptor>>;
+
+fn contains_count_files(current: &CountFiles, base: &CountFiles) -> bool {
+    base.iter().all(|(path, dv)| current.get(path) == Some(dv))
+}
+
 #[derive(Debug)]
 struct CachedPartition {
     fingerprint: u64,
-    files: Arc<std::collections::HashSet<String>>,
+    files: Arc<CountFiles>,
     index: Arc<LogicalCountIndex>,
     estimated_bytes: usize,
     last_access: AtomicU64,
@@ -2667,7 +2674,7 @@ impl LogicalCountCache {
         self.access_clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn insert_memory(&self, key: CountPartition, fingerprint: u64, files: std::collections::HashSet<String>, index: Arc<LogicalCountIndex>) -> bool {
+    fn insert_memory(&self, key: CountPartition, fingerprint: u64, files: CountFiles, index: Arc<LogicalCountIndex>) -> bool {
         let estimated_bytes = index.estimated_heap_bytes();
         if estimated_bytes > self.max_resident_bytes {
             return false;
@@ -2713,15 +2720,12 @@ impl LogicalCountCache {
 
     /// Install only after a builder has covered the complete physical
     /// partition represented by `fingerprint`.
-    pub fn install(&self, key: CountPartition, fingerprint: u64, files: Vec<String>, mut index: LogicalCountIndex) -> Result<()> {
+    pub fn install(&self, key: CountPartition, fingerprint: u64, files: CountFiles, mut index: LogicalCountIndex) -> Result<()> {
         index.finalize()?;
         let path = self.path(&key);
         index.save(&path, fingerprint, &files)?;
         Self::prune_disk_partitions(&path);
-        anyhow::ensure!(
-            self.insert_memory(key, fingerprint, files.into_iter().collect(), Arc::new(index)),
-            "logical-count partition exceeds the resident cache budget"
-        );
+        anyhow::ensure!(self.insert_memory(key, fingerprint, files, Arc::new(index)), "logical-count partition exceeds the resident cache budget");
         Ok(())
     }
 
@@ -2745,15 +2749,15 @@ impl LogicalCountCache {
         }
         let (loaded, files) = LogicalCountIndex::load(&self.path(key), fingerprint).ok()?;
         let loaded = Arc::new(loaded);
-        self.insert_memory(key.clone(), fingerprint, files.into_iter().collect(), Arc::clone(&loaded)).then_some(loaded)
+        self.insert_memory(key.clone(), fingerprint, files, Arc::clone(&loaded)).then_some(loaded)
     }
 
     /// Background restart warm-up for an append-only successor snapshot.
     /// A removed base file refuses the load; newly added files are handled by
     /// the query's narrow append overlay.
-    pub fn load_appendable(&self, key: &CountPartition, current_files: &std::collections::HashSet<String>) -> Option<usize> {
+    pub fn load_appendable(&self, key: &CountPartition, current_files: &CountFiles) -> Option<usize> {
         if let Some(entry) = self.entries.get(key) {
-            if entry.files.is_subset(current_files) {
+            if contains_count_files(current_files, &entry.files) {
                 entry.last_access.store(self.next_access(), Ordering::Relaxed);
                 return Some(current_files.len() - entry.files.len());
             }
@@ -2761,8 +2765,8 @@ impl LogicalCountCache {
             self.invalidate(key);
         }
         let (index, fingerprint, files) = LogicalCountIndex::load_file(&self.path(key)).ok()?;
-        let files: std::collections::HashSet<String> = files.into_iter().collect();
-        if !files.is_subset(current_files) {
+
+        if !contains_count_files(current_files, &files) {
             return None;
         }
         let added = current_files.len() - files.len();
@@ -2786,15 +2790,13 @@ impl LogicalCountCache {
     /// caller's current partition. The difference is safe to scan as a narrow
     /// append overlay. Any removal/rewrite declines because the base may then
     /// count rows no longer present.
-    pub fn get_memory_appendable(
-        &self, key: &CountPartition, current_files: &std::collections::HashSet<String>,
-    ) -> Option<(Arc<LogicalCountIndex>, Vec<String>)> {
+    pub fn get_memory_appendable(&self, key: &CountPartition, current_files: &CountFiles) -> Option<(Arc<LogicalCountIndex>, Vec<String>)> {
         let entry = self.entries.get(key)?;
-        if !entry.files.is_subset(current_files) {
+        if !contains_count_files(current_files, &entry.files) {
             return None;
         }
         entry.last_access.store(self.next_access(), Ordering::Relaxed);
-        let added = current_files.difference(&entry.files).cloned().collect();
+        let added = current_files.keys().filter(|path| !entry.files.contains_key(*path)).cloned().collect();
         Some((Arc::clone(&entry.index), added))
     }
 
@@ -3118,7 +3120,7 @@ impl LogicalCountIndex {
     /// canonical winner table avoids two sources of truth. A fingerprint is
     /// embedded in schema metadata and must match the caller's current Delta
     /// snapshot before the file can be served.
-    pub fn save(&self, path: &Path, fingerprint: u64, files: &[String]) -> Result<()> {
+    pub fn save(&self, path: &Path, fingerprint: u64, files: &CountFiles) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create logical-count cache directory {}", parent.display()))?;
         }
@@ -3197,7 +3199,7 @@ impl LogicalCountIndex {
     }
 
     /// Load only when the file belongs to the caller's exact snapshot.
-    pub fn load(path: &Path, expected_fingerprint: u64) -> Result<(Self, Vec<String>)> {
+    pub fn load(path: &Path, expected_fingerprint: u64) -> Result<(Self, CountFiles)> {
         let (index, fingerprint, files) = Self::load_file(path)?;
         if fingerprint != expected_fingerprint {
             bail!("logical-count cache fingerprint mismatch: cached={fingerprint} current={expected_fingerprint}");
@@ -3205,7 +3207,7 @@ impl LogicalCountIndex {
         Ok((index, files))
     }
 
-    fn load_file(path: &Path) -> Result<(Self, u64, Vec<String>)> {
+    fn load_file(path: &Path) -> Result<(Self, u64, CountFiles)> {
         let file = File::open(path).with_context(|| format!("open logical-count cache {}", path.display()))?;
         let reader = FileReader::try_new(file, None)?;
         let schema = reader.schema();
@@ -3233,7 +3235,7 @@ impl LogicalCountIndex {
             .context("logical-count cache missing fingerprint")?
             .parse::<u64>()
             .context("logical-count cache fingerprint is invalid")?;
-        let files: Vec<String> = serde_json::from_str(schema.metadata().get(META_FILES).context("logical-count cache missing file set")?)
+        let files: CountFiles = serde_json::from_str(schema.metadata().get(META_FILES).context("logical-count cache missing file set")?)
             .context("logical-count cache file set is invalid")?;
 
         let mut index = Self::new();
@@ -3297,6 +3299,9 @@ impl<'a> StringValues<'a> {
 
 #[cfg(test)]
 mod logical_count_index_tests {
+    fn unmasked(paths: &[&str]) -> super::CountFiles {
+        paths.iter().map(|path| ((*path).to_owned(), None)).collect()
+    }
     use super::*;
 
     fn versions(rows: &[(i64, &str, Option<i64>, Option<bool>)]) -> RecordBatch {
@@ -3443,7 +3448,7 @@ mod logical_count_index_tests {
         index.apply(10, "a", None, false);
         index.apply(10, "a", Some(2), true);
         index.apply(60_000_001, "b", Some(3), false);
-        let files = vec!["date=2026-08-04/a.parquet".to_string()];
+        let files = unmasked(&["date=2026-08-04/a.parquet"]);
         index.save(&path, 99, &files).unwrap();
 
         let (loaded, loaded_files) = LogicalCountIndex::load(&path, 99).unwrap();
@@ -3463,7 +3468,7 @@ mod logical_count_index_tests {
         for value in 0..70_000 {
             index.apply(value, &value.to_string(), Some(value), false);
         }
-        index.save(&path, 1, &["large.parquet".into()]).unwrap();
+        index.save(&path, 1, &unmasked(&["large.parquet"])).unwrap();
         let (loaded, _) = LogicalCountIndex::load(&path, 1).unwrap();
         assert_eq!(loaded.physical_keys(), 70_000);
         assert_eq!(loaded.count(0, 70_000), 70_000);
@@ -3476,26 +3481,65 @@ mod logical_count_index_tests {
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), usize::MAX);
         let mut index = LogicalCountIndex::new();
         index.apply(42, "id", Some(1), false);
-        cache.install(key.clone(), 7, vec!["a.parquet".into()], index).unwrap();
+        cache.install(key.clone(), 7, unmasked(&["a.parquet"]), index).unwrap();
         assert_eq!(cache.get(&key, 7).unwrap().logical_rows(), 1);
         assert!(cache.get(&key, 8).is_none());
 
         let restarted = LogicalCountCache::new(dir.path().to_path_buf(), usize::MAX);
         assert_eq!(restarted.get(&key, 7).unwrap().count(0, 100), 1);
-        let current = ["a.parquet".to_string(), "b.parquet".to_string()].into_iter().collect();
+        let current = unmasked(&["a.parquet", "b.parquet"]);
         let (_, added) = restarted.get_memory_appendable(&key, &current).unwrap();
         assert_eq!(added, vec!["b.parquet"]);
         let append_restart = LogicalCountCache::new(dir.path().to_path_buf(), usize::MAX);
         assert_eq!(append_restart.load_appendable(&key, &current), Some(1));
         assert_eq!(append_restart.get_memory_appendable(&key, &current).unwrap().1, vec!["b.parquet"]);
-        let far_ahead: std::collections::HashSet<_> =
-            std::iter::once("a.parquet".to_string()).chain((0..=MAX_APPEND_OVERLAY_FILES).map(|i| format!("new-{i}.parquet"))).collect();
+        let far_ahead: CountFiles = std::iter::once("a.parquet".to_string())
+            .chain((0..=MAX_APPEND_OVERLAY_FILES).map(|i| format!("new-{i}.parquet")))
+            .map(|path| (path, None))
+            .collect();
         assert_eq!(append_restart.load_appendable(&key, &far_ahead), Some(MAX_APPEND_OVERLAY_FILES + 1));
-        let rewritten = ["replacement.parquet".to_string()].into_iter().collect();
+        let rewritten = unmasked(&["replacement.parquet"]);
         assert!(restarted.get_memory_appendable(&key, &rewritten).is_none(), "a removed base file must fail closed");
         restarted.invalidate(&key);
         assert!(restarted.get(&key, 8).is_none());
         assert!(dir.path().join("6f74656c/702f756e73616665/323032362d30382d3034.arrow").exists());
+    }
+
+    #[test]
+    fn legacy_logical_count_files_require_rebuilding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.arrow");
+        for version in ["1", "2"] {
+            let schema = Schema::empty().with_metadata([(META_VERSION.to_owned(), version.to_owned())].into());
+            let mut writer = FileWriter::try_new(std::fs::File::create(&path).unwrap(), &schema).unwrap();
+            writer.finish().unwrap();
+            assert!(LogicalCountIndex::load(&path, 0).unwrap_err().to_string().contains("unsupported logical-count cache format"));
+        }
+    }
+
+    #[test]
+    fn same_path_visibility_changes_reject_memory_and_disk_counts() {
+        use deltalake::kernel::{DeletionVectorDescriptor, StorageType};
+        let dv = |offset| {
+            Some(DeletionVectorDescriptor {
+                storage_type: StorageType::UuidRelativePath,
+                path_or_inline_dv: "same-sidecar".into(),
+                offset: Some(offset),
+                size_in_bytes: 10,
+                cardinality: 1,
+            })
+        };
+        for (before, after) in [(None, dv(1)), (dv(1), dv(2)), (dv(1), None)] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = CountPartition { project_id: "p".into(), table_name: "otel".into(), date: "2026-08-14".into() };
+            let cache = LogicalCountCache::new(dir.path().to_owned(), usize::MAX);
+            let files = [("same.parquet".into(), before)].into_iter().collect();
+            cache.install(key.clone(), 1, files, LogicalCountIndex::new()).unwrap();
+            let changed = [("same.parquet".into(), after)].into_iter().collect();
+            assert!(cache.get_memory_appendable(&key, &changed).is_none());
+            let restarted = LogicalCountCache::new(dir.path().to_owned(), usize::MAX);
+            assert!(restarted.load_appendable(&key, &changed).is_none());
+        }
     }
 
     #[test]
@@ -3515,12 +3559,12 @@ mod logical_count_index_tests {
         first.finalize().unwrap();
         let per_entry = first.estimated_heap_bytes();
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), per_entry);
-        cache.install(key("a"), 1, vec!["a.parquet".into()], first).unwrap();
+        cache.install(key("a"), 1, unmasked(&["a.parquet"]), first).unwrap();
         assert!(cache.get_memory(&key("a"), 1).is_some());
 
         let mut second = LogicalCountIndex::new();
         second.apply(2, "b", Some(1), false);
-        cache.install(key("b"), 2, vec!["b.parquet".into()], second).unwrap();
+        cache.install(key("b"), 2, unmasked(&["b.parquet"]), second).unwrap();
         assert!(cache.get_memory(&key("a"), 1).is_none());
         assert!(cache.get_memory(&key("b"), 2).is_some());
         assert!(cache.resident_bytes.load(Ordering::Relaxed) <= per_entry);
@@ -3532,7 +3576,7 @@ mod logical_count_index_tests {
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), usize::MAX);
         for day in 1..=DISK_PARTITIONS_PER_PROJECT + 3 {
             let key = CountPartition { project_id: "p".into(), table_name: "otel".into(), date: format!("2026-08-{day:02}") };
-            cache.install(key, u64::try_from(day).unwrap(), Vec::new(), LogicalCountIndex::new()).unwrap();
+            cache.install(key, u64::try_from(day).unwrap(), CountFiles::new(), LogicalCountIndex::new()).unwrap();
         }
         let project_dir = dir.path().join(LogicalCountCache::safe_component("otel")).join(LogicalCountCache::safe_component("p"));
         let files: Vec<_> = std::fs::read_dir(project_dir).unwrap().flatten().map(|entry| entry.path()).collect();

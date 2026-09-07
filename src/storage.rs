@@ -3482,8 +3482,17 @@ use std::io::ErrorKind;
 /// which is also the likeliest to have been invalidated already.
 pub const PERSIST_CAP: usize = 20_000;
 
+/// Only evidence produced with position-correct deletion-vector scans is reusable.
+/// Missing or unknown generations must be rebuilt, never promoted to a proof.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupProofVersion {
+    PhysicalRowOrderV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StoredCertification {
+    pub proof_version: DedupProofVersion,
     pub project_id: String,
     pub table_name: String,
     pub date: String,
@@ -3634,6 +3643,7 @@ pub struct StoredUntaggedCell {
 /// uncertifiable — cert_granted_total=0, diagnosed 2026-08-21).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StoredSliceCoverage {
+    pub proof_version: DedupProofVersion,
     pub project_id: String,
     pub table_name: String,
     pub date: String,
@@ -4136,5 +4146,27 @@ mod coverage_ledger_tests {
         assert!(ledger.coverage(&old).is_empty(), "the retired cell is gone");
         assert_eq!(ledger.coverage(&cell()).len(), 1, "the in-retention cell is untouched");
         assert!(JsonCoverageLedger::load(dir.path()).coverage(&old).is_empty(), "retirement is durable, not in-memory only");
+    }
+}
+
+#[cfg(test)]
+mod dedup_proof_version_tests {
+    use super::{StoredCertification, StoredSliceCoverage};
+
+    #[test]
+    fn legacy_and_unknown_proofs_require_rebuilding() {
+        for version in [None, Some("physical_row_order_v1"), Some("unknown_future_version")] {
+            let mut proof = serde_json::json!({
+                "project_id": "p", "table_name": "otel", "date": "2026-08-14",
+                "fp": 7, "granted_unix_ms": 1, "files": ["a.parquet"], "stale": false,
+                "intervals": [[0, 10]]
+            });
+            if let Some(version) = version {
+                proof["proof_version"] = version.into();
+            }
+            let valid = version == Some("physical_row_order_v1");
+            assert_eq!(serde_json::from_value::<StoredCertification>(proof.clone()).is_ok(), valid);
+            assert_eq!(serde_json::from_value::<StoredSliceCoverage>(proof).is_ok(), valid);
+        }
     }
 }
