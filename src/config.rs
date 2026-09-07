@@ -2871,7 +2871,7 @@ pub struct MaintenanceConfig {
     /// Delta tables must understand DVs (TF's own scan does; external log
     /// readers may not) — set `TIMEFUSION_USE_DELETION_VECTORS=false` to keep
     /// copy-on-write rewrites.
-    #[serde_inline_default(false)]
+    #[serde_inline_default(true)]
     pub timefusion_use_deletion_vectors: bool,
     /// Commit DV merges append-tolerantly: a concurrent flush commit (AddFile
     /// only) no longer aborts the merge with ConcurrentAppend — the commit
