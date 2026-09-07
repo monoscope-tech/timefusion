@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_dormant_at};
+use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_dormant_at, insert_dormant_named};
 
 /// Live parquet data files for the default tenant table.
 async fn parquet_files(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
@@ -92,8 +92,10 @@ async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Resu
     }
     insert_dormant_at(&client, "dup", past + 100 * sec).await?;
     env.force_flush().await?;
-    // File 2: the DUPLICATE (identical timestamp+id dedup key) + one more unique.
-    insert_dormant_at(&client, "dup", past + 100 * sec).await?;
+    // File 2: the DUPLICATE (identical timestamp+id dedup key; different
+    // content, else the ingest-time content-identity filter drops it before it
+    // ever becomes a physical duplicate) + one more unique.
+    insert_dormant_named(&client, "dup", past + 100 * sec, "span-v2").await?;
     insert_dormant_at(&client, "u-3", past + 3 * sec).await?;
     env.force_flush().await?;
 
