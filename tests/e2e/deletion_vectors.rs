@@ -78,7 +78,14 @@ async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Res
 async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Result<()> {
     use std::collections::HashSet;
 
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    // The two explicit flushes define the two source files. A background tick
+    // between INSERTs can otherwise split the fixture on a busy test runner.
+    let env = E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_bucket_duration(Duration::from_secs(60))
+        .with_flush_interval(Duration::from_secs(3600))
+        .start()
+        .await?;
     let client = env.pg_client().await?;
 
     let past = 1_735_689_600_000_000i64; // 2025-01-01, sealed relative to real now

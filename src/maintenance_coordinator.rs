@@ -2393,7 +2393,27 @@ impl TaskJournal {
     /// invalidations are idempotent by `TaskKey`; an already-complete slice is
     /// made pending again and its quiet-period deadline moves forward.
     pub fn invalidate(&mut self, invalidation: Invalidation<'_>) -> anyhow::Result<()> {
-        let Invalidation { source_table, rollup_table, source, project_id, start_micros, end_micros, observed_at_micros, derived } = invalidation;
+        let Invalidation { start_micros, end_micros, derived, .. } = invalidation;
+        let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
+        let rollup_slices = if derived {
+            let aligned_start = start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
+            let aligned_end = end_micros.saturating_add(DERIVED_SLICE_MICROS - 1).div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
+            TimeSlice::fixed_units(aligned_start, aligned_end, DERIVED_SLICE_MICROS)?
+        } else {
+            normal_slices.clone()
+        };
+        self.invalidate_slices(invalidation, &normal_slices, &rollup_slices)
+    }
+
+    /// A history gap has no trustworthy per-hour change bounds. Requeue the
+    /// complete range as coarse work; ordinary capacity splitting still applies.
+    pub(crate) fn invalidate_coarse(&mut self, invalidation: Invalidation<'_>) -> anyhow::Result<()> {
+        let slice = TimeSlice::new(invalidation.start_micros, invalidation.end_micros)?;
+        self.invalidate_slices(invalidation, &[slice], &[slice])
+    }
+
+    fn invalidate_slices(&mut self, invalidation: Invalidation<'_>, normal_slices: &[TimeSlice], rollup_slices: &[TimeSlice]) -> anyhow::Result<()> {
+        let Invalidation { source_table, rollup_table, source, project_id, observed_at_micros, derived, .. } = invalidation;
         // Round up, never down: a bucket can delay eligibility slightly but
         // can never publish before the full quiet period. High-rate ingest
         // then journals one deadline extension per bucket rather than one full
@@ -2404,14 +2424,6 @@ impl TaskJournal {
             .div_euclid(INVALIDATION_DEADLINE_BUCKET_MICROS)
             .saturating_mul(INVALIDATION_DEADLINE_BUCKET_MICROS);
         let created_unix_ms = u64::try_from(observed_at_micros.div_euclid(1_000)).unwrap_or_default();
-        let normal_slices = TimeSlice::normal_units(start_micros, end_micros)?;
-        let rollup_slices = if derived {
-            let aligned_start = start_micros.div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            let aligned_end = end_micros.saturating_add(DERIVED_SLICE_MICROS - 1).div_euclid(DERIVED_SLICE_MICROS) * DERIVED_SLICE_MICROS;
-            TimeSlice::fixed_units(aligned_start, aligned_end, DERIVED_SLICE_MICROS)?
-        } else {
-            normal_slices.clone()
-        };
         // HotPacking is deliberately NOT here. File hygiene is planned by DEBT,
         // not by the calendar: `plan_compaction_debt` scans the actual file list
         // per (project, date) every 60s and mints ONE day-wide unit when the
@@ -2432,8 +2444,7 @@ impl TaskJournal {
         // the "~450 durable tasks per (project, date)" expansion that coarse
         // planning exists to undo. This stops minting them rather than
         // collapsing them afterwards.
-        for (operation, slices) in
-            [(Operation::Dedup, normal_slices.as_slice()), (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices.as_slice())]
+        for (operation, slices) in [(Operation::Dedup, normal_slices), (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices)]
         {
             for &slice in slices {
                 let key = TaskKey {
