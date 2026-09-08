@@ -579,3 +579,28 @@ hash arrays exceed that old daily limit, with parity against the same capture.
 The metadata and DV owner must keep its reservation alive through source
 execution and fallback. This is the next implementation step, not another
 standalone reader refactor.
+
+### 30-minute goal audit — 2026-09-08 22:40 UTC
+
+Verified current source, rather than treating passing component tests as the
+performance outcome. SQL still calls `capture_histogram(..., 64 MiB, ...)`
+and `captured.count()`. The non-unique daily path still calls collecting
+`read_file_rows`. Production `hashes` Elements remains disabled. No deployment
+or production speed improvement is established.
+
+Progress since the preceding audit: full streamed-proof CI passed; captured
+reader and sorted winner-mask changes are pushed. The new large-run regression
+exposed and fixed version loss at the canonical 64 MiB run ceiling. Prepared
+repeatable readers now pass all 136 selected regressions and final fmt/clippy
+signoff (`113a4d91`). Scoped Rust reviews found and addressed issues; full
+feature reviews remain open.
+
+Immediate priority: connect prepared sources to winner masks and indexed
+counting, with streamed missing-index fallback and explicit working-memory
+ownership. Verify a dirty day above the old decoded limit, then benchmark
+complete 3/7/30-day queries before production activation. Component cleanup
+alone does not meet the goal. CPU/memory profiling of other popular columns
+follows production hash validation. Next goal audit: 2026-09-08 23:10 UTC.
+
+For `113a4d91`, `make ci-signoff CHECKS="fmt clippy"` passed and attested both
+checks. Final status leaves full test, pg-smoke, and e2e to GitHub.
