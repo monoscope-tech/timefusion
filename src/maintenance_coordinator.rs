@@ -7810,6 +7810,33 @@ mod tests {
         assert!(!widths.is_empty() && widths.iter().all(|w| *w < DAY_MICROS), "bisection must leave smaller claimable children; got {widths:?}");
     }
 
+    #[test_case::test_case(true, 0 ; "timeout without a byte estimate")]
+    #[test_case::test_case(true, MAX_DECODED_BYTES / 2 ; "timeout below byte budget")]
+    #[test_case::test_case(false, 0 ; "capacity failure without a byte estimate")]
+    #[test_case::test_case(false, 2 * MAX_DECODED_BYTES ; "capacity failure with an estimate")]
+    fn failure_driven_splits_do_not_fabricate_byte_measurements(via_timeout: bool, estimate: u64) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let mut unit = task("p", 0, DAY_MICROS, Operation::Dedup);
+        unit.estimated_decoded_bytes = estimate;
+        unit.state = TaskState::Running;
+        unit.attempts = 2;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+        if via_timeout {
+            journal.abandon_running(&key, 0, None);
+        } else {
+            journal.retry_or_split(&key, "Not enough memory to continue external sort".to_owned(), 0, 2);
+        }
+        journal.checkpoint().expect("persist split");
+        let journal = TaskJournal::load(dir.path()).expect("reload split");
+        assert_eq!(journal.state(&key), Some(TaskState::Superseded));
+        let children: Vec<_> = journal.tasks().filter(|task| task.state == TaskState::Pending).collect();
+        assert_eq!(children.len(), 2, "a repeated failure still bisects the task");
+        assert_eq!(children.iter().map(|task| task.estimated_decoded_bytes).sum::<u64>(), estimate, "bisection apportions the existing estimate");
+        assert!(children.iter().all(|task| task.parent_measured_bytes.is_none()), "a failure supplies no byte measurement to persist");
+    }
+
     /// Only capacity failures shrink. A missing object or a commit conflict says
     /// nothing about size, and splitting on it would shred a healthy slice.
     #[test]
