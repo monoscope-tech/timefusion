@@ -462,3 +462,26 @@ Local `make ci-signoff` remains required before a push; its Docker prerequisite 
 
 The remaining uncertainty is integration cost, not whether an index can compute these charts.
 The native-library tests demonstrate the computation. The snapshot and coverage gates define what TimeFusion must prove before deployment.
+
+### Continued execution mandate — 2026-09-08 22:10 UTC
+
+The user requests a goal audit every 30 minutes during active work. Next audit:
+2026-09-08 22:40 UTC. Each audit must check progress toward fast hash-column
+queries, measured end to end, including the busy current day. Passing isolated
+collector tests does not establish that outcome.
+
+Before deployment, run rs-distill and rs-evasion-review at least twice, apply
+findings, and repeat affected checks. Review the full feature diff in bounded
+sections; a clean section does not establish a clean full branch. The user has
+authorized implementation of review suggestions without further confirmation.
+
+After deployment, verify hash correctness and latency in production and fix
+observed issues. Then collect CPU and memory profiles for popular queries on
+different columns and time ranges. Use those measurements to select further
+optimizations, deploy, and validate continuously until the user asks to stop.
+This profiling phase follows production verification of the hash work.
+
+The full-status rerun of the 135 selected tests passed in 10.038 seconds with
+no leak notification (`/tmp/timefusion-stream-proof-leak-check.log`). The earlier
+notification did not recur; its source remains unidentified. Full local CI for
+`bdb49995` is still running.
