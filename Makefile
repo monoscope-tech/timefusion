@@ -1,4 +1,4 @@
-.PHONY: ci ci-status ci-down ci-selftest fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: ci ci-signoff ci-status ci-down ci-selftest fmt lint lint-fix test test-unit prepush test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # THE inner-loop command: the whole suite, every time you change something.
 #
@@ -182,6 +182,13 @@ CHECKS ?=
 
 ci:
 	./scripts/ci/ci.sh local $(CHECKS)
+
+# Run local checks, publish passing results, then show what GitHub still needs.
+ci-signoff:
+	@result=0; \
+	./scripts/ci/ci.sh local $(CHECKS) || result=$$?; \
+	./scripts/ci/ci.sh gate || exit $$?; \
+	exit $$result
 
 # What CI would run right now, without running any of it.
 ci-status:

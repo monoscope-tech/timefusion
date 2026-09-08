@@ -34,7 +34,7 @@ permissions:
 jobs:
   ab:
     name: "${{ inputs.baseline_cpu }} vs ${{ inputs.candidate_cpu }}"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # The bench profile inherits `release` (thin LTO, 16 CGUs), and building this
     # dep tree that way killed a 4-vCPU runner mid-link. Lighten codegen for both
     # legs: the A/B stays valid because the two legs differ ONLY in target-cpu,

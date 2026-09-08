@@ -317,7 +317,10 @@ run_body() { # <check>
       # the workflow and `make ci` cannot drift. A partitioned run proves only
       # its slice, so ci.yml sets CI_NO_ATTEST and attests once both shards pass.
       # shellcheck disable=SC2086
-      cargo nextest run --profile ci --locked ${CI_PARTITION:+--partition "$CI_PARTITION"}
+      # nextest excludes doctests. Include them before publishing a test result,
+      # so local signoff proves the same suite as the remote shards.
+      cargo nextest run --profile ci --locked ${CI_PARTITION:+--partition "$CI_PARTITION"} &&
+        cargo test --doc --locked
       ;;
     pg-smoke) run_pg_smoke ;;
     # Default features elsewhere: --all-features would pull `e2e` into the main

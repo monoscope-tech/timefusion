@@ -10,7 +10,7 @@ permissions:
   contents: write # to publish attestation refs under refs/ci-attest/*
 
 # A newer push makes an in-flight run for the same branch obsolete. Keep pull
-# requests isolated from one another while avoiding wasted Blacksmith minutes
+# requests isolated from one another while avoiding wasted runner minutes
 # during rapid pushes to a branch.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -33,7 +33,7 @@ jobs:
   # on the remote as a ref and the job below skips it. See docs/local-ci.md.
   gate:
     name: Gate
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       fingerprints: ${{ steps.checks.outputs.fingerprints }}
       skip_fmt: ${{ steps.checks.outputs.skip_fmt }}
@@ -50,7 +50,7 @@ jobs:
     name: Format
     needs: gate
     if: needs.gate.outputs.skip_fmt != 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       # rustfmt.toml is stable-only, and rust-toolchain.toml pins the stable
@@ -79,7 +79,7 @@ jobs:
     name: Clippy
     needs: gate
     if: needs.gate.outputs.skip_clippy != 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Free disk space
@@ -108,7 +108,7 @@ jobs:
     name: Clippy & Test (shard ${{ matrix.shard }})
     needs: gate
     if: needs.gate.outputs.skip_test != 'true' || needs.gate.outputs.skip_pg_smoke != 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Tests run concurrently now. The old `--test-threads=1` was there because
     # every `WalManager` shared the process-global `WALRUS_DATA_DIR`, so two
     # concurrent tests corrupted each other's WAL (9/9 tantivy_e2e failed).
@@ -217,14 +217,6 @@ jobs:
           CI_NO_ATTEST: 'true'
         run: scripts/ci/ci.sh run test
 
-      # nextest does not run doctests, so nothing here ever did: two were broken
-      # on master for hours on 2026-08-23 (prod log output in an indented doc
-      # block, which rustdoc parses as Rust). Unpartitioned — doctests are cheap
-      # and splitting them by shard would only halve an already small step.
-      - name: Doctests
-        if: matrix.shard == 1
-        run: cargo test --doc --locked
-
       # libpq 18 sends a protocol-3.2 probe during startup. Exercise the real
       # client and its catalog meta-commands rather than only replaying SQL.
       - name: PostgreSQL 18 client smoke
@@ -243,7 +235,7 @@ jobs:
     name: Attest test
     needs: [gate, build-test]
     if: always() && needs.build-test.result == 'success' && needs.gate.outputs.skip_test != 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Attest
@@ -260,7 +252,7 @@ jobs:
     name: E2E
     needs: gate
     if: needs.gate.outputs.skip_e2e != 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always

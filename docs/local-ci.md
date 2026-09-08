@@ -1,18 +1,18 @@
 # Running CI on your own machine
 
-Our GitHub runners are 4 vCPU. Your laptop almost certainly isn't. And most of
-what CI does on any given push it has already done — the PR that produced the
-merge ran the same checks over the same bytes.
+Run checks locally before pushing. Use `make ci-signoff` to run the CI checks and publish passing results for GitHub to reuse.
+The final status output shows which checks still need a remote run.
 
-So CI now asks, before every check: **has anyone already proven this?** If yes it
-skips. It does not matter who proved it — a previous run, a re-run, or you.
+GitHub runs checks without matching attestations on standard GitHub-hosted runners.
+All workflows use GitHub runners, including releases and image builds.
 
-Nothing here is mandatory. Push and wait for CI as before, or run `make ci` and
-watch CI have almost nothing left to do.
+A signoff records passing checks for specific file contents. It does not bypass failed checks or approve different contents.
+Repository push access identifies who can publish these records. A Git `Signed-off-by` trailer does not replace CI results.
 
 ## The short version
 
 ```bash
+make ci-signoff     # local checks, published results, then remaining remote checks
 make ci                      # everything CI runs
 make ci CHECKS="fmt clippy"  # just these
 make ci-status               # what CI would run right now, without running it
@@ -22,6 +22,21 @@ make ci-down                 # stop the MinIO service
 `make prepush` is still the right thing for the fast inner loop. `make ci` is the
 whole gate, and unlike `prepush` its results are **published**, so CI can reuse
 them.
+
+## Before pushing
+
+1. Run `make ci-signoff`.
+2. Read the final status output for checks that still need GitHub.
+3. Commit the checked changes and push them.
+4. In the PR description, record the local commands, results, and any checks left for GitHub.
+
+If you edit check inputs after signoff, run signoff again. GitHub only reuses results with matching content fingerprints.
+If local checks fail, fix the failure before pushing.
+If services or tools are unavailable, record the missing checks and let GitHub run them.
+
+`CHECKS="..."` limits the local run. The final output still covers every check.
+`CI_NO_ATTEST=true` prevents publication. Without published results, GitHub must repeat the checks.
+If publication fails, the final output shows that GitHub still needs those results.
 
 ## How it works
 

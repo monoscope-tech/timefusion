@@ -34,19 +34,12 @@ concurrency:
 
 jobs:
   build:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # NOTE: the Blacksmith sticky-disk builder (useblacksmith/setup-docker-builder
-      # + build-push-action) was tried in 9082ef1 to keep the cargo-chef cook layer
-      # warm, but it never produced a working build — every run died instantly with
-      # `buildkit .../snapshots/metadata.db: no such file` (the sticky disk wasn't
-      # provisioned). Reverted to the standard buildx + gha cache that deployed
-      # reliably through 19ccb41. Re-attempt Blacksmith only once its sticky-disk
-      # feature is confirmed enabled for this repo.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
