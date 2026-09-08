@@ -6755,6 +6755,8 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn force_flush_current_bucket_drains_open_window() {
+        let now = crate::support::set_micros(chrono::Utc::now().timestamp_micros());
+        let _clock = scopeguard::guard((), |_| crate::support::unfreeze());
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
@@ -6766,8 +6768,9 @@ mod tests {
         layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
         let layer = Arc::new(layer);
 
-        // create_test_batch uses now() timestamps → the current (open) bucket.
-        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+        // Row and flush clocks must stay in the same bucket even at a wall-clock boundary.
+        let batch = json_to_batch(vec![crate::support::test_helpers::test_span_ts("open", "span", &project, now)]).unwrap();
+        layer.insert(&project, &table, vec![batch]).await.unwrap();
 
         // Normal completed-bucket flush must NOT touch the open bucket.
         layer.flush_completed_buckets().await.unwrap();
