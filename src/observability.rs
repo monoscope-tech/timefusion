@@ -1144,6 +1144,11 @@ atomic_stats! {
         /// selection hypothesis confirmed.
         rollup_base_file_skipped_tag_project,
         rollup_base_file_skipped_tag_range,
+        /// Relevant base files whose materialization generation could not be proved.
+        /// Each refusal schedules base rebuilding and retries the derived unit.
+        rollup_base_file_skipped_generation,
+        /// Persisted coverage entries rejected during restart generation validation.
+        rollup_ledger_seed_rejected_generation,
         /// Splits refused because the unit measured nearly what its parent measured:
         /// bisection has hit the row-group floor and halving the width again buys
         /// nothing but journal units.

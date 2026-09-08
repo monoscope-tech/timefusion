@@ -3,6 +3,12 @@
 use super::*;
 use tap::Tap;
 
+#[derive(Clone, Copy, Debug)]
+enum RollupRebuildReason {
+    MissingRowWitness,
+    ObsoleteGeneration,
+}
+
 /// Estimated decoded (in-memory) bytes for a Parquet file of `compressed_size` on
 /// disk — a fixed 12x compression-ratio guess used for budgeting, not measurement.
 /// One tier's contribution to a fleet contiguity gauge, or `None` to abstain.
@@ -2517,6 +2523,7 @@ impl Database {
         // Tagged base files the derived selection loop refuses, by reason. See
         // the counters' declarations and the skip site below.
         let (mut skipped_tag_project, mut skipped_tag_range) = (0u64, 0u64);
+        let mut skipped_generation = 0u64;
         // Read STRICTLY BEFORE the snapshot below, and evaluated after it — see
         // the derived base-coverage gate. Coverage is inserted only AFTER the
         // base unit's Delta commit and only ever grows, so a range collected
@@ -2532,15 +2539,24 @@ impl Database {
         // only claim a measure its base cells proved — see
         // `materialized_measures`.
         let mut base_evidence = None;
+        let mut base_generations = HashSet::new();
         let base_covered: Vec<(i64, i64)> = if derived {
             let cells = self
                 .rollup_slice_coverage
                 .iter()
                 .filter(|entry| {
                     let (project, source, table, start, end) = entry.key();
-                    *project == key.project_id && *source == key.source && *table == from && key.slice.overlaps(*start, *end)
+                    *project == key.project_id
+                        && *source == key.source
+                        && *table == from
+                        && key.slice.overlaps(*start, *end)
+                        && chrono::DateTime::from_timestamp_micros(*start)
+                            .is_some_and(|time| Self::rollup_generation_current(source, table, project, &time.date_naive().to_string(), entry.value()))
                 })
-                .map(|entry| ((entry.key().3, entry.key().4), entry.value().measures.clone()))
+                .map(|entry| {
+                    base_generations.insert(entry.value().generation.clone());
+                    ((entry.key().3, entry.key().4), entry.value().measures.clone())
+                })
                 .collect::<Vec<_>>();
             base_evidence = crate::rollup::base_measure_evidence(spec, cells.iter().map(|(_, measures)| measures.as_ref()));
             cells.into_iter().map(|(span, _)| span).collect()
@@ -2648,24 +2664,11 @@ impl Database {
                                 continue;
                             }
                         }
-                        // No slice tags — a file written before tagging existed.
-                        // Prune it on its OWN timestamp statistics, exactly as the
-                        // base branch above already does, instead of dropping it.
-                        //
-                        // Dropping it was silent and permanent: prod 2026-08-18
-                        // logged `maintenance_rollup_untagged_input` 15 times in 20
-                        // minutes, and EVERY rollup published in that window was a
-                        // derived unit with rows=0. The 1h tier — the one 14d/30d
-                        // queries read — sat at 6 days while the 1m tier had 22,
-                        // because history written before tagging can never reach it.
-                        //
-                        // Safe because this is pruning, not correctness: the
-                        // candidate set is already scoped to this (project, date)
-                        // partition, and the aggregation SQL filters `project_id`,
-                        // `date` and the timestamp range itself. A file kept here
-                        // that does not belong costs IO; a file dropped here loses
-                        // its rows for good. Missing statistics therefore mean
-                        // KEEP, never skip.
+                        // Without slice tags, prune unrelated files by their own
+                        // timestamp statistics. Missing statistics retain a candidate
+                        // for generation validation below. Dropping overlapping
+                        // inputs and publishing an empty derived cell was the #169
+                        // failure; unknown generations now require base rebuilding.
                         _ => {
                             untagged_inputs = untagged_inputs.saturating_add(1);
                             if let Ok(Some(stats)) = add.get_stats()
@@ -2678,6 +2681,18 @@ impl Database {
                                 continue;
                             }
                         }
+                    }
+                    // A current coverage range cannot authorize files from an
+                    // older materialization generation that overlap that range.
+                    if !add
+                        .tags
+                        .as_ref()
+                        .and_then(|tags| tags.get(crate::maintenance_coordinator::TAG_GENERATION))
+                        .and_then(Option::as_ref)
+                        .is_some_and(|generation| base_generations.contains(generation))
+                    {
+                        skipped_generation += 1;
+                        continue;
                     }
                 }
                 let decoded = estimated_decoded_bytes(add.size);
@@ -2715,28 +2730,52 @@ impl Database {
             stats.rollup_base_file_skipped_tag_project.fetch_add(skipped_tag_project, Relaxed);
             stats.rollup_base_file_skipped_tag_range.fetch_add(skipped_tag_range, Relaxed);
         }
+        if skipped_generation > 0 {
+            crate::observability::maintenance_stats().rollup_base_file_skipped_generation.fetch_add(skipped_generation, Relaxed);
+            warn!(source = %key.source, target = %key.physical_table, project_id = %key.project_id, skipped_generation,
+                event = "maintenance_rollup_obsolete_inputs", "derived rollup refused obsolete base materializations");
+        }
         if untagged_inputs > 0 {
             crate::observability::maintenance_stats().rollup_untagged_inputs.fetch_add(untagged_inputs, std::sync::atomic::Ordering::Relaxed);
-            // Since #169 these files are KEPT — pruned on their own timestamp
-            // statistics rather than discarded — so this is no longer a report of
-            // data that can never arrive. It now measures how much of the base
-            // tier predates tagging and is therefore being selected by the wider,
-            // stats-only test. Left at `warn` while that population is still
-            // large; it should shrink as those partitions are rewritten.
-            //
-            // The old text said "their rows can never reach this tier", which was
-            // true when it was written and false the moment #169 shipped. Stale
-            // log text is worse than none: this exact line was the evidence used
-            // to diagnose the empty coarse tier, and it would have been read the
-            // same way again.
+            // Preserve visibility into tag loss even when its generation is
+            // also missing. Such files need a base rebuild before derivation;
+            // a timestamp range alone cannot prove current reader semantics.
             warn!(
                 table = %key.physical_table,
                 project_id = %key.project_id,
                 slice_start = key.slice.start_micros,
                 untagged_inputs,
                 event = "maintenance_rollup_untagged_input",
-                "base files carry no slice tags; selected on timestamp statistics instead"
+                "base files carry no slice tags; checked by timestamp range and materialization generation"
             );
+        }
+        if skipped_generation > 0 {
+            // Excluding an unverified file is not evidence that its rows were
+            // empty. Rebuild this base range from its source and retry the
+            // derived unit, even if an in-memory coverage claim still spans it.
+            let base_spec = source_schema
+                .rollups
+                .iter()
+                .find(|candidate| candidate.table_name(&key.source) == from)
+                .ok_or_else(|| anyhow::anyhow!("derived rollup {} has no base spec", key.physical_table))?;
+            let base_key = crate::maintenance_coordinator::TaskKey {
+                physical_table: from.clone(),
+                operation: if base_spec.derive_from.is_some() {
+                    crate::maintenance_coordinator::Operation::DerivedRollup
+                } else {
+                    crate::maintenance_coordinator::Operation::BaseRollup
+                },
+                ..key.clone()
+            };
+            let now = crate::support::now_micros();
+            {
+                let mut journal = self.journal();
+                journal.enqueue(base_key, now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());
+                journal.checkpoint()?;
+            }
+            let attempts = self.journal().attempts(&key);
+            retry("base_generation_unverified".to_owned(), std::time::Duration::from_secs(60u64 << attempts.min(5)))?;
+            return Ok(true);
         }
         // A DERIVED unit's witness describes the RAW partition, but its INPUT is
         // the base tier — witness table != input table, which is the one
@@ -4567,8 +4606,9 @@ impl Database {
     /// fully-covered day says "republish me" — the claim is unverifiable, not
     /// missing. Enqueue is idempotent (keyed), so re-running hourly re-queues only
     /// what has not drained.
-    fn enqueue_witnessless_rebuilds(
-        &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, slices: &[(String, crate::maintenance_coordinator::TimeSlice)],
+    fn enqueue_unverifiable_rebuilds(
+        &self, source: &str, spec: &crate::schema::RollupSpec, target: &str, reason: RollupRebuildReason,
+        slices: &[(String, crate::maintenance_coordinator::TimeSlice)],
     ) {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey};
         if slices.is_empty() {
@@ -4588,10 +4628,11 @@ impl Database {
         // more than any older one and the bound costs nothing it would have got.
         // Re-running hourly advances the frontier: a republished slice carries a
         // witness, leaves this list, and the next pass takes the next `BOUND`.
-        let mut ordered: Vec<_> = slices.iter().collect();
+        let mut ordered: Vec<_> = slices.iter().collect::<HashSet<_>>().into_iter().collect();
         ordered.sort_unstable_by_key(|(_, slice)| std::cmp::Reverse(slice.start_micros));
         const BOUND: usize = 512;
-        let queued = ordered.len().min(BOUND);
+        let total = ordered.len();
+        let queued = total.min(BOUND);
         let mut journal = self.journal();
         for (project_id, slice) in ordered.into_iter().take(BOUND) {
             let key = TaskKey { physical_table: target.to_owned(), source: source.to_owned(), project_id: project_id.clone(), slice: *slice, operation };
@@ -4604,9 +4645,10 @@ impl Database {
             queued,
             // Named, never silent: a cap that does not say what it dropped reads
             // as "everything is queued" and hides the real size of the backlog.
-            deferred = slices.len().saturating_sub(queued),
-            event = "rollup_witnessless_rebuild_queued",
-            "slices predating the row witness cannot be verified and were queued for republish, newest first"
+            deferred = total.saturating_sub(queued),
+            ?reason,
+            event = "rollup_unverifiable_rebuild_queued",
+            "unverifiable slices queued for republish, newest first"
         );
     }
 
@@ -4627,28 +4669,28 @@ impl Database {
     /// attempt to route at all. The ledger already holds that answer durably, so
     /// routing can be correct from the first query after boot.
     ///
-    /// Sound only because the ledger records exactly the slices that passed the
-    /// read path's own filters — see `record_readable_coverage`. It seeds rather
-    /// than replaces: the replay still runs, still verifies, and overwrites
-    /// anything here, so a stale ledger costs one interval of narrower coverage
-    /// and never a wrong answer.
+    /// Revalidate materialization generations before restoring coverage: a
+    /// ledger accepted by an older reader does not prove the current semantics.
+    /// Delta tag recovery still runs and replaces the restored evidence.
     pub fn seed_routing_from_ledger(&self) -> usize {
         use crate::storage::CoverageLedger as _;
         let mut seeded = 0usize;
         for cell in self.coverage_ledger.cells() {
-            let (source, project_id, table_name, _date) = cell.clone();
+            let (source, project_id, table_name, date) = cell.clone();
             for entry in self.coverage_ledger.coverage(&cell) {
-                self.rollup_slice_coverage.insert(
-                    (project_id.clone(), source.clone(), table_name.clone(), entry.start_micros, entry.end_micros),
-                    RollupCoverage {
-                        source_fp: entry.source_fingerprint,
-                        source_epoch: None,
-                        generation: entry.generation.clone(),
-                        source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
-                        covered_through: entry.end_micros,
-                        measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
-                    },
-                );
+                let coverage = RollupCoverage {
+                    source_fp: entry.source_fingerprint,
+                    source_epoch: None,
+                    generation: entry.generation.clone(),
+                    source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
+                    covered_through: entry.end_micros,
+                    measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
+                };
+                if !Self::rollup_generation_current(&source, &table_name, &project_id, &date, &coverage) {
+                    crate::observability::maintenance_stats().rollup_ledger_seed_rejected_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                self.rollup_slice_coverage.insert((project_id.clone(), source.clone(), table_name.clone(), entry.start_micros, entry.end_micros), coverage);
                 seeded += 1;
             }
         }
@@ -4946,6 +4988,7 @@ impl Database {
             // the general queue they compete with ~7,000 other units behind a restart
             // cadence measured in tens of minutes. Queue them explicitly instead.
             let mut witnessless: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
+            let mut obsolete_generations = Vec::new();
             // The BACKLOG comes from the Delta tags, which are durable and unaffected
             // by journal state. Counting it from `published_rollups` instead made the
             // gauge lie the moment it worked: enqueueing a slice flips its task off
@@ -5000,20 +5043,35 @@ impl Database {
                 if publication.source_rows.is_none() {
                     witnessless.push((key.project_id.clone(), key.slice));
                 }
-                self.rollup_slice_coverage.insert(
-                    (key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros),
-                    RollupCoverage {
-                        source_fp: publication.source_fingerprint,
-                        source_epoch: None,
-                        generation: publication.generation.clone(),
-                        source_rows: publication.source_rows,
-                        covered_through: key.slice.end_micros,
-                        // The journal records no measure evidence, so this route
-                        // can only say "unproven". Harmless for a slice that also
-                        // has tags: the tagged loop below overwrites this entry.
-                        measures: None,
-                    },
+                let Some(date) = chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| time.date_naive().to_string()) else { continue };
+                let identity = (
+                    key.project_id.clone(),
+                    key.slice.start_micros,
+                    key.slice.end_micros,
+                    publication.generation.clone(),
+                    publication.source_fingerprint,
+                    publication.source_rows,
                 );
+                let coverage = RollupCoverage {
+                    source_fp: publication.source_fingerprint,
+                    source_epoch: None,
+                    generation: publication.generation.clone(),
+                    source_rows: publication.source_rows,
+                    covered_through: key.slice.end_micros,
+                    // The journal alone has no measure proof. Use matching file
+                    // evidence when available, including partial measure sets.
+                    measures: measures_by_identity.get(&identity).and_then(Option::as_ref).map(|names| names.iter().cloned().collect()),
+                };
+                if !Self::rollup_generation_current(source, &target, &key.project_id, &date, &coverage) {
+                    // The tagged loop queues identities it sees. A journal-only
+                    // publication still needs rebuilding when the tags are absent.
+                    if !measures_by_identity.contains_key(&identity) {
+                        obsolete_generations.push((key.project_id.clone(), key.slice));
+                    }
+                    continue;
+                }
+                self.rollup_slice_coverage
+                    .insert((key.project_id.clone(), source.to_string(), target.clone(), key.slice.start_micros, key.slice.end_micros), coverage);
                 recovered += 1;
             }
             if !tagged.is_empty() {
@@ -5067,6 +5125,7 @@ impl Database {
                     if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp, restrict.as_deref()) != generation {
                         fate(UnverifiableFate::StaleGeneration);
                         stale_generation += 1;
+                        obsolete_generations.push((project_id.clone(), slice));
                         continue;
                     }
                     if source_rows.is_none() {
@@ -5105,11 +5164,13 @@ impl Database {
                     recovered += 1;
                 }
                 self.record_readable_coverage(source, &target, readable);
-                self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
+                self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
+                self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
                 self.recover_date_coverage(source, &target).await;
                 continue;
             }
-            self.enqueue_witnessless_rebuilds(source, spec, &target, &witnessless);
+            self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
+            self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
             self.recover_date_coverage(source, &target).await;
             if !published.is_empty() {
                 continue;

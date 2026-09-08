@@ -4363,6 +4363,14 @@ impl Database {
         Ok(built)
     }
 
+    fn rollup_generation_current(source: &str, target: &str, project: &str, date: &str, coverage: &RollupCoverage) -> bool {
+        let Some(spec) = get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target)) else {
+            return false;
+        };
+        let measures = coverage.measures.as_ref().map(|names| names.iter().cloned().collect::<Vec<_>>());
+        coverage.generation == crate::rollup::generation_id(spec, source, project, date, coverage.source_fp, measures.as_deref())
+    }
+
     pub(crate) async fn rollup_sql(
         &self, logical_plan: &datafusion::logical_expr::LogicalPlan, session: &datafusion::execution::context::SessionState,
     ) -> std::result::Result<Option<RollupRewrite>, crate::rollup::MissReason> {
@@ -4544,7 +4552,10 @@ impl Database {
                     .or_else(|| fingerprints.get(&("default".to_string(), date.clone())))
                     .map_or(0, |stats| stats.fingerprint);
                 let source_epoch = self.rollup_source_epochs.get(&(project.clone(), route.source.clone(), date.clone())).map_or(0, |entry| *entry.value());
-                if coverage.source_fp != source_fp || coverage.source_epoch != Some(source_epoch) {
+                if !Self::rollup_generation_current(&route.source, &route.target, project, &date, &coverage)
+                    || coverage.source_fp != source_fp
+                    || coverage.source_epoch != Some(source_epoch)
+                {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
                     continue;
                 }
@@ -4634,6 +4645,10 @@ impl Database {
                     }
                 }
                 for (key, coverage) in fresh {
+                    if !Self::rollup_generation_current(&route.source, &route.target, project, &date, &coverage) {
+                        miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
+                        continue;
+                    }
                     // Per slice, like the witness above and for the same reason:
                     // a slice built before the measure existed sends only ITS
                     // range to the raw fringe, while siblings that do carry the
@@ -13504,6 +13519,239 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rollup_routing_rejects_legacy_materialization_generations() -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use std::hash::{Hash, Hasher};
+        let db = Arc::new(Database::with_config(create_test_config("rollup-generation-read")).await?);
+        db.cancel_maintenance();
+        let project = format!("generation_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        for hour in [1, 7, 13, 19] {
+            let at = day.and_hms_opt(hour, 0, 0).unwrap().and_utc().timestamp_micros();
+            db.insert_records_batch(
+                &project,
+                "otel_logs_and_spans",
+                vec![json_to_batch(vec![test_span_ts(&format!("row-{hour}"), "op", &project, at)])?],
+                true,
+                None,
+            )
+            .await?;
+        }
+        db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let state = ctx.state();
+        let lo = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let hi = lo + crate::maintenance_coordinator::DAY_MICROS;
+        let sql = format!(
+            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id='{project}' AND timestamp >= to_timestamp_micros({lo}) AND timestamp < to_timestamp_micros({hi})"
+        );
+        let plan = state.optimize(&state.create_logical_plan(&sql).await?)?;
+        assert!(matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "fresh materializations must route");
+        let schema = get_schema("otel_logs_and_spans").unwrap();
+        let legacy = |target: &str, coverage: &RollupCoverage| {
+            let spec = schema.rollups.iter().find(|s| s.table_name("otel_logs_and_spans") == target).unwrap();
+            let restricted = crate::schema::RollupSpec {
+                measures: spec.measures.iter().filter(|m| coverage.measures.as_ref().is_none_or(|held| held.contains(&m.name))).cloned().collect(),
+                ..spec.clone()
+            };
+            // The persisted generation algorithm before source-read semantics were versioned.
+            let mut hasher = fnv::FnvHasher::default();
+            format!("{restricted:?}").hash(&mut hasher);
+            ("otel_logs_and_spans", project.as_str(), day.to_string().as_str()).hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+        for mut entry in db.rollup_coverage.iter_mut() {
+            if entry.key().0 == project {
+                entry.value_mut().generation = legacy(&entry.key().2, entry.value());
+            }
+        }
+        for mut entry in db.rollup_slice_coverage.iter_mut() {
+            if entry.key().0 == project {
+                entry.value_mut().generation = legacy(&entry.key().2, entry.value());
+            }
+        }
+        let outcome = db.rollup_sql(&plan, &state).await;
+        // The coarser, unbuilt tier may supply the first miss; either coverage
+        // refusal is valid, but no legacy generation may produce a rewrite.
+        assert!(
+            matches!(outcome, Err(crate::rollup::MissReason::StaleCoverage | crate::rollup::MissReason::NotBuilt)),
+            "matching source rows cannot validate a pre-fix materialization: {:?}",
+            outcome.as_ref().map(|route| route.as_ref().map(|r| r.sql.as_str())).map_err(|reason| reason.label())
+        );
+        let target = schema.rollups.iter().find(|spec| spec.derive_from.is_none()).unwrap().table_name("otel_logs_and_spans");
+        let (key, mut publication) =
+            db.journal().published_rollups("otel_logs_and_spans", &target).into_iter().find(|(key, _)| key.project_id == project).unwrap();
+        let derived = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::DerivedRollup, 24, 0).await?;
+        assert_eq!(derived.state, Some(crate::maintenance_coordinator::TaskState::Retry), "a derived unit must wait for a current base generation");
+
+        // Persist the obsolete identity too. Recovery must requeue a completed
+        // publication, then a real rebuild must replace its files and restore reads.
+        use crate::maintenance_coordinator::{Operation, TAG_GENERATION, TaskState};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        let tier = db.get_or_create_table(&project, &target).await?;
+        let obsolete_paths;
+        {
+            let mut table = tier.read().await.clone();
+            let store = table.log_store().object_store(None);
+            #[allow(deprecated)]
+            let adds: Vec<_> = table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect();
+            let file_count = adds.len();
+            obsolete_paths = adds.iter().map(|add| format!("{}-fixture.parquet", add.path.trim_end_matches(".parquet"))).collect::<Vec<_>>();
+            assert!(!obsolete_paths.is_empty());
+            let coverage = db
+                .rollup_slice_coverage
+                .get(&(project.clone(), "otel_logs_and_spans".to_owned(), target.clone(), key.slice.start_micros, key.slice.end_micros))
+                .unwrap()
+                .value()
+                .clone();
+            assert!(
+                !Database::rollup_generation_current("otel_logs_and_spans", &target, &project, &day.to_string(), &coverage),
+                "fixture must persist an obsolete generation"
+            );
+            publication.generation = coverage.generation.clone();
+            assert!(db.journal().publish(&key, publication.clone()));
+            let mut actions = Vec::new();
+            for mut add in adds {
+                actions.push(Action::Remove(remove_for_add(&add, false)));
+                add.tags.as_mut().unwrap().insert(TAG_GENERATION.to_owned(), Some(coverage.generation.clone()));
+                // Use a distinct path: a Remove/Add pair for one path can be
+                // replayed as a removal, which would erase the fixture's evidence.
+                let path = format!("{}-fixture.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                add.path = path;
+                add.data_change = false;
+                actions.push(Action::Add(add));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            assert_eq!(table.snapshot()?.log_data().iter().count(), file_count, "retagging preserves every fixture file");
+            *tier.write().await = table;
+        }
+        assert_eq!(db.journal().tasks().find(|task| task.key == key).unwrap().state, TaskState::Complete);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let task_states = db.journal().tasks().map(|task| (task.key.clone(), task.state)).collect::<Vec<_>>();
+        assert_eq!(
+            task_states.iter().find(|(task, _)| *task == key).unwrap().1,
+            TaskState::Pending,
+            "obsolete completed materializations must be rebuilt; key={key:?}, tasks={task_states:?}, coverage={:?}",
+            db.rollup_slice_coverage.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>()
+        );
+        assert!(!matches!(db.rollup_sql(&plan, &state).await, Ok(Some(_))), "recovery must not restore an obsolete publication");
+        let rebuilt = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+        assert_eq!(rebuilt.state, Some(TaskState::Complete));
+        let live = live_paths(&db, &project, &target).await;
+        assert!(obsolete_paths.iter().all(|path| !live.contains(path)), "the rebuild retires the obsolete files");
+        let rewrite = db.rollup_sql(&plan, &state).await.map_err(|reason| anyhow::anyhow!("{}", reason.label()))?.expect("rebuilt coverage must route");
+        let batches = ctx.sql(&rewrite.sql).await?.collect().await?;
+        assert_eq!(
+            batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0),
+            4,
+            "rebuilt rollup agrees with the four source rows"
+        );
+
+        // A rewrite that loses all tags cannot turn a nonempty base into a
+        // trusted empty derived publication. It must request a base rebuild.
+        {
+            let mut table = tier.read().await.clone();
+            let store = table.log_store().object_store(None);
+            #[allow(deprecated)]
+            let adds: Vec<_> = table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect();
+            let file_count = adds.len();
+            assert!(file_count > 0);
+            let mut actions = Vec::new();
+            for mut add in adds {
+                actions.push(Action::Remove(remove_for_add(&add, false)));
+                let path = format!("{}-untagged.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                add.path = path;
+                add.tags = None;
+                add.data_change = false;
+                actions.push(Action::Add(add));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            assert_eq!(table.snapshot()?.log_data().iter().count(), file_count);
+            *tier.write().await = table;
+        }
+        let missing_tags = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+        assert_eq!(missing_tags.state, Some(TaskState::Retry), "missing generation evidence must not silently drop base rows");
+        assert_eq!(db.journal().tasks().find(|task| task.key == key).unwrap().state, TaskState::Pending, "the refused input must trigger base rebuilding");
+        assert!(db.journal().publish(&key, publication));
+        assert_eq!(db.journal().tasks().find(|task| task.key == key).unwrap().state, TaskState::Complete);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert_eq!(
+            db.journal().tasks().find(|task| task.key == key).unwrap().state,
+            TaskState::Pending,
+            "an obsolete journal-only publication must also be requeued"
+        );
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+        let repaired = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+        assert_eq!(repaired.state, Some(TaskState::Complete), "base rebuilding must unblock the derived tier");
+        let derived_table = schema.rollups.iter().find(|spec| spec.derive_from.is_some()).unwrap().table_name("otel_logs_and_spans");
+        let batches = ctx.sql(&format!("SELECT SUM(request_count) FROM {derived_table} WHERE project_id='{project}'")).await?.collect().await?;
+        assert_eq!(batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 4);
+
+        Ok(())
+    }
+
+    // Keep persisted generation and measure evidence consistent when modeling
+    // a materialization that predates a measure. Recover through the real tag path.
+    async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDate, measure: &str) -> Result<()> {
+        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_MEASURES, TAG_PROJECT, TAG_SLICE_START};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        use object_store::ObjectStoreExt as _;
+        let source = "otel_logs_and_spans";
+        for spec in &get_schema(source).expect("source schema").rollups {
+            let tier = db.get_or_create_table(project, &spec.table_name(source)).await?;
+            let mut table = tier.read().await.clone();
+            let store = table.log_store().object_store(None);
+            #[allow(deprecated)]
+            let adds: Vec<_> = table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect();
+            let file_count = adds.len();
+            let mut actions = Vec::new();
+            for mut add in adds {
+                let Some(tags) = add.tags.as_mut() else { continue };
+                let at = tags.get(TAG_SLICE_START).and_then(Option::as_ref).and_then(|s| s.parse().ok()).and_then(chrono::DateTime::from_timestamp_micros);
+                if tags.get(TAG_PROJECT).and_then(Option::as_deref) != Some(project) || at.is_none_or(|at| at.date_naive() != day) {
+                    continue;
+                }
+                let held = tags.get(TAG_MEASURES).and_then(Option::as_deref).expect("fresh build proves its measures");
+                assert!(held.split(',').any(|name| name == measure));
+                let names: Vec<String> = held.split(',').filter(|name| *name != measure).map(str::to_owned).collect();
+                tags.insert(TAG_MEASURES.to_owned(), Some(names.join(",")));
+                tags.insert(TAG_GENERATION.to_owned(), Some(crate::rollup::generation_id(spec, source, project, &day.to_string(), 0, Some(&names))));
+                actions.push(Action::Remove(remove_for_add(&add, false)));
+                // Use a distinct path: a Remove/Add pair for one path can be
+                // replayed as a removal, which would erase the fixture's evidence.
+                let path = format!("{}-fixture.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                add.path = path;
+                add.data_change = false;
+                actions.push(Action::Add(add));
+            }
+            if actions.is_empty() {
+                continue;
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            assert_eq!(table.snapshot()?.log_data().iter().count(), file_count, "retagging preserves every fixture file");
+            *tier.write().await = table;
+        }
+        db.recover_rollup_coverage(source).await?;
+        Ok(())
+    }
+
     /// A date whose cells cannot PROVE they hold a measure must fall to the raw
     /// fringe while its siblings keep routing.
     ///
@@ -13597,21 +13845,8 @@ mod tests {
 
         // The older day's cells lose their proof — exactly the prod shape, where
         // the column was declared before any file carried it.
-        let strip = |measures: &mut Option<HashSet<String>>| {
-            *measures = Some(measures.clone().unwrap_or_default().into_iter().filter(|name| name != DIGEST).collect());
-        };
         let stripped = days[0].to_string();
-        for mut entry in db.rollup_slice_coverage.iter_mut() {
-            if entry.key().0 == project && chrono::DateTime::from_timestamp_micros(entry.key().3).is_some_and(|time| time.date_naive().to_string() == stripped)
-            {
-                strip(&mut entry.value_mut().measures);
-            }
-        }
-        for mut entry in db.rollup_coverage.iter_mut() {
-            if entry.key().0 == project && entry.key().3 == stripped {
-                strip(&mut entry.value_mut().measures);
-            }
-        }
+        strip_rollup_measure(&db, &project, days[0], DIGEST).await?;
 
         let misses = || crate::observability::maintenance_stats().rollup_miss_measure_not_stored.load(std::sync::atomic::Ordering::Relaxed);
         for (index, select) in shapes.iter().enumerate() {
@@ -13641,16 +13876,7 @@ mod tests {
         // can prove it. That is the shape a not-yet-servable measure produces by
         // construction, and it is the case the counter could not report.
         {
-            for mut entry in db.rollup_slice_coverage.iter_mut() {
-                if entry.key().0 == project {
-                    strip(&mut entry.value_mut().measures);
-                }
-            }
-            for mut entry in db.rollup_coverage.iter_mut() {
-                if entry.key().0 == project {
-                    strip(&mut entry.value_mut().measures);
-                }
-            }
+            strip_rollup_measure(&db, &project, days[1], DIGEST).await?;
             let total = route(&db, sql(&shapes[1], true)).await;
             let reason = total.expect_err("no date can prove the digest, so nothing may route").to_string();
             assert!(
@@ -13909,13 +14135,8 @@ mod tests {
         // The base cells lose their digest proof — the prod shape, where the
         // column was declared before any base file carried a value for it. The
         // base tier's SCHEMA keeps it, which is what used to be consulted.
-        for mut entry in db.rollup_slice_coverage.iter_mut() {
-            if entry.key().0 == project && entry.key().2 == base_tier {
-                let held = entry.value().measures.clone().unwrap_or_default();
-                assert!(held.contains(DIGEST), "a fresh base build must prove the digest, or stripping it proves nothing");
-                entry.value_mut().measures = Some(held.into_iter().filter(|name| name != DIGEST).collect());
-            }
-        }
+        assert!(measures(&base_tier).iter().all(|held| held.as_ref().is_some_and(|held| held.contains(DIGEST))), "fresh base proves the digest");
+        strip_rollup_measure(&db, &project, day, DIGEST).await?;
         db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 4, 20).await?;
 
         let published = measures(&derived_tier);
@@ -14569,6 +14790,28 @@ mod tests {
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
         assert!(db.coverage_ledger.coverage(&ancient).is_empty(), "a cell past the rollup horizon is retired");
         assert_eq!(db.coverage_ledger.coverage(&cell), recorded, "and an in-window cell is untouched by retirement");
+
+        // Restart seeding must validate the materialization semantics independently
+        // of Delta replay. Recreate the pre-version generation from its real spec.
+        use std::hash::{Hash, Hasher};
+        let spec = get_schema(&cell.0).unwrap().rollups.iter().find(|spec| spec.table_name(&cell.0) == cell.2).unwrap();
+        let mut legacy = recorded.clone();
+        for entry in &mut legacy {
+            let restricted = crate::schema::RollupSpec {
+                measures: spec.measures.iter().filter(|m| entry.measures.as_ref().is_none_or(|names| names.contains(&m.name))).cloned().collect(),
+                ..spec.clone()
+            };
+            let mut hasher = fnv::FnvHasher::default();
+            format!("{restricted:?}").hash(&mut hasher);
+            (cell.0.as_str(), project.as_str(), cell.3.as_str()).hash(&mut hasher);
+            entry.generation = format!("{:016x}", hasher.finish());
+        }
+        db.coverage_ledger.replace(&cell, legacy);
+        db.rollup_slice_coverage.clear();
+        assert_eq!(db.seed_routing_from_ledger(), 0, "an old reader's ledger cannot authorize current reads");
+        db.coverage_ledger.replace(&cell, recorded);
+        assert!(db.seed_routing_from_ledger() > 0, "current persisted coverage survives restart");
+
         Ok(())
     }
 
