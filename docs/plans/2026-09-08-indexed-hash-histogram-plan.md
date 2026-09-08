@@ -375,6 +375,14 @@ Implementation checkpoint:
   `make ci-signoff CHECKS="fmt clippy test e2e"` passed and attested all four checks for `7609cc46`, including all 8 doctests.
   The final gate leaves only canonical pgwire smoke for GitHub because of the local Docker host-network limitation.
   The preceding revision's complete GitHub CI run also passed.
+- SQL histogram capture now requests one missing proof for a completed UTC day in the background.
+  One admission slot covers both queued and executing query-triggered work. Busy requests do not add a queue.
+  The existing count builder supplies per-partition single-flight coordination, its memory semaphore, and the host memory brake.
+  A bounded history of 256 attempts defers retries for 60 seconds while each entry remains resident, allowing other requested days to advance.
+  Tests verify busy-slot rejection, duplicate admission rejection, completion, retry delay, and persisted proof recovery.
+  All 133 selected Tantivy, proof, and logical-count tests passed in 8.854 seconds (`a414da47-0837-40bb-a2de-7481ea24214c`).
+  The change was tested in an isolated checkout while the preceding revision completed CI.
+  Large-day proof construction still retains the complete winner index; a count-only build path remains necessary where that exceeds the cache's build limits.
 - Initial SQL routing recognizes `count(*)` by `time_bucket` with bounded timestamps, project equality, and exact `array_has` predicates.
   String and SQL INTERVAL widths share the existing UDF parser. Aggregate replacement preserves parent projections and ordering.
   Only schema-declared element fields qualify; the `mor_versioned` fixture now has such a hashes field, while production schemas remain unchanged.
