@@ -485,3 +485,10 @@ The full-status rerun of the 135 selected tests passed in 10.038 seconds with
 no leak notification (`/tmp/timefusion-stream-proof-leak-check.log`). The earlier
 notification did not recur; its source remains unidentified. Full local CI for
 `bdb49995` is still running.
+
+Validation checkpoint — 2026-09-08 22:16 UTC: `make ci-signoff
+CHECKS="fmt clippy test e2e"` completed successfully for the `bdb49995`
+source. All four checks were attested. Final status leaves only canonical
+`pg-smoke` to GitHub because of the local Docker host-network limitation.
+The direct-provider review cleanup is isolated at `5445827b`; its focused
+regression is still running and is not covered by these attestations.
