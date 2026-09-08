@@ -1334,6 +1334,7 @@ impl Database {
                         base_tier_present: false,
                         input: Some(footprint),
                         parent_measured_bytes: None,
+                        preflight_decoded_bytes: None,
                         backfill_priority_micros: None,
                     });
                 }
@@ -1363,6 +1364,7 @@ impl Database {
                             base_tier_present: false,
                             input: Some(footprint),
                             parent_measured_bytes: None,
+                            preflight_decoded_bytes: None,
                             backfill_priority_micros: None,
                         });
                     }
@@ -2218,7 +2220,7 @@ impl Database {
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(selected_paths, whole_file_bytes);
         // Before the split test, because a unit that FITS still needs this: a
         // later timeout bisect knows only the key.
-        if self.journal().record_input(&key, input_footprint) {
+        if self.journal().record_preflight(&key, Some(input_footprint), estimated_bytes) {
             self.journal().checkpoint()?;
         }
         if estimated_bytes > MAX_DECODED_BYTES && key.slice.width() > crate::maintenance_coordinator::MIN_SLICE_MICROS {
@@ -2723,7 +2725,7 @@ impl Database {
         // Same reason as the dedup preflight: record it on every claim, not only
         // when this one splits, or a timeout bisect mints footprint-less
         // children that fusion can only sum.
-        if self.journal().record_input(&key, input_footprint) {
+        if self.journal().record_preflight(&key, Some(input_footprint), estimated_bytes) {
             self.journal().checkpoint()?;
         }
         if skipped_tag_project + skipped_tag_range > 0 {
