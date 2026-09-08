@@ -530,3 +530,29 @@ for GitHub. The next local change sorts complete keys and lineage before
 canonical deduplication and consumes its winner output incrementally. Review
 identified the canonical 64 MiB timestamp-run early-emission case; a focused
 large-run regression is running before the version-order fix.
+
+Streaming winner masks: the first 118 selected tests passed in 9.637 seconds
+(nextest `9fc081cb-27aa-414a-90a9-6a5c2bcdef12`). A new real-size regression
+then crossed the canonical 64 MiB timestamp-run ceiling and failed with 8,192
+old winners instead of 8,191. The implementation now sorts complete keys,
+version descending/nulls last, then physical source/ordinal. This keeps early
+run emission exact and preserves equal-version source priority. The expanded
+regressions are running. The source-plan consumer uses canonical deduplication
+and `execute_stream`; it charges mask buffers during execution.
+
+The collecting source adapter now uses that consumer. Wiring captured Parquet
+streams into it without retaining all decoded source batches remains pending.
+Returning masks also requires caller ownership accounting; an execution-time
+reservation alone is not a lifetime-wide memory guarantee.
+
+The version-order fix passed all 136 selected tests in 11.479 seconds
+(nextest `ae1fc38e-fce0-4379-9946-e94153b4fd94`), including the previously
+failing 64 MiB run regression. `make ci-signoff CHECKS="fmt clippy"` is
+running against this source; no new-source attestation is inferred from the
+preceding extraction. Full-feature reviews remain open.
+
+For the next source adapter, Parquet's installed async reader exposes
+`ArrowReaderMetadata` and `ParquetRecordBatchStreamBuilder::new_with_metadata`.
+Inspect the pinned version and use immutable prepared metadata to produce
+reusable physical streams and exact source lengths, rather than a one-shot
+stream hidden behind a mutex. Metadata and DV masks need reservation ownership.

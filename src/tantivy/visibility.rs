@@ -11,7 +11,11 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use datafusion::{datasource::memory::MemorySourceConfig, execution::context::TaskContext, physical_plan::collect};
+use datafusion::{
+    datasource::memory::MemorySourceConfig,
+    execution::context::TaskContext,
+    physical_plan::{ExecutionPlan, execute_stream},
+};
 
 /// Exact daily count derived from complete Delta winner resolution. File names
 /// alone are insufficient: a same-path deletion-vector update changes the proof.
@@ -312,17 +316,9 @@ pub async fn deletion_vector_mask(
 pub async fn winner_masks(
     sources: &[SourceRows], keys: &[String], tiebreak: Option<&str>, tombstone: Option<&str>, context: Arc<TaskContext>,
 ) -> Result<Vec<BooleanBuffer>> {
-    let mut masks = sources
-        .iter()
-        .map(|source| {
-            let mut mask = BooleanBufferBuilder::new(source.live.len());
-            mask.append_n(source.live.len(), false);
-            mask
-        })
-        .collect::<Vec<_>>();
     let Some(first) = sources.iter().flat_map(|source| &source.batches).next() else {
         ensure!(sources.iter().all(|source| source.live.is_empty()), "visibility source has a mask but no physical rows");
-        return Ok(masks.iter_mut().map(BooleanBufferBuilder::finish).collect());
+        return Ok(sources.iter().map(|source| BooleanBuffer::new_unset(source.live.len())).collect());
     };
     ensure!(!keys.is_empty(), "winner masks require a complete deduplication key");
     let source_schema = first.schema();
@@ -336,9 +332,7 @@ pub async fn winner_masks(
     let narrow_schema = source_schema.project(&projection)?;
     // These are physical lineage columns, carried through DedupExec alongside the
     // keys. They never enter the user schema or influence version comparison.
-    let source_column = narrow_schema.fields().len();
-    let ordinal_column = source_column + 1;
-    let lineage_names = ["__timefusion_visibility_source", "__timefusion_visibility_ordinal"];
+    let lineage_names = VISIBILITY_LINEAGE;
     ensure!(lineage_names.iter().all(|name| narrow_schema.index_of(name).is_err()), "visibility lineage column conflicts with source schema");
     let schema = Arc::new(Schema::new(
         narrow_schema
@@ -367,11 +361,58 @@ pub async fn winner_masks(
             offset += len;
         }
     }
-    // One partition preserves source order for equal-version ties. The canonical
-    // operator supplies cancellation and its existing memory reservation limits.
     let input = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
-    let plan = crate::read::DedupExec::with_tiebreak(input, keys.to_vec(), tiebreak.map(str::to_owned), None)?;
-    for batch in collect(Arc::new(plan), context).await? {
+    stream_winner_masks(input, sources.iter().map(|source| source.live.len()).collect(), keys, tiebreak, tombstone, context).await
+}
+
+pub(crate) const VISIBILITY_LINEAGE: [&str; 2] = ["__timefusion_visibility_source", "__timefusion_visibility_ordinal"];
+
+/// Resolve physical lineage from a complete source plan without collecting its output.
+/// The explicit sort preserves source/ordinal ties and lets canonical deduplication
+/// release timestamp runs. Its memory pool and spill limits come from `context`.
+pub(crate) async fn stream_winner_masks(
+    input: Arc<dyn ExecutionPlan>, source_rows: Vec<usize>, keys: &[String], tiebreak: Option<&str>, tombstone: Option<&str>, context: Arc<TaskContext>,
+) -> Result<Vec<BooleanBuffer>> {
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use futures::TryStreamExt;
+
+    ensure!(!keys.is_empty(), "streamed visibility requires a complete key");
+    let schema = input.schema();
+    let [source_column, ordinal_column] = VISIBILITY_LINEAGE.map(|name| schema.index_of(name));
+    let (source_column, ordinal_column) = (source_column?, ordinal_column?);
+    // Greatest-first within a key also keeps canonical early run emission exact
+    // when a single timestamp group exceeds its retained-buffer ceiling.
+    let ascending = arrow::compute::SortOptions::default();
+    let ordering = keys
+        .iter()
+        .map(String::as_str)
+        .filter(|key| *key == "timestamp")
+        .chain(keys.iter().map(String::as_str).filter(|key| *key != "timestamp"))
+        .map(|name| (name, ascending))
+        .chain(tiebreak.map(|name| (name, arrow::compute::SortOptions { descending: true, nulls_first: false })))
+        .chain(VISIBILITY_LINEAGE.map(|name| (name, ascending)))
+        .map(|(name, options)| Ok(PhysicalSortExpr::new(Arc::new(Column::new_with_schema(name, &schema)?), options)))
+        .collect::<Result<Vec<_>>>()?;
+    let ordering = LexOrdering::new(ordering).context("visibility sort requires keys")?;
+    let input = Arc::new(datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(input));
+    let sorted = Arc::new(SortExec::new(ordering.clone(), input));
+    let plan = crate::read::DedupExec::with_tiebreak(sorted, keys.to_vec(), tiebreak.map(str::to_owned), None)?.requiring(Some(ordering));
+    let reservation = datafusion::execution::memory_pool::MemoryConsumer::new("TantivyWinnerMasks").register(context.memory_pool());
+    let bytes = source_rows.iter().map(|rows| rows.div_ceil(8)).try_fold(0_usize, usize::checked_add).context("winner mask size overflow")?;
+    reservation.try_resize(bytes)?;
+    let mut masks = source_rows
+        .iter()
+        .map(|&rows| {
+            let mut mask = BooleanBufferBuilder::new(rows);
+            mask.append_n(rows, false);
+            mask
+        })
+        .collect::<Vec<_>>();
+    let allocated = masks.iter().map(|mask| mask.capacity().div_ceil(8)).try_fold(0_usize, usize::checked_add).context("winner mask allocation overflow")?;
+    reservation.try_resize(allocated)?;
+    let mut stream = execute_stream(Arc::new(plan), context)?;
+    while let Some(batch) = stream.try_next().await? {
         let source_ids = batch.column(source_column).as_any().downcast_ref::<UInt32Array>().context("visibility source column is not UInt32")?;
         let ordinals = batch.column(ordinal_column).as_any().downcast_ref::<UInt64Array>().context("visibility ordinal column is not UInt64")?;
         let deleted = tombstone
@@ -383,7 +424,7 @@ pub async fn winner_masks(
             if deleted.is_none_or(|column| column.is_null(row) || !column.value(row)) {
                 let source = usize::try_from(source_ids.value(row))?;
                 let ordinal = usize::try_from(ordinals.value(row))?;
-                ensure!(source < masks.len() && ordinal < sources[source].live.len(), "winner lineage is outside its source");
+                ensure!(source < masks.len() && ordinal < source_rows[source], "winner lineage is outside its source");
                 masks[source].set_bit(ordinal, true);
             }
         }
@@ -625,6 +666,25 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_winners_preserve_versions_across_large_timestamp_run() -> Result<()> {
+        // Cross the canonical 64 MiB run buffer at an output-batch boundary.
+        // The same key's newer version must still beat the preceding batch.
+        let rows = 8192;
+        let ids = (0..rows).map(|i| format!("{i:05}{}", "x".repeat(8200))).collect::<Vec<_>>();
+        let old = batch(&ids.iter().map(|id| ("p", "s", id.as_str(), 10, Some(1), None)).collect::<Vec<_>>());
+        let newer = batch(&[("p", "s", ids.last().unwrap(), 10, Some(2), None)]);
+        let sources =
+            [SourceRows { batches: vec![old], live: BooleanBuffer::new_set(rows) }, SourceRows { batches: vec![newer], live: BooleanBuffer::new_set(1) }];
+        let context = datafusion::prelude::SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_batch_size(rows));
+        let keys = ["project", "timestamp", "service", "id"].map(str::to_owned);
+        let masks = winner_masks(&sources, &keys, Some("version"), Some("deleted"), context.task_ctx()).await?;
+        assert_eq!(masks[0].count_set_bits(), rows - 1);
+        assert!(!masks[0].value(rows - 1), "the pre-boundary version must lose");
+        assert!(masks[1].value(0), "the post-boundary newer version must win");
         Ok(())
     }
 

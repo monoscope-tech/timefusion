@@ -100,3 +100,39 @@ was tightened to avoid claiming that the Parquet reader retains only one
 batch internally; the guarantee is that this adapter does not collect output.
 A second reading of the resulting extraction found no further scoped issue.
 The full-feature review remains incomplete.
+
+## Streaming winner-mask review, in progress
+
+Scope: `winner_masks`, the new `stream_winner_masks`, their callers, and
+canonical `DedupExec`/`Dedup`/`Greatest` behavior in `src/read/mod.rs`.
+
+Reuse: use the existing spill-capable `SortExec`, canonical deduplication, and
+`execute_stream`. Do not collect all winning batches before building masks.
+Coalesce input partitions before the global sort. Sort physical source and
+ordinal after keys to preserve equal-version source priority.
+
+Correctness finding: canonical bounded deduplication closes a run early above
+64 MiB, recording emitted keys as seen. Ordering only keys and lineage can
+therefore emit an older version before its newer replacement. A large-run
+regression now targets this exact boundary. It must fail for that symptom
+before fixing the new path to sort greatest version first within each key,
+with null versions last. Source/ordinal still breaks equal-version ties.
+
+Compatibility finding: generic `winner_masks` previously accepted complete
+keys without timestamp. Its extracted consumer must preserve that contract;
+prefer timestamp as the leading sort key when present, otherwise use the
+complete declared key order. Histogram capture independently requires timestamp.
+
+Mask buffers are charged to the query pool during execution, including actual
+builder capacity. The returned masks still need ownership accounting by their
+consumer; this change does not claim a complete process RSS bound.
+
+The large-run regression failed with 8,192 old winners instead of 8,191,
+confirming loss of the newer version. Applied descending version order with
+nulls last before lineage ordering. Also restored support for complete keys
+without timestamp. The expanded regression set passed: 136 tests in 11.479 seconds, nextest
+`ae1fc38e-fce0-4379-9946-e94153b4fd94`, including the large-run guard.
+A second scoped review with both skills found no further change: the sort
+retains complete keys, descending versions, and ascending physical lineage;
+mask allocation is checked and charged; errors propagate. Full-feature reviews
+and real captured-stream integration remain open.
