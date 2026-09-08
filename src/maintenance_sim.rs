@@ -287,6 +287,9 @@ pub struct SimReport {
     pub max_cell: String,
     pub max_cell_units: usize,
     pub units_at_min_slice: usize,
+    /// Minimum-width tasks per cell, separating new splits from unrelated debris.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub min_slice_units_per_cell: BTreeMap<String, usize>,
     pub samples: Vec<SimSample>,
 }
 
@@ -517,6 +520,47 @@ fn mint_stream(journal: &mut TaskJournal, stream: &Stream, start_micros: i64, en
     }
 }
 
+fn streams_from_journal(journal: &TaskJournal) -> Vec<Stream> {
+    // Streams from the journal: dedup tasks name the source table, rollup
+    // tasks name the tier tables. No tasks -> no minting (an empty journal
+    // just idles, which is itself a valid answer).
+    let mut streams: Vec<Stream> = Vec::new();
+    for task in journal.tasks() {
+        let key = &task.key;
+        let position = match streams.iter().position(|s| s.source == key.source && s.project_id == key.project_id) {
+            Some(position) => position,
+            None => {
+                streams.push(Stream {
+                    source_table: key.source.clone(),
+                    base_rollup_table: key.physical_table.clone(),
+                    derived_rollup_table: None,
+                    source: key.source.clone(),
+                    project_id: key.project_id.clone(),
+                    last_created_ms: 0,
+                });
+                streams.len() - 1
+            }
+        };
+        let stream = &mut streams[position];
+        stream.last_created_ms = stream.last_created_ms.max(task.created_unix_ms);
+        match key.operation {
+            Operation::Dedup | Operation::HotPacking => stream.source_table = key.physical_table.clone(),
+            Operation::BaseRollup => stream.base_rollup_table = key.physical_table.clone(),
+            Operation::DerivedRollup => stream.derived_rollup_table = Some(key.physical_table.clone()),
+            _ => {}
+        }
+    }
+    streams
+}
+
+/// A brief restart reconciles the touched hour from each stream, not its day.
+fn reconcile_restart(journal: &mut TaskJournal, streams: &[Stream], now: i64) {
+    let hour_start = now.div_euclid(HOUR_MICROS) * HOUR_MICROS;
+    for stream in streams {
+        mint_stream(journal, stream, hour_start, hour_start + HOUR_MICROS, now);
+    }
+}
+
 /// The claim-time preflight, mirroring `database/maintain.rs:1273-1278`:
 /// measure what the claimed slice reads, record it on the unit whether or not
 /// it splits, and split before dispatch when it is over budget and still wide
@@ -526,9 +570,7 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
     let observed = model.bytes(key);
     let footprint = model.footprint(key);
     report.preflight_measures += 1;
-    if let Some(footprint) = footprint {
-        journal.record_input(key, footprint);
-    }
+    journal.record_preflight(key, footprint, observed);
     if observed <= MAX_DECODED_BYTES || key.slice.width() <= MIN_SLICE_MICROS {
         return Some(observed);
     }
@@ -561,10 +603,10 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
 
 /// Clear the parent's measurement so `split_sheds_enough` takes its `None` arm
 /// — the only way to run the pre-fix behaviour without touching the shipped
-/// predicate. The claimed task is the journal's own post-`mark_running` copy,
-/// so re-upserting it changes exactly this one field.
+/// predicate. Read the current task so preflight evidence recorded since the
+/// claim is retained when changing the guard.
 fn defeat_guard(journal: &mut TaskJournal, task: &MaintenanceTask) {
-    let mut task = task.clone();
+    let mut task = journal.tasks().find(|current| current.key == task.key).cloned().expect("preflight task remains in the journal");
     task.parent_measured_bytes = None;
     journal.upsert(task);
 }
@@ -596,35 +638,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     let mut rng = Rng(cfg.seed);
     let end = start_micros.saturating_add(cfg.horizon_micros);
 
-    // Streams from the journal: dedup tasks name the source table, rollup
-    // tasks name the tier tables. No tasks -> no minting (an empty journal
-    // just idles, which is itself a valid answer).
-    let mut streams: Vec<Stream> = Vec::new();
-    for task in journal.tasks() {
-        let key = &task.key;
-        let position = match streams.iter().position(|s| s.source == key.source && s.project_id == key.project_id) {
-            Some(position) => position,
-            None => {
-                streams.push(Stream {
-                    source_table: key.source.clone(),
-                    base_rollup_table: key.physical_table.clone(),
-                    derived_rollup_table: None,
-                    source: key.source.clone(),
-                    project_id: key.project_id.clone(),
-                    last_created_ms: 0,
-                });
-                streams.len() - 1
-            }
-        };
-        let stream = &mut streams[position];
-        stream.last_created_ms = stream.last_created_ms.max(task.created_unix_ms);
-        match key.operation {
-            Operation::Dedup | Operation::HotPacking => stream.source_table = key.physical_table.clone(),
-            Operation::BaseRollup => stream.base_rollup_table = key.physical_table.clone(),
-            Operation::DerivedRollup => stream.derived_rollup_table = Some(key.physical_table.clone()),
-            _ => {}
-        }
-    }
+    let mut streams = streams_from_journal(&journal);
     // Only streams that are actually INGESTING mint. Discovery walks every task
     // the journal ever held, so without this an account that stopped writing
     // weeks ago still generates frontier work forever — which is where the ~6x
@@ -758,24 +772,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         }
 
         if now >= next_restart {
-            for stream in &streams {
-                // The boot reconcile enqueues per partition that saw commits
-                // while down. Models the 2026-08-18 behavior: touched hours are
-                // derived from commit file statistics, so a brief restart
-                // reconciles the CURRENT hour rather than the whole partition-day
-                // — ~13 tasks per stream rather than ~312, and 13/312 is 1/24,
-                // which is exactly this one-hour-instead-of-one-day change.
-                //
-                // It used to mint `[day_start, day_start + DAY)`. That was the
-                // PRE-fix shape and it dominated every restart backtest: measured
-                // 2026-08-23 on the real prod journal, 2 virtual hours of hourly
-                // restarts left pending at 57,444 against 22,484 with no
-                // restarts, for IDENTICAL work done (2,190 executions, identical
-                // completions). Keeping a stale model is worse than having none —
-                // it prices a fix that already shipped.
-                let hour_start = now.div_euclid(HOUR_MICROS) * HOUR_MICROS;
-                mint_stream(&mut journal, stream, hour_start, hour_start + HOUR_MICROS, now);
-            }
+            reconcile_restart(&mut journal, &streams, now);
             none_until = [0; 6];
             next_restart = if cfg.restart_every_micros > 0 { next_restart + cfg.restart_every_micros } else { i64::MAX };
         }
@@ -949,7 +946,10 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     for task in journal.tasks() {
         *report.tasks_end.entry(format!("{:?}/{:?}", task.key.operation, task.state)).or_default() += 1;
         *report.units_per_cell.entry(cell_of(&task.key)).or_default() += 1;
-        report.units_at_min_slice += usize::from(task.key.slice.width() <= MIN_SLICE_MICROS);
+        if task.key.slice.width() <= MIN_SLICE_MICROS {
+            report.units_at_min_slice += 1;
+            *report.min_slice_units_per_cell.entry(cell_of(&task.key)).or_default() += 1;
+        }
     }
     if let Some((cell, units)) = report.units_per_cell.iter().max_by_key(|(_, units)| **units) {
         (report.max_cell, report.max_cell_units) = (cell.clone(), *units);
@@ -1186,6 +1186,7 @@ mod tests {
                 base_tier_present: false,
                 input: None,
                 parent_measured_bytes: None,
+                preflight_decoded_bytes: None,
                 backfill_priority_micros: None,
             };
             journal.upsert(task.clone());
@@ -1347,31 +1348,21 @@ mod tests {
 
     #[test]
     fn a_restart_reconciles_only_the_touched_hour() {
-        // Pins the 2026-08-18 boot-reconcile behavior the model now mirrors:
-        // touched hours come from commit file statistics, so a restart
-        // re-invalidates the CURRENT HOUR per stream, not the whole
-        // partition-day. That is ~13 tasks per stream rather than ~312.
-        //
-        // The previous version of this test asserted the opposite — that hourly
-        // restarts add >100 pending — and it passed because the model still
-        // minted a whole day. Keeping it would have pinned a fix out of the
-        // model: measured 2026-08-23 on the real prod journal, the stale model
-        // reported 57,444 pending against 22,484 calm, while the corrected one
-        // reports 23,948. A backtest that prices an already-shipped fix as still
-        // broken is worse than no backtest.
-        let start = 100 * DAY_MICROS;
-        let calm = run(journal_with_streams(4), &cfg(2), start).unwrap();
-        let churning = run(journal_with_streams(4), &SimConfig { restart_every_micros: HOUR, ..cfg(2) }, start).unwrap();
-        assert!(churning.pending_end >= calm.pending_end, "a restart cannot REDUCE the queue: calm {} vs churning {}", calm.pending_end, churning.pending_end);
-        // An hour of reconcile per stream per restart, not a day of it. The
-        // bound is deliberately far below the old >100 assertion — that gap IS
-        // the fix.
+        let mut journal = journal_with_streams(4);
+        let before: HashMap<_, _> = journal.tasks().map(|task| (task.key.clone(), serde_json::to_value(task).unwrap())).collect();
+        let streams = streams_from_journal(&journal);
+        let hour_start = 100 * DAY_MICROS + 7 * HOUR;
+        reconcile_restart(&mut journal, &streams, hour_start + HOUR / 2);
+        let added: Vec<_> = journal.tasks().filter(|task| !before.contains_key(&task.key)).collect();
+        assert_eq!(added.len(), 13 * streams.len(), "each stream needs six dedup slices, six base slices, and one derived hour");
         assert!(
-            churning.pending_end < calm.pending_end + 100,
-            "an hour-scoped reconcile must not grow the queue like a day-scoped one: calm {} vs churning {}",
-            calm.pending_end,
-            churning.pending_end
+            added.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + HOUR),
+            "restart must only reconcile the touched hour"
         );
+        for (key, prior) in before {
+            let current = journal.tasks().find(|task| task.key == key).expect("unrelated task preserved");
+            assert_eq!(serde_json::to_value(current).unwrap(), prior, "unrelated history stays unchanged");
+        }
     }
 
     /// The §3c run: `synth:whale`, 6 virtual hours, 16 workers, no minting —
@@ -1444,13 +1435,28 @@ mod tests {
     }
 
     /// §3c.2 — the control. Bytes strictly proportional to width is the model
-    /// `byte_bounded_units` assumes; under it the same queue never approaches
-    /// the floor, with the guard on OR off. So the shred above is caused by the
-    /// floor, not by the scheduler.
+    /// `byte_bounded_units` assumes. Without independent execution timeouts,
+    /// byte-driven splitting must stop above the floor with either guard.
     #[test]
     fn a_floorless_whale_never_reaches_the_floor() {
         for guard in [SplitGuard::Off, SplitGuard::Shipped] {
-            let (report, whale, _) = synth_run(false, guard);
+            let start = 100 * DAY_MICROS;
+            let queue = synthetic_whale_queue(start, false, 100, 1);
+            let whale = queue.whale_cell;
+            // The duration model is independent of bytes. Its random timeouts
+            // can legitimately split even a small task, so isolate byte physics
+            // here; timeout bisection is exercised by the failure tests.
+            let cfg = SimConfig {
+                mint_frontier: false,
+                workers: 16,
+                horizon_micros: 6 * HOUR,
+                byte_model: Some(queue.model),
+                split_guard: guard,
+                duration_scale: 0.0,
+                ..Default::default()
+            };
+            let report = run(queue.journal, &cfg, start).unwrap();
+            assert_eq!(report.timeouts.values().sum::<u64>(), 0);
             // 255 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves,
             // bisection only makes powers of two, and since bisection descends
             // ONE level per measurement the 127 intermediate parents are
@@ -1458,7 +1464,7 @@ mod tests {
             // subtree). The discriminating property is unchanged and is the
             // only one asserted below: NOTHING reaches MIN_SLICE_MICROS.
             assert!(cell_units(&report, &whale) < 300, "{guard:?}: {} units", cell_units(&report, &whale));
-            assert_eq!(report.units_at_min_slice, 0, "{guard:?}: nothing may reach the floor");
+            assert_eq!(report.min_slice_units_per_cell.get(&whale).copied().unwrap_or_default(), 0, "{guard:?}: the floorless whale must not reach the floor");
         }
     }
 
