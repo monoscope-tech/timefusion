@@ -523,3 +523,10 @@ passed formatting and is running lint. No push of this extraction yet.
 The completed temporary review and proof-seeding worktrees were removed; their
 changes are integrated on the feature branch. Next 30-minute audit remains
 2026-09-08 22:40 UTC.
+
+The extraction's `make ci-signoff CHECKS="fmt clippy"` completed successfully;
+both checks were attested. Final status leaves full test, pg-smoke, and e2e
+for GitHub. The next local change sorts complete keys and lineage before
+canonical deduplication and consumes its winner output incrementally. Review
+identified the canonical 64 MiB timestamp-run early-emission case; a focused
+large-run regression is running before the version-order fix.
