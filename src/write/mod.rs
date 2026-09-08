@@ -3688,30 +3688,29 @@ impl BufferedWriteLayer {
             }
         });
 
-        let reopen_on_error = || {
+        // A cancelled query drops this future without taking an error branch.
+        // Restore admission on both paths, unless shutdown or a newer handoff
+        // has taken ownership of the fence.
+        let reopen_admission = scopeguard::guard((), |_| {
             if !self.shutdown.is_cancelled() && self.handoff_generation.load(Ordering::Acquire) == generation {
                 self.deploy_handoff_ready.store(false, Ordering::Release);
                 self.accepting_writes.store(true, Ordering::Release);
             }
-        };
+        });
         let deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
         if !self.wait_for_active_writes_until(deadline).await {
-            reopen_on_error();
             anyhow::bail!("HANDOFF timed out waiting for admitted writers; write admission reopened");
         }
         let stats = match tokio::time::timeout_at(deadline, self.flush_buckets_where(|_| true)).await {
             Ok(Ok(stats)) => stats,
             Ok(Err(e)) => {
-                reopen_on_error();
                 return Err(e.context("HANDOFF flush failed; write admission reopened"));
             }
             Err(_) => {
-                reopen_on_error();
                 anyhow::bail!("HANDOFF flush exceeded four minutes; write admission reopened");
             }
         };
         if stats.buckets_failed > 0 || !self.is_drained() {
-            reopen_on_error();
             anyhow::bail!("HANDOFF left {} failed bucket(s) or undrained WAL state; write admission reopened", stats.buckets_failed);
         }
         info!(
@@ -3721,6 +3720,7 @@ impl BufferedWriteLayer {
             HANDOFF_LEASE.as_secs()
         );
         self.deploy_handoff_ready.store(true, Ordering::Release);
+        scopeguard::ScopeGuard::into_inner(reopen_admission);
         Ok(stats)
     }
 
@@ -5799,6 +5799,26 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1), "drained handoff shutdown must stay constant-time");
         let snap = layer.wal().load_cursor_snapshot().unwrap();
         assert!(snap.clean_shutdown && snap.drained);
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_deploy_handoff_restores_admission_unless_shutdown_fenced_it() {
+        for shutting_down in [false, true] {
+            let dir = tempdir().unwrap();
+            let cfg = create_test_config(dir.path().to_path_buf());
+            let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
+            let _flush = layer.flush_lock.lock().await;
+            let mut handoff = Box::pin(layer.prepare_deploy_handoff());
+            assert!(futures::poll!(handoff.as_mut()).is_pending());
+            assert!(layer.admit_write().is_err());
+            if shutting_down {
+                layer.stop_accepting_writes();
+            }
+            drop(handoff);
+            assert_eq!(layer.admit_write().is_ok(), !shutting_down);
+            assert!(!layer.is_deploy_handoff_ready());
+        }
     }
 
     #[serial]
