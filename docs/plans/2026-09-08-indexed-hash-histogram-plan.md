@@ -556,3 +556,7 @@ For the next source adapter, Parquet's installed async reader exposes
 Inspect the pinned version and use immutable prepared metadata to produce
 reusable physical streams and exact source lengths, rather than a one-shot
 stream hidden behind a mutex. Metadata and DV masks need reservation ownership.
+
+`76a958f7` passed `make ci-signoff CHECKS="fmt clippy"`; both checks were
+attested. Final status leaves full test, pg-smoke, and e2e to GitHub. The
+current selected regression set passed all 136 tests as recorded above.
