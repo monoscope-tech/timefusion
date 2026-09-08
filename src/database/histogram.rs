@@ -415,11 +415,9 @@ impl super::Database {
         }
         let provider = Self::narrow_provider(log_store, snapshot, files.keys().cloned().collect(), None, None).await?;
         let context = SessionContext::new_with_state(super::build_optimize_session_state(1, self.maintenance_runtime_env()));
-        context.register_table("__histogram_proof", provider)?;
         let columns: Vec<_> = schema.dedup_keys.iter().chain(schema.tombstone_column.iter()).map(String::as_str).collect();
         let frame = context
-            .table("__histogram_proof")
-            .await?
+            .read_table(provider)?
             .select_columns(&columns)?
             .sort(schema.dedup_keys.iter().map(|key| datafusion::logical_expr::col(key).sort(true, true)).collect())?;
         let arrow_schema = frame.schema().as_arrow();
