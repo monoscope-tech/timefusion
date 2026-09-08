@@ -2736,12 +2736,7 @@ impl TaskJournal {
             } else {
                 self.claim_tick.is_multiple_of(2)
             };
-        let claimable = |task: &MaintenanceTask| {
-            task.key.operation == operation
-                && matches!(task.state, TaskState::Pending | TaskState::Retry)
-                && task.deadline_micros <= now_micros
-                && (allow_quarantined || !Self::is_quarantined(task))
-        };
+        let claimable = |task: &MaintenanceTask| task.key.operation == operation && Self::task_can_be_claimed(task, now_micros, allow_quarantined);
         // `(class, hole_rank, width, recency)`. Class still leads, so the live
         // frontier keeps strict priority over sealed work. `hole_rank` orders
         // WITHIN a class: a cell whose tier output is missing outranks one that
@@ -2882,6 +2877,21 @@ impl TaskJournal {
         self.fair_cursors.insert(operation, key.project_id.clone());
         self.mark_running(&key);
         self.task_indices.get(&key).map(|index| self.snapshot.tasks[*index].clone())
+    }
+
+    /// Claim exactly the requested task without changing unrelated queue entries.
+    /// Manual selection changes ordering, not eligibility or dependency proofs.
+    pub fn claim_exact(&mut self, key: &TaskKey, now_micros: i64, allow_quarantined: bool) -> Option<MaintenanceTask> {
+        let task = self.snapshot.tasks.get(*self.task_indices.get(key)?)?;
+        if !Self::task_can_be_claimed(task, now_micros, allow_quarantined) || !self.dependencies_complete(task) {
+            return None;
+        }
+        self.mark_running(key);
+        self.task_indices.get(key).map(|index| self.snapshot.tasks[*index].clone())
+    }
+
+    fn task_can_be_claimed(task: &MaintenanceTask, now_micros: i64, allow_quarantined: bool) -> bool {
+        matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros && (allow_quarantined || !Self::is_quarantined(task))
     }
 
     fn dependencies_complete(&self, task: &MaintenanceTask) -> bool {

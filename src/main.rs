@@ -349,9 +349,8 @@ fn run_sim_cli() -> anyhow::Result<()> {
 ///
 /// Execute ONE maintenance unit against the configured storage and print where
 /// its time went (scan/stage/commit/end-to-end deltas + wall). The per-unit
-/// cost decomposition as a command, not a fleet-counter inference. Point
-/// TIMEFUSION_DATA_DIR at a scratch dir so the journal holds no other
-/// claimable work.
+/// cost decomposition as a command. Claims only the requested task and preserves
+/// unrelated journal entries. Normal admission and dependency checks still apply.
 async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
     let mut source = "otel_logs_and_spans".to_string();

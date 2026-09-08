@@ -12458,6 +12458,49 @@ mod tests {
     use super::*;
     use crate::{config::AppConfig, schema::get_default_schema, support::test_helpers::*};
 
+    #[tokio::test]
+    async fn run_unit_preserves_unrelated_journal_tasks() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TaskState, TimeSlice};
+        let db = Database::with_config(create_test_config("targeted-run-unit")).await?;
+        db.cancel_maintenance();
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let start = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let unrelated = TaskKey {
+            physical_table: "otel_logs_and_spans".into(),
+            source: "otel_logs_and_spans".into(),
+            project_id: "unrelated-unit-project".into(),
+            slice: TimeSlice::new(start, start + 3_600_000_000)?,
+            operation: Operation::Dedup,
+        };
+        let before = {
+            let mut journal = db.journal();
+            journal.enqueue(unrelated.clone(), 0, 1024, 0);
+            serde_json::to_value(journal.tasks().find(|task| task.key == unrelated).unwrap())?
+        };
+        db.run_unit_once("otel_logs_and_spans", "requested-unit-project", day, Operation::Dedup, 1, 0).await?;
+        let journal = db.journal();
+        let after = serde_json::to_value(journal.tasks().find(|task| task.key == unrelated).unwrap())?;
+        assert_eq!(before, after, "running one unit must not rewrite another task");
+        drop(journal);
+
+        let report = db.run_unit_once("otel_logs_and_spans", "requested-unit-project", day, Operation::DerivedRollup, 1, 0).await?;
+        assert_eq!(report.state, Some(TaskState::Pending), "missing base coverage must block a derived claim");
+        assert!(!db.journal().tasks().any(|task| task.key.operation == Operation::BaseRollup), "a CLI run must not fabricate base completion");
+
+        let running = TaskKey { project_id: "running-unit-project".into(), ..unrelated };
+        let running_before = {
+            let mut journal = db.journal();
+            journal.enqueue(running.clone(), 0, 1024, 0);
+            assert!(journal.claim_exact(&running, -1, false).is_none(), "manual claims respect deadlines");
+            let task = journal.claim_exact(&running, 0, false).unwrap();
+            serde_json::to_value(task)?
+        };
+        db.run_unit_once("otel_logs_and_spans", "running-unit-project", day, Operation::Dedup, 1, 0).await?;
+        let journal = db.journal();
+        assert_eq!(running_before, serde_json::to_value(journal.tasks().find(|task| task.key == running).unwrap())?, "a running task cannot be claimed twice");
+        Ok(())
+    }
+
     /// A rollup tier that predates a measure gains the column, keeps it after a
     /// second pass, and makes the measure MATERIALIZABLE — which is what lets
     /// `TAG_MEASURES` record it and the read gate serve it.

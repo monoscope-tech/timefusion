@@ -3,6 +3,21 @@
 use super::*;
 use tap::Tap;
 
+#[derive(Clone, Copy)]
+enum TaskSelection<'a> {
+    Next(crate::maintenance_coordinator::Operation),
+    Exact(&'a crate::maintenance_coordinator::TaskKey),
+}
+
+impl TaskSelection<'_> {
+    fn operation(self) -> crate::maintenance_coordinator::Operation {
+        match self {
+            Self::Next(operation) => operation,
+            Self::Exact(key) => key.operation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RollupRebuildReason {
     MissingRowWitness,
@@ -1545,26 +1560,10 @@ impl Database {
             // coverage re-plans work that may already be done, which is wasteful
             // but safe, while this direction is only taken on an explicit zero.
             let default_project = if storage_project.is_empty() { "default" } else { storage_project.as_str() };
-            let partitions_of = |table: &DeltaTable| -> Result<HashSet<(String, chrono::NaiveDate)>> {
-                Ok(table
-                    .snapshot()?
-                    .log_data()
-                    .iter()
-                    .filter_map(|file| {
-                        #[allow(deprecated)]
-                        let add = file.add_action();
-                        if partition_file_is_empty(add.get_stats().ok().flatten().map(|stats| stats.num_records)) {
-                            return None;
-                        }
-                        let (project, date) = Self::maintenance_partition_from_action(&file.path(), None, default_project)?;
-                        Some((project, date.parse::<chrono::NaiveDate>().ok()?))
-                    })
-                    .collect())
-            };
 
             let source_partitions = {
                 let table = table_ref.read().await;
-                partitions_of(&table)?
+                Self::maintenance_table_partitions(&table, default_project)?
             };
             // Projects still ingesting into THIS source. Taken from the source
             // rather than from the tier, deliberately: a project whose rollup is
@@ -1607,7 +1606,10 @@ impl Database {
                 let Ok(target_ref) = self.resolve_table(&storage_project, &target).await else { continue };
                 let (covered, tier_created_ms) = {
                     let table = target_ref.read().await;
-                    (partitions_of(&table)?, table.snapshot().ok().and_then(|state| state.snapshot().metadata().created_time()))
+                    (
+                        Self::maintenance_table_partitions(&table, default_project)?,
+                        table.snapshot().ok().and_then(|state| state.snapshot().metadata().created_time()),
+                    )
                 };
                 // A tier YOUNGER than the coverage horizon cannot hold that many
                 // days, so a low number from it is ramp-up, not starvation — and
@@ -1654,7 +1656,7 @@ impl Database {
                 // without saying where. Finding that the zero came from ONE
                 // project cost a manual sweep of every project across two
                 // sources on 2026-08-17. Name it instead.
-                // `contiguous_days` counts DATE PARTITIONS — see `partitions_of`,
+                // `contiguous_days` counts DATE PARTITIONS — see `maintenance_table_partitions`,
                 // which reads file paths and non-emptiness and nothing else. A
                 // date whose files carry a superseded generation is therefore
                 // counted as covered here while the READ path refuses it, and
@@ -1699,7 +1701,7 @@ impl Database {
             let mut missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
             // ONE-SHOT REPAIR for coverage the planner is structurally blind to.
             //
-            // `partitions_of` decides "covered" from a non-empty file existing at
+            // `maintenance_table_partitions` decides "covered" from a non-empty file existing at
             // the path — it never reads the generation. So when a spec edit
             // changes `generation_id`, every slice built before it keeps the old
             // value, the READ path refuses those dates, and the planner counts
@@ -1892,7 +1894,7 @@ impl Database {
             //
             // `cells_missing` is what coverage says is absent; `cells_wanted` is
             // what survives the already-queued veto. missing=0 means the planner
-            // sees no holes (suspect `partitions_of`); missing>0 with wanted=0
+            // sees no holes (suspect `maintenance_table_partitions`); missing>0 with wanted=0
             // means the work is queued and the question is why it is not CLAIMED.
             // Those want opposite investigations and were indistinguishable.
             // Pairs with the cell census: that one says whether the planner sees
@@ -2016,7 +2018,7 @@ impl Database {
                         // infer from journal records that a historical day does
                         // not have — see `MaintenanceTask::base_tier_present`.
                         //
-                        // Sealed days only. `partitions_of` reports PRESENCE — a
+                        // Sealed days only. `maintenance_table_partitions` reports PRESENCE — a
                         // partition with one file counts — which is a true
                         // statement about a day that has stopped changing and a
                         // misleading one about a day still being written, where
@@ -2084,6 +2086,23 @@ impl Database {
         Ok(queued)
     }
 
+    fn maintenance_table_partitions(table: &DeltaTable, default_project: &str) -> Result<HashSet<(String, chrono::NaiveDate)>> {
+        Ok(table
+            .snapshot()?
+            .log_data()
+            .iter()
+            .filter_map(|file| {
+                #[allow(deprecated)]
+                let add = file.add_action();
+                if partition_file_is_empty(add.get_stats().ok().flatten().map(|stats| stats.num_records)) {
+                    return None;
+                }
+                let (project, date) = Self::maintenance_partition_from_action(&file.path(), None, default_project)?;
+                Some((project, date.parse::<chrono::NaiveDate>().ok()?))
+            })
+            .collect())
+    }
+
     /// Claim one unit, bounding occupancy by units that have proven they cannot
     /// fit their deadline. See `maintenance_quarantine_slots` for the measurement.
     ///
@@ -2092,12 +2111,16 @@ impl Database {
     /// it is released immediately when the claim turns out to be ordinary work,
     /// so the cap costs nothing in the common case.
     fn claim_coordinator_task(
-        &self, operation: crate::maintenance_coordinator::Operation,
+        &self, selection: TaskSelection<'_>,
     ) -> Option<(crate::maintenance_coordinator::MaintenanceTask, Option<tokio::sync::OwnedSemaphorePermit>)> {
         let permit = Arc::clone(&self.maintenance_quarantine_slots).try_acquire_owned().ok();
         let task = {
             let mut journal = self.journal();
-            journal.claim_next(operation, crate::support::now_micros(), permit.is_some())?
+            let now = crate::support::now_micros();
+            match selection {
+                TaskSelection::Next(operation) => journal.claim_next(operation, now, permit.is_some()),
+                TaskSelection::Exact(key) => journal.claim_exact(key, now, permit.is_some()),
+            }?
         };
         let quarantined = crate::maintenance_coordinator::TaskJournal::is_quarantined(&task);
         Some((task, permit.filter(|_| quarantined)))
@@ -2114,10 +2137,14 @@ impl Database {
     }
 
     pub(crate) async fn run_coordinator_dedup_once(&self) -> Result<bool> {
-        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources};
+        self.run_coordinator_dedup_selected(TaskSelection::Next(crate::maintenance_coordinator::Operation::Dedup)).await
+    }
+
+    async fn run_coordinator_dedup_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources};
         use std::sync::atomic::Ordering::Relaxed;
 
-        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(Operation::Dedup) else { return Ok(false) };
+        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
@@ -2302,13 +2329,13 @@ impl Database {
     /// Execute ONE maintenance unit end-to-end and report where its time went.
     /// Backs the `run-unit` CLI: the per-unit cost decomposition (handover
     /// §7.2, plan Phase 1.1) as a five-minute command instead of fleet-counter
-    /// inference. Point TIMEFUSION_DATA_DIR at a scratch dir: the journal must
-    /// hold no other claimable work, or the coordinator may claim that first.
+    /// inference. Claims only the requested key and preserves unrelated work.
+    /// Real dependency coverage and normal admission limits still apply.
     pub async fn run_unit_once(
         &self, source: &str, project_id: &str, date: chrono::NaiveDate, operation: crate::maintenance_coordinator::Operation, slice_hours: i64,
         offset_hours: i64,
     ) -> Result<UnitRunReport> {
-        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, MaintenanceTask, Operation, TaskKey, TaskState, TimeSlice};
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
         let schema = get_schema(source).ok_or_else(|| anyhow::anyhow!("unknown source table {source}"))?;
         let base_table = || schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name(source));
@@ -2331,53 +2358,22 @@ impl Database {
         let start = day_start.saturating_add(offset_hours.saturating_mul(3_600_000_000));
         let slice = TimeSlice::new(start, start.saturating_add(slice_hours.saturating_mul(3_600_000_000)))?;
         let key = TaskKey { physical_table, source: source.to_owned(), project_id: project_id.to_owned(), slice, operation };
+        // Match the planner's historical-tier admission proof. Presence permits
+        // inspection; the worker still validates generation and complete coverage.
+        // Today's base tier can still grow, so it needs journal dependency proof.
+        let base_tier_present = if operation == Operation::DerivedRollup && date < Utc::now().date_naive() {
+            let base = base_table().ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?;
+            let table = self.resolve_table(project_id, &base).await?;
+            let table = table.read().await;
+            Self::maintenance_table_partitions(&table, project_id)?.contains(&(project_id.to_owned(), date))
+        } else {
+            false
+        };
         let now = crate::support::now_micros();
         {
             let mut journal = self.journal();
-            // A CLI unit must run the unit it was ASKED for. The runners below
-            // claim whatever ranks FIRST, and this journal is not scratch: a
-            // Database built against prod storage plans prod's whole outstanding
-            // queue into it. So `run-unit --project X --date D` silently ran
-            // someone else's slice — 2026-08-20, a repair pass of 100 targeted
-            // units spent 28 of them on a 6-hour slice of a different project
-            // while every requested day stayed Pending and its untagged files
-            // survived. The report printed the REQUESTED key, so it read as
-            // success. Retire everything else, so ours is the only claimable
-            // task and the report cannot lie.
-            let others = journal.tasks().map(|task| task.key.clone()).filter(|other| *other != key).collect::<Vec<_>>();
-            for other in &others {
-                journal.complete(other);
-            }
-            if operation == Operation::DerivedRollup {
-                // A derived unit is unclaimable until its base generation is
-                // Complete; a scratch journal has none. Seed the dependency
-                // with a synthetic completed base covering the whole day.
-                let base_key = TaskKey {
-                    physical_table: base_table().ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?,
-                    slice: TimeSlice::new(day_start, day_start.saturating_add(86_400_000_000))?,
-                    operation: Operation::BaseRollup,
-                    ..key.clone()
-                };
-                journal.upsert(MaintenanceTask {
-                    key: base_key,
-                    state: TaskState::Complete,
-                    deadline_micros: 0,
-                    estimated_decoded_bytes: 0,
-                    hash_shard: 0,
-                    hash_shards: 1,
-                    attempts: 0,
-                    created_unix_ms: 0,
-                    retry_reason: None,
-                    publication: None,
-                    // A synthetic COMPLETE base for the day is exactly the proof
-                    // `dependencies_complete` looks for, so say so.
-                    base_tier_present: true,
-                    input: None,
-                    parent_measured_bytes: None,
-                    backfill_priority_micros: None,
-                });
-            }
-            journal.enqueue(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());
+            journal.enqueue_with_base_tier(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default(), base_tier_present);
+            journal.checkpoint()?;
         }
         let stats = crate::observability::maintenance_stats();
         let snapshot = || {
@@ -2393,13 +2389,13 @@ impl Database {
         let started = std::time::Instant::now();
         match operation {
             Operation::Dedup => {
-                self.run_coordinator_dedup_once().await?;
+                self.run_coordinator_dedup_selected(TaskSelection::Exact(&key)).await?;
             }
             Operation::BaseRollup | Operation::DerivedRollup => {
-                self.run_coordinator_rollup_once(operation).await?;
+                self.run_coordinator_rollup_selected(TaskSelection::Exact(&key)).await?;
             }
             _ => {
-                self.run_coordinator_compaction_once(operation).await?;
+                self.run_coordinator_compaction_selected(TaskSelection::Exact(&key)).await?;
             }
         }
         let wall = started.elapsed();
@@ -2424,6 +2420,11 @@ impl Database {
     }
 
     async fn run_coordinator_rollup_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
+        self.run_coordinator_rollup_selected(TaskSelection::Next(operation)).await
+    }
+
+    async fn run_coordinator_rollup_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
+        let operation = selection.operation();
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Resources, TaskState};
         use deltalake::{
             kernel::{Action, transaction::TableReference},
@@ -2448,7 +2449,7 @@ impl Database {
             add.tags.as_ref().and_then(|tags| tags.get(crate::maintenance_coordinator::TAG_PROJECT)).and_then(Option::as_deref)
         }
 
-        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
+        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
         let key = task.key.clone();
         self.log_task_started(&task);
         let lease = crate::maintenance_coordinator::TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
@@ -3653,6 +3654,11 @@ impl Database {
     }
 
     pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
+        self.run_coordinator_compaction_selected(TaskSelection::Next(operation)).await
+    }
+
+    async fn run_coordinator_compaction_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
+        let operation = selection.operation();
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, Resources, TaskLease, TaskState};
         // The rewrite permit BEFORE the claim, never inside `stage_hot_bin`.
         //
@@ -3682,7 +3688,7 @@ impl Database {
             },
             _ => None,
         };
-        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(operation) else { return Ok(false) };
+        let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
