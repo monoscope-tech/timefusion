@@ -463,6 +463,21 @@ impl TableSchema {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        for field in &self.fields {
+            if let Some(config) = &field.tantivy
+                && config.list_mode == TantivyListMode::Elements
+            {
+                anyhow::ensure!(
+                    config.indexed
+                        && config.tokenizer.as_deref() == Some("raw")
+                        && config.flatten.is_none()
+                        && matches!(parse_arrow_data_type(&field.data_type)?, ArrowDataType::List(inner) if matches!(inner.data_type(), ArrowDataType::Utf8 | ArrowDataType::Utf8View)),
+                    "schema `{}`: element index `{}` requires an indexed string list, raw tokenizer and no flattening",
+                    self.table_name,
+                    field.name
+                );
+            }
+        }
         let field = |role: &str, name: &str| {
             self.fields
                 .iter()
@@ -558,6 +573,18 @@ pub struct TantivyFieldConfig {
     pub tokenizer: Option<String>,
     #[serde(default)]
     pub flatten: Option<String>,
+    #[serde(default)]
+    pub list_mode: TantivyListMode,
+}
+
+/// Representation of string arrays in the search index. The default preserves
+/// existing full-text list searches; elements preserve exact tag boundaries.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TantivyListMode {
+    #[default]
+    JoinedText,
+    Elements,
 }
 
 impl TableSchema {
@@ -892,6 +919,22 @@ mod tests {
 
     fn parse_schema(extra: &str, fields: &str) -> TableSchema {
         serde_yaml::from_str(&format!("{BASE_YAML}{extra}{fields}")).expect("yaml parses")
+    }
+
+    #[test]
+    fn element_index_configuration_requires_exact_string_lists() {
+        for (data_type, options, valid) in [
+            ("List(Utf8)", "indexed: true, tokenizer: raw, list_mode: elements", true),
+            ("Utf8", "indexed: true, tokenizer: raw, list_mode: elements", false),
+            ("List(Int64)", "indexed: true, tokenizer: raw, list_mode: elements", false),
+            ("List(Utf8)", "indexed: true, list_mode: elements", false),
+            ("List(Utf8)", "indexed: false, tokenizer: raw, list_mode: elements", false),
+            ("List(Utf8)", "indexed: true, tokenizer: raw, list_mode: elements, flatten: json", false),
+            ("List(Utf8)", "indexed: true", true),
+        ] {
+            let fields = format!("{FIELDS_YAML}  - name: hashes\n    data_type: {data_type}\n    tantivy: {{{options}}}\n    nullable: true\n");
+            assert_eq!(parse_schema("", &fields).validate().is_ok(), valid, "{data_type}: {options}");
+        }
     }
 
     #[test]

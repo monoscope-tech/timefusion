@@ -30,6 +30,14 @@ z_order_columns:
   - timestamp
   - id
 fields:
+  - name: hashes
+    data_type: List(Utf8)
+    nullable: true
+    mutable: true
+    tantivy:
+      indexed: true
+      tokenizer: raw
+      list_mode: elements
   - name: date
     data_type: Date32
     nullable: false
@@ -47,6 +55,9 @@ fields:
     # merge-on-read dedup; this one must not be, or a predicate could match the
     # superseded version.
     mutable: true
+    tantivy:
+      indexed: true
+      tokenizer: raw
   # Nullable for the same reason as otel_logs_and_spans: delta-rs nulls out
   # partition columns in per-file stats.
   - name: project_id

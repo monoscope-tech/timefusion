@@ -3903,6 +3903,11 @@ impl BufferedWriteLayer {
         self.mem_buffer.get_bucket_ranges(project_id, table_name)
     }
 
+    /// Captures memory rows together with the Delta ranges they replace.
+    pub fn snapshot_for_merge(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> anyhow::Result<mem_buffer::MemSnapshot> {
+        self.mem_buffer.snapshot_for_merge(project_id, table_name, lo, hi)
+    }
+
     pub fn has_rows_in_range(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> bool {
         self.mem_buffer.has_rows_in_range(project_id, table_name, lo, hi)
     }

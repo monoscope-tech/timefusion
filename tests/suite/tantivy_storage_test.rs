@@ -48,7 +48,7 @@ fn table() -> TableSchema {
                 name: "level".into(),
                 data_type: "Utf8".into(),
                 nullable: true,
-                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
+                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None, list_mode: Default::default() }),
                 dictionary: None,
                 bloom_filter: false,
                 mutable: false,
@@ -148,16 +148,16 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     svc.build_index_for_file(TABLE, "p1", parquet_rel, &parquet_uri, store_obj.clone()).await.expect("build_index_for_file");
 
     // Manifest entry is keyed by the parquet rel path, points at the
-    // deterministic partition-mirrored blob, and the blob exists.
+    // generation of the partition-mirrored blob, and the blob exists.
     let m = load_manifest(store_obj.as_ref(), TABLE, "p1").await.unwrap();
     let entry = m.entries.get(parquet_rel).expect("manifest entry keyed by parquet rel");
     assert_eq!(entry.rows, 3);
     assert!(entry.error.is_none());
-    let expected_blob = timefusion::tantivy::index_path_for_parquet(TABLE, parquet_rel).to_string();
-    assert_eq!(entry.index.as_deref(), Some(expected_blob.as_str()));
+    let expected_blob = entry.index.as_ref().expect("published blob");
+    assert_eq!(timefusion::tantivy::index_to_parquet_rel(TABLE, expected_blob).as_deref(), Some(parquet_rel));
     assert_eq!(entry.covered_files, vec![parquet_uri.clone()], "covered_files must carry the absolute URI (coverage gate / GC keying)");
     assert!(entry.ordinals_valid, "read-back build indexes parquet row order → ordinals valid for row selection");
-    download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob)).await.expect("blob exists");
+    download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob.as_str())).await.expect("blob exists");
 
     // And the published index is actually searchable end-to-end.
     let cache = TempDir::new().unwrap();
@@ -194,6 +194,7 @@ async fn manifest_load_default_when_missing() {
 async fn manifest_upsert_and_remove_roundtrip() {
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let entry = ManifestEntry {
+        element_fields: Default::default(),
         index: Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst".into()),
         rows: 100,
         built_at: Utc::now(),
@@ -211,6 +212,7 @@ async fn manifest_upsert_and_remove_roundtrip() {
         "proj1",
         "part-uuid-2.parquet",
         ManifestEntry {
+            element_fields: Default::default(),
             index: None,
             rows: 0,
             built_at: Utc::now(),
@@ -252,6 +254,7 @@ async fn concurrent_upserts_last_writer_wins() {
                 "proj1",
                 "part-uuid-A.parquet",
                 ManifestEntry {
+                    element_fields: Default::default(),
                     index: Some("a".into()),
                     rows: 1,
                     built_at: Utc::now(),
@@ -272,6 +275,7 @@ async fn concurrent_upserts_last_writer_wins() {
                 "proj1",
                 "part-uuid-B.parquet",
                 ManifestEntry {
+                    element_fields: Default::default(),
                     index: Some("b".into()),
                     rows: 2,
                     built_at: Utc::now(),

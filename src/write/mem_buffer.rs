@@ -950,6 +950,16 @@ pub struct MemLeg {
     pub sorted: bool,
 }
 
+/// Rows and Delta exclusions captured together for merge-on-read aggregation.
+/// Each bucket is captured under its batch lock; this is not a transaction
+/// across buckets. Capture this before the Delta snapshot so a completed flush
+/// cannot remove a row from both legs of the resulting read view.
+#[derive(Debug, Default)]
+pub struct MemSnapshot {
+    pub batches: Vec<RecordBatch>,
+    pub covered_ranges: Vec<(i64, i64)>,
+}
+
 /// Sort one partition's batches into a single batch ordered by `schema`'s
 /// declared `sorting_columns`, or `None` when that cannot be done truthfully.
 ///
@@ -1561,6 +1571,41 @@ impl MemBuffer {
     #[instrument(skip(self, filters), fields(project_id, table_name))]
     pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<MemLeg> {
         self.scan_buckets(project_id, table_name, filters, None)
+    }
+
+    /// Captures complete overlapping buckets and their authority over Delta.
+    /// Rows are not predicate-filtered: version resolution must see nonmatching
+    /// replacements too. Callers apply the half-open window after resolving
+    /// versions, and must retain exclusions even when a DELETE emptied a bucket.
+    pub fn snapshot_for_merge(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> anyhow::Result<MemSnapshot> {
+        anyhow::ensure!(lo < hi, "memory snapshot requires a nonempty time window");
+        let Some(table) = self.get_table(project_id, table_name) else { return Ok(MemSnapshot::default()) };
+        let key = table_key(project_id, table_name);
+        let current = Self::current_bucket_id();
+        let mut bucket_ids: Vec<_> = table.buckets.iter().map(|bucket| *bucket.key()).collect();
+        bucket_ids.sort_unstable();
+        let mut snapshot = MemSnapshot::default();
+        for bucket_id in bucket_ids {
+            let Some(bucket) = table.buckets.get(&bucket_id) else { continue };
+            let batches = bucket.batches.lock();
+            if !bucket_overlaps_range(&bucket, &(Some(lo), Some(hi - 1))) {
+                continue;
+            }
+            snapshot.batches.extend(batches.iter().cloned());
+            if bucket_id == current || self.force_flushed.get(&key).is_some_and(|set| set.contains(&bucket_id)) {
+                continue;
+            }
+            // Use the authority range, not the surviving rows' range: a DELETE
+            // can remove all rows while an older flush is still in flight.
+            let min = bucket.min_timestamp.load(Ordering::Relaxed).max(lo);
+            let max = bucket.max_timestamp.load(Ordering::Relaxed).min(hi - 1);
+            let min = self.flushed_max.get(&key).and_then(|map| map.get(&bucket_id).copied()).map_or(min, |through| min.max(through.saturating_add(1)));
+            if min <= max {
+                snapshot.covered_ranges.push((min, max + 1));
+            }
+        }
+        snapshot.covered_ranges = merge_ranges(snapshot.covered_ranges);
+        Ok(snapshot)
     }
 
     /// Bucket scan shared by both query entry points: prune by timestamp
@@ -3863,6 +3908,30 @@ mod tests {
 
         let stats = buffer.get_stats();
         assert_eq!(stats.total_buckets, 2);
+    }
+
+    #[test]
+    fn merge_snapshot_preserves_rows_and_delete_exclusions_across_flush() {
+        let buffer = MemBuffer::new();
+        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+        let batch = create_test_batch(ts);
+        let rows = batch.num_rows();
+        buffer.insert("p", "table1", batch, ts).unwrap();
+        let before = buffer.snapshot_for_merge("p", "table1", ts, ts + 1).unwrap();
+        assert_eq!(before.covered_ranges, vec![(ts, ts + 1)]);
+        let flush = buffer.snapshot_bucket_for_flush("p", "table1", bucket_id).unwrap();
+        assert_eq!(buffer.delete("p", "table1", None, None).unwrap(), rows as u64);
+        let deleted = buffer.snapshot_for_merge("p", "table1", ts, ts + 1).unwrap();
+        assert!(deleted.batches.is_empty());
+        assert_eq!(deleted.covered_ranges, before.covered_ranges, "deleted rows must still suppress the in-flight Delta copy");
+        assert!(!buffer.finish_flushed_snapshot(&flush), "a deleted bucket must invalidate its older flush snapshot");
+        assert_eq!(before.batches.iter().map(RecordBatch::num_rows).sum::<usize>(), rows, "later deletes must not alter captured rows");
+        buffer.mark_force_flushed("p", "table1", bucket_id);
+        assert!(buffer.snapshot_for_merge("p", "table1", ts, ts + 1).unwrap().covered_ranges.is_empty());
+        assert_eq!(deleted.covered_ranges, vec![(ts, ts + 1)], "later flush markers must not alter captured exclusions");
+        assert!(buffer.snapshot_for_merge("p", "table1", ts + 1, ts + 2).unwrap().covered_ranges.is_empty());
+        assert!(buffer.snapshot_for_merge("p", "table1", ts, ts).is_err());
     }
 
     /// Snapshot-flush lifecycle: rows stay queryable after the snapshot, a

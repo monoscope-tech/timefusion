@@ -2392,15 +2392,10 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
     // Snapshot the unflushed tail before the Delta snapshot. Flush removes a
     // batch only after publishing its table snapshot, so a transitioning row
     // appears in at least one leg; an equal winner in both is a no-op overlay.
-    let filters = vec![
-        datafusion::logical_expr::col("timestamp").gt_eq(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(q.lo), Some("UTC".into())))),
-        datafusion::logical_expr::col("timestamp").lt(datafusion::logical_expr::lit(ScalarValue::TimestampMicrosecond(Some(hi), Some("UTC".into())))),
-    ];
     let (mem_batches, mem_ranges) = match database.buffered_layer() {
         Some(layer) => {
-            let mem = layer.query(&q.project_id, &q.table_name, &filters).ok()?;
-            let mem_ranges = layer.get_bucket_ranges(&q.project_id, &q.table_name);
-            (mem, mem_ranges)
+            let snapshot = layer.snapshot_for_merge(&q.project_id, &q.table_name, q.lo, hi).ok()?;
+            (snapshot.batches, snapshot.covered_ranges)
         }
         None => (Vec::new(), Vec::new()),
     };

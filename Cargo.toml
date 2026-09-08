@@ -38,7 +38,7 @@ deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", re
   "datafusion",
   "s3",
 ] }
-buoyant_kernel = { version = "0.22", features = [
+buoyant_kernel = { git = "https://github.com/tonyalaribe/delta-kernel-rs.git", rev = "6817692622f376208c95246ca7ea1a4cb4231438", features = [
   "arrow-conversion",
   "default-engine-rustls",
   "arrow-58",

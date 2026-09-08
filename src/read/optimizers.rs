@@ -1472,6 +1472,9 @@ fn indexed_columns_for(table: &str) -> Option<&'static IndexedCols> {
                         .iter()
                         .filter_map(|f| {
                             let cfg = f.tantivy.as_ref().filter(|c| c.indexed)?;
+                            if cfg.list_mode == crate::schema::TantivyListMode::Elements {
+                                return None; // exact membership has a separate route
+                            }
                             let tok = match cfg.tokenizer.as_deref().unwrap_or(NGRAM3_TOKENIZER) {
                                 RAW_TOKENIZER => RAW_TOKENIZER,
                                 DEFAULT_TOKENIZER => DEFAULT_TOKENIZER,

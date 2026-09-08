@@ -158,6 +158,178 @@ fn unique_project() -> String {
 }
 const TABLE: &str = "otel_logs_and_spans";
 
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn tantivy_histogram_daily_budget_preserves_buckets_and_captured_files() -> Result<()> {
+    use timefusion::{
+        support::test_helpers::json_to_batch_for,
+        tantivy::histogram::{HistogramWindow, Membership},
+    };
+    let (db, ctx, _) = build_db(&uuid::Uuid::new_v4().to_string(), true).await?;
+    let project = unique_project();
+    let table = "mor_versioned";
+    let day = 86_400_000_000_i64;
+    let start = (chrono::Utc::now().timestamp_micros().div_euclid(day) - 3) * day;
+    let width = 17 * 3_600_000_000_i64;
+    let hash = "x".repeat(4096);
+    let row = |id: String, timestamp: i64| json!({"project_id": project, "timestamp": timestamp, "date": chrono::DateTime::from_timestamp_micros(timestamp).unwrap().date_naive().to_string(), "id": id, "name": "match", "hashes": [hash]});
+    let mut expected = std::collections::BTreeMap::new();
+    let mut records = Vec::new();
+    for date in 0..3 {
+        for n in 0..32 {
+            let timestamp = start + date * day + if n < 16 { n } else { day - n };
+            *expected.entry(timestamp.div_euclid(width) * width).or_insert(0_u64) += 1;
+            records.push(row(format!("{date}-{n}"), timestamp));
+        }
+    }
+    let batch = json_to_batch_for(table, records)?;
+    assert!(batch.column_by_name("hashes").unwrap().get_array_memory_size() > 192 * 1024, "the test's combined hash data must exceed its daily budget");
+    db.insert_records_batch(&project, table, vec![batch], true, None).await?;
+    let window = HistogramWindow::new(start, start + 3 * day, width, 0, 16)?;
+    let membership = Membership::Contains { column: "hashes".into(), value: hash.clone() };
+    // Each date expands to >128 KiB of hash strings. All three exceed this
+    // budget, while one date fits: execution must release each day's sources.
+    let captured = db.capture_histogram(&project, table, window, Some(&membership), 192 * 1024, ctx.task_ctx()).await?;
+    assert_eq!(captured.count().await?.counts, expected);
+    assert!(db.indexed_histogram(&project, table, window, Some(&membership), 1024, ctx.task_ctx()).await.is_err());
+    db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("after-capture".into(), start + 1_000_000)])?], true, None).await?;
+    assert_eq!(captured.count().await?.counts, expected, "later commits must not change any captured daily file set");
+    *expected.entry(start.div_euclid(width) * width).or_default() += 1;
+    assert_eq!(db.indexed_histogram(&project, table, window, Some(&membership), 192 * 1024, ctx.task_ctx()).await?.counts, expected);
+    Ok(())
+}
+
+/// A newer nonmatching indexed version must defeat an older matching version
+/// outside index coverage. Exercises real SQL planning and merge-on-read.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<()> {
+    use timefusion::{
+        support::test_helpers::json_to_batch_for,
+        tantivy::udf::{PredNode, TextMatchPred},
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let (db, ctx, svc) = build_db(&format!("{id}-mutable"), true).await?;
+    let project = unique_project();
+    let table = "mor_versioned";
+    let now = chrono::Utc::now();
+    let row = |id: &str, name: &str| json!({"timestamp": now.timestamp_micros(), "date": now.date_naive().to_string(), "id": id, "name": name, "hashes": [name], "project_id": project});
+    // Direct writes bypass index construction. The update is appended through
+    // the buffer, whose flush creates the only indexed file.
+    db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("changed", "a")])?], true, None).await?;
+    let mut newer = vec![row("changed", "b")];
+    newer.extend((0..9).map(|i| row(&format!("filler-{i}"), "b")));
+    db.insert_records_batch(&project, table, vec![json_to_batch_for(table, newer)?], false, None).await?;
+    db.buffered_layer().unwrap().flush_all_now().await?;
+    let svc = svc.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let manifest = timefusion::tantivy::load_manifest(svc.object_store.as_ref(), table, &project).await?;
+        if manifest.entries.values().any(|entry| entry.index.is_some()) {
+            break;
+        }
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "index publication timed out");
+        tokio::task::yield_now().await;
+    }
+    let result = db
+        .tantivy_search()
+        .unwrap()
+        .search_with_stats(table, &project, &PredNode::Leaf(TextMatchPred { column: "name".into(), query: "a".into() }), 100, None)
+        .await?
+        .expect("usable newer index");
+    assert!(result.hits.is_empty(), "only the uncovered old version matches");
+    assert_eq!(result.indexed_rows, 10);
+    assert_eq!(db.list_file_uris(&project, table).await?.len(), 2, "both physical versions must survive in separate files");
+    assert!(
+        collect_ids(&ctx, &format!("SELECT id FROM {table} WHERE project_id='{project}' AND name='a'")).await?.is_empty(),
+        "superseded match must not return"
+    );
+    assert_eq!(collect_ids(&ctx, &format!("SELECT id FROM {table} WHERE project_id='{project}' AND id='changed' AND name='b'")).await?, vec!["changed"]);
+    let window = timefusion::tantivy::histogram::HistogramWindow::new(now.timestamp_micros(), now.timestamp_micros() + 1, 1_000_000, 0, 2)?;
+    let histogram = db.indexed_histogram(&project, table, window, None, 16 * 1024 * 1024, ctx.task_ctx()).await?;
+    assert_eq!(histogram.counts.values().sum::<u64>(), 10, "captured Delta versions must count only their winners");
+    let cache_hits = db.tantivy_search().unwrap().stats.histogram_delta_cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+    db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("memory-only", "c")])?], false, None).await?;
+    let histogram = db.indexed_histogram(&project, table, window, None, 16 * 1024 * 1024, ctx.task_ctx()).await?;
+    assert_eq!(histogram.counts.values().sum::<u64>(), 11, "captured memory must participate alongside Delta");
+    assert_eq!(
+        db.tantivy_search().unwrap().stats.histogram_delta_cache_hits.load(std::sync::atomic::Ordering::Relaxed),
+        cache_hits + 1,
+        "memory changes must reuse the unchanged Delta snapshot"
+    );
+    assert!(db.indexed_histogram(&project, table, window, None, 0, ctx.task_ctx()).await.is_err(), "snapshot capture must enforce its decoded budget");
+    for width in ["'1 second'", "INTERVAL '1 second'"] {
+        let sql = format!(
+            "SELECT time_bucket({width}, timestamp) AS bucket, count(*) AS n FROM {table} WHERE project_id='{project}' AND timestamp >= TIMESTAMP '{}' AND timestamp < TIMESTAMP '{}' AND array_has(hashes, 'b') GROUP BY 1 ORDER BY 1",
+            now.format("%Y-%m-%d %H:%M:%S%.6f"),
+            (now + chrono::Duration::microseconds(1)).format("%Y-%m-%d %H:%M:%S%.6f")
+        );
+        let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
+        let result = ctx.sql(&sql).await?.collect().await?;
+        assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 10);
+        let logical = ctx.state().create_logical_plan(&sql).await?;
+        assert_eq!(
+            db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "SQL must reach the histogram service: {}",
+            ctx.state().optimize(&logical)?.display_indent()
+        );
+        let union = sql.replace("array_has(hashes, 'b')", "(array_has(hashes, 'b') OR array_has(hashes, 'c'))");
+        let result = ctx.sql(&union).await?.collect().await?;
+        assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 11);
+        assert_eq!(db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed), before + 2);
+        let unsupported = sql.replace("AND array_has", "AND name = 'does-not-match' AND array_has");
+        assert_eq!(ctx.sql(&unsupported).await?.collect().await?.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        assert_eq!(
+            db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
+            before + 2,
+            "unsupported filters must remain on the ordinary plan"
+        );
+        for (predicate, expected, routed) in [
+            ("hashes @> ARRAY['b']", 10, true),
+            ("hashes @> ARRAY['b', 'b']", 10, true),
+            ("hashes @> ARRAY['b', 'c']", 0, true),
+            ("hashes && ARRAY['b', 'c']", 11, true),
+            (r#"jsonb_path_exists(to_jsonb(hashes), '$[*] ? (@ == "b")'::jsonpath)"#, 10, true),
+            (r#"jsonb_path_exists(to_json(hashes), '$[*] ? (@ == "c")')"#, 1, true),
+            (r#"jsonb_path_exists(to_jsonb(hashes), '$[*] ? (@ != "b")')"#, 1, false),
+            ("hashes @> ARRAY[]::text[]", 11, false),
+            ("hashes && ARRAY[NULL]::text[]", 0, false),
+        ] {
+            let query = sql.replace("array_has(hashes, 'b')", predicate);
+            let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
+            let result = ctx.sql(&query).await?.collect().await?;
+            assert_eq!(
+                result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(),
+                expected,
+                "{predicate}"
+            );
+            let logical = ctx.state().create_logical_plan(&query).await?;
+            assert_eq!(
+                db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
+                before + u64::from(routed),
+                "{predicate}: {}",
+                ctx.state().optimize(&logical)?.display_indent()
+            );
+        }
+    }
+    let predicate = timefusion::tantivy::histogram::Membership::Contains { column: "hashes".into(), value: "c".into() };
+    let captured = db.capture_histogram(&project, table, window, Some(&predicate), 16 * 1024 * 1024, ctx.task_ctx()).await?;
+    let (count, write) = tokio::join!(captured.count(), async {
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("after-capture", "b")])?], false, None).await?;
+        db.buffered_layer().unwrap().flush_all_now().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    write?;
+    assert_eq!(count?.counts.values().sum::<u64>(), 1, "a concurrent flush must not change the captured population");
+    ctx.sql(&format!("DELETE FROM {table} WHERE project_id='{project}' AND id='memory-only'")).await?.collect().await?;
+    assert_eq!(captured.count().await?.counts.values().sum::<u64>(), 1, "a later delete must not alter the retained view");
+    let fresh = db.indexed_histogram(&project, table, window, Some(&predicate), 16 * 1024 * 1024, ctx.task_ctx()).await?;
+    assert_eq!(fresh.counts.values().sum::<u64>(), 0, "a new query must see the committed delete");
+    Ok(())
+}
+
 /// Poll the tantivy manifest until it has at least `want` entries. The index
 /// build is a detached task since the flush-throughput work (ef13450) —
 /// `flush_all_now()` returning only guarantees the Delta commit, so tests

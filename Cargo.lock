@@ -1315,44 +1315,11 @@ checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
 name = "buoyant_kernel"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d3ca37afa82755db7b4fd51a4eab9e53eeb0aa1898fae15d373bd6df4bdf0f8"
-dependencies = [
- "arrow",
- "buoyant_kernel_derive 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "bytes",
- "chrono",
- "crc",
- "futures",
- "indexmap 2.14.0",
- "itertools 0.14.0",
- "object_store",
- "parquet",
- "percent-encoding",
- "rand 0.9.2",
- "reqwest 0.13.3",
- "roaring",
- "rustc_version",
- "serde",
- "serde_json",
- "strum",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "z85",
-]
-
-[[package]]
-name = "buoyant_kernel"
 version = "0.24.0"
 source = "git+https://github.com/tonyalaribe/delta-kernel-rs.git?rev=6817692622f376208c95246ca7ea1a4cb4231438#6817692622f376208c95246ca7ea1a4cb4231438"
 dependencies = [
  "arrow",
- "buoyant_kernel_derive 1.0.0 (git+https://github.com/tonyalaribe/delta-kernel-rs.git?rev=6817692622f376208c95246ca7ea1a4cb4231438)",
+ "buoyant_kernel_derive",
  "bytes",
  "chrono",
  "crc",
@@ -1376,17 +1343,6 @@ dependencies = [
  "url",
  "uuid",
  "z85",
-]
-
-[[package]]
-name = "buoyant_kernel_derive"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3448e05bba811d98c73a466843abd8c16d0416dc083f92b66847693fcb0714f4"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -2965,7 +2921,7 @@ name = "deltalake"
 version = "1.0.0"
 source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=12847eb612ad49a7d43850081639b4647c42d3ec#12847eb612ad49a7d43850081639b4647c42d3ec"
 dependencies = [
- "buoyant_kernel 0.24.0",
+ "buoyant_kernel",
  "ctor",
  "deltalake-aws",
  "deltalake-core",
@@ -3013,7 +2969,7 @@ dependencies = [
  "arrow-select",
  "async-trait",
  "brotli-decompressor",
- "buoyant_kernel 0.24.0",
+ "buoyant_kernel",
  "bytes",
  "cfg-if",
  "chrono",
@@ -8422,7 +8378,7 @@ dependencies = [
  "base64",
  "bincode 2.0.1",
  "bon",
- "buoyant_kernel 0.22.0",
+ "buoyant_kernel",
  "bytes",
  "chrono",
  "chrono-tz",
