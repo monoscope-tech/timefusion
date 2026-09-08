@@ -512,3 +512,14 @@ resolution. Charge masks and batch/sort working memory; do not silently bypass
 the existing daily decoded-budget contract. A sorted key stream should use the
 query runtime's spill limits. No full-day hash-array collection is required by
 that design. This consumer and its large-day parity test are not yet implemented.
+
+Stream extraction `1edf7519`: all 135 selected tests passed in 9.099 seconds
+(nextest `6ccf21b2-704d-4261-8a00-759a9153c9f1`). Command:
+`SSL_CERT_FILE=/etc/ssl/cert.pem TIMEFUSION_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+cargo nextest run --locked --no-default-features -E 'test(tantivy) |
+test(count_proofs_bind) | test(logical_count) | test(delta_cache) |
+test(histogram_capture_detects)'`. `make ci-signoff CHECKS="fmt clippy"`
+passed formatting and is running lint. No push of this extraction yet.
+The completed temporary review and proof-seeding worktrees were removed; their
+changes are integrated on the feature branch. Next 30-minute audit remains
+2026-09-08 22:40 UTC.
