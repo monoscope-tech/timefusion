@@ -372,7 +372,9 @@ Implementation checkpoint:
   Command: `SSL_CERT_FILE=/etc/ssl/cert.pem TIMEFUSION_TEST_S3_ENDPOINT=http://127.0.0.1:9000 cargo nextest run --locked --no-default-features -E 'test(tantivy) | test(count_proofs_bind) | test(delta_cache) | test(histogram_capture_detects) | test(logical_count) | test(positional)'`.
   Production seeding and large-partition build limits remain outstanding. Loading an older Arrow cache alone does not publish a new proof.
   The proof currently publishes only after a successful fresh count build and cache install; publication failure retains ordinary fallback behavior.
-  `make ci-signoff CHECKS="fmt clippy test e2e"` is running for this revision.
+  `make ci-signoff CHECKS="fmt clippy test e2e"` passed and attested all four checks for `7609cc46`, including all 8 doctests.
+  The final gate leaves only canonical pgwire smoke for GitHub because of the local Docker host-network limitation.
+  The preceding revision's complete GitHub CI run also passed.
 - Initial SQL routing recognizes `count(*)` by `time_bucket` with bounded timestamps, project equality, and exact `array_has` predicates.
   String and SQL INTERVAL widths share the existing UDF parser. Aggregate replacement preserves parent projections and ordering.
   Only schema-declared element fields qualify; the `mor_versioned` fixture now has such a hashes field, while production schemas remain unchanged.
