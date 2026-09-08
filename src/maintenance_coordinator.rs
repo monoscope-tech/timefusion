@@ -1487,7 +1487,8 @@ impl TaskJournal {
             })
         };
         self.retain_tasks(|task| {
-            if !matches!(task.state, TaskState::Pending | TaskState::Retry) || is_live_frontier(task.key.slice, now_micros) || is_damage(task) {
+            // A covering task does not carry this retry's failure history or deadline.
+            if task.state != TaskState::Pending || is_live_frontier(task.key.slice, now_micros) || is_damage(task) {
                 return true;
             }
             // The NARROWEST ladder width this unit fits inside, so that every
@@ -1538,7 +1539,7 @@ impl TaskJournal {
         let untagged_cells = self.untagged_cells.clone();
         let coarsenable = |task: &MaintenanceTask| {
             matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
-                && matches!(task.state, TaskState::Pending | TaskState::Retry)
+                && task.state == TaskState::Pending
                 && !is_live_frontier(task.key.slice, now_micros)
                 && task.key.slice.width() < width
                 && !chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
@@ -1550,27 +1551,16 @@ impl TaskJournal {
                     ))
                 })
         };
-        // Which buckets may not be fused at this width, and why. Three distinct
-        // reasons, and collapsing them into one rule is what made the old
-        // day-or-nothing version dead-end:
-        //
-        //   Running          — claimed work. Never race it, at any width.
-        //   Superseded, <= W — proven too big at a width no larger than this
-        //                      one, so this one cannot fit either.
-        //   Pending/Retry, >= W — the span is already queued at least this wide;
-        //                      a narrower unit inside it is duplicate work.
-        //
-        // The middle rule is the cascade. `split_time_task` supersedes a unit
-        // that did not fit and replaces it with children; without the width
-        // comparison a superseded DAY would block its children at every width
-        // and they would sit at ten minutes forever, which is the state prod was
-        // in. With it, a superseded day frees six hours, a superseded six hours
-        // frees one, and each supersede strictly lowers the ceiling — so the
-        // split/fuse loop the guard exists to prevent still cannot run.
+        // Running and Retry units block every overlapping bucket. A retry
+        // owns a deadline and failure history: fusing it would reset both on
+        // a fresh Pending parent, and fusing only its neighbours into that
+        // parent would bypass the same retry. Preserve it until the worker
+        // resolves it, even after its deadline passes.
+        // Pending units block buckets already covered at this width or wider.
         let mut blocked: HashSet<(String, String, String, Operation, i64)> = HashSet::new();
         for task in self.snapshot.tasks.iter().filter(|task| match task.state {
-            TaskState::Running => true,
-            TaskState::Pending | TaskState::Retry => task.key.slice.width() >= width,
+            TaskState::Running | TaskState::Retry => true,
+            TaskState::Pending => task.key.slice.width() >= width,
             // Superseded does NOT block, and that reversal is the point.
             //
             // It used to block every width at or above its own, so a cell split
@@ -7254,6 +7244,51 @@ mod tests {
         assert!(!journal.split_time_task(&repair, MAX_DECODED_BYTES * 8, None), "repair must decline to split");
         assert_eq!(journal.snapshot.tasks.len(), before, "a declined split must mint no children");
         assert_eq!(journal.state(&repair), Some(TaskState::Pending), "and must not supersede the parent");
+    }
+
+    #[test_case::test_case(Operation::Dedup, "worker_error")]
+    #[test_case::test_case(Operation::BaseRollup, "schema_error")]
+    #[test_case::test_case(Operation::DerivedRollup, "source_not_flushed")]
+    fn coarsening_preserves_retry_state(operation: Operation, reason: &str) {
+        const DAY: i64 = 86_400_000_000;
+        let now = 10 * DAY;
+        for deadline in [now - 1, now + 60_000_000] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            let retry = task("p", DAY, DAY + NORMAL_SLICE_MICROS, operation).key;
+            let neighbour = task("p", DAY + NORMAL_SLICE_MICROS, DAY + 2 * NORMAL_SLICE_MICROS, operation).key;
+            let other = task("q", DAY, DAY + NORMAL_SLICE_MICROS, operation).key;
+            for key in [&retry, &neighbour, &other] {
+                journal.enqueue(key.clone(), 0, 1, 0);
+            }
+            assert!(journal.mark_running(&retry));
+            journal.retry(&retry, reason.to_owned(), deadline);
+            journal.coarsen_sealed_slices(now);
+            journal.checkpoint().expect("checkpoint");
+            let loaded = TaskJournal::load(dir.path()).expect("reload");
+            let retained = loaded.tasks().find(|t| t.key == retry).expect("coarsening must retain the retry");
+            assert_eq!(
+                (retained.state, retained.attempts, retained.deadline_micros, retained.retry_reason.as_deref()),
+                (TaskState::Retry, 1, deadline, Some(reason))
+            );
+            assert!(loaded.tasks().any(|t| t.key.project_id == "q" && t.key.slice.width() > NORMAL_SLICE_MICROS), "unrelated pending work still coarsens");
+            assert!(
+                !loaded.tasks().any(|t| t.key.project_id == "p"
+                    && t.key != retry
+                    && t.key.slice.start_micros <= retry.slice.start_micros
+                    && t.key.slice.end_micros >= retry.slice.end_micros),
+                "coarsening must not bypass the retry through a covering parent"
+            );
+            // A wider unit queued independently must not erase the retry either.
+            let parent = task("p", DAY, 2 * DAY, operation).key;
+            journal.enqueue(parent, 0, 1, 0);
+            journal.coarsen_sealed_slices(now);
+            let retained = journal.tasks().find(|t| t.key == retry).expect("subsumption must retain the retry");
+            assert_eq!(
+                (retained.state, retained.attempts, retained.deadline_micros, retained.retry_reason.as_deref()),
+                (TaskState::Retry, 1, deadline, Some(reason))
+            );
+        }
     }
 
     #[test]
