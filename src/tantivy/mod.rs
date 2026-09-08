@@ -711,6 +711,9 @@ pub struct Manifest {
     /// queries. GC removes them after the grace period, retrying failed deletes.
     #[serde(default)]
     pub retired_blobs: BTreeMap<String, DateTime<Utc>>,
+    /// Bounded daily proofs survive eviction of the large logical-count cache.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) count_proofs: BTreeMap<chrono::NaiveDate, visibility::PartitionCountProof>,
 }
 
 impl Manifest {

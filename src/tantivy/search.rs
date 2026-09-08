@@ -1469,6 +1469,24 @@ impl TantivyIndexService {
         }
     }
 
+    pub(crate) async fn publish_count_proof(
+        &self, table: &str, project: &str, date: chrono::NaiveDate, proof: super::visibility::PartitionCountProof,
+    ) -> Result<()> {
+        super::mutate(self.object_store.as_ref(), table, project, |manifest| {
+            manifest.count_proofs.insert(date, proof);
+            // A thirty-day chart can intersect thirty-one UTC partitions.
+            while manifest.count_proofs.len() > 32 {
+                manifest.count_proofs.pop_first();
+            }
+            ((), true)
+        })
+        .await?;
+        if let Some(reader) = self.reader() {
+            reader.invalidate_manifest(table, project);
+        }
+        Ok(())
+    }
+
     /// Carry existing coverage FORWARD across a compaction instead of
     /// re-indexing its output.
     ///

@@ -360,7 +360,19 @@ Implementation checkpoint:
   The route requires complete usable index coverage and timestamp bounds inside the partition, then counts with pinned DV masks without decoding event keys or hashes.
   A real Delta/Tantivy test declines coverage without proof, counts under a 64-byte bitmap budget after proof, rejects added versions and same-path DV changes, and accepts a refreshed proof after the superseded physical row is deleted.
   The original captured view retains its pre-DV count.
-  Existing path-only dedup certificates do not supply this proof. The logical-count cache's limited resident history still constrains availability; durable compact proofs and production seeding remain outstanding.
+  Existing path-only dedup certificates do not supply this proof.
+- Fresh logical-count builds now publish compact daily proofs to the Tantivy manifest for tables with element indexes.
+  Each proof binds the table root, complete file/DV set, key order, tiebreak, tombstone column, and projected visibility schema.
+  Queries can recover the count after winner-cache eviction or database restart. They still require complete usable ordinal indexes and physical/logical count equality.
+  The manifest retains at most 32 daily proofs per project/table, covering the 31 UTC partitions a thirty-day window can intersect.
+  A real integration test checks cache eviction, manifest reload, a cold database and index-reader restart, stale file/DV rejection, and retained old captures.
+  A persistence test checks identity changes, serialization, and the retention limit.
+  The two focused tests passed in 1.539 seconds (`9a9c16f1-438c-4ec5-972f-545eb93ec358`).
+  All 135 selected Tantivy, proof, logical-count, cache, capture, and positional tests passed in 9.095 seconds (`fa247551-9636-4a81-8290-fdad3942221c`).
+  Command: `SSL_CERT_FILE=/etc/ssl/cert.pem TIMEFUSION_TEST_S3_ENDPOINT=http://127.0.0.1:9000 cargo nextest run --locked --no-default-features -E 'test(tantivy) | test(count_proofs_bind) | test(delta_cache) | test(histogram_capture_detects) | test(logical_count) | test(positional)'`.
+  Production seeding and large-partition build limits remain outstanding. Loading an older Arrow cache alone does not publish a new proof.
+  The proof currently publishes only after a successful fresh count build and cache install; publication failure retains ordinary fallback behavior.
+  `make ci-signoff CHECKS="fmt clippy test e2e"` is running for this revision.
 - Initial SQL routing recognizes `count(*)` by `time_bucket` with bounded timestamps, project equality, and exact `array_has` predicates.
   String and SQL INTERVAL widths share the existing UDF parser. Aggregate replacement preserves parent projections and ordering.
   Only schema-declared element fields qualify; the `mor_versioned` fixture now has such a hashes field, while production schemas remain unchanged.
@@ -388,7 +400,8 @@ Implementation checkpoint:
   A repeat with `CI_KEEP_GOING=true make ci-signoff CHECKS="pg-smoke e2e"` confirmed this limitation and started e2e.
   The server listened on port 12345. The same PostgreSQL 18.4 container returned `SELECT 1` through `host.docker.internal`.
   All five catalog commands (`\dt`, `\d otel_logs_and_spans`, `\l`, `\du`, `\dn`) passed through that address with `ON_ERROR_STOP=1`.
-  This alternate-address check has no attestation; GitHub must run canonical pgwire smoke. E2e remains in progress.
+  This alternate-address check has no attestation; GitHub must run canonical pgwire smoke.
+  E2e subsequently passed and published an attestation for the source in `a426b1e9`, before the persisted-proof change.
 - A read-only repeat of the recorded seven-day known-ID production chart timed out after 10.043 seconds.
   [Recorded result](evidence/2026-09-08-hashes/production-known-candidate-recheck.json), taken at `2026-09-08T21:05:56Z`.
   This branch was not deployed, and the probe did not establish the server revision.

@@ -13,6 +13,56 @@ use arrow::{
 };
 use datafusion::{datasource::memory::MemorySourceConfig, execution::context::TaskContext, physical_plan::collect};
 
+/// Exact daily count derived from complete Delta winner resolution. File names
+/// alone are insufficient: a same-path deletion-vector update changes the proof.
+/// Keeping this small result in the manifest avoids retaining every event key.
+#[serde_with::serde_as]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PartitionCountProof {
+    version: u32,
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    root: url::Url,
+    files: crate::read::CountFiles,
+    keys: Vec<String>,
+    tiebreak: Option<String>,
+    tombstone: Option<String>,
+    schema: Schema,
+    pub logical_count: u64,
+}
+
+impl PartitionCountProof {
+    fn visibility_schema(table: &crate::schema::TableSchema) -> Result<Schema> {
+        let schema = table.schema_ref();
+        let columns = table.dedup_keys.iter().chain(table.dedup_tiebreak.iter()).chain(table.tombstone_column.iter());
+        let projection = columns.map(|column| schema.index_of(column)).collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(schema.project(&projection)?)
+    }
+
+    /// The caller must have resolved the entire partition represented by `files`.
+    pub fn new(root: url::Url, files: crate::read::CountFiles, table: &crate::schema::TableSchema, logical_count: u64) -> Result<Self> {
+        Ok(Self {
+            version: 1,
+            root,
+            files,
+            keys: table.dedup_keys.clone(),
+            tiebreak: table.dedup_tiebreak.clone(),
+            tombstone: table.tombstone_column.clone(),
+            schema: Self::visibility_schema(table)?,
+            logical_count,
+        })
+    }
+
+    pub fn matches(&self, root: &url::Url, files: &crate::read::CountFiles, table: &crate::schema::TableSchema) -> bool {
+        self.version == 1
+            && self.root == *root
+            && self.files == *files
+            && self.keys == table.dedup_keys
+            && self.tiebreak == table.dedup_tiebreak
+            && self.tombstone == table.tombstone_column
+            && Self::visibility_schema(table).is_ok_and(|schema| schema == self.schema)
+    }
+}
+
 /// Resolves an index source URI against the captured table root.
 /// Absolute URIs outside this store or table cannot establish coverage.
 pub fn relative_source_path(root: &url::Url, source: &str) -> Result<Option<String>> {
@@ -326,6 +376,52 @@ pub async fn winner_masks(
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
+
+    #[tokio::test]
+    async fn count_proofs_bind_visibility_and_retain_thirty_day_windows() -> Result<()> {
+        let root = url::Url::parse("s3://bucket/table")?;
+        let schema = crate::schema::get_schema("mor_versioned").unwrap();
+        let files: crate::read::CountFiles = [("part/file.parquet".into(), None)].into();
+        let proof = PartitionCountProof::new(root.clone(), files.clone(), schema, 7)?;
+        for change in 0..8 {
+            let mut changed = proof.clone();
+            match change {
+                0 => changed.version += 1,
+                1 => changed.root = url::Url::parse("s3://other/table")?,
+                2 => {
+                    changed.files.insert("other.parquet".into(), None);
+                }
+                3 => {
+                    changed.files.insert(
+                        "part/file.parquet".into(),
+                        Some(deltalake::kernel::DeletionVectorDescriptor {
+                            storage_type: deltalake::kernel::StorageType::UuidRelativePath,
+                            path_or_inline_dv: "dv".into(),
+                            offset: Some(1),
+                            size_in_bytes: 10,
+                            cardinality: 1,
+                        }),
+                    );
+                }
+                4 => changed.keys.reverse(),
+                5 => changed.tiebreak = None,
+                6 => changed.tombstone = None,
+                _ => changed.schema = Schema::empty(),
+            }
+            assert!(!changed.matches(&root, &files, schema), "proof must reject visibility change {change}");
+        }
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let indexer = crate::tantivy::search::TantivyIndexService::new(store.clone(), Arc::new(Default::default()));
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        for offset in 0..35 {
+            indexer.publish_count_proof("mor_versioned", "project", start + chrono::Duration::days(offset), proof.clone()).await?;
+        }
+        let manifest = crate::tantivy::load_manifest(store.as_ref(), "mor_versioned", "project").await?;
+        assert_eq!(manifest.count_proofs.len(), 32);
+        assert_eq!(manifest.count_proofs.first_key_value().unwrap().0, &(start + chrono::Duration::days(3)));
+        assert!(manifest.count_proofs.values().all(|loaded| loaded.matches(&root, &files, schema) && loaded.logical_count == 7));
+        Ok(())
+    }
 
     #[test_case::test_case("part/a%20b.parquet", Some("part/a%20b.parquet"))]
     #[test_case::test_case("s3://bucket/table/part/a%20b.parquet", Some("part/a b.parquet"))]

@@ -428,6 +428,7 @@ impl super::Database {
         if partitions.is_empty() {
             partitions.entry(lo.div_euclid(DAY_MICROS)).or_default();
         }
+        let manifest = search.load_manifest_cached(table_name, project).await?;
         let mut logical_counts = std::collections::BTreeMap::new();
         for (&day, files) in &partitions {
             let current: crate::read::CountFiles = files.iter().map(|file| (file.path.clone(), file.deletion_vector.clone())).collect();
@@ -438,9 +439,12 @@ impl super::Database {
                 && let Some(hi) = lo.checked_add(DAY_MICROS)
             {
                 logical_counts.insert(day, index.count(lo, hi));
+            } else if let Some(proof) = manifest.count_proofs.get(&date.parse::<chrono::NaiveDate>()?)
+                && proof.matches(log_store.root_url(), &current, schema)
+            {
+                logical_counts.insert(day, proof.logical_count);
             }
         }
-        let manifest = search.load_manifest_cached(table_name, project).await?;
         Ok(CapturedHistogram {
             search,
             table: table_name.into(),
@@ -477,9 +481,9 @@ mod tests {
         let config = minio_test_config(&project, &dir.path().to_string_lossy());
         let store = Arc::new(object_store::memory::InMemory::new());
         let search = Arc::new(TantivySearchService::new(store.clone(), dir.path().join("indexes"), Arc::new(config.tantivy.clone())));
-        let indexer = Arc::new(TantivyIndexService::new(store, Arc::new(config.tantivy.clone())));
+        let indexer = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(config.tantivy.clone())));
         indexer.with_reader(&search);
-        let db = super::super::Database::with_config(config).await?.with_tantivy_search(search.clone());
+        let db = super::super::Database::with_config(config.clone()).await?.with_tantivy_search(search.clone()).with_tantivy_indexer(indexer.clone());
         let table = "mor_versioned";
         let timestamp = chrono::Utc::now().timestamp_micros() - DAY_MICROS;
         let date = chrono::DateTime::from_timestamp_micros(timestamp).unwrap().date_naive().to_string();
@@ -543,6 +547,11 @@ mod tests {
         assert_eq!(result.counts.values().sum::<u64>(), 4);
         assert_eq!(result.scanned_sources, 0, "unique partition needs no row fallback");
         assert_eq!(search.stats.histogram_unique_partitions.load(Ordering::Relaxed), 1);
+        db.logical_count_cache.invalidate(&partition);
+        search.invalidate_manifest(table, &project);
+        let persisted = db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
+        assert_eq!(persisted.counts, result.counts, "persisted proof survives winner-cache eviction and manifest reload");
+        assert_eq!(persisted.scanned_sources, 0);
         db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("0", "b")])?], true, None).await?;
         build_indexes().await?;
         assert_eq!(captured.count().await?.counts.values().sum::<u64>(), 4, "the retained proof belongs to the old file set");
@@ -573,10 +582,18 @@ mod tests {
             "a same-path DV change invalidates the cached proof"
         );
         db.build_logical_count_partition(&partition, true).await?;
-        let result = db.indexed_histogram(&project, table, window, Some(&membership), 64, context).await?;
+        let result = db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         assert_eq!(result.counts.values().sum::<u64>(), 3);
         assert_eq!(result.scanned_sources, 0, "a newly proven unique partition counts through its pinned DV mask");
         assert_eq!(captured.count().await?.counts.values().sum::<u64>(), 4, "old capture retains pre-DV visibility");
+        let restart_dir = tempfile::tempdir()?;
+        let mut restart_config = (*config).clone();
+        restart_config.core.timefusion_data_dir = restart_dir.path().into();
+        let restart_search = Arc::new(TantivySearchService::new(store, restart_dir.path().join("indexes"), Arc::new(config.tantivy.clone())));
+        let restarted = super::super::Database::with_config(Arc::new(restart_config)).await?.with_tantivy_search(restart_search);
+        let result = restarted.indexed_histogram(&project, table, window, Some(&membership), 64, context).await?;
+        assert_eq!(result.counts.values().sum::<u64>(), 3, "cold database and index reader recover the exact persisted DV proof");
+        assert_eq!(result.scanned_sources, 0);
         Ok(())
     }
 
