@@ -1,0 +1,11 @@
+{
+  "version": "tantivy v0.22.0, index_format v6",
+  "checks_passed": [
+    "duplicate element counts once",
+    "tag removal",
+    "old searcher snapshot",
+    "tag addition at original event time",
+    "event deletion"
+  ],
+  "scope": "Single Tantivy index commit. Does not prove atomic visibility across TimeFusion files, Delta and memory."
+}

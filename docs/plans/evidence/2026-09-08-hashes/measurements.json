@@ -1,0 +1,144 @@
+{
+  "window_end_utc": "2026-09-08T15:53:24.566813Z",
+  "project": "00000000-0000-0000-0000-000000000000",
+  "issue": "7e6d04e5-0f43-4e16-ad90-e480f9ab1f1d",
+  "method": "Serial read-only queries, one sample per shape/window; TimeFusion statement_timeout=10s; PostgreSQL statement_timeout=8s; client execution includes network, excludes connection setup. Plan excerpts omit schema annotations and scan file lists.",
+  "results": [
+    {
+      "days": 3,
+      "explain": false,
+      "seconds": 10.023,
+      "error": "canceling statement due to statement timeout",
+      "predicate": "array containment",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '3 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND hashes @> ARRAY['err:e03848c6'] GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC",
+      "explain_seconds": 0.235,
+      "physical_plan_excerpt": [
+        "    SortExec: expr=[time_bucket(Utf8(\"1 hour\"),otel_logs_and_spans.timestamp)@2 DESC], preserve_partitioning=[true]",
+        "                FilterExec: timestamp@0 >= 1788623604566813 AND timestamp@0 <= 1788882804566813 AND array_has_all(hashes@1, [err:e03848c6]) AND deleted@2 IS DISTINCT FROM true, projection=[timestamp@0]",
+        "                  DedupExec: keys=[timestamp, resource___service___name, id], mode=bounded[timestamp]/greatest",
+        "                        SortExec: expr=[timestamp@0 DESC], preserve_partitioning=[false]",
+        "                            GatedScanExec: permits=256",
+        "                              FilterExec: timestamp@0 >= 1788623604566813 AND timestamp@0 <= 1788882804566813"
+      ]
+    },
+    {
+      "days": 3,
+      "explain": false,
+      "seconds": 10.029,
+      "error": "canceling statement due to statement timeout",
+      "predicate": "current source JSONPath",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '3 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND jsonb_path_exists(to_jsonb(hashes), '$[*] ? (@ == \"err:e03848c6\")'::jsonpath) GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC",
+      "explain_seconds": 0.308,
+      "physical_plan_excerpt": [
+        "    SortExec: expr=[time_bucket(Utf8(\"1 hour\"),otel_logs_and_spans.timestamp)@2 DESC], preserve_partitioning=[true]",
+        "                FilterExec: timestamp@0 >= 1788623604566813 AND timestamp@0 <= 1788882804566813 AND jsonb_path_exists(to_jsonb(hashes@1), $[*] ? (@ == \"err:e03848c6\")) AND deleted@2 IS DISTINCT FROM true, projection=[timestamp@0]",
+        "                  DedupExec: keys=[timestamp, resource___service___name, id], mode=bounded[timestamp]/greatest",
+        "                        SortExec: expr=[timestamp@0 DESC], preserve_partitioning=[false]",
+        "                            GatedScanExec: permits=256",
+        "                              FilterExec: timestamp@0 >= 1788623604566813 AND timestamp@0 <= 1788882804566813"
+      ]
+    },
+    {
+      "days": 3,
+      "seconds": 0.1178,
+      "buckets": 0,
+      "total": 0,
+      "rows": [],
+      "source": "PostgreSQL apis.error_hourly_stats joined to error_patterns on project_id and error_id, hash=e03848c6"
+    },
+    {
+      "days": 7,
+      "explain": false,
+      "seconds": 10.103,
+      "error": "canceling statement due to statement timeout",
+      "predicate": "array containment",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '7 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND hashes @> ARRAY['err:e03848c6'] GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC",
+      "explain_seconds": 0.32,
+      "physical_plan_excerpt": [
+        "    SortExec: expr=[time_bucket(Utf8(\"1 hour\"),otel_logs_and_spans.timestamp)@2 DESC], preserve_partitioning=[true]",
+        "                FilterExec: timestamp@0 >= 1788278004566813 AND timestamp@0 <= 1788882804566813 AND array_has_all(hashes@1, [err:e03848c6]) AND deleted@2 IS DISTINCT FROM true, projection=[timestamp@0]",
+        "                  DedupExec: keys=[timestamp, resource___service___name, id], mode=bounded[timestamp]/greatest",
+        "                        SortExec: expr=[timestamp@0 DESC], preserve_partitioning=[false]",
+        "                            GatedScanExec: permits=256",
+        "                              FilterExec: timestamp@0 >= 1788278004566813 AND timestamp@0 <= 1788882804566813"
+      ]
+    },
+    {
+      "days": 7,
+      "explain": false,
+      "seconds": 10.073,
+      "error": "canceling statement due to statement timeout",
+      "predicate": "current source JSONPath",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '7 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND jsonb_path_exists(to_jsonb(hashes), '$[*] ? (@ == \"err:e03848c6\")'::jsonpath) GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC",
+      "explain_seconds": 0.325,
+      "physical_plan_excerpt": [
+        "    SortExec: expr=[time_bucket(Utf8(\"1 hour\"),otel_logs_and_spans.timestamp)@2 DESC], preserve_partitioning=[true]",
+        "                FilterExec: timestamp@0 >= 1788278004566813 AND timestamp@0 <= 1788882804566813 AND jsonb_path_exists(to_jsonb(hashes@1), $[*] ? (@ == \"err:e03848c6\")) AND deleted@2 IS DISTINCT FROM true, projection=[timestamp@0]",
+        "                  DedupExec: keys=[timestamp, resource___service___name, id], mode=bounded[timestamp]/greatest",
+        "                        SortExec: expr=[timestamp@0 DESC], preserve_partitioning=[false]",
+        "                            GatedScanExec: permits=256",
+        "                              FilterExec: timestamp@0 >= 1788278004566813 AND timestamp@0 <= 1788882804566813"
+      ]
+    },
+    {
+      "days": 7,
+      "seconds": 0.0302,
+      "buckets": 1,
+      "total": 1,
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "source": "PostgreSQL apis.error_hourly_stats joined to error_patterns on project_id and error_id, hash=e03848c6"
+    },
+    {
+      "days": 30,
+      "explain": false,
+      "seconds": 10.027,
+      "error": "canceling statement due to statement timeout",
+      "predicate": "array containment",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '30 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND hashes @> ARRAY['err:e03848c6'] GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC",
+      "explain_seconds": 1.83,
+      "physical_plan_excerpt": [
+        "    SortExec: expr=[time_bucket(Utf8(\"1 hour\"),otel_logs_and_spans.timestamp)@2 DESC], preserve_partitioning=[true]",
+        "                FilterExec: timestamp@0 >= 1786290804566813 AND timestamp@0 <= 1788882804566813 AND array_has_all(hashes@1, [err:e03848c6]) AND deleted@2 IS DISTINCT FROM true, projection=[timestamp@0]",
+        "                  DedupExec: keys=[timestamp, resource___service___name, id], mode=bounded[timestamp]/greatest",
+        "                        SortExec: expr=[timestamp@0 DESC], preserve_partitioning=[false]",
+        "                            GatedScanExec: permits=236",
+        "                              FilterExec: timestamp@0 >= 1786290804566813 AND timestamp@0 <= 1788882804566813"
+      ]
+    },
+    {
+      "days": 30,
+      "explain": false,
+      "seconds": 10.026,
+      "error": "canceling statement due to statement timeout",
+      "predicate": "current source JSONPath",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '30 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND jsonb_path_exists(to_jsonb(hashes), '$[*] ? (@ == \"err:e03848c6\")'::jsonpath) GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC",
+      "explain_seconds": 0.52,
+      "physical_plan_excerpt": [
+        "    SortExec: expr=[time_bucket(Utf8(\"1 hour\"),otel_logs_and_spans.timestamp)@2 DESC], preserve_partitioning=[true]",
+        "                FilterExec: timestamp@0 >= 1786290804566813 AND timestamp@0 <= 1788882804566813 AND jsonb_path_exists(to_jsonb(hashes@1), $[*] ? (@ == \"err:e03848c6\")) AND deleted@2 IS DISTINCT FROM true, projection=[timestamp@0]",
+        "                  DedupExec: keys=[timestamp, resource___service___name, id], mode=bounded[timestamp]/greatest",
+        "                        SortExec: expr=[timestamp@0 DESC], preserve_partitioning=[false]",
+        "                            GatedScanExec: permits=256",
+        "                              FilterExec: timestamp@0 >= 1786290804566813 AND timestamp@0 <= 1788882804566813"
+      ]
+    },
+    {
+      "days": 30,
+      "seconds": 0.0258,
+      "buckets": 1,
+      "total": 1,
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "source": "PostgreSQL apis.error_hourly_stats joined to error_patterns on project_id and error_id, hash=e03848c6"
+    }
+  ]
+}

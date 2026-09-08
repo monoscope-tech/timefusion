@@ -1,0 +1,23 @@
+{
+  "note": "Known candidate ID from trace lookup. Measures downstream lookup only, excludes discovering all hash matches and does not establish the total issue count. Same window as initial benchmark.",
+  "results": [
+    {
+      "days": 3,
+      "seconds": 10.028,
+      "error": "canceling statement due to statement timeout",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '3 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND hashes @> ARRAY['err:e03848c6'] AND id IN ('1da21fbb-1d78-555f-ae88-a10edfc3afdf') GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC"
+    },
+    {
+      "days": 7,
+      "seconds": 20.396,
+      "error": "canceling statement due to statement timeout",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '7 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND hashes @> ARRAY['err:e03848c6'] AND id IN ('1da21fbb-1d78-555f-ae88-a10edfc3afdf') GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC"
+    },
+    {
+      "days": 30,
+      "seconds": 10.543,
+      "error": "canceling statement due to statement timeout",
+      "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '30 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND hashes @> ARRAY['err:e03848c6'] AND id IN ('1da21fbb-1d78-555f-ae88-a10edfc3afdf') GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC"
+    }
+  ]
+}

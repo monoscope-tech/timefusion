@@ -1,0 +1,90 @@
+{
+  "native_jsonpath_equivalence": {
+    "sql": "WITH arrays(hashes) AS (VALUES (NULL::text[]), ('{}'::text[]), (ARRAY[NULL]::text[]), (ARRAY['a']), (ARRAY['a','a']), (ARRAY['a',NULL]), (ARRAY['b']), (ARRAY['a b']), (ARRAY['err:a']), (ARRAY['\u03b1'])) SELECT hashes,(hashes @> ARRAY['a']) IS TRUE AS native_match,jsonb_path_exists(to_jsonb(hashes),'$[*] ? (@ == \"a\")'::jsonpath) IS TRUE AS json_match FROM arrays",
+    "rows": [
+      [
+        null,
+        false,
+        false
+      ],
+      [
+        [],
+        false,
+        false
+      ],
+      [
+        [
+          null
+        ],
+        false,
+        false
+      ],
+      [
+        [
+          "a"
+        ],
+        true,
+        true
+      ],
+      [
+        [
+          "a",
+          "a"
+        ],
+        true,
+        true
+      ],
+      [
+        [
+          "a",
+          null
+        ],
+        true,
+        true
+      ],
+      [
+        [
+          "b"
+        ],
+        false,
+        false
+      ],
+      [
+        [
+          "a b"
+        ],
+        false,
+        false
+      ],
+      [
+        [
+          "err:a"
+        ],
+        false,
+        false
+      ],
+      [
+        [
+          "\u03b1"
+        ],
+        false,
+        false
+      ]
+    ],
+    "passed": 10
+  },
+  "partial_coverage_counterexample": {
+    "sql": "WITH versions(id,version,hashes,indexed) AS (VALUES (1,1,ARRAY['a'],false),(1,2,ARRAY['b'],true)), candidates AS (SELECT id FROM versions WHERE indexed AND hashes @> ARRAY['a']), narrowed AS (SELECT * FROM versions WHERE NOT indexed OR id IN (SELECT id FROM candidates)), winner AS (SELECT DISTINCT ON(id) * FROM narrowed ORDER BY id,version DESC), canonical AS (SELECT DISTINCT ON(id) * FROM versions ORDER BY id,version DESC) SELECT 'partial_index' AS method,count(*) FROM winner WHERE hashes @> ARRAY['a'] UNION ALL SELECT 'canonical',count(*) FROM canonical WHERE hashes @> ARRAY['a']",
+    "result": [
+      [
+        "partial_index",
+        1
+      ],
+      [
+        "canonical",
+        0
+      ]
+    ],
+    "scope": "PostgreSQL execution of the algorithm shape, not a TimeFusion integration test"
+  }
+}
