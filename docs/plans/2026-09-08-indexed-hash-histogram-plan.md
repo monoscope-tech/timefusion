@@ -117,7 +117,7 @@ The proposed integration must supply that proof before an index-only count becom
 | PostgreSQL array GIN | Find candidate rows, fetch visible tuples and timestamps, aggregate | PostgreSQL manages MVCC and index maintenance | Strong sparse lookup, but common hashes still require substantial row processing |
 | Elasticsearch / Quickwit style | Filter indexed terms, aggregate indexed columnar timestamps | Consistency depends on the engine's document and ingestion model | Flexible buckets and filters, with query cost that still grows with matches and segments |
 | Pinot upsert style | Filter postings, restrict to valid documents, aggregate | Winner masks track upserts, with explicit snapshot consistency options | Closest visibility model, but maintaining masks has memory and lifecycle costs |
-| ClickHouse raw query | Prune blocks, scan relevant columns, aggregate | Replacing tables need correct version resolution | Efficient broad scans, but a skipping index is not an exact per-event membership index |
+| ClickHouse | Scan relevant columns or use array-capable text-index postings, then aggregate | Replacing tables need correct version resolution | Current text indexes offer a closer comparison than block skipping alone; exact tokenization and query eligibility matter |
 | Timescale continuous aggregates | Read stored bucket summaries | Refresh policies reconcile changed buckets | Very cheap repeated charts, but resolution, dimensions, retention, and refresh coverage constrain queries |
 | Proposed TimeFusion integration | Filter exact tags and count indexed timestamps through a visibility gate | Delta/memory snapshot determines which index documents count | Reuses Tantivy, but requires integration work for masks, coverage, and sidecar fan-out |
 
@@ -125,6 +125,11 @@ The benchmarks establish potential for the proposed computation, not superiority
 Those databases were not benchmarked here.
 The PostgreSQL comparison also used different storage and execution settings from Tantivy.
 Its strongest conclusion is that avoiding payload retrieval can matter substantially for this chart shape.
+
+ClickHouse's current [text-index documentation](https://clickhouse.com/docs/reference/engines/table-engines/mergetree-family/textindexes)
+also describes string-array support and posting lists stored as Roaring bitmaps.
+The earlier block-skipping comparison did not cover this mechanism.
+We have not benchmarked that path against TimeFusion.
 
 The initial fast path must explicitly support fixed-duration buckets.
 Calendar months, local-time days across daylight-saving changes, and unsupported filters remain on the canonical path until separately implemented and verified.
@@ -366,17 +371,27 @@ Implementation checkpoint:
   Literal Unicode and supported string escapes are preserved. Unicode escape sequences remain rejected by the existing parser.
   Additional optimized query shapes still need matching and parity checks.
 - Backfill and its coverage census now treat obsolete element representations and invalid physical ordinals as uncovered.
-- One hundred seventy selected Tantivy, DML, visibility, logical-count, memory snapshot, and versioned-table tests pass.
+- One hundred eighty-six selected Tantivy, DML, visibility, logical-count, memory snapshot, and versioned-table tests pass.
   Command: `SSL_CERT_FILE=/etc/ssl/cert.pem TIMEFUSION_TEST_S3_ENDPOINT=http://127.0.0.1:9000 cargo nextest run --no-default-features -E 'test(tantivy) | test(delta_cache) | test(histogram_capture_detects) | test(dml::tests) | test(decide_prefilter_tests) | test(element_index_configuration) | test(merge_snapshot_preserves) | test(logical_count) | test(mor_) | test(versioned) | test(version_append)'`.
-  Run ID: `d125d2f9-60f8-4183-93ca-d817c2de3f95` (9.182 seconds), before integrating upstream positional scan ordering fix `ed6e56b4`. `cargo lint`, formatting, and diff checks passed on this base; the combined tree will be checked again before publication.
+  Run ID: `27487bb1-68ad-4a68-b1ec-2cc8c2c492cd` (9.501 seconds), after integrating upstream positional scan ordering fix `ed6e56b4`. The command also includes `test(dv_scan) | test(footer) | test(positional)`. The full default-feature test suite and all 8 doctests passed and were attested.
   JSONPath tests verify chart-form routing, ordinary execution for inequality, escaped strings, and agreement with the existing evaluator.
   SQL tests verify service execution for string/INTERVAL widths and OR membership, and verify ordinary planning for an unsupported filter.
   The database integration test counts competing Delta versions plus memory and verifies decoded-budget rejection.
   Histogram parity covers indexed, uncovered, and missing-blob sources combined with memory, plus exact element fallback for nulls and duplicates.
   The committed-DV test reads original captured file metadata after two later deletes and retains the original visibility.
 - The stale-version integration test fails with the old decision and passes with the guard restored.
-- `make ci-signoff CHECKS="fmt clippy"` could not start Docker and published no attestations.
-  Storage integration tests used native MinIO on localhost instead.
+- Earlier signoff attempts could not start Docker; those attempts published no attestations.
+  Docker is now available. The rebased tests use CI’s pinned MinIO release `2025-04-22T22-12-26Z`; the temporary native service was stopped.
+  `make ci-signoff CHECKS="fmt clippy"` passed and attested both checks.
+  `make ci-signoff CHECKS="test pg-smoke e2e"` attested the full test check.
+  The canonical pgwire smoke check cannot reach the native server through Docker's `--network host` on this laptop.
+  A repeat with `CI_KEEP_GOING=true make ci-signoff CHECKS="pg-smoke e2e"` confirmed this limitation and started e2e.
+  The server listened on port 12345. The same PostgreSQL 18.4 container returned `SELECT 1` through `host.docker.internal`.
+  All five catalog commands (`\dt`, `\d otel_logs_and_spans`, `\l`, `\du`, `\dn`) passed through that address with `ON_ERROR_STOP=1`.
+  This alternate-address check has no attestation; GitHub must run canonical pgwire smoke. E2e remains in progress.
+- A read-only repeat of the recorded seven-day known-ID production chart timed out after 10.043 seconds.
+  [Recorded result](evidence/2026-09-08-hashes/production-known-candidate-recheck.json), taken at `2026-09-08T21:05:56Z`.
+  This branch was not deployed, and the probe did not establish the server revision.
 - Concurrent snapshot validation, mask caching, SQL histogram routing, measured backfill, and production validation remain incomplete.
   Publication failures can also leave unreferenced generation blobs; general orphan collection remains to be addressed.
 
