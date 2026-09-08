@@ -423,6 +423,10 @@ pub struct MaintenanceTask {
     /// they did before.
     #[serde(default)]
     pub parent_measured_bytes: Option<u64>,
+    /// Byte estimate from this claim's input preflight, before time-share modelling.
+    /// Older journals have no observation; a timeout itself supplies none.
+    #[serde(default)]
+    pub preflight_decoded_bytes: Option<u64>,
     /// Scheduling weight inherited from the backfill unit this task was split
     /// out of. `None` means "weigh me by my own width".
     ///
@@ -588,13 +592,10 @@ const SPLIT_MUST_SHED_DENOMINATOR: u64 = 4;
 /// `None` — no parent evidence — always splits: that is the first measurement
 /// of this lineage and there is nothing yet to compare against.
 ///
-/// The window is deliberately two-sided. A child that measured MORE than its
-/// parent is not evidence of the floor, it is evidence the parent's number was
-/// never a measurement — which is exactly what `retry_or_split` stamps when it
-/// forces a bisection with a synthetic `MAX_DECODED_BYTES + 1`. Declining there
-/// would freeze that lineage forever, the immortal-unit shape this file already
-/// has three incidents of. Let it split once more; the next preflight stamps a
-/// real number and the guard starts working.
+/// The window is deliberately two-sided. A larger child preflight may reflect
+/// input growth, or a historical journal whose parent carried a synthetic byte
+/// count. Allow that preflight to establish a new baseline. New failure splits
+/// retain preflight evidence when available and never manufacture a byte count.
 fn split_sheds_enough(parent_measured_bytes: Option<u64>, observed_bytes: u64) -> bool {
     split_sheds_enough_at(parent_measured_bytes, observed_bytes, SPLIT_MUST_SHED_NUMERATOR, SPLIT_MUST_SHED_DENOMINATOR)
 }
@@ -629,6 +630,26 @@ pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u
         task.estimated_decoded_bytes = observed_or_estimated_bytes;
         return vec![task];
     }
+    if let Some(children) = bisect_time_unit(task, observed_or_estimated_bytes) {
+        return children.into();
+    }
+
+    let shards_u64 = observed_or_estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(2);
+    let shards = u32::try_from(shards_u64).unwrap_or(u32::MAX);
+    let per_shard = observed_or_estimated_bytes.div_ceil(u64::from(shards));
+    (0..shards)
+        .map(|hash_shard| {
+            let mut shard = task.clone();
+            shard.hash_shard = hash_shard;
+            shard.hash_shards = shards;
+            shard.estimated_decoded_bytes = per_shard;
+            shard
+        })
+        .collect()
+}
+
+/// Bisect time independently of whether a byte estimate exceeds the budget.
+fn bisect_time_unit(task: &MaintenanceTask, observed_or_estimated_bytes: u64) -> Option<[MaintenanceTask; 2]> {
     // Time-bisection stops at the width where a slice stops shedding FILES, not
     // at the narrowest slice the journal can express.
     //
@@ -659,22 +680,17 @@ pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u
             let mut right = task.clone();
             right.key.slice.start_micros = midpoint;
             right.estimated_decoded_bytes = observed_or_estimated_bytes.saturating_sub(left_bytes);
-            return vec![left, right];
+            return Some([left, right]);
         }
     }
 
-    let shards_u64 = observed_or_estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(2);
-    let shards = u32::try_from(shards_u64).unwrap_or(u32::MAX);
-    let per_shard = observed_or_estimated_bytes.div_ceil(u64::from(shards));
-    (0..shards)
-        .map(|hash_shard| {
-            let mut shard = task.clone();
-            shard.hash_shard = hash_shard;
-            shard.hash_shards = shards;
-            shard.estimated_decoded_bytes = per_shard;
-            shard
-        })
-        .collect()
+    None
+}
+
+#[derive(Clone, Copy)]
+enum SplitTrigger {
+    Preflight(u64),
+    RepeatedFailure,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1743,6 +1759,7 @@ impl TaskJournal {
                 // guessing one would let the next width up under-price itself.
                 input: price.unanimous_input(),
                 parent_measured_bytes: None,
+                preflight_decoded_bytes: None,
                 backfill_priority_micros: None,
             });
         }
@@ -2173,6 +2190,20 @@ impl TaskJournal {
             return false;
         }
         task.input = Some(input);
+        task.preflight_decoded_bytes = None;
+        self.dirty_tasks.insert(key.clone());
+        true
+    }
+
+    /// Retain the current input estimate even when the unit fits and is dispatched.
+    pub fn record_preflight(&mut self, key: &TaskKey, input: Option<InputFootprint>, decoded_bytes: u64) -> bool {
+        let input_changed = input.is_some_and(|input| self.record_input(key, input));
+        let Some(index) = self.task_indices.get(key).copied() else { return false };
+        let task = &mut self.snapshot.tasks[index];
+        if task.preflight_decoded_bytes == Some(decoded_bytes) {
+            return input_changed;
+        }
+        task.preflight_decoded_bytes = Some(decoded_bytes);
         self.dirty_tasks.insert(key.clone());
         true
     }
@@ -2362,6 +2393,7 @@ impl TaskJournal {
             base_tier_present,
             input,
             parent_measured_bytes: None,
+            preflight_decoded_bytes: None,
             backfill_priority_micros: None,
         });
         true
@@ -2511,6 +2543,7 @@ impl TaskJournal {
                         base_tier_present: false,
                         input: None,
                         parent_measured_bytes: None,
+                        preflight_decoded_bytes: None,
                         backfill_priority_micros: None,
                     });
                     self.dirty_tasks.insert(key);
@@ -2527,6 +2560,7 @@ impl TaskJournal {
             return false;
         }
         task.state = TaskState::Running;
+        task.preflight_decoded_bytes = None;
         task.attempts = task.attempts.saturating_add(1);
         true
     }
@@ -3004,10 +3038,7 @@ impl TaskJournal {
             return;
         }
         let attempts = self.task_indices.get(key).and_then(|index| self.snapshot.tasks.get(*index)).map_or(1, |task| task.attempts);
-        // `MAX_DECODED_BYTES + 1` is the smallest input that makes
-        // `byte_bounded_units` bisect, and a bisect is one halving: this asks
-        // for one split, never a shred down to the minimum slice.
-        if attempts >= 2 && self.split_time_task(key, MAX_DECODED_BYTES.saturating_add(1), None) {
+        if attempts >= 2 && self.split_task(key, SplitTrigger::RepeatedFailure, None) {
             return;
         }
         // Floored at this operation's OWN deadline. A unit that cannot be split
@@ -3058,27 +3089,7 @@ impl TaskJournal {
             self.park_schema_failure(key, crate::support::now_micros(), &reason);
             return;
         }
-        // Price the guard on the unit's OWN estimate, not a bare synthetic.
-        //
-        // This passed `MAX_DECODED_BYTES + 1`, which made `split_sheds_enough`
-        // compare a CONSTANT against the parent's real measured bytes: against
-        // any parent above ~683 MiB, 512 MiB always satisfies
-        // `observed * 4 < parent * 3`, so the shed test passed at EVERY level
-        // and the lineage bisected to `MIN_SLICE_MICROS`. The guard was
-        // structurally blind here — it cannot compare a measurement to a
-        // constant. Prod 2026-09-03: 147 live units at or below the 60 s floor
-        // (all `base_rollup`, one whale) and 8,595 completed there.
-        //
-        // `max(estimate, MAX + 1)` because the synthetic does TWO jobs and only
-        // one was wrong. It also forces `byte_bounded_units` past its
-        // `<= MAX_DECODED_BYTES` early return, so a unit that OVERRAN ITS
-        // DEADLINE still splits though its estimate claims it fits
-        // (`a_unit_that_overruns_its_deadline_twice_is_bisected`). Taking the
-        // max keeps that: a large real estimate reaches the guard intact, a
-        // small or unpriced one falls back to the synthetic and splits as before.
-        let estimate = self.task_indices.get(key).map_or(0, |index| self.snapshot.tasks[*index].estimated_decoded_bytes);
-        let observed = estimate.max(MAX_DECODED_BYTES.saturating_add(1));
-        if attempts >= 2 && is_capacity_failure(&reason) && self.split_time_task(key, observed, None) {
+        if attempts >= 2 && is_capacity_failure(&reason) && self.split_task(key, SplitTrigger::RepeatedFailure, None) {
             return;
         }
         // Split refused (already at minimum width, or would hash-shard) on a
@@ -3096,6 +3107,10 @@ impl TaskJournal {
     }
 
     pub fn split_time_task(&mut self, key: &TaskKey, observed_bytes: u64, input: Option<InputFootprint>) -> bool {
+        self.split_task(key, SplitTrigger::Preflight(observed_bytes), input)
+    }
+
+    fn split_task(&mut self, key: &TaskKey, trigger: SplitTrigger, input: Option<InputFootprint>) -> bool {
         // A Repair unit's cost is the FILE it rewrites, and time-bisection
         // cannot shrink a file. `coordinator_compaction_files` hands Repair
         // `take(1)` of a whole file whatever the slice width is, so every child
@@ -3130,11 +3145,19 @@ impl TaskJournal {
         // RUN — the runner already hash-shards internally at any width
         // (`database/maintain.rs:1623`), which bounds memory without minting a
         // single journal unit.
-        if !split_sheds_enough(parent.parent_measured_bytes, observed_bytes) {
+        let observed_bytes = match trigger {
+            SplitTrigger::Preflight(bytes) => Some(bytes),
+            SplitTrigger::RepeatedFailure => parent.preflight_decoded_bytes,
+        };
+        if observed_bytes.is_some_and(|bytes| !split_sheds_enough(parent.parent_measured_bytes, bytes)) {
             crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
-        let children = byte_bounded_units(&parent, observed_bytes);
+        let cost = observed_bytes.unwrap_or(parent.estimated_decoded_bytes);
+        let children = match trigger {
+            SplitTrigger::Preflight(_) => byte_bounded_units(&parent, cost),
+            SplitTrigger::RepeatedFailure => bisect_time_unit(&parent, cost).map(Vec::from).unwrap_or_default(),
+        };
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
             // Counted for the same reason the floor decline is: a unit that can
             // neither finish nor shrink is invisible otherwise. See
@@ -3151,7 +3174,8 @@ impl TaskJournal {
         for mut child in children {
             // What the PARENT measured, not the child's modelled share — the
             // modelled share is the very number that cannot be trusted.
-            child.parent_measured_bytes = Some(observed_bytes);
+            child.parent_measured_bytes = observed_bytes;
+            child.preflight_decoded_bytes = None;
             child.state = TaskState::Pending;
             child.attempts = 0;
             child.retry_reason = None;
@@ -4167,8 +4191,9 @@ mod tests {
     ///
     /// The unit below shed NOTHING: its own estimate equals its parent's
     /// measurement, so bisecting again cannot help and must be declined.
-    #[test]
-    fn a_lineage_that_did_not_shed_is_not_split_again() {
+    #[test_case::test_case(true ; "timeout")]
+    #[test_case::test_case(false ; "capacity failure")]
+    fn a_lineage_that_did_not_shed_is_not_split_again(via_timeout: bool) {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         const DAY: i64 = 86_400_000_000;
@@ -4180,7 +4205,12 @@ mod tests {
         let key = unit.key.clone();
         journal.upsert(unit);
 
-        journal.retry_or_split(&key, "resource_admission".into(), 1_000_000, 3);
+        journal.record_preflight(&key, None, MEASURED);
+        if via_timeout {
+            journal.abandon_running(&key, 1_000_000, None);
+        } else {
+            journal.retry_or_split(&key, "resource_admission".into(), 1_000_000, 3);
+        }
 
         assert_eq!(
             journal.state(&key),
@@ -4486,6 +4516,7 @@ mod tests {
             base_tier_present: false,
             input: None,
             parent_measured_bytes: None,
+            preflight_decoded_bytes: None,
             backfill_priority_micros: None,
         }
     }
@@ -7810,11 +7841,13 @@ mod tests {
         assert!(!widths.is_empty() && widths.iter().all(|w| *w < DAY_MICROS), "bisection must leave smaller claimable children; got {widths:?}");
     }
 
-    #[test_case::test_case(true, 0 ; "timeout without a byte estimate")]
-    #[test_case::test_case(true, MAX_DECODED_BYTES / 2 ; "timeout below byte budget")]
-    #[test_case::test_case(false, 0 ; "capacity failure without a byte estimate")]
-    #[test_case::test_case(false, 2 * MAX_DECODED_BYTES ; "capacity failure with an estimate")]
-    fn failure_driven_splits_do_not_fabricate_byte_measurements(via_timeout: bool, estimate: u64) {
+    #[test_case::test_case(true, 0, None ; "timeout without a byte estimate")]
+    #[test_case::test_case(true, MAX_DECODED_BYTES / 2, None ; "timeout below byte budget")]
+    #[test_case::test_case(false, 0, None ; "capacity failure without a byte estimate")]
+    #[test_case::test_case(false, 2 * MAX_DECODED_BYTES, None ; "capacity failure with an estimate")]
+    #[test_case::test_case(true, 0, Some(2 * MAX_DECODED_BYTES) ; "timeout retains actual preflight")]
+    #[test_case::test_case(false, 0, Some(MAX_DECODED_BYTES / 2) ; "capacity failure below byte budget retains actual preflight")]
+    fn failure_driven_splits_do_not_fabricate_byte_measurements(via_timeout: bool, estimate: u64, preflight: Option<u64>) {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
         let mut unit = task("p", 0, DAY_MICROS, Operation::Dedup);
@@ -7823,6 +7856,9 @@ mod tests {
         unit.attempts = 2;
         let key = unit.key.clone();
         journal.upsert(unit);
+        if let Some(bytes) = preflight {
+            journal.record_preflight(&key, None, bytes);
+        }
         if via_timeout {
             journal.abandon_running(&key, 0, None);
         } else {
@@ -7833,8 +7869,15 @@ mod tests {
         assert_eq!(journal.state(&key), Some(TaskState::Superseded));
         let children: Vec<_> = journal.tasks().filter(|task| task.state == TaskState::Pending).collect();
         assert_eq!(children.len(), 2, "a repeated failure still bisects the task");
-        assert_eq!(children.iter().map(|task| task.estimated_decoded_bytes).sum::<u64>(), estimate, "bisection apportions the existing estimate");
-        assert!(children.iter().all(|task| task.parent_measured_bytes.is_none()), "a failure supplies no byte measurement to persist");
+        assert_eq!(
+            children.iter().map(|task| task.estimated_decoded_bytes).sum::<u64>(),
+            preflight.unwrap_or(estimate),
+            "bisection apportions the available input estimate"
+        );
+        assert!(
+            children.iter().all(|task| task.parent_measured_bytes == preflight && task.preflight_decoded_bytes.is_none()),
+            "only actual preflight evidence belongs on children; each child needs its own fresh preflight"
+        );
     }
 
     /// Only capacity failures shrink. A missing object or a commit conflict says

@@ -526,9 +526,7 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
     let observed = model.bytes(key);
     let footprint = model.footprint(key);
     report.preflight_measures += 1;
-    if let Some(footprint) = footprint {
-        journal.record_input(key, footprint);
-    }
+    journal.record_preflight(key, footprint, observed);
     if observed <= MAX_DECODED_BYTES || key.slice.width() <= MIN_SLICE_MICROS {
         return Some(observed);
     }
@@ -1186,6 +1184,7 @@ mod tests {
                 base_tier_present: false,
                 input: None,
                 parent_measured_bytes: None,
+                preflight_decoded_bytes: None,
                 backfill_priority_micros: None,
             };
             journal.upsert(task.clone());
