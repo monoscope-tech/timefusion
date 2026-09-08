@@ -141,6 +141,20 @@ pub struct CapturedHistogram {
 
 const DAY_MICROS: i64 = 86_400_000_000;
 
+/// Admission and recent-attempt history for query-triggered maintenance.
+/// A failed large day must give other requested days a chance to build.
+#[derive(Debug)]
+pub(super) struct HistogramProofBuilds {
+    slot: Arc<tokio::sync::Semaphore>,
+    attempts: parking_lot::Mutex<std::collections::VecDeque<(crate::read::CountPartition, std::time::Instant)>>,
+}
+
+impl Default for HistogramProofBuilds {
+    fn default() -> Self {
+        Self { slot: Arc::new(tokio::sync::Semaphore::new(1)), attempts: Default::default() }
+    }
+}
+
 fn histogram_timestamps(batch: &RecordBatch) -> Result<&[i64]> {
     let column = batch.column_by_name("timestamp").context("histogram source is missing timestamp")?;
     ensure!(column.null_count() == 0, "histogram timestamp contains nulls");
@@ -152,6 +166,49 @@ fn histogram_timestamps(batch: &RecordBatch) -> Result<&[i64]> {
 }
 
 impl CapturedHistogram {
+    /// Request one missing completed-day proof without delaying this query.
+    /// The shared builder retains its memory brake, semaphore and single-flight
+    /// key. The extra permit prevents a chart workload from queuing many days.
+    fn seed_missing_proof(&self, database: &super::Database) -> Option<tokio::task::JoinHandle<()>> {
+        database.tantivy_indexer()?;
+        let state = &database.histogram_proof_build;
+        let permit = state.slot.clone().try_acquire_owned().ok()?;
+        let today = chrono::Utc::now().timestamp_micros().div_euclid(DAY_MICROS);
+        let key = {
+            let now = std::time::Instant::now();
+            let mut attempts = state.attempts.lock();
+            attempts.retain(|(_, at)| now.duration_since(*at) < std::time::Duration::from_secs(60));
+            let key = self
+                .partitions
+                .iter()
+                .rev()
+                .filter(|(day, files)| **day < today && !files.is_empty() && !self.logical_counts.contains_key(*day))
+                .filter_map(|(_, files)| {
+                    Some(crate::read::CountPartition {
+                        project_id: self.project.clone(),
+                        table_name: self.table.clone(),
+                        date: files.first()?.partition_values.get("date")?.clone()?,
+                    })
+                })
+                .find(|key| !attempts.iter().any(|(attempt, _)| attempt == key))?;
+            if attempts.len() == 256 {
+                attempts.pop_front();
+            }
+            attempts.push_back((key.clone(), now));
+            key
+        };
+        let database = Arc::new(database.background_clone());
+        // A fresh build supplies schema-bound evidence. Loading an old Arrow
+        // cache alone does not establish the persisted proof's schema contract.
+        let build = database.schedule_logical_count_build(&key.project_id, &key.table_name, &key.date, true)?;
+        Some(tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = build.await {
+                tracing::warn!(%error, "histogram proof builder task failed");
+            }
+        }))
+    }
+
     /// Counts daily partitions sequentially against the same captured read view.
     pub async fn count(&self) -> Result<HistogramSnapshotResult> {
         let mut total = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
@@ -338,7 +395,10 @@ impl super::Database {
             logical_expr::LogicalPlanBuilder,
         };
         let Some(query) = crate::tantivy::planner::match_query(plan) else { return Ok(None) };
-        let result = self.indexed_histogram(&query.project, &query.table, query.window, Some(&query.membership), 64 * 1024 * 1024, session.task_ctx()).await?;
+        let captured =
+            self.capture_histogram(&query.project, &query.table, query.window, Some(&query.membership), 64 * 1024 * 1024, session.task_ctx()).await?;
+        drop(captured.seed_missing_proof(self));
+        let result = captured.count().await?;
         for error in &result.index_errors {
             tracing::warn!(error = %error, "histogram used captured-row fallback");
         }
@@ -541,7 +601,14 @@ mod tests {
             "index coverage alone cannot prove visibility"
         );
         let partition = crate::read::CountPartition { project_id: project.clone(), table_name: table.into(), date: date.clone() };
-        db.build_logical_count_partition(&partition, true).await?;
+        let unproven = db.capture_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
+        let busy = db.histogram_proof_build.slot.clone().acquire_owned().await?;
+        assert!(unproven.seed_missing_proof(&db).is_none(), "busy proof builder must decline without queuing");
+        drop(busy);
+        let build = unproven.seed_missing_proof(&db).context("completed partition must schedule a proof")?;
+        assert!(unproven.seed_missing_proof(&db).is_none(), "one query-triggered proof build holds the admission slot");
+        build.await?;
+        assert!(unproven.seed_missing_proof(&db).is_none(), "a recent attempt must not rebuild from a stale query capture");
         let captured = db.capture_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         let result = captured.count().await?;
         assert_eq!(result.counts.values().sum::<u64>(), 4);

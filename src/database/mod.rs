@@ -3001,6 +3001,9 @@ pub struct Database {
     dml_locks: DmlLocks,
     histogram_dml: Arc<dashmap::DashMap<(String, String), Arc<histogram::HistogramDmlState>>>,
     histogram_delta: Arc<histogram::HistogramDeltaCache>,
+    /// At most one query-triggered proof build, including time waiting for the
+    /// shared count-builder budget. Admission never queues query requests.
+    histogram_proof_build: Arc<histogram::HistogramProofBuilds>,
     /// Last snapshot-persist time per table URL; throttles `persist_snapshot`.
     /// The on-disk snapshot is only a boot-recovery seed, so staleness just
     /// means boot replays a few more sub-second commits.
@@ -3735,6 +3738,7 @@ impl Database {
             dml_locks: Arc::new(dashmap::DashMap::new()),
             histogram_dml: Arc::new(dashmap::DashMap::new()),
             histogram_delta: Arc::new(histogram::HistogramDeltaCache::default()),
+            histogram_proof_build: Arc::new(histogram::HistogramProofBuilds::default()),
             snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
             bypass_buffer: false,

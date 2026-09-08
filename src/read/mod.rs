@@ -2425,7 +2425,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
     };
     if !missing.is_empty() {
         for date in missing {
-            database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, false);
+            drop(database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, false));
         }
         return None;
     }
@@ -2436,7 +2436,7 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
     // the new base is ready instead of moving that scan onto every query.
     if added_files.len() > crate::read::MAX_APPEND_OVERLAY_FILES {
         for date in stale_dates {
-            database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, true);
+            drop(database.schedule_logical_count_build(&q.project_id, &q.table_name, &date, true));
         }
         return None;
     }
