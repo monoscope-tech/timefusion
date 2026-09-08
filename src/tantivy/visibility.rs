@@ -189,6 +189,25 @@ pub async fn resolve_with_memory(
 pub async fn read_file_rows(
     log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile, schema: arrow::datatypes::SchemaRef, max_decoded_bytes: usize,
 ) -> Result<SourceRows> {
+    use futures::TryStreamExt;
+
+    let (mut stream, live) = stream_file_rows(log_store, add, schema).await?;
+    let mut batches = Vec::new();
+    let mut decoded_bytes = 0_usize;
+    while let Some(batch) = stream.try_next().await? {
+        decoded_bytes = decoded_bytes.checked_add(batch.get_array_memory_size()).context("visibility decode size overflow")?;
+        ensure!(decoded_bytes <= max_decoded_bytes, "visibility source exceeds its decoded memory budget");
+        batches.push(batch);
+    }
+    Ok(SourceRows { batches, live })
+}
+
+/// Streams logical columns in physical order without collecting output batches.
+/// The separate DV mask never filters the stream or changes physical ordinals.
+/// Consumers must account for retained batches and the mask in their memory budget.
+pub async fn stream_file_rows(
+    log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile, schema: arrow::datatypes::SchemaRef,
+) -> Result<(futures::stream::BoxStream<'static, Result<RecordBatch>>, BooleanBuffer)> {
     use deltalake::datafusion::parquet::arrow::{
         ProjectionMask,
         async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
@@ -215,17 +234,19 @@ pub async fn read_file_rows(
         }
     }
     let projection = ProjectionMask::roots(builder.parquet_schema(), projection);
-    let mut stream = builder.with_projection(projection).build()?;
+    let stream = builder.with_projection(projection).build()?;
     let live = deletion_vector_mask(log_store, add.deletion_vector.as_ref(), rows).await?;
-    let mut batches = Vec::new();
-    let mut decoded_bytes = 0_usize;
-    let mut decoded_rows = 0_usize;
-    while let Some(batch) = stream.try_next().await? {
+    let partitions = add.partition_values.clone();
+    let batches = futures::stream::try_unfold((stream, schema, partitions, 0_usize), move |(mut stream, schema, partitions, decoded_rows)| async move {
+        let Some(batch) = stream.try_next().await? else {
+            ensure!(decoded_rows == rows, "visibility read did not preserve every physical source ordinal");
+            return Ok(None);
+        };
         let columns = schema
             .fields()
             .iter()
             .map(|field| -> Result<ArrayRef> {
-                let array: ArrayRef = if let Some(partition) = add.partition_values.get(field.name()) {
+                let array: ArrayRef = if let Some(partition) = partitions.get(field.name()) {
                     Arc::new(arrow::array::StringArray::from_iter(std::iter::repeat_n(partition.as_deref(), batch.num_rows())))
                 } else if let Some(column) = batch.column_by_name(field.name()) {
                     column.clone()
@@ -238,13 +259,11 @@ pub async fn read_file_rows(
             })
             .collect::<Result<Vec<_>>>()?;
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        decoded_bytes = decoded_bytes.checked_add(batch.get_array_memory_size()).context("visibility decode size overflow")?;
-        ensure!(decoded_bytes <= max_decoded_bytes, "visibility source exceeds its decoded memory budget");
-        decoded_rows = decoded_rows.checked_add(batch.num_rows()).context("visibility source row count overflow")?;
-        batches.push(batch);
-    }
-    ensure!(decoded_rows == rows, "visibility read did not preserve every physical source ordinal");
-    Ok(SourceRows { batches, live })
+        let decoded_rows = decoded_rows.checked_add(batch.num_rows()).context("visibility source row count overflow")?;
+        ensure!(decoded_rows <= rows, "visibility read exceeds physical source row count");
+        Ok(Some((batch, (stream, schema, partitions, decoded_rows))))
+    });
+    Ok((Box::pin(batches), live))
 }
 
 /// Reads the deletion vector pinned in a Delta snapshot, preserving physical ordinals.

@@ -492,3 +492,23 @@ source. All four checks were attested. Final status leaves only canonical
 `pg-smoke` to GitHub because of the local Docker host-network limitation.
 The direct-provider review cleanup is isolated at `5445827b`; its focused
 regression is still running and is not covered by these attestations.
+
+The direct-provider cleanup passed its focused integration test (nextest run
+`14dc8b09-ce49-4654-9ab7-2fbdaf4a1ebe`) and was integrated as `d05f161a`.
+The preceding full-CI source and validation are pushed through `212f2466`.
+
+Busy-day implementation now extracts a captured Parquet stream from
+`read_file_rows`. The collecting API retains its existing decoded budget.
+The stream preserves all physical rows, reconstructs captured partition
+constants, checks object size and required columns, and returns its pinned DV
+mask separately. Both end-of-stream and excess-row checks protect ordinal
+lineage. This extraction is a foundation, not completion of busy-day execution.
+
+The next consumer must stream complete keys plus version and physical lineage
+through ordered canonical deduplication, accumulate only winner masks, and
+count indexed timestamps. Preserve first-source/ordinal ties explicitly when
+sorting. Missing index sources must stream membership columns after winner
+resolution. Charge masks and batch/sort working memory; do not silently bypass
+the existing daily decoded-budget contract. A sorted key stream should use the
+query runtime's spill limits. No full-day hash-array collection is required by
+that design. This consumer and its large-day parity test are not yet implemented.

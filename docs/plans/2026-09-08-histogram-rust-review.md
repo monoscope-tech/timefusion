@@ -35,7 +35,7 @@ derived default would not preserve admission behavior.
 
 **Consolidate / Bloat** — Remove the temporary catalog plumbing above.
 
-**Estimated lines saved:** 3.
+**Lines saved:** 2.
 
 ### rs-evasion-review findings
 
@@ -52,9 +52,9 @@ The whole-diff mechanical scan found no newly added allow attributes, unsafe
 blocks, ignored tests, todo macros, or unimplemented macros. This scan alone
 does not establish a clean semantic review of the full diff.
 
-| File | Lines saved, pending | Highest-value change |
+| File | Lines saved | Highest-value change |
 | --- | ---: | --- |
-| src/database/histogram.rs | 3 | Read the captured provider directly |
+| src/database/histogram.rs | 2 | Read the captured provider directly |
 
 ## Pass 2: direct provider cleanup
 
@@ -64,7 +64,39 @@ continues to bind the captured Delta snapshot and exact file selection.
 Projection, full-key ordering, deletion vectors, memory accounting, shutdown,
 partition revalidation, and publication are unchanged. No further distillation
 or type-evasion finding in this scoped change. The focused existing regression
-test is running; no new test duplicates its coverage.
+test passed: nextest run `14dc8b09-ce49-4654-9ab7-2fbdaf4a1ebe`, one test
+in 1.642 seconds. The cleanup is integrated as `d05f161a`; no new test
+duplicates its coverage.
 
 This is a second pass over the proof section, not a second complete review of
 the feature. Full-feature reviews and the hot-day performance gap remain open.
+
+## Stream extraction review
+
+### src/tantivy/visibility.rs
+
+**Reuse** — `read_file_rows` now collects the same `stream_file_rows` used by
+future streaming consumers. Parquet projection, captured partition constants,
+casts, required-column checks, and physical-row validation remain in one place.
+
+**Algebraic** — The stream and DV mask have distinct types. No sentinel batch
+or synthetic user field carries completion or deletion metadata.
+
+**Functional** — `try_unfold` carries reader state and checked physical-row
+count between batches. Keep the collecting wrapper's loop: it checks the
+aggregate decoded budget before retaining each output batch.
+
+**Combinators / Derives** — No additional finding.
+
+**Consolidate / Bloat** — No duplicate decoder was added. Extraction adds a
+stream boundary and preserves the collecting API's budget contract.
+
+**Lines saved:** none; this introduces a reusable streaming boundary.
+
+rs-evasion-review: physical rows remain unfiltered; DV visibility stays in a
+separate mask. End-of-stream validates complete decoding; excess rows fail
+earlier. Errors propagate through `Result` without suppression. Documentation
+was tightened to avoid claiming that the Parquet reader retains only one
+batch internally; the guarantee is that this adapter does not collect output.
+A second reading of the resulting extraction found no further scoped issue.
+The full-feature review remains incomplete.
