@@ -17,8 +17,8 @@ use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
 /// monoscope's ACTUAL log-explorer listing must stream, not materialise.
 ///
-/// `order_by_ts_desc_limit_merges_mem_and_delta` pins the same window and limit
-/// with a two-column projection and passes. Prod 2026-09-04 shows the real query
+/// `order_by_ts_desc_limit_merges_mem_and_delta` checks rows from both stores
+/// with a two-column projection. Prod 2026-09-04 shows the real query
 /// failing: from 09:58 a listing on one project retried every ~15 s, each attempt
 /// dying in `ExternalSorterMerge` at 5.5 GB, with **`scan.has_limit=false
 /// scan.limit=0`** in the span — the LIMIT never reached the scan, so the sort
@@ -84,23 +84,24 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
     let client = env.pg_client().await?;
 
     let sec = 1_000_000i64;
-    // 5 older rows → flushed to Delta (physically DESC-sorted, honest footer).
-    for i in 0..5 {
-        insert_at(&client, &format!("old-{i}"), FROZEN_START_MICROS + i * sec).await?;
+    // Two separate flushes exercise ordered readers across multiple Delta files.
+    for batch in 0..2 {
+        let base = FROZEN_START_MICROS + batch * (bucket_secs as i64) * 3 * sec;
+        for i in 0..5 {
+            insert_at(&client, &format!("old-{}", batch * 5 + i), base + i * sec).await?;
+        }
+        env.advance(Duration::from_secs(bucket_secs * 3));
+        env.force_flush().await?;
     }
-    // Advance well past the bucket boundary so the old bucket is completed, then
-    // flush it out to Delta and drain MemBuffer.
-    env.advance(Duration::from_secs(bucket_secs * 3));
-    env.force_flush().await?;
 
     // 5 newer rows stay in MemBuffer (current, open bucket).
-    let new_base = FROZEN_START_MICROS + (bucket_secs as i64) * 3 * sec;
+    let new_base = FROZEN_START_MICROS + (bucket_secs as i64) * 6 * sec;
     for i in 0..5 {
         insert_at(&client, &format!("new-{i}"), new_base + i * sec).await?;
     }
 
     // The query has no lower time bound, so it spans MemBuffer ∪ Delta.
-    let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
+    let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 12";
 
     // Plan shape: the union became order-preserving → a streaming merge, not a
     // blocking sort over the full window.
@@ -113,10 +114,14 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
         .join("\n");
     assert!(plan.contains("SortPreservingMergeExec"), "expected a streaming SortPreservingMergeExec (ordering pushdown fired); plan was:\n{plan}");
 
-    // Correctness: true top-3 newest, strictly descending, drawn from MemBuffer.
+    // The result must cross memory and both Delta files, with no omissions or duplicates.
     let rows = client.query(sql, &[]).await?;
     let ids: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    assert_eq!(ids, vec!["new-4", "new-3", "new-2"], "wrong top-n or wrong order; plan:\n{plan}");
+    assert_eq!(
+        ids,
+        vec!["new-4", "new-3", "new-2", "new-1", "new-0", "old-9", "old-8", "old-7", "old-6", "old-5", "old-4", "old-3"],
+        "wrong top-n or wrong order; plan:\n{plan}"
+    );
 
     let ts: Vec<i64> = rows.iter().map(|r| r.get::<_, chrono::DateTime<chrono::Utc>>(1).timestamp_micros()).collect();
     assert!(ts.windows(2).all(|w| w[0] > w[1]), "timestamps not strictly descending: {ts:?}");
