@@ -19479,15 +19479,25 @@ mod tests {
         // ENTIRELY — not downgraded to a merge, removed. That is the whole
         // remaining cost of a dedup rewrite (the bench put the sort at 81% of
         // one), so this assertion is guarding the win, not a detail.
-        let declared = rendered.split("output_ordering=[").nth(1).and_then(|rest| rest.split(']').next()).unwrap_or("").to_owned();
-        for column in &schema.sorting_columns {
-            assert!(
-                declared.contains(column.name.as_str()),
-                "`{}` is missing from the declared ordering, so the footer index no longer resolves to the column it names — \
-                 the rewrite is paying a full sort again. declared=[{declared}]",
-                column.name
-            );
+        let mut pending = vec![Arc::clone(&plan)];
+        let mut scans = 0;
+        while let Some(node) = pending.pop() {
+            if node.downcast_ref::<DataSourceExec>().is_some() {
+                let declared = node.properties().output_ordering().expect("the Parquet scan retains its footer ordering");
+                let actual: Vec<_> = declared
+                    .iter()
+                    .map(|expr| {
+                        let column = expr.expr.downcast_ref::<datafusion::physical_expr::expressions::Column>().expect("plain sort column");
+                        (column.name(), expr.options.descending, expr.options.nulls_first)
+                    })
+                    .collect();
+                let expected: Vec<_> = schema.sorting_columns.iter().map(|column| (column.name.as_str(), column.descending, column.nulls_first)).collect();
+                assert_eq!(actual, expected, "the scan must retain all footer keys in order, including direction and null placement");
+                scans += 1;
+            }
+            pending.extend(node.children().into_iter().cloned());
         }
+        assert!(scans > 0, "must inspect the actual Parquet scan");
         assert!(!rendered.contains("SortExec"), "the declared ordering satisfies the schema sort, so nothing should sort:\n{rendered}");
         Ok(())
     }
