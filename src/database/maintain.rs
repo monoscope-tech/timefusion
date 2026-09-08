@@ -1656,7 +1656,7 @@ impl Database {
                 // without saying where. Finding that the zero came from ONE
                 // project cost a manual sweep of every project across two
                 // sources on 2026-08-17. Name it instead.
-                // `contiguous_days` counts DATE PARTITIONS — see `partitions_of`,
+                // `contiguous_days` counts DATE PARTITIONS — see `maintenance_table_partitions`,
                 // which reads file paths and non-emptiness and nothing else. A
                 // date whose files carry a superseded generation is therefore
                 // counted as covered here while the READ path refuses it, and
@@ -1701,7 +1701,7 @@ impl Database {
             let mut missing_tiers = tiers_missing_per_day(&candidates, &covered_per_tier);
             // ONE-SHOT REPAIR for coverage the planner is structurally blind to.
             //
-            // `partitions_of` decides "covered" from a non-empty file existing at
+            // `maintenance_table_partitions` decides "covered" from a non-empty file existing at
             // the path — it never reads the generation. So when a spec edit
             // changes `generation_id`, every slice built before it keeps the old
             // value, the READ path refuses those dates, and the planner counts
@@ -1894,7 +1894,7 @@ impl Database {
             //
             // `cells_missing` is what coverage says is absent; `cells_wanted` is
             // what survives the already-queued veto. missing=0 means the planner
-            // sees no holes (suspect `partitions_of`); missing>0 with wanted=0
+            // sees no holes (suspect `maintenance_table_partitions`); missing>0 with wanted=0
             // means the work is queued and the question is why it is not CLAIMED.
             // Those want opposite investigations and were indistinguishable.
             // Pairs with the cell census: that one says whether the planner sees
@@ -2018,7 +2018,7 @@ impl Database {
                         // infer from journal records that a historical day does
                         // not have — see `MaintenanceTask::base_tier_present`.
                         //
-                        // Sealed days only. `partitions_of` reports PRESENCE — a
+                        // Sealed days only. `maintenance_table_partitions` reports PRESENCE — a
                         // partition with one file counts — which is a true
                         // statement about a day that has stopped changing and a
                         // misleading one about a day still being written, where
@@ -2360,6 +2360,7 @@ impl Database {
         let key = TaskKey { physical_table, source: source.to_owned(), project_id: project_id.to_owned(), slice, operation };
         // Match the planner's historical-tier admission proof. Presence permits
         // inspection; the worker still validates generation and complete coverage.
+        // Today's base tier can still grow, so it needs journal dependency proof.
         let base_tier_present = if operation == Operation::DerivedRollup && date < Utc::now().date_naive() {
             let base = base_table().ok_or_else(|| anyhow::anyhow!("{source} declares no base rollup"))?;
             let table = self.resolve_table(project_id, &base).await?;
