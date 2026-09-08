@@ -377,12 +377,27 @@ Implementation checkpoint:
   The preceding revision's complete GitHub CI run also passed.
 - SQL histogram capture now requests one missing proof for a completed UTC day in the background.
   One admission slot covers both queued and executing query-triggered work. Busy requests do not add a queue.
-  The existing count builder supplies per-partition single-flight coordination, its memory semaphore, and the host memory brake.
+  Proof builds share the count-build semaphore and use the maintenance memory pool, spill-disk limit, and host memory brake.
   A bounded history of 256 attempts defers retries for 60 seconds while each entry remains resident, allowing other requested days to advance.
   Tests verify busy-slot rejection, duplicate admission rejection, completion, retry delay, and persisted proof recovery.
   All 133 selected Tantivy, proof, and logical-count tests passed in 8.854 seconds (`a414da47-0837-40bb-a2de-7481ea24214c`).
   The change was tested in an isolated checkout while the preceding revision completed CI.
-  Large-day proof construction still retains the complete winner index; a count-only build path remains necessary where that exceeds the cache's build limits.
+- Query-triggered proof construction now sorts only complete keys and the optional tombstone column, then checks strict key ordering across batches.
+  A duplicate key or physical tombstone declines publication. Unexpected key ordering is an error.
+  A unique, tombstone-free partition's physical count is also its exact logical count, so no winner cache is needed.
+  The checker retains one encoded-key batch and the preceding batch's final key, charged to the maintenance memory pool.
+  The external sort uses the existing maintenance spill runtime. This removes the complete winner-index admission limit from proof seeding.
+  The builder checks that its exact file/DV set remains current before publishing.
+  Tests verify publication with the winner cache disabled, duplicate and tombstone rejection, and acceptance after a real deletion-vector update.
+  The first focused test passed in 1.681 seconds (`e457fe53-ca82-4f38-9d49-dfc7b8fcb590`).
+  All 135 selected regression tests then passed in 8.843 seconds (`41e92162-dbc5-4c3d-9f1a-581ecc9eeb84`).
+  An added multi-batch case checks unique keys over several batches and a duplicate at a sorted batch boundary.
+  That case exposed a fixture truncation: `json_to_batch_for` returned only the first 1,024 supplied records.
+  The helper now sizes its reader batch to include all supplied records. The corrected case inserts 4,097 rows under the default maintenance batch size.
+  The corrected 135-test run passed in 12.262 seconds (`a35fded1-d92e-4e83-9cae-0fa6aefe9120`), with one nextest leak notification.
+  A repeat with full final-status output is running to identify any recurring leak.
+  Full local signoff (`fmt clippy test e2e`) is running because the shared helper change also affects other fixtures.
+  Large-file spill performance and dirty/hot-day histogram execution remain unverified. The ordinary captured-row path still has its 64 MiB daily decoded limit.
 - Initial SQL routing recognizes `count(*)` by `time_bucket` with bounded timestamps, project equality, and exact `array_has` predicates.
   String and SQL INTERVAL widths share the existing UDF parser. Aggregate replacement preserves parent projections and ordering.
   Only schema-declared element fields qualify; the `mor_versioned` fixture now has such a hashes field, while production schemas remain unchanged.

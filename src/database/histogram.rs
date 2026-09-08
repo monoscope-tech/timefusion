@@ -167,8 +167,8 @@ fn histogram_timestamps(batch: &RecordBatch) -> Result<&[i64]> {
 
 impl CapturedHistogram {
     /// Request one missing completed-day proof without delaying this query.
-    /// The shared builder retains its memory brake, semaphore and single-flight
-    /// key. The extra permit prevents a chart workload from queuing many days.
+    /// The builder uses the maintenance runtime and shared count-build semaphore.
+    /// The extra permit prevents a chart workload from queuing many days.
     fn seed_missing_proof(&self, database: &super::Database) -> Option<tokio::task::JoinHandle<()>> {
         database.tantivy_indexer()?;
         let state = &database.histogram_proof_build;
@@ -198,13 +198,14 @@ impl CapturedHistogram {
             key
         };
         let database = Arc::new(database.background_clone());
-        // A fresh build supplies schema-bound evidence. Loading an old Arrow
-        // cache alone does not establish the persisted proof's schema contract.
-        let build = database.schedule_logical_count_build(&key.project_id, &key.table_name, &key.date, true)?;
         Some(tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = build.await {
-                tracing::warn!(%error, "histogram proof builder task failed");
+            match database.build_histogram_count_proof(&key).await {
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::debug!(project_id = key.project_id, table = key.table_name, date = key.date, "histogram uniqueness proof declined"),
+                Err(error) => {
+                    tracing::warn!(%error, project_id = key.project_id, table = key.table_name, date = key.date, "histogram proof builder task failed")
+                }
             }
         }))
     }
@@ -382,6 +383,108 @@ impl CapturedHistogram {
 }
 
 impl super::Database {
+    /// Prove a complete Delta partition is unique and contains no tombstones.
+    /// Sorting can spill through the maintenance runtime; the checker retains
+    /// only one batch of encoded keys and the preceding batch's final key.
+    /// Non-unique partitions decline without publishing a count witness.
+    async fn build_histogram_count_proof(&self, key: &crate::read::CountPartition) -> Result<Option<u64>> {
+        use arrow::row::{RowConverter, SortField};
+        use datafusion::{execution::memory_pool::MemoryConsumer, prelude::SessionContext};
+        use futures::TryStreamExt;
+
+        let _permit = tokio::select! {
+            permit = self.logical_count_build_sem.acquire() => permit?,
+            () = self.maintenance_shutdown.cancelled() => return Ok(None),
+        };
+        let indexer = self.tantivy_indexer().context("histogram proof requires an index publisher")?;
+        tracing::info!(project_id = key.project_id, table = key.table_name, date = key.date, "histogram uniqueness proof build started");
+        let schema = crate::schema::get_schema(&key.table_name).context("unknown histogram proof table")?;
+        ensure!(schema.dedup_keys.iter().any(|key| key == "timestamp"), "histogram proof requires timestamp in the key");
+        let date = key.date.parse::<chrono::NaiveDate>()?;
+        let lo = date.and_hms_opt(0, 0, 0).context("invalid proof date")?.and_utc().timestamp_micros();
+        let hi = lo.checked_add(DAY_MICROS).context("proof date overflow")?;
+        let table_ref = self.resolve_table(&key.project_id, &key.table_name).await?;
+        let (files, snapshot, log_store) = {
+            let table = table_ref.read().await;
+            let (_, files) = Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?;
+            (files, Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
+        };
+        let root = log_store.root_url().clone();
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let provider = Self::narrow_provider(log_store, snapshot, files.keys().cloned().collect(), None, None).await?;
+        let context = SessionContext::new_with_state(super::build_optimize_session_state(1, self.maintenance_runtime_env()));
+        context.register_table("__histogram_proof", provider)?;
+        let columns: Vec<_> = schema.dedup_keys.iter().chain(schema.tombstone_column.iter()).map(String::as_str).collect();
+        let frame = context
+            .table("__histogram_proof")
+            .await?
+            .select_columns(&columns)?
+            .sort(schema.dedup_keys.iter().map(|key| datafusion::logical_expr::col(key).sort(true, true)).collect())?;
+        let arrow_schema = frame.schema().as_arrow();
+        let key_indices = schema.dedup_keys.iter().map(|key| arrow_schema.index_of(key)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let converter = RowConverter::new(key_indices.iter().map(|&index| SortField::new(arrow_schema.field(index).data_type().clone())).collect())?;
+        let task = context.task_ctx();
+        let reservation = MemoryConsumer::new("TantivyProofKeys").register(task.memory_pool());
+        let mut stream = frame.execute_stream().await?;
+        let mut previous: Option<Vec<u8>> = None;
+        let mut count = 0_u64;
+        let mut brake = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            let batch = tokio::select! {
+                () = self.maintenance_shutdown.cancelled() => return Ok(None),
+                _ = brake.tick() => {
+                    ensure!(
+                        super::process_memory_bytes().is_none_or(|used| used <= self.config.derived.memory_brake_limit_bytes()),
+                        "histogram proof stopped at the host memory brake"
+                    );
+                    continue;
+                }
+                batch = stream.try_next() => batch?,
+            };
+            let Some(batch) = batch else { break };
+            ensure!(histogram_timestamps(&batch)?.iter().all(|&timestamp| timestamp >= lo && timestamp < hi), "proof timestamp differs from its partition");
+            if let Some(name) = &schema.tombstone_column {
+                let deleted = batch.column_by_name(name).context("missing proof tombstone")?;
+                let deleted = deleted.as_any().downcast_ref::<arrow::array::BooleanArray>().context("proof tombstone must be Boolean")?;
+                if deleted.iter().any(|value| value == Some(true)) {
+                    return Ok(None);
+                }
+            }
+            let keys = converter.convert_columns(&key_indices.iter().map(|&index| batch.column(index).clone()).collect::<Vec<_>>())?;
+            let bytes = [batch.get_array_memory_size(), keys.size(), converter.size(), previous.as_ref().map_or(0, Vec::capacity)]
+                .into_iter()
+                .try_fold(0_usize, usize::checked_add)
+                .context("proof buffer size overflow")?;
+            reservation.try_resize(bytes)?;
+            if keys.num_rows() != 0 {
+                let first = previous.as_ref().map(|last| last.as_slice().cmp(keys.row(0).as_ref()));
+                let adjacent = keys.iter().zip(keys.iter().skip(1)).map(|(left, right)| left.as_ref().cmp(right.as_ref()));
+                for order in first.into_iter().chain(adjacent) {
+                    if order.is_eq() {
+                        return Ok(None);
+                    }
+                    ensure!(order.is_lt(), "histogram proof source is not sorted by its complete key");
+                }
+                previous = Some(keys.row(keys.num_rows() - 1).as_ref().to_vec());
+                count = count.checked_add(u64::try_from(keys.num_rows())?).context("histogram proof count overflow")?;
+            }
+            drop(keys);
+            drop(batch);
+            reservation.try_resize(converter.size().checked_add(previous.as_ref().map_or(0, Vec::capacity)).context("proof key size overflow")?)?;
+        }
+        let current = {
+            let table = table_ref.read().await;
+            Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?.1
+        };
+        ensure!(files == current, "histogram proof partition changed during build");
+        let proof = crate::tantivy::visibility::PartitionCountProof::new(root, files, schema, count)?;
+        indexer.publish_count_proof(&key.table_name, &key.project_id, date, proof).await?;
+        tracing::info!(project_id = key.project_id, table = key.table_name, %date, count, "histogram unique partition proof ready");
+        Ok(Some(count))
+    }
+
     pub(crate) fn histogram_dml_guard(&self, project: &str, table: &str) -> HistogramDmlGuard {
         self.histogram_dml.entry((project.to_owned(), table.to_owned())).or_default().clone().enter()
     }
@@ -609,6 +712,7 @@ mod tests {
         assert!(unproven.seed_missing_proof(&db).is_none(), "one query-triggered proof build holds the admission slot");
         build.await?;
         assert!(unproven.seed_missing_proof(&db).is_none(), "a recent attempt must not rebuild from a stale query capture");
+        assert_eq!(db.logical_count_cache.stats().0, 0, "proof seeding must not retain the complete winner index");
         let captured = db.capture_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         let result = captured.count().await?;
         assert_eq!(result.counts.values().sum::<u64>(), 4);
@@ -623,6 +727,7 @@ mod tests {
         build_indexes().await?;
         assert_eq!(captured.count().await?.counts.values().sum::<u64>(), 4, "the retained proof belongs to the old file set");
         assert!(db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(), "new files invalidate the old proof");
+        assert_eq!(db.build_histogram_count_proof(&partition).await?, None, "duplicate physical keys cannot receive a uniqueness proof");
         db.build_logical_count_partition(&partition, true).await?;
         assert!(
             db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(),
@@ -648,7 +753,7 @@ mod tests {
             db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(),
             "a same-path DV change invalidates the cached proof"
         );
-        db.build_logical_count_partition(&partition, true).await?;
+        assert_eq!(db.build_histogram_count_proof(&partition).await?, Some(4));
         let result = db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         assert_eq!(result.counts.values().sum::<u64>(), 3);
         assert_eq!(result.scanned_sources, 0, "a newly proven unique partition counts through its pinned DV mask");
@@ -657,10 +762,29 @@ mod tests {
         let mut restart_config = (*config).clone();
         restart_config.core.timefusion_data_dir = restart_dir.path().into();
         let restart_search = Arc::new(TantivySearchService::new(store, restart_dir.path().join("indexes"), Arc::new(config.tantivy.clone())));
-        let restarted = super::super::Database::with_config(Arc::new(restart_config)).await?.with_tantivy_search(restart_search);
+        let mut restarted =
+            super::super::Database::with_config(Arc::new(restart_config)).await?.with_tantivy_search(restart_search).with_tantivy_indexer(indexer);
+        restarted.logical_count_cache = Arc::new(crate::read::LogicalCountCache::new(restart_dir.path().join("counts"), 0));
         let result = restarted.indexed_histogram(&project, table, window, Some(&membership), 64, context).await?;
         assert_eq!(result.counts.values().sum::<u64>(), 3, "cold database and index reader recover the exact persisted DV proof");
         assert_eq!(result.scanned_sources, 0);
+        assert_eq!(restarted.build_histogram_count_proof(&partition).await?, Some(4), "uniqueness proof needs no winner-cache capacity");
+        let error = restarted.build_logical_count_partition(&partition, true).await.unwrap_err();
+        assert!(error.to_string().contains("resident cache budget"), "the same input must exceed the disabled winner cache: {error}");
+        let mut tombstone = row("deleted-row", "b");
+        tombstone["deleted"] = serde_json::json!(true);
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![tombstone])?], true, None).await?;
+        assert_eq!(db.build_histogram_count_proof(&partition).await?, None, "physical tombstones cannot be certified as live rows");
+        let batch_rows = super::super::build_optimize_session_state(1, db.maintenance_runtime_env()).config().options().execution.batch_size;
+        let dense_timestamp = timestamp - DAY_MICROS;
+        let dense_date = chrono::DateTime::from_timestamp_micros(dense_timestamp).unwrap().date_naive().to_string();
+        let dense_row = |id: usize| serde_json::json!({"project_id": project, "timestamp": dense_timestamp, "date": dense_date, "id": format!("{id:08}")});
+        let rows = 2 * batch_rows + 1;
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, (0..rows).map(dense_row).collect())?], true, None).await?;
+        let dense_partition = crate::read::CountPartition { date: dense_date.clone(), ..partition.clone() };
+        assert_eq!(db.build_histogram_count_proof(&dense_partition).await?, Some(u64::try_from(rows)?), "unique keys span several output batches");
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![dense_row(batch_rows - 1)])?], true, None).await?;
+        assert_eq!(db.build_histogram_count_proof(&dense_partition).await?, None, "duplicate keys at a sorted batch boundary must decline");
         Ok(())
     }
 

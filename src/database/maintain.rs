@@ -5637,21 +5637,19 @@ impl Database {
 
     /// Schedule one exact partition build. Concurrent misses share the same
     /// single-flight key and the global semaphore bounds winner-map memory.
-    pub(crate) fn schedule_logical_count_build(
-        self: &Arc<Self>, project_id: &str, table_name: &str, date: &str, force_refresh: bool,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    pub(crate) fn schedule_logical_count_build(self: &Arc<Self>, project_id: &str, table_name: &str, date: &str, force_refresh: bool) {
         let key = crate::read::CountPartition { project_id: project_id.to_string(), table_name: table_name.to_string(), date: date.to_string() };
         if !self.logical_count_building.insert(key.clone()) {
-            return None;
+            return;
         }
         let database = Arc::clone(self);
-        Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             let result = database.build_logical_count_partition(&key, force_refresh).await;
             database.logical_count_building.remove(&key);
             if let Err(error) = result {
                 warn!(project_id = key.project_id, table_name = key.table_name, date = key.date, %error, "logical-count background build failed");
             }
-        }))
+        });
     }
 
     pub(crate) async fn build_logical_count_partition(&self, key: &crate::read::CountPartition, force_refresh: bool) -> Result<()> {
