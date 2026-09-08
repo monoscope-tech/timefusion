@@ -212,62 +212,88 @@ pub async fn read_file_rows(
 pub async fn stream_file_rows(
     log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile, schema: arrow::datatypes::SchemaRef,
 ) -> Result<(futures::stream::BoxStream<'static, Result<RecordBatch>>, BooleanBuffer)> {
-    use deltalake::datafusion::parquet::arrow::{
-        ProjectionMask,
-        async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
-    };
-    use futures::TryStreamExt;
-    use object_store::ObjectStoreExt;
+    let prepared = PreparedFileRows::open(log_store, add).await?;
+    Ok((prepared.stream(schema)?, prepared.live))
+}
 
-    // Add paths are relative to the table; the unprefixed root store is used by
-    // the kernel only after it has resolved an absolute URL.
-    let store = log_store.object_store(None);
-    let path = object_store::path::Path::from(add.path.as_str());
-    let meta = store.head(&path).await?;
-    ensure!(i64::try_from(meta.size)? == add.size, "Parquet object size differs from snapshot Add");
-    let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
-    let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-    let rows = usize::try_from(builder.metadata().file_metadata().num_rows())?;
-    let mut projection = Vec::new();
-    for field in schema.fields() {
-        if !add.partition_values.contains_key(field.name()) {
-            match builder.schema().index_of(field.name()) {
-                Ok(index) => projection.push(index),
-                Err(_) => ensure!(field.is_nullable(), "required visibility column is absent from Parquet: {}", field.name()),
+/// Immutable Parquet metadata and DV visibility shared by repeatable source scans.
+/// Each scan creates its own reader; no execution consumes another query's stream.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedFileRows {
+    store: Arc<dyn object_store::ObjectStore>,
+    path: object_store::path::Path,
+    size: u64,
+    metadata: deltalake::datafusion::parquet::arrow::arrow_reader::ArrowReaderMetadata,
+    partitions: std::collections::HashMap<String, Option<String>>,
+    live: BooleanBuffer,
+}
+
+impl PreparedFileRows {
+    pub async fn open(log_store: deltalake::logstore::LogStoreRef, add: &SnapshotFile) -> Result<Self> {
+        use deltalake::datafusion::parquet::arrow::{arrow_reader::ArrowReaderMetadata, async_reader::ParquetObjectReader};
+        use object_store::ObjectStoreExt;
+
+        let store = log_store.object_store(None);
+        let path = object_store::path::Path::from(add.path.as_str());
+        let meta = store.head(&path).await?;
+        ensure!(i64::try_from(meta.size)? == add.size, "Parquet object size differs from snapshot Add");
+        let mut reader = ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(meta.size);
+        let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+        let rows = usize::try_from(metadata.metadata().file_metadata().num_rows())?;
+        let live = deletion_vector_mask(log_store, add.deletion_vector.as_ref(), rows).await?;
+        Ok(Self { store, path, size: meta.size, metadata, partitions: add.partition_values.clone(), live })
+    }
+
+    pub fn stream(&self, schema: arrow::datatypes::SchemaRef) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
+        use deltalake::datafusion::parquet::arrow::{
+            ProjectionMask,
+            async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+        };
+        use futures::TryStreamExt;
+
+        let reader = ParquetObjectReader::new(self.store.clone(), self.path.clone()).with_file_size(self.size);
+        let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.metadata.clone());
+        let rows = self.live.len();
+        let mut projection = Vec::new();
+        for field in schema.fields() {
+            if !self.partitions.contains_key(field.name()) {
+                match builder.schema().index_of(field.name()) {
+                    Ok(index) => projection.push(index),
+                    Err(_) => ensure!(field.is_nullable(), "required visibility column is absent from Parquet: {}", field.name()),
+                }
             }
         }
+        let projection = ProjectionMask::roots(builder.parquet_schema(), projection);
+        let stream = builder.with_projection(projection).build()?;
+        let partitions = self.partitions.clone();
+        let batches = futures::stream::try_unfold((stream, schema, partitions, 0_usize), move |(mut stream, schema, partitions, decoded_rows)| async move {
+            let Some(batch) = stream.try_next().await? else {
+                ensure!(decoded_rows == rows, "visibility read did not preserve every physical source ordinal");
+                return Ok(None);
+            };
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| -> Result<ArrayRef> {
+                    let array: ArrayRef = if let Some(partition) = partitions.get(field.name()) {
+                        Arc::new(arrow::array::StringArray::from_iter(std::iter::repeat_n(partition.as_deref(), batch.num_rows())))
+                    } else if let Some(column) = batch.column_by_name(field.name()) {
+                        column.clone()
+                    } else {
+                        arrow::array::new_null_array(field.data_type(), batch.num_rows())
+                    };
+                    let array = arrow::compute::cast(&array, field.data_type())?;
+                    ensure!(field.is_nullable() || array.null_count() == 0, "required visibility column contains nulls: {}", field.name());
+                    Ok(array)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batch = RecordBatch::try_new(schema.clone(), columns)?;
+            let decoded_rows = decoded_rows.checked_add(batch.num_rows()).context("visibility source row count overflow")?;
+            ensure!(decoded_rows <= rows, "visibility read exceeds physical source row count");
+            Ok(Some((batch, (stream, schema, partitions, decoded_rows))))
+        });
+        Ok(Box::pin(batches))
     }
-    let projection = ProjectionMask::roots(builder.parquet_schema(), projection);
-    let stream = builder.with_projection(projection).build()?;
-    let live = deletion_vector_mask(log_store, add.deletion_vector.as_ref(), rows).await?;
-    let partitions = add.partition_values.clone();
-    let batches = futures::stream::try_unfold((stream, schema, partitions, 0_usize), move |(mut stream, schema, partitions, decoded_rows)| async move {
-        let Some(batch) = stream.try_next().await? else {
-            ensure!(decoded_rows == rows, "visibility read did not preserve every physical source ordinal");
-            return Ok(None);
-        };
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| -> Result<ArrayRef> {
-                let array: ArrayRef = if let Some(partition) = partitions.get(field.name()) {
-                    Arc::new(arrow::array::StringArray::from_iter(std::iter::repeat_n(partition.as_deref(), batch.num_rows())))
-                } else if let Some(column) = batch.column_by_name(field.name()) {
-                    column.clone()
-                } else {
-                    arrow::array::new_null_array(field.data_type(), batch.num_rows())
-                };
-                let array = arrow::compute::cast(&array, field.data_type())?;
-                ensure!(field.is_nullable() || array.null_count() == 0, "required visibility column contains nulls: {}", field.name());
-                Ok(array)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let decoded_rows = decoded_rows.checked_add(batch.num_rows()).context("visibility source row count overflow")?;
-        ensure!(decoded_rows <= rows, "visibility read exceeds physical source row count");
-        Ok(Some((batch, (stream, schema, partitions, decoded_rows))))
-    });
-    Ok((Box::pin(batches), live))
 }
 
 /// Reads the deletion vector pinned in a Delta snapshot, preserving physical ordinals.
@@ -503,6 +529,7 @@ mod tests {
             kernel::{Action, transaction::CommitBuilder},
             operations::deletion_vectors::{FileDeletion, write_deletion_vectors},
         };
+        use futures::TryStreamExt;
         let store = Arc::new(object_store::memory::InMemory::new());
         let url = url::Url::parse("memory:///histogram-visibility")?;
         let mut table = DeltaTableBuilder::from_url(url.clone())?
@@ -537,6 +564,7 @@ mod tests {
         let mut previous = None;
         let mut captured = SnapshotFile::capture(&table.snapshot()?.log_data().iter().next().context("missing snapshot file")?, &["project".into()])?;
         let original = captured.clone();
+        let pinned = PreparedFileRows::open(log_store.clone(), &original).await?;
         assert!(SnapshotFile::capture(&table.snapshot()?.log_data().iter().next().unwrap(), &["missing".into()]).is_err());
         for (row, expected) in [(1, vec![true, false, true, true]), (3, vec![true, false, true, false])] {
             let actions =
@@ -563,6 +591,15 @@ mod tests {
             captured = SnapshotFile::capture(&table.snapshot()?.log_data().iter().next().context("missing snapshot file")?, &["project".into()])?;
             let mask = deletion_vector_mask(log_store.clone(), Some(&descriptor), 4).await?;
             assert_eq!(mask.iter().collect::<Vec<_>>(), expected);
+            for projection in [schema.clone(), Arc::new(schema.project(&[0])?)] {
+                let batches = pinned.clone().stream(projection)?.try_collect::<Vec<_>>().await?;
+                let ids = batches
+                    .iter()
+                    .flat_map(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().iter().copied())
+                    .collect::<Vec<_>>();
+                assert_eq!(ids, [1, 2, 3, 4], "repeated scans must retain original physical row order");
+                assert_eq!(pinned.live, BooleanBuffer::new_set(4), "later DV commits must not replace prepared visibility");
+            }
             let source = read_file_rows(log_store.clone(), &captured, schema.clone(), 1_000_000).await?;
             assert_eq!(source.live, mask);
             assert_eq!(source.batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4, "DV filtering must not rebase physical ordinals");

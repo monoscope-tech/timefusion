@@ -560,3 +560,22 @@ stream hidden behind a mutex. Metadata and DV masks need reservation ownership.
 `76a958f7` passed `make ci-signoff CHECKS="fmt clippy"`; both checks were
 attested. Final status leaves full test, pg-smoke, and e2e to GitHub. The
 current selected regression set passed all 136 tests as recorded above.
+
+Prepared Parquet sources now retain immutable `ArrowReaderMetadata` and the
+pinned DV mask, creating fresh readers with `new_with_metadata` for each scan.
+The collecting and streaming entry points share the same decoder. Extended
+the real Delta DV test with repeated prepared scans, alternate projections,
+and old-mask preservation after later commits. All 136 selected tests passed
+in 9.317 seconds (`be958064-0dd1-4562-9701-53c98848a3d8`). Final fmt/clippy
+signoff is running.
+
+Next integration: construct reusable physical source partitions from prepared
+files, attach source/ordinal before eligibility filtering, and feed them to
+`stream_winner_masks`. Retain prepared sources for missing-index fallback that
+streams membership columns after winner resolution. Add an explicit streaming
+count entry point with a working-memory budget; preserve the existing public
+collecting API's total-decoded-budget contract. Test a dirty indexed day whose
+hash arrays exceed that old daily limit, with parity against the same capture.
+The metadata and DV owner must keep its reservation alive through source
+execution and fallback. This is the next implementation step, not another
+standalone reader refactor.

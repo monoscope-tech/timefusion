@@ -136,3 +136,28 @@ A second scoped review with both skills found no further change: the sort
 retains complete keys, descending versions, and ascending physical lineage;
 mask allocation is checked and charged; errors propagate. Full-feature reviews
 and real captured-stream integration remain open.
+
+## Prepared Parquet source review
+
+Scope: `stream_file_rows`, `PreparedFileRows::open`, `PreparedFileRows::stream`,
+and the extended real Delta DV test.
+
+rs-distill pass 1: reuse Parquet 58.3.0's cloneable `ArrowReaderMetadata` and
+`new_with_metadata`. Each scan owns a fresh reader. Projection, partition
+reconstruction, casts, and physical-row validation remain in one decoder.
+No mutex or one-shot execution state is required. The test extends the
+existing DV scenario with repeat scans and a second projection.
+
+rs-evasion pass 1: the prepared DV mask must be private. Exposing mutation
+would let a caller change the physical-row count used by the stream checker.
+Made it private; construction validates it against Parquet metadata.
+
+Pass 2 with both skills: no further scoped finding. The prepared source holds
+immutable snapshot metadata, each execution has independent reader state, and
+errors propagate. Metadata and DV ownership still need query-pool accounting
+in the forthcoming histogram source-plan owner. No whole-process memory
+bound is claimed by this reader API.
+
+All 136 selected tests passed in 9.317 seconds (nextest
+`be958064-0dd1-4562-9701-53c98848a3d8`). Final lint is running. This remains a
+scoped review, not completion of the required full-feature reviews.
