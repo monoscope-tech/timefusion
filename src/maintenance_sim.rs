@@ -1435,13 +1435,28 @@ mod tests {
     }
 
     /// §3c.2 — the control. Bytes strictly proportional to width is the model
-    /// `byte_bounded_units` assumes; under it the same queue never approaches
-    /// the floor, with the guard on OR off. So the shred above is caused by the
-    /// floor, not by the scheduler.
+    /// `byte_bounded_units` assumes. Without independent execution timeouts,
+    /// byte-driven splitting must stop above the floor with either guard.
     #[test]
     fn a_floorless_whale_never_reaches_the_floor() {
         for guard in [SplitGuard::Off, SplitGuard::Shipped] {
-            let (report, whale, _) = synth_run(false, guard);
+            let start = 100 * DAY_MICROS;
+            let queue = synthetic_whale_queue(start, false, 100, 1);
+            let whale = queue.whale_cell;
+            // The duration model is independent of bytes. Its random timeouts
+            // can legitimately split even a small task, so isolate byte physics
+            // here; timeout bisection is exercised by the failure tests.
+            let cfg = SimConfig {
+                mint_frontier: false,
+                workers: 16,
+                horizon_micros: 6 * HOUR,
+                byte_model: Some(queue.model),
+                split_guard: guard,
+                duration_scale: 0.0,
+                ..Default::default()
+            };
+            let report = run(queue.journal, &cfg, start).unwrap();
+            assert_eq!(report.timeouts.values().sum::<u64>(), 0);
             // 255 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves,
             // bisection only makes powers of two, and since bisection descends
             // ONE level per measurement the 127 intermediate parents are
