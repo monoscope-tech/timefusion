@@ -301,3 +301,8 @@ datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", rev = 
 # frame (2026-07-31). Re-vendor from the registry on upgrade; see the PATCH
 # comment in vendor/tikv-jemalloc-sys/build.rs.
 tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
+
+# Delta's synchronous readers must deliver async results without waiting for
+# another slot in the same blocking pool (production DV-reader deadlock).
+[patch."https://github.com/buoyant-data/delta-kernel-rs"]
+buoyant_kernel = { git = "https://github.com/tonyalaribe/delta-kernel-rs.git", rev = "6817692622f376208c95246ca7ea1a4cb4231438" }

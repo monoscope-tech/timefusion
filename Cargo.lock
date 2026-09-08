@@ -1349,10 +1349,10 @@ dependencies = [
 [[package]]
 name = "buoyant_kernel"
 version = "0.24.0"
-source = "git+https://github.com/buoyant-data/delta-kernel-rs?rev=393fbf662f56c4bb04445e1d36805a33e32b8fbc#393fbf662f56c4bb04445e1d36805a33e32b8fbc"
+source = "git+https://github.com/tonyalaribe/delta-kernel-rs.git?rev=6817692622f376208c95246ca7ea1a4cb4231438#6817692622f376208c95246ca7ea1a4cb4231438"
 dependencies = [
  "arrow",
- "buoyant_kernel_derive 1.0.0 (git+https://github.com/buoyant-data/delta-kernel-rs?rev=393fbf662f56c4bb04445e1d36805a33e32b8fbc)",
+ "buoyant_kernel_derive 1.0.0 (git+https://github.com/tonyalaribe/delta-kernel-rs.git?rev=6817692622f376208c95246ca7ea1a4cb4231438)",
  "bytes",
  "chrono",
  "crc",
@@ -1392,7 +1392,7 @@ dependencies = [
 [[package]]
 name = "buoyant_kernel_derive"
 version = "1.0.0"
-source = "git+https://github.com/buoyant-data/delta-kernel-rs?rev=393fbf662f56c4bb04445e1d36805a33e32b8fbc#393fbf662f56c4bb04445e1d36805a33e32b8fbc"
+source = "git+https://github.com/tonyalaribe/delta-kernel-rs.git?rev=6817692622f376208c95246ca7ea1a4cb4231438#6817692622f376208c95246ca7ea1a4cb4231438"
 dependencies = [
  "proc-macro2",
  "quote",
