@@ -73,7 +73,7 @@ pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
     // Same nullability-widened file set as `Database::create_session_context`
     // (2026-07-31, 7d68f01): a DML plan reading those files must not trip the
     // physical-vs-logical aggregate schema check either.
-    let cfg = cfg.set_bool("datafusion.execution.skip_physical_aggregate_schema_check", true);
+    let mut cfg = cfg.set_bool("datafusion.execution.skip_physical_aggregate_schema_check", true);
     // A MERGE-UPDATE re-reads and rewrites WHOLE wide otel rows, so it is the
     // most decode-expensive read in the system — and it was the only one still
     // on DataFusion's 8192-row default. The query and maintenance sessions have
@@ -81,7 +81,6 @@ pub(crate) fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
     // was missed, and a dump taken mid-burst on 2026-08-13 put 38.3 GiB (57% of
     // live heap) back in exactly the stack that work had cut —
     // `extend_from_dictionary` under `ByteArrayDecoder::read`.
-    let mut cfg = cfg;
     let _ = cfg.options_mut().set("datafusion.execution.batch_size", crate::database::WIDE_ROW_DECODE_BATCH_SIZE);
     Arc::new(
         SessionStateBuilder::new()
@@ -688,10 +687,11 @@ impl DisplayAs for DmlExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "{}: table={}, project_id={}", self.name(), self.table_name, self.project_id)?;
                 if self.op_type == DmlOperation::Update && !self.assignments.is_empty() {
-                    write!(f, ", assignments=[{}]", self.assignments.iter().map(|(col, expr)| format!("{} = {}", col, expr)).collect::<Vec<_>>().join(", "))?;
+                    use itertools::Itertools;
+                    write!(f, ", assignments=[{}]", self.assignments.iter().map(|(col, expr)| format!("{col} = {expr}")).format(", "))?;
                 }
-                if let Some(ref pred) = self.predicate {
-                    write!(f, ", predicate={}", pred)?;
+                if let Some(pred) = &self.predicate {
+                    write!(f, ", predicate={pred}")?;
                 }
                 Ok(())
             }
@@ -1021,14 +1021,13 @@ async fn perform_version_append(
         // columns are identity columns, never version-mutable. Skipped above
         // a cap so a giant source can't build a pathological expression.
         if src.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS {
-            for (t, s) in &src.join_keys {
-                let idx = src.schema.index_of(s)?;
-                let arr = src.batch.column(idx);
+            builder = src.join_keys.iter().try_fold(builder, |builder, (t, s)| {
+                let arr = src.batch.column(src.schema.index_of(s)?);
                 let mut vals = (0..arr.len()).map(|i| datafusion::common::ScalarValue::try_from_array(arr, i)).collect::<Result<Vec<_>>>()?;
                 vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 vals.dedup();
-                builder = builder.filter(Expr::Column(Column::from_name(t)).in_list(vals.into_iter().map(lit).collect(), false))?;
-            }
+                builder.filter(Expr::Column(Column::from_name(t)).in_list(vals.into_iter().map(lit).collect(), false))
+            })?;
         }
         let mem = MemTable::try_new(src.schema.clone(), vec![vec![src.batch.clone()]])?;
         let src_plan = LogicalPlanBuilder::scan(MOR_SOURCE, provider_as_source(Arc::new(mem)), None)?.build()?;
@@ -1120,22 +1119,19 @@ async fn perform_update_with_buffer(
     // last-write-wins hold.
     if is_version_append(table_name) {
         let append_span = tracing::trace_span!(parent: span, "mor.update");
-        let rounds = match source {
-            Some(src) => crate::dml::split_source_rounds(src)?.into_iter().map(Some).collect(),
+        // `split_source_rounds` preserves successive applications for duplicate
+        // keys. Keys are disjoint within each round, so bounded sequential
+        // chunks preserve semantics and keep pushdown enabled.
+        let chunks: Vec<Option<UpdateSource>> = match source {
+            Some(src) => crate::dml::split_source_rounds(src)?.into_iter().flat_map(|round| bounded_mor_source_chunks(round).into_iter().map(Some)).collect(),
             None => vec![None],
         };
         let mut total = 0u64;
-        for round in rounds {
-            // `split_source_rounds` preserves successive applications for
-            // duplicate keys. Keys are disjoint within each round, so bounded
-            // sequential chunks preserve semantics and keep pushdown enabled.
-            let chunks = round.map_or_else(|| vec![None], |source| bounded_mor_source_chunks(source).into_iter().map(Some).collect());
-            for chunk in chunks {
-                total +=
-                    perform_version_append(database, buffered_layer, table_name, project_id, predicate.clone(), &assignments, chunk.as_ref(), false, &session)
-                        .instrument(append_span.clone())
-                        .await?;
-            }
+        // Sequential awaits accumulating with `?`: ordered and fallible.
+        for chunk in chunks {
+            total += perform_version_append(database, buffered_layer, table_name, project_id, predicate.clone(), &assignments, chunk.as_ref(), false, &session)
+                .instrument(append_span.clone())
+                .await?;
         }
         return Ok(total);
     }
@@ -1197,13 +1193,8 @@ fn bounded_mor_source_chunks(source: UpdateSource) -> Vec<UpdateSource> {
         chunks = rows.div_ceil(MOR_KEY_PUSHDOWN_ROWS),
         "bounded merge-on-read source to preserve complete-key pushdown"
     );
-    (0..rows)
-        .step_by(MOR_KEY_PUSHDOWN_ROWS)
-        .map(|offset| UpdateSource {
-            batch: source.batch.slice(offset, (rows - offset).min(MOR_KEY_PUSHDOWN_ROWS)),
-            schema: source.schema.clone(),
-            join_keys: source.join_keys.clone(),
-        })
+    chunk_rows(&source.batch, MOR_KEY_PUSHDOWN_ROWS)
+        .map(|batch| UpdateSource { batch, schema: source.schema.clone(), join_keys: source.join_keys.clone() })
         .collect()
 }
 
@@ -2130,11 +2121,17 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
 /// rest (prod 2026-07-19: same-key multi-tag hash enrichment lost tags / errored).
 /// Returns one round for the common no-duplication case.
 pub(crate) fn split_source_rounds(source: UpdateSource) -> Result<Vec<UpdateSource>> {
-    let key_indices: Vec<usize> = source.join_keys.iter().map(|(_, s)| source.schema.index_of(s)).collect::<std::result::Result<_, _>>()?;
-    Ok(split_rounds(&source.batch, &key_indices)?
+    Ok(split_rounds_on_keys(&source.batch, &source.join_keys)?
         .into_iter()
         .map(|batch| UpdateSource { batch, schema: source.schema.clone(), join_keys: source.join_keys.clone() })
         .collect())
+}
+
+/// [`split_rounds`] keyed by the SOURCE-side names of `join_keys`, resolved
+/// against `batch`'s own schema.
+fn split_rounds_on_keys(batch: &RecordBatch, join_keys: &[(String, String)]) -> Result<Vec<RecordBatch>> {
+    let key_indices: Vec<usize> = join_keys.iter().map(|(_, s)| batch.schema().index_of(s)).collect::<std::result::Result<_, _>>()?;
+    split_rounds(batch, &key_indices)
 }
 
 /// Split `batch` into merge rounds: exact-duplicate rows are dropped, and
@@ -2309,8 +2306,7 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
             ok += 1;
             continue;
         }
-        let key_indices: Result<Vec<usize>> = meta.join_keys.iter().map(|(_, s)| Ok(merged.schema().index_of(s)?)).collect();
-        let rounds = match key_indices.and_then(|idx| split_rounds(&merged, &idx)) {
+        let rounds = match split_rounds_on_keys(&merged, &meta.join_keys) {
             Ok(r) => r,
             Err(e) => {
                 warn!("dml redrive: round split failed for {path:?}: {e}; leaving parked");
@@ -2532,8 +2528,9 @@ fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(
         m
     });
     let unfolded = |members: Vec<Member>| members.into_iter().map(|(k, g, _)| (k, g)).collect::<Vec<_>>();
-    unfolded(ineligible)
+    ineligible
         .into_iter()
+        .map(|(k, g, _)| (k, g))
         .chain(buckets.into_iter().flat_map(|((table_name, shape_fp), mut members)| {
             if members.len() == 1 {
                 return unfolded(members);
@@ -2766,8 +2763,7 @@ impl DmlCoalescer {
             if merged.num_rows() == 0 {
                 continue;
             }
-            let key_indices: Result<Vec<usize>> = group.join_keys.iter().map(|(_, s)| Ok(merged.schema().index_of(s)?)).collect();
-            let rounds = match key_indices.and_then(|idx| split_rounds(&merged, &idx)) {
+            let rounds = match split_rounds_on_keys(&merged, &group.join_keys) {
                 Ok(r) => r,
                 Err(e) => {
                     park_group("round split", &e, std::slice::from_ref(&merged));

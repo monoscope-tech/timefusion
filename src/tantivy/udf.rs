@@ -47,6 +47,9 @@ pub fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: b
     let leading_wildcard = it.next_if_eq(&'%').is_some();
     let mut out = String::new();
     let mut trailing_wildcard = false;
+    // Kept imperative: an invalid char must bail the WHOLE function (`return None`),
+    // while a trailing '%' must merely stop the loop (`break`, out still valid) —
+    // collecting via an iterator adapter conflates those two exits.
     while let Some(c) = it.next() {
         let lit = match c {
             c if c == esc => it.next()?, // trailing escape → bail
@@ -96,20 +99,22 @@ const REGEX_META: &str = ".^$*+?()[]{}|\\";
 /// and therefore bail: prefix/suffix routing over a 3-gram field needs its own
 /// correctness argument and is out of scope here.
 pub fn regex_literal_substring(pat: &str) -> Option<String> {
-    let mut out = String::new();
     let mut it = pat.chars();
-    while let Some(c) = it.next() {
-        let lit = match c {
-            // trailing backslash / non-meta escape (`\d`, `\y`, …) → not a literal
-            '\\' => it.next().filter(|n| REGEX_META.contains(*n))?,
-            c if REGEX_META.contains(c) => return None,
-            c => c,
-        };
-        if !is_tantivy_safe_term_char(lit) {
-            return None;
-        }
-        out.push(lit);
-    }
+    // `Option<char>` items collect into `Option<String>`, short-circuiting on the
+    // first non-literal exactly like the early `return None`s it replaces.
+    let out = std::iter::from_fn(move || {
+        let c = it.next()?;
+        Some(
+            match c {
+                // trailing backslash / non-meta escape (`\d`, `\y`, …) → not a literal
+                '\\' => it.next().filter(|n| REGEX_META.contains(*n)),
+                c if REGEX_META.contains(c) => None,
+                c => Some(c),
+            }
+            .filter(|c| is_tantivy_safe_term_char(*c)),
+        )
+    })
+    .collect::<Option<String>>()?;
     (!out.is_empty()).then_some(out)
 }
 
@@ -122,16 +127,14 @@ pub fn regex_literal_substring(pat: &str) -> Option<String> {
 /// original predicate still post-filters).
 pub fn classify_deferred(kind: &str, value: &str) -> Option<String> {
     use crate::tantivy::{NGRAM3_TOKENIZER, RAW_TOKENIZER};
-    if kind == "eq" {
-        return (!value.is_empty() && value.chars().all(is_eq_term_safe)).then(|| value.to_string());
-    }
-    let (form, tok) = kind.split_once(':')?;
-    match form {
-        "ilike" if tok == RAW_TOKENIZER => return None, // case-sensitive single token can't serve ILIKE
-        "like" | "ilike" => {}
+    let Some((form, tok)) = kind.split_once(':') else {
+        return (kind == "eq" && !value.is_empty() && value.chars().all(is_eq_term_safe)).then(|| value.to_string());
+    };
+    let allow_substring = match (form, tok) {
+        ("ilike", t) if t == RAW_TOKENIZER => return None, // case-sensitive single token can't serve ILIKE
+        ("like" | "ilike", t) => t == NGRAM3_TOKENIZER,
         _ => return None,
-    }
-    let allow_substring = tok == NGRAM3_TOKENIZER;
+    };
     let q = classify_like_pattern(value, None, allow_substring)?;
     (!allow_substring || q.chars().filter(|c| *c != '*').count() >= NGRAM_MIN_QUERY_LEN).then_some(q)
 }
@@ -172,27 +175,21 @@ impl ScalarUDFImpl for TextMatchUdf {
         let kind: Option<String> = arrs.get(2).filter(|a| !a.is_empty()).and_then(|a| string_extractor(a)(0));
         let out: BooleanArray = (0..n)
             .map(|i| {
-                Some(match (col_str(i), pat_str(i)) {
-                    (Some(haystack), Some(needle)) => match kind.as_deref() {
-                        Some(k) => deferred_row_matches(k, &needle, &haystack),
-                        // 2-arg: plan-time-classified tantivy syntax
-                        // (`'foo*'` prefix, `'foo'` substring on ngram3);
-                        // strip wildcards and require token containment.
-                        None => {
-                            let h_low = haystack.to_lowercase();
-                            needle
-                                .to_lowercase()
-                                .split_whitespace()
-                                .map(|tok| tok.trim_matches(|c: char| c == '*' || c == '?'))
-                                .all(|tok| !tok.is_empty() && h_low.contains(tok))
-                        }
-                    },
-                    _ => false,
-                })
+                Some(col_str(i).zip(pat_str(i)).is_some_and(|(haystack, needle)| {
+                    kind.as_deref().map_or_else(|| tantivy_tokens_contained(&needle, &haystack), |k| deferred_row_matches(k, &needle, &haystack))
+                }))
             })
             .collect();
         Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
     }
+}
+
+/// Row eval of a 2-arg (plan-time-classified) text_match: the query is tantivy
+/// syntax (`'foo*'` prefix, `'foo'` substring on ngram3), so strip wildcards and
+/// require every token to be contained, case-insensitively.
+fn tantivy_tokens_contained(query: &str, haystack: &str) -> bool {
+    let h_low = haystack.to_lowercase();
+    query.to_lowercase().split_whitespace().map(|tok| tok.trim_matches(|c: char| c == '*' || c == '?')).all(|tok| !tok.is_empty() && h_low.contains(tok))
 }
 
 /// Row-level evaluation of a DEFERRED (3-arg) text_match: a SUPERSET of the
@@ -414,26 +411,29 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
 mod tests {
     use super::*;
 
-    #[test]
-    fn deferred_like_row_eval_is_a_superset_of_sql_like() {
-        // `_` and embedded `%` — the shapes the old substring row-eval dropped.
-        assert!(like_match_ci("a_c", "abc"));
-        assert!(!like_match_ci("a_c", "abbc"));
-        assert!(like_match_ci("foo%bar", "fooXbar"));
-        assert!(like_match_ci("foo%bar", "foobar"));
-        assert!(!like_match_ci("foo%bar", "fooba"));
-        assert!(like_match_ci("%user_id%", "xuserXidz"));
-        assert!(like_match_ci("%foo%", "afoob"));
-        assert!(like_match_ci("foo", "FOO"), "case-insensitive superset of LIKE");
-        assert!(!like_match_ci("foo", "food"), "no wildcard = exact length");
-        assert!(like_match_ci("a\\_c", "a_c"), "escaped underscore is literal");
-        assert!(!like_match_ci("a\\_c", "abc"));
-        assert!(like_match_ci("%", ""));
-        assert!(!like_match_ci("_", ""));
+    // `_` and embedded `%` — the shapes the old substring row-eval dropped.
+    #[test_case::test_case("a_c", "abc" => true)]
+    #[test_case::test_case("a_c", "abbc" => false)]
+    #[test_case::test_case("foo%bar", "fooXbar" => true)]
+    #[test_case::test_case("foo%bar", "foobar" => true)]
+    #[test_case::test_case("foo%bar", "fooba" => false)]
+    #[test_case::test_case("%user_id%", "xuserXidz" => true)]
+    #[test_case::test_case("%foo%", "afoob" => true)]
+    #[test_case::test_case("foo", "FOO" => true ; "case-insensitive superset of LIKE")]
+    #[test_case::test_case("foo", "food" => false ; "no wildcard = exact length")]
+    #[test_case::test_case("a\\_c", "a_c" => true ; "escaped underscore is literal")]
+    #[test_case::test_case("a\\_c", "abc" => false ; "escaped underscore does not match any char")]
+    #[test_case::test_case("%", "" => true)]
+    #[test_case::test_case("_", "" => false)]
+    fn like_ci_is_a_superset_of_sql_like(pattern: &str, text: &str) -> bool {
+        like_match_ci(pattern, text)
+    }
 
-        assert!(deferred_row_matches("eq", "abc", "xxabcyy"), "eq → containment superset");
-        assert!(deferred_row_matches("like:tf_ngram3", "%a_b%", "zzaXbzz"));
-        assert!(!deferred_row_matches("like:tf_ngram3", "%a_b%", "zzabzz"));
+    #[test_case::test_case("eq", "abc", "xxabcyy" => true ; "eq → containment superset")]
+    #[test_case::test_case("like:tf_ngram3", "%a_b%", "zzaXbzz" => true)]
+    #[test_case::test_case("like:tf_ngram3", "%a_b%", "zzabzz" => false)]
+    fn deferred_row_eval_reproduces_the_original_predicate(kind: &str, value: &str, haystack: &str) -> bool {
+        deferred_row_matches(kind, value, haystack)
     }
 
     #[test]

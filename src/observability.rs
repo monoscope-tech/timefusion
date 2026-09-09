@@ -18,22 +18,24 @@
 
 use std::{
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, LazyLock, OnceLock, Weak,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
 };
 
-static MAINTENANCE_RETRY_REASON: OnceLock<Mutex<String>> = OnceLock::new();
+// `parking_lot`, not `std`: these mutexes guard counters and summaries, where a
+// panic leaves no invariant worth propagating, so poison handling was pure noise.
+use parking_lot::Mutex;
+
+static MAINTENANCE_RETRY_REASON: LazyLock<Mutex<String>> = LazyLock::new(Mutex::default);
 
 pub fn set_maintenance_retry_reason(reason: &str) {
-    let mut current = MAINTENANCE_RETRY_REASON.get_or_init(|| Mutex::new(String::new())).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    current.clear();
-    current.push_str(reason);
+    *MAINTENANCE_RETRY_REASON.lock() = reason.to_owned();
 }
 
 pub fn maintenance_retry_reason() -> String {
-    MAINTENANCE_RETRY_REASON.get_or_init(|| Mutex::new(String::new())).lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    MAINTENANCE_RETRY_REASON.lock().clone()
 }
 
 /// Retries counted per `(operation, reason)`.
@@ -43,7 +45,7 @@ pub fn maintenance_retry_reason() -> String {
 /// 14 completions and 472 retries?" on 2026-08-31 meant copying a 52 MB journal
 /// out of the prod container. `retry_or_split` writes the reason into the task,
 /// so the fleet-level histogram was the only thing missing.
-static MAINTENANCE_RETRIES: OnceLock<dashmap::DashMap<String, AtomicU64>> = OnceLock::new();
+static MAINTENANCE_RETRIES: LazyLock<dashmap::DashMap<String, AtomicU64>> = LazyLock::new(dashmap::DashMap::new);
 
 /// Work actually done per `(operation, metric)` — the counterpart to the retry
 /// histogram above, and the metric deploy 12 could not be judged on.
@@ -54,14 +56,13 @@ static MAINTENANCE_RETRIES: OnceLock<dashmap::DashMap<String, AtomicU64>> = Once
 /// per minute measures churn as readily as work, so the fleet needs a rate
 /// whose numerator is work (`rows_dropped`) and whose denominator is capacity
 /// (`worker_secs`).
-static MAINTENANCE_WORK: OnceLock<dashmap::DashMap<String, AtomicU64>> = OnceLock::new();
+static MAINTENANCE_WORK: LazyLock<dashmap::DashMap<String, AtomicU64>> = LazyLock::new(dashmap::DashMap::new);
 
 /// Bounded on purpose: a retry reason can carry error text (`"dedup: Not enough
 /// memory ..."`), so the map stops accepting new keys once it is full rather
 /// than growing with distinct error strings.
-fn add_bounded(map: &OnceLock<dashmap::DashMap<String, AtomicU64>>, key: String, amount: u64) {
+fn add_bounded(map: &dashmap::DashMap<String, AtomicU64>, key: String, amount: u64) {
     const MAX_KEYS: usize = 128;
-    let map = map.get_or_init(dashmap::DashMap::new);
     if let Some(count) = map.get(&key) {
         count.fetch_add(amount, Relaxed);
     } else if map.len() < MAX_KEYS {
@@ -69,8 +70,8 @@ fn add_bounded(map: &OnceLock<dashmap::DashMap<String, AtomicU64>>, key: String,
     }
 }
 
-fn counter_rows(map: &OnceLock<dashmap::DashMap<String, AtomicU64>>, prefix: &str) -> Vec<(String, u64)> {
-    map.get().map(|map| map.iter().map(|entry| (format!("{prefix}.{}", entry.key()), entry.value().load(Relaxed))).collect()).unwrap_or_default()
+fn counter_rows(map: &dashmap::DashMap<String, AtomicU64>, prefix: &str) -> Vec<(String, u64)> {
+    map.iter().map(|entry| (format!("{prefix}.{}", entry.key()), entry.value().load(Relaxed))).collect()
 }
 
 pub fn count_maintenance_retry(operation: &str, reason: &str) {
@@ -219,7 +220,7 @@ struct LocalHistograms(dashmap::DashMap<String, Mutex<metrics_util::storage::Sum
 
 impl LocalHistograms {
     fn quantile(&self, name: &str, p: f64) -> Option<f64> {
-        self.0.get(name)?.lock().unwrap_or_else(std::sync::PoisonError::into_inner).quantile(p)
+        self.0.get(name)?.lock().quantile(p)
     }
 }
 
@@ -230,13 +231,7 @@ struct LocalHistogramHandle {
 
 impl metrics::HistogramFn for LocalHistogramHandle {
     fn record(&self, value: f64) {
-        self.histograms
-            .0
-            .entry(self.name.clone())
-            .or_insert_with(|| Mutex::new(metrics_util::storage::Summary::with_defaults()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .add(value);
+        self.histograms.0.entry(self.name.clone()).or_insert_with(|| Mutex::new(metrics_util::storage::Summary::with_defaults())).lock().add(value);
     }
 }
 
@@ -269,8 +264,26 @@ impl metrics::Recorder for LocalRecorder {
     }
 }
 
+impl LocalRecorder {
+    fn new() -> Self {
+        Self { histograms: Arc::new(LocalHistograms(dashmap::DashMap::new())), registry: Arc::new(CounterGaugeRegistry::atomic()) }
+    }
+}
+
 static LOCAL_HISTOGRAMS: OnceLock<Arc<LocalHistograms>> = OnceLock::new();
 static LOCAL_REGISTRY: OnceLock<Arc<CounterGaugeRegistry>> = OnceLock::new();
+
+/// Installs `recorder` as the global `metrics` recorder — a no-op if one is
+/// already installed (a second `init_metrics()`, or a test against a booted
+/// server) — and on success publishes `local`'s handles for in-process readback.
+/// `local` is either `recorder` itself or one of its fanout arms, so the two
+/// share the same `Arc`s and readback sees every write.
+fn publish_local(local: LocalRecorder, recorder: impl metrics::Recorder + Sync + 'static) {
+    if metrics::set_global_recorder(recorder).is_ok() {
+        let _ = LOCAL_HISTOGRAMS.set(local.histograms);
+        let _ = LOCAL_REGISTRY.set(local.registry);
+    }
+}
 
 /// Read back a quantile (0.0-1.0) for a name recorded via `metrics::histogram!()`.
 /// `None` if metrics weren't initialized or the name has never recorded a value.
@@ -297,12 +310,8 @@ pub fn gauge_value(name: &'static str) -> f64 {
 /// A no-op if a recorder is already installed (e.g. the test runs against a fully bootstrapped
 /// server) — matches `init_metrics()`'s own idempotence.
 pub fn init_local_metrics_for_test() {
-    let local_histograms = Arc::new(LocalHistograms(dashmap::DashMap::new()));
-    let local_registry = Arc::new(CounterGaugeRegistry::atomic());
-    if metrics::set_global_recorder(LocalRecorder { histograms: local_histograms.clone(), registry: local_registry.clone() }).is_ok() {
-        let _ = LOCAL_HISTOGRAMS.set(local_histograms);
-        let _ = LOCAL_REGISTRY.set(local_registry);
-    }
+    let local = LocalRecorder::new();
+    publish_local(local.clone(), local);
 }
 
 /// Initialize OTel metrics. Idempotent (subsequent calls are no-ops).
@@ -343,16 +352,12 @@ pub fn init_metrics(
     // `histogram_quantile()`/`counter_value()`/`gauge_value()`.
     // Idempotent-guarded by the METRICS OnceLock above; ignore "already installed"
     // from a second init_metrics() call (tests, embedded use).
-    let local_histograms = Arc::new(LocalHistograms(dashmap::DashMap::new()));
-    let local_registry = Arc::new(CounterGaugeRegistry::atomic());
+    let local = LocalRecorder::new();
     let fanout = metrics_util::layers::FanoutBuilder::default()
-        .add_recorder(LocalRecorder { histograms: local_histograms.clone(), registry: local_registry.clone() })
+        .add_recorder(local.clone())
         .add_recorder(metrics_exporter_opentelemetry::Recorder::with_meter(meter.clone()))
         .build();
-    if metrics::set_global_recorder(fanout).is_ok() {
-        let _ = LOCAL_HISTOGRAMS.set(local_histograms);
-        let _ = LOCAL_REGISTRY.set(local_registry);
-    }
+    publish_local(local, fanout);
 
     // Observable gauges polled from snapshot_stats() each export cycle. We
     // build one shared snapshot per export by stashing the Weak; if the
@@ -393,6 +398,14 @@ pub fn init_metrics(
         (counter $($rest:tt)+) => { layer_metric!(@build u64_observable_counter, $($rest)+) };
     }
 
+    /// Same shape for gauges whose source is a process-global atomic (no Weak,
+    /// no snapshot) — `$read` is evaluated once per export cycle.
+    macro_rules! atomic_gauge {
+        ($id:literal, $desc:literal, $read:expr) => {
+            meter.u64_observable_gauge($id).with_description($desc).with_callback(|obs| obs.observe($read, &[])).build();
+        };
+    }
+
     layer_metric!(gauge "timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
     layer_metric!(gauge "timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
     layer_metric!(gauge "timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
@@ -413,38 +426,36 @@ pub fn init_metrics(
     // Extracted-index disk cache, as of the last reap. Shares a volume with
     // the WAL, so a plateau at the configured budget is healthy and a climb
     // past it means the reap cron has stopped running.
-    meter
-        .u64_observable_gauge("timefusion.tantivy.cache_disk_bytes")
-        .with_description("Bytes under <data_dir>/tantivy_cache as of the most recent reap; 0 until the first one runs")
-        .with_callback(|obs| obs.observe(TANTIVY_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed), &[]))
-        .build();
+    atomic_gauge!(
+        "timefusion.tantivy.cache_disk_bytes",
+        "Bytes under <data_dir>/tantivy_cache as of the most recent reap; 0 until the first one runs",
+        TANTIVY_CACHE_BYTES.load(Relaxed)
+    );
 
     // Runtime scheduling lag — see `spawn_runtime_lag_sampler`. `last` is the
     // current state; `max` is the high-water mark for the process lifetime, so
     // a spike that has since recovered is still visible after the fact.
-    meter
-        .u64_observable_gauge("timefusion.runtime.scheduling_lag_ms")
-        .with_description(
-            "How late a 500ms timer task actually woke — nonzero means workers are starved, which is what a missed health probe looks like from inside",
-        )
-        .with_callback(|obs| obs.observe(RUNTIME_LAG_LAST_MS.load(Relaxed), &[]))
-        .build();
-    meter
-        .u64_observable_gauge("timefusion.runtime.scheduling_lag_max_ms")
-        .with_description("Worst scheduling lag this process lifetime; survives the spike so a post-mortem can still see it")
-        .with_callback(|obs| obs.observe(RUNTIME_LAG_MAX_MS.load(Relaxed), &[]))
-        .build();
+    atomic_gauge!(
+        "timefusion.runtime.scheduling_lag_ms",
+        "How late a 500ms timer task actually woke — nonzero means workers are starved, which is what a missed health probe looks like from inside",
+        RUNTIME_LAG_LAST_MS.load(Relaxed)
+    );
+    atomic_gauge!(
+        "timefusion.runtime.scheduling_lag_max_ms",
+        "Worst scheduling lag this process lifetime; survives the spike so a post-mortem can still see it",
+        RUNTIME_LAG_MAX_MS.load(Relaxed)
+    );
 
-    meter
-        .u64_observable_gauge("timefusion.rollup.maintenance.pending_dirty_partitions")
-        .with_description("Source partitions with durable rollup invalidations awaiting maintenance")
-        .with_callback(|obs| obs.observe(maintenance_stats().rollup_dirty_partitions.load(Relaxed), &[]))
-        .build();
-    meter
-        .u64_observable_gauge("timefusion.rollup.maintenance.oldest_invalidation_age_seconds")
-        .with_description("Age of the oldest durable rollup invalidation")
-        .with_callback(|obs| obs.observe(maintenance_stats().rollup_oldest_invalidation_age_secs.load(Relaxed), &[]))
-        .build();
+    atomic_gauge!(
+        "timefusion.rollup.maintenance.pending_dirty_partitions",
+        "Source partitions with durable rollup invalidations awaiting maintenance",
+        maintenance_stats().rollup_dirty_partitions.load(Relaxed)
+    );
+    atomic_gauge!(
+        "timefusion.rollup.maintenance.oldest_invalidation_age_seconds",
+        "Age of the oldest durable rollup invalidation",
+        maintenance_stats().rollup_oldest_invalidation_age_secs.load(Relaxed)
+    );
 
     // Index lag: how far behind ingest the newest published tantivy index is.
     // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
@@ -510,10 +521,10 @@ pub fn record_flush(success: bool) {
 /// Last observed size of the tantivy extracted-index disk cache. Written by
 /// the reap cron, read by the `cache_disk_bytes` gauge callback — the walk it
 /// comes from is far too expensive to run per scrape.
-static TANTIVY_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TANTIVY_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_tantivy_cache_bytes(bytes: u64) {
-    TANTIVY_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    TANTIVY_CACHE_BYTES.store(bytes, Relaxed);
 }
 
 /// When this process started, as seen from inside it.
@@ -524,13 +535,13 @@ pub fn record_tantivy_cache_bytes(bytes: u64) {
 /// (2026-08-23: a tantivy accrual "fix" was credited twice to what was purely
 /// process age). `docker service ps` answers this from outside, but nothing
 /// pairs it with the numbers themselves; `timefusion_stats` now does.
-static PROCESS_START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+static PROCESS_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
 /// Pin the process-start instant. Idempotent; call as early as possible in
 /// every entry point (`main`, `bootstrap`) — the first force wins, so a late
 /// first call would under-report uptime for the whole process lifetime.
 pub fn mark_process_start() {
-    std::sync::LazyLock::force(&PROCESS_START);
+    LazyLock::force(&PROCESS_START);
 }
 
 pub fn process_uptime_secs() -> u64 {
@@ -544,7 +555,7 @@ pub fn process_uptime_secs() -> u64 {
 /// restart would claim to be the same process — the one answer that turns
 /// "somebody else staged this" into "we are still staging it".
 pub fn instance_id() -> &'static str {
-    static INSTANCE_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+    static INSTANCE_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
     &INSTANCE_ID
 }
 
@@ -614,7 +625,7 @@ struct SectionStat {
 /// awaits that gave the worker back. Reading one as the other is how "blocked"
 /// and "slow" get confused, which is the exact confusion this plan exists to
 /// resolve.
-static SECTION_STATS: std::sync::LazyLock<dashmap::DashMap<(&'static str, &'static str), SectionStat>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+static SECTION_STATS: LazyLock<dashmap::DashMap<(&'static str, &'static str), SectionStat>> = LazyLock::new(dashmap::DashMap::new);
 
 fn record_section(component: &'static str, name: &'static str, elapsed: Duration) {
     let entry = SECTION_STATS.entry((component, name)).or_default();
@@ -704,7 +715,10 @@ pub fn section_stats() -> Vec<((&'static str, &'static str), u64, u64, u64)> {
 
 /// Holds `inner` while a [`BlockWatch`] times it. Derefs to `inner`, so a
 /// `MutexGuard` wrapped in one is used exactly like the guard.
+#[derive(derive_more::Deref, derive_more::DerefMut)]
 pub struct Watched<T> {
+    #[deref]
+    #[deref_mut]
     inner: T,
     _watch: BlockWatch,
 }
@@ -712,19 +726,6 @@ pub struct Watched<T> {
 impl<T> Watched<T> {
     pub fn new(name: &'static str, inner: T) -> Self {
         Self { inner, _watch: BlockWatch::new(name) }
-    }
-}
-
-impl<T> std::ops::Deref for Watched<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.inner
-    }
-}
-
-impl<T> std::ops::DerefMut for Watched<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner
     }
 }
 
@@ -831,26 +832,15 @@ sum_recorders! {
     record_dangling_removed(n => reconcile_dangling_removed mirror MAINTENANCE_STATS.dangling_removed);
 }
 
-/// One commit-path operation abandoned by its bound. `op` is a fixed set of
-/// static labels (bounded cardinality by construction — never a table or
-/// project id, which belong on the accompanying warn's span attributes).
 /// One dashboard aggregate answered from a configured rollup.
 pub fn record_rollup_hit(mode: &'static str, grain: &str) {
     let stats = maintenance_stats();
-    if mode == "hybrid" { &stats.rollup_hits_hybrid } else { &stats.rollup_hits_full }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if mode == "hybrid" { &stats.rollup_hits_hybrid } else { &stats.rollup_hits_full }.fetch_add(1, Relaxed);
     if let Some(m) = METRICS.get() {
         m.rollup_hits.add(1, &[KeyValue::new("mode", mode), KeyValue::new("grain", grain.to_string())]);
     }
 }
 
-/// One dashboard aggregate that fell through to a raw scan.
-///
-/// Takes the REASON, not its label: the match below is exhaustive, so a new
-/// variant fails the build instead of landing in a catch-all bucket. It
-/// previously matched on the string and four of the thirteen reasons had no
-/// arm, so `missing_project`, `unbounded_time`, `non_decomposable` and
-/// `rewrite_schema_mismatch` were indistinguishable in prod — 29 misses that
-/// could not be diagnosed without a deploy.
 /// True on the first, and then every `ROLLUP_MISS_SAMPLE`th, miss under `key` —
 /// for logging one refused plan with context. Misses run at several per second
 /// on a busy node, so the counter is what you alert on and this is what you
@@ -871,16 +861,23 @@ pub fn record_rollup_hit(mode: &'static str, grain: &str) {
 /// 2026-08-17 — still prints only ~2.5 lines/min, the same order as before.
 pub fn sample_rollup_miss(key: &'static str) -> bool {
     const ROLLUP_MISS_SAMPLE: u64 = 64;
-    static SEEN: std::sync::OnceLock<dashmap::DashMap<&'static str, u64>> = std::sync::OnceLock::new();
-    let mut seen = SEEN.get_or_init(dashmap::DashMap::new).entry(key).or_insert(0);
-    *seen += 1;
-    (*seen - 1).is_multiple_of(ROLLUP_MISS_SAMPLE)
+    static SEEN: LazyLock<dashmap::DashMap<&'static str, AtomicU64>> = LazyLock::new(dashmap::DashMap::new);
+    // `fetch_add` returns the count BEFORE the increment, so a key's first miss always samples.
+    SEEN.entry(key).or_default().fetch_add(1, Relaxed).is_multiple_of(ROLLUP_MISS_SAMPLE)
 }
 
+/// One dashboard aggregate that fell through to a raw scan.
+///
+/// Takes the REASON, not its label: the match below is exhaustive, so a new
+/// variant fails the build instead of landing in a catch-all bucket. It
+/// previously matched on the string and four of the thirteen reasons had no
+/// arm, so `missing_project`, `unbounded_time`, `non_decomposable` and
+/// `rewrite_schema_mismatch` were indistinguishable in prod — 29 misses that
+/// could not be diagnosed without a deploy.
 pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
     use crate::rollup::MissReason as R;
     let stats = maintenance_stats();
-    stats.rollup_misses_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stats.rollup_misses_total.fetch_add(1, Relaxed);
     match reason {
         R::NotBuilt => &stats.rollup_miss_not_built,
         R::StaleCoverage => &stats.rollup_miss_stale_coverage,
@@ -902,12 +899,15 @@ pub fn record_rollup_miss(reason: crate::rollup::MissReason) {
         R::UnwalkableSource => &stats.rollup_miss_unwalkable_source,
         R::MeasureNotStored => &stats.rollup_miss_measure_not_stored,
     }
-    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    .fetch_add(1, Relaxed);
     if let Some(m) = METRICS.get() {
         m.rollup_misses.add(1, &[KeyValue::new("reason", reason.label())]);
     }
 }
 
+/// One commit-path operation abandoned by its bound. `op` is a fixed set of
+/// static labels (bounded cardinality by construction — never a table or
+/// project id, which belong on the accompanying warn's span attributes).
 pub fn record_commit_timeout(op: &'static str) {
     if let Some(m) = METRICS.get() {
         m.commit_lock_timeouts.add(1, &[KeyValue::new("op", op)]);
@@ -934,7 +934,7 @@ macro_rules! atomic_stats {
                 vec![$((
                     $component,
                     atomic_stats!(@key $field $(, $key)?),
-                    self.$field.load(std::sync::atomic::Ordering::Relaxed),
+                    self.$field.load(Relaxed),
                 ),)+]
             }
         }
@@ -1006,8 +1006,6 @@ atomic_stats! {
         /// single metadata walk found work for; `completed` counts bins that landed.
         /// ALERT when completed lags planned for N consecutive ticks — that's the
         /// "8 of 11 hot projects never reached" shape (prod 2026-07-29).
-        // planned vs completed is the per-tick coverage check: a persistent
-        // gap means hot projects are going uncompacted (prod 2026-07-29).
         light_optimize_projects_planned as "light_optimize_projects_planned_total",
         light_optimize_projects_completed as "light_optimize_projects_completed_total",
         light_optimize_bins_committed as "light_optimize_bins_committed_total",
@@ -1249,9 +1247,8 @@ atomic_stats! {
         /// `TAG_SOURCE_ROWS` existed. Every read refuses them `stale_coverage` and no
         /// rule can ever rescue them, so this is the size of the backlog that has to
         /// republish before wide dashboards route. Set from the whole recovery pass,
-        /// hourly, so it reads 0 only when there genuinely are none.
-        // The republish backlog that gates wide-window routing. Watch it fall;
-        // `rollup_stale_no_witness` per query falls with it.
+        /// hourly, so it reads 0 only when there genuinely are none. Watch it
+        /// fall; `rollup_stale_no_witness` per query falls with it.
         rollup_witnessless_slices,
         /// Contiguous sealed days of rollup coverage, counting back from yesterday,
         /// minimised over every (project, declared tier).
@@ -1477,20 +1474,16 @@ atomic_stats! {
         /// row-preserving by construction, so this must be ZERO forever; nonzero
         /// means a truncated staging that would have DROPPED rows, or a broken
         /// assumption. PAGE if > 0.
-        // MUST stay 0 — nonzero = a staged repair whose rows didn't add up.
         repair_resume_row_mismatch as "repair_resume_row_mismatch_total",
         /// Cron ticks skipped because the previous run of the same job was still
         /// in flight. A steadily growing value = a wedged/overlong job body.
         cron_ticks_skipped,
         /// Cron fires actually dispatched (all jobs). Frozen while uptime grows =
         /// the scheduler is dead (2026-07-14 outage signature).
-        // Fired frozen while uptime grows = scheduler dead (2026-07-14
-        // outage); skipped growing = a job body is wedged or overlong.
         cron_ticks_fired,
         /// Cron runs that exceeded the long-running warning threshold. Slow but
-        /// progressing work is allowed to finish; this is for observability.
-        // Runs exceeding the long-running warning threshold. Slow progress
-        // is allowed; sustained nonzero with no completion = wedged.
+        /// progressing work is allowed to finish; sustained nonzero with no
+        /// completion = wedged.
         cron_long_running as "cron_long_running_total",
         /// Ingest-time client-retry dedup: rows DROPPED because their exact
         /// client-visible content was provably already committed
@@ -1898,27 +1891,18 @@ mod imp {
     /// (2026-08-03, twice). Boot moves the newest few into `prekill-<pid-seq>/`;
     /// only the 3 newest archives are kept.
     fn archive_prekill_dumps(dir: &std::path::Path) {
-        let mut dumps: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("jeprof") && n.ends_with(".heap")))
-            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-            .collect();
-        if dumps.is_empty() {
-            return;
-        }
-        dumps.sort_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
-        let stamp = dumps[0].0.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let dumps = newest_first(dir, |n| n.starts_with("jeprof") && n.ends_with(".heap"));
+        let Some((newest, _)) = dumps.first() else { return };
+        let stamp = newest.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let arch = dir.join(format!("prekill-{stamp}"));
         if std::fs::create_dir_all(&arch).is_err() {
             return;
         }
-        for (_, p) in dumps.iter().take(5) {
+        dumps.iter().take(5).for_each(|(_, p)| {
             if let Some(name) = p.file_name() {
                 let _ = std::fs::rename(p, arch.join(name));
             }
-        }
+        });
         // The rest of the dead process's dumps are noise — drop them now so the
         // rolling pruner starts clean for this process.
         dumps.into_iter().skip(5).for_each(|(_, old)| {
@@ -1931,9 +1915,8 @@ mod imp {
             .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("prekill-")))
             .map(|e| e.path())
             .collect();
-        archives.sort();
-        let n = archives.len();
-        archives.into_iter().take(n.saturating_sub(3)).for_each(|old| {
+        archives.sort(); // `prekill-<unix secs>` sorts oldest-first by name
+        archives.into_iter().rev().skip(3).for_each(|old| {
             let _ = std::fs::remove_dir_all(&old);
         });
         info!("profiling: archived previous process's final heap dumps → {arch:?}");
@@ -1952,17 +1935,22 @@ mod imp {
     /// is monotonic across restarts, so newest-by-mtime always keeps the live
     /// process's files and evicts the stale ones.
     fn prune_old(dir: &std::path::Path, prefix: &str, keep: usize) {
-        let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        newest_first(dir, |n| n.starts_with(prefix)).into_iter().skip(keep).for_each(|(_, old)| {
+            let _ = std::fs::remove_file(old);
+        });
+    }
+
+    /// `(mtime, path)` for every file in `dir` whose name satisfies `matches`, newest first.
+    fn newest_first(dir: &std::path::Path, matches: impl Fn(&str) -> bool) -> Vec<(std::time::SystemTime, PathBuf)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(prefix)))
+            .filter(|e| e.file_name().to_str().is_some_and(&matches))
             .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
             .collect();
-        files.sort_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first; `mut`: std sorts in place
-        files.into_iter().skip(keep).for_each(|(_, old)| {
-            let _ = std::fs::remove_file(old);
-        });
+        files.sort_unstable_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // `mut`: std sorts in place
+        files
     }
 }
 

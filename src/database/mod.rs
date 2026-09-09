@@ -2075,8 +2075,9 @@ const DEDUP_SCAN_NAME: &str = "__dedup_src";
 /// proof of which file set was proved clean, so changing the hasher silently
 /// invalidates every certification and resets hard-won coverage to zero. Not
 /// part of the XXH3 sweep.
-fn partition_file_fp(mut files: Vec<String>) -> u64 {
+fn partition_file_fp(files: &[String]) -> u64 {
     use std::hash::{Hash, Hasher};
+    let mut files = files.to_vec();
     files.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     files.hash(&mut h);
@@ -3282,7 +3283,7 @@ impl Database {
     /// worker. That is exactly what these two numbers measure.
     fn journal(&self) -> crate::observability::Watched<std::sync::MutexGuard<'_, crate::maintenance_coordinator::TaskJournal>> {
         let wait = crate::observability::BlockWatch::new("journal_lock_wait");
-        let guard = self.maintenance_tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = crate::support::lock(&self.maintenance_tasks);
         drop(wait);
         crate::observability::Watched::new("journal_hold", guard)
     }
@@ -4906,7 +4907,7 @@ impl Database {
                     runtime.block_on(async move {
                         let journal = Arc::clone(&db.maintenance_tasks);
                         match tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
-                            let mut journal = journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut journal = crate::support::lock(&journal);
                             let discarded = journal.migrate_bootstrap_backlog();
                             let migrated = journal.migrate_derived_slices();
                             // One-shot: collapse the fine-grained sealed backfill
@@ -7997,11 +7998,10 @@ impl TailAdd {
     /// previously trusted those accessors and silently selected nothing, so it now parses the raw
     /// stats JSON instead.
     fn from_stats(path: String, size: i64, is_sorted_run: bool, has_dv: bool, stats: Option<&str>) -> Self {
-        let range = stats.and_then(Database::event_time_range_from_stats);
-        // Re-parses the blob `event_time_range_from_stats` just parsed — fine at
-        // planner frequency; a single-parse API means a compact.rs signature change.
-        let rows = stats.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
-        Self { path, size, is_sorted_run, event_range: range, rows, has_dv }
+        let stats = stats.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let event_range = stats.as_ref().and_then(Database::event_time_range_from_stats);
+        let rows = stats.as_ref().and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
+        Self { path, size, is_sorted_run, event_range, rows, has_dv }
     }
 }
 
@@ -12347,9 +12347,9 @@ mod writer_properties_tests {
         let a = vec!["p/date=2026-07-01/f1.parquet".to_string(), "p/date=2026-07-01/f2.parquet".to_string()];
         let mut b = a.clone();
         b.reverse();
-        assert_eq!(partition_file_fp(a.clone()), partition_file_fp(b), "order must not matter");
+        assert_eq!(partition_file_fp(&a), partition_file_fp(&b), "order must not matter");
         let c = vec![a[0].clone()];
-        assert_ne!(partition_file_fp(a), partition_file_fp(c), "content must matter");
+        assert_ne!(partition_file_fp(&a), partition_file_fp(&c), "content must matter");
 
         let day = 86_400_000_000i64;
         assert_eq!(window_dates(0, 0).map(|d| d.len()), Some(1));
@@ -21437,12 +21437,12 @@ mod tests {
             let guard = table.read().await;
             Database::partition_files_by_pid(&guard, &format!("date={day}"))?.remove(&key.0).unwrap_or_default()
         };
-        db.dedup_probe_declined.insert(key.clone(), partition_file_fp(files));
+        db.dedup_probe_declined.insert(key.clone(), partition_file_fp(&files));
         assert!(!candidate().await, "and is skipped once declined at that exact file set");
 
         // A commit moves the fingerprint, so it must be examined again — otherwise
         // a date that was cleaned up would stay permanently unprovable.
-        db.dedup_probe_declined.insert(key, partition_file_fp(vec!["some-other-file.parquet".to_owned()]));
+        db.dedup_probe_declined.insert(key, partition_file_fp(&["some-other-file.parquet".to_owned()]));
         assert!(candidate().await, "a changed file set makes it a candidate again");
         Ok(())
     }

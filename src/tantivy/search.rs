@@ -22,6 +22,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt};
+use itertools::Itertools;
 use lru::LruCache;
 use object_store::{ObjectStore, path::Path as ObjPath};
 use parking_lot::Mutex;
@@ -378,7 +379,7 @@ impl TantivySearchService {
             // path. `block_in_place` rather than `spawn_blocking` because the
             // body borrows `self`, `node` and the stats — moving the OTHER
             // tasks off this thread needs no ownership changes at all.
-            let out = crate::support::without_blocking_the_worker(|| {
+            crate::support::without_blocking_the_worker(|| {
                 let (index, reader) = self.open_cached(&dir).with_context(|| format!("open index {file_uuid}"))?;
                 SearchStats::timed(&self.stats.prepares, &self.stats.prepare_us, prepare_started);
                 let started = Instant::now();
@@ -406,8 +407,7 @@ impl TantivySearchService {
                 };
                 SearchStats::timed(&self.stats.searches, &self.stats.search_us, started);
                 Ok::<_, anyhow::Error>(out)
-            })?;
-            Ok::<_, anyhow::Error>(out)
+            })
         }))
         .buffer_unordered(self.config.search_concurrency());
 
@@ -1001,7 +1001,6 @@ fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, quer
     // WHOLE literal: `default` splits it itself, and `raw` indexes the value as
     // one token, so pre-splitting it would under-match.
     let words: Vec<&str> = if tokenizer == NGRAM3_TOKENIZER { query.split_whitespace().collect() } else { vec![query] };
-    let mut seen: HashSet<String> = HashSet::new();
     let clauses: Vec<(Occur, Box<dyn Query>)> = words
         .iter()
         // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
@@ -1014,7 +1013,7 @@ fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, quer
             analyzer.token_stream(word.trim_end_matches('*')).process(&mut |t| terms.push(t.text.clone()));
             terms
         })
-        .filter(|t| seen.insert(t.clone()))
+        .unique()
         .map(|t| (Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, &t), IndexRecordOption::Basic)) as Box<dyn Query>))
         .collect();
     if clauses.is_empty() {
@@ -1064,19 +1063,17 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
             // `None` = no fast columns for this segment, or this doc carries no
             // value for them (shouldn't happen for required fields) — either way
             // fall back to the doc store.
-            let fast = match cols {
-                Some((ts_col, id_col, ord_col)) => match (ts_col.first(addr.doc_id), id_col.term_ords(addr.doc_id).next()) {
-                    (Some(ts), Some(ord)) => {
-                        id_buf.clear();
-                        id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))?.then(|| Hit {
-                            timestamp_micros: ts,
-                            id: id_buf.clone(),
-                            row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)),
-                        })
-                    }
-                    _ => None,
-                },
-                None => None,
+            let fast = if let Some((ts_col, id_col, ord_col)) = cols
+                && let (Some(ts), Some(ord)) = (ts_col.first(addr.doc_id), id_col.term_ords(addr.doc_id).next())
+            {
+                id_buf.clear();
+                id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))?.then(|| Hit {
+                    timestamp_micros: ts,
+                    id: id_buf.clone(),
+                    row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)),
+                })
+            } else {
+                None
             };
             match fast {
                 Some(hit) => Ok(hit),
@@ -1228,24 +1225,6 @@ use crate::{
     write::TantivyIndexCallback,
 };
 
-/// Where the indexed batches came from — fixes both `_row_ordinal` validity
-/// and the merge cadence.
-#[derive(Debug, Clone, Copy)]
-enum IndexSource {
-    /// Flush path: batches are indexed BEFORE the Delta writer's sort, so doc
-    /// order ≠ parquet row order and ordinals must not drive row selection.
-    /// Merging is deferred to keep it off the ingest path.
-    Flush,
-}
-
-impl IndexSource {
-    fn ordinals_and_merge(self) -> (bool, MergeMode) {
-        match self {
-            Self::Flush => (false, MergeMode::Deferred),
-        }
-    }
-}
-
 /// Owns the object store + tantivy config and produces a callback.
 #[derive(Debug)]
 pub struct TantivyIndexService {
@@ -1318,7 +1297,7 @@ impl TantivyIndexService {
             let uuid = Uuid::new_v4().to_string();
             (format!("bucket-{uuid}"), super::blob_path(table_name, project_id, &uuid))
         });
-        self.build_pack_upload(table_name, project_id, &key, path, added_files, batches, IndexSource::Flush).await
+        self.build_pack_upload(table_name, project_id, &key, path, added_files, batches).await
     }
 
     /// Build & publish an index for a single already-committed parquet file,
@@ -1365,14 +1344,14 @@ impl TantivyIndexService {
     /// (index=None, error set) and returns the error. Shared by the flush
     /// callback (random bucket key + flat path) and `build_index_for_file`
     /// (parquet-rel key + partition-mirrored path).
-    // Still 8 with `&self` even after `(ordinals_valid, merge)` folded into
-    // `source`; the rest are independent identifiers, not a cohesive struct.
-    #[allow(clippy::too_many_arguments)]
     async fn build_pack_upload(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
-        batches: Vec<arrow::record_batch::RecordBatch>, source: IndexSource,
+        batches: Vec<arrow::record_batch::RecordBatch>,
     ) -> Result<()> {
-        let (ordinals_valid, merge) = source.ordinals_and_merge();
+        // Flush path: batches are indexed BEFORE the Delta writer's sort, so doc
+        // order ≠ parquet row order and ordinals must not drive row selection;
+        // merging is deferred to keep it off the ingest path.
+        let (ordinals_valid, merge) = (false, MergeMode::Deferred);
         let svc_table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
         let level = self.config.compression_level();
         let pack_result = tokio::task::spawn_blocking(move || {
@@ -1529,9 +1508,8 @@ impl TantivyIndexService {
             if !removed_rel.iter().all(|u| covered.contains(u)) {
                 return (false, false);
             }
-            let removed_set = &removed_rel;
             let mut touched = false;
-            for e in m.entries.values_mut().filter(|e| usable(e) && e.covered_files.iter().any(|u| removed_set.contains(&rel_of(u)))) {
+            for e in m.entries.values_mut().filter(|e| usable(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)))) {
                 let fresh: Vec<String> = added.iter().filter(|u| !e.covered_files.contains(u)).cloned().collect();
                 e.covered_files.extend(fresh);
                 e.ordinals_valid = false;

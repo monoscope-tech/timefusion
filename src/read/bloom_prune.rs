@@ -40,13 +40,13 @@ use tracing::{debug, warn};
 
 /// IN-lists above this skip pruning — probing the registry per value must
 /// stay negligible next to the planning it saves.
-pub const MAX_NEEDLE_VALUES: usize = 64;
+pub(crate) const MAX_NEEDLE_VALUES: usize = 64;
 /// A file whose bloom payload exceeds this is recorded `no_bloom`: a bloom
 /// this dense prunes little and would bloat the blob (whale-file guard).
-pub const PER_FILE_BLOOM_CAP_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const PER_FILE_BLOOM_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// Windows wider than this skip pruning — the per-date probe cost scales
 /// with the window while its value concentrates in point lookups.
-pub const MAX_PRUNE_DATES: usize = 92;
+pub(crate) const MAX_PRUNE_DATES: usize = 92;
 const SIDECAR_VERSION: u8 = 1;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
