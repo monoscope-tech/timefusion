@@ -141,27 +141,10 @@ pub fn build_partition_sql(spec: &RollupSpec, source: &str, project_id: &str, da
     build_partition_sql_from(spec, source, source, project_id, date)
 }
 
-/// `build_partition_sql`, but reading `from` instead of the raw source.
-///
-/// When `from` is a finer rollup the measures are re-aggregated as STATES —
-/// `SUM` of counts and sums, `MIN`/`MAX` of extrema, `tdigest_merge` of digests —
-/// and each measure's declared `filter` is deliberately NOT re-applied: the base
-/// row already had it applied when it was built, and the filter's columns do not
-/// even exist on the base table.
 /// One bit per hour of a UTC day. `ALL_HOURS` is the conservative value: every
 /// invalidation means it unless the caller can prove a narrower set.
 pub(crate) const ALL_HOURS: u32 = (1 << 24) - 1;
 
-/// The hours of a partition-day a committed file can hold rows for, from its
-/// Delta stats JSON (`minValues.timestamp` / `maxValues.timestamp`). `None`
-/// when stats or timestamp bounds are absent — the caller falls back to
-/// `ALL_HOURS`, never to skipping work. A computed mask of zero (bounds
-/// entirely outside the partition day) is likewise treated as absent.
-///
-/// This is what lets a boot reconcile invalidate the ONE hour a downtime
-/// commit actually touched instead of all 24 (`enqueue_maintenance_hours`
-/// with `ALL_HOURS` was ~312 durable tasks per active project per restart,
-/// prod 2026-08-18 — the queue's dominant growth source under deploy churn).
 /// The inclusive timestamp bounds a file's Delta statistics claim.
 ///
 /// Writers spell them either as epoch micros or RFC 3339, so both are accepted.
@@ -178,6 +161,16 @@ pub(crate) fn stats_time_range(stats: &str) -> Option<(i64, i64)> {
     Some((parse_ts("minValues")?, parse_ts("maxValues")?))
 }
 
+/// The hours of a partition-day a committed file can hold rows for, from its
+/// Delta stats JSON (`minValues.timestamp` / `maxValues.timestamp`). `None`
+/// when stats or timestamp bounds are absent — the caller falls back to
+/// `ALL_HOURS`, never to skipping work. A computed mask of zero (bounds
+/// entirely outside the partition day) is likewise treated as absent.
+///
+/// This is what lets a boot reconcile invalidate the ONE hour a downtime
+/// commit actually touched instead of all 24 (`enqueue_maintenance_hours`
+/// with `ALL_HOURS` was ~312 durable tasks per active project per restart,
+/// prod 2026-08-18 — the queue's dominant growth source under deploy churn).
 pub(crate) fn hours_from_stats_json(stats: &str, day_start_micros: i64) -> Option<u32> {
     let (lo, hi) = stats_time_range(stats)?;
     let (lo_h, hi_h) = ((lo - day_start_micros).div_euclid(HOUR_MICROS), (hi - day_start_micros).div_euclid(HOUR_MICROS));
@@ -198,17 +191,17 @@ pub(crate) fn dirty_ranges(day_start: i64, hours: u32) -> Vec<(i64, i64)> {
     )
 }
 
+/// `build_partition_sql`, but reading `from` instead of the raw source.
+///
+/// When `from` is a finer rollup the measures are re-aggregated as STATES —
+/// `SUM` of counts and sums, `MIN`/`MAX` of extrema, `tdigest_merge` of digests —
+/// and each measure's declared `filter` is deliberately NOT re-applied: the base
+/// row already had it applied when it was built, and the filter's columns do not
+/// even exist on the base table.
 pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, project_id: &str, date: &str) -> anyhow::Result<String> {
     build_partition_sql_ranges(spec, source, from, "", project_id, date, &[])
 }
 
-/// The partition's rows, rebuilt over `ranges` only and carried forward from
-/// `target` everywhere else. Empty `ranges` means the whole day, from scratch.
-///
-/// The carried-forward rows are re-emitted verbatim: they were aggregated from
-/// source rows that have not changed since, so re-aggregating them would produce
-/// the same numbers at the cost of scanning the raw partition again — which is
-/// the entire expense this exists to avoid.
 /// One measure's projection in a rollup build, as `<expression> AS <name>`.
 ///
 /// `derived` selects the tier-to-tier merge (folding the base tier's stored
@@ -221,7 +214,7 @@ pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, pro
 /// applied it when the state was built, and applying it twice over an
 /// aggregated column is not the same predicate.
 fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool) -> anyhow::Result<String> {
-    if derived {
+    let (expression, filter) = if derived {
         let expression = match measure.agg.as_str() {
             "min" => format!("MIN({})", measure.name),
             "max" => format!("MAX({})", measure.name),
@@ -242,42 +235,68 @@ fn measure_projection(spec: &RollupSpec, measure: &RollupMeasure, derived: bool)
             ),
             _ => format!("SUM({})", measure.name),
         };
-        return Ok(format!("{expression} AS {}", measure.name));
-    }
-    let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
-        ("count", None) => "COUNT(*)".to_string(),
-        ("count", Some(column)) => format!("COUNT({column})"),
-        ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
-        ("hll", Some(column)) => format!("hll_agg({column})"),
-        // Built from raw, the ordering key is the row's own timestamp. The
-        // FILTER appended below applies to both, so the stored value and the
-        // companion describe the SAME row.
-        ("first", Some(column)) => format!("first_value({column} ORDER BY timestamp)"),
-        (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
-        (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
+        (expression, None)
+    } else {
+        let expression = match (measure.agg.as_str(), measure.column.as_deref()) {
+            ("count", None) => "COUNT(*)".to_string(),
+            ("count", Some(column)) => format!("COUNT({column})"),
+            ("tdigest", Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+            ("hll", Some(column)) => format!("hll_agg({column})"),
+            // Built from raw, the ordering key is the row's own timestamp. The
+            // FILTER appended below applies to both, so the stored value and the
+            // companion describe the SAME row.
+            ("first", Some(column)) => format!("first_value({column} ORDER BY timestamp)"),
+            (aggregate, Some(column)) => format!("{}({column})", aggregate.to_uppercase()),
+            (aggregate, None) => return Err(anyhow::anyhow!("{} measure `{}` needs a source column", aggregate, measure.name)),
+        };
+        (expression, measure.filter.as_deref())
     };
-    Ok(match &measure.filter {
-        Some(filter) => format!("{expression} FILTER (WHERE {filter}) AS {}", measure.name),
-        None => format!("{expression} AS {}", measure.name),
-    })
+    Ok(format!("{} AS {}", filtered(expression, filter), measure.name))
 }
 
+/// `<expression> FILTER (WHERE …)`, or the bare expression. The build side, the
+/// raw leg and the `HAVING` guard all render a measure's declared filter, and
+/// they must render it identically.
+fn filtered(expression: String, filter: Option<&str>) -> String {
+    match filter {
+        Some(filter) => format!("{expression} FILTER (WHERE {filter})"),
+        None => expression,
+    }
+}
+
+/// The bucketed `timestamp`, the dimensions and the measures every rollup build
+/// selects, plus the `, dim…` fragment its carried-forward leg reuses.
+///
+/// ONE spelling of the bucket-floor formula: it was written out in both the
+/// per-project and the cohort builder, where the two had to stay in step by
+/// hand — the same way this file has already lost a caveat.
+fn bucketed_projection(spec: &RollupSpec, derived: bool, grain: i64) -> anyhow::Result<(String, String)> {
+    let dimensions = spec.dimensions.join(", ");
+    let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
+    let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
+    let projection = format!(
+        "to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp{select_dimensions}, {measures}"
+    );
+    Ok((select_dimensions, projection))
+}
+
+/// The partition's rows, rebuilt over `ranges` only and carried forward from
+/// `target` everywhere else. Empty `ranges` means the whole day, from scratch.
+///
+/// The carried-forward rows are re-emitted verbatim: they were aggregated from
+/// source rows that have not changed since, so re-aggregating them would produce
+/// the same numbers at the cost of scanning the raw partition again — which is
+/// the entire expense this exists to avoid.
 pub(crate) fn build_partition_sql_ranges(
     spec: &RollupSpec, source: &str, from: &str, target: &str, project_id: &str, date: &str, ranges: &[(i64, i64)],
 ) -> anyhow::Result<String> {
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
-    let derived = from != source;
-    let dimensions = spec.dimensions.join(", ");
-    let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
+    let (select_dimensions, projection) = bucketed_projection(spec, from != source, grain)?;
     let source = from;
-    let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let group_by = (1..=1 + spec.dimensions.len()).join(", ");
 
     let partition = format!("project_id = {} AND date = {}", sql_literal(project_id), sql_literal(date));
-    let rebuilt = format!(
-        "SELECT to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp{select_dimensions}, {measures} \
-         FROM {source} WHERE {partition}"
-    );
+    let rebuilt = format!("SELECT {projection} FROM {source} WHERE {partition}");
     if ranges.is_empty() {
         return Ok(format!("{rebuilt} GROUP BY {group_by}"));
     }
@@ -300,13 +319,11 @@ pub(crate) fn build_cohort_sql_range_mode(
         anyhow::bail!("rollup cohort has no projects");
     }
     let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
-    let dimensions = spec.dimensions.join(", ");
-    let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
-    let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
+    let (_, projection) = bucketed_projection(spec, derived, grain)?;
     let group_by = (1..=2 + spec.dimensions.len()).join(", ");
     let projects = project_ids.iter().map(|project| sql_literal(project)).join(", ");
     Ok(format!(
-        "SELECT project_id, to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp{select_dimensions}, {measures} \
+        "SELECT project_id, {projection} \
          FROM {from} WHERE project_id IN ({projects}) AND date = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) \
          GROUP BY {group_by}",
         sql_literal(date)
@@ -424,13 +441,14 @@ pub(crate) fn to_rollup_batches_by_project(
         let projects = batch.column_by_name("project_id").ok_or_else(|| anyhow::anyhow!("cohort aggregate is missing project_id"))?;
         let projects = cast(projects, &DataType::Utf8)?;
         let projects = projects.as_any().downcast_ref::<StringArray>().ok_or_else(|| anyhow::anyhow!("cohort project_id cannot cast to Utf8"))?;
-        let mut rows_by_project: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
-        for row in 0..batch.num_rows() {
-            if projects.is_null(row) {
-                anyhow::bail!("cohort aggregate project_id is null");
-            }
-            rows_by_project.entry(projects.value(row)).or_default().push(u32::try_from(row)?);
-        }
+        let rows_by_project: std::collections::HashMap<&str, Vec<u32>> = (0..batch.num_rows())
+            .map(|row| match projects.is_null(row) {
+                true => Err(anyhow::anyhow!("cohort aggregate project_id is null")),
+                false => Ok((projects.value(row), u32::try_from(row)?)),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .into_group_map();
         for (project_id, rows) in rows_by_project {
             let indices = arrow::array::UInt32Array::from(rows);
             let columns = batch.columns().iter().map(|column| arrow::compute::take(column, &indices, None)).collect::<arrow::error::Result<Vec<_>>>()?;
@@ -483,7 +501,9 @@ impl Merge {
             Self::Max => "MAX",
             Self::TDigest => "tdigest_merge",
             Self::Hll => "hll_merge",
-            _ => "SUM",
+            // Exhaustive rather than a catch-all: a new state-carrying variant
+            // must state its operator instead of silently folding with SUM.
+            Self::Count | Self::Sum | Self::Avg | Self::First => "SUM",
         }
     }
 
@@ -562,6 +582,7 @@ const fn ceil_grain(value: i64, grain: i64) -> i64 {
 /// half of one cannot be given to a fringe. That alignment is the invariant the
 /// whole rewrite rests on — with `a` or `b` off-grain the legs either double
 /// count a bucket or drop one, and no aggregate can detect it afterwards.
+///
 /// Test-only: the single-interval shape, kept because the cost-floor and
 /// alignment cases read far more clearly against one range than a set.
 #[cfg(test)]
@@ -753,19 +774,17 @@ pub(crate) fn verify_slice_witness(witness: Option<SliceWitness>, source: LiveSo
     let (Some(witness), Some(files)) = (witness, source.files) else { return WitnessVerdict::Unverifiable };
     match witness {
         SliceWitness::Physical(rows) => verdict(rows, files.iter().fold(0, |sum, file| sum.saturating_add(file.rows))),
-        SliceWitness::PhysicalBelow { rows, bound } => {
-            let mut below = 0u64;
-            for file in files {
-                let (Some(min_ts), Some(max_ts)) = (file.min_ts, file.max_ts) else { return WitnessVerdict::Unverifiable };
-                if min_ts < bound && max_ts >= bound {
-                    return WitnessVerdict::Unverifiable;
+        SliceWitness::PhysicalBelow { rows, bound } => files
+            .iter()
+            // A file straddling the bound, or carrying no statistics, poisons the
+            // whole witness — see the straddle rule above.
+            .try_fold(0u64, |below, file| match (file.min_ts, file.max_ts) {
+                (Some(min_ts), Some(max_ts)) if !(min_ts < bound && max_ts >= bound) => {
+                    Ok(if max_ts < bound { below.saturating_add(file.rows) } else { below })
                 }
-                if max_ts < bound {
-                    below = below.saturating_add(file.rows);
-                }
-            }
-            verdict(rows, below)
-        }
+                _ => Err(WitnessVerdict::Unverifiable),
+            })
+            .map_or_else(std::convert::identity, |below| verdict(rows, below)),
         // The witness carries its own range so a count taken over a DIFFERENT
         // window cannot be mistaken for evidence about this one — the index is
         // per (project, date) and every slice of that date asks it a different
@@ -877,17 +896,15 @@ pub(crate) struct SliceDedup<'a> {
 
 /// The identity a generated rollup tier is physically written with.
 ///
-/// A tier's own `TableSchema` deliberately declares NO `dedup_keys` — see
-/// `RollupSpec::synthesize`, where doing so made every routed read plan a
-/// `DedupExec` over columns the rewrite does not project ("DedupExec key `id`
-/// not in input schema") and dropped every query back to a raw scan. That is a
-/// statement about the QUERY path. It is not true of the tier's bytes: a
-/// rebuild appends a new version of a bucket, and the replace-set that is meant
-/// to retire the old file skips any file carrying no slice tags — so partitions
-/// really do hold several versions of one `id` (prod 2026-08-20: 7.17 per id).
+/// A tier's own `TableSchema` declares `dedup_keys = [timestamp, id]` (see
+/// `RollupSpec::synthesize`), so the QUERY path collapses versions through the
+/// planner's `DedupExec`. It has to: a rebuild appends a new version of a
+/// bucket, and the replace-set that is meant to retire the old file skips any
+/// file carrying no slice tags — so partitions really do hold several versions
+/// of one `id` (prod 2026-08-20: 7.17 per id).
 ///
-/// So a MAINTENANCE read of a tier must collapse versions explicitly, without
-/// declaring keys the query planner would then act on.
+/// A MAINTENANCE read gets no such help — it registers the tier directly rather
+/// than through the routing table — so it must spell the same identity out.
 pub(crate) fn rollup_tier_dedup(schema: &crate::schema::TableSchema) -> Option<(Vec<String>, &'static str, Option<&str>)> {
     let has = |name: &str| schema.fields.iter().any(|field| field.name == name);
     (has("timestamp") && has("id") && has("updated_at"))
@@ -966,10 +983,8 @@ pub(crate) fn slice_retires(file: &LiveFile<'_>, publish: &SlicePublish<'_>) -> 
 /// `hi` is INCLUSIVE — it is a row's timestamp, straight from file statistics —
 /// while a slice's end is exclusive, so a range must reach strictly past `hi`.
 pub(crate) fn ranges_cover(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool {
-    let mut sorted: Vec<(i64, i64)> = ranges.to_vec();
-    sorted.sort_unstable();
     let mut reached = lo;
-    for (start, end) in sorted {
+    for (start, end) in ranges.iter().copied().sorted() {
         if start > reached {
             return false;
         }
@@ -998,8 +1013,7 @@ pub(crate) fn ranges_cover(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> bool 
 /// Ends are EXCLUSIVE here, but a file's statistics `hi` is a row timestamp, so
 /// callers pass `hi + 1`.
 pub(crate) fn uncovered_gaps(untagged: &[(i64, i64)], tagged: &[(i64, i64)]) -> Vec<(i64, i64)> {
-    let mut covered = tagged.to_vec();
-    covered.sort_unstable();
+    let covered = tagged.iter().copied().sorted().collect_vec();
     let mut gaps: Vec<(i64, i64)> = Vec::new();
     for &(lo, hi) in untagged {
         let mut reached = lo;
@@ -1173,8 +1187,8 @@ pub(crate) fn slice_input_sql(
     present: Option<&std::collections::HashSet<String>>,
 ) -> String {
     let window = format!(
-        "WHERE project_id = '{}' AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}){shard_predicate}",
-        project_id.replace('\'', "''")
+        "WHERE project_id = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}){shard_predicate}",
+        sql_literal(project_id)
     );
     // `NULL AS x` for a column the provider lacks, `x` otherwise.
     let projected = |field: &crate::schema::FieldDef| match present {
@@ -1421,12 +1435,11 @@ impl RoutedRollup {
         let group_by = self.group_by();
         let having =
             self.guard.as_ref().map_or_else(String::new, |guard| format!(" HAVING {} > 0", guard.merge.sql(&[format!("__s{}_0", self.measures.len())])));
-        let mut legs = vec![self.leg(&self.target, interiors, &generations, &rollup_projects)];
-        if !fringes.is_empty() {
-            legs.push(self.leg(&self.source, &fringes, "", &rollup_projects));
-        }
-        legs.extend(raw_only_leg);
-        format!("SELECT {outer} FROM ({}) AS rollup_union{group_by}{having}", legs.join(" UNION ALL "))
+        let legs = std::iter::once(self.leg(&self.target, interiors, &generations, &rollup_projects))
+            .chain((!fringes.is_empty()).then(|| self.leg(&self.source, &fringes, "", &rollup_projects)))
+            .chain(raw_only_leg)
+            .join(" UNION ALL ");
+        format!("SELECT {outer} FROM ({legs}) AS rollup_union{group_by}{having}")
     }
 }
 
@@ -1525,9 +1538,9 @@ fn simplify_filtered_group(
 /// exactly; anything else declines rather than guessing a type.
 fn epoch_of(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logical_expr::Expr, Option<&'static str>)> {
     use datafusion::logical_expr::Expr;
-    let (expr, cast) = match expr {
-        Expr::Alias(alias) => (alias.expr.as_ref(), None),
-        expr => (expr, None),
+    let expr = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        expr => expr,
     };
     let (expr, cast) = match expr {
         Expr::Cast(inner) => (
@@ -1538,7 +1551,7 @@ fn epoch_of(expr: &datafusion::logical_expr::Expr) -> Option<(&datafusion::logic
                 _ => return None,
             }),
         ),
-        expr => (expr, cast),
+        expr => (expr, None),
     };
     let Expr::ScalarFunction(function) = unaliased(expr) else { return None };
     (function.name().eq_ignore_ascii_case("date_part")
@@ -1692,12 +1705,10 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
             if binary.op == Operator::And {
                 strip_index_hints(&mut operands);
             }
-            let mut terms = operands.into_iter().map(canonical).collect::<Vec<_>>();
-            terms.sort();
             // Idempotence, at EVERY level rather than only the outermost one:
             // the duplicated conjuncts observed in prod were nested inside an OR
             // branch, where a top-level dedupe cannot reach them.
-            terms.dedup();
+            let mut terms = operands.into_iter().map(canonical).sorted().dedup().collect_vec();
             // Stripping or deduping can leave one operand, and a one-element
             // conjunction IS that operand — `((X))` must not differ from `(X)`.
             if terms.len() == 1 {
@@ -1765,8 +1776,6 @@ fn strip_index_hints(operands: &mut Vec<&datafusion::logical_expr::Expr>) {
 }
 
 fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logical_expr::Expr>) -> String {
-    let mut expressions = expressions.into_iter().map(canonical).collect::<Vec<_>>();
-    expressions.sort();
     // AND is idempotent, so `X AND X` must canonicalize to `X`. Both sides
     // genuinely do repeat conjuncts: the optimizer leaves a predicate on the
     // Filter node AND re-pushes it into the TableScan's `partial_filters`, so
@@ -1774,8 +1783,7 @@ fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logic
     // every declared filter printed as `(X) AND (X)`). It happened to cancel
     // out while both sides duplicated equally, which is precisely the kind of
     // accident that stops holding the moment one side is shaped differently.
-    expressions.dedup();
-    expressions.join(" AND ")
+    expressions.into_iter().map(canonical).sorted().dedup().join(" AND ")
 }
 
 fn parse_bucket_micros(value: &str) -> Option<i64> {
@@ -2493,199 +2501,206 @@ async fn route_with_spec(
         return Err(MissReason::TinyInterior);
     }
 
-    let mut groups = Vec::new();
-    for (index, expression) in aggregate.group_expr.iter().enumerate() {
-        let alias = aggregate.schema.field(index).name();
-        let simplified = simplify_filtered_group(expression, predicates, &spec.dimensions).map_err(|_| MissReason::UnsupportedShape)?;
-        let expression = &simplified;
-        // monoscope's chart SQL groups by `extract(epoch from time_bucket(w,
-        // timestamp))::integer`, never by the bare bucket, so every percentile
-        // and grouped panel declined as `unsupported_shape` and scanned raw —
-        // 3,525 ms against 278 ms routed at 3 days (2026-08-22 A/B).
-        //
-        // Epoch-of-bucket is injective on the bucket, so the grouping is
-        // identical and only the spelling differs. The wrapper is REPRODUCED
-        // rather than lifted: the rewrite is substituted for this aggregate and
-        // must match its schema types, so dropping a cast here would fail
-        // `has_equivalent_names_and_types` instead of routing.
-        let epoch_wrapped = epoch_of(expression);
-        let expression = match epoch_wrapped.map_or_else(|| unaliased(expression), |(inner, _)| inner) {
-            // `project_id` is not a declared dimension — it is the partition
-            // column, written on every rollup row by `to_rollup_batches` — but
-            // it groups exactly like one.
-            Expr::Column(column) if column.name == "project_id" || spec.dimensions.iter().any(|dimension| dimension == &column.name) => column.name.clone(),
-            Expr::ScalarFunction(function)
-                if function.name().eq_ignore_ascii_case("time_bucket") && function.args.len() == 2 && column_name(&function.args[1]) == Some("timestamp") =>
-            {
-                let interval = string_literal(&function.args[0]).ok_or(MissReason::UnsupportedShape)?;
-                let width = parse_bucket_micros(interval).ok_or(MissReason::UnsupportedShape)?;
-                // A width that is not a whole number of grains would make one
-                // rollup row straddle two output buckets, and no state can be
-                // split across them. Raw fringes do not change this: the
-                // interior is still answered by whole rollup rows.
-                if width < grain || width % grain != 0 {
-                    return Err(MissReason::PartialBucket);
-                }
-                format!("time_bucket({}, timestamp)", sql_literal(interval))
-            }
-            // monoscope spells EVERY grouped chart's dimension
-            // `COALESCE(<dimension>, 'null')`, so the bare-column arm above
-            // never matched one and every such panel scanned raw — 3,237 ms
-            // against 276 ms routed at 3 days (2026-08-22 A/B).
+    let groups = aggregate
+        .group_expr
+        .iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            let alias = aggregate.schema.field(index).name();
+            let simplified = simplify_filtered_group(expression, predicates, &spec.dimensions).map_err(|_| MissReason::UnsupportedShape)?;
+            let expression = &simplified;
+            // monoscope's chart SQL groups by `extract(epoch from time_bucket(w,
+            // timestamp))::integer`, never by the bare bucket, so every percentile
+            // and grouped panel declined as `unsupported_shape` and scanned raw —
+            // 3,525 ms against 278 ms routed at 3 days (2026-08-22 A/B).
             //
-            // Sound because `COALESCE(dim, lit)` is a FUNCTION of `dim`: the
-            // rollup's partition by `dim` therefore REFINES the partition by
-            // `COALESCE(dim, lit)`, and re-aggregating decomposable states over
-            // a refinement equals aggregating the raw rows. So the expression is
-            // emitted verbatim onto both legs and NULL needs no special case —
-            // the NULL cell and the literal-'null' cell simply merge, exactly as
-            // the raw rows do.
-            other
-                if coalesced_column(other).is_some_and(|(column, _)| column == "project_id" || spec.dimensions.iter().any(|dimension| dimension == column)) =>
-            {
-                let (column, fallback) = coalesced_column(other).ok_or(MissReason::UnsupportedShape)?;
-                format!("COALESCE({column}, {})", sql_literal(fallback))
-            }
-            Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
-            _ => return Err(MissReason::UnsupportedShape),
-        };
-        // Only the bucket may wear the epoch wrapper; a dimension grouped by
-        // `extract(epoch …)` is nonsense and must not be silently accepted.
-        let expression = match epoch_wrapped {
-            Some((_, cast)) if expression.starts_with("time_bucket(") => {
-                let epoch = format!("date_part('EPOCH', {expression})");
-                match cast {
-                    Some(sql_type) => format!("CAST({epoch} AS {sql_type})"),
-                    None => epoch,
+            // Epoch-of-bucket is injective on the bucket, so the grouping is
+            // identical and only the spelling differs. The wrapper is REPRODUCED
+            // rather than lifted: the rewrite is substituted for this aggregate and
+            // must match its schema types, so dropping a cast here would fail
+            // `has_equivalent_names_and_types` instead of routing.
+            let epoch_wrapped = epoch_of(expression);
+            let expression = match epoch_wrapped.map_or_else(|| unaliased(expression), |(inner, _)| inner) {
+                // `project_id` is not a declared dimension — it is the partition
+                // column, written on every rollup row by `to_rollup_batches` — but
+                // it groups exactly like one.
+                Expr::Column(column) if column.name == "project_id" || spec.dimensions.iter().any(|dimension| dimension == &column.name) => column.name.clone(),
+                Expr::ScalarFunction(function)
+                    if function.name().eq_ignore_ascii_case("time_bucket")
+                        && function.args.len() == 2
+                        && column_name(&function.args[1]) == Some("timestamp") =>
+                {
+                    let interval = string_literal(&function.args[0]).ok_or(MissReason::UnsupportedShape)?;
+                    let width = parse_bucket_micros(interval).ok_or(MissReason::UnsupportedShape)?;
+                    // A width that is not a whole number of grains would make one
+                    // rollup row straddle two output buckets, and no state can be
+                    // split across them. Raw fringes do not change this: the
+                    // interior is still answered by whole rollup rows.
+                    if width < grain || width % grain != 0 {
+                        return Err(MissReason::PartialBucket);
+                    }
+                    format!("time_bucket({}, timestamp)", sql_literal(interval))
                 }
-            }
-            Some(_) => return Err(MissReason::UnsupportedShape),
-            None => expression,
-        };
-        groups.push((expression, alias.to_string()));
-    }
+                // monoscope spells EVERY grouped chart's dimension
+                // `COALESCE(<dimension>, 'null')`, so the bare-column arm above
+                // never matched one and every such panel scanned raw — 3,237 ms
+                // against 276 ms routed at 3 days (2026-08-22 A/B).
+                //
+                // Sound because `COALESCE(dim, lit)` is a FUNCTION of `dim`: the
+                // rollup's partition by `dim` therefore REFINES the partition by
+                // `COALESCE(dim, lit)`, and re-aggregating decomposable states over
+                // a refinement equals aggregating the raw rows. So the expression is
+                // emitted verbatim onto both legs and NULL needs no special case —
+                // the NULL cell and the literal-'null' cell simply merge, exactly as
+                // the raw rows do.
+                other
+                    if coalesced_column(other)
+                        .is_some_and(|(column, _)| column == "project_id" || spec.dimensions.iter().any(|dimension| dimension == column)) =>
+                {
+                    let (column, fallback) = coalesced_column(other).ok_or(MissReason::UnsupportedShape)?;
+                    format!("COALESCE({column}, {})", sql_literal(fallback))
+                }
+                Expr::Column(_) => return Err(MissReason::UnknownGroupBy),
+                _ => return Err(MissReason::UnsupportedShape),
+            };
+            // Only the bucket may wear the epoch wrapper; a dimension grouped by
+            // `extract(epoch …)` is nonsense and must not be silently accepted.
+            let expression = match epoch_wrapped {
+                Some((_, cast)) if expression.starts_with("time_bucket(") => {
+                    let epoch = format!("date_part('EPOCH', {expression})");
+                    match cast {
+                        Some(sql_type) => format!("CAST({epoch} AS {sql_type})"),
+                        None => epoch,
+                    }
+                }
+                Some(_) => return Err(MissReason::UnsupportedShape),
+                None => expression,
+            };
+            Ok((expression, alias.to_string()))
+        })
+        .collect::<Result<Vec<_>, MissReason>>()?;
 
-    let mut measures = Vec::new();
-    for (index, expression) in aggregate.aggr_expr.iter().enumerate() {
-        let alias = aggregate.schema.field(aggregate.group_expr.len() + index).name().to_string();
-        let Expr::AggregateFunction(function) = unaliased(expression) else { return Err(MissReason::NonDecomposableAggregate) };
-        // An ORDER BY inside an aggregate makes it depend on row order, which no
-        // partial state can carry -- with one exception. `first_value(x ORDER BY
-        // timestamp)` orders by the very axis the rollup buckets on, so the
-        // earliest row of the earliest bucket IS the earliest row overall, and a
-        // (value, timestamp) pair merges associatively. Nothing else is relaxed:
-        // ordering by any other column, or DESC, still declines.
-        let ordered_by_timestamp = function.func.name().eq_ignore_ascii_case("first_value")
-            && matches!(
-                function.params.order_by.as_slice(),
-                [sort] if column_name(&sort.expr) == Some("timestamp") && sort.asc
-            );
-        if function.params.distinct || (!function.params.order_by.is_empty() && !ordered_by_timestamp) {
-            return Err(MissReason::NonDecomposableAggregate);
-        }
-        // The promoted conjuncts join the aggregate's own, so a `count(*) FILTER
-        // (WHERE status_code = 'ERROR' …)` under the `server` row filter resolves
-        // to `server_error_count`, which is declared as exactly that conjunction.
-        let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
-        let name = function.func.name().to_ascii_lowercase();
-        let column = function.params.args.first().and_then(column_name).map(str::to_string);
-        // Dropping `col IS NOT NULL` is only sound for aggregates that skip nulls
-        // over THAT column. `SELECT count(*), p95(duration) … WHERE duration IS NOT
-        // NULL` is real monoscope traffic (the top-K tables) and its `count(*)`
-        // counts only rows with a duration, where `request_count` counts them all.
-        //
-        // `count(*)` is the one aggregate that can be REWRITTEN to satisfy the
-        // guard instead of being refused by it: under `col IS NOT NULL`,
-        // `count(*) ≡ count(col)`. The guard was set aside above rather than
-        // pushed, so neither leg re-applies it — and `{agg: count, column: col}`
-        // skips exactly the rows the predicate excluded, while the raw leg emits
-        // `COUNT(col)` for the same measure. Before this, monoscope's log-explorer
-        // latency widget (`count(*)` folded in from `HAVING COUNT(*) > 0` beside
-        // `percentile_agg(duration)`) was refused outright and scanned 7 days raw.
-        //
-        // This was briefly withheld from queries also carrying a `percentile_agg`,
-        // because cells built before the 2026-08-22 spec change hold no
-        // `duration_digest` COLUMN and the reader null-fills it, so a routed
-        // latency chart rendered a hole over the rollup interior. That stopgap is
-        // gone: `TAG_MEASURES` now records what each cell MATERIALIZED and
-        // `Database::rollup_rewrite_for` gates both coverage paths on
-        // `RoutedRollup::measures_available`, so a date or slice that cannot prove
-        // the digest falls to the raw fringe while its siblings keep routing —
-        // pinned by `a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe`
-        // in `src/database/mod.rs`, which covers this widget's exact shape.
-        let column = match (column, null_guard) {
-            (None, Some(guard)) if name == "count" => Some(guard.to_string()),
-            (column, _) => column,
-        };
-        if null_guard.is_some() && column.as_deref() != null_guard {
-            return Err(MissReason::FilterNullGuardMismatch);
-        }
-        let measure = |aggregate: &str, column: Option<&str>| {
-            configured_filters
-                .iter()
-                .find(|(measure, measure_filter)| measure.agg == aggregate && measure.column.as_deref() == column && *measure_filter == filter)
-                .map(|(measure, _)| *measure)
-        };
-        // The raw leg reproduces the measure's DECLARED filter text verbatim.
-        // The matcher has already proven the query's aggregate filter
-        // canonicalizes to the same predicate, so this is exact — and it avoids
-        // unparsing an optimized `Expr` back into SQL.
-        let raw = |expression: String, declared: Option<&String>| match declared {
-            Some(filter) => format!("{expression} FILTER (WHERE {filter})"),
-            None => expression,
-        };
-        let (merge, resolved) = match name.as_str() {
-            "count" => (Merge::Count, measure("count", column.as_deref()).map(|m| vec![m])),
-            "sum" => (Merge::Sum, measure("sum", column.as_deref()).map(|m| vec![m])),
-            "min" => (Merge::Min, measure("min", column.as_deref()).map(|m| vec![m])),
-            "max" => (Merge::Max, measure("max", column.as_deref()).map(|m| vec![m])),
-            "avg" => (Merge::Avg, measure("sum", column.as_deref()).zip(measure("count", column.as_deref())).map(|(sum, count)| vec![sum, count])),
-            "percentile_agg" => (Merge::TDigest, measure("tdigest", column.as_deref()).map(|m| vec![m])),
-            // `hll_agg`, a.k.a. Toolkit's `approx_count_distinct`. It behaves
-            // exactly like `percentile_agg` above: the aggregate yields the STATE
-            // and the scalar that reads a number out of it (`distinct_count`)
-            // sits above, untouched. DataFusion's own `approx_distinct` is NOT
-            // routed — it returns a bare count with no state to store. Exact
-            // `COUNT(DISTINCT x)` stays non-decomposable and is still declined;
-            // approximating it without being asked is what the measure list
-            // refuses to do.
-            "hll_agg" => (Merge::Hll, measure("hll", column.as_deref()).map(|m| vec![m])),
-            // Resolves to a PAIR, exactly as `avg` resolves to sum/count: the
-            // stored value plus the companion `min(timestamp)` that says which
-            // row it came from. `RollupSpec::validate` guarantees a `first`
-            // measure cannot be declared without its companion, so a spec that
-            // reaches here either resolves both or neither.
-            //
-            // Declines under a null guard. The guard is set aside rather than
-            // applied to either leg, which is only sound for aggregates that
-            // skip nulls over the guarded column -- and `first_value` does not:
-            // it returns the earliest row's value even when that value is NULL.
-            "first_value" if null_guard.is_none() => {
-                (Merge::First, measure("first", column.as_deref()).zip(measure("min", Some("timestamp"))).map(|(first, at)| vec![first, at]))
+    let measures = aggregate
+        .aggr_expr
+        .iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            let alias = aggregate.schema.field(aggregate.group_expr.len() + index).name().to_string();
+            let Expr::AggregateFunction(function) = unaliased(expression) else { return Err(MissReason::NonDecomposableAggregate) };
+            // An ORDER BY inside an aggregate makes it depend on row order, which no
+            // partial state can carry -- with one exception. `first_value(x ORDER BY
+            // timestamp)` orders by the very axis the rollup buckets on, so the
+            // earliest row of the earliest bucket IS the earliest row overall, and a
+            // (value, timestamp) pair merges associatively. Nothing else is relaxed:
+            // ordering by any other column, or DESC, still declines.
+            let ordered_by_timestamp = function.func.name().eq_ignore_ascii_case("first_value")
+                && matches!(
+                    function.params.order_by.as_slice(),
+                    [sort] if column_name(&sort.expr) == Some("timestamp") && sort.asc
+                );
+            if function.params.distinct || (!function.params.order_by.is_empty() && !ordered_by_timestamp) {
+                return Err(MissReason::NonDecomposableAggregate);
             }
-            _ => return Err(MissReason::NonDecomposableAggregate),
-        };
-        let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
-        debug_assert_eq!(resolved.len(), merge.arity(), "{merge:?} resolved the wrong number of measures");
-        let raw = resolved
-            .iter()
-            .map(|measure| {
-                let aggregate = measure.agg.to_uppercase();
-                let expression = match (merge, measure.column.as_deref()) {
-                    (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
-                    (Merge::Hll, Some(column)) => format!("hll_agg({column})"),
-                    // The companion of a `first` pair is an ordinary `min`
-                    // measure, so it renders through the general arm below;
-                    // only the value state needs the ordered spelling.
-                    (Merge::First, Some(column)) if measure.agg == "first" => format!("first_value({column} ORDER BY timestamp)"),
-                    (_, None) => "COUNT(*)".to_string(),
-                    (_, Some(column)) => format!("{aggregate}({column})"),
-                };
-                raw(expression, measure.filter.as_ref())
-            })
-            .collect();
-        measures.push(RoutedMeasure { alias, merge, measures: resolved.iter().map(|measure| measure.name.clone()).collect(), raw });
-    }
+            // The promoted conjuncts join the aggregate's own, so a `count(*) FILTER
+            // (WHERE status_code = 'ERROR' …)` under the `server` row filter resolves
+            // to `server_error_count`, which is declared as exactly that conjunction.
+            let filter = canonical_and(function.params.filter.iter().flat_map(|filter| split_conjunction(filter.as_ref())).chain(promotable.iter().copied()));
+            let name = function.func.name().to_ascii_lowercase();
+            let column = function.params.args.first().and_then(column_name).map(str::to_string);
+            // Dropping `col IS NOT NULL` is only sound for aggregates that skip nulls
+            // over THAT column. `SELECT count(*), p95(duration) … WHERE duration IS NOT
+            // NULL` is real monoscope traffic (the top-K tables) and its `count(*)`
+            // counts only rows with a duration, where `request_count` counts them all.
+            //
+            // `count(*)` is the one aggregate that can be REWRITTEN to satisfy the
+            // guard instead of being refused by it: under `col IS NOT NULL`,
+            // `count(*) ≡ count(col)`. The guard was set aside above rather than
+            // pushed, so neither leg re-applies it — and `{agg: count, column: col}`
+            // skips exactly the rows the predicate excluded, while the raw leg emits
+            // `COUNT(col)` for the same measure. Before this, monoscope's log-explorer
+            // latency widget (`count(*)` folded in from `HAVING COUNT(*) > 0` beside
+            // `percentile_agg(duration)`) was refused outright and scanned 7 days raw.
+            //
+            // This was briefly withheld from queries also carrying a `percentile_agg`,
+            // because cells built before the 2026-08-22 spec change hold no
+            // `duration_digest` COLUMN and the reader null-fills it, so a routed
+            // latency chart rendered a hole over the rollup interior. That stopgap is
+            // gone: `TAG_MEASURES` now records what each cell MATERIALIZED and
+            // `Database::rollup_rewrite_for` gates both coverage paths on
+            // `RoutedRollup::measures_available`, so a date or slice that cannot prove
+            // the digest falls to the raw fringe while its siblings keep routing —
+            // pinned by `a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe`
+            // in `src/database/mod.rs`, which covers this widget's exact shape.
+            let column = match (column, null_guard) {
+                (None, Some(guard)) if name == "count" => Some(guard.to_string()),
+                (column, _) => column,
+            };
+            if null_guard.is_some() && column.as_deref() != null_guard {
+                return Err(MissReason::FilterNullGuardMismatch);
+            }
+            let measure = |aggregate: &str, column: Option<&str>| {
+                configured_filters
+                    .iter()
+                    .find(|(measure, measure_filter)| measure.agg == aggregate && measure.column.as_deref() == column && *measure_filter == filter)
+                    .map(|(measure, _)| *measure)
+            };
+            let (merge, resolved) = match name.as_str() {
+                "count" => (Merge::Count, measure("count", column.as_deref()).map(|m| vec![m])),
+                "sum" => (Merge::Sum, measure("sum", column.as_deref()).map(|m| vec![m])),
+                "min" => (Merge::Min, measure("min", column.as_deref()).map(|m| vec![m])),
+                "max" => (Merge::Max, measure("max", column.as_deref()).map(|m| vec![m])),
+                "avg" => (Merge::Avg, measure("sum", column.as_deref()).zip(measure("count", column.as_deref())).map(|(sum, count)| vec![sum, count])),
+                "percentile_agg" => (Merge::TDigest, measure("tdigest", column.as_deref()).map(|m| vec![m])),
+                // `hll_agg`, a.k.a. Toolkit's `approx_count_distinct`. It behaves
+                // exactly like `percentile_agg` above: the aggregate yields the STATE
+                // and the scalar that reads a number out of it (`distinct_count`)
+                // sits above, untouched. DataFusion's own `approx_distinct` is NOT
+                // routed — it returns a bare count with no state to store. Exact
+                // `COUNT(DISTINCT x)` stays non-decomposable and is still declined;
+                // approximating it without being asked is what the measure list
+                // refuses to do.
+                "hll_agg" => (Merge::Hll, measure("hll", column.as_deref()).map(|m| vec![m])),
+                // Resolves to a PAIR, exactly as `avg` resolves to sum/count: the
+                // stored value plus the companion `min(timestamp)` that says which
+                // row it came from. `RollupSpec::validate` guarantees a `first`
+                // measure cannot be declared without its companion, so a spec that
+                // reaches here either resolves both or neither.
+                //
+                // Declines under a null guard. The guard is set aside rather than
+                // applied to either leg, which is only sound for aggregates that
+                // skip nulls over the guarded column -- and `first_value` does not:
+                // it returns the earliest row's value even when that value is NULL.
+                "first_value" if null_guard.is_none() => {
+                    (Merge::First, measure("first", column.as_deref()).zip(measure("min", Some("timestamp"))).map(|(first, at)| vec![first, at]))
+                }
+                _ => return Err(MissReason::NonDecomposableAggregate),
+            };
+            let resolved = resolved.ok_or(MissReason::MissingMeasure)?;
+            debug_assert_eq!(resolved.len(), merge.arity(), "{merge:?} resolved the wrong number of measures");
+            // The raw leg reproduces the measure's DECLARED filter text verbatim.
+            // The matcher has already proven the query's aggregate filter
+            // canonicalizes to the same predicate, so this is exact — and it avoids
+            // unparsing an optimized `Expr` back into SQL.
+            let raw = resolved
+                .iter()
+                .map(|measure| {
+                    let aggregate = measure.agg.to_uppercase();
+                    let expression = match (merge, measure.column.as_deref()) {
+                        (Merge::TDigest, Some(column)) => format!("percentile_agg(CAST({column} AS DOUBLE))"),
+                        (Merge::Hll, Some(column)) => format!("hll_agg({column})"),
+                        // The companion of a `first` pair is an ordinary `min`
+                        // measure, so it renders through the general arm below;
+                        // only the value state needs the ordered spelling.
+                        (Merge::First, Some(column)) if measure.agg == "first" => format!("first_value({column} ORDER BY timestamp)"),
+                        (_, None) => "COUNT(*)".to_string(),
+                        (_, Some(column)) => format!("{aggregate}({column})"),
+                    };
+                    filtered(expression, measure.filter.as_deref())
+                })
+                .collect();
+            Ok(RoutedMeasure { alias, merge, measures: resolved.iter().map(|measure| measure.name.clone()).collect(), raw })
+        })
+        .collect::<Result<Vec<_>, MissReason>>()?;
 
     let guard = guard.map(|measure| RoutedMeasure {
         alias: "__guard".to_string(),
@@ -2694,13 +2709,7 @@ async fn route_with_spec(
         // `COUNT(col)` when the guard carries one — the raw leg must eliminate the
         // same buckets the rollup leg's `HAVING sum(count(col)) > 0` does, and
         // `COUNT(*)` there would keep an all-null bucket the rollup drops.
-        raw: vec![{
-            let counted = measure.column.as_deref().map_or_else(|| "COUNT(*)".to_string(), |column| format!("COUNT({column})"));
-            match measure.filter.as_ref() {
-                Some(filter) => format!("{counted} FILTER (WHERE {filter})"),
-                None => counted,
-            }
-        }],
+        raw: vec![filtered(measure.column.as_deref().map_or_else(|| "COUNT(*)".to_string(), |column| format!("COUNT({column})")), measure.filter.as_deref())],
     });
 
     Ok(RoutedRollup {
@@ -3302,8 +3311,6 @@ mod tests {
         assert!(target.fields.iter().any(|field| field.name == "rollup_generation"));
         assert_eq!(target.partitions, source.partitions);
         assert!(!target.version_append);
-        // A rollup must declare NO dedup keys. `replace_rollup_partition` removes
-        // every existing file in the partition in the same commit that adds the
         // Both tiers get the SAME identity, base and derived alike. The
         // asymmetry that preceded this — a derived tier protected by its input
         // collapse while the base tier had no read-time defence at all — is what
@@ -3569,12 +3576,6 @@ mod tests {
         assert_substitutes(&state, &sql, None).await;
     }
 
-    /// The same chart with the `::text` cast monoscope actually emits. The cast
-    /// is the whole difference: `COALESCE(col, 'null')` repeats a bare column,
-    /// which CSE leaves alone, while `COALESCE(col::text, 'null')` repeats a
-    /// COMPUTATION and gets lifted into `__common_expr_1` — so the test above
-    /// passed for a year while every real panel declined. Prod 2026-08-25:
-    /// 39.2s here against 4.25s for the bare-column spelling, 7 days, one project.
     /// A measure on the not-yet-servable list is refused on a TAGGED cell, not
     /// merely an untagged one. The tag proves the COLUMN existed; it cannot prove
     /// a VALUE was written, and `distinct_count` of an empty sketch is 0 — so a
@@ -3596,6 +3597,13 @@ mod tests {
         assert!(!route.measures_available(None), "and an untagged cell must not either");
     }
 
+    /// The same chart with the `::text` cast monoscope actually emits. The cast
+    /// is the whole difference: `COALESCE(col, 'null')` repeats a bare column,
+    /// which CSE leaves alone, while `COALESCE(col::text, 'null')` repeats a
+    /// COMPUTATION and gets lifted into `__common_expr_1` — so the bare-column
+    /// test above passed for a year while every real panel declined. Prod
+    /// 2026-08-25: 39.2s here against 4.25s for the bare spelling, 7 days, one
+    /// project.
     #[tokio::test]
     async fn a_grouped_chart_casting_its_dimension_routes_despite_cse() {
         let state = session().await;

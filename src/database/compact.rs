@@ -151,10 +151,7 @@ impl Database {
                     let new_uris: Vec<String> = file_uris(&new_table);
                     let new_sets = Self::filesets_for_dates(&new_uris, &kept_dates);
                     let mut guard = self.zorder_filesets.write().await;
-                    let entry = guard.entry(table_url.clone()).or_default();
-                    for d in &kept_dates {
-                        entry.insert(*d, new_sets.get(d).cloned().unwrap_or_default());
-                    }
+                    guard.entry(table_url.clone()).or_default().extend(kept_dates.iter().map(|d| (*d, new_sets.get(d).cloned().unwrap_or_default())));
                 }
                 crate::observability::record_optimize_partitions(kept_dates.len() as u64, skipped as u64);
 
@@ -238,24 +235,22 @@ impl Database {
                     }
                     // Whatever carry-forward covered needs no build.
                     let added: Vec<_> = added.into_iter().filter(|(_, _, uri)| !carried.contains(uri)).collect();
-                    let mut built = 0usize;
-                    let mut reindex_errs = 0usize;
                     let table_owned = table_name.to_string();
-                    let mut jobs = futures::stream::iter(added.into_iter().map(|(pid, rel, uri)| {
+                    let (built, reindex_errs) = futures::stream::iter(added.into_iter().map(|(pid, rel, uri)| {
                         let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
                         async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
                     }))
-                    .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
-                    while let Some(r) = jobs.next().await {
+                    .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1))
+                    .fold((0usize, 0usize), |(built, errs), r| async move {
                         match r {
-                            Ok(()) => built += 1,
+                            Ok(()) => (built + 1, errs),
                             Err(e) => {
-                                reindex_errs += 1;
                                 warn!("tantivy post-optimize reindex failed for table={}: {}", table_name, e);
+                                (built, errs + 1)
                             }
                         }
-                    }
-                    drop(jobs);
+                    })
+                    .await;
                     if built > 0 || reindex_errs > 0 || !carried.is_empty() {
                         info!("tantivy post-optimize reindex: table={} built={} carried_forward={} errors={}", table_name, built, carried.len(), reindex_errs);
                     }
@@ -328,9 +323,11 @@ impl Database {
             .counts();
         // Most-fragmented partition first: it's the one whose recent-window
         // queries open the most files, so it benefits most from an early tick.
-        let mut projects: Vec<_> = counts.into_iter().collect();
-        projects.sort_unstable_by(|(a, a_count), (b, b_count)| b_count.cmp(a_count).then_with(|| a.cmp(b)));
-        projects.into_iter().map(|(project_id, _)| project_id.to_owned()).collect()
+        counts
+            .into_iter()
+            .sorted_by(|(a, a_count), (b, b_count)| b_count.cmp(a_count).then_with(|| a.cmp(b)))
+            .map(|(project_id, _)| project_id.to_owned())
+            .collect()
     }
 
     /// Select the specific files a light optimize should bin-pack.
@@ -402,7 +399,7 @@ impl Database {
                 ))
             })
             .into_group_map();
-        let mut planned: Vec<(String, Vec<String>, usize)> = per_project
+        let planned = per_project
             .into_iter()
             .map(|(project_id, adds)| {
                 let debt = adds.len();
@@ -422,7 +419,7 @@ impl Database {
                 )
             })
             .filter(|(_, bin, _)| !bin.is_empty())
-            .collect();
+            .collect_vec();
         // Packing goes MOST-fragmented first — that partition opens the most
         // files per query, so it is the most urgent. Repair inverts it:
         // SHORTEST-JOB-FIRST.
@@ -441,11 +438,17 @@ impl Database {
         // Widening the admission reach the same morning made it worse, by
         // promoting that project's 1.6-2.3 GB files from "ineligible" to
         // "eligible and first in line".
-        match policy.pass {
-            TailPass::Pack => planned.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0))),
-            TailPass::Repair => planned.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0))),
-        }
-        Ok(planned.into_iter().map(|(project_id, bin, _)| (project_id, bin)).collect())
+        Ok(planned
+            .into_iter()
+            .sorted_by(|a, b| {
+                match policy.pass {
+                    TailPass::Pack => b.2.cmp(&a.2),
+                    TailPass::Repair => a.2.cmp(&b.2),
+                }
+                .then_with(|| a.0.cmp(&b.0))
+            })
+            .map(|(project_id, bin, _)| (project_id, bin))
+            .collect())
     }
 
     /// `[min, max]` event time (micros) of a file from its raw Add stats JSON.
@@ -1065,18 +1068,16 @@ impl Database {
              (SELECT \"timestamp\", count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {filter} GROUP BY {keys_csv}) AS g \
              WHERE c > 1 GROUP BY 1 ORDER BY 1"
         );
-        crate::database::maintain::collect_watched(ctx, &probe).await?.into_iter().try_fold(Vec::new(), |mut starts, batch| {
-            let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
-            let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
-            starts.extend(col.iter().flatten().filter_map(|value| {
+        Ok(read_string_column(crate::database::maintain::collect_watched(ctx, &probe).await?)?
+            .iter()
+            .filter_map(|value| {
                 value.get(..19).and_then(|datetime| {
                     chrono::NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S")
                         .or_else(|_| chrono::NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S"))
                         .ok()
                 })
-            }));
-            Ok::<_, anyhow::Error>(starts)
-        })
+            })
+            .collect())
     }
 
     /// Counts dedup keys whose versions disagree on a column declared IMMUTABLE,
@@ -1132,13 +1133,9 @@ impl Database {
     /// consumer. The old call-site claim, "one extra aggregate over a shard this
     /// rewrite is about to read in full anyway", was never true of either SQL
     /// formulation; it is true of the streaming one.
-    /// Columns an immutable-column audit compares — the single definition both
-    /// audit forms read, so the SQL and the streaming collapse cannot drift.
     ///
-    /// Dedup keys are excluded (they are the grouping), as are the tiebreak and
-    /// tombstone columns, which vary across versions by construction. Composite
-    /// types are excluded because ordering over them is neither cheap nor
-    /// meaningful.
+    /// This is the single definition of which columns an audit compares, so the
+    /// SQL and the streaming collapse cannot drift.
     fn immutable_audit_columns(schema: &crate::schema::TableSchema) -> Vec<String> {
         let excluded: HashSet<&str> =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect();
@@ -1252,7 +1249,7 @@ impl Database {
             // Ten-minute sealed bins bound materialization and avoid racing late
             // flushes; newer duplicates are retried later.
             let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
-            let mut skipped_unsealed = 0usize;
+            let mut skipped_unsealed = false;
             // A one-minute whale cannot be split further in time. Bound the
             // key GROUP BY used by the duplicate probe with the same complete-
             // key hash partitioning as the rewrite. Each pass may reread the
@@ -1273,7 +1270,7 @@ impl Database {
                     let end = start + chrono::Duration::minutes(10);
                     if slice.is_none() && end > sealed_before {
                         debug!("dedup: skipping unsealed chunk starting {start} (cleared on a later sweep)");
-                        skipped_unsealed += 1;
+                        skipped_unsealed = true;
                         return None;
                     }
                     let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"));
@@ -1288,7 +1285,7 @@ impl Database {
                     ))
                 })
                 .collect();
-            (built, skipped_unsealed > 0)
+            (built, skipped_unsealed)
         } else {
             // No timestamp dedup key → can't chunk safely; whole-partition
             // rewrite, gated on the same any-dupes probe.
@@ -1303,7 +1300,6 @@ impl Database {
 
         // `buffer_unordered` bounds tasks in flight; the rewrite semaphore bounds
         // concurrent Arrow materialization.
-        use futures::stream::StreamExt;
         let permits = self.config.derived.rewrite_permits().max(1);
         let staged: Vec<Result<BinOutcome<StagedBin>>> = futures::stream::iter(chunks.into_iter().map(|(chunk_filter, label)| {
             let (partition_filter, key, date_str) = (&partition_filter, key.clone(), date_str.as_str());
@@ -1368,12 +1364,10 @@ impl Database {
             let dv_enabled =
                 table_ref.read().await.snapshot().ok().map(|s| s.snapshot().table_properties().enable_deletion_vectors == Some(true)).unwrap_or(false);
             if dv_enabled {
-                let _ = (partition_filter, scan_name);
                 return self.stage_dedup_chunk_dv(table_ref, table_name, project_id, schema, chunk_filter, label, date_str, key, limits).await;
             }
         }
         use deltalake::{kernel::Action, writer::DeltaWriter};
-        use futures::StreamExt;
         // Re-plan against a fresh snapshot when concurrent rewrites invalidate
         // file mappings; `commit_wave` guards the remaining commit window.
         const MAX_REPLANS: usize = 3;
@@ -1878,24 +1872,21 @@ impl Database {
                 .collect()
                 .await;
             drop(rewrite_permit);
-            // Fold: every shard hands back its adds even when it failed, so a
-            // mid-flight failure still leaks nothing.
-            let (mut before, mut after) = (0usize, 0usize);
-            let mut adds: Vec<Action> = Vec::new();
-            let mut first_err: Option<anyhow::Error> = None;
-            for (shard_adds, outcome) in staged_shards {
-                adds.extend(shard_adds);
-                match outcome {
-                    Ok((shard_before, shard_after)) => (before, after) = (before + shard_before, after + shard_after),
-                    Err(error) => {
-                        first_err.get_or_insert(error);
-                    }
+            // Every shard hands back its adds even when it failed, so collect
+            // them all BEFORE folding the outcomes: a mid-flight failure still
+            // leaks nothing.
+            let (shard_adds, outcomes): (Vec<Vec<Action>>, Vec<_>) = staged_shards.into_iter().unzip();
+            let adds: Vec<Action> = shard_adds.concat();
+            let (before, after) = match outcomes
+                .into_iter()
+                .try_fold((0usize, 0usize), |(before, after), outcome| outcome.map(|(shard_before, shard_after)| (before + shard_before, after + shard_after)))
+            {
+                Ok(totals) => totals,
+                Err(e) => {
+                    Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                    return Err(e);
                 }
-            }
-            if let Some(e) = first_err {
-                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                return Err(e);
-            }
+            };
             if !dedup_rewrite_counts_match(before as u64, expected_live_rows, after as u64, expected_logical_rows) {
                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                 anyhow::bail!(

@@ -81,31 +81,32 @@ struct Bound {
 }
 
 impl Bound {
-    /// Counts ordering violations for a specific union leg.
-    fn advance_counting(&mut self, t: i64, leg: LegKind) {
-        if let Some(l) = self.last
-            && if self.desc { t > l } else { t < l }
-        {
-            leg.counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if self.last.is_none_or(|l| if self.desc { t < l } else { t > l }) {
-            self.last = Some(t);
-        }
+    /// Is `a` strictly further along the declared direction than `b`?
+    const fn ahead(&self, a: i64, b: i64) -> bool {
+        if self.desc { a < b } else { a > b }
     }
 
-    fn advance(&mut self, t: i64) -> bool {
-        // A value moving AGAINST the declared direction proves this scan's
-        // advertised ordering is false — a parquet footer's `sorting_columns` is
-        // lying. Dedup stays sound either way (`dedup_key_idxs`), but this is the
-        // only direct signal that the hot-tail footer repair still has work to
-        // do; a zero here across prod would exonerate footers entirely and send
-        // the 2026-08-07 under-count investigation elsewhere.
-        if let Some(l) = self.last
-            && if self.desc { t > l } else { t < l }
-        {
-            ORDERING_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Advance the run bound, counting violations into `violations`. Returns
+    /// true when this row OPENS a new run (i.e. it moved forward and was not the
+    /// very first row).
+    ///
+    /// A value moving AGAINST the declared direction proves this scan's
+    /// advertised ordering is false — a parquet footer's `sorting_columns` is
+    /// lying. Dedup stays sound either way (the bound column stays in the dedup
+    /// key — see `dedup_key_idxs`), but this is the only direct signal that the
+    /// hot-tail footer repair still has work to do; a zero here across prod
+    /// would exonerate footers entirely and send the 2026-08-07 under-count
+    /// investigation elsewhere.
+    fn step(&mut self, t: i64, violations: &AtomicU64) -> bool {
+        if self.last.is_some_and(|l| self.ahead(l, t)) {
+            violations.fetch_add(1, Ordering::Relaxed);
         }
-        self.last.is_none_or(|l| if self.desc { t < l } else { t > l }) && self.last.replace(t).is_some()
+        self.last.is_none_or(|l| self.ahead(t, l)) && self.last.replace(t).is_some()
+    }
+
+    /// Advance against the global counter, the one every dedup scan feeds.
+    fn advance(&mut self, t: i64) -> bool {
+        self.step(t, &ORDERING_VIOLATIONS)
     }
 }
 
@@ -131,7 +132,7 @@ impl LegKind {
         self.into()
     }
 
-    fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
+    fn counter(self) -> &'static AtomicU64 {
         match self {
             LegKind::Mem => &ORDERING_VIOLATIONS_MEM,
             LegKind::Delta => &ORDERING_VIOLATIONS_DELTA,
@@ -139,11 +140,11 @@ impl LegKind {
     }
 }
 
-pub(crate) static ORDERING_VIOLATIONS_MEM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static ORDERING_VIOLATIONS_DELTA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static ORDERING_VIOLATIONS_MEM: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ORDERING_VIOLATIONS_DELTA: AtomicU64 = AtomicU64::new(0);
 
 pub fn ordering_violations_by_leg() -> [(&'static str, u64); 2] {
-    [LegKind::Mem, LegKind::Delta].map(|leg| (leg.label(), leg.counter().load(std::sync::atomic::Ordering::Relaxed)))
+    [LegKind::Mem, LegKind::Delta].map(|leg| (leg.label(), leg.counter().load(Ordering::Relaxed)))
 }
 
 /// Diagnostic wrapper that answers "which leg's declared ordering is false?".
@@ -266,53 +267,47 @@ impl ExecutionPlan for OrderingProbeExec {
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        use futures::StreamExt;
         let stream = self.inner.execute(partition, context)?;
         let schema = stream.schema();
-        // The leg's OWN claim — not the union's. `None` means this leg declares
-        // nothing, and a leg that promises nothing cannot break a promise.
-        let Some(mut bound) = detect_bound(&self.inner, &[], &schema, true).or_else(|| leading_bound(&self.inner, &schema)) else {
+        // The leg's OWN claim — not the union's, and ignoring whether the column
+        // is a dedup key: the probe cares only about "did this leg honour what it
+        // declared". `None` means this leg declares nothing, and a leg that
+        // promises nothing cannot break a promise.
+        let Some(mut bound) = leading_bound(&self.inner, &schema, |_| true) else {
             return Ok(stream);
         };
-        let leg = self.leg;
+        let counter = self.leg.counter();
         let out = stream.map(move |batch| {
             let batch = batch?;
-            if let Some(col) = batch.column(bound.idx).as_any().downcast_ref::<arrow::array::TimestampMicrosecondArray>() {
-                for i in 0..col.len() {
-                    if col.is_valid(i) {
-                        bound.advance_counting(col.value(i), leg);
-                    }
-                }
-            } else if let Some(col) = batch.column(bound.idx).as_any().downcast_ref::<arrow::array::Int64Array>() {
-                for i in 0..col.len() {
-                    if col.is_valid(i) {
-                        bound.advance_counting(col.value(i), leg);
-                    }
-                }
+            let col = batch.column(bound.idx);
+            if let Some(values) = bound_slice(col) {
+                (0..col.len()).filter(|&i| col.is_valid(i)).for_each(|i| {
+                    bound.step(values[i], counter);
+                });
             }
             Ok(batch)
         });
-        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, out)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, out)))
     }
 }
 
-/// The leg's leading sort column as a `Bound`, ignoring whether it is a dedup
-/// key — the probe cares only about "did this leg honour what it declared".
-fn leading_bound(input: &Arc<dyn ExecutionPlan>, in_schema: &SchemaRef) -> Option<Bound> {
+/// The input's leading sort column as a `Bound`, when `accept`s its name and it
+/// is i64-backed. The declared ordering is never verified — see `detect_bound`.
+fn leading_bound(input: &Arc<dyn ExecutionPlan>, in_schema: &SchemaRef, accept: impl Fn(&str) -> bool) -> Option<Bound> {
     let se = input.properties().output_ordering()?.iter().next()?;
     let col = sort_col(se)?;
-    matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..)).then(|| Bound {
+    (accept(col.name()) && matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))).then(|| Bound {
         idx: col.index(),
         desc: se.options.descending,
         last: None,
     })
 }
 
-/// Rows observed out of the order their scan declared. See `Bound::advance`.
-pub(crate) static ORDERING_VIOLATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Rows observed out of the order their scan declared. See `Bound::step`.
+pub(crate) static ORDERING_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
 pub fn ordering_violations() -> u64 {
-    ORDERING_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed)
+    ORDERING_VIOLATIONS.load(Ordering::Relaxed)
 }
 
 /// The i64-backed values of a bound column (timestamps / Int64), for cheap
@@ -369,9 +364,9 @@ pub fn set_bounded_dedup_enabled(enabled: bool) {
     let _ = BOUNDED_DEDUP_ENABLED.set(enabled);
 }
 
-/// The dedup key columns to hash, given the chosen bound.
+/// The dedup key columns to hash. The bound column is ALWAYS retained.
 ///
-/// The bound column is ALWAYS retained. It used to be filtered out here: within
+/// It used to be filtered out here: within
 /// a *genuinely* sorted run the bound is constant, so encoding it into every key
 /// is redundant, and dropping it saved one timestamp encoding per physical row.
 ///
@@ -386,8 +381,7 @@ pub fn set_bounded_dedup_enabled(enabled: bool) {
 ///
 /// Keeping the bound in the key makes bounded mode fail-SAFE: a false ordering
 /// can now only under-dedup (emit a duplicate), never drop a distinct row.
-fn dedup_key_idxs(bound: Option<&Bound>, key_idxs: &[usize]) -> Vec<usize> {
-    let _ = bound;
+fn dedup_key_idxs(key_idxs: &[usize]) -> Vec<usize> {
     key_idxs.to_vec()
 }
 
@@ -400,16 +394,7 @@ fn dedup_key_idxs(bound: Option<&Bound>, key_idxs: &[usize]) -> Vec<usize> {
 /// when it lies badly enough to matter, and defaults OFF until the footer repair
 /// has drained the poisoned files.
 fn detect_bound(input: &Arc<dyn ExecutionPlan>, keys: &[String], in_schema: &SchemaRef, enabled: bool) -> Option<Bound> {
-    if !enabled {
-        return None;
-    }
-    let se = input.properties().output_ordering()?.iter().next()?;
-    let col = sort_col(se)?;
-    (keys.iter().any(|k| k == col.name()) && matches!(in_schema.field(col.index()).data_type(), DataType::Int64 | DataType::Timestamp(..))).then(|| Bound {
-        idx: col.index(),
-        desc: se.options.descending,
-        last: None,
-    })
+    enabled.then(|| leading_bound(input, in_schema, |name| keys.iter().any(|k| k == name))).flatten()
 }
 
 /// The input's output ordering, remapped through `output_projection` onto the
@@ -590,7 +575,7 @@ impl ExecutionPlan for DedupExec {
             None => crate::database::scan_metric_names::DEDUP_FULL_SET_TOTAL,
         })
         .increment(1);
-        let key_idxs = dedup_key_idxs(bound.as_ref(), &self.key_idxs);
+        let key_idxs = dedup_key_idxs(&self.key_idxs);
         // A bound lets keep-greatest emit per run without buffering the stream,
         // so it is the preferred shape — but it is no longer REQUIRED. Refusing
         // to run unbounded is what forced `version_append` scans to manufacture
@@ -1022,20 +1007,18 @@ struct Dedup {
     direct_string_key: Option<usize>,
 }
 
-enum KeyRows {
+enum KeyRows<'a> {
     Encoded(datafusion::arrow::row::Rows),
-    Utf8(ArrayRef),
-    Utf8View(ArrayRef),
-    LargeUtf8(ArrayRef),
+    /// The `direct_string_key` fast path: a single non-nullable string column,
+    /// read in place rather than re-encoded through the row converter.
+    Direct(StringValues<'a>),
 }
 
-impl KeyRows {
+impl KeyRows<'_> {
     fn value(&self, row: usize) -> &[u8] {
         match self {
             Self::Encoded(rows) => rows.row(row).data(),
-            Self::Utf8(array) => array.as_any().downcast_ref::<StringArray>().expect("validated Utf8 key").value(row).as_bytes(),
-            Self::Utf8View(array) => array.as_any().downcast_ref::<StringViewArray>().expect("validated Utf8View key").value(row).as_bytes(),
-            Self::LargeUtf8(array) => array.as_any().downcast_ref::<LargeStringArray>().expect("validated LargeUtf8 key").value(row).as_bytes(),
+            Self::Direct(values) => values.value(row).expect("direct string key is non-nullable").as_bytes(),
         }
     }
 }
@@ -1047,13 +1030,8 @@ impl Dedup {
             let keys = self.conv.convert_columns(&key_arrays).map_err(arrow_err)?;
             return Ok(dedup_first(batch, &keys, &mut self.seen, self.output_projection.as_deref(), self.bound.as_mut())?.into_iter().collect());
         };
-        let keys = match self.direct_string_key {
-            Some(idx) => match batch.column(idx).data_type() {
-                DataType::Utf8 => KeyRows::Utf8(batch.column(idx).clone()),
-                DataType::Utf8View => KeyRows::Utf8View(batch.column(idx).clone()),
-                DataType::LargeUtf8 => KeyRows::LargeUtf8(batch.column(idx).clone()),
-                _ => unreachable!("direct string key type was validated at construction"),
-            },
+        let keys = match self.direct_string_key.and_then(|idx| StringValues::from_column(batch.column(idx))) {
+            Some(values) => KeyRows::Direct(values),
             None => {
                 let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
                 KeyRows::Encoded(self.conv.convert_columns(&key_arrays).map_err(arrow_err)?)
@@ -1202,8 +1180,6 @@ fn dedup_first(
 
 #[cfg(test)]
 mod tests {
-    use super::{FileSpan, skippable_certified_files};
-
     /// The soundness rule for additive, file-set certification. Getting this
     /// wrong silently over-counts every dashboard tile, so the cases that must
     /// DECLINE are enumerated as carefully as the ones that may skip.
@@ -1358,7 +1334,7 @@ mod tests {
 
         // `dedup_key_idxs` must therefore RETAIN the bound column, making the
         // operator fail-safe under a false ordering.
-        assert_eq!(dedup_key_idxs(Some(&Bound { idx: 1, desc: true, last: None }), &[0, 1]), vec![0, 1], "bound column must stay in the dedup key");
+        assert_eq!(dedup_key_idxs(&[0, 1]), vec![0, 1], "bound column must stay in the dedup key");
 
         let full = RowConverter::new(vec![SortField::new(DataType::Utf8), SortField::new(DataType::Int64)]).unwrap();
         let mut bound2 = Bound { idx: 1, desc: true, last: None };
@@ -2305,13 +2281,6 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
     // Only tables served by ProjectRoutingTable qualify (system tables like
     // timefusion_stats share the session but not the storage model).
     let Some(schema) = crate::schema::get_schema(&q.table_name) else { return Ok(None) };
-    if schema.tombstones_possible()
-        && let Some(total) = try_logical_count(database, &q, schema).await
-    {
-        debug!("count_pushdown: answered {}/{} [{}, {}] = {} from logical-count index", q.project_id, q.table_name, q.lo, q.hi, total);
-        crate::observability::record_logical_count_pushdown_used();
-        return count_result(plan, total);
-    }
     // Tombstones make `stats.numRecords` an over-count in exactly the way
     // deletion vectors do (below), except invisibly: a merge-on-read DELETE is
     // an APPEND, so the file stats count both the tombstone version and the
@@ -2324,9 +2293,13 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
     // would trade the whole stats fast path (the highest-frequency dashboard
     // tile) for an unbounded scan that buys nothing. See
     // `TableSchema::tombstones_possible` for the ordering invariant that makes
-    // this sound.
+    // this sound. The logical-count index is the one exact answer for such a
+    // table, so try it first and decline when it has no covering partition.
     if schema.tombstones_possible() {
-        return Ok(None);
+        let Some(total) = try_logical_count(database, &q, schema).await else { return Ok(None) };
+        debug!("count_pushdown: answered {}/{} [{}, {}] = {} from logical-count index", q.project_id, q.table_name, q.lo, q.hi, total);
+        crate::observability::record_logical_count_pushdown_used();
+        return count_result(plan, total);
     }
 
     // Gate: window fully flushed (no MemBuffer rows in range).
@@ -2440,22 +2413,17 @@ async fn try_logical_count(database: &Arc<Database>, q: &CountQuery, schema: &cr
         }
         return None;
     }
-    let authoritative_batches = mem_batches;
     let covered_ranges = crate::write::mem_buffer::merge_ranges(mem_ranges);
     let delta_batches = database.logical_count_overlay_batches(delta_snapshot, log_store, added_files, columns).await.ok()?;
     indexes.into_iter().try_fold(0u64, |total, (date, index)| {
         let day_lo = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
         let day_hi = date.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
-        let input =
-            crate::read::LogicalCountOverlay { authoritative_batches: &authoritative_batches, delta_batches: &delta_batches, covered_ranges: &covered_ranges };
+        let input = crate::read::LogicalCountOverlay { authoritative_batches: &mem_batches, delta_batches: &delta_batches, covered_ranges: &covered_ranges };
         let count = index.count_with_covered_overlay(input, q.lo.max(day_lo), hi.min(day_hi), columns).ok()?;
         total.checked_add(count)
     })
 }
 
-/// Extract `(min_ts, max_ts, numRecords)` for this project's files from the
-/// flattened add-actions batch and sum the fully-contained ones. `None` on
-/// any missing column/stat, DV presence, or boundary straddle.
 /// A timestamp stats column as microseconds, or `None` when it is absent or not
 /// a timestamp. Shared with the rollup coverage fingerprint, which reads the
 /// same per-file span this pushdown does.
@@ -2467,8 +2435,10 @@ pub(crate) fn ts_micros_column(b: &RecordBatch, name: &str) -> Option<Int64Array
     Some(c.as_any().downcast_ref::<TimestampMicrosecondArray>()?.reinterpret_cast())
 }
 
+/// Extract `(min_ts, max_ts, numRecords)` for this project's files from the
+/// flattened add-actions batch and sum the fully-contained ones. `None` on
+/// any missing column/stat, DV presence, or boundary straddle.
 fn sum_from_actions(actions: &RecordBatch, q: &CountQuery) -> Option<u64> {
-    let ts_micros_col = ts_micros_column;
     // Deletion vectors make numRecords an over-count — bail if ANY file has
     // one (column families vary by writer; check every dv-prefixed column).
     let any_dv = actions
@@ -2482,8 +2452,8 @@ fn sum_from_actions(actions: &RecordBatch, q: &CountQuery) -> Option<u64> {
     }
     let pid = actions.column_by_name("partition.project_id")?.as_any().downcast_ref::<StringArray>()?;
     let records = actions.column_by_name("stats.numRecords")?.as_any().downcast_ref::<Int64Array>()?;
-    let min_ts = ts_micros_col(actions, "stats.minValues.timestamp")?;
-    let max_ts = ts_micros_col(actions, "stats.maxValues.timestamp")?;
+    let min_ts = ts_micros_column(actions, "stats.minValues.timestamp")?;
+    let max_ts = ts_micros_column(actions, "stats.maxValues.timestamp")?;
     let rows = (0..actions.num_rows())
         .filter(|&i| pid.is_valid(i) && pid.value(i) == q.project_id)
         .map(|i| (min_ts.is_valid(i).then(|| min_ts.value(i)), max_ts.is_valid(i).then(|| max_ts.value(i)), records.is_valid(i).then(|| records.value(i))));
@@ -2540,7 +2510,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use arrow::{
     array::TimestampMicrosecondArray,
-    datatypes::{Field, Schema, TimeUnit},
+    datatypes::{Field, Schema},
 };
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
 
@@ -2821,10 +2791,7 @@ const KEY_NULL: char = '\u{0}';
 /// `FORMAT_VERSION` bump, because a cached index encodes a shorter tail and
 /// mixing widths would over-count.
 fn key(timestamp: i64, id: &str) -> Box<[u8]> {
-    let mut out = Vec::with_capacity(8 + id.len());
-    out.extend_from_slice(&timestamp.to_be_bytes());
-    out.extend_from_slice(id.as_bytes());
-    out.into_boxed_slice()
+    [timestamp.to_be_bytes().as_slice(), id.as_bytes()].concat().into_boxed_slice()
 }
 
 /// The non-timestamp dedup-key columns of one batch, resolved once per batch.
@@ -2851,15 +2818,78 @@ impl<'a> KeyTail<'a> {
     }
 }
 
+/// The four narrow columns a logical-count batch carries, resolved once per
+/// batch: `timestamp`, the remaining dedup keys, the version tiebreak and the
+/// tombstone marker.
+struct CountColumns<'a> {
+    timestamps: &'a TimestampMicrosecondArray,
+    tiebreaks: &'a TimestampMicrosecondArray,
+    deleted: &'a BooleanArray,
+    tail: KeyTail<'a>,
+}
+
+impl<'a> CountColumns<'a> {
+    fn new(batch: &'a RecordBatch, columns: LogicalCountColumns<'_>) -> Result<Self> {
+        Ok(Self {
+            timestamps: column_as(batch, columns.timestamp)?,
+            tiebreaks: column_as(batch, columns.tiebreak)?,
+            deleted: column_as(batch, columns.deleted)?,
+            tail: KeyTail::new(batch, columns.keys)?,
+        })
+    }
+
+    /// `(timestamp, encoded key tail, winner)` for one row, reusing `buffer`.
+    ///
+    /// `None` when the timestamp is NULL: a bounded timestamp predicate never
+    /// matches one, so such a row contributes to no count index. A NULL in any
+    /// other key encodes as a distinct segment rather than erroring — it can
+    /// only split a group, never merge two.
+    fn row<'b>(&self, row: usize, buffer: &'b mut String) -> Option<(i64, &'b str, Winner)> {
+        if self.timestamps.is_null(row) {
+            return None;
+        }
+        let winner = Winner {
+            tiebreak: (!self.tiebreaks.is_null(row)).then(|| self.tiebreaks.value(row)),
+            deleted: !self.deleted.is_null(row) && self.deleted.value(row),
+        };
+        Some((self.timestamps.value(row), self.tail.encode(row, buffer), winner))
+    }
+}
+
 fn packed_id<'a>(ids: &'a [u8], winner: &PackedWinner) -> &'a [u8] {
     let start = winner.id_offset as usize;
     let end = start + usize::from(winner.id_len);
     &ids[start..end]
 }
 
+/// The timestamp prefix every index key carries (see [`key`]).
+fn key_timestamp(key: &[u8]) -> i64 {
+    i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"))
+}
+
+impl PackedWinner {
+    fn winner(&self) -> Winner {
+        Winner { tiebreak: (self.flags & FLAG_TIEBREAK_PRESENT != 0).then_some(self.tiebreak), deleted: self.flags & FLAG_DELETED != 0 }
+    }
+}
+
 impl LogicalCountIndex {
     pub fn new() -> Self {
-        Self { winners: HashMap::default(), packed: None, key_bytes: 0 }
+        Self::default()
+    }
+
+    /// Every stored winner, whichever representation is live: `(timestamp, id
+    /// bytes, winner)`. The one place the packed/build split is spelled out.
+    fn entries(&self) -> impl Iterator<Item = (i64, &[u8], Winner)> {
+        match &self.packed {
+            Some(packed) => itertools::Either::Left(packed.winners.iter().map(move |w| (w.timestamp, packed_id(&packed.ids, w), w.winner()))),
+            None => itertools::Either::Right(self.winners.iter().map(|(key, winner)| (key_timestamp(key), &key[8..], *winner))),
+        }
+    }
+
+    /// Live winners satisfying `keep`, over whichever representation is live.
+    fn count_where(&self, keep: impl Fn(i64, Winner) -> bool) -> u64 {
+        u64::try_from(self.entries().filter(|&(timestamp, _, winner)| keep(timestamp, winner)).count()).expect("logical-count partition length fits u64")
     }
 
     /// Apply one physical version. Returns whether it changed the logical row.
@@ -2894,7 +2924,7 @@ impl LogicalCountIndex {
             live_timestamps: Vec::with_capacity(winners.len()),
         };
         for (key, winner) in winners {
-            let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
+            let timestamp = key_timestamp(&key);
             let id = &key[8..];
             let id_offset = u32::try_from(packed.ids.len()).context("logical-count ID arena exceeds 4GiB")?;
             let id_len = u16::try_from(id.len()).context("logical-count ID exceeds 65535 bytes")?;
@@ -2924,8 +2954,7 @@ impl LogicalCountIndex {
                 .winners
                 .binary_search_by(|candidate| candidate.timestamp.cmp(&timestamp).then_with(|| packed_id(&packed.ids, candidate).cmp(id.as_bytes())))
                 .ok()?;
-            let winner = packed.winners[pos];
-            Some(Winner { tiebreak: (winner.flags & FLAG_TIEBREAK_PRESENT != 0).then_some(winner.tiebreak), deleted: winner.flags & FLAG_DELETED != 0 })
+            Some(packed.winners[pos].winner())
         } else {
             self.winners.get(key(timestamp, id).as_ref()).copied()
         }
@@ -2934,28 +2963,15 @@ impl LogicalCountIndex {
     /// Apply the four-column narrow form emitted by a count-index build:
     /// `timestamp`, `id`, version tiebreak, tombstone marker.
     pub fn apply_batch(&mut self, batch: &RecordBatch, columns: LogicalCountColumns<'_>) -> Result<usize> {
-        let timestamps = timestamp_values(batch, columns.timestamp)?;
-        let tail = KeyTail::new(batch, columns.keys)?;
-        let tiebreaks = timestamp_values(batch, columns.tiebreak)?;
-        let deleted = batch
-            .column_by_name(columns.deleted)
-            .with_context(|| format!("logical-count batch missing {}", columns.deleted))?
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .with_context(|| format!("logical-count {} is not Boolean", columns.deleted))?;
-        let mut changed = 0;
+        let narrow = CountColumns::new(batch, columns)?;
         let mut buffer = String::new();
+        let mut changed = 0;
+        // Imperative: each row hands back a `&str` borrowed from the reused
+        // `buffer`, which no iterator chain can thread through a closure.
         for row in 0..batch.num_rows() {
-            // A bounded timestamp predicate never matches NULL, so such a row
-            // contributes to no count index. A NULL in any other key encodes as
-            // a distinct segment rather than erroring: it can only split a
-            // group, never merge two.
-            if timestamps.is_null(row) {
-                continue;
+            if let Some((timestamp, id, winner)) = narrow.row(row, &mut buffer) {
+                changed += usize::from(self.apply(timestamp, id, winner.tiebreak, winner.deleted));
             }
-            let tiebreak = (!tiebreaks.is_null(row)).then(|| tiebreaks.value(row));
-            let is_deleted = !deleted.is_null(row) && deleted.value(row);
-            changed += usize::from(self.apply(timestamps.value(row), tail.encode(row, &mut buffer), tiebreak, is_deleted));
         }
         Ok(changed)
     }
@@ -2973,6 +2989,7 @@ impl LogicalCountIndex {
     /// Delta rows; `delta_batches` are newly appended Delta files and remain
     /// subject to the same range gate as the indexed base.
     pub fn count_with_covered_overlay(&self, input: LogicalCountOverlay<'_>, lo: i64, hi: i64, columns: LogicalCountColumns<'_>) -> Result<u64> {
+        use std::collections::hash_map::Entry;
         let LogicalCountOverlay { authoritative_batches, delta_batches, covered_ranges } = input;
         #[derive(Clone, Copy)]
         struct Overlay {
@@ -2983,37 +3000,22 @@ impl LogicalCountIndex {
 
         let base_visible = |timestamp: i64| !covered_ranges.iter().any(|&(start, end)| (start..end).contains(&timestamp));
         let mut overlay: HashMap<Box<[u8]>, Overlay, ahash::RandomState> = HashMap::default();
+        let mut buffer = String::new();
         for (batches, authoritative) in [(authoritative_batches, true), (delta_batches, false)] {
             for batch in batches {
-                let timestamps = timestamp_values(batch, columns.timestamp)?;
-                let tail = KeyTail::new(batch, columns.keys)?;
-                let mut buffer = String::new();
-                let tiebreaks = timestamp_values(batch, columns.tiebreak)?;
-                let deleted = batch
-                    .column_by_name(columns.deleted)
-                    .with_context(|| format!("logical-count overlay missing {}", columns.deleted))?
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .with_context(|| format!("logical-count overlay {} is not Boolean", columns.deleted))?;
+                let narrow = CountColumns::new(batch, columns)?;
                 for row in 0..batch.num_rows() {
-                    if timestamps.is_null(row) {
-                        continue;
-                    }
-                    let timestamp = timestamps.value(row);
-                    let id = tail.encode(row, &mut buffer);
-                    let encoded = key(timestamp, id);
-                    let candidate =
-                        Winner { tiebreak: (!tiebreaks.is_null(row)).then(|| tiebreaks.value(row)), deleted: !deleted.is_null(row) && deleted.value(row) };
+                    let Some((timestamp, id, candidate)) = narrow.row(row, &mut buffer) else { continue };
                     if !authoritative && !base_visible(timestamp) {
                         continue;
                     }
-                    match overlay.entry(encoded) {
-                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    match overlay.entry(key(timestamp, id)) {
+                        Entry::Occupied(mut entry) => {
                             if candidate.tiebreak > entry.get().current.tiebreak {
                                 entry.get_mut().current = candidate;
                             }
                         }
-                        std::collections::hash_map::Entry::Vacant(entry) => {
+                        Entry::Vacant(entry) => {
                             let base = self.winner(timestamp, id).filter(|_| base_visible(timestamp));
                             let current = base.filter(|winner| winner.tiebreak >= candidate.tiebreak).unwrap_or(candidate);
                             entry.insert(Overlay { base, current, timestamp });
@@ -3034,30 +3036,9 @@ impl LogicalCountIndex {
     }
 
     fn count_covered_live(&self, lo: i64, hi: i64, covered_ranges: &[(i64, i64)]) -> u64 {
-        let visible = |timestamp: i64, winner: Winner| {
+        self.count_where(|timestamp, winner| {
             !winner.deleted && (lo..hi).contains(&timestamp) && covered_ranges.iter().any(|&(start, end)| (start..end).contains(&timestamp))
-        };
-        let count = if let Some(packed) = &self.packed {
-            packed
-                .winners
-                .iter()
-                .filter(|winner| {
-                    visible(
-                        winner.timestamp,
-                        Winner { tiebreak: (winner.flags & FLAG_TIEBREAK_PRESENT != 0).then_some(winner.tiebreak), deleted: winner.flags & FLAG_DELETED != 0 },
-                    )
-                })
-                .count()
-        } else {
-            self.winners
-                .iter()
-                .filter(|(key, winner)| {
-                    let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
-                    visible(timestamp, **winner)
-                })
-                .count()
-        };
-        u64::try_from(count).expect("logical-count partition length fits u64")
+        })
     }
 
     /// Exact live row count in the half-open interval `[lo, hi)`.
@@ -3065,28 +3046,19 @@ impl LogicalCountIndex {
         if lo >= hi {
             return 0;
         }
+        // The packed form pays two binary searches instead of a full walk.
         if let Some(packed) = &self.packed {
             let start = packed.live_timestamps.partition_point(|timestamp| *timestamp < lo);
             let end = packed.live_timestamps.partition_point(|timestamp| *timestamp < hi);
             return u64::try_from(end - start).expect("logical-count partition length fits u64");
         }
-        u64::try_from(
-            self.winners
-                .iter()
-                .filter(|(key, winner)| {
-                    let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
-                    !winner.deleted && (lo..hi).contains(&timestamp)
-                })
-                .count(),
-        )
-        .expect("logical-count partition length fits u64")
+        self.count_where(|timestamp, winner| !winner.deleted && (lo..hi).contains(&timestamp))
     }
 
     pub fn logical_rows(&self) -> u64 {
-        if let Some(packed) = &self.packed {
-            u64::try_from(packed.live_timestamps.len()).expect("logical-count partition length fits u64")
-        } else {
-            u64::try_from(self.winners.values().filter(|winner| !winner.deleted).count()).expect("logical-count partition length fits u64")
+        match &self.packed {
+            Some(packed) => u64::try_from(packed.live_timestamps.len()).expect("logical-count partition length fits u64"),
+            None => self.count_where(|_, winner| !winner.deleted),
         }
     }
 
@@ -3159,26 +3131,10 @@ impl LogicalCountIndex {
                 rows.clear();
                 Ok(())
             };
-            if let Some(packed) = &self.packed {
-                for winner in &packed.winners {
-                    let id = std::str::from_utf8(packed_id(&packed.ids, winner)).context("logical-count key contains non-UTF8 id")?;
-                    rows.push((
-                        winner.timestamp,
-                        id,
-                        Winner { tiebreak: (winner.flags & FLAG_TIEBREAK_PRESENT != 0).then_some(winner.tiebreak), deleted: winner.flags & FLAG_DELETED != 0 },
-                    ));
-                    if rows.len() == WRITE_ROWS {
-                        write_rows(&mut rows)?;
-                    }
-                }
-            } else {
-                for (key, winner) in &self.winners {
-                    let timestamp = i64::from_be_bytes(key[..8].try_into().expect("logical-count key always starts with timestamp"));
-                    let id = std::str::from_utf8(&key[8..]).context("logical-count key contains non-UTF8 id")?;
-                    rows.push((timestamp, id, *winner));
-                    if rows.len() == WRITE_ROWS {
-                        write_rows(&mut rows)?;
-                    }
+            for (timestamp, id, winner) in self.entries() {
+                rows.push((timestamp, std::str::from_utf8(id).context("logical-count key contains non-UTF8 id")?, winner));
+                if rows.len() == WRITE_ROWS {
+                    write_rows(&mut rows)?;
                 }
             }
             write_rows(&mut rows)?;
@@ -3186,11 +3142,9 @@ impl LogicalCountIndex {
             std::fs::rename(&tmp, path).with_context(|| format!("publish logical-count cache {}", path.display()))?;
             Ok(())
         };
-        if let Err(error) = write() {
+        write().inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
-        Ok(())
+        })
     }
 
     /// Load only when the file belongs to the caller's exact snapshot.
@@ -3253,14 +3207,12 @@ impl LogicalCountIndex {
     }
 }
 
-fn timestamp_values<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a TimestampMicrosecondArray> {
+/// One named column of a logical-count batch as its concrete Arrow array type.
+/// The downcast IS the type check — a wrong timestamp unit or a non-Boolean
+/// tombstone column fails here rather than being read as something else.
+fn column_as<'a, A: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a A> {
     let column = batch.column_by_name(name).with_context(|| format!("logical-count batch missing {name}"))?;
-    match column.data_type() {
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            column.as_any().downcast_ref::<TimestampMicrosecondArray>().with_context(|| format!("logical-count {name} is not TimestampMicrosecond"))
-        }
-        other => bail!("logical-count {name} has unsupported type {other}"),
-    }
+    column.as_any().downcast_ref::<A>().with_context(|| format!("logical-count {name} has unsupported type {}", column.data_type()))
 }
 
 enum StringValues<'a> {
@@ -3270,17 +3222,18 @@ enum StringValues<'a> {
 }
 
 impl<'a> StringValues<'a> {
+    /// `None` for any non-string column.
+    fn from_column(column: &'a ArrayRef) -> Option<Self> {
+        let any = column.as_any();
+        any.downcast_ref::<StringViewArray>()
+            .map(Self::View)
+            .or_else(|| any.downcast_ref::<StringArray>().map(Self::Utf8))
+            .or_else(|| any.downcast_ref::<LargeStringArray>().map(Self::Large))
+    }
+
     fn new(batch: &'a RecordBatch, name: &str) -> Result<Self> {
         let column = batch.column_by_name(name).with_context(|| format!("logical-count batch missing {name}"))?;
-        if let Some(values) = column.as_any().downcast_ref::<StringViewArray>() {
-            Ok(Self::View(values))
-        } else if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
-            Ok(Self::Utf8(values))
-        } else if let Some(values) = column.as_any().downcast_ref::<LargeStringArray>() {
-            Ok(Self::Large(values))
-        } else {
-            bail!("logical-count {name} has unsupported type {}", column.data_type())
-        }
+        Self::from_column(column).with_context(|| format!("logical-count {name} has unsupported type {}", column.data_type()))
     }
 
     fn value(&self, row: usize) -> Option<&'a str> {
@@ -3294,10 +3247,13 @@ impl<'a> StringValues<'a> {
 
 #[cfg(test)]
 mod logical_count_index_tests {
+    use arrow::datatypes::TimeUnit;
+
+    use super::*;
+
     fn unmasked(paths: &[&str]) -> super::CountFiles {
         paths.iter().map(|path| ((*path).to_owned(), None)).collect()
     }
-    use super::*;
 
     fn versions(rows: &[(i64, &str, Option<i64>, Option<bool>)]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -3762,15 +3718,16 @@ pub enum Hll {
     Dense(Box<[u8; M]>),
 }
 
-/// Split a hash into its register index and the 1-based position of the first
-/// set bit in the remaining suffix.
+/// Raise the register this hash lands in. The hash's register index is its top
+/// `P` bits; the value is the 1-based position of the first set bit in the
+/// remaining suffix.
 #[inline]
-const fn register_of(hash: u64) -> (usize, u8) {
+fn set_register(registers: &mut [u8; M], hash: u64) {
     let index = (hash >> (64 - P)) as usize;
     // `| 1` bounds rho at 64-P+1 without a branch: the sentinel bit stops the
     // count when the whole suffix is zero.
     let rho = ((hash << P) | 1).leading_zeros() as u8 + 1;
-    (index, rho)
+    registers[index] = registers[index].max(rho);
 }
 
 impl Hll {
@@ -3783,20 +3740,14 @@ impl Hll {
                     self.densify();
                 }
             }
-            Self::Dense(registers) => {
-                let (index, rho) = register_of(hash);
-                registers[index] = registers[index].max(rho);
-            }
+            Self::Dense(registers) => set_register(registers, hash),
         }
     }
 
     fn densify(&mut self) {
         let Self::Sparse(hashes) = self else { return };
         let mut registers = Box::new([0u8; M]);
-        for &hash in hashes.iter() {
-            let (index, rho) = register_of(hash);
-            registers[index] = registers[index].max(rho);
-        }
+        hashes.iter().for_each(|&hash| set_register(&mut registers, hash));
         *self = Self::Dense(registers);
     }
 
@@ -3814,17 +3765,8 @@ impl Hll {
                 let mine = std::mem::replace(self, other.clone());
                 self.merge(&mine);
             }
-            (Self::Dense(mine), Self::Sparse(theirs)) => {
-                for &hash in theirs.iter() {
-                    let (index, rho) = register_of(hash);
-                    mine[index] = mine[index].max(rho);
-                }
-            }
-            (Self::Dense(mine), Self::Dense(theirs)) => {
-                for (slot, &their) in mine.iter_mut().zip(theirs.iter()) {
-                    *slot = (*slot).max(their);
-                }
-            }
+            (Self::Dense(mine), Self::Sparse(theirs)) => theirs.iter().for_each(|&hash| set_register(mine, hash)),
+            (Self::Dense(mine), Self::Dense(theirs)) => mine.iter_mut().zip(theirs.iter()).for_each(|(slot, &their)| *slot = (*slot).max(their)),
         }
     }
 

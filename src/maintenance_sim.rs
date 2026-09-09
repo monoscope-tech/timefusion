@@ -13,16 +13,16 @@ use anyhow::Context as _;
 use itertools::Itertools;
 use serde::Serialize;
 
+use crate::database::{coverage_is_short_for, median_contiguous_days};
 use crate::maintenance_coordinator::{
-    InputFootprint, Invalidation, MAX_DECODED_BYTES, MIN_SLICE_MICROS, MaintenanceTask, Operation, TaskJournal, TaskKey, TaskState, operation_cycle,
-    operation_deadline_secs,
+    DAY_MICROS, InputFootprint, Invalidation, LIVE_FRONTIER_WINDOW_MICROS, MAX_DECODED_BYTES, MIN_SLICE_MICROS, MaintenanceTask, NORMAL_SLICE_MICROS,
+    Operation, STARVATION_HORIZON_MICROS, TaskJournal, TaskKey, TaskState, TimeSlice, operation_cycle, operation_deadline_secs, split_sheds_enough_at,
 };
 
 const MICROS: i64 = 1_000_000;
-const DAY_MICROS: i64 = 86_400_000_000;
 const HOUR_MICROS: i64 = 3_600_000_000;
 /// Matches the write path's bucket cadence.
-const MINT_INTERVAL_MICROS: i64 = crate::maintenance_coordinator::NORMAL_SLICE_MICROS;
+const MINT_INTERVAL_MICROS: i64 = NORMAL_SLICE_MICROS;
 /// Lets idle workers notice newly mature deadlines.
 const IDLE_POLL_MICROS: i64 = 5 * MICROS;
 /// `run_maintenance_coordinator_once` coarsens on the same 60s cadence it plans
@@ -82,10 +82,7 @@ impl DayShape {
     pub fn bytes(&self, width_micros: i64, floored: bool) -> u64 {
         let width = width_micros.max(0) as u128;
         let proportional = (u128::from(self.decoded_bytes) * width / u128::from(DAY_MICROS as u64)) as u64;
-        if !floored {
-            return proportional;
-        }
-        proportional.saturating_add(self.files_overlapping(width_micros).saturating_mul(ROW_GROUP_BYTES))
+        if floored { proportional.saturating_add(self.files_overlapping(width_micros).saturating_mul(ROW_GROUP_BYTES)) } else { proportional }
     }
 
     fn files_overlapping(&self, width_micros: i64) -> u64 {
@@ -345,8 +342,11 @@ fn duration_range_secs(operation: Operation, width_micros: i64, rng: &mut Rng) -
 
 /// Debt work = file rewrites that cannot advance rollup coverage
 /// (`dependencies_complete`): the operations #176's occupancy cap applies to.
+/// Spelled as the COMPLEMENT of the rollup tiers, exactly like the server's own
+/// `_debt_slot` predicate — an operation added later is debt on both sides
+/// rather than silently exempt here.
 fn is_debt_op(operation: Operation) -> bool {
-    matches!(operation, Operation::Dedup | Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair)
+    !matches!(operation, Operation::BaseRollup | Operation::DerivedRollup)
 }
 
 /// Deterministic SplitMix64 generator for simulation.
@@ -419,9 +419,9 @@ impl Coverage {
         };
         // A slice can straddle midnight after time-bisection; credit each day
         // it overlaps, clamped to that day.
+        let days = self.days.entry((key.source.clone(), key.project_id.clone())).or_default();
         for day in (day_start(key.slice.start_micros)..key.slice.end_micros).step_by(DAY_MICROS as usize) {
-            let overlap = (key.slice.end_micros.min(day + DAY_MICROS) - key.slice.start_micros.max(day)).max(0);
-            self.days.entry((key.source.clone(), key.project_id.clone())).or_default().entry(day).or_default()[tier] += overlap;
+            days.entry(day).or_default()[tier] += (key.slice.end_micros.min(day + DAY_MICROS) - key.slice.start_micros.max(day)).max(0);
         }
     }
 
@@ -470,8 +470,8 @@ impl Coverage {
     /// created tier production reads its median as provisional where the sim
     /// takes it at face value.
     fn coverage_is_short(&self, now_micros: i64) -> bool {
-        let fleet = self.per_sweep(now_micros).into_iter().map(|mut days| crate::database::median_contiguous_days(&mut days)).min().unwrap_or(0);
-        crate::database::coverage_is_short_for(fleet)
+        let fleet = self.per_sweep(now_micros).into_iter().map(|mut days| median_contiguous_days(&mut days)).min().unwrap_or(0);
+        coverage_is_short_for(fleet)
     }
 }
 
@@ -558,7 +558,7 @@ fn preflight(journal: &mut TaskJournal, model: &ByteModel, guard: SplitGuard, ta
             // inline transcription, which is a drift hazard by construction —
             // and is why the sim never reproduced the 2026-09-03
             // synthetic-observation defect.
-            let sheds = crate::maintenance_coordinator::split_sheds_enough_at(task.parent_measured_bytes, observed, numerator, denominator);
+            let sheds = split_sheds_enough_at(task.parent_measured_bytes, observed, numerator, denominator);
             if !sheds {
                 report.split_declined_at_floor += 1;
                 return Some(observed);
@@ -826,14 +826,15 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     // Bucketed on the SAME quantity `starved` ranks on: how long
                     // ago the slice's DATA ended, not when the record was made.
                     let waited = now.saturating_sub(task.key.slice.end_micros);
-                    if waited > crate::maintenance_coordinator::STARVATION_HORIZON_MICROS {
-                        report.claims_privileged += 1;
-                    } else if waited > 3 * crate::maintenance_coordinator::DAY_MICROS {
-                        report.claims_mid_band += 1;
+                    let band = if waited > STARVATION_HORIZON_MICROS {
+                        &mut report.claims_privileged
+                    } else if waited > 3 * DAY_MICROS {
+                        &mut report.claims_mid_band
                     } else {
-                        report.claims_frontier += 1;
-                    }
-                    if task.key.slice.width() >= crate::maintenance_coordinator::DAY_MICROS {
+                        &mut report.claims_frontier
+                    };
+                    *band += 1;
+                    if task.key.slice.width() >= DAY_MICROS {
                         report.claims_day_wide += 1;
                     }
                     if is_debt_op(operation) {
@@ -851,28 +852,24 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             // prod runs it. A split leaves the worker free after the cost of
             // the measurement — no unit ran, so the debt slot goes back too.
             if let (Some(model), Some(task)) = (cfg.byte_model.as_ref(), claimed.as_ref()) {
-                match preflight(&mut journal, model, cfg.split_guard, task, &mut report) {
-                    Some(observed) => {
-                        let shards = observed.div_ceil(MAX_DECODED_BYTES).max(1);
-                        report.max_run_bytes = report.max_run_bytes.max(observed.div_ceil(shards));
-                        if shards > 1 {
-                            let width = task.key.slice.width();
-                            report.sharded_runs += 1;
-                            report.sharded_runs_above_min_slice += u64::from(width > MIN_SLICE_MICROS);
-                            report.narrowest_sharded_run_micros = match report.narrowest_sharded_run_micros {
-                                0 => width,
-                                current => current.min(width),
-                            };
-                        }
+                let Some(observed) = preflight(&mut journal, model, cfg.split_guard, task, &mut report) else {
+                    if is_debt_op(task.key.operation) {
+                        debt_busy -= 1;
                     }
-                    None => {
-                        if is_debt_op(task.key.operation) {
-                            debt_busy -= 1;
-                        }
-                        none_until = [0; 6];
-                        worker.busy_until = now + PREFLIGHT_COST_MICROS;
-                        continue;
-                    }
+                    none_until = [0; 6];
+                    worker.busy_until = now + PREFLIGHT_COST_MICROS;
+                    continue;
+                };
+                let shards = observed.div_ceil(MAX_DECODED_BYTES).max(1);
+                report.max_run_bytes = report.max_run_bytes.max(observed.div_ceil(shards));
+                if shards > 1 {
+                    let width = task.key.slice.width();
+                    report.sharded_runs += 1;
+                    report.sharded_runs_above_min_slice += u64::from(width > MIN_SLICE_MICROS);
+                    report.narrowest_sharded_run_micros = match report.narrowest_sharded_run_micros {
+                        0 => width,
+                        current => current.min(width),
+                    };
                 }
             }
             match claimed {
@@ -938,19 +935,21 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             })
             .into_group_map();
         report.dedup_island_cells = by_cell.len();
-        for ((_, _, day), mut slices) in by_cell {
-            slices.sort_unstable();
-            let (runs, open_end) = slices.iter().fold((0usize, i64::MIN), |(runs, open), &(start, end)| (runs + usize::from(start > open), open.max(end)));
-            report.dedup_islands_total += runs;
-            // The grant-relevant outcome: ONE run covering the whole day. The
-            // island count is stock (dominated by pre-sim state); this is the
-            // conversion that certification actually pays on. `open_end` is the
-            // union's max end — with runs == 1 the union is one interval from
-            // the first start to `open_end`.
-            let day_start = day * DAY_MICROS;
-            report.dedup_cells_day_covered +=
-                usize::from(runs == 1 && slices.first().is_some_and(|&(s, _)| s <= day_start) && open_end >= day_start + DAY_MICROS);
-        }
+        (report.dedup_islands_total, report.dedup_cells_day_covered) = by_cell
+            .into_iter()
+            .map(|((_, _, day), mut slices)| {
+                slices.sort_unstable();
+                let (runs, open_end) = slices.iter().fold((0usize, i64::MIN), |(runs, open), &(start, end)| (runs + usize::from(start > open), open.max(end)));
+                // The grant-relevant outcome: ONE run covering the whole day.
+                // The island count is stock (dominated by pre-sim state); this
+                // is the conversion that certification actually pays on.
+                // `open_end` is the union's max end — with runs == 1 the union
+                // is one interval from the first start to `open_end`.
+                let day_start = day * DAY_MICROS;
+                let covered = runs == 1 && slices.first().is_some_and(|&(s, _)| s <= day_start) && open_end >= day_start + DAY_MICROS;
+                (runs, usize::from(covered))
+            })
+            .fold((0, 0), |(islands, covered), (runs, day_covered)| (islands + runs, covered + day_covered));
     }
     Ok(report)
 }
@@ -962,9 +961,7 @@ fn frontier_lag_secs(journal: &TaskJournal, now_micros: i64) -> u64 {
     journal
         .tasks()
         .filter(|task| {
-            is_open(task.state)
-                && task.deadline_micros <= now_micros
-                && task.key.slice.end_micros >= now_micros.saturating_sub(crate::maintenance_coordinator::LIVE_FRONTIER_WINDOW_MICROS)
+            is_open(task.state) && task.deadline_micros <= now_micros && task.key.slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS)
         })
         .map(|task| u64::try_from(now_micros.saturating_sub(task.deadline_micros).div_euclid(MICROS)).unwrap_or_default())
         .max()
@@ -1069,7 +1066,7 @@ fn rollup_key(project_id: &str, start_micros: i64, width_micros: i64) -> TaskKey
         physical_table: "otel_logs_and_spans_rollup_dashboard_1m_v3".to_owned(),
         source: "otel_logs_and_spans".to_owned(),
         project_id: project_id.to_owned(),
-        slice: crate::maintenance_coordinator::TimeSlice::new(start_micros, start_micros + width_micros).expect("fixture slice"),
+        slice: TimeSlice::new(start_micros, start_micros + width_micros).expect("fixture slice"),
         operation: Operation::BaseRollup,
     }
 }
@@ -1098,7 +1095,7 @@ pub fn load_sandboxed(input: &std::path::Path) -> anyhow::Result<(TaskJournal, t
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::maintenance_coordinator::{MAX_DECODED_BYTES, TimeSlice};
+    use crate::maintenance_coordinator::FRONTIER_LAG_BUDGET_SECS;
 
     fn key(project: &str, op: Operation, start: i64, width: i64) -> TaskKey {
         let table = match op {
@@ -1125,8 +1122,8 @@ mod tests {
     fn journal_with_streams(projects: usize) -> TaskJournal {
         let mut journal = empty_journal();
         for i in 0..projects {
-            let mut task = crate::maintenance_coordinator::MaintenanceTask {
-                key: key(&format!("p{i}"), Operation::BaseRollup, 60 * DAY_MICROS, crate::maintenance_coordinator::NORMAL_SLICE_MICROS),
+            let mut task = MaintenanceTask {
+                key: key(&format!("p{i}"), Operation::BaseRollup, 60 * DAY_MICROS, NORMAL_SLICE_MICROS),
                 state: TaskState::Complete,
                 deadline_micros: 0,
                 estimated_decoded_bytes: 0,
@@ -1183,7 +1180,7 @@ mod tests {
         let report_13 = run(journal_with_streams(13), &cfg(6), start).unwrap();
         let pending_13 = report_13.pending_end;
         assert!(
-            report_13.frontier_lag_secs_max > crate::maintenance_coordinator::FRONTIER_LAG_BUDGET_SECS,
+            report_13.frontier_lag_secs_max > FRONTIER_LAG_BUDGET_SECS,
             "13 projects already exceed the lag budget under measured durations, lag {}s",
             report_13.frontier_lag_secs_max
         );
@@ -1247,7 +1244,7 @@ mod tests {
         // with no ramping tier.
         let active = projects.iter().map(String::as_str).collect::<HashSet<_>>();
         let fleet = covered.iter().map(|covered| crate::database::min_contiguous_days(covered, &source, today, &active).2).min().unwrap();
-        let server = crate::database::coverage_is_short_for(fleet);
+        let server = coverage_is_short_for(fleet);
         assert_eq!(server, expected, "server decision at fleet median {fleet}");
         assert_eq!(coverage.coverage_is_short(now), server, "sim must decide as the server does (fleet median {fleet})");
     }
@@ -1321,10 +1318,10 @@ mod tests {
     /// The §3c run: `synth:whale`, 6 virtual hours, 16 workers, no minting —
     /// the queue under study is the fixture, not the frontier.
     fn synth_run(floored: bool, guard: SplitGuard) -> (SimReport, String, String) {
-        synth_run_at(floored, guard, 100)
+        synth_run_at(floored, guard, 100, 1.0)
     }
 
-    fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64) -> (SimReport, String, String) {
+    fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64, duration_scale: f64) -> (SimReport, String, String) {
         let start = 100 * DAY_MICROS;
         let queue = synthetic_whale_queue(start, floored, whale_x_max, 1);
         let cfg = SimConfig {
@@ -1333,6 +1330,7 @@ mod tests {
             horizon_micros: 6 * HOUR_MICROS,
             byte_model: Some(queue.model),
             split_guard: guard,
+            duration_scale,
             ..Default::default()
         };
         let report = run(queue.journal, &cfg, start).unwrap();
@@ -1399,22 +1397,11 @@ mod tests {
     #[test]
     fn a_floorless_whale_never_reaches_the_floor() {
         for guard in [SplitGuard::Off, SplitGuard::Shipped] {
-            let start = 100 * DAY_MICROS;
-            let queue = synthetic_whale_queue(start, false, 100, 1);
-            let whale = queue.whale_cell;
-            // The duration model is independent of bytes. Its random timeouts
-            // can legitimately split even a small task, so isolate byte physics
-            // here; timeout bisection is exercised by the failure tests.
-            let cfg = SimConfig {
-                mint_frontier: false,
-                workers: 16,
-                horizon_micros: 6 * HOUR_MICROS,
-                byte_model: Some(queue.model),
-                split_guard: guard,
-                duration_scale: 0.0,
-                ..Default::default()
-            };
-            let report = run(queue.journal, &cfg, start).unwrap();
+            // `duration_scale: 0.0` — the duration model is independent of
+            // bytes, and its random timeouts can legitimately split even a small
+            // task, so isolate byte physics here; timeout bisection is exercised
+            // by the failure tests.
+            let (report, whale, _) = synth_run_at(false, guard, 100, 0.0);
             assert_eq!(report.timeouts.values().sum::<u64>(), 0);
             // 255 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves,
             // bisection only makes powers of two, and since bisection descends
@@ -1515,7 +1502,7 @@ mod tests {
     fn threshold_sweep() {
         for whale_x_max in [100, 20, 5] {
             for guard in [SplitGuard::Ratio(1, 2), SplitGuard::Ratio(2, 3), SplitGuard::Ratio(3, 4), SplitGuard::Ratio(4, 5), SplitGuard::Off] {
-                let (report, whale, _) = synth_run_at(true, guard, whale_x_max);
+                let (report, whale, _) = synth_run_at(true, guard, whale_x_max, 1.0);
                 println!(
                     "whale={whale_x_max:>3}x guard={guard:?} whale_units={:>5} at_min={:>5} declined={:>4} completed={:>5} sharded_above_min={} pending_end={}",
                     cell_units(&report, &whale),

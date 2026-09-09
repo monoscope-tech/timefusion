@@ -798,7 +798,6 @@ async fn staged_objects_complete(store: &dyn object_store::ObjectStore, adds: &[
 }
 
 impl Database {
-    /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
     /// The busy-pool backoff for `key`, with the journal guard confined to this
     /// body so no caller can hold it across `retry_task`.
     ///
@@ -814,6 +813,7 @@ impl Database {
         admission_backoff(self.journal().attempts(key))
     }
 
+    /// Push a coordinator task's next attempt out by `delay`, journaled and checkpointed.
     fn retry_task(&self, key: &crate::maintenance_coordinator::TaskKey, reason: String, delay: std::time::Duration) -> Result<()> {
         let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
         let mut journal = self.journal();
@@ -827,10 +827,6 @@ impl Database {
         journal.checkpoint()
     }
 
-    /// Exclusive upper bound the coverage was built to. `i64::MAX` means whole-partition.
-    ///
-    /// Must be the bound stored with the coverage, never one recomputed here — for a day still
-    /// being written the two would differ and invalidate good coverage every query.
     /// The partition fingerprint the ticket re-check compares against
     /// `coverage.source_fp`.
     ///
@@ -2504,19 +2500,21 @@ impl Database {
                 return Ok(true);
             }
         };
-        let mut required_columns: HashSet<&str> = ["project_id", "date", "timestamp"].into_iter().collect();
-        required_columns.extend(source_schema.dedup_keys.iter().map(String::as_str));
-        required_columns.extend(source_schema.dedup_tiebreak.iter().map(String::as_str));
-        required_columns.extend(source_schema.tombstone_column.iter().map(String::as_str));
-        required_columns.extend(spec.dimensions.iter().map(String::as_str));
-        required_columns.extend(spec.measures.iter().filter_map(|measure| measure.column.as_deref()));
-        required_columns.extend(
-            spec.measures
-                .iter()
-                .filter_map(|measure| measure.filter.as_deref())
-                .flat_map(|filter| filter.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_')))
-                .filter(|token| source_schema.fields.iter().any(|field| field.name == *token)),
-        );
+        let required_columns: HashSet<&str> = ["project_id", "date", "timestamp"]
+            .into_iter()
+            .chain(source_schema.dedup_keys.iter().map(String::as_str))
+            .chain(source_schema.dedup_tiebreak.iter().map(String::as_str))
+            .chain(source_schema.tombstone_column.iter().map(String::as_str))
+            .chain(spec.dimensions.iter().map(String::as_str))
+            .chain(spec.measures.iter().filter_map(|measure| measure.column.as_deref()))
+            .chain(
+                spec.measures
+                    .iter()
+                    .filter_map(|measure| measure.filter.as_deref())
+                    .flat_map(|filter| filter.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_')))
+                    .filter(|token| source_schema.fields.iter().any(|field| field.name == *token)),
+            )
+            .collect();
         let projected_numerator = u64::try_from(required_columns.len()).unwrap_or(u64::MAX);
         let projected_denominator = u64::try_from(source_schema.fields.len().max(1)).unwrap_or(u64::MAX);
         let mut untagged_inputs = 0u64;
@@ -3106,16 +3104,7 @@ impl Database {
         // partition's, so it reads as a backlog draining rather than a per-unit
         // blip; `retired` proves this unit actually removed one.
         let no_identity = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
-        {
-            let stats = crate::observability::maintenance_stats();
-            // Record per TABLE and export the SUM. One shared slot was
-            // overwritten by whichever tier published last, so a publish to an
-            // already-clean tier reported 0 while another still held 67 untagged
-            // files — a gauge reading clean over live damage is the exact
-            // failure it exists to catch.
-            self.rollup_tier_untagged.insert(key.physical_table.clone(), live_adds.iter().filter(|add| no_identity(add)).count() as u64);
-            stats.rollup_tier_untagged_found.store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), Relaxed);
-        }
+        self.publish_tier_untagged(&key.physical_table, live_adds.iter().filter(|add| no_identity(add)).count() as u64);
         // Deferred to AFTER the commit. Counted here, this read 21 retired
         // within an hour on prod 2026-08-22 while a fresh Delta-log replay said
         // the live count had not moved at all — two deploys had killed the units
@@ -3169,12 +3158,8 @@ impl Database {
             crate::observability::maintenance_stats().rollup_skipped_covered_by_wider.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut journal = self.journal();
             if let Ok(covering) = crate::maintenance_coordinator::TimeSlice::new(covering_start, covering_end) {
-                journal.enqueue(
-                    crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() },
-                    crate::support::now_micros(),
-                    MAX_DECODED_BYTES,
-                    unix_ms(crate::support::now_micros()),
-                );
+                let now = crate::support::now_micros();
+                journal.enqueue(crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() }, now, MAX_DECODED_BYTES, unix_ms(now));
             }
             journal.complete(&key);
             journal.checkpoint()?;
@@ -3593,7 +3578,6 @@ impl Database {
         // Only when the unit will do NOTHING, so this cannot become chatter: a
         // selection of one file is a 1:1 rewrite and retires no files either.
         if selected.len() < 2 {
-            let unsorted = unsorted_candidates;
             info!(
                 operation = ?key.operation,
                 project_id = %key.project_id,
@@ -3603,7 +3587,7 @@ impl Database {
                 after_date_filter = after_date,
                 after_project_filter = after_project,
                 after_range_filter = after_range,
-                unsorted_candidates = unsorted,
+                unsorted_candidates,
                 under_target = under_target_candidates,
                 selected = selected.len(),
                 target,
@@ -3956,7 +3940,9 @@ impl Database {
             let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
             // Scoped here, at the one place the operation is known, so every
             // query a unit runs can be attributed without threading a label
-            // through three rewrite paths.
+            // through three rewrite paths. It is also the ONE spelling of the
+            // operation's name: the work counters below read it rather than
+            // re-deriving it via `{operation:?}`, so the two cannot drift.
             let label: &'static str = match operation {
                 Operation::Dedup => "Dedup",
                 Operation::BaseRollup => "BaseRollup",
@@ -3987,9 +3973,8 @@ impl Database {
                     let elapsed = started.elapsed();
                     // Before `result?`: a unit that errors after 800s spent that
                     // capacity just as surely as one that succeeded.
-                    let op = format!("{operation:?}");
-                    crate::observability::count_maintenance_work(&op, "worker_secs", elapsed.as_secs());
-                    crate::observability::count_maintenance_work(&op, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
+                    crate::observability::count_maintenance_work(label, "worker_secs", elapsed.as_secs());
+                    crate::observability::count_maintenance_work(label, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
                     // Only the slow tail: a unit finishing well inside its
                     // deadline says nothing, and this runs on every claim.
                     if elapsed.as_secs_f64() > timeout.as_secs_f64() / 4.0 {
@@ -4011,10 +3996,9 @@ impl Database {
                     warn!(?operation, timeout_seconds = timeout.as_secs(), event = "maintenance_coordinator_unit_timed_out");
                     // `killed_secs` is a strict subset of `worker_secs`: the
                     // share of the fleet's capacity that produced nothing.
-                    let op = format!("{operation:?}");
-                    crate::observability::count_maintenance_work(&op, "worker_secs", started.elapsed().as_secs());
-                    crate::observability::count_maintenance_work(&op, "killed_secs", started.elapsed().as_secs());
-                    crate::observability::count_maintenance_work(&op, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
+                    crate::observability::count_maintenance_work(label, "worker_secs", started.elapsed().as_secs());
+                    crate::observability::count_maintenance_work(label, "killed_secs", started.elapsed().as_secs());
+                    crate::observability::count_maintenance_work(label, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
                     return Ok(true);
                 }
             };
@@ -4172,10 +4156,6 @@ impl Database {
         Ok(Self::partition_stats_bounded(table, tiebreak, bound_for)?.into_iter().map(|(key, stats)| (key, stats.fingerprint)).collect())
     }
 
-    /// As [`Self::partition_fingerprints_bounded`], but also carrying the row
-    /// timestamps each partition's files span — one pass, since the fingerprint
-    /// already folds those in and the add-actions scan is the dominant cost of
-    /// planning a rollup route.
     /// Split a window's live Delta files into the ones that may skip
     /// `DedupExec` and the ones that may not.
     ///
@@ -4277,6 +4257,10 @@ impl Database {
             .collect())
     }
 
+    /// As [`Self::partition_fingerprints_bounded`], but also carrying the row
+    /// timestamps each partition's files span — one pass, since the fingerprint
+    /// already folds those in and the add-actions scan is the dominant cost of
+    /// planning a rollup route.
     pub(crate) fn partition_stats_bounded(
         table: &DeltaTable, tiebreak: Option<&str>, bound_for: &dyn Fn(&str, &str) -> i64,
     ) -> Result<HashMap<(String, String), PartitionStats>> {
@@ -4377,14 +4361,37 @@ impl Database {
             .collect())
     }
 
-    /// Re-adopt rollup coverage that previous processes durably wrote.
+    /// Record one tier's untagged-file count and re-export the FLEET sum.
     ///
-    /// `rollup_coverage` is in-memory, so restarts used to lose it; because reads filter on
-    /// `rollup_generation`, already-written rollup rows became unreadable. There is no sidecar
-    /// file: the rollup table is the record. Each stored `(date, generation)` is re-proved against
-    /// the current source partition's generation, so a moved source fails to match and the
-    /// partition is left uncovered. Unproved claims cost a raw scan; trusting one would make a
-    /// rewrite read zero rows.
+    /// Per TABLE, summed on export. One shared slot was overwritten by whichever
+    /// tier published last, so a publish to an already-clean tier reported 0
+    /// while another still held 67 untagged files — a gauge reading clean over
+    /// live damage is the exact failure it exists to catch. Shared by the
+    /// publish path and the hourly replay so the two cannot disagree.
+    fn publish_tier_untagged(&self, table_name: &str, untagged: u64) {
+        self.rollup_tier_untagged.insert(table_name.to_owned(), untagged);
+        crate::observability::maintenance_stats()
+            .rollup_tier_untagged_found
+            .store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Write the damage set through to its sidecar. Best-effort by design: a
+    /// lost or stale file costs one mis-ranked claim, never correctness, because
+    /// recovery replaces each tier's slice and a clean publish clears its cell.
+    fn persist_untagged_cells(&self) {
+        let cells = self
+            .journal()
+            .untagged_cells()
+            .map(|(source, project_id, table_name, date)| crate::storage::StoredUntaggedCell {
+                source: source.clone(),
+                project_id: project_id.clone(),
+                table_name: table_name.clone(),
+                date: date.clone(),
+            })
+            .collect::<Vec<_>>();
+        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::UNTAGGED_CELLS, &cells);
+    }
+
     /// Queue a day-wide rebuild for every partition still holding a tier file
     /// with no identity tags.
     ///
@@ -4404,23 +4411,6 @@ impl Database {
     /// Self-limiting — the set is read from the log each recovery, so it shrinks
     /// as partitions are repaired and reaches zero. `rollup_tier_untagged_found`
     /// is the gauge that says whether it is converging.
-    /// Write the damage set through to its sidecar. Best-effort by design: a
-    /// lost or stale file costs one mis-ranked claim, never correctness, because
-    /// recovery replaces each tier's slice and a clean publish clears its cell.
-    fn persist_untagged_cells(&self) {
-        let cells = self
-            .journal()
-            .untagged_cells()
-            .map(|(source, project_id, table_name, date)| crate::storage::StoredUntaggedCell {
-                source: source.clone(),
-                project_id: project_id.clone(),
-                table_name: table_name.clone(),
-                date: date.clone(),
-            })
-            .collect::<Vec<_>>();
-        crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::UNTAGGED_CELLS, &cells);
-    }
-
     fn enqueue_untagged_rebuilds(&self, source: &str, spec: &crate::schema::RollupSpec, target: &str, partitions: &UntaggedPartitions) {
         use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
         // Published before the empty check, so a tier that has just converged
@@ -4757,6 +4747,14 @@ impl Database {
         retired
     }
 
+    /// Re-adopt rollup coverage that previous processes durably wrote.
+    ///
+    /// `rollup_coverage` is in-memory, so restarts used to lose it; because reads filter on
+    /// `rollup_generation`, already-written rollup rows became unreadable. There is no sidecar
+    /// file: the rollup table is the record. Each stored `(date, generation)` is re-proved against
+    /// the current source partition's generation, so a moved source fails to match and the
+    /// partition is left uncovered. Unproved claims cost a raw scan; trusting one would make a
+    /// rewrite read zero rows.
     pub async fn recover_rollup_coverage(&self, source: &str) -> Result<usize> {
         let Some(schema) = get_schema(source).filter(|schema| !schema.rollups.is_empty()) else { return Ok(0) };
         self.retire_aged_out_coverage();
@@ -4933,10 +4931,7 @@ impl Database {
             // live untagged files for the first 40 minutes of every boot. A
             // reading that cannot distinguish "none" from "unmeasured" is not a
             // measurement.
-            self.rollup_tier_untagged.insert(target.clone(), untagged_files);
-            crate::observability::maintenance_stats()
-                .rollup_tier_untagged_found
-                .store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), std::sync::atomic::Ordering::Relaxed);
+            self.publish_tier_untagged(&target, untagged_files);
             let untagged_partitions: UntaggedPartitions = untagged_spans
                 .drain()
                 .map(|(partition, untagged)| {
@@ -5131,18 +5126,14 @@ impl Database {
                     );
                     recovered += 1;
                 }
+                // Only from the FILTERED loop above: with no tagged files
+                // `readable` is empty, and recording an empty set would retire
+                // every ledger cell this tier has as an orphan.
                 self.record_readable_coverage(source, &target, readable);
-                self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
-                self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
-                self.recover_date_coverage(source, &target).await;
-                continue;
             }
             self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::MissingRowWitness, &witnessless);
             self.enqueue_unverifiable_rebuilds(source, spec, &target, RollupRebuildReason::ObsoleteGeneration, &obsolete_generations);
             self.recover_date_coverage(source, &target).await;
-            if !published.is_empty() {
-                continue;
-            }
             // Untagged legacy generations cannot be recovered safely without
             // scanning rollup data.  A production restart showed that even a
             // single 230 MiB compatibility GROUP BY starved PGWire for 19s.
@@ -5943,12 +5934,6 @@ impl Database {
         Ok(())
     }
 
-    /// Snapshot `dedup_clean_fp` to the data dir. Called at the end of a sweep
-    /// rather than per certification: one write per tick instead of one per
-    /// partition, and the snapshot picks up invalidations in the same pass.
-    ///
-    /// Best-effort by design — this is a cache, and a lost write costs a cold
-    /// start, never a wrong answer.
     /// Mirror of `persist_certifications` for the accumulating half of the
     /// evidence. Same flag, same lock (one writer at a time across both
     /// sidecars), same newest-irrelevant cap semantics — coverage entries are
@@ -5977,6 +5962,12 @@ impl Database {
         crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::SLICE_COVERAGE, &entries);
     }
 
+    /// Snapshot `dedup_clean_fp` to the data dir. Called at the end of a sweep
+    /// rather than per certification: one write per tick instead of one per
+    /// partition, and the snapshot picks up invalidations in the same pass.
+    ///
+    /// Best-effort by design — this is a cache, and a lost write costs a cold
+    /// start, never a wrong answer.
     fn persist_certifications(&self) {
         if !self.config.maintenance.timefusion_dedup_certification_persist {
             return;
@@ -8445,15 +8436,17 @@ impl Database {
         }
     }
 
-    /// Resume a repair bin that a previous attempt already wrote.
-    ///
-    /// Returns the staged output as a `StagedBin` instead of spending another 40+ minutes
-    /// rewriting the same file. Hooked at bin selection, keyed on an intent whose inputs exactly
-    /// match the bin we were about to stage. The restart case falls out for free because
-    /// selection is deterministic given the snapshot, and the same lookup covers a stage whose
-    /// commit lost an OCC race. `commit_wave` lands it with the same lock, flush priority, liveness
-    /// re-check and OCC ladder. `None` is always safe: the caller stages normally, and the
-    /// declined entry's parquet falls to boot-time reconcile / VACUUM.
+    /// Publish a resumed rollup and retire its intent — the bookkeeping both
+    /// success arms owe, and which the commit alone does not satisfy.
+    fn publish_resumed_rollup(&self, rollup: &crate::database::RollupResume, wave_id: &str) -> Result<()> {
+        let mut journal = self.journal();
+        journal.publish(&rollup.key, rollup.publication.clone());
+        journal.checkpoint()?;
+        drop(journal);
+        self.clear_staged_intent(&[wave_id]);
+        Ok(())
+    }
+
     /// Commit a rollup unit whose output was staged before a restart, instead of
     /// re-running its scan. `Ok(true)` means this unit is DONE and the caller
     /// must not build anything.
@@ -8467,17 +8460,6 @@ impl Database {
     /// orphan sweep already collects staged parquet that no longer belongs to
     /// anything, and deleting an entry here on a transient read failure would
     /// discard a perfectly good staged output.
-    /// Publish a resumed rollup and retire its intent — the bookkeeping both
-    /// success arms owe, and which the commit alone does not satisfy.
-    fn publish_resumed_rollup(&self, rollup: &crate::database::RollupResume, wave_id: &str) -> Result<()> {
-        let mut journal = self.journal();
-        journal.publish(&rollup.key, rollup.publication.clone());
-        journal.checkpoint()?;
-        drop(journal);
-        self.clear_staged_intent(&[wave_id]);
-        Ok(())
-    }
-
     pub(crate) async fn resume_rollup_unit(&self, key: &crate::maintenance_coordinator::TaskKey, current_source_rows: Option<u64>) -> Result<bool> {
         use deltalake::protocol::{DeltaOperation, SaveMode};
         use std::sync::atomic::Ordering::Relaxed;
@@ -8600,6 +8582,15 @@ impl Database {
         Ok(false)
     }
 
+    /// Resume a repair bin that a previous attempt already wrote.
+    ///
+    /// Returns the staged output as a `StagedBin` instead of spending another 40+ minutes
+    /// rewriting the same file. Hooked at bin selection, keyed on an intent whose inputs exactly
+    /// match the bin we were about to stage. The restart case falls out for free because
+    /// selection is deterministic given the snapshot, and the same lookup covers a stage whose
+    /// commit lost an OCC race. `commit_wave` lands it with the same lock, flush priority, liveness
+    /// re-check and OCC ladder. `None` is always safe: the caller stages normally, and the
+    /// declined entry's parquet falls to boot-time reconcile / VACUUM.
     async fn resumable_staged_bin(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, files: &[String]) -> Option<StagedBin> {
         use deltalake::kernel::Action;
         use std::sync::atomic::Ordering::Relaxed;
@@ -8948,11 +8939,6 @@ impl Database {
         if !self.config.maintenance.timefusion_repair_mark_sorted_at_write {
             return (0, 0);
         }
-        // The object store is captured HERE, once per table, so the probe stage below takes NO
-        // table locks at all. Re-locking per file would put 16 concurrent readers against a lock
-        // that `refresh_table_snapshot` needs to WRITE — and a delayed refresh is a stale
-        // snapshot, i.e. committed rows a query cannot see. Background hygiene must never be
-        // able to do that to the foreground.
         // Grouped BY TABLE, and the store is taken once while the enumeration lock is already
         // held, so the probe stage below takes NO table locks at all. Re-locking per file would
         // put `REPAIR_VERIFY_CONCURRENCY` readers against a lock `refresh_table_snapshot` needs
@@ -9163,8 +9149,6 @@ impl Database {
         Ok(())
     }
 
-    /// Vacuum the Delta table to clean up old files that are no longer needed
-    /// This reduces storage costs and improves query performance
     /// On-demand vacuum of a single unified table (pgwire `VACUUM <table>`).
     /// `retention_hours = None` uses the configured default. Mirrors
     /// `compact_date`: resolves the table then delegates, keeping config private.

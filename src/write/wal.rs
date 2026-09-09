@@ -63,6 +63,15 @@ pub fn meta_path(data_dir: &Path, file: &str) -> PathBuf {
     data_dir.join(META_DIR).join(file)
 }
 
+/// Remove `path`, treating "already absent" as success — every caller here
+/// wants the goal state ("no file"), not the event.
+fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// Magic bytes identifying the WAL format ("WAL2").
 const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32];
 /// Insert batches are stored as Arrow IPC stream bytes. Embeds the schema so
@@ -643,7 +652,7 @@ impl WalManager {
     pub fn replay_iter(&self) -> Result<WalReplayIter<'_>, WalError> {
         Ok(WalReplayIter {
             wal: self,
-            topics: self.list_topics(),
+            topics: self.known_topics.iter().map(|t| t.clone()).collect(),
             topic_idx: 0,
             heap: std::collections::BinaryHeap::new(),
             shard_keys: Vec::new(),
@@ -701,12 +710,8 @@ impl WalManager {
         }
     }
 
-    fn list_topics(&self) -> Vec<String> {
-        self.known_topics.iter().map(|t| t.clone()).collect()
-    }
-
-    /// Same as `list_topics` but parsed into `(project_id, table_name)` pairs.
-    /// Callers iterating topics shouldn't need to know the joining convention.
+    /// Known topics parsed into `(project_id, table_name)` pairs. Callers
+    /// iterating topics shouldn't need to know the joining convention.
     pub fn list_topic_pairs(&self) -> Vec<(String, String)> {
         self.known_topics.iter().filter_map(|t| Self::parse_topic(&t)).collect()
     }
@@ -892,10 +897,7 @@ impl WalManager {
     /// and shallow-scan over commits made since the last good write. NotFound
     /// is silently ignored (caller's intent — "no file" is the goal state).
     pub fn delete_cursor_snapshot(&self) -> Result<(), WalError> {
-        match std::fs::remove_file(self.cursor_snapshot_path()) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(WalError::Io(e)),
-            _ => Ok(()),
-        }
+        Ok(remove_if_exists(&self.cursor_snapshot_path())?)
     }
 
     fn recovery_rewind_path(&self) -> PathBuf {
@@ -992,9 +994,7 @@ impl WalManager {
     }
 
     pub fn remove_recovery_rewind_marker(&self) {
-        if let Err(e) = std::fs::remove_file(self.recovery_rewind_path())
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
+        if let Err(e) = remove_if_exists(&self.recovery_rewind_path()) {
             warn!("failed to remove recovery rewind marker: {}", e);
         }
     }
@@ -1481,7 +1481,7 @@ impl WalDirLock {
 }
 
 pub fn takeover_requested(wal_dir: &std::path::Path) -> bool {
-    wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE).is_file()
+    meta_path(wal_dir, TAKEOVER_REQUEST_FILE).is_file()
 }
 
 /// How long a takeover request has been outstanding, or `None` when none is.
@@ -1489,7 +1489,7 @@ pub fn takeover_requested(wal_dir: &std::path::Path) -> bool {
 /// The predecessor escalates on this: a request it keeps ignoring because it
 /// never reaches handoff readiness is exactly the wedge this bounds.
 pub fn takeover_request_age(wal_dir: &std::path::Path) -> Option<std::time::Duration> {
-    let path = wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE);
+    let path = meta_path(wal_dir, TAKEOVER_REQUEST_FILE);
     let requested_at =
         std::fs::read_to_string(&path).ok()?.split_whitespace().find_map(|field| field.strip_prefix("requested_at_micros=")?.parse::<i64>().ok())?;
     let elapsed = crate::support::now_micros().saturating_sub(requested_at).max(0);
@@ -1497,10 +1497,8 @@ pub fn takeover_request_age(wal_dir: &std::path::Path) -> Option<std::time::Dura
 }
 
 pub fn clear_takeover_request(wal_dir: &std::path::Path) {
-    match std::fs::remove_file(wal_dir.join(META_DIR).join(TAKEOVER_REQUEST_FILE)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!("could not clear WAL takeover request: {e}"),
+    if let Err(e) = remove_if_exists(&meta_path(wal_dir, TAKEOVER_REQUEST_FILE)) {
+        warn!("could not clear WAL takeover request: {e}");
     }
 }
 
@@ -1544,9 +1542,7 @@ pub fn boot_wal_gc(wal_dir: &std::path::Path) {
         // the un-swept dir only costs startup time, and the next boot
         // re-attempts.
         warn!("bootstrap.phase=wal_gc could not consume drained flag ({e}) — skipping sweep, deleting snapshot");
-        if let Err(rm) = std::fs::remove_file(&target)
-            && rm.kind() != std::io::ErrorKind::NotFound
-        {
+        if let Err(rm) = remove_if_exists(&target) {
             error!(
                 "bootstrap.phase=wal_gc stale drained=true snapshot could not be removed ({rm}) — \
                  delete {:?} manually before the next restart or the boot sweep may delete un-flushed WAL",

@@ -15,6 +15,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+/// Lock without letting a poisoned mutex propagate: every mutex here guards
+/// plain data, so a panicking holder leaves it usable.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub const NORMAL_SLICE_MICROS: i64 = 10 * 60 * 1_000_000;
 pub const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 /// Widths `coarsen_sealed_slices` fuses sealed units to, widest first. It takes
@@ -330,14 +336,9 @@ impl TimeSlice {
     fn fixed_units(start_micros: i64, end_micros: i64, width_micros: i64) -> anyhow::Result<Vec<Self>> {
         let whole = Self::new(start_micros, end_micros)?;
         anyhow::ensure!(width_micros > 0, "maintenance slice width must be positive");
-        let mut result = Vec::new();
-        let mut start = whole.start_micros;
-        while start < whole.end_micros {
-            let end = start.saturating_add(width_micros).min(whole.end_micros);
-            result.push(Self { start_micros: start, end_micros: end });
-            start = end;
-        }
-        Ok(result)
+        Ok(std::iter::successors(Some(whole.start_micros), |start| Some(start.saturating_add(width_micros)).filter(|next| *next < whole.end_micros))
+            .map(|start| Self { start_micros: start, end_micros: start.saturating_add(width_micros).min(whole.end_micros) })
+            .collect())
     }
 }
 
@@ -564,11 +565,20 @@ struct GroupPrice {
     /// Every member's own estimate, summed — what the old rule charged, kept
     /// only so a pass can report whether footprint pricing changed anything.
     summed_bytes: u64,
+    /// How many units this bucket holds, which is what `over_budget` reports.
+    members: usize,
+    /// The OLDEST member's creation time, because the fused unit inherits its
+    /// members' work and must inherit their age with it. `Option`, not a bare
+    /// `u64`: a `Default` of 0 would min-fold to the epoch and make every fused
+    /// unit permanently the oldest thing in the queue.
+    oldest: Option<u64>,
 }
 
 impl GroupPrice {
     fn add(&mut self, task: &MaintenanceTask) {
         self.summed_bytes = self.summed_bytes.saturating_add(task.estimated_decoded_bytes);
+        self.members += 1;
+        self.oldest = Some(self.oldest.unwrap_or(u64::MAX).min(task.created_unix_ms));
         match task.input {
             Some(input) => {
                 self.distinct.insert(input.fp, input);
@@ -653,9 +663,7 @@ pub fn split_sheds_enough_at(parent_measured_bytes: Option<u64>, observed_bytes:
 /// can observe the floor at the width where the floor starts to dominate.
 pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u64) -> Vec<MaintenanceTask> {
     if observed_or_estimated_bytes <= MAX_DECODED_BYTES {
-        let mut task = task.clone();
-        task.estimated_decoded_bytes = observed_or_estimated_bytes;
-        return vec![task];
+        return vec![MaintenanceTask { estimated_decoded_bytes: observed_or_estimated_bytes, ..task.clone() }];
     }
     if let Some(children) = bisect_time_unit(task, observed_or_estimated_bytes) {
         return children.into();
@@ -664,15 +672,7 @@ pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u
     let shards_u64 = observed_or_estimated_bytes.div_ceil(MAX_DECODED_BYTES).max(2);
     let shards = u32::try_from(shards_u64).unwrap_or(u32::MAX);
     let per_shard = observed_or_estimated_bytes.div_ceil(u64::from(shards));
-    (0..shards)
-        .map(|hash_shard| {
-            let mut shard = task.clone();
-            shard.hash_shard = hash_shard;
-            shard.hash_shards = shards;
-            shard.estimated_decoded_bytes = per_shard;
-            shard
-        })
-        .collect()
+    (0..shards).map(|hash_shard| MaintenanceTask { hash_shard, hash_shards: shards, estimated_decoded_bytes: per_shard, ..task.clone() }).collect()
 }
 
 /// Bisect time independently of whether a byte estimate exceeds the budget.
@@ -846,14 +846,14 @@ impl TaskLease {
 
     /// Annotate the error on its way out: `lease.note_failure(error)?`.
     pub fn note_failure<E: std::fmt::Display>(&self, error: E) -> E {
-        *self.failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
+        *lock(&self.failure) = Some(error.to_string());
         error
     }
 }
 
 impl Drop for TaskLease {
     fn drop(&mut self) {
-        let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut journal = lock(&self.journal);
         // The ONLY place a unit's end is observable on every path. Prod
         // 2026-08-24, one container's whole 62-minute life: 244
         // `maintenance_task_started` and ZERO completion lines of any kind —
@@ -926,6 +926,20 @@ pub struct Invalidation<'a> {
     /// within one process while dedup was quiet). Every other caller passes
     /// true — fail toward minting.
     pub mint_rollup: bool,
+}
+
+/// Insert or replace a task by key, keeping `indices` in step with `tasks`.
+///
+/// A free function so WAL replay in [`TaskJournal::load`] — which runs before
+/// there is a `Self` — shares the one definition with every other insert site.
+fn insert_task(tasks: &mut Vec<MaintenanceTask>, indices: &mut HashMap<TaskKey, usize>, task: MaintenanceTask) {
+    match indices.get(&task.key).copied() {
+        Some(index) => tasks[index] = task,
+        None => {
+            indices.insert(task.key.clone(), tasks.len());
+            tasks.push(task);
+        }
+    }
 }
 
 impl TaskJournal {
@@ -1006,15 +1020,7 @@ impl TaskJournal {
                 }
                 let record = serde_json::from_slice::<JournalRecord>(&line[..line.len() - 1])?;
                 match record {
-                    JournalRecord::Task(task) => {
-                        if let Some(index) = task_indices.get(&task.key).copied() {
-                            snapshot.tasks[index] = task;
-                        } else {
-                            let index = snapshot.tasks.len();
-                            task_indices.insert(task.key.clone(), index);
-                            snapshot.tasks.push(task);
-                        }
-                    }
+                    JournalRecord::Task(task) => insert_task(&mut snapshot.tasks, &mut task_indices, task),
                     JournalRecord::SourceCursor { source, delta_version } => {
                         snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
                     }
@@ -1221,11 +1227,13 @@ impl TaskJournal {
         if self.migration_done(Self::STALE_ESTIMATE_MIGRATION) {
             return None;
         }
-        let mut cleared = 0usize;
-        for task in self.snapshot.tasks.iter_mut().filter(|task| task.state != TaskState::Complete && task.estimated_decoded_bytes != 0) {
-            task.estimated_decoded_bytes = 0;
-            cleared += 1;
-        }
+        let cleared = self.snapshot.tasks.iter_mut().filter(|task| task.state != TaskState::Complete && task.estimated_decoded_bytes != 0).fold(
+            0usize,
+            |cleared, task| {
+                task.estimated_decoded_bytes = 0;
+                cleared + 1
+            },
+        );
         self.dirty_tasks.clear();
         self.mark_migration_done(Self::STALE_ESTIMATE_MIGRATION);
         Some(cleared)
@@ -1251,13 +1259,15 @@ impl TaskJournal {
         if self.migration_done(Self::REPAIR_SINGLE_PASS_MIGRATION) {
             return None;
         }
-        let mut reset = 0usize;
-        for task in self.snapshot.tasks.iter_mut().filter(|task| task.key.operation == Operation::Repair && task.state != TaskState::Complete) {
-            task.attempts = 0;
-            task.retry_reason = None;
-            task.deadline_micros = 0;
-            reset += 1;
-        }
+        let reset = self.snapshot.tasks.iter_mut().filter(|task| task.key.operation == Operation::Repair && task.state != TaskState::Complete).fold(
+            0usize,
+            |reset, task| {
+                task.attempts = 0;
+                task.retry_reason = None;
+                task.deadline_micros = 0;
+                reset + 1
+            },
+        );
         // A journal with no repair queue has nothing to forgive, so it must not
         // spend the one-shot cursor — or the migration would be consumed by a
         // boot that happened to precede the queue, and the caller would compact
@@ -1528,9 +1538,7 @@ impl TaskJournal {
         // deleted them first.
         let damaged = self.untagged_cells.clone();
         let is_damage = |task: &MaintenanceTask| {
-            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
-                damaged.contains(&(task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), time.date_naive().to_string()))
-            })
+            task_date(task).is_some_and(|date| damaged.contains(&(task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), date)))
         };
         self.retain_tasks(|task| {
             // A covering task does not carry this retry's failure history or deadline.
@@ -1588,14 +1596,8 @@ impl TaskJournal {
                 && task.state == TaskState::Pending
                 && !is_live_frontier(task.key.slice, now_micros)
                 && task.key.slice.width() < width
-                && !chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).is_some_and(|time| {
-                    untagged_cells.contains(&(
-                        task.key.source.clone(),
-                        task.key.project_id.clone(),
-                        task.key.physical_table.clone(),
-                        time.date_naive().to_string(),
-                    ))
-                })
+                && !task_date(task)
+                    .is_some_and(|date| untagged_cells.contains(&(task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), date)))
         };
         // Running and Retry units block every overlapping bucket. A retry
         // owns a deadline and failure history: fusing it would reset both on
@@ -1636,10 +1638,6 @@ impl TaskJournal {
 
         let mut report = CoarsenReport::default();
         let mut groups: HashMap<(String, String, String, Operation, i64), GroupPrice> = HashMap::new();
-        let mut members: HashMap<(String, String, String, Operation, i64), usize> = HashMap::new();
-        // The OLDEST member's creation time, because the fused unit inherits its
-        // members' work and must inherit their age with it.
-        let mut oldest: HashMap<(String, String, String, Operation, i64), u64> = HashMap::new();
         for task in self.snapshot.tasks.iter().filter(|task| coarsenable(task)) {
             report.candidates += 1;
             let group = (
@@ -1653,9 +1651,7 @@ impl TaskJournal {
                 report.blocked += 1;
                 continue;
             }
-            groups.entry(group.clone()).or_default().add(task);
-            *members.entry(group.clone()).or_default() += 1;
-            oldest.entry(group).and_modify(|at| *at = (*at).min(task.created_unix_ms)).or_insert(task.created_unix_ms);
+            groups.entry(group).or_default().add(task);
         }
         // Only fuse a span that will actually FIT. Coarsening is a win because
         // one unit does one scan where 144 slices each did the same scan — but a
@@ -1734,7 +1730,7 @@ impl TaskJournal {
             let fits = price.bytes() <= MAX_DECODED_BYTES || priced_by_partition.contains(group);
             report.priced_by_footprint += usize::from(fits && price.summed_bytes > MAX_DECODED_BYTES);
             if !fits {
-                report.over_budget += members.get(group).copied().unwrap_or(0);
+                report.over_budget += price.members;
             }
             fits
         });
@@ -1753,10 +1749,7 @@ impl TaskJournal {
         });
         for ((physical_table, source, project_id, operation, bucket), price) in groups {
             let Ok(slice) = TimeSlice::new(bucket, bucket.saturating_add(width)) else { continue };
-            let oldest_member = oldest
-                .get(&(physical_table.clone(), source.clone(), project_id.clone(), operation, bucket))
-                .copied()
-                .unwrap_or_else(|| u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default());
+            let oldest_member = price.oldest.unwrap_or_else(|| u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default());
             self.upsert(MaintenanceTask {
                 // Only when every member agreed. A fused unit over several file
                 // sets reads their union, which no scalar here can state, and
@@ -1978,14 +1971,14 @@ impl TaskJournal {
         }
         files.sort_unstable();
         let at = |q: f64| files[((files.len() - 1) as f64 * q) as usize];
-        let tied = files.iter().filter(|f| **f / BENEFIT_BUCKET_FILES == 0).count();
+        let tied = files.iter().filter(|f| **f < BENEFIT_BUCKET_FILES).count();
         let buckets = files.iter().map(|f| f / BENEFIT_BUCKET_FILES).collect::<std::collections::BTreeSet<_>>().len();
         Some(format!(
             "cells={} files_p50={} files_p90={} files_max={} tied_at_zero={} distinct_buckets={}",
             files.len(),
             at(0.5),
             at(0.9),
-            files[files.len() - 1],
+            at(1.0),
             tied,
             buckets
         ))
@@ -1994,9 +1987,7 @@ impl TaskJournal {
     pub fn most_indebted_unclaimed(&self, operation: Operation, now_micros: i64) -> Option<String> {
         let eligible =
             || self.snapshot.tasks.iter().filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry));
-        let date_of = |task: &MaintenanceTask| {
-            chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map_or_else(|| "?".to_owned(), |time| time.date_naive().to_string())
-        };
+        let date_of = |task: &MaintenanceTask| task_date(task).unwrap_or_else(|| "?".to_owned());
         let worst = eligible().max_by_key(|task| task.input.map_or(0, |input| input.files))?;
         let files = worst.input.map_or(0, |input| input.files);
         // The reasons that live on the task itself, in the order `claim_next`
@@ -2049,18 +2040,18 @@ impl TaskJournal {
                 "CLAIMABLE"
             }
         };
-        let describe = |task: &MaintenanceTask| {
-            let date = chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
-                .map(|time| time.date_naive().to_string())
-                .unwrap_or_else(|| "?".to_owned());
-            (task.key.project_id.clone(), date, why(task))
-        };
-        let mut sealed = self.snapshot.tasks.iter().filter(|task| {
-            task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && !is_frontier_task(task, now_micros)
-        });
+        let describe = |task: &MaintenanceTask| (task.key.project_id.clone(), task_date(task).unwrap_or_else(|| "?".to_owned()), why(task));
         // A claimable one is the interesting answer: it means eligibility is fine
         // and the refusal is in ordering. Otherwise report the first task's reason.
-        let sample: Vec<_> = sealed.by_ref().take(LIMIT).collect();
+        let sample: Vec<_> = self
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry) && !is_frontier_task(task, now_micros)
+            })
+            .take(LIMIT)
+            .collect();
         sample.iter().find(|task| why(task) == "CLAIMABLE").or_else(|| sample.first()).map(|task| describe(task))
     }
 
@@ -2156,7 +2147,7 @@ impl TaskJournal {
         if !matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup) {
             return 2;
         }
-        let Some(date) = chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| time.date_naive().to_string()) else {
+        let Some(date) = task_date(task) else {
             return 2;
         };
         let cell = (task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), date);
@@ -2170,27 +2161,29 @@ impl TaskJournal {
     }
 
     pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
-        let mut proven = 0;
-        for task in &mut self.snapshot.tasks {
+        // Disjoint field borrows, so the pipeline can mark tasks dirty as it goes.
+        let dirty = &mut self.dirty_tasks;
+        self.snapshot
+            .tasks
+            .iter_mut()
             // Only work that can still run. A completed task matches its own
-            // day and proving it is a no-op that would make `proven` read as
+            // day and proving it is a no-op that would make the count read as
             // progress when nothing became claimable.
-            if !matches!(task.state, TaskState::Pending | TaskState::Retry)
-                || task.base_tier_present
-                || task.key.operation != key.operation
-                || task.key.source != key.source
-                || task.key.project_id != key.project_id
-                || task.key.physical_table != key.physical_table
-                || task.key.slice.start_micros < day_start
-                || task.key.slice.end_micros > day_end
-            {
-                continue;
-            }
-            task.base_tier_present = true;
-            self.dirty_tasks.insert(task.key.clone());
-            proven += 1;
-        }
-        proven
+            .filter(|task| {
+                matches!(task.state, TaskState::Pending | TaskState::Retry)
+                    && !task.base_tier_present
+                    && task.key.operation == key.operation
+                    && task.key.source == key.source
+                    && task.key.project_id == key.project_id
+                    && task.key.physical_table == key.physical_table
+                    && task.key.slice.start_micros >= day_start
+                    && task.key.slice.end_micros <= day_end
+            })
+            .fold(0, |proven, task| {
+                task.base_tier_present = true;
+                dirty.insert(task.key.clone());
+                proven + 1
+            })
     }
 
     /// Remember what a unit reads, measured by the claim-time preflight.
@@ -2236,13 +2229,7 @@ impl TaskJournal {
         if task.state == TaskState::Complete {
             self.note_dedup_edges(&task.key);
         }
-        if let Some(index) = self.task_indices.get(&task.key).copied() {
-            self.snapshot.tasks[index] = task;
-        } else {
-            let index = self.snapshot.tasks.len();
-            self.task_indices.insert(task.key.clone(), index);
-            self.snapshot.tasks.push(task);
-        }
+        insert_task(&mut self.snapshot.tasks, &mut self.task_indices, task);
     }
 
     pub fn enqueue(&mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) {
@@ -2394,13 +2381,11 @@ impl TaskJournal {
             return true;
         }
         self.dirty_tasks.insert(key.clone());
-        let index = self.snapshot.tasks.len();
-        self.task_indices.insert(key.clone(), index);
-        self.snapshot.tasks.push(MaintenanceTask {
-            base_tier_present,
-            input,
-            ..MaintenanceTask::pending(key, deadline_micros, estimated_decoded_bytes, created_unix_ms)
-        });
+        insert_task(
+            &mut self.snapshot.tasks,
+            &mut self.task_indices,
+            MaintenanceTask { base_tier_present, input, ..MaintenanceTask::pending(key, deadline_micros, estimated_decoded_bytes, created_unix_ms) },
+        );
         true
     }
 
@@ -2532,9 +2517,8 @@ impl TaskJournal {
                         self.dirty_tasks.insert(key);
                     }
                 } else {
-                    let index = self.snapshot.tasks.len();
-                    self.task_indices.insert(key.clone(), index);
-                    self.snapshot.tasks.push(MaintenanceTask::pending(key.clone(), deadline_micros, 0, created_unix_ms));
+                    let task = MaintenanceTask::pending(key.clone(), deadline_micros, 0, created_unix_ms);
+                    insert_task(&mut self.snapshot.tasks, &mut self.task_indices, task);
                     self.dirty_tasks.insert(key);
                 }
             }
@@ -2909,14 +2893,11 @@ impl TaskJournal {
     }
 
     fn dependencies_complete(&self, task: &MaintenanceTask) -> bool {
-        let required = match task.key.operation {
-            // Base publication performs its own bounded complete-key/tiebreak
-            // dedup before aggregation. Physical source consolidation is
-            // independent debt and must not block exact rollup coverage.
-            Operation::BaseRollup => None,
-            Operation::DerivedRollup => Some(Operation::BaseRollup),
-            _ => None,
-        };
+        // Only a DERIVED unit has a dependency at all. Base publication performs
+        // its own bounded complete-key/tiebreak dedup before aggregation, and
+        // physical source consolidation is independent debt that must not block
+        // exact rollup coverage.
+        let required = matches!(task.key.operation, Operation::DerivedRollup).then_some(Operation::BaseRollup);
         // Proven from real tier coverage, which is strictly better evidence than
         // the journal's own record of who built what. See the field's comment.
         //
@@ -2927,14 +2908,17 @@ impl TaskJournal {
         if task.base_tier_present {
             return true;
         }
-        if let Some(date) = chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| time.date_naive().to_string())
+        if let Some(date) = task_date(task)
             && self.base_tier_ready.contains(&(task.key.source.clone(), task.key.project_id.clone(), date))
         {
             return true;
         }
+        // Contiguous coverage of the slice by COMPLETE units of the required
+        // operation: `scan` walks the sorted intervals and stops dead at the
+        // first gap, `any` stops at the first interval that reaches the end.
         required.is_none_or(|required| {
-            let mut intervals = self
-                .snapshot
+            use itertools::Itertools;
+            self.snapshot
                 .tasks
                 .iter()
                 .filter(|candidate| {
@@ -2945,19 +2929,14 @@ impl TaskJournal {
                         && task.key.slice.overlaps(candidate.key.slice.start_micros, candidate.key.slice.end_micros)
                 })
                 .map(|candidate| candidate.key.slice)
-                .collect::<Vec<_>>();
-            intervals.sort_unstable();
-            let mut covered_through = task.key.slice.start_micros;
-            for interval in intervals {
-                if interval.start_micros > covered_through {
-                    break;
-                }
-                covered_through = covered_through.max(interval.end_micros);
-                if covered_through >= task.key.slice.end_micros {
-                    return true;
-                }
-            }
-            false
+                .sorted_unstable()
+                .scan(task.key.slice.start_micros, |covered, interval| {
+                    (interval.start_micros <= *covered).then(|| {
+                        *covered = (*covered).max(interval.end_micros);
+                        *covered
+                    })
+                })
+                .any(|covered| covered >= task.key.slice.end_micros)
         })
     }
 
@@ -2979,21 +2958,23 @@ impl TaskJournal {
     }
 
     pub fn complete(&mut self, key: &TaskKey) -> bool {
-        let Some(index) = self.task_indices.get(key).copied() else { return false };
-        let task = &mut self.snapshot.tasks[index];
-        task.state = TaskState::Complete;
-        task.retry_reason = None;
-        self.dirty_tasks.insert(key.clone());
-        self.note_dedup_edges(key);
-        true
+        self.finish(key, None)
     }
 
     pub fn publish(&mut self, key: &TaskKey, publication: Publication) -> bool {
+        self.finish(key, Some(publication))
+    }
+
+    /// Mark a unit Complete. `None` leaves any existing publication untouched,
+    /// matching `complete`'s behaviour.
+    fn finish(&mut self, key: &TaskKey, publication: Option<Publication>) -> bool {
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let task = &mut self.snapshot.tasks[index];
         task.state = TaskState::Complete;
         task.retry_reason = None;
-        task.publication = Some(publication);
+        if let Some(publication) = publication {
+            task.publication = Some(publication);
+        }
         self.dirty_tasks.insert(key.clone());
         self.note_dedup_edges(key);
         true
@@ -3182,17 +3163,15 @@ impl TaskJournal {
     /// A process may die after selecting work. Running is not a durable lease;
     /// requeue it at boot so recovery produces redundant work, never a hole.
     pub fn requeue_running(&mut self, now_micros: i64) -> usize {
-        let mut count = 0;
-        for task in &mut self.snapshot.tasks {
-            if task.state == TaskState::Running {
-                task.state = TaskState::Retry;
-                task.deadline_micros = now_micros;
-                task.retry_reason = Some("coordinator_restart".to_owned());
-                self.dirty_tasks.insert(task.key.clone());
-                count += 1;
-            }
-        }
-        count
+        // Disjoint field borrows, so the pipeline can mark tasks dirty as it goes.
+        let dirty = &mut self.dirty_tasks;
+        self.snapshot.tasks.iter_mut().filter(|task| task.state == TaskState::Running).fold(0, |count, task| {
+            task.state = TaskState::Retry;
+            task.deadline_micros = now_micros;
+            task.retry_reason = Some("coordinator_restart".to_owned());
+            dirty.insert(task.key.clone());
+            count + 1
+        })
     }
 
     pub fn tasks(&self) -> impl Iterator<Item = &MaintenanceTask> {
@@ -3246,9 +3225,7 @@ impl TaskJournal {
         self.snapshot
             .tasks
             .iter()
-            .filter(|task| {
-                task.key.project_id == project_id && task.key.physical_table == target && task.key.slice.start_micros < end && task.key.slice.end_micros > start
-            })
+            .filter(|task| task.key.project_id == project_id && task.key.physical_table == target && task.key.slice.overlaps(start, end))
             .filter_map(|task| task.publication.as_ref().map(|publication| publication.rows))
             .sum()
     }
@@ -3275,27 +3252,28 @@ impl TaskJournal {
     /// Complete to Pending and mints no task, and a derived publish does not
     /// call it.
     pub fn reopen_derived_over(&mut self, project_id: &str, rollup_table: &str, start_micros: i64, end_micros: i64) -> usize {
-        let mut reopened = 0;
-        for task in &mut self.snapshot.tasks {
-            if task.state != TaskState::Complete
-                || task.key.operation != Operation::DerivedRollup
-                || task.key.project_id != project_id
-                || task.key.physical_table != rollup_table
-                || task.key.slice.start_micros >= end_micros
-                || task.key.slice.end_micros <= start_micros
-            {
-                continue;
-            }
-            task.state = TaskState::Pending;
-            task.retry_reason = None;
-            // Dropped with the state: `Publication` is what coverage is recovered
-            // from at boot, so leaving it would have the next process re-adopt
-            // the very cell this reopen exists to replace.
-            task.publication = None;
-            self.dirty_tasks.insert(task.key.clone());
-            reopened += 1;
-        }
-        reopened
+        // Disjoint field borrows, so the pipeline can mark tasks dirty as it goes.
+        let dirty = &mut self.dirty_tasks;
+        self.snapshot
+            .tasks
+            .iter_mut()
+            .filter(|task| {
+                task.state == TaskState::Complete
+                    && task.key.operation == Operation::DerivedRollup
+                    && task.key.project_id == project_id
+                    && task.key.physical_table == rollup_table
+                    && task.key.slice.overlaps(start_micros, end_micros)
+            })
+            .fold(0, |reopened, task| {
+                task.state = TaskState::Pending;
+                task.retry_reason = None;
+                // Dropped with the state: `Publication` is what coverage is recovered
+                // from at boot, so leaving it would have the next process re-adopt
+                // the very cell this reopen exists to replace.
+                task.publication = None;
+                dirty.insert(task.key.clone());
+                reopened + 1
+            })
     }
 
     pub fn source_cursor(&self, source: &str) -> Option<u64> {
@@ -3484,7 +3462,7 @@ impl TaskJournal {
             .maintenance_raw_tail_duration_secs
             .store(u64::try_from(FINALIZATION_DELAY_MICROS / 1_000_000).unwrap_or_default().saturating_add(eligible_lag_secs), Relaxed);
         let processed = stats.maintenance_processed_bytes.load(Relaxed);
-        let mut sample = THROUGHPUT_SAMPLE.get_or_init(|| Mutex::new((now_micros, processed))).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut sample = lock(THROUGHPUT_SAMPLE.get_or_init(|| Mutex::new((now_micros, processed))));
         let elapsed = now_micros.saturating_sub(sample.0);
         if elapsed >= 1_000_000 {
             let rate = processed.saturating_sub(sample.1).saturating_mul(1_000_000) / u64::try_from(elapsed).unwrap_or(u64::MAX).max(1);
@@ -3498,8 +3476,8 @@ impl TaskJournal {
     }
 }
 
-/// `(class, operation priority, -width, -recency)` -> project -> that project's
-/// queue. Ordered so smaller tuples run first; see `scheduling_class`.
+/// `(class, starved, operation priority, -width, benefit, recency)` -> project ->
+/// that project's queue. Ordered so smaller tuples run first; see `scheduling_class`.
 type ReadyGroups<'a> = BTreeMap<(u8, u8, u8, i64, i64, i64), HashMap<&'a str, VecDeque<&'a MaintenanceTask>>>;
 
 /// Deadline ordering with round-robin selection among projects at the same
@@ -3839,6 +3817,11 @@ fn is_frontier_task(task: &MaintenanceTask, now_micros: i64) -> bool {
     task.key.operation != Operation::SealedConsolidation && is_live_frontier(task.key.slice, now_micros)
 }
 
+/// A task's slice as a calendar date, `None` if the start timestamp is out of `chrono`'s range.
+fn task_date(task: &MaintenanceTask) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros).map(|time| time.date_naive().to_string())
+}
+
 fn track_latest_frontier_rollup<'a>(latest: &mut HashMap<(&'a str, &'a str, &'a str), &'a MaintenanceTask>, task: &'a MaintenanceTask, now_micros: i64) {
     if task.key.operation != Operation::BaseRollup || !is_live_frontier(task.key.slice, now_micros) {
         return;
@@ -3988,7 +3971,7 @@ impl AdmissionController {
         if request.decoded_bytes > MAX_DECODED_BYTES {
             return None;
         }
-        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&self.0);
         if request.decoded_bytes > occupancy_scaled_ceiling(state.available.decoded_bytes, state.capacity.decoded_bytes) {
             return None;
         }
@@ -4001,7 +3984,7 @@ impl AdmissionController {
     }
 
     pub fn utilization(&self) -> Resources {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).used()
+        lock(&self.0).used()
     }
 
     fn publish_utilization(state: &AdmissionState) {
@@ -4023,7 +4006,7 @@ pub struct AdmissionPermit {
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        let mut state = self.controller.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&self.controller.0);
         state.available = state.available.saturating_add(self.resources);
         debug_assert!(state.available.fits(state.capacity));
         AdmissionController::publish_utilization(&state);

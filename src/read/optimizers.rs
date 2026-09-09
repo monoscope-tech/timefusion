@@ -12,12 +12,17 @@ pub fn downcast<T: 'static>(any: &dyn std::any::Any) -> Option<&T> {
     any.downcast_ref()
 }
 
-/// Extracts any UTF-8 scalar representation.
-pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
+/// Borrows any UTF-8 scalar representation; `None` for NULL and non-string scalars.
+fn utf8_scalar(v: &ScalarValue) -> Option<&String> {
     match v {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+        ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => s.as_ref(),
         _ => None,
     }
+}
+
+/// Extracts any UTF-8 scalar representation.
+pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
+    utf8_scalar(v).cloned()
 }
 
 /// Matches a column through coercion casts.
@@ -388,7 +393,7 @@ fn wrap_variant_exprs(exprs: &[Expr], variant: &HashSet<usize>, udf: &Arc<Scalar
 fn is_utf8_expr(expr: &Expr) -> bool {
     match expr {
         // NULL literals must pass through: json_to_variant would try to parse "" and fail.
-        Expr::Literal(ScalarValue::Utf8(Some(_)) | ScalarValue::Utf8View(Some(_)) | ScalarValue::LargeUtf8(Some(_)), _) => true,
+        Expr::Literal(v, _) => utf8_scalar(v).is_some(),
         Expr::Cast(cast) => is_utf8_expr(&cast.expr),
         _ => false,
     }
@@ -421,7 +426,7 @@ fn is_utf8_expr(expr: &Expr) -> bool {
 use std::collections::HashMap;
 
 use datafusion::{
-    arrow::datatypes::{DataType, Field},
+    arrow::datatypes::{DataType, Field, TimeUnit},
     catalog::default_table_source::DefaultTableSource,
     common::{Column, DFSchema, DFSchemaRef},
     logical_expr::{
@@ -716,31 +721,25 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
         // Recurse into a node's single input in place, leaving the parent's own
         // fields (and cached schema) untouched.
         let down = |input: Arc<LogicalPlan>| -> Result<Arc<LogicalPlan>> { Ok(Arc::new(peel(Arc::unwrap_or_clone(input), d)?)) };
+        // Every peelable node is "rebuild me with my single `input` recursed
+        // into", differing only in the constructor.
+        macro_rules! descend {
+            ($rebuild:expr, $node:expr) => {{
+                let mut node = $node;
+                node.input = down(node.input)?;
+                Ok($rebuild(node))
+            }};
+        }
         match plan {
-            LogicalPlan::Sort(mut s) => {
-                s.input = down(s.input)?;
-                Ok(LogicalPlan::Sort(s))
-            }
-            LogicalPlan::Limit(mut l) => {
-                l.input = down(l.input)?;
-                Ok(LogicalPlan::Limit(l))
-            }
-            LogicalPlan::Distinct(Distinct::All(input)) => Ok(LogicalPlan::Distinct(Distinct::All(down(input)?))),
-            LogicalPlan::Distinct(Distinct::On(mut on)) => {
-                on.input = down(on.input)?;
-                Ok(LogicalPlan::Distinct(Distinct::On(on)))
-            }
-            LogicalPlan::SubqueryAlias(mut s) => {
-                s.input = down(s.input)?;
-                Ok(LogicalPlan::SubqueryAlias(s))
-            }
+            LogicalPlan::Sort(s) => descend!(LogicalPlan::Sort, s),
+            LogicalPlan::Limit(l) => descend!(LogicalPlan::Limit, l),
+            LogicalPlan::SubqueryAlias(s) => descend!(LogicalPlan::SubqueryAlias, s),
             // Some DataFusion rewrite passes promote a Filter above the
             // outermost Projection. Peel through it so Variant columns still
             // reach the wire wrapped, not as raw binary.
-            LogicalPlan::Filter(mut f) => {
-                f.input = down(f.input)?;
-                Ok(LogicalPlan::Filter(f))
-            }
+            LogicalPlan::Filter(f) => descend!(LogicalPlan::Filter, f),
+            LogicalPlan::Distinct(Distinct::All(input)) => Ok(LogicalPlan::Distinct(Distinct::All(down(input)?))),
+            LogicalPlan::Distinct(Distinct::On(on)) => descend!(|on| LogicalPlan::Distinct(Distinct::On(on)), on),
             LogicalPlan::Projection(proj) => wrap_projection(proj),
             // Union/Intersect/Except/Aggregate/Join/Window/etc. — anything we
             // can't peel through. We don't descend (would need branch-aware
@@ -931,6 +930,10 @@ mod variant_json_accessor_tests {
 
     use super::*;
 
+    fn json_call(udf: Arc<ScalarUDF>, args: Vec<Expr>) -> Expr {
+        Expr::ScalarFunction(ScalarFunction { func: udf, args })
+    }
+
     async fn run(sql: &str, with_rule: bool) -> (String, Vec<datafusion::arrow::record_batch::RecordBatch>) {
         let mut ctx = SessionContext::new();
         crate::read::functions::register_custom_functions(&mut ctx).expect("custom functions");
@@ -989,14 +992,12 @@ mod variant_json_accessor_tests {
     /// walks the descent loop — and it pins the path encoding while it is there.
     #[test]
     fn the_nested_json_get_tower_prod_emits_folds_into_one_path() {
-        use datafusion::{logical_expr::Cast, prelude::lit};
-        let json_call = |udf: Arc<ScalarUDF>, args: Vec<Expr>| Expr::ScalarFunction(ScalarFunction { func: udf, args });
         // Exactly what JsonExprPlanner emits, aliases and all; `::` binds tighter
         // than `->>`, so the last key arrives wrapped in a Cast.
         let level1 =
             json_call(datafusion_functions_json::udfs::json_get_udf(), vec![json_call(variant_to_json_udf(), vec![col("v")]), lit("a")]).alias("v -> 'a'");
         let level2 = json_call(datafusion_functions_json::udfs::json_get_udf(), vec![level1, lit(0i64)]).alias("v -> 'a' -> 0");
-        let cast_key = Expr::Cast(Cast::new(Box::new(lit("b")), datafusion::arrow::datatypes::DataType::Utf8));
+        let cast_key = Expr::Cast(Cast::new(Box::new(lit("b")), DataType::Utf8));
         let tower = json_call(datafusion_functions_json::udfs::json_as_text_udf(), vec![level2, cast_key]);
 
         let native = super::variant_native_extraction(&tower).expect("the nested tower is the shape this rule exists for");
@@ -1008,8 +1009,6 @@ mod variant_json_accessor_tests {
     /// rewriter normalizes them away first.
     #[test]
     fn an_excluded_shape_is_left_alone() {
-        use datafusion::prelude::lit;
-        let json_call = |udf: Arc<ScalarUDF>, args: Vec<Expr>| Expr::ScalarFunction(ScalarFunction { func: udf, args });
         let as_text = |args: Vec<Expr>| json_call(datafusion_functions_json::udfs::json_as_text_udf(), args);
         let variant = json_call(variant_to_json_udf(), vec![col("v")]);
         let rewrite = |e: Expr| super::variant_native_extraction(&e);
@@ -1369,7 +1368,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
             // the prefilter and the preserved LIKE/ILIKE re-runs with correct
             // semantics on the Delta side.
             let route = match r.as_ref() {
-                Expr::Literal(s, _) => classify_like_pattern(&extract_utf8_string(s)?, *escape_char, tok == NGRAM3_TOKENIZER)
+                Expr::Literal(s, _) => classify_like_pattern(utf8_scalar(s)?, *escape_char, tok == NGRAM3_TOKENIZER)
                     // ngram3 needs a full trigram to match anything.
                     .filter(|q| tok != NGRAM3_TOKENIZER || q.chars().filter(|c| *c != '*').count() >= NGRAM_MIN_QUERY_LEN)
                     .map(Route::Ready)?,
@@ -1399,7 +1398,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
             let (tok, text_typed) = *indexed_columns.get(&c.name)?;
             let Expr::Literal(s, _) = right.as_ref() else { return None };
             (tok == NGRAM3_TOKENIZER && text_typed)
-                .then(|| regex_literal_substring(&extract_utf8_string(s)?).filter(|q| q.chars().count() >= NGRAM_MIN_QUERY_LEN))
+                .then(|| regex_literal_substring(utf8_scalar(s)?).filter(|q| q.chars().count() >= NGRAM_MIN_QUERY_LEN))
                 .flatten()
                 .map(|q| (c.name.clone(), Route::Ready(q)))
         }
@@ -1412,15 +1411,9 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq:
 /// Utf8-ish; the cast is value-preserving for string types, so seeing through
 /// it is safe (non-string sources are rejected by the `text_typed` gate).
 fn column_through_string_cast(e: &Expr) -> Option<&Column> {
-    use arrow::datatypes::DataType;
-    use datafusion::logical_expr::expr::{Cast, TryCast};
     match e {
         Expr::Column(c) => Some(c),
-        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field })
-            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) =>
-        {
-            column_through_string_cast(expr)
-        }
+        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) if is_text_type(field.data_type()) => column_through_string_cast(expr),
         _ => None,
     }
 }
@@ -1622,8 +1615,6 @@ mod tantivy_rewriter_tests {
     /// was built on ingest and never read.
     #[test]
     fn match_regex_imatch_through_cast_routes_on_ngram3() {
-        use arrow::datatypes::DataType;
-        use datafusion::logical_expr::expr::Cast;
         let cols = cols_of([("name", NGRAM3_TOKENIZER), ("tid", RAW_TOKENIZER)]);
         let re = |c: &str, op: Operator, pat: &str, cast: bool| {
             let lhs = if cast { Expr::Cast(Cast::new(Box::new(col(c)), DataType::Utf8)) } else { col(c) };
@@ -1790,10 +1781,7 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
             // fails on the second list and the original error surfaces — no
             // silent mis-typing, just a planner-time error like today.
             let list_t = arg_types.iter().find(|t| matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..))).ok_or(e)?.clone();
-            let patched: Vec<DataType> = arg_types
-                .iter()
-                .map(|t| if matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) { list_t.clone() } else { t.clone() })
-                .collect();
+            let patched: Vec<DataType> = arg_types.iter().map(|t| if is_text_type(t) { list_t.clone() } else { t.clone() }).collect();
             self.inner.coerce_types(&patched)
         })
     }
@@ -1858,12 +1846,7 @@ fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transf
     // reach TypeCoercion would NOT error: arrow-cast's blanket `(_, List)`
     // rule wraps each value in a single-element list — a silently wrong
     // result. Reject it like PG ("COALESCE types ... cannot be matched").
-    if let Some(bad) = new_args.iter().find_map(|a| {
-        input_schemas.iter().find_map(|s| match a.get_type(s.as_ref()) {
-            Ok(t @ (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)) => Some(t),
-            _ => None,
-        })
-    }) {
+    if let Some(bad) = new_args.iter().find_map(|a| input_schemas.iter().find_map(|s| a.get_type(s.as_ref()).ok().filter(is_text_type))) {
         return plan_err!("COALESCE types {bad} and List({elem_type}) cannot be matched");
     }
     Ok(Transformed::new_transformed(Expr::ScalarFunction(ScalarFunction { func, args: new_args }), transformed))
@@ -1877,10 +1860,8 @@ fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transf
 /// then casts the literal (arrow supports List → Large/FixedSizeList), so no
 /// physical-planning mismatch — the variant only matters for element type.
 fn pg_list_literal(arg: &Expr, elem_type: &DataType) -> Option<ScalarValue> {
-    let Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) = arg else {
-        return None;
-    };
-    let vals: Vec<ScalarValue> = parse_pg_string_array(s)?
+    let Expr::Literal(v, _) = arg else { return None };
+    let vals: Vec<ScalarValue> = parse_pg_string_array(utf8_scalar(v)?)?
         .into_iter()
         .map(|e| e.map_or_else(|| ScalarValue::try_from(elem_type).ok(), |s| ScalarValue::try_from_string(s, elem_type).ok()))
         .collect::<Option<_>>()?;
@@ -2751,29 +2732,22 @@ impl AnalyzerRule for ExistsInProjection {
 }
 
 fn rewrite_exprs(exprs: Vec<Expr>) -> Result<(Vec<Expr>, bool)> {
-    let mut any = false;
-    let rewritten = exprs
-        .into_iter()
-        .map(|expr| {
-            // `transform_up` so a nested EXISTS is rewritten before its parent
-            // is inspected; `Alias` nodes must survive untouched or the
-            // projection's output column names change.
-            expr.transform_up(|expr| match expr {
-                Expr::Exists(exists) => {
-                    any = true;
-                    Ok(Transformed::yes(match count_subquery(exists.subquery)? {
-                        Some(count) if exists.negated => count.eq(lit(0_i64)),
-                        Some(count) => count.gt(lit(0_i64)),
-                        // Provably empty subquery: EXISTS is a constant.
-                        None => lit(exists.negated),
-                    }))
-                }
-                other => Ok(Transformed::no(other)),
-            })
-            .map(|transformed| transformed.data)
+    // `transform_up` so a nested EXISTS is rewritten before its parent is
+    // inspected; `Alias` nodes must survive untouched or the projection's
+    // output column names change. The collected `transformed` flag is the
+    // "did anything change" answer — no separate accumulator.
+    let Transformed { data, transformed, .. } = exprs.into_iter().map_until_stop_and_collect(|expr| {
+        expr.transform_up(|expr| match expr {
+            Expr::Exists(exists) => Ok(Transformed::yes(match count_subquery(exists.subquery)? {
+                Some(count) if exists.negated => count.eq(lit(0_i64)),
+                Some(count) => count.gt(lit(0_i64)),
+                // Provably empty subquery: EXISTS is a constant.
+                None => lit(exists.negated),
+            })),
+            other => Ok(Transformed::no(other)),
         })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((rewritten, any))
+    })?;
+    Ok((data, transformed))
 }
 
 /// `q` → scalar subquery `SELECT count(1) FROM q`, keeping the outer
@@ -2799,23 +2773,23 @@ fn count_subquery(subquery: Subquery) -> Result<Option<Expr>> {
 /// keeps its Limit and simply fails to plan, as it does today.
 ///
 /// Returns `None` for `LIMIT 0`, which can never produce a row.
-fn peel_row_caps(mut plan: LogicalPlan) -> Option<LogicalPlan> {
-    while let LogicalPlan::Limit(limit) = &plan {
-        if limit.skip.as_deref().is_some_and(|skip| literal_count(skip) != Some(0)) {
-            break;
+fn peel_row_caps(plan: LogicalPlan) -> Option<LogicalPlan> {
+    match plan {
+        // A non-zero OFFSET is not peelable, so it falls through to `other`.
+        LogicalPlan::Limit(limit) if limit.skip.as_deref().is_none_or(|skip| literal_count(skip) == Some(0)) => {
+            if limit.fetch.as_deref().and_then(literal_count) == Some(0) {
+                return None; // LIMIT 0 can never produce a row
+            }
+            peel_row_caps(Arc::unwrap_or_clone(limit.input))
         }
-        if limit.fetch.as_deref().and_then(literal_count) == Some(0) {
-            return None;
-        }
-        plan = Arc::unwrap_or_clone(limit.input.clone());
+        other => Some(other),
     }
-    Some(plan)
 }
 
 fn literal_count(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Literal(value, ..) => value.cast_to(&datafusion::arrow::datatypes::DataType::Int64).ok().and_then(|value| match value {
-            datafusion::scalar::ScalarValue::Int64(count) => count,
+        Expr::Literal(value, ..) => value.cast_to(&DataType::Int64).ok().and_then(|value| match value {
+            ScalarValue::Int64(count) => count,
             _ => None,
         }),
         _ => None,
@@ -3398,7 +3372,7 @@ mod dedup_needs_ordered_input_tests {
 use datafusion::logical_expr::{Filter, SubqueryAlias, utils::split_conjunction};
 
 /// Branches a wide aggregate window is split into. `<2` disables the rule.
-static RANGE_SPLIT_BRANCHES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static RANGE_SPLIT_BRANCHES: OnceLock<usize> = OnceLock::new();
 
 pub fn range_split_branches() -> usize {
     *RANGE_SPLIT_BRANCHES.get_or_init(|| 4)
@@ -3592,7 +3566,7 @@ fn narrow_scan_window(plan: &LogicalPlan, lo: i64, hi: i64) -> Option<LogicalPla
             // A non-microsecond timestamp declines the whole rewrite.
             let field = scan.projected_schema.field_with_unqualified_name("timestamp").ok()?;
             let timezone = match field.data_type() {
-                arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, timezone) => timezone.clone(),
+                DataType::Timestamp(TimeUnit::Microsecond, timezone) => timezone.clone(),
                 _ => return None,
             };
             let literal = |micros| Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), timezone.clone()), None);
@@ -3793,7 +3767,7 @@ impl PhysicalOptimizerRule for AggregateInputOrdering {
             if downcast::<SortExec>(plan.as_ref()).is_some() || downcast::<UnorderedAggregateInput>(plan.as_ref()).is_some() {
                 return false;
             }
-            downcast::<DedupExec>(plan.as_ref()).is_some() || plan.children().iter().any(|child| relies_on_storage_order(child))
+            downcast::<DedupExec>(plan.as_ref()).is_some() || plan.children().into_iter().any(relies_on_storage_order)
         }
         plan.transform_up(|node| {
             if downcast::<datafusion::physical_plan::aggregates::AggregateExec>(node.as_ref()).is_some() {
