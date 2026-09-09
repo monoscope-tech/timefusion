@@ -1900,3 +1900,30 @@ Worth watching rather than fixing: recent partitions ARE re-partialized by
 compaction, as Sep 9 going from 33 covered to 1 shows. If a recent date is
 observed sitting in the degraded regime persistently rather than passing
 through it, this decision should be revisited with that evidence.
+
+### Knobs applied, and a correction to the cadence model — 2026-09-09 18:40 UTC
+
+TIMEFUSION_TANTIVY_BUILD_CONCURRENCY is now 4 and
+TIMEFUSION_TANTIVY_BACKFILL_MAX_BYTES_PER_PASS_MB is now 4096, set through the
+CapRover app definition with every other field passed through unchanged. The
+app restarted on the same digest, f007af8f, and converged to 1/1.
+
+The effect is measured. The 18:04:20 pass planned 48 files and 3,653 MB
+against budget_mb = 4096, where the 17:00 pass planned 31 files and 1,977 MB
+against 2,048. Completed builds ran 21 in the first 24 minutes and 28 in 35
+minutes, so roughly 48 to 52 per hour against the previous 33. Whole-process
+memory stayed at 61.6 GiB of the 120 GiB cap, with jemalloc allocated_mb at
+61,586, so doubling concurrency did not approach the OOM ceiling.
+
+The earlier statement that coverage rate is min(build rate, budget x cadence)
+was wrong, and it understated what faster builds are worth. The tick is not
+hourly. Ticks arrived at 18:15:18 and 18:30:14 while the 18:04 pass was still
+running and both logged tantivy_backfill_already_active, because a semaphore
+drops any tick that lands inside an active pass. Throughput is therefore
+budget per PASS DURATION, and a pass that finishes sooner is followed by
+another pass sooner.
+
+So the full-index rebuild work on 548920d1, which projects only indexed
+columns and prepares variants once per batch, converts directly into coverage
+rate rather than merely creating idle headroom. Its end-to-end speedup is
+still unmeasured, and that measurement is what should decide whether it ships.
