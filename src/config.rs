@@ -1024,8 +1024,23 @@ pub struct TantivyConfig {
     /// cannot fix that ordering; only a reservation can.
     ///
     /// Carved OUT of the cap, never added to it, so pass cost is unchanged.
-    /// 0 restores pure newest-first.
-    #[serde_inline_default(33)]
+    ///
+    /// DEFAULT 0 since 2026-09-09: the premise above no longer holds. That
+    /// measurement predates `skip_today`, which now drops today's partition
+    /// from the queue BEFORE this split runs, so the 624 hot files that once
+    /// buried the cap are never in it. Recent data is what every dashboard
+    /// queries and what maintenance should reach first, so the pass is pure
+    /// newest-first over everything except today.
+    ///
+    /// Measured cost of the old default, prod 2026-09-09: with a third of each
+    /// pass spent on mid-August, the unified project's Sep 1-7 gained ZERO
+    /// physical hash coverage across two 76- and 82-minute windows, while
+    /// fleet throughput rose 1.6x from a concurrency and budget raise. The
+    /// dashboard band is reached by ordering, not by throughput.
+    ///
+    /// Raise it again if the oldest files are observed frozen while newer ones
+    /// converge — that is the starvation this exists to prevent.
+    #[serde_inline_default(0)]
     pub timefusion_tantivy_backfill_tail_share_pct: u8,
     /// Skip TODAY's date partition in the backfill queue.
     ///
@@ -3128,6 +3143,18 @@ mod tests {
         // orders of magnitude throttled the cheap tables to protect the
         // expensive one. See the field's own comment.
         assert_eq!(cfg.timefusion_tantivy_backfill_max_files_per_pass, 320);
+
+        // The backfill order policy, as a pair: recent data first, today
+        // excluded. Neither half is safe alone. Pure newest-first WITHOUT
+        // `skip_today` is the 2026-08-22 starvation the reservation was added
+        // to fix, because today's churn refills faster than a pass drains it;
+        // a reservation WITH `skip_today` spends a third of every pass on the
+        // oldest files while the dashboard window it is meant to serve gains
+        // nothing (prod 2026-09-09: Sep 1-7 gained zero coverage over two
+        // consecutive hours). Changing either default alone reintroduces one
+        // of those two failures.
+        assert_eq!(cfg.timefusion_tantivy_backfill_tail_share_pct, 0);
+        assert!(cfg.timefusion_tantivy_backfill_skip_today);
 
         let derived = TantivyConfig::default();
         assert!(!derived.seed_cache_on_publish(), "derived Default really does diverge — that is why this test exists");
