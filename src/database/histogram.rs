@@ -30,22 +30,106 @@ struct CachedDelta {
     reservation: datafusion::execution::memory_pool::MemoryReservation,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct VisibilityCacheKey {
+    delta: DeltaCacheKey,
+    bounds: std::ops::Range<i64>,
+    tombstone: Option<String>,
+}
+
+impl VisibilityCacheKey {
+    /// Account retained identity as well as bitmaps. Hash-table buckets use a
+    /// conservative allowance for spare capacity and control bytes.
+    fn retained_bytes(&self) -> Result<usize> {
+        let mut bytes = [
+            std::mem::size_of::<Self>(),
+            self.delta.root.as_str().len(),
+            std::mem::size_of_val(self.delta.files.as_slice()),
+            std::mem::size_of_val(self.delta.keys.as_slice()),
+            self.delta.tiebreak.as_ref().map_or(0, String::capacity),
+            self.tombstone.as_ref().map_or(0, String::capacity),
+        ]
+        .into_iter()
+        .chain(self.delta.keys.iter().map(String::capacity))
+        .chain(self.delta.schema.fields().iter().map(|field| field.size()))
+        .chain(self.delta.schema.metadata().iter().flat_map(|(key, value)| [key.capacity(), value.capacity()]))
+        .try_fold(0_usize, usize::checked_add)
+        .context("visibility identity size overflow")?;
+        for file in &self.delta.files {
+            let buckets = file
+                .partition_values
+                .capacity()
+                .checked_mul(2 * (std::mem::size_of::<(String, Option<String>)>() + 1))
+                .context("visibility partition capacity overflow")?;
+            bytes = [file.path.capacity(), buckets, file.deletion_vector.as_ref().map_or(0, |dv| dv.path_or_inline_dv.capacity())]
+                .into_iter()
+                .chain(file.partition_values.iter().flat_map(|(key, value)| [key.capacity(), value.as_ref().map_or(0, String::capacity)]))
+                .try_fold(bytes, usize::checked_add)
+                .context("visibility file identity size overflow")?;
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug)]
+struct CapturedDeltaMasks {
+    masks: Vec<arrow::buffer::BooleanBuffer>,
+    reservation: datafusion::execution::memory_pool::MemoryReservation,
+}
+
+#[derive(Debug)]
+enum HistogramCacheEntry {
+    Rows(Arc<CachedDelta>),
+    Visibility { key: Box<VisibilityCacheKey>, masks: Arc<CapturedDeltaMasks> },
+}
+
+impl HistogramCacheEntry {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Rows(rows) => rows.reservation.size(),
+            Self::Visibility { masks, .. } => masks.reservation.size(),
+        }
+    }
+
+    fn same_snapshot(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Rows(a), Self::Rows(b)) => a.key == b.key,
+            (Self::Visibility { key: a, .. }, Self::Visibility { key: b, .. }) => a == b,
+            (Self::Rows(_), Self::Visibility { .. }) | (Self::Visibility { .. }, Self::Rows(_)) => false,
+        }
+    }
+}
+
 /// Small resident LRU. Eviction releases its ownership, while captured queries
 /// retain the entry and its memory-pool reservation until execution finishes.
 #[derive(Debug, Default)]
 pub(super) struct HistogramDeltaCache {
-    entries: parking_lot::Mutex<std::collections::VecDeque<Arc<CachedDelta>>>,
+    entries: parking_lot::Mutex<std::collections::VecDeque<HistogramCacheEntry>>,
 }
 
 impl HistogramDeltaCache {
     const MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
 
     fn get(&self, key: &DeltaCacheKey) -> Option<Arc<CachedDelta>> {
+        self.lookup(|entry| match entry {
+            HistogramCacheEntry::Rows(rows) => (rows.key == *key).then(|| rows.clone()),
+            HistogramCacheEntry::Visibility { .. } => None,
+        })
+    }
+
+    fn visibility(&self, key: &VisibilityCacheKey) -> Option<Arc<CapturedDeltaMasks>> {
+        self.lookup(|entry| match entry {
+            HistogramCacheEntry::Visibility { key: candidate, masks } => (candidate.as_ref() == key).then(|| masks.clone()),
+            HistogramCacheEntry::Rows(_) => None,
+        })
+    }
+
+    fn lookup<T>(&self, find: impl Fn(&HistogramCacheEntry) -> Option<Arc<T>>) -> Option<Arc<T>> {
         let mut entries = self.entries.lock();
-        let position = entries.iter().position(|entry| entry.key == *key)?;
+        let (position, value) = entries.iter().enumerate().find_map(|(position, entry)| find(entry).map(|value| (position, value)))?;
         let entry = entries.remove(position)?;
-        entries.push_back(entry.clone());
-        Some(entry)
+        entries.push_back(entry);
+        Some(value)
     }
 
     fn reserve(
@@ -67,17 +151,21 @@ impl HistogramDeltaCache {
     }
 
     fn insert(&self, entry: Arc<CachedDelta>) {
-        let size = entry.reservation.size();
+        self.insert_entry(HistogramCacheEntry::Rows(entry));
+    }
+
+    fn insert_entry(&self, entry: HistogramCacheEntry) {
+        let size = entry.bytes();
         if size > Self::MAX_RESIDENT_BYTES {
             return;
         }
         let mut entries = self.entries.lock();
         // Concurrent builders can finish the same snapshot. Keep only one resident copy.
-        entries.retain(|existing| existing.key != entry.key);
-        let mut resident: usize = entries.iter().map(|entry| entry.reservation.size()).sum();
+        entries.retain(|existing| !existing.same_snapshot(&entry));
+        let mut resident: usize = entries.iter().map(HistogramCacheEntry::bytes).sum();
         while resident > Self::MAX_RESIDENT_BYTES - size || entries.len() >= 32 {
             let Some(oldest) = entries.pop_front() else { break };
-            resident -= oldest.reservation.size();
+            resident -= oldest.bytes();
         }
         entries.push_back(entry);
     }
@@ -292,10 +380,151 @@ impl CapturedHistogram {
         Ok(total)
     }
 
+    fn visibility_cache_key(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<VisibilityCacheKey>> {
+        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
+        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
+        if self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) {
+            return Ok(None);
+        }
+        for batch in &self.memory.batches {
+            if histogram_timestamps(batch)?.iter().any(|&timestamp| timestamp >= lo && timestamp < hi) {
+                return Ok(None);
+            }
+        }
+        let (start, end) = self.window.bounds();
+        Ok(Some(VisibilityCacheKey {
+            delta: DeltaCacheKey {
+                root: self.log_store.root_url().clone(),
+                files: files.to_vec(),
+                schema: self.projected.clone(),
+                keys: self.keys.clone(),
+                tiebreak: self.tiebreak.clone(),
+            },
+            bounds: start.max(lo)..end.min(hi),
+            tombstone: self.tombstone.clone(),
+        }))
+    }
+
+    async fn prepare_file(
+        &self, file: &SnapshotFile,
+    ) -> Result<(Arc<crate::tantivy::visibility::PreparedFileRows>, Arc<datafusion::execution::memory_pool::MemoryReservation>)> {
+        self.search.stats.histogram_parquet_prepares.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("timefusion_tantivy_histogram_parquet_prepares_total").increment(1);
+        let file = Arc::new(crate::tantivy::visibility::PreparedFileRows::open(self.log_store.clone(), file).await?);
+        let owner = Arc::new(self.cache.reserve(file.retained_bytes()?, self.context.memory_pool())?);
+        Ok((file, owner))
+    }
+
     async fn count_streaming_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<HistogramSnapshotResult> {
-        use crate::tantivy::visibility::{FileVisibilitySource, PreparedFileRows, VisibilityFiles, lineage_batch, lineage_schema, stream_winner_masks};
-        use datafusion::physical_plan::{streaming::StreamingTableExec, union::UnionExec};
         use futures::TryStreamExt;
+
+        let key = self.visibility_cache_key(day, files)?;
+        let cached = key.as_ref().and_then(|key| self.cache.visibility(key));
+        let (delta, memory, _memory_owner, prepared) = match cached {
+            Some(delta) => {
+                self.search.stats.histogram_delta_cache_hits.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("timefusion_tantivy_histogram_delta_cache_hits_total").increment(1);
+                let rows =
+                    self.memory.batches.iter().map(RecordBatch::num_rows).try_fold(0_usize, usize::checked_add).context("memory visibility row overflow")?;
+                let owner = self.cache.reserve(rows.div_ceil(8), self.context.memory_pool())?;
+                let memory = arrow::buffer::BooleanBuffer::new_unset(rows);
+                owner.try_resize(memory.inner().capacity())?;
+                (delta, memory, owner, None)
+            }
+            None => {
+                let mut prepared = Vec::with_capacity(files.len());
+                for file in files {
+                    prepared.push(self.prepare_file(file).await?);
+                }
+                let mut masks = self.stream_partition_masks(day, &prepared).await?;
+                let memory = masks.pop().context("missing memory winner mask")?;
+                let owner = self.cache.reserve(memory.inner().capacity(), self.context.memory_pool())?;
+                let header = masks
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<arrow::buffer::BooleanBuffer>())
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CapturedDeltaMasks>() + 2 * std::mem::size_of::<usize>()))
+                    .context("histogram mask capacity overflow")?;
+                let bytes = masks.iter().map(|mask| mask.inner().capacity()).try_fold(header, usize::checked_add).context("histogram mask size overflow")?;
+                let bytes = bytes
+                    .checked_add(key.as_ref().map(VisibilityCacheKey::retained_bytes).transpose()?.unwrap_or(0))
+                    .context("visibility cache size overflow")?;
+                let reservation = self.cache.reserve(bytes, self.context.memory_pool())?;
+                let delta = Arc::new(CapturedDeltaMasks { masks, reservation });
+                if let Some(key) = key {
+                    self.cache.insert_entry(HistogramCacheEntry::Visibility { key: Box::new(key), masks: delta.clone() });
+                }
+                (delta, memory, owner, Some(prepared))
+            }
+        };
+        let entries = self.manifest.histogram_entries(&self.root, files)?;
+        let mut result = HistogramSnapshotResult::default();
+        for (index, file) in files.iter().enumerate() {
+            let indexed = match &entries[index] {
+                Some(entry) => {
+                    self.search
+                        .histogram_file(
+                            &self.table,
+                            &self.project,
+                            self.window,
+                            self.membership.as_ref(),
+                            HistogramFile {
+                                table_root: &self.root,
+                                manifest_key: entry.key,
+                                entry: entry.entry,
+                                source_file: &file.path,
+                                visible: delta.masks[index].clone(),
+                            },
+                        )
+                        .await
+                }
+                None => Err(anyhow::anyhow!("snapshot file has no histogram index")),
+            };
+            let counts = match indexed {
+                Ok(counts) => {
+                    result.indexed_sources += 1;
+                    counts
+                }
+                Err(error) => {
+                    result.index_errors.push(error);
+                    result.scanned_sources += 1;
+                    // A cached mask already pins physical row identity. Read
+                    // Parquet only when this source cannot use its index.
+                    let (file, _owner) = match &prepared {
+                        Some(prepared) => prepared[index].clone(),
+                        None => self.prepare_file(file).await?,
+                    };
+                    let mut counts = std::collections::BTreeMap::<i64, u64>::new();
+                    let mut rows = file.stream(self.projected.clone())?;
+                    let mut offset = 0;
+                    while let Some(batch) = rows.try_next().await? {
+                        let bytes = batch.get_array_memory_size();
+                        ensure!(bytes <= self.max_decoded_bytes, "histogram fallback batch exceeds decoded budget");
+                        let _owner = self.cache.reserve(bytes, self.context.memory_pool())?;
+                        let visible = delta.masks[index].slice(offset, batch.num_rows());
+                        crate::tantivy::histogram::merge_counts(
+                            &mut counts,
+                            self.window.count_rows(std::slice::from_ref(&batch), &visible, self.membership.as_ref())?,
+                        )?;
+                        offset += batch.num_rows();
+                    }
+                    counts
+                }
+            };
+            crate::tantivy::histogram::merge_counts(&mut result.counts, counts)?;
+        }
+        crate::tantivy::histogram::merge_counts(&mut result.counts, self.window.count_rows(&self.memory.batches, &memory, self.membership.as_ref())?)?;
+        if !self.memory.batches.is_empty() {
+            result.scanned_sources += 1;
+        }
+        TantivySearchService::record_histogram_snapshot(&self.search.stats);
+        Ok(result)
+    }
+
+    async fn stream_partition_masks(
+        &self, day: i64, prepared: &[(Arc<crate::tantivy::visibility::PreparedFileRows>, Arc<datafusion::execution::memory_pool::MemoryReservation>)],
+    ) -> Result<Vec<arrow::buffer::BooleanBuffer>> {
+        use crate::tantivy::visibility::{FileVisibilitySource, VisibilityFiles, lineage_batch, lineage_schema, stream_winner_masks};
+        use datafusion::physical_plan::{streaming::StreamingTableExec, union::UnionExec};
 
         let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
         let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
@@ -305,26 +534,21 @@ impl CapturedHistogram {
         let narrow = Arc::new(self.projected.project(&projection)?);
         let schema = lineage_schema(&narrow)?;
         let ranges = Arc::new(self.memory.covered_ranges.clone());
-        let mut prepared = Vec::new();
-        let mut owners = Vec::new();
-        let mut partitions = Vec::new();
-        let mut source_rows = Vec::new();
-        for (source, file) in files.iter().enumerate() {
-            let file = Arc::new(PreparedFileRows::open(self.log_store.clone(), file).await?);
-            let owner = Arc::new(self.cache.reserve(file.retained_bytes()?, self.context.memory_pool())?);
-            source_rows.push(file.live().len());
-            partitions.push(FileVisibilitySource {
-                file: file.clone(),
-                schema: schema.clone(),
-                source: u32::try_from(source)?,
-                covered_ranges: ranges.clone(),
-                partition: (lo, hi),
-                max_batch_bytes: self.max_decoded_bytes,
-                owner: owner.clone(),
-            });
-            prepared.push(file);
-            owners.push(owner);
-        }
+        let partitions = prepared
+            .iter()
+            .enumerate()
+            .map(|(source, (file, owner))| {
+                Ok(FileVisibilitySource {
+                    file: file.clone(),
+                    schema: schema.clone(),
+                    source: u32::try_from(source)?,
+                    covered_ranges: ranges.clone(),
+                    partition: (lo, hi),
+                    max_batch_bytes: self.max_decoded_bytes,
+                    owner: owner.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut memory = Vec::new();
         let mut offset = 0_usize;
         for batch in &self.memory.batches {
@@ -343,10 +567,10 @@ impl CapturedHistogram {
                 .collect::<Result<Vec<_>>>()?;
             let batch = RecordBatch::try_new(narrow.clone(), arrays)?;
             let live = arrow::buffer::BooleanBuffer::from_iter(histogram_timestamps(&batch)?.iter().map(|&t| t >= lo && t < hi));
-            memory.push(lineage_batch(&batch, &live, schema.clone(), u32::try_from(files.len())?, offset)?);
+            memory.push(lineage_batch(&batch, &live, schema.clone(), u32::try_from(prepared.len())?, offset)?);
             offset = offset.checked_add(batch.num_rows()).context("memory visibility row overflow")?;
         }
-        source_rows.push(offset);
+        let source_rows = prepared.iter().map(|(file, _)| file.live().len()).chain(std::iter::once(offset)).collect();
         let memory_bytes =
             memory.iter().map(RecordBatch::get_array_memory_size).try_fold(0_usize, usize::checked_add).context("memory visibility size overflow")?;
         let _memory_owner = self.cache.reserve(memory_bytes, self.context.memory_pool())?;
@@ -377,68 +601,7 @@ impl CapturedHistogram {
         } else {
             input
         };
-        let masks = stream_winner_masks(input, source_rows, &self.keys, self.tiebreak.as_deref(), self.tombstone.as_deref(), self.context.clone()).await?;
-        let mask_bytes = masks.iter().map(|mask| mask.inner().capacity()).try_fold(0_usize, usize::checked_add).context("histogram mask size overflow")?;
-        let _mask_owner = self.cache.reserve(mask_bytes, self.context.memory_pool())?;
-        let entries = self.manifest.histogram_entries(&self.root, files)?;
-        let mut result = HistogramSnapshotResult::default();
-        for (index, file) in prepared.iter().enumerate() {
-            let indexed = match &entries[index] {
-                Some(entry) => {
-                    self.search
-                        .histogram_file(
-                            &self.table,
-                            &self.project,
-                            self.window,
-                            self.membership.as_ref(),
-                            HistogramFile {
-                                table_root: &self.root,
-                                manifest_key: entry.key,
-                                entry: entry.entry,
-                                source_file: &files[index].path,
-                                visible: masks[index].clone(),
-                            },
-                        )
-                        .await
-                }
-                None => Err(anyhow::anyhow!("snapshot file has no histogram index")),
-            };
-            let counts = match indexed {
-                Ok(counts) => {
-                    result.indexed_sources += 1;
-                    counts
-                }
-                Err(error) => {
-                    result.index_errors.push(error);
-                    result.scanned_sources += 1;
-                    let mut counts = std::collections::BTreeMap::<i64, u64>::new();
-                    let mut rows = file.stream(self.projected.clone())?;
-                    let mut offset = 0;
-                    while let Some(batch) = rows.try_next().await? {
-                        let bytes = batch.get_array_memory_size();
-                        ensure!(bytes <= self.max_decoded_bytes, "histogram fallback batch exceeds decoded budget");
-                        let _owner = self.cache.reserve(bytes, self.context.memory_pool())?;
-                        let visible = masks[index].slice(offset, batch.num_rows());
-                        crate::tantivy::histogram::merge_counts(
-                            &mut counts,
-                            self.window.count_rows(std::slice::from_ref(&batch), &visible, self.membership.as_ref())?,
-                        )?;
-                        offset += batch.num_rows();
-                    }
-                    counts
-                }
-            };
-            crate::tantivy::histogram::merge_counts(&mut result.counts, counts)?;
-        }
-        crate::tantivy::histogram::merge_counts(
-            &mut result.counts,
-            self.window.count_rows(&self.memory.batches, masks.last().context("missing memory winner mask")?, self.membership.as_ref())?,
-        )?;
-        if !self.memory.batches.is_empty() {
-            result.scanned_sources += 1;
-        }
-        TantivySearchService::record_histogram_snapshot(&self.search.stats);
-        Ok(result)
+        stream_winner_masks(input, source_rows, &self.keys, self.tiebreak.as_deref(), self.tombstone.as_deref(), self.context.clone()).await
     }
 
     async fn count_empty_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
@@ -1078,12 +1241,45 @@ mod tests {
         assert_eq!(result.counts.values().sum::<u64>(), 64);
         assert_eq!(result.scanned_sources, 0, "wide hashes stay in the index during version resolution");
         db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![wide_row(1, "b")])?], true, None).await?;
-        let partial = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context.clone()).await?;
+        let mut partial = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context.clone()).await?;
         let result = partial.count_streaming().await?;
         assert_eq!(result.counts.values().sum::<u64>(), 63, "an unindexed replacement must suppress its indexed old version");
         assert_eq!(result.scanned_sources, 1);
+        let cache_hits = search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
+        let prepares = search.stats.histogram_parquet_prepares.load(Ordering::Relaxed);
+        assert_eq!(partial.count_streaming().await?.counts, result.counts, "repeated partial histograms preserve exact buckets");
+        assert_eq!(search.stats.histogram_parquet_prepares.load(Ordering::Relaxed) - prepares, 1, "only the unindexed replacement needs Parquet metadata");
+        assert!(
+            search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed) > cache_hits,
+            "repeated streaming histograms must reuse captured Delta visibility"
+        );
+        let saved_memory = std::mem::take(&mut partial.memory);
+        for (id, tag, deleted, expected) in [(66, hash.as_str(), false, 64), (2, "b", false, 62), (2, hash.as_str(), true, 62)] {
+            let mut record = wide_row(id, tag);
+            record["updated_at"] = serde_json::json!(chrono::Utc::now().timestamp_micros() + DAY_MICROS);
+            record["deleted"] = serde_json::json!(deleted);
+            partial.memory.batches = vec![json_to_batch_for(table, vec![record])?];
+            let before = search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
+            assert_eq!(partial.count_streaming().await?.counts.values().sum::<u64>(), expected, "fresh memory insert/update/delete overrides cached Delta");
+            assert_eq!(search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed), before, "overlapping memory must decline cached masks");
+        }
+        partial.memory.batches.clear();
+        partial.memory.covered_ranges = vec![(wide_timestamp, wide_timestamp + 1)];
+        assert!(partial.count_streaming().await?.counts.is_empty(), "covered memory ranges suppress Delta even without surviving memory rows");
+        partial.memory.covered_ranges.clear();
+        for rows in 1..=2 {
+            let mut record = wide_row(66, &hash);
+            record["timestamp"] = serde_json::json!(wide_timestamp + DAY_MICROS);
+            partial.memory.batches = vec![json_to_batch_for(table, vec![record; rows])?];
+            let before = search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
+            assert_eq!(partial.count_streaming().await?.counts, result.counts, "unrelated memory has a fresh correctly sized mask");
+            assert!(search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed) > before);
+        }
+        partial.memory = saved_memory;
         assert_eq!(wide.count_streaming().await?.counts.values().sum::<u64>(), 64, "later writes cannot replace captured sources");
-        assert_eq!(pool.reserved(), 0, "streaming query reservations must release after counting");
+        assert!(pool.reserved() > 0, "resident streamed masks must remain charged after execution");
+        drop(wide.cache.reserve(32 * 1024 * 1024, &pool)?);
+        assert_eq!(pool.reserved(), 0, "pressure must release unpinned cached masks");
         // Irrelevant keys in the same day must not consume the query's sort
         // budget. Keep a partial index and the same one-microsecond window.
         let outside_timestamp = wide_timestamp.div_euclid(DAY_MICROS) * DAY_MICROS + (wide_timestamp.rem_euclid(DAY_MICROS) + 1) % DAY_MICROS;
@@ -1098,7 +1294,8 @@ mod tests {
         db.insert_records_batch(&project, table, vec![json_to_batch_for(table, records)?], true, None).await?;
         let narrow = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context).await?;
         assert_eq!(narrow.count_streaming().await?.counts.values().sum::<u64>(), 63, "out-of-window keys must not force a daily sort or spill");
-        assert_eq!(pool.reserved(), 0);
+        drop(narrow.cache.reserve(32 * 1024 * 1024, &pool)?);
+        assert_eq!(pool.reserved(), 0, "narrow-window cache reservations release after eviction");
         // Removing the superseded physical row makes the partition unique.
         // The same Parquet paths now have a different DV identity.
         let mut table_guard = table_ref.write().await;
@@ -1210,6 +1407,33 @@ mod tests {
         assert!(cache.get(&next).is_none(), "memory pressure must evict unpinned cache ownership");
         drop(pressure);
         drop(cache);
+        assert_eq!(pool.reserved(), 0);
+        let cache = HistogramDeltaCache::default();
+        let visibility = VisibilityCacheKey { delta: key, bounds: 0..2, tombstone: None };
+        let masks = Arc::new(CapturedDeltaMasks { masks: vec![], reservation: cache.reserve(64, &pool)? });
+        cache.insert_entry(HistogramCacheEntry::Visibility { key: Box::new(visibility.clone()), masks: masks.clone() });
+        assert!(Arc::ptr_eq(&cache.visibility(&visibility).context("same visibility identity must hit")?, &masks));
+        for field in 0..4 {
+            let mut changed = visibility.clone();
+            match field {
+                0 => changed.bounds.start += 1,
+                1 => changed.bounds.end += 1,
+                2 => changed.tombstone = Some("deleted".into()),
+                _ => {
+                    changed.delta.files[0].deletion_vector = Some(deltalake::kernel::DeletionVectorDescriptor {
+                        storage_type: deltalake::kernel::StorageType::UuidRelativePath,
+                        path_or_inline_dv: "new-dv".into(),
+                        offset: Some(0),
+                        size_in_bytes: 8,
+                        cardinality: 1,
+                    })
+                }
+            }
+            assert!(cache.visibility(&changed).is_none(), "visibility identity field {field} must invalidate reuse");
+        }
+        drop(cache);
+        assert_eq!(pool.reserved(), 64, "captured visibility retains its pool ownership after eviction");
+        drop(masks);
         assert_eq!(pool.reserved(), 0);
         Ok(())
     }

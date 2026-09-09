@@ -1,0 +1,18 @@
+{
+  "at": "2026-09-09T14:53:49.189088+00:00",
+  "container": "6722ae2dc2e1",
+  "database_host_pid": 1079501,
+  "event": "cpu-clock",
+  "frequency_hz": 49,
+  "requested_seconds": 10,
+  "samples": 10169,
+  "lost_samples": 0,
+  "capture_bytes": 5405670,
+  "inclusive_observations_percent": {
+    "dedup_partition_range_limited": 52.37,
+    "coordinator_compaction_selected": 10.54,
+    "coordinator_rollup_selected": 10.18,
+    "tantivy_IndexMerger_write": 8.9
+  },
+  "limitations": "Whole database process under live ingestion and maintenance. Inclusive stacks overlap and percentages must not be summed. No per-query or per-file attribution. Initial attempt targeted docker-init and captured no CPU samples; that attempt is not performance evidence."
+}

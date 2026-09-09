@@ -47,6 +47,7 @@ use crate::tantivy::{
 pub struct SearchStats {
     pub histogram_snapshots: AtomicU64,
     pub histogram_delta_cache_hits: AtomicU64,
+    pub histogram_parquet_prepares: AtomicU64,
     pub histogram_unique_partitions: AtomicU64,
     pub manifest_loads: AtomicU64,
     pub manifest_load_us: AtomicU64,

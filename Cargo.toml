@@ -178,6 +178,10 @@ harness = false
 name = "rewrite_throughput"
 harness = false
 
+[[bench]]
+name = "hash_histogram_sql"
+harness = false
+
 [features]
 default = []
 test = []

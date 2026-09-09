@@ -1,0 +1,248 @@
+{
+  "at": "2026-09-09T14:39:48.501966+00:00",
+  "delta_version": 557112,
+  "project": "00000000-0000-0000-0000-000000000000",
+  "missing_all": {
+    "files": 329,
+    "compressed_bytes": 16357392413,
+    "known_rows": 0,
+    "rows_unknown_files": 329,
+    "median_file_bytes": 6233793,
+    "largest_file_bytes": 272984333
+  },
+  "missing_sep2_8": {
+    "files": 208,
+    "compressed_bytes": 7389972212,
+    "known_rows": 0,
+    "rows_unknown_files": 208,
+    "median_file_bytes": 5901512.0,
+    "largest_file_bytes": 265761138
+  },
+  "missing_by_date": {
+    "2026-08-13": {
+      "files": 2,
+      "compressed_bytes": 279413173,
+      "known_rows": 0,
+      "rows_unknown_files": 2,
+      "median_file_bytes": 139706586.5,
+      "largest_file_bytes": 195117738
+    },
+    "2026-08-14": {
+      "files": 1,
+      "compressed_bytes": 237255926,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 237255926,
+      "largest_file_bytes": 237255926
+    },
+    "2026-08-15": {
+      "files": 1,
+      "compressed_bytes": 233461527,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 233461527,
+      "largest_file_bytes": 233461527
+    },
+    "2026-08-16": {
+      "files": 1,
+      "compressed_bytes": 271844398,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 271844398,
+      "largest_file_bytes": 271844398
+    },
+    "2026-08-17": {
+      "files": 1,
+      "compressed_bytes": 272285686,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 272285686,
+      "largest_file_bytes": 272285686
+    },
+    "2026-08-18": {
+      "files": 2,
+      "compressed_bytes": 277637882,
+      "known_rows": 0,
+      "rows_unknown_files": 2,
+      "median_file_bytes": 138818941.0,
+      "largest_file_bytes": 205641127
+    },
+    "2026-08-19": {
+      "files": 2,
+      "compressed_bytes": 271901327,
+      "known_rows": 0,
+      "rows_unknown_files": 2,
+      "median_file_bytes": 135950663.5,
+      "largest_file_bytes": 148910657
+    },
+    "2026-08-20": {
+      "files": 1,
+      "compressed_bytes": 268317102,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 268317102,
+      "largest_file_bytes": 268317102
+    },
+    "2026-08-21": {
+      "files": 1,
+      "compressed_bytes": 267308346,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 267308346,
+      "largest_file_bytes": 267308346
+    },
+    "2026-08-22": {
+      "files": 2,
+      "compressed_bytes": 269829327,
+      "known_rows": 0,
+      "rows_unknown_files": 2,
+      "median_file_bytes": 134914663.5,
+      "largest_file_bytes": 138030488
+    },
+    "2026-08-23": {
+      "files": 2,
+      "compressed_bytes": 270877319,
+      "known_rows": 0,
+      "rows_unknown_files": 2,
+      "median_file_bytes": 135438659.5,
+      "largest_file_bytes": 226780902
+    },
+    "2026-08-24": {
+      "files": 1,
+      "compressed_bytes": 269038444,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 269038444,
+      "largest_file_bytes": 269038444
+    },
+    "2026-08-25": {
+      "files": 2,
+      "compressed_bytes": 273329534,
+      "known_rows": 0,
+      "rows_unknown_files": 2,
+      "median_file_bytes": 136664767.0,
+      "largest_file_bytes": 158162800
+    },
+    "2026-08-26": {
+      "files": 1,
+      "compressed_bytes": 252097422,
+      "known_rows": 0,
+      "rows_unknown_files": 1,
+      "median_file_bytes": 252097422,
+      "largest_file_bytes": 252097422
+    },
+    "2026-08-27": {
+      "files": 4,
+      "compressed_bytes": 779980452,
+      "known_rows": 0,
+      "rows_unknown_files": 4,
+      "median_file_bytes": 218773694.0,
+      "largest_file_bytes": 272984333
+    },
+    "2026-08-28": {
+      "files": 4,
+      "compressed_bytes": 866585256,
+      "known_rows": 0,
+      "rows_unknown_files": 4,
+      "median_file_bytes": 239565378.5,
+      "largest_file_bytes": 250689513
+    },
+    "2026-08-29": {
+      "files": 4,
+      "compressed_bytes": 786204554,
+      "known_rows": 0,
+      "rows_unknown_files": 4,
+      "median_file_bytes": 227421916.0,
+      "largest_file_bytes": 262536574
+    },
+    "2026-08-30": {
+      "files": 4,
+      "compressed_bytes": 815408628,
+      "known_rows": 0,
+      "rows_unknown_files": 4,
+      "median_file_bytes": 242360837.5,
+      "largest_file_bytes": 264511154
+    },
+    "2026-08-31": {
+      "files": 3,
+      "compressed_bytes": 692090726,
+      "known_rows": 0,
+      "rows_unknown_files": 3,
+      "median_file_bytes": 252727748,
+      "largest_file_bytes": 256227578
+    },
+    "2026-09-01": {
+      "files": 14,
+      "compressed_bytes": 810174414,
+      "known_rows": 0,
+      "rows_unknown_files": 14,
+      "median_file_bytes": 63906784.5,
+      "largest_file_bytes": 209688479
+    },
+    "2026-09-02": {
+      "files": 26,
+      "compressed_bytes": 429265327,
+      "known_rows": 0,
+      "rows_unknown_files": 26,
+      "median_file_bytes": 5044944.0,
+      "largest_file_bytes": 68404043
+    },
+    "2026-09-03": {
+      "files": 21,
+      "compressed_bytes": 257588291,
+      "known_rows": 0,
+      "rows_unknown_files": 21,
+      "median_file_bytes": 768540,
+      "largest_file_bytes": 87391212
+    },
+    "2026-09-04": {
+      "files": 22,
+      "compressed_bytes": 768498972,
+      "known_rows": 0,
+      "rows_unknown_files": 22,
+      "median_file_bytes": 24525060.0,
+      "largest_file_bytes": 136361802
+    },
+    "2026-09-05": {
+      "files": 19,
+      "compressed_bytes": 810832101,
+      "known_rows": 0,
+      "rows_unknown_files": 19,
+      "median_file_bytes": 6178433,
+      "largest_file_bytes": 197000824
+    },
+    "2026-09-06": {
+      "files": 33,
+      "compressed_bytes": 3461676219,
+      "known_rows": 0,
+      "rows_unknown_files": 33,
+      "median_file_bytes": 6426083,
+      "largest_file_bytes": 265761138
+    },
+    "2026-09-07": {
+      "files": 31,
+      "compressed_bytes": 867764557,
+      "known_rows": 0,
+      "rows_unknown_files": 31,
+      "median_file_bytes": 3164092,
+      "largest_file_bytes": 259667068
+    },
+    "2026-09-08": {
+      "files": 56,
+      "compressed_bytes": 794346745,
+      "known_rows": 0,
+      "rows_unknown_files": 56,
+      "median_file_bytes": 3498112.5,
+      "largest_file_bytes": 264403181
+    },
+    "2026-09-09": {
+      "files": 68,
+      "compressed_bytes": 502378758,
+      "known_rows": 0,
+      "rows_unknown_files": 68,
+      "median_file_bytes": 3393911.5,
+      "largest_file_bytes": 61237529
+    }
+  },
+  "limitations": "Compressed file size is not projected column bytes or tokenization cost. Delta and manifest read independently; coverage metadata only."
+}

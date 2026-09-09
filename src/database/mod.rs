@@ -1024,7 +1024,7 @@ pub(crate) async fn ensure_table_properties(table: DeltaTable, desired: HashMap<
     if desired.iter().all(|(k, v)| current.get(k) == Some(v)) {
         return table;
     }
-    match table.clone().set_tbl_properties().with_properties(desired.clone()).await {
+    match table.clone().set_tbl_properties().with_properties(desired.clone()).with_commit_properties(base_commit_properties()).await {
         Ok(updated) => {
             info!("Reconciled table properties {desired:?}");
             updated
@@ -6075,7 +6075,7 @@ impl Database {
 
                 loop {
                     create_attempts += 1;
-                    let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
+                    let commit_properties = base_commit_properties();
                     let checkpoint_interval = self.config.parquet.timefusion_checkpoint_interval.to_string();
 
                     let mut config = HashMap::new();
@@ -20063,7 +20063,7 @@ mod tests {
     async fn ensure_deleted_file_retention_sets_property_once() -> Result<()> {
         const KEY: &str = "delta.deletedFileRetentionDuration";
         const CP_KEY: &str = "delta.checkpointInterval";
-        let props = |hours: u64| HashMap::from([(KEY.to_string(), format!("interval {hours} hours")), (CP_KEY.to_string(), "10".to_string())]);
+        let props = |hours: u64| HashMap::from([(KEY.to_string(), format!("interval {hours} hours")), (CP_KEY.to_string(), "1".to_string())]);
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///retention_tbl")?;
         let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem, url).build()?;
@@ -20073,7 +20073,7 @@ mod tests {
         let table = ensure_table_properties(table, props(24)).await;
         let config = table.snapshot()?.metadata().configuration().clone();
         assert_eq!(config.get(KEY).map(String::as_str), Some("interval 24 hours"));
-        assert_eq!(config.get(CP_KEY).map(String::as_str), Some("10"), "checkpoint interval retrofitted alongside");
+        assert_eq!(config.get(CP_KEY).map(String::as_str), Some("1"), "checkpoint interval retrofitted alongside");
         assert_eq!(table.version(), Some(1), "properties set in one commit");
 
         let table = ensure_table_properties(table, props(24)).await;
@@ -20083,6 +20083,8 @@ mod tests {
         let table = ensure_table_properties(table, props(48)).await;
         assert_eq!(table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str), Some("interval 48 hours"));
         assert_eq!(table.version(), Some(2));
+        let files: Vec<_> = table.log_store().object_store(None).list(None).try_collect().await?;
+        assert!(files.iter().all(|file| !file.location.as_ref().contains("checkpoint")), "table property reconciliation must leave checkpointing out of band");
         Ok(())
     }
 

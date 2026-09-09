@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-09T14:49:17.361642+00:00",
+  "command": "CARGO_TARGET_DIR=/Users/tonyalaribe/Projects/apitoolkit/timefusion/target cargo rustc --release --bench hash_histogram_sql -- -C strip=none",
+  "exit_code": 0,
+  "histogram_source_sha256": "b5e926ed3e5a248667caa7740b45e26218bc493639cbf9309d6d35b9d2ec8b70",
+  "benchmark_source_sha256": "f302b4d92eba606446eb02d666206a7d320a18b4bf7f45ece44f862231590bc0",
+  "binary": "target/release/deps/hash_histogram_sql-b0f1217e96d29072",
+  "build_log_tail": [
+    "   Compiling timefusion v0.1.0 (/Users/tonyalaribe/Projects/apitoolkit/timefusion)",
+    "    Finished `release` profile [optimized] target(s) in 23m 29s"
+  ],
+  "binary_sha256": "1a7aa91738ca638902b8d470844976d4dcd7969909858c96d7189c36f45602c6",
+  "preserved_binary": "/tmp/timefusion-first-visibility-cache-benchmark"
+}
