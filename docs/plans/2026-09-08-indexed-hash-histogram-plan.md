@@ -1845,3 +1845,58 @@ degrades to lost work and orphan blobs rather than wrong query results,
 because missing coverage falls back to scanning, but it would erase the very
 progress the drain intends to make. Both a conditional manifest write and a
 new subcommand would be required first.
+
+### Partial coverage is a pessimization, measured in production — 2026-09-09 18:35 UTC
+
+Correction first. An earlier note here said the native histogram route "has
+not executed once in production" because histogram_snapshots stayed 0. That
+reading was wrong. record_histogram_snapshot fires at the END of a partition,
+so a query cancelled at the statement timeout records its Parquet prepares
+and never reaches the snapshot counter. Prepares moving while snapshots stay
+0 means the route ran and did not finish, not that the route was skipped.
+
+Varying only the aggregate names the code path, and it produces a clear
+result. On the same one-hour window, same predicate, arms alternated across
+three repetitions with a twelve-second timeout:
+
+Sep 8, which has partial coverage of 21 of 73 live files, answered
+count(timestamp) in 899, 1,071 and 1,278 ms, and count(*) in 3,824, 5,114
+and 3,646 ms. The native route is 3.4 to 4.8 times SLOWER, in every
+alternation, and it exceeds the three-second dashboard bound while the
+ordinary scan stays under 1.3 seconds.
+
+Sep 2, which has no coverage at all, answered 539, 422 and 328 ms ordinary
+against 524, 523 and 298 ms native. Indistinguishable.
+
+So the penalty belongs to PARTIAL partition coverage specifically, not to
+missing coverage. This reproduces the local 3M benchmark, where partial warm
+native medians were 730-981 ms against ordinary 153-175 ms while complete
+warm native was 8-147 ms against ordinary 123-156 ms. Production shows a
+wider gap than the fixture did.
+
+The consequence matters more than the measurement. Every date passes through
+partial coverage on its way to complete coverage, so backfill drags each date
+through a regime where the chart query it is meant to accelerate is several
+times slower than it was before. Raising the backfill knobs at 18:00 UTC
+doubles the rate at which dates enter that regime. Sep 8 is in it now.
+
+A route gate conditional on complete partition coverage was considered and
+REJECTED. It would not help the queries this work exists to fix. Sep 6 and
+the Sep 2 to Sep 9 week exceed the three-second bound on count(timestamp)
+and count(*) alike, and Sep 6 has no coverage at all, so has_index is false
+and both aggregates already take the ordinary route. Its timeout is bytes,
+not routing. The penalty measured here applies only to a day that is midway
+through being indexed, and only at sub-day windows.
+
+That state is transient and self-healing. Sealed dates are indexed once and
+stay indexed, because compaction rewrites recent partitions rather than old
+ones, so each date leaves the degraded regime when its backfill completes and
+does not re-enter it. The correct response is to finish indexing those dates,
+which is the existing plan, not to add routing code that optimizes a few
+hours of transit on a path where a wrong-cost defect passes correctness
+tests unnoticed. No route behavior was changed by this reading.
+
+Worth watching rather than fixing: recent partitions ARE re-partialized by
+compaction, as Sep 9 going from 33 covered to 1 shows. If a recent date is
+observed sitting in the degraded regime persistently rather than passing
+through it, this decision should be revisited with that evidence.

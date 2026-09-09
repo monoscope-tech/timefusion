@@ -1,0 +1,18 @@
+{
+  "at": "2026-09-09T18:35:00+00:00",
+  "image": "ghcr.io/monoscope-tech/timefusion@sha256:f007af8f064b3a87c2a4828cc0889de119b2153cd09b1dd8b8894a8cce369556",
+  "method": "Same one-hour window, same predicate, arms alternated each repetition, 12s statement timeout, production pgwire.",
+  "query": "SELECT time_bucket('1 hour',timestamp), <aggregate> FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= <start> AND timestamp < <start>+1h AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+  "cases": [
+    {"date": "2026-09-08", "coverage": "partial: 21 of 73 live files carry physical hash candidates",
+     "ordinary_count_timestamp_ms": [898.519, 1071.464, 1277.969],
+     "native_count_star_ms": [3823.566, 5114.337, 3646.176],
+     "ratio_native_over_ordinary": "3.4x to 4.8x slower"},
+    {"date": "2026-09-02", "coverage": "none: 0 of 21 live files",
+     "ordinary_count_timestamp_ms": [538.808, 422.147, 328.008],
+     "native_count_star_ms": [524.128, 523.443, 298.170],
+     "ratio_native_over_ordinary": "indistinguishable"}
+  ],
+  "limitations": "Six samples per date on a live box under concurrent maintenance; medians not distributions. One project and one tag. Does not measure a fully covered production date, because none exists yet.",
+  "reading": "The penalty is specific to PARTIAL partition coverage, not to absent coverage. It reproduces the local 3M benchmark, where partial native was 730-981 ms against ordinary 153-175 ms while complete native was 8-147 ms against ordinary 123-156 ms."
+}
