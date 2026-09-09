@@ -31,9 +31,9 @@ pub struct RollupInvalidation {
 }
 
 #[derive(Deserialize, Serialize)]
-struct Snapshot {
+struct Snapshot<E = Vec<RollupInvalidation>> {
     version: u32,
-    entries: Vec<RollupInvalidation>,
+    entries: E,
 }
 
 fn path(data_dir: &Path) -> PathBuf {
@@ -70,7 +70,7 @@ pub fn store(data_dir: &Path, entries: &[RollupInvalidation]) -> std::io::Result
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec(&Snapshot { version: VERSION, entries: entries.to_vec() }).map_err(std::io::Error::other)?;
+    let bytes = serde_json::to_vec(&Snapshot { version: VERSION, entries }).map_err(std::io::Error::other)?;
     crate::write::wal::write_atomic_with(&path, true, |file| file.write_all(&bytes))
 }
 

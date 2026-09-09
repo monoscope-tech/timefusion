@@ -7,10 +7,7 @@ impl Database {
         let start_time = std::time::Instant::now();
         let window_hours = self.config.maintenance.timefusion_optimize_window_hours.max(1);
 
-        let table_clone = {
-            let table = table_ref.read().await;
-            table.clone()
-        };
+        let table_clone = { table_ref.read().await.clone() };
 
         let now = Utc::now();
         let today = now.date_naive();
@@ -119,7 +116,7 @@ impl Database {
                         .optimize()
                         .with_filters(&partition_filters)
                         .with_type(optimize_type.clone())
-                        .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                        .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::<u64>::MIN))
                         .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                         .with_max_concurrent_tasks(optimize_concurrency)
                         .with_writer_properties(writer_properties.clone())
@@ -309,14 +306,13 @@ impl Database {
     /// requested date gets an entry (possibly empty) so the idempotence guard
     /// can tell "no files" from "not looked at".
     pub(crate) fn filesets_for_dates(uris: &[String], dates: &[chrono::NaiveDate]) -> HashMap<chrono::NaiveDate, HashSet<String>> {
-        let markers: Vec<(chrono::NaiveDate, String)> = dates.iter().map(|d| (*d, format!("date={d}"))).collect();
-        let mut out: HashMap<chrono::NaiveDate, HashSet<String>> = dates.iter().map(|d| (*d, HashSet::new())).collect();
-        for uri in uris {
-            if let Some((d, _)) = markers.iter().find(|(_, marker)| uri.contains(marker)) {
-                out.entry(*d).or_default().insert(uri.clone());
-            }
-        }
-        out
+        dates
+            .iter()
+            .map(|d| {
+                let marker = format!("date={d}");
+                (*d, uris.iter().filter(|uri| uri.contains(&marker)).cloned().collect())
+            })
+            .collect()
     }
 
     /// Project IDs with live files in one hot `(project_id, date)` partition.
@@ -329,10 +325,7 @@ impl Database {
             .filter(|uri| uri.contains(&date_marker))
             .filter_map(|uri| path_partition_value(uri, "project_id"))
             .filter(|project_id| !project_id.is_empty())
-            .fold(HashMap::<&str, usize>::new(), |mut counts, project_id| {
-                *counts.entry(project_id).or_default() += 1;
-                counts
-            });
+            .counts();
         // Most-fragmented partition first: it's the one whose recent-window
         // queries open the most files, so it benefits most from an early tick.
         let mut projects: Vec<_> = counts.into_iter().collect();
@@ -408,10 +401,7 @@ impl Database {
                     TailAdd::from_stats(path.into_owned(), size, sorted_run, file.deletion_vector_descriptor().is_some(), file.stats().as_deref()),
                 ))
             })
-            .fold(HashMap::<String, Vec<TailAdd>>::new(), |mut per_project, (project_id, add)| {
-                per_project.entry(project_id).or_default().push(add);
-                per_project
-            });
+            .into_group_map();
         let mut planned: Vec<(String, Vec<String>, usize)> = per_project
             .into_iter()
             .map(|(project_id, adds)| {
@@ -543,8 +533,9 @@ impl Database {
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let scope: Vec<String> = std::iter::once(format!("date={date}/")).chain(project_id.map(|pid| format!("project_id={pid}/"))).collect();
         let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
-        let pre_uris: Option<HashSet<String>> = if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
-        let mut scope_files = scoped_file_uris(&*table_ref.read().await, &scope).len();
+        let scoped = scoped_file_uris(&*table_ref.read().await, &scope);
+        let mut scope_files = scoped.len();
+        let pre_uris: Option<HashSet<String>> = track_files.then(|| scoped.into_iter().collect());
         let (mut attempt, mut total_attempts) = (0usize, 0usize);
         loop {
             // The snapshot is refreshed in the Err arm (needed there anyway for
@@ -600,7 +591,7 @@ impl Database {
                 .optimize()
                 .with_filters(&partition_filters)
                 .with_type(optimize_type)
-                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::<u64>::MIN))
                 .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                 .with_max_concurrent_tasks(sort_concurrency)
                 .with_writer_properties(writer_properties)
@@ -669,7 +660,7 @@ impl Database {
     /// ascending. Drives the CLI/pgwire "compact old partitions" loop.
     pub async fn partition_dates(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<Vec<chrono::NaiveDate>> {
         let uris: Vec<String> = { file_uris(&*table_ref.read().await) };
-        let dates: std::collections::BTreeSet<chrono::NaiveDate> = uris
+        let dates: BTreeSet<chrono::NaiveDate> = uris
             .iter()
             .filter_map(|uri| {
                 let tail = &uri[uri.find("date=")? + 5..];
@@ -731,7 +722,7 @@ impl Database {
         // before matching.
         let probe_uri = &uris[0];
         let table_prefix = table_uri.split('?').next().unwrap_or(&table_uri).trim_end_matches('/');
-        let probe_tier = match probe_uri.strip_prefix(table_prefix).and_then(|s| s.strip_prefix('/').or(Some(s))) {
+        let probe_tier = match probe_uri.strip_prefix(table_prefix).map(|s| s.strip_prefix('/').unwrap_or(s)) {
             Some(rel) => {
                 let object_store = log_store.object_store(None);
                 let path = OsPath::from(rel);
@@ -1037,10 +1028,7 @@ impl Database {
     async fn dedup_probe_ctx(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, date_str: &str, limits: Option<DedupExecutionLimits>,
     ) -> Result<datafusion::prelude::SessionContext> {
-        let (snapshot, log_store) = {
-            let table = table_ref.read().await;
-            (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
-        };
+        let (snapshot, log_store) = snapshot_and_store(table_ref).await?;
         let partition_files = dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
         // Probe-only provider (chunk detection). The rewrite builds its own
         // provider per attempt — from a FRESH snapshot, with the synthetic
@@ -1152,7 +1140,7 @@ impl Database {
     /// types are excluded because ordering over them is neither cheap nor
     /// meaningful.
     fn immutable_audit_columns(schema: &crate::schema::TableSchema) -> Vec<String> {
-        let excluded: std::collections::HashSet<&str> =
+        let excluded: HashSet<&str> =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect();
         schema
             .fields
@@ -1167,18 +1155,19 @@ impl Database {
     }
 
     fn immutable_audit_sql(schema: &crate::schema::TableSchema, scan_name: &str, rows_filter: &str) -> Option<String> {
-        let predicates = Self::immutable_audit_columns(schema)
+        let columns = Self::immutable_audit_columns(schema);
+        if columns.is_empty() || schema.dedup_keys.is_empty() {
+            return None;
+        }
+        let predicates = columns
             .iter()
             .map(|name| {
                 let column = crate::rollup::quoted(name);
                 format!("MIN({column}) <> MAX({column}) OR (COUNT({column}) > 0 AND COUNT({column}) < COUNT(*))")
             })
-            .collect::<Vec<_>>();
-        if predicates.is_empty() || schema.dedup_keys.is_empty() {
-            return None;
-        }
-        let keys = schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
-        Some(format!("SELECT COUNT(*) FROM (SELECT {keys} FROM {scan_name} WHERE {rows_filter} GROUP BY {keys} HAVING {})", predicates.join(" OR ")))
+            .join(" OR ");
+        let keys = quoted_csv(&schema.dedup_keys);
+        Some(format!("SELECT COUNT(*) FROM (SELECT {keys} FROM {scan_name} WHERE {rows_filter} GROUP BY {keys} HAVING {predicates})"))
     }
 
     /// Runs `sql` and pulls its first output row's `column(0)` as an `i64` —
@@ -1205,7 +1194,7 @@ impl Database {
         let ctx = self.dedup_probe_ctx(table_ref, project_id, date_str, None).await?;
         let safe_pid = project_id.replace('\'', "''");
         let filter = format!("project_id = '{safe_pid}' AND date = DATE '{date_str}'");
-        let keys_csv = schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ");
+        let keys_csv = quoted_csv(&schema.dedup_keys);
         Ok(Self::dup_bin_starts(&ctx, &filter, &keys_csv).await?.into_iter().map(|s| s.and_utc().timestamp_micros() / bin_micros()).collect())
     }
 
@@ -1251,7 +1240,7 @@ impl Database {
         };
         // Probe keys before materializing rows: it bounds the common no-duplicate
         // case by key cardinality rather than row width.
-        let keys_csv = schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ");
+        let keys_csv = quoted_csv(&schema.dedup_keys);
 
         // Identify the hour buckets that actually contain duplicates. A dup
         // group shares one exact `timestamp` (it's a dedup key), so chunking
@@ -1270,18 +1259,10 @@ impl Database {
             // selected files, but no pass can accumulate the whale's full key
             // cardinality in memory.
             let probe_shards = limits.map_or(1, |limits| limits.probe_hash_shards.max(1));
+            let bucket_expr = dedup_bucket_expr(schema);
             let mut duplicate_starts = Vec::new();
             for shard in 0..probe_shards {
-                let shard_filter = if probe_shards == 1 {
-                    filter.clone()
-                } else {
-                    let keys_varchar = schema.dedup_keys.iter().map(|key| format!("CAST(\"{key}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
-                    let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
-                    let lo = u64::try_from(shard).unwrap_or(u64::MAX).saturating_mul(DEDUP_BUCKET_COUNT) / u64::try_from(probe_shards).unwrap_or(1);
-                    let hi = u64::try_from(shard + 1).unwrap_or(u64::MAX).saturating_mul(DEDUP_BUCKET_COUNT) / u64::try_from(probe_shards).unwrap_or(1);
-                    let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < {hi}") } else { String::new() };
-                    format!("{filter} AND {bucket_expr} >= {lo}{upper}")
-                };
+                let shard_filter = format!("{filter}{}", shard_bucket_pred(&bucket_expr, shard as u64, probe_shards as u64));
                 duplicate_starts.extend(Self::dup_bin_starts(&ctx, &shard_filter, &keys_csv).await?);
             }
             duplicate_starts.sort_unstable();
@@ -1393,19 +1374,6 @@ impl Database {
         }
         use deltalake::{kernel::Action, writer::DeltaWriter};
         use futures::StreamExt;
-        let read_string_column = |batches: Vec<RecordBatch>| -> Result<Vec<String>> {
-            Ok(batches
-                .into_iter()
-                .map(|batch| -> Result<Vec<String>> {
-                    let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
-                    let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
-                    Ok((0..col.len()).filter(|&i| !col.is_null(i)).map(|i| col.value(i).to_string()).collect())
-                })
-                .collect::<Result<Vec<Vec<String>>>>()?
-                .into_iter()
-                .flatten()
-                .collect())
-        };
         // Re-plan against a fresh snapshot when concurrent rewrites invalidate
         // file mappings; `commit_wave` guards the remaining commit window.
         const MAX_REPLANS: usize = 3;
@@ -1419,10 +1387,7 @@ impl Database {
             // re-plan therefore rebuilds provider + ctx from a fresh eager
             // snapshot; the commit-time liveness check below still guards the
             // remaining snapshot→commit window.
-            let (chunk_snapshot, chunk_log_store) = {
-                let table = table_ref.read().await;
-                (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
-            };
+            let (chunk_snapshot, chunk_log_store) = snapshot_and_store(table_ref).await?;
             let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
             let provider = Self::narrow_provider(chunk_log_store, Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL), None)
                 .await
@@ -1447,25 +1412,8 @@ impl Database {
                 // (concurrent rewrite) — nothing verified, don't certify clean.
                 return Ok(BinOutcome::Retry);
             }
-            // 2. Map scan values to Add actions in the SAME snapshot
-            // (suffix-match either direction: the scan column carries the
-            // store path, the log a table-relative one).
-            let targets = dedup_adds_by_path(
-                chunk_snapshot
-                    .log_data()
-                    .iter()
-                    .filter(|f| {
-                        let p = f.path();
-                        file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
-                    })
-                    // Deprecated in favour of arrow-direct access, but the
-                    // Remove tombstones below need the Add's exact fields.
-                    .map(|f| {
-                        #[allow(deprecated)]
-                        f.add_action()
-                    }),
-                table_name,
-            );
+            // 2. Map scan values to Add actions in the SAME snapshot.
+            let targets = adds_for_file_ids(&chunk_snapshot, &file_ids, table_name);
             if targets.len() != file_ids.len() {
                 warn!(
                     "dedup rewrite: mapped {}/{} files for table={} chunk=[{}] (sample scan value: {:?}), re-planning",
@@ -1556,21 +1504,18 @@ impl Database {
                     event = "dedup_rewrite_sharded"
                 );
             }
-            let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
-            // Bucket = `hash_bucket` over the dedup keys, in `[0, DEDUP_BUCKET_COUNT)`
-            // and evenly spread; chr(31) separates keys so distinct tuples can't
-            // collide. Also the GROUP BY for the skew probe below.
-            //
-            // This was `substr(md5(…), 1, 2)` until 2026-08-18, when a live CPU
-            // profile put `md5::compress` at 5.71% of all CPU — larger than the ZSTD
-            // decompression it serves, because each of K passes hashes every row to
-            // keep 1/K of them.
+            let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).join(", ");
+            // The bucket expr was `substr(md5(…), 1, 2)` until 2026-08-18, when a
+            // live CPU profile put `md5::compress` at 5.71% of all CPU — larger
+            // than the ZSTD decompression it serves, because each of K passes
+            // hashes every row to keep 1/K of them.
             // ONE binding, read both by the writer properties below and by the
             // StagedBin this function returns — `mark_written_sorted` must be
             // told the same fact that decided the footer, not a re-derivation.
             let sorted = !schema_order_by_clause(schema).is_empty();
-            let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
-            let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
+            // `keys_varchar` doubles as the GROUP BY for the skew probe below.
+            let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).join(", ");
+            let bucket_expr = dedup_bucket_expr(schema);
             // Independent narrow oracle for the staged output count. The
             // Arrow rewrite below chooses the greatest tiebreak per key, but it
             // must still emit exactly one row per distinct key (tombstones are
@@ -1630,15 +1575,7 @@ impl Database {
                     async move {
                         let mut adds: Vec<Action> = Vec::new();
                         let staged: anyhow::Result<(usize, usize)> = async {
-                            let shard_pred = if shards > 1 {
-                                // Contiguous bucket range per shard (even ±1); string compare of
-                                // zero-padded lowercase hex == numeric order.
-                                let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
-                                let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < {hi}") } else { String::new() };
-                                format!(" AND {bucket_expr} >= {lo}{upper}")
-                            } else {
-                                String::new()
-                            };
+                            let shard_pred = shard_bucket_pred(bucket_expr, shard, shards);
                             let rows_filter = format!("{partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
                             let rows_sql = format!("SELECT * FROM {scan_name} WHERE {rows_filter}");
                             // Version collapse: greatest `dedup_tiebreak` per key wins, so a
@@ -1719,8 +1656,8 @@ impl Database {
                                         Err(error) => warn!(%error, "immutable-column audit failed"),
                                     }
                                 }
-                                let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
-                                let keys = schema.dedup_keys.iter().map(|field| crate::rollup::quoted(field)).collect::<Vec<_>>().join(", ");
+                                let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).join(", ");
+                                let keys = quoted_csv(&schema.dedup_keys);
                                 let order = schema
                                     .dedup_tiebreak
                                     .as_ref()
@@ -1945,20 +1882,17 @@ impl Database {
             // mid-flight failure still leaks nothing.
             let (mut before, mut after) = (0usize, 0usize);
             let mut adds: Vec<Action> = Vec::new();
-            let mut stage_result: anyhow::Result<()> = Ok(());
+            let mut first_err: Option<anyhow::Error> = None;
             for (shard_adds, outcome) in staged_shards {
                 adds.extend(shard_adds);
                 match outcome {
                     Ok((shard_before, shard_after)) => (before, after) = (before + shard_before, after + shard_after),
                     Err(error) => {
-                        stage_result = Err(match stage_result {
-                            Ok(()) => error,
-                            Err(first) => first,
-                        })
+                        first_err.get_or_insert(error);
                     }
                 }
             }
-            if let Err(e) = stage_result {
+            if let Some(e) = first_err {
                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                 return Err(e);
             }
@@ -2041,35 +1975,28 @@ impl Database {
         const MAX_REPLANS: usize = 3;
 
         let tiebreak = schema.dedup_tiebreak.as_deref();
-        let mut proj_cols = vec![format!("\"{DEDUP_FILE_COL}\""), format!("\"{DV_ROW_INDEX_COL}\"")];
-        proj_cols.extend(schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)));
-        if let Some(tb) = tiebreak {
-            proj_cols.push(crate::rollup::quoted(tb));
-        }
-        let proj_csv = proj_cols.join(", ");
+        let proj_csv = [format!("\"{DEDUP_FILE_COL}\""), format!("\"{DV_ROW_INDEX_COL}\"")]
+            .into_iter()
+            .chain(schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)))
+            .chain(tiebreak.map(crate::rollup::quoted))
+            .join(", ");
 
         // (file path, 0-based physical row index) for every row of a projected
         // batch list. The scan exposes a 1-based physical row number; DV indexes
         // are 0-based (`v - 1`), and physical even on an already-DV'd file (fork
         // fix `044f7c98`).
         let pairs_of = |batches: &[RecordBatch]| -> Result<Vec<(String, u64)>> {
-            let mut out = Vec::new();
-            for b in batches {
+            batches.iter().try_fold(Vec::new(), |mut out, b| {
                 let files = datafusion::arrow::compute::cast(b.column(0), &DataType::Utf8)?;
                 let files = files.as_any().downcast_ref::<StringArray>().expect("file column casts to Utf8");
                 let idxs = b.column(1).as_any().downcast_ref::<UInt64Array>().ok_or_else(|| anyhow::anyhow!("dv-dedup row-index column is not UInt64"))?;
-                for i in 0..b.num_rows() {
-                    out.push((files.value(i).to_string(), idxs.value(i).saturating_sub(1)));
-                }
-            }
-            Ok(out)
+                out.extend((0..b.num_rows()).map(|i| (files.value(i).to_string(), idxs.value(i).saturating_sub(1))));
+                Ok(out)
+            })
         };
 
         for replan in 0..MAX_REPLANS {
-            let (chunk_snapshot, chunk_log_store) = {
-                let table = table_ref.read().await;
-                (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
-            };
+            let (chunk_snapshot, chunk_log_store) = snapshot_and_store(table_ref).await?;
             let partition_files = dedup_partition_paths(chunk_snapshot.log_data().iter().map(|f| f.path().to_string()), project_id, date_str);
             let provider =
                 Self::narrow_provider(chunk_log_store.clone(), Arc::clone(&chunk_snapshot), partition_files, Some(DEDUP_FILE_COL), Some(DV_ROW_INDEX_COL))
@@ -2083,32 +2010,11 @@ impl Database {
 
             // Files holding the chunk's rows → Add targets, from THIS snapshot.
             let files_sql = format!("SELECT DISTINCT \"{DEDUP_FILE_COL}\" FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter}");
-            let file_ids: Vec<String> = {
-                let mut v = Vec::new();
-                for b in crate::database::maintain::collect_watched(&ctx, &files_sql).await? {
-                    let col = datafusion::arrow::compute::cast(b.column(0), &DataType::Utf8)?;
-                    let col = col.as_any().downcast_ref::<StringArray>().expect("cast to Utf8");
-                    v.extend((0..col.len()).filter(|&i| !col.is_null(i)).map(|i| col.value(i).to_string()));
-                }
-                v
-            };
+            let file_ids = read_string_column(crate::database::maintain::collect_watched(&ctx, &files_sql).await?)?;
             if file_ids.is_empty() {
                 return Ok(BinOutcome::Retry);
             }
-            let targets = dedup_adds_by_path(
-                chunk_snapshot
-                    .log_data()
-                    .iter()
-                    .filter(|f| {
-                        let p = f.path();
-                        file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
-                    })
-                    .map(|f| {
-                        #[allow(deprecated)]
-                        f.add_action()
-                    }),
-                table_name,
-            );
+            let targets = adds_for_file_ids(&chunk_snapshot, &file_ids, table_name);
             if targets.len() != file_ids.len() {
                 warn!("dv-dedup: mapped {}/{} files for table={} chunk=[{}], re-planning", targets.len(), file_ids.len(), table_name, label);
                 tokio::time::sleep(occ_backoff(replan)).await;
@@ -2122,8 +2028,7 @@ impl Database {
 
             // Shard the chunk by dedup-key hash so decode memory is bounded; a dup
             // group shares one bucket and is never split.
-            let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
-            let bucket_expr = format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})");
+            let bucket_expr = dedup_bucket_expr(schema);
             let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
             let est_decoded = oracle.saturating_mul(bytes_per_row).saturating_mul(2);
             let decoded_budget = limits.map_or(self.config.maintenance.timefusion_dedup_max_decoded_bytes, |l| {
@@ -2140,7 +2045,7 @@ impl Database {
             if limits.is_none() && shards > 1 && decoded_budget > 0 {
                 let max_group_sql = format!(
                     "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter} GROUP BY {})",
-                    schema.dedup_keys.iter().map(|k| crate::rollup::quoted(k)).collect::<Vec<_>>().join(", ")
+                    quoted_csv(&schema.dedup_keys)
                 );
                 let max_group = Self::scalar_i64(&ctx, &max_group_sql).await?.unwrap_or(0);
                 if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
@@ -2153,31 +2058,20 @@ impl Database {
                 }
             }
 
-            let mut losers_by_file: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+            let mut losers_by_file: HashMap<String, Vec<u64>> = HashMap::new();
             let mut survivors_total: u64 = 0;
             let mut scanned_total: u64 = 0;
             {
                 let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
                 for shard in 0..shards {
-                    let shard_pred = if shards > 1 {
-                        let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
-                        let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < {hi}") } else { String::new() };
-                        format!(" AND {bucket_expr} >= {lo}{upper}")
-                    } else {
-                        String::new()
-                    };
-                    let sql = format!("SELECT {proj_csv} FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter}{shard_pred}");
+                    let sql = format!("SELECT {proj_csv} FROM {DEDUP_SCAN_NAME} WHERE {chunk_filter}{}", shard_bucket_pred(&bucket_expr, shard, shards));
                     let batches = crate::database::maintain::collect_watched(&ctx, &sql).await?;
                     let all_pairs = pairs_of(&batches)?;
                     scanned_total += all_pairs.len() as u64;
                     let survivors = crate::write::mem_buffer::dedup_batches(batches.clone(), &schema.dedup_keys, tiebreak, None)?;
-                    let survivor_set: std::collections::HashSet<(String, u64)> = pairs_of(&survivors)?.into_iter().collect();
+                    let survivor_set: HashSet<(String, u64)> = pairs_of(&survivors)?.into_iter().collect();
                     survivors_total += survivor_set.len() as u64;
-                    for pair in all_pairs {
-                        if !survivor_set.contains(&pair) {
-                            losers_by_file.entry(pair.0).or_default().push(pair.1);
-                        }
-                    }
+                    all_pairs.into_iter().filter(|pair| !survivor_set.contains(pair)).for_each(|(file, idx)| losers_by_file.entry(file).or_default().push(idx));
                 }
             }
 
@@ -2199,17 +2093,17 @@ impl Database {
 
             // Attach each loser set to its Add (scan file paths are store paths;
             // the Add carries a log-relative path — suffix-match either way).
-            let mut deletions: Vec<FileDeletion> = Vec::new();
-            for add in &targets {
-                let idxs: Vec<u64> = losers_by_file
-                    .iter()
-                    .filter(|(fpath, _)| fpath.ends_with(add.path.as_str()) || add.path.as_str().ends_with(fpath.as_str()))
-                    .flat_map(|(_, positions)| positions.iter().copied())
-                    .collect();
-                if !idxs.is_empty() {
-                    deletions.push(FileDeletion { add: add.clone(), deleted_indexes: idxs });
-                }
-            }
+            let deletions: Vec<FileDeletion> = targets
+                .iter()
+                .filter_map(|add| {
+                    let idxs: Vec<u64> = losers_by_file
+                        .iter()
+                        .filter(|(fpath, _)| fpath.ends_with(add.path.as_str()) || add.path.as_str().ends_with(fpath.as_str()))
+                        .flat_map(|(_, positions)| positions.iter().copied())
+                        .collect();
+                    (!idxs.is_empty()).then(|| FileDeletion { add: add.clone(), deleted_indexes: idxs })
+                })
+                .collect();
             let n_files = deletions.len();
 
             let root = url::Url::parse(table_ref.read().await.table_url().as_ref()).map_err(|e| anyhow::anyhow!("dv-dedup table url: {e}"))?;
@@ -2280,10 +2174,11 @@ impl Database {
     /// tables don't embed it). Shared by the sweep's fingerprint capture and
     /// the read-side dedup-skip check so both hash identical groupings.
     pub(crate) fn partition_files_by_pid(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, Vec<String>>> {
-        Ok(table.get_file_uris()?.filter(|uri| uri.contains(date_marker) && uri.ends_with(".parquet")).fold(HashMap::new(), |mut files, uri| {
-            files.entry(path_partition_value(&uri, "project_id").unwrap_or("default").to_string()).or_default().push(uri);
-            files
-        }))
+        Ok(table
+            .get_file_uris()?
+            .filter(|uri| uri.contains(date_marker) && uri.ends_with(".parquet"))
+            .map(|uri| (path_partition_value(&uri, "project_id").unwrap_or("default").to_string(), uri))
+            .into_group_map())
     }
 
     /// Live `(path, dv_unique_id)` set of one project's `date=` partition — the
@@ -2305,15 +2200,6 @@ impl Database {
     }
 }
 
-/// Whether every dedup key is a leading `sorting_columns` entry, in order.
-///
-/// This is the ClickHouse ReplacingMergeTree invariant (`ORDER BY` carries the
-/// full dedup key so merges stream). When it holds, a stream in schema order
-/// has all versions of a key adjacent and `RunCollapse` can keep-greatest in
-/// one pass — replacing the `ROW_NUMBER() OVER (PARTITION BY keys)` plan, which
-/// costs TWO full external sorts because the window normalizes its partition
-/// ordering to ASC and can therefore never produce the DESC output order
-/// (measured 2026-09-02: 2 `SortExec` under every SQL formulation tried).
 /// Width of a dedup "dirty bin" — THE definition, used by the producer
 /// (`write.rs`), the prober (`probe_dup_bins`) and the drain (`maintain.rs`).
 ///
@@ -2339,31 +2225,113 @@ impl Database {
 /// without a code change.
 pub(crate) const DEFAULT_BIN_MINUTES: i64 = 10;
 
-/// The dedup bin width, in micros. Read through the config `OnceLock`, so it is
-/// fixed for the life of the process — a width that changed under a running
-/// coordinator would leave the dirty-bin queue keyed two ways at once.
-/// Falls back to the default before config init (unit tests, early boot).
-#[inline]
-/// The similar-size admission ratio for packing bins, from config (0 = off in
-/// processes with no config, e.g. unit tests). See `bin_breaks_size_ratio`.
 /// The packing VALUE floor from config (0 = off / shadow in configless
 /// processes). See `refuse_low_value_bin`.
 pub(crate) fn pack_value_floor() -> u64 {
     crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_rows_per_file_eliminated)
 }
 
+/// The similar-size admission ratio for packing bins, from config (0 = off in
+/// processes with no config, e.g. unit tests). See `bin_breaks_size_ratio`.
 pub(crate) fn pack_size_ratio() -> i64 {
     crate::config::try_config().map_or(0, |c| c.maintenance.timefusion_pack_max_size_ratio)
 }
 
+/// The dedup bin width, in micros. Read through the config `OnceLock`, so it is
+/// fixed for the life of the process — a width that changed under a running
+/// coordinator would leave the dirty-bin queue keyed two ways at once.
+/// Falls back to the default before config init (unit tests, early boot).
+#[inline]
 pub(crate) fn bin_micros() -> i64 {
     crate::config::try_config().map_or(DEFAULT_BIN_MINUTES, |c| c.buffer.timefusion_dedup_bin_minutes).max(1) * 60 * 1_000_000
 }
 
+/// Whether every dedup key is a leading `sorting_columns` entry, in order.
+///
+/// This is the ClickHouse ReplacingMergeTree invariant (`ORDER BY` carries the
+/// full dedup key so merges stream). When it holds, a stream in schema order
+/// has all versions of a key adjacent and `RunCollapse` can keep-greatest in
+/// one pass — replacing the `ROW_NUMBER() OVER (PARTITION BY keys)` plan, which
+/// costs TWO full external sorts because the window normalizes its partition
+/// ordering to ASC and can therefore never produce the DESC output order
+/// (measured 2026-09-02: 2 `SortExec` under every SQL formulation tried).
 pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> bool {
     !schema.dedup_keys.is_empty()
         && schema.sorting_columns.len() >= schema.dedup_keys.len()
         && schema.dedup_keys.iter().zip(&schema.sorting_columns).all(|(key, sort)| *key == sort.name)
+}
+
+/// One consistent `(eager snapshot, log store)` pair off the current table
+/// state — the read every dedup scan/rewrite pins itself to.
+async fn snapshot_and_store(table_ref: &Arc<RwLock<DeltaTable>>) -> Result<(Arc<deltalake::kernel::EagerSnapshot>, deltalake::logstore::LogStoreRef)> {
+    let table = table_ref.read().await;
+    Ok((Arc::new(table.snapshot()?.snapshot().clone()), table.log_store()))
+}
+
+/// `"a", "b", …` — quoted column list for SQL, the shape every dedup query needs.
+fn quoted_csv(names: &[String]) -> String {
+    names.iter().map(|name| crate::rollup::quoted(name)).join(", ")
+}
+
+/// The `hash_bucket(...)` SQL expression partitioning rows by dedup key into
+/// `[0, DEDUP_BUCKET_COUNT)`; chr(31) separates keys so distinct tuples can't
+/// collide, and hashing (not `key % K`) spreads evenly and is NULL-safe.
+fn dedup_bucket_expr(schema: &crate::schema::TableSchema) -> String {
+    let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).join(", ");
+    format!("hash_bucket(arrow_cast(concat_ws(chr(31), {keys_varchar}), 'Utf8View'), {DEDUP_BUCKET_COUNT})")
+}
+
+/// ` AND <bucket_expr> >= lo[ AND < hi]` — one shard's contiguous bucket range
+/// (even ±1); empty when unsharded.
+fn shard_bucket_pred(bucket_expr: &str, shard: u64, shards: u64) -> String {
+    if shards <= 1 {
+        return String::new();
+    }
+    let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
+    let upper = if hi < DEDUP_BUCKET_COUNT { format!(" AND {bucket_expr} < {hi}") } else { String::new() };
+    format!(" AND {bucket_expr} >= {lo}{upper}")
+}
+
+/// Non-null values of `column(0)` across `batches`, cast to Utf8.
+fn read_string_column(batches: Vec<RecordBatch>) -> Result<Vec<String>> {
+    Ok(batches
+        .into_iter()
+        .map(|batch| -> Result<Vec<String>> {
+            let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+            let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
+            Ok(col.iter().flatten().map(str::to_string).collect())
+        })
+        .collect::<Result<Vec<Vec<String>>>>()?
+        .concat())
+}
+
+/// Map scan file-id values back to Add actions in the SAME snapshot
+/// (suffix-match either direction: the scan column carries the store path, the
+/// log a table-relative one). `add_action` is deprecated in favour of
+/// arrow-direct access, but the Remove tombstones need the Add's exact fields.
+fn adds_for_file_ids(snapshot: &deltalake::kernel::EagerSnapshot, file_ids: &[String], table_name: &str) -> Vec<deltalake::kernel::Add> {
+    dedup_adds_by_path(
+        snapshot
+            .log_data()
+            .iter()
+            .filter(|f| {
+                let p = f.path();
+                file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
+            })
+            .map(|f| {
+                #[allow(deprecated)]
+                f.add_action()
+            }),
+        table_name,
+    )
+}
+
+/// The run of equal keys currently in flight. `winner: None` means the carried
+/// row from the previous batch still holds it.
+struct OpenRun {
+    key: Vec<u8>,
+    winner: Option<u32>,
+    best: Option<Vec<u8>>,
 }
 
 /// Keep-greatest over a stream already sorted by the schema's sort key.
@@ -2374,14 +2342,6 @@ pub(crate) fn dedup_keys_lead_the_sort(schema: &crate::schema::TableSchema) -> b
 /// batch. Ties keep the first row, matching the window's
 /// `ORDER BY tiebreak DESC NULLS LAST` + `__tf_rn = 1`. Tombstones are retained
 /// (dropping one silently resurrects the row).
-/// The run of equal keys currently in flight. `winner: None` means the carried
-/// row from the previous batch still holds it.
-struct OpenRun {
-    key: Vec<u8>,
-    winner: Option<u32>,
-    best: Option<Vec<u8>>,
-}
-
 pub(crate) struct RunCollapse {
     keys: datafusion::arrow::row::RowConverter,
     tiebreak: Option<(usize, datafusion::arrow::row::RowConverter)>,
@@ -2455,10 +2415,13 @@ impl RunCollapse {
         self.audit.is_some()
     }
 
-    /// One compact row of `batch`, detached from its buffers so a held-back run
-    /// cannot pin the whole batch.
-    fn row(batch: &RecordBatch, row: usize) -> Result<RecordBatch> {
-        let indices = datafusion::arrow::array::UInt32Array::from(vec![u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?]);
+    fn idx(row: usize) -> Result<u32> {
+        u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))
+    }
+
+    /// Rows of `batch` at `indices`, as a new batch detached from its buffers —
+    /// so a held-back run cannot pin the whole batch.
+    fn take_rows(batch: &RecordBatch, indices: datafusion::arrow::array::UInt32Array) -> Result<RecordBatch> {
         Ok(RecordBatch::try_new(
             batch.schema(),
             batch.columns().iter().map(|column| datafusion::arrow::compute::take(column, &indices, None)).collect::<std::result::Result<Vec<_>, _>>()?,
@@ -2497,7 +2460,7 @@ impl RunCollapse {
                     }
                     // Strictly greater only: ties keep the earlier row.
                     if tiebreak > open.best {
-                        open.winner = Some(u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?);
+                        open.winner = Some(Self::idx(row)?);
                         open.best = tiebreak;
                     }
                 }
@@ -2509,8 +2472,7 @@ impl RunCollapse {
                         Some(OpenRun { winner: Some(index), .. }) => winners.push(index),
                         None => {}
                     }
-                    let winner = Some(u32::try_from(row).map_err(|_| anyhow::anyhow!("run collapse row index overflow"))?);
-                    current = Some(OpenRun { key, winner, best: tiebreak });
+                    current = Some(OpenRun { key, winner: Some(Self::idx(row)?), best: tiebreak });
                     self.run_immutable = immutable_at(row);
                     self.run_disagreed = false;
                 }
@@ -2518,16 +2480,12 @@ impl RunCollapse {
         }
         // Whatever is still open becomes the new carry.
         self.carry = match current {
-            Some(OpenRun { key, winner: Some(index), best }) => Some((Self::row(&batch, index as usize)?, key, best)),
+            Some(OpenRun { key, winner: Some(index), best }) => Some((Self::take_rows(&batch, vec![index].into())?, key, best)),
             Some(OpenRun { winner: None, .. }) => self.carry.take(),
             None => None,
         };
         if !winners.is_empty() {
-            let indices = datafusion::arrow::array::UInt32Array::from(winners);
-            out.push(RecordBatch::try_new(
-                batch.schema(),
-                batch.columns().iter().map(|column| datafusion::arrow::compute::take(column, &indices, None)).collect::<std::result::Result<Vec<_>, _>>()?,
-            )?);
+            out.push(Self::take_rows(&batch, winners.into())?);
         }
         Ok(out)
     }
@@ -2753,8 +2711,8 @@ mod immutable_audit_tests {
         )
         .expect("batch");
 
-        let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).collect::<Vec<_>>().join(", ");
-        let keys = schema.dedup_keys.iter().map(|key| crate::rollup::quoted(key)).collect::<Vec<_>>().join(", ");
+        let columns = schema.fields.iter().map(|field| crate::rollup::quoted(&field.name)).join(", ");
+        let keys = quoted_csv(&schema.dedup_keys);
         let order_by = schema_order_by_clause(&schema);
         let run = |sql: String| {
             let batch = batch.clone();

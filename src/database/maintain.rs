@@ -25,8 +25,6 @@ enum RollupRebuildReason {
     ObsoleteGeneration,
 }
 
-/// Estimated decoded (in-memory) bytes for a Parquet file of `compressed_size` on
-/// disk — a fixed 12x compression-ratio guess used for budgeting, not measurement.
 /// One tier's contribution to a fleet contiguity gauge, or `None` to abstain.
 ///
 /// Every tier folds into one number with `.min()`, and that is the SAFETY
@@ -533,6 +531,33 @@ pub(crate) fn add_row_count(add: &deltalake::kernel::Add) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(add.stats.as_deref()?).ok()?.get("numRecords")?.as_u64()
 }
 
+/// `(min, max)` row-timestamp bounds an `Add`'s statistics declare, when readable.
+fn add_ts_bounds(add: &deltalake::kernel::Add) -> (Option<i64>, Option<i64>) {
+    add.get_stats().ok().flatten().map_or((None, None), |stats| {
+        (
+            stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+            stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
+        )
+    })
+}
+
+/// True when the `Add`'s timestamp statistics PROVE it disjoint from `slice`.
+/// Missing bounds prove nothing, so the file stays a candidate.
+fn stats_disjoint_from(add: &deltalake::kernel::Add, slice: crate::maintenance_coordinator::TimeSlice) -> bool {
+    matches!(add_ts_bounds(add), (Some(min), Some(max)) if min >= slice.end_micros || max < slice.start_micros)
+}
+
+/// `micros` truncated to unix milliseconds, as the u64 the journal stores.
+fn unix_ms(micros: i64) -> u64 {
+    u64::try_from(micros.div_euclid(1_000)).unwrap_or_default()
+}
+
+/// `LogicalFileView::add_action()`, centralizing its one `#[allow(deprecated)]` call site.
+fn add_action(file: &deltalake::kernel::LogicalFileView) -> deltalake::kernel::Add {
+    #[allow(deprecated)]
+    file.add_action()
+}
+
 tokio::task_local! {
     /// Rows the maintenance unit running on this task has written.
     ///
@@ -765,7 +790,7 @@ async fn staged_objects_complete(store: &dyn object_store::ObjectStore, adds: &[
     use object_store::{ObjectStoreExt, path::Path as OsPath};
     for add in adds {
         let meta = store.head(&OsPath::from(add.path.as_str())).await;
-        if meta.map_or(true, |meta| i64::try_from(meta.size).unwrap_or(-1) != add.size) {
+        if !meta.is_ok_and(|meta| i64::try_from(meta.size).is_ok_and(|size| size == add.size)) {
             return false;
         }
     }
@@ -1114,7 +1139,7 @@ impl Database {
         }
         let now = crate::support::now_micros();
         let today = crate::support::today_utc();
-        let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        let created_unix_ms = unix_ms(now);
         let mut planned = Vec::new();
         // Every table EXCEPT a rollup tier. Packing a tier destroys the coverage
         // it exists to prove.
@@ -1205,6 +1230,23 @@ impl Database {
                 continue;
             }
             let schema = schema_or_default(&source);
+            let mk_task = |project_id: &str, slice, operation, estimate: u64, footprint, created_unix_ms| MaintenanceTask {
+                key: TaskKey { physical_table: source.clone(), source: source.clone(), project_id: project_id.to_owned(), slice, operation },
+                state: TaskState::Pending,
+                deadline_micros: now,
+                estimated_decoded_bytes: estimate.max(1),
+                hash_shard: 0,
+                hash_shards: 1,
+                attempts: 0,
+                created_unix_ms,
+                retry_reason: None,
+                publication: None,
+                base_tier_present: false,
+                input: Some(footprint),
+                parent_measured_bytes: None,
+                preflight_decoded_bytes: None,
+                backfill_priority_micros: None,
+            };
             let mut partitions: HashMap<(String, chrono::NaiveDate), Vec<CompactionDebtFile>> = HashMap::new();
             {
                 let table = table_ref.read().await;
@@ -1319,25 +1361,9 @@ impl Database {
                     // survives restarts because it is a property of the data
                     // rather than of the process. Today's partition keeps `now`
                     // — it is the live tail, not a backlog.
-                    let sealed_at_ms = u64::try_from(slice.end_micros.max(0).div_euclid(1_000)).unwrap_or_default();
+                    let sealed_at_ms = unix_ms(slice.end_micros.max(0));
                     let created_unix_ms = if date == today { created_unix_ms } else { sealed_at_ms.min(created_unix_ms) };
-                    planned.push(MaintenanceTask {
-                        key: TaskKey { physical_table: source.clone(), source: source.clone(), project_id: project_id.clone(), slice, operation },
-                        state: TaskState::Pending,
-                        deadline_micros: now,
-                        estimated_decoded_bytes: estimate.max(1),
-                        hash_shard: 0,
-                        hash_shards: 1,
-                        attempts: 0,
-                        created_unix_ms,
-                        retry_reason: None,
-                        publication: None,
-                        base_tier_present: false,
-                        input: Some(footprint),
-                        parent_measured_bytes: None,
-                        preflight_decoded_bytes: None,
-                        backfill_priority_micros: None,
-                    });
+                    planned.push(mk_task(&project_id, slice, operation, estimate, footprint, created_unix_ms));
                 }
                 if date < today && !schema.sorting_columns.is_empty() {
                     let suspects = files.iter().filter(|file| !self.repair_verified_sorted.contains(&file.path)).collect::<Vec<_>>();
@@ -1345,29 +1371,7 @@ impl Database {
                         planned_keys.insert((project_id.clone(), date, Operation::Repair));
                         let estimate = suspects.iter().fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size)));
                         let footprint = crate::maintenance_coordinator::InputFootprint::new(suspects.iter().map(|file| &file.path), estimate);
-                        planned.push(MaintenanceTask {
-                            key: TaskKey {
-                                physical_table: source.clone(),
-                                source: source.clone(),
-                                project_id: project_id.clone(),
-                                slice,
-                                operation: Operation::Repair,
-                            },
-                            state: TaskState::Pending,
-                            deadline_micros: now,
-                            estimated_decoded_bytes: estimate.max(1),
-                            hash_shard: 0,
-                            hash_shards: 1,
-                            attempts: 0,
-                            created_unix_ms,
-                            retry_reason: None,
-                            publication: None,
-                            base_tier_present: false,
-                            input: Some(footprint),
-                            parent_measured_bytes: None,
-                            preflight_decoded_bytes: None,
-                            backfill_priority_micros: None,
-                        });
+                        planned.push(mk_task(&project_id, slice, Operation::Repair, estimate, footprint, created_unix_ms));
                     }
                 }
             }
@@ -1966,7 +1970,7 @@ impl Database {
             // routes those to SealedConsolidation, so the ~41k HotPacking tasks
             // this used to mint for history were pure waste.
             let now = crate::support::now_micros();
-            let created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+            let created_unix_ms = unix_ms(now);
             // Forced cells the QUEUE refused, from either veto that can eat one
             // silently. Structurally real and, from outside this process, only
             // measurable here: prod's journal lives under root-owned bind mounts
@@ -2095,8 +2099,7 @@ impl Database {
             .log_data()
             .iter()
             .filter_map(|file| {
-                #[allow(deprecated)]
-                let add = file.add_action();
+                let add = add_action(&file);
                 if partition_file_is_empty(add.get_stats().ok().flatten().map(|stats| stats.num_records)) {
                     return None;
                 }
@@ -2190,15 +2193,8 @@ impl Database {
                 .iter()
                 .filter(|file| partition_paths.contains(file.path().as_ref()))
                 .filter_map(|file| {
-                    #[allow(deprecated)]
-                    let add = file.add_action();
-                    let bounds = add.get_stats().ok().flatten().map(|stats| {
-                        (
-                            stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                            stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                        )
-                    });
-                    let (min, max) = bounds.unwrap_or((None, None));
+                    let add = add_action(&file);
+                    let (min, max) = add_ts_bounds(&add);
                     if let (Some(min), Some(max)) = (min, max)
                         && (min >= key.slice.end_micros || max < key.slice.start_micros)
                     {
@@ -2375,7 +2371,7 @@ impl Database {
         let now = crate::support::now_micros();
         {
             let mut journal = self.journal();
-            journal.enqueue_with_base_tier(key.clone(), now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default(), base_tier_present);
+            journal.enqueue_with_base_tier(key.clone(), now, MAX_DECODED_BYTES, unix_ms(now), base_tier_present);
             journal.checkpoint()?;
         }
         let stats = crate::observability::maintenance_stats();
@@ -2405,7 +2401,7 @@ impl Database {
         let after = snapshot();
         let (state, retry_reason) = {
             let journal = self.journal();
-            journal.tasks().find(|task| task.key == key).map(|task| (Some(task.state), task.retry_reason.clone())).unwrap_or((None, None))
+            journal.tasks().find(|task| task.key == key).map_or((None, None), |task| (Some(task.state), task.retry_reason.clone()))
         };
         Ok(UnitRunReport {
             operation,
@@ -2608,16 +2604,8 @@ impl Database {
                 if !partition_paths.contains(&path) {
                     continue;
                 }
-                #[allow(deprecated)]
-                let add = file.add_action();
-                if !derived
-                    && let Ok(Some(stats)) = add.get_stats()
-                    && let (Some(min), Some(max)) = (
-                        stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                        stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                    )
-                    && (min >= key.slice.end_micros || max < key.slice.start_micros)
-                {
+                let add = add_action(&file);
+                if !derived && stats_disjoint_from(&add, key.slice) {
                     continue;
                 }
                 if derived {
@@ -2675,13 +2663,7 @@ impl Database {
                         // failure; unknown generations now require base rebuilding.
                         _ => {
                             untagged_inputs = untagged_inputs.saturating_add(1);
-                            if let Ok(Some(stats)) = add.get_stats()
-                                && let (Some(min), Some(max)) = (
-                                    stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                                    stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                                )
-                                && (min >= key.slice.end_micros || max < key.slice.start_micros)
-                            {
+                            if stats_disjoint_from(&add, key.slice) {
                                 continue;
                             }
                         }
@@ -2701,17 +2683,7 @@ impl Database {
                 }
                 let decoded = estimated_decoded_bytes(add.size);
                 let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
-                let (file_min, file_max) = add
-                    .get_stats()
-                    .ok()
-                    .flatten()
-                    .map(|stats| {
-                        (
-                            stats.min_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                            stats.max_values.get("timestamp").and_then(|value| value.as_value()).and_then(delta_stat_micros),
-                        )
-                    })
-                    .unwrap_or((None, None));
+                let (file_min, file_max) = add_ts_bounds(&add);
                 let (share, whole) = slice_share_of_file(file_min, file_max, key.slice, estimated_row_groups(add.size));
                 estimated = estimated.saturating_add(projected.saturating_mul(share).div_ceil(whole.max(1)));
                 // Unprorated: what a SIBLING slice over these same files would
@@ -2774,7 +2746,7 @@ impl Database {
             let now = crate::support::now_micros();
             {
                 let mut journal = self.journal();
-                journal.enqueue(base_key, now, MAX_DECODED_BYTES, u64::try_from(now.div_euclid(1_000)).unwrap_or_default());
+                journal.enqueue(base_key, now, MAX_DECODED_BYTES, unix_ms(now));
                 journal.checkpoint()?;
             }
             let attempts = self.journal().attempts(&key);
@@ -2928,10 +2900,7 @@ impl Database {
         let materialized = crate::rollup::materialized_measures(spec, derived, &present_columns, &target_schema.schema_ref(), base_evidence.as_ref());
         let generation = crate::rollup::generation_id(spec, &key.source, &key.project_id, &date.to_string(), source_fp, Some(&materialized));
         let default_shard_keys = || ["project_id".to_owned(), "timestamp".to_owned()].into_iter().chain(spec.dimensions.iter().cloned()).collect::<Vec<_>>();
-        let mut shard_keys = if derived { default_shard_keys() } else { source_schema.dedup_keys.clone() };
-        if shard_keys.is_empty() {
-            shard_keys = default_shard_keys();
-        }
+        let shard_keys = if derived || source_schema.dedup_keys.is_empty() { default_shard_keys() } else { source_schema.dedup_keys.clone() };
         let shard_key_sql = shard_keys.iter().map(|field| format!("CAST({} AS VARCHAR)", crate::rollup::quoted(field))).collect::<Vec<_>>().join(", ");
         // Same reasoning as the dedup rewrite's bucketing: an even, stable spread
         // is all this needs, and a cryptographic digest evaluated per row is not
@@ -3081,15 +3050,7 @@ impl Database {
             add.tags = Some(tags);
         }
 
-        let live_adds = staging_table
-            .snapshot()?
-            .log_data()
-            .iter()
-            .map(|file| {
-                #[allow(deprecated)]
-                file.add_action()
-            })
-            .collect::<Vec<_>>();
+        let live_adds = staging_table.snapshot()?.log_data().iter().map(|file| add_action(&file)).collect::<Vec<_>>();
         // Containment, not exact equality. Slice WIDTH is not stable for a
         // given range: `split_time_task` cuts a day into children and
         // `coarsen_sealed_slices` (#134) fuses them back, so the same hours get
@@ -3144,15 +3105,15 @@ impl Database {
         // live set. `found` is the whole tier's untagged count, not just this
         // partition's, so it reads as a backlog draining rather than a per-unit
         // blip; `retired` proves this unit actually removed one.
+        let no_identity = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
         {
-            let untagged = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
             let stats = crate::observability::maintenance_stats();
             // Record per TABLE and export the SUM. One shared slot was
             // overwritten by whichever tier published last, so a publish to an
             // already-clean tier reported 0 while another still held 67 untagged
             // files — a gauge reading clean over live damage is the exact
             // failure it exists to catch.
-            self.rollup_tier_untagged.insert(key.physical_table.clone(), live_adds.iter().filter(|add| untagged(add)).count() as u64);
+            self.rollup_tier_untagged.insert(key.physical_table.clone(), live_adds.iter().filter(|add| no_identity(add)).count() as u64);
             stats.rollup_tier_untagged_found.store(self.rollup_tier_untagged.iter().map(|entry| *entry.value()).sum(), Relaxed);
         }
         // Deferred to AFTER the commit. Counted here, this read 21 retired
@@ -3162,7 +3123,6 @@ impl Database {
         // `clear_untagged_cell` was removing the hole boost from partitions
         // whose repair never landed, so the ranking fix would have switched
         // itself off on exactly the cells that still needed it.
-        let no_identity = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
         let retiring = replaced.iter().filter(|add| no_identity(add)).count() as u64;
         let leaves_partition_clean = !live_adds.iter().filter(|add| in_partition(add) && !replaced.iter().any(|gone| gone.path == add.path)).any(no_identity);
         // A slice covered by a STRICTLY WIDER live file must not publish: the
@@ -3213,7 +3173,7 @@ impl Database {
                     crate::maintenance_coordinator::TaskKey { slice: covering, ..key.clone() },
                     crate::support::now_micros(),
                     MAX_DECODED_BYTES,
-                    u64::try_from(crate::support::now_micros().div_euclid(1_000)).unwrap_or_default(),
+                    unix_ms(crate::support::now_micros()),
                 );
             }
             journal.complete(&key);
@@ -4472,7 +4432,7 @@ impl Database {
         }
         let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
         let now = crate::support::now_micros();
-        let created = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        let created = unix_ms(now);
         let mut journal = self.journal();
         let mut queued = 0usize;
         for ((project_id, date), (untagged, tagged)) in partitions {
@@ -4625,7 +4585,7 @@ impl Database {
         }
         let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
         let now = crate::support::now_micros();
-        let created = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        let created = unix_ms(now);
         // NEWEST FIRST, and bounded. The first pass on prod found 23,337 of these
         // across the two sources — 92% of ALL recovered coverage — and queueing
         // them flat took `pending_base_rollup` from 7,075 to 12,131 against a
@@ -4857,8 +4817,7 @@ impl Database {
                     // two entries racing for one coverage slot.
                     let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
                     for add in table.snapshot()?.log_data().iter() {
-                        #[allow(deprecated)]
-                        let action = add.add_action();
+                        let action = add_action(&add);
                         // An untagged file proves no coverage, so this loop has
                         // always skipped it. Skipping SILENTLY is what let 352 of
                         // them accumulate over a month: `slice_retires` can now
@@ -7376,13 +7335,7 @@ impl Database {
         // Map paths to Add actions in the SAME snapshot the scan reads, so the
         // Remove tombstones carry the exact fields of the files we rewrote.
         let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
-        let targets = dedup_adds_by_path(
-            snapshot.log_data().iter().filter(|f| wanted.contains(f.path().as_ref())).map(|f| {
-                #[allow(deprecated)]
-                f.add_action()
-            }),
-            table_name,
-        );
+        let targets = dedup_adds_by_path(snapshot.log_data().iter().filter(|f| wanted.contains(f.path().as_ref())).map(|f| add_action(&f)), table_name);
         if targets.len() != files.len() {
             // WARN, not debug: prod runs RUST_LOG=info, so at debug this exit is
             // INVISIBLE — a bin that is selected every pass and silently
@@ -8563,10 +8516,7 @@ impl Database {
                 .snapshot()?
                 .log_data()
                 .iter()
-                .map(|file| {
-                    #[allow(deprecated)]
-                    file.add_action()
-                })
+                .map(|file| add_action(&file))
                 .filter(|add| {
                     Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default")
                         .is_some_and(|(project, date)| project == key.project_id && date == date_string)
@@ -8690,8 +8640,7 @@ impl Database {
                 // a mismatch and decline the very bins this exists to save.
                 let dropped = file.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality);
                 live.insert(file_path.clone(), file.num_records().and_then(|n| i64::try_from(n).ok()).map(|n| n - dropped));
-                #[allow(deprecated)]
-                target_adds.insert(file_path, file.add_action());
+                target_adds.insert(file_path, add_action(&file));
             }
             (live, target_adds, table.log_store().object_store(None))
         };
@@ -9135,7 +9084,7 @@ impl Database {
                 .with_binned_files(selected_files)
                 // Cloned per attempt: the retry loop re-submits after OCC conflicts.
                 .with_type(optimize_type.clone())
-                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::<u64>::MIN))
                 .with_max_files_per_bin(self.config.derived.optimize_max_files_per_bin())
                 .with_max_concurrent_tasks(self.config.derived.optimize_merge_tasks())
                 .with_writer_properties(writer_properties.clone())
@@ -9431,12 +9380,11 @@ impl Database {
     /// decision deterministically against a real store, without fighting
     /// delta-rs's post-commit error timing.
     #[cfg(any(test, feature = "e2e"))]
-    #[allow(deprecated)] // add_action() is deprecated but fine for a test-only probe
     pub async fn test_probe_landed(&self, project_id: &str, table_name: &str) -> Result<bool> {
         let table_ref = self.get_or_create_table(project_id, table_name).await?;
         let adds: Vec<deltalake::kernel::Action> = {
             let guard = table_ref.read().await;
-            guard.snapshot()?.log_data().iter().map(|f| deltalake::kernel::Action::Add(f.add_action())).collect()
+            guard.snapshot()?.log_data().iter().map(|f| deltalake::kernel::Action::Add(add_action(&f))).collect()
         };
         Ok(matches!(self.probe_commit_landed(&table_ref, &adds).await, CommitProbe::Landed))
     }

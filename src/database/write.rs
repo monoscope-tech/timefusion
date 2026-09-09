@@ -2,6 +2,22 @@
 //! per-table locks, staged writes, watermark reconciliation.
 use super::*;
 
+/// Shared OCC retry budget for the staged single-unit and coalesced commit loops.
+const MAX_COMMIT_RETRIES: u32 = 5;
+
+/// How many top memory-pool consumers to name when a pool is exhausted
+/// (shared by the query and maintenance-family pool builders).
+const TOP_POOL_CONSUMERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(5).unwrap();
+
+/// Acquire a per-table commit lock with FLUSH PRIORITY: a [`flush_waiter`] is
+/// registered across the WAIT only. Waves stand down while the count is nonzero
+/// (see `flush_waiter_counts`), so it must fall the moment the lock is held —
+/// or the moment a watchdog cancels this future.
+async fn lock_with_flush_priority<'a>(lock: &'a tokio::sync::Mutex<()>, waiters: &Arc<std::sync::atomic::AtomicUsize>) -> tokio::sync::MutexGuard<'a, ()> {
+    let _waiting = flush_waiter(waiters);
+    lock.lock().await
+}
+
 impl Database {
     /// Directory holding locally persisted Delta snapshots (see `snapshot_cache`).
     pub(crate) fn delta_snapshot_dir(cfg: &AppConfig) -> PathBuf {
@@ -20,11 +36,9 @@ impl Database {
             .get_or_init(|| {
                 let pool_size = self.config.derived.query_pool_bytes();
                 use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, TrackConsumersPool};
-                // Name the largest consumers when the pool is exhausted.
-                let top = std::num::NonZeroUsize::new(5).unwrap();
                 let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
-                    crate::config::MemoryPoolKind::Greedy => Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(pool_size), top)),
-                    crate::config::MemoryPoolKind::FairSpill => Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), top)),
+                    crate::config::MemoryPoolKind::Greedy => Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(pool_size), TOP_POOL_CONSUMERS)),
+                    crate::config::MemoryPoolKind::FairSpill => Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), TOP_POOL_CONSUMERS)),
                 };
                 let meta_cache_bytes = self.config.cache.timefusion_df_metadata_cache_mb * 1024 * 1024;
                 Arc::new(build_query_runtime_env(pool, meta_cache_bytes))
@@ -47,9 +61,7 @@ impl Database {
         let _ = std::fs::create_dir_all(&spill_dir);
         reap_orphaned_spill_dirs(&spill_dir);
         let disk = spill_disk_builder(spill_dir, self.config.maintenance.timefusion_maintenance_spill_max_gb);
-        // Name holders, not merely the allocation victim, on exhaustion.
-        let top = std::num::NonZeroUsize::new(5).expect("5 is non-zero");
-        let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), top));
+        let pool = Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), TOP_POOL_CONSUMERS));
         Arc::new(RuntimeEnvBuilder::new().with_memory_pool(pool).with_disk_manager_builder(disk).build().expect("build maintenance runtime env"))
     }
 
@@ -244,13 +256,7 @@ impl Database {
         ctx.register_table(&name, Arc::new(MemTable::try_new(arrow_schema, vec![unified]).ok()?)).ok()?;
         let out = ctx.sql(&format!("SELECT * FROM {name} ORDER BY {order_by}")).await.ok()?.collect().await;
         let _ = ctx.deregister_table(&name);
-        match out {
-            Ok(sorted) => Some(sorted),
-            Err(e) => {
-                warn!("flush sort: spilling DataFusion sort failed, writing unsorted: {e}");
-                None
-            }
-        }
+        out.inspect_err(|e| warn!("flush sort: spilling DataFusion sort failed, writing unsorted: {e}")).ok()
     }
 
     /// Heavy-maintenance session state, built once (see field doc).
@@ -333,6 +339,13 @@ impl Database {
         self.flush_waiter_counts.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
     }
 
+    /// [`Self::commit_lock`] and [`Self::flush_waiters`] together, resolving
+    /// `table_lock_key` (a `has_custom_storage` await) once instead of twice.
+    async fn commit_lock_and_waiters(&self, project_id: &str, table_name: &str) -> (Arc<tokio::sync::Mutex<()>>, Arc<std::sync::atomic::AtomicUsize>) {
+        let key = self.table_lock_key(project_id, table_name).await;
+        (self.commit_locks.entry(key.clone()).or_default().clone(), self.flush_waiter_counts.entry(key).or_default().clone())
+    }
+
     /// Persist `table`'s post-commit snapshot locally (detached) so the next
     /// boot restores it and replays only later commits (see `snapshot_cache`).
     /// Called from every commit path that swaps a fresh table state in.
@@ -343,9 +356,8 @@ impl Database {
         const MIN_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let url = table.table_url().to_string();
         let now = std::time::Instant::now();
-        match self.snapshot_persist_gate.get(&url) {
-            Some(last) if now.duration_since(*last) < MIN_PERSIST_INTERVAL => return,
-            _ => {}
+        if self.snapshot_persist_gate.get(&url).is_some_and(|last| now.duration_since(*last) < MIN_PERSIST_INTERVAL) {
+            return;
         }
         if let Some(state) = table.state.clone() {
             self.snapshot_persist_gate.insert(url.clone(), now);
@@ -581,20 +593,19 @@ impl Database {
         // "default" — silently misrouting writes is the worst outcome, but
         // returning an error would break callers that already rely on the
         // legacy fallback.
-        let project_id = if project_id.is_empty() && !batches.is_empty() {
-            extract_project_id(&batches[0]).unwrap_or_else(|| {
+        let project_id = match (project_id, batches.first()) {
+            ("", Some(first)) => extract_project_id(first).unwrap_or_else(|| {
                 warn!("insert_records_batch: empty project_id and batch has no project_id column → bucketing under 'default'");
                 "default".to_string()
-            })
-        } else if project_id.is_empty() {
-            warn!("insert_records_batch: empty project_id and no batches → bucketing under 'default'");
-            "default".to_string()
-        } else {
-            project_id.to_string()
+            }),
+            ("", None) => {
+                warn!("insert_records_batch: empty project_id and no batches → bucketing under 'default'");
+                "default".to_string()
+            }
+            _ => project_id.to_string(),
         };
 
-        // Use provided table_name or default to otel_logs_and_spans
-        let table_name = if table_name.is_empty() { "otel_logs_and_spans".to_string() } else { table_name.to_string() };
+        let table_name = if table_name.is_empty() { "otel_logs_and_spans" } else { table_name }.to_string();
 
         if watermark.is_none() {
             self.invalidate_rollup_batches(&project_id, &table_name, &batches)?;
@@ -623,17 +634,12 @@ impl Database {
         }
 
         // Fallback to legacy batch queue if configured
-        let enable_queue = self.config.core.enable_batch_queue;
         if !skip_queue
-            && enable_queue
+            && self.config.core.enable_batch_queue
             && let Some(ref queue) = self.batch_queue
         {
             span.record("use_queue", true);
-            for batch in batches {
-                if let Err(e) = queue.queue(batch) {
-                    return Err(anyhow::anyhow!("Queue error: {}", e));
-                }
-            }
+            batches.into_iter().try_for_each(|batch| queue.queue(batch).map_err(|e| anyhow::anyhow!("Queue error: {}", e)))?;
             return Ok(Vec::new());
         }
 
@@ -671,7 +677,6 @@ impl Database {
         } else {
             commit_properties
         };
-        let max_retries = 5;
         // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
         // per-table commit lock, then serialize only the tiny commit-log
         // append. The old path held the lock across the whole `.write()`
@@ -704,13 +709,7 @@ impl Database {
 
             let partition_by = (!schema.partitions.is_empty()).then(|| schema.partitions.clone());
             let op = DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by, predicate: None };
-            // Store to clean up the staged parquet on a terminal commit failure —
-            // those objects have no Add/Remove in the log, so Delta VACUUM won't
-            // reclaim them; abandoning them leaks files on S3 forever.
-            let stage_store = stage_store.clone();
-
-            let commit_lock = self.commit_lock(&project_id, &table_name).await;
-            let flush_waiters = self.flush_waiters(&project_id, &table_name).await;
+            let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(&project_id, &table_name).await;
             let mut retry_count = 0;
             loop {
                 // Refresh UNDER the lock (the merge path refreshes before locking).
@@ -720,14 +719,7 @@ impl Database {
                 // probe-cheap (a single GET that 404-short-circuits when already
                 // current), so the extra lock-hold is sub-millisecond on the common
                 // path.
-                // FLUSH PRIORITY: registered across the WAIT only. Waves stand
-                // down while this is nonzero (see `flush_waiter_counts`), so the
-                // count must fall the moment we hold the lock — or the moment a
-                // watchdog cancels this future.
-                let commit_guard = {
-                    let _waiting = flush_waiter(&flush_waiters);
-                    commit_lock.lock().await
-                };
+                let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
                 // DIAG (commit-throughput profiling): time the serial commit phases
                 // (refresh + Delta log append) under the lock — these bound the
                 // process-wide commit rate. Remove once the flush bottleneck is found.
@@ -797,11 +789,11 @@ impl Database {
                         drop(commit_guard);
                         if !timed_out && is_occ_conflict_err(&e) {
                             retry_count += 1;
-                            if retry_count >= max_retries {
+                            if retry_count >= MAX_COMMIT_RETRIES {
                                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                                return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", max_retries, e));
+                                return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", MAX_COMMIT_RETRIES, e));
                             }
-                            debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, max_retries, e);
+                            debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, MAX_COMMIT_RETRIES, e);
                             tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                             continue;
                         }
@@ -856,23 +848,16 @@ impl Database {
         // whole-bucket residency by necessity. It is unreachable when a staged
         // writer exists (the block above always returns).
         let batches: Vec<RecordBatch> = batches.collect::<Result<_, _>>()?;
-        let commit_lock = self.commit_lock(&project_id, &table_name).await;
-        let flush_waiters = self.flush_waiters(&project_id, &table_name).await;
+        let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(&project_id, &table_name).await;
         let mut retry_count = 0;
         let mut last_error = None;
-        while retry_count < max_retries {
+        while retry_count < MAX_COMMIT_RETRIES {
             if let Err(e) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
-            let commit_guard = {
-                let _waiting = flush_waiter(&flush_waiters);
-                commit_lock.lock().await
-            };
-            let (table, pre_uris) = {
-                let guard = table_ref.read().await;
-                let pre: HashSet<String> = file_uris(&guard);
-                (guard.clone(), pre)
-            };
+            let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
+            let table = { table_ref.read().await.clone() };
+            let pre_uris: HashSet<String> = file_uris(&table);
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
@@ -909,7 +894,7 @@ impl Database {
                     if is_occ_conflict_err(&e.to_string()) {
                         retry_count += 1;
                         last_error = Some(e);
-                        debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
+                        debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, MAX_COMMIT_RETRIES);
                         // Release the commit lock BEFORE the backoff sleep — do
                         // not remove. Holding it across the sleep serializes
                         // every other writer behind this writer's backoff.
@@ -928,7 +913,7 @@ impl Database {
 
         Err(anyhow::anyhow!(
             "Delta write failed after {} retries: {}",
-            max_retries,
+            MAX_COMMIT_RETRIES,
             last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
         ))
     }
@@ -946,7 +931,7 @@ impl Database {
         use futures::stream::{self, StreamExt};
         let parallelism = self.config.buffer.flush_parallelism();
         let mut results: Vec<Result<Vec<String>>> = units.iter().map(|_| Ok(Vec::new())).collect();
-        let units = std::sync::Arc::new(units);
+        let units = Arc::new(units);
 
         // ---- Phase 1: prepare (bounded-concurrent; table resolution + casts).
         let prepared: Vec<(usize, Result<PreparedForPhysicalTable>)> = stream::iter(0..units.len())
@@ -973,7 +958,6 @@ impl Database {
                 Err(e) => results[i] = Err(e),
                 Ok((p, _)) if p.staged_writer.is_none() => {
                     debug!("coalesced flush: {}/{} needs schema evolution — splitting out of the shared commit", units[i].project_id, units[i].table_name);
-                    drop(p);
                     solo.push(i);
                 }
                 Ok((p, key)) => stageable.push((i, p, key)),
@@ -1022,10 +1006,9 @@ impl Database {
                     let digests: Vec<(String, String, crate::write::LandedDigest)> = if self.config.buffer.landed_skip_enabled() {
                         indices
                             .iter()
-                            .filter(|i| crate::write::landed_identity_applies(&units[**i].table_name))
-                            .filter_map(|i| {
-                                crate::write::landed_digest(&units[*i].batches).map(|d| (units[*i].project_id.clone(), units[*i].table_name.clone(), d))
-                            })
+                            .map(|i| &units[*i])
+                            .filter(|u| crate::write::landed_identity_applies(&u.table_name))
+                            .filter_map(|u| crate::write::landed_digest(&u.batches).map(|d| (u.project_id.clone(), u.table_name.clone(), d)))
                             .collect()
                     } else {
                         Vec::new()
@@ -1105,17 +1088,12 @@ impl Database {
         commit_properties: CommitProperties, op: deltalake::protocol::DeltaOperation,
     ) -> Result<Vec<String>> {
         use deltalake::kernel::transaction::TableReference;
-        const MAX_RETRIES: u32 = 5;
         // Any member resolves to the same physical lock (the group key IS
         // `table_lock_key`), so serialization is identical to the per-project path.
-        let commit_lock = self.commit_lock(projects[0].0, table_name).await;
-        let flush_waiters = self.flush_waiters(projects[0].0, table_name).await;
+        let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(projects[0].0, table_name).await;
         let mut retry_count = 0u32;
         loop {
-            let commit_guard = {
-                let _waiting = flush_waiter(&flush_waiters);
-                commit_lock.lock().await
-            };
+            let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
             if let Err(e) = bounded_commit_await(
                 COMMIT_LOCK_OP_TIMEOUT,
                 "coalesced_refresh",
@@ -1151,10 +1129,10 @@ impl Database {
                     drop(commit_guard);
                     if !timed_out && is_occ_conflict_err(&e) {
                         retry_count += 1;
-                        if retry_count >= MAX_RETRIES {
-                            return Err(anyhow::anyhow!("coalesced staged commit failed after {} retries: {}", MAX_RETRIES, e));
+                        if retry_count >= MAX_COMMIT_RETRIES {
+                            return Err(anyhow::anyhow!("coalesced staged commit failed after {} retries: {}", MAX_COMMIT_RETRIES, e));
                         }
-                        debug!("coalesced commit conflict, retrying ({}/{}): {}", retry_count, MAX_RETRIES, e);
+                        debug!("coalesced commit conflict, retrying ({}/{}): {}", retry_count, MAX_COMMIT_RETRIES, e);
                         tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                         continue;
                     }
@@ -1377,11 +1355,14 @@ impl Database {
         // once per project made a dirty boot pay the same remote snapshot load
         // dozens of times. Custom-storage topics retain their isolated group.
         let custom = self.custom_storage_keys().await;
-        let mut physical: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-        for (project_id, table_name) in wal.list_topic_pairs() {
-            let physical_project = if custom.contains(&(project_id.clone(), table_name.clone())) { project_id.clone() } else { String::new() };
-            physical.entry((physical_project, table_name.clone())).or_default().push((project_id, table_name));
-        }
+        let physical: HashMap<(String, String), Vec<(String, String)>> = wal
+            .list_topic_pairs()
+            .into_iter()
+            .map(|(project_id, table_name)| {
+                let physical_project = if custom.contains(&(project_id.clone(), table_name.clone())) { project_id.clone() } else { String::new() };
+                ((physical_project, table_name.clone()), (project_id, table_name))
+            })
+            .into_group_map();
         let totals: Vec<usize> = stream::iter(physical.into_values())
             .map(|topics| async move { self.derive_wal_cursors_for_physical_table(wal, topics, layer).await.unwrap_or(0) })
             .buffer_unordered(self.config.buffer.delta_scan_concurrency())

@@ -11,6 +11,7 @@ use std::{
 
 use arrow::array::RecordBatch;
 use futures::stream::{self, StreamExt};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, Notify},
@@ -313,8 +314,8 @@ pub struct FlushStats {
 /// MemBuffer bytes a flush reclaims — uses the same `estimate_batch_size` as
 /// the per-bucket accounting, so `flush_freed_bytes_total` is directly
 /// comparable to `mem_buffer.estimated_bytes`.
-fn flushable_bytes(b: &crate::write::mem_buffer::FlushableBucket) -> u64 {
-    b.batches.iter().map(crate::write::mem_buffer::estimate_batch_size).sum::<usize>() as u64
+fn flushable_bytes(b: &FlushableBucket) -> u64 {
+    b.batches.iter().map(estimate_batch_size).sum::<usize>() as u64
 }
 
 /// How recently a flush failure still counts as "flush is broken" for the
@@ -361,7 +362,7 @@ pub type DeltaWriteCallback =
 /// provably already committed — the duplicates WAL replay manufactures after an
 /// unclean exit (`docs/plans/2026-09-02-stop-manufacturing-duplicates.md`).
 ///
-/// SHA-256 per batch over its Arrow IPC bytes, combined by **wrapping 256-bit
+/// One hash per batch over its Arrow IPC bytes, combined by **wrapping
 /// addition**. Three properties, each load-bearing:
 ///
 /// - **Commutative**, so the digest is immune to batch ORDER. This is required,
@@ -429,21 +430,17 @@ pub fn landed_digest(batches: &[RecordBatch]) -> Option<LandedDigest> {
     if batches.iter().all(|b| b.num_rows() == 0) {
         return None;
     }
-    batches.iter().try_fold([0u8; DIGEST_BYTES], |mut acc, batch| {
-        let once = crate::write::wal::serialize_record_batch(batch).ok()?;
-        let canonical = crate::write::wal::deserialize_record_batch(&once)
-            .ok()
-            .map(crate::write::mem_buffer::compact_batch)
-            .and_then(|b| crate::write::wal::serialize_record_batch(&b).ok())?;
-        let digest = twox_hash::XxHash3_128::oneshot(&canonical).to_be_bytes();
-        let mut carry = 0u16;
-        for i in (0..DIGEST_BYTES).rev() {
-            let sum = acc[i] as u16 + digest[i] as u16 + carry;
-            acc[i] = sum as u8;
-            carry = sum >> 8;
-        }
-        Some(acc)
-    })
+    batches
+        .iter()
+        .try_fold(0u128, |acc, batch| {
+            let once = crate::write::wal::serialize_record_batch(batch).ok()?;
+            let canonical = crate::write::wal::deserialize_record_batch(&once)
+                .ok()
+                .map(crate::write::mem_buffer::compact_batch)
+                .and_then(|b| crate::write::wal::serialize_record_batch(&b).ok())?;
+            Some(acc.wrapping_add(twox_hash::XxHash3_128::oneshot(&canonical)))
+        })
+        .map(u128::to_be_bytes)
 }
 
 /// Per-row (key_hash, content_hash) for ingest-time client-retry dedup — the
@@ -604,6 +601,10 @@ impl IngestDedupIndex {
         self.probe(key_hash, content_hash).1
     }
 
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, IngestEpochs> {
+        self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// `(key_hit, duplicate)`. `key_hit` counts version traffic apart from
     /// retries (the metrics need both); a duplicate is always a key hit.
     pub fn probe(&self, key_hash: u128, content_hash: u128) -> (bool, bool) {
@@ -619,7 +620,7 @@ impl IngestDedupIndex {
     /// caller skip stage-2 content hashing entirely.
     pub fn key_contents(&self, key_hash: u128) -> (Option<u128>, Option<u128>) {
         let (current, previous) = {
-            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let e = self.read();
             (std::sync::Arc::clone(&e.current), std::sync::Arc::clone(&e.previous))
         };
         (current.get(&key_hash).map(|c| *c), previous.get(&key_hash).map(|c| *c))
@@ -629,10 +630,8 @@ impl IngestDedupIndex {
     /// version overwrites — fail-open: a stale retry then key-hits with mismatched
     /// content, passes, and maintenance dedup resolves it).
     pub fn populate(&self, key_hash: u128, content_hash: u128) {
-        let current = {
-            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::sync::Arc::clone(&e.current)
-        };
+        // Clone the handle out so the read lock is dropped before the insert.
+        let current = std::sync::Arc::clone(&self.read().current);
         current.insert(key_hash, content_hash);
     }
 
@@ -640,16 +639,13 @@ impl IngestDedupIndex {
     /// call rotated (for the rotations counter). Cheap and idempotent under
     /// contention (a double rotation only shrinks coverage).
     pub fn maybe_rotate(&self, now_micros: i64) -> bool {
-        let needs = {
-            let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros
-        };
-        if !needs {
+        let due = |e: &IngestEpochs| e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros;
+        if !due(&self.read()) {
             return false;
         }
         let mut e = self.epochs.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Re-check under the write lock (another thread may have rotated).
-        if e.current.len() >= self.rotate_at_entries || now_micros - e.current_started_micros >= self.rotate_at_micros {
+        if due(&e) {
             e.previous = std::mem::replace(&mut e.current, std::sync::Arc::new(dashmap::DashMap::new()));
             e.current_started_micros = now_micros;
             return true;
@@ -659,7 +655,7 @@ impl IngestDedupIndex {
 
     /// Total live entries across both epochs (for the `index_entries` metric).
     pub fn entries(&self) -> usize {
-        let e = self.epochs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let e = self.read();
         e.current.len() + e.previous.len()
     }
 }
@@ -1048,10 +1044,6 @@ impl BufferedWriteLayer {
             config: cfg.clone(),
             wal,
             mem_buffer,
-            // `open` rescans the dir, so a restart comes back warm.
-            // An eighth of the write buffer's own budget: enough that a burst of
-            // drained buckets queues instead of being thrown away, small enough
-            // that it cannot itself become the thing that OOMs the box.
             shutdown: CancellationToken::new(),
             accepting_writes: std::sync::atomic::AtomicBool::new(true),
             active_writes: AtomicU64::new(0),
@@ -1751,15 +1743,7 @@ impl BufferedWriteLayer {
             self.wal_recovery_duration_ms.store(recovery_duration_ms, Ordering::Relaxed);
             self.wal_recovery_complete.store(true, Ordering::Relaxed);
             info!("WAL recovery complete: exact cursor/tail match, no replay required, duration={}ms", recovery_duration_ms);
-            return Ok(RecoveryStats {
-                entries_replayed: 0,
-                batches_recovered: 0,
-                oldest_entry_timestamp: None,
-                newest_entry_timestamp: None,
-                recovery_duration_ms,
-                corrupted_entries_skipped: 0,
-                tantivy_files_deferred: 0,
-            });
+            return Ok(RecoveryStats { recovery_duration_ms, ..Default::default() });
         }
         let p0 = self.wal.write_recovery_rewind_marker().map_err(|e| anyhow::anyhow!("recovery rewind marker write failed: {}", e))?;
 
@@ -2767,14 +2751,11 @@ impl BufferedWriteLayer {
         // replace it at that id — the id becomes eligible at most one dwell
         // after the youngest bucket's creation.
         ids.retain(|id| !fresh_small.contains(id));
-        let mut lo = i64::MIN;
         for chunk in ids.iter().copied().collect::<Vec<_>>().chunks(FLUSH_CHUNK_BUCKET_IDS) {
-            let hi = chunk[chunk.len() - 1];
             // Membership, not a range: the ids between chunk members may be
             // dwell-held and a range predicate would flush them anyway.
             let members: std::collections::BTreeSet<i64> = chunk.iter().copied().collect();
-            self.flush_buckets_where(move |id| id > lo && id <= hi && members.contains(&id)).await?;
-            lo = hi;
+            self.flush_buckets_where(move |id| members.contains(&id)).await?;
         }
         Ok(())
     }
@@ -2792,11 +2773,8 @@ impl BufferedWriteLayer {
         // Group the matching bucket keys per (project, table) FIRST: the
         // in-flight registration below must precede any snapshot of that
         // topic's buckets.
-        let by_topic =
-            self.mem_buffer.bucket_keys(&pred).into_iter().fold(std::collections::HashMap::<(String, String), Vec<i64>>::new(), |mut m, (p, t, id)| {
-                m.entry((p, t)).or_default().push(id);
-                m
-            });
+        let by_topic: std::collections::HashMap<(String, String), Vec<i64>> =
+            self.mem_buffer.bucket_keys(&pred).into_iter().map(|(p, t, id)| ((p, t), id)).into_group_map();
 
         // Snapshot (not take): rows stay queryable in MemBuffer while the
         // Delta commit is airborne — a take here blacked out the flushed
@@ -3347,11 +3325,10 @@ impl BufferedWriteLayer {
         &self, p0: &std::collections::HashMap<(String, String), ShardHolds>, applied_frontiers: &std::collections::HashMap<(String, String), ShardHolds>,
     ) {
         let positions: std::collections::HashMap<(String, String), ShardHolds> = p0
-            .keys()
-            .map(|(p, t)| {
-                let baseline =
-                    applied_frontiers.get(&(p.clone(), t.clone())).cloned().unwrap_or_else(|| p0.get(&(p.clone(), t.clone())).cloned().unwrap_or_default());
-                ((p.clone(), t.clone()), self.merge_holds_over_baseline(p, t, baseline))
+            .iter()
+            .map(|(key, p0_holds)| {
+                let baseline = applied_frontiers.get(key).unwrap_or(p0_holds).clone();
+                (key.clone(), self.merge_holds_over_baseline(&key.0, &key.1, baseline))
             })
             .collect();
         if let Err(e) = self.wal.write_recovery_rewind_marker_at(&positions) {
@@ -4329,6 +4306,11 @@ mod tests {
         assert_eq!(BufferedWriteLayer::normalized_wal_sql(&col("u.tag"), &source_cols), "source__tag");
     }
 
+    /// A Delta write callback that always succeeds with no files.
+    fn noop_delta() -> DeltaWriteCallback {
+        Arc::new(|_p, _t, _b, _w| Box::pin(async { Ok(Vec::new()) }))
+    }
+
     /// Default config rooted at `data_dir`, with `tweak` applied before freezing.
     fn test_config_with(data_dir: PathBuf, tweak: impl FnOnce(&mut AppConfig)) -> Arc<AppConfig> {
         let mut cfg = AppConfig::default();
@@ -4960,7 +4942,7 @@ mod tests {
         let (project, table) = (format!("sd{test_id}"), "otel_logs_and_spans".to_string());
 
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _w| Box::pin(async { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let layer = Arc::new(layer);
         let stats = crate::observability::maintenance_stats();
         let (drop0, hits0) = (stats.ingest_dedup_dropped_rows.load(Ordering::Relaxed), stats.ingest_dedup_key_hits.load(Ordering::Relaxed));
@@ -5007,7 +4989,7 @@ mod tests {
         assert!(!landed_identity_applies(&table), "premise: no schema => no identity");
 
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _w| Box::pin(async { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let layer = Arc::new(layer);
 
         let ts = crate::support::now_micros();
@@ -5405,7 +5387,7 @@ mod tests {
         {
             let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
             // Mock Delta writer so the sealed bucket "commits" successfully.
-            layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+            layer.delta_write_callback = Some(noop_delta());
             let layer = Arc::new(layer);
 
             layer.insert(&project, &table, vec![row("live", now)]).await.unwrap(); // i0 → shard 0
@@ -5613,7 +5595,7 @@ mod tests {
 
         {
             let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-            layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+            layer.delta_write_callback = Some(noop_delta());
             let layer = Arc::new(layer);
 
             layer.insert(&project, &table, vec![row("live", now)]).await.unwrap(); // shard 0
@@ -5740,7 +5722,7 @@ mod tests {
         let table = format!("d{}", test_id);
 
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _wm| Box::pin(async { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let layer = Arc::new(layer);
         let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span("x", "spanX", &project)]).unwrap();
         layer.insert(&project, &table, vec![batch]).await.unwrap();
@@ -5786,7 +5768,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _wm| Box::pin(async { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let layer = Arc::new(layer);
         let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span("handoff", "span", "p")]).unwrap();
         layer.insert("p", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
@@ -5855,7 +5837,7 @@ mod tests {
         let table = project.clone();
 
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _wm| Box::pin(async { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let layer = Arc::new(layer);
         layer.background_tasks.lock().await.push(tokio::spawn(async {
             // Deliberately ignores the layer's cancellation token.
@@ -6650,7 +6632,7 @@ mod tests {
         let (project, table) = (format!("cb{test_id}"), format!("cb{test_id}"));
 
         let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let layer = Arc::new(layer);
 
         // NOW timestamp → every row lands in the current (unsealed) bucket.
@@ -6695,7 +6677,7 @@ mod tests {
             c.buffer.timefusion_wal_admit_decouple = decouple;
         });
         let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
@@ -6768,7 +6750,7 @@ mod tests {
         let table = format!("fc{}", test_id);
 
         let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+        layer.delta_write_callback = Some(noop_delta());
         let layer = Arc::new(layer);
 
         // create_test_batch uses now() timestamps → the current (open) bucket.

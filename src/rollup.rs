@@ -6,6 +6,7 @@
 //! is deliberately conservative: an unsupported query must use raw data.
 
 use crate::schema::{RollupMeasure, RollupSpec};
+use itertools::Itertools;
 
 /// Why a query cannot use a rollup. Variant names ARE the `rollup_misses`
 /// telemetry labels (snake_case); the two `serialize` overrides are historical
@@ -119,14 +120,8 @@ fn sql_literal(value: &str) -> String {
 /// measure availability remains a separate proof at read time.
 pub fn generation_id(spec: &RollupSpec, source: &str, project_id: &str, date: &str, _source_fp: u64, measures: Option<&[String]>) -> String {
     use std::hash::{Hash, Hasher};
-    let restricted;
-    let spec = match measures {
-        Some(names) => {
-            restricted = RollupSpec { measures: spec.measures.iter().filter(|m| names.contains(&m.name)).cloned().collect(), ..spec.clone() };
-            &restricted
-        }
-        None => spec,
-    };
+    let restricted = measures.map(|names| RollupSpec { measures: spec.measures.iter().filter(|m| names.contains(&m.name)).cloned().collect(), ..spec.clone() });
+    let spec = restricted.as_ref().unwrap_or(spec);
     let mut hasher = fnv::FnvHasher::default();
     // Materialized aggregates depend on source-read semantics as well as the
     // SQL spec. Older generations may contain results from incorrect physical
@@ -189,10 +184,7 @@ pub(crate) fn hours_from_stats_json(stats: &str, day_start_micros: i64) -> Optio
     if hi_h < 0 || lo_h >= 24 || lo_h > hi_h {
         return None;
     }
-    let mut mask = 0u32;
-    for hour in lo_h.clamp(0, 23)..=hi_h.clamp(0, 23) {
-        mask |= 1 << hour;
-    }
+    let mask = (lo_h.clamp(0, 23)..=hi_h.clamp(0, 23)).fold(0u32, |mask, hour| mask | 1 << hour);
     (mask != 0).then_some(mask)
 }
 
@@ -201,18 +193,9 @@ const HOUR_MICROS: i64 = 3_600_000_000;
 /// The `[start, end)` ranges `hours` marks on the day beginning at `day_start`,
 /// with adjacent hours merged so a contiguous span costs one predicate.
 pub(crate) fn dirty_ranges(day_start: i64, hours: u32) -> Vec<(i64, i64)> {
-    let mut ranges: Vec<(i64, i64)> = Vec::new();
-    for hour in 0..24 {
-        if hours & (1 << hour) == 0 {
-            continue;
-        }
-        let (start, end) = (day_start + hour * HOUR_MICROS, day_start + (hour + 1) * HOUR_MICROS);
-        match ranges.last_mut() {
-            Some(last) if last.1 == start => last.1 = end,
-            _ => ranges.push((start, end)),
-        }
-    }
-    ranges
+    crate::write::mem_buffer::merge_ranges(
+        (0..24).filter(|hour| hours & (1 << hour) != 0).map(|hour| (day_start + hour * HOUR_MICROS, day_start + (hour + 1) * HOUR_MICROS)).collect(),
+    )
 }
 
 pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, project_id: &str, date: &str) -> anyhow::Result<String> {
@@ -288,7 +271,7 @@ pub(crate) fn build_partition_sql_ranges(
     let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
     let source = from;
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
-    let group_by = std::iter::once("1".to_string()).chain((2..).take(spec.dimensions.len()).map(|index| index.to_string())).collect::<Vec<_>>().join(", ");
+    let group_by = (1..=1 + spec.dimensions.len()).join(", ");
 
     let partition = format!("project_id = {} AND date = {}", sql_literal(project_id), sql_literal(date));
     let rebuilt = format!(
@@ -301,12 +284,9 @@ pub(crate) fn build_partition_sql_ranges(
     // Only `>=`/`<`, and the SAME range list drives both legs — the rebuilt
     // hours and the carried-forward ones must partition the day exactly, or a
     // bucket is either counted twice or silently dropped from the rollup.
-    let dirty = ranges
-        .iter()
-        .map(|(start, end)| format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let carried = spec.measures.iter().map(|measure| measure.name.clone()).collect::<Vec<_>>().join(", ");
+    let dirty =
+        ranges.iter().map(|(start, end)| format!("(timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}))")).join(" OR ");
+    let carried = spec.measures.iter().map(|measure| &measure.name).join(", ");
     Ok(format!(
         "{rebuilt} AND ({dirty}) GROUP BY {group_by} \
          UNION ALL SELECT timestamp{select_dimensions}, {carried} FROM {target} WHERE {partition} AND NOT ({dirty})"
@@ -323,12 +303,8 @@ pub(crate) fn build_cohort_sql_range_mode(
     let dimensions = spec.dimensions.join(", ");
     let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
-    let group_by = std::iter::once("1".to_string())
-        .chain(std::iter::once("2".to_string()))
-        .chain((3..).take(spec.dimensions.len()).map(|index| index.to_string()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let projects = project_ids.iter().map(|project| sql_literal(project)).collect::<Vec<_>>().join(", ");
+    let group_by = (1..=2 + spec.dimensions.len()).join(", ");
+    let projects = project_ids.iter().map(|project| sql_literal(project)).join(", ");
     Ok(format!(
         "SELECT project_id, to_timestamp_micros(CAST(FLOOR(EXTRACT(EPOCH FROM timestamp) * 1000000 / {grain}) AS BIGINT) * {grain}) AS timestamp{select_dimensions}, {measures} \
          FROM {from} WHERE project_id IN ({projects}) AND date = {} AND timestamp >= to_timestamp_micros({start}) AND timestamp < to_timestamp_micros({end}) \
@@ -1210,14 +1186,14 @@ pub(crate) fn slice_input_sql(
         // `SELECT *` returns only what the provider has, so it cannot stand in
         // once anything is missing.
         if schema.fields.iter().any(|field| missing(&field.name)) {
-            let columns = schema.fields.iter().map(&projected).collect::<Vec<_>>().join(", ");
+            let columns = schema.fields.iter().map(&projected).join(", ");
             return format!("SELECT {columns} FROM {raw} {window}");
         }
         return format!("SELECT * FROM {raw} {window}");
     };
-    let inner = schema.fields.iter().map(&projected).collect::<Vec<_>>().join(", ");
-    let columns = schema.fields.iter().map(|field| quoted(&field.name)).collect::<Vec<_>>().join(", ");
-    let keys = dedup.keys.iter().map(|field| quoted(field)).collect::<Vec<_>>().join(", ");
+    let inner = schema.fields.iter().map(&projected).join(", ");
+    let columns = schema.fields.iter().map(|field| quoted(&field.name)).join(", ");
+    let keys = dedup.keys.iter().map(|field| quoted(field)).join(", ");
     let order = dedup.tiebreak.map_or_else(|| keys.clone(), |field| format!("{} DESC NULLS LAST", quoted(field)));
     let tombstone = dedup.tombstone.map_or_else(String::new, |field| format!(" AND COALESCE({}, false) = false", quoted(field)));
     format!(
@@ -1335,7 +1311,7 @@ impl RoutedRollup {
         if self.groups.is_empty() {
             return String::new();
         }
-        format!(" GROUP BY {}", (1..=self.groups.len()).map(|index| index.to_string()).collect::<Vec<_>>().join(", "))
+        format!(" GROUP BY {}", (1..=self.groups.len()).join(", "))
     }
 
     /// One partial-aggregate SELECT over `ranges`, with synthetic column names.
@@ -1352,9 +1328,8 @@ impl RoutedRollup {
                 let states = if table == self.target { measure.merge.partial_states(&measure.measures) } else { measure.raw.clone() };
                 states.into_iter().enumerate().map(move |(state, sql)| format!("{sql} AS __s{index}_{state}"))
             }))
-            .collect::<Vec<_>>()
             .join(", ");
-        let ranges = ranges.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR ");
+        let ranges = ranges.iter().map(Self::range_sql).join(" OR ");
         let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
         let group_by = self.group_by();
         format!("SELECT {select} FROM {table} WHERE {projects}({ranges}){extra}{row_filters}{group_by}")
@@ -1372,7 +1347,7 @@ impl RoutedRollup {
     /// proved coverage.
     fn projects_in(&self, projects: Option<&[String]>) -> String {
         match projects {
-            Some(list) => format!("project_id IN ({}) AND ", list.iter().map(|p| sql_literal(p)).collect::<Vec<_>>().join(", ")),
+            Some(list) => format!("project_id IN ({}) AND ", list.iter().map(|p| sql_literal(p)).join(", ")),
             None => self.project_predicate(),
         }
     }
@@ -1398,7 +1373,6 @@ impl RoutedRollup {
                     None =>
                         format!("(project_id = {} AND date = {} AND rollup_generation = {})", sql_literal(project), sql_literal(date), sql_literal(generation)),
                 })
-                .collect::<Vec<_>>()
                 .join(" OR ")
         );
         // An open-ended window's raw leg must run to the sentinel, not to the
@@ -1424,7 +1398,6 @@ impl RoutedRollup {
                 .iter()
                 .map(|(expression, alias)| format!("{expression} AS {}", quoted(alias)))
                 .chain(self.measures.iter().map(|measure| format!("{} AS {}", measure.merge.sql(&measure.measures), quoted(&measure.alias))))
-                .collect::<Vec<_>>()
                 .join(", ");
             let row_filters = self.row_filters.iter().map(|filter| format!(" AND ({filter})")).collect::<String>();
             let group_by = self.group_by();
@@ -1432,7 +1405,7 @@ impl RoutedRollup {
             return format!(
                 "SELECT {select} FROM {} WHERE {rollup_projects}({}){generations}{row_filters}{group_by}{having}",
                 self.target,
-                interiors.iter().map(Self::range_sql).collect::<Vec<_>>().join(" OR "),
+                interiors.iter().map(Self::range_sql).join(" OR "),
             );
         }
         let outer = self
@@ -1444,7 +1417,6 @@ impl RoutedRollup {
                 let states = (0..measure.merge.arity()).map(|state| format!("__s{index}_{state}")).collect::<Vec<_>>();
                 format!("{} AS {}", measure.merge.sql(&states), quoted(&measure.alias))
             }))
-            .collect::<Vec<_>>()
             .join(", ");
         let group_by = self.group_by();
         let having =
@@ -1741,7 +1713,7 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
         }
         Expr::BinaryExpr(binary) => format!("({} {:?} {})", canonical(&binary.left), binary.op, canonical(&binary.right)),
         Expr::IsNotNull(expr) => format!("{} IS NOT NULL", canonical(expr)),
-        Expr::ScalarFunction(function) => format!("{}({})", function.name(), function.args.iter().map(canonical).collect::<Vec<_>>().join(",")),
+        Expr::ScalarFunction(function) => format!("{}({})", function.name(), function.args.iter().map(canonical).join(",")),
         expr => format!("{expr:?}"),
     }
 }
@@ -1849,10 +1821,9 @@ pub(crate) fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, f
         // node: the `SELECT *` variant-wrap over `otel_logs_and_spans` projects
         // every column of a wide schema, and `display()` on it is a multi-KB
         // log line.
-        LogicalPlan::Projection(projection) => Err(truncated(&format!(
-            "Projection: {}",
-            projection.expr.iter().filter(|expr| !matches!(expr, Expr::Column(_))).take(4).map(ToString::to_string).collect::<Vec<_>>().join(", ")
-        ))),
+        LogicalPlan::Projection(projection) => {
+            Err(truncated(&format!("Projection: {}", projection.expr.iter().filter(|expr| !matches!(expr, Expr::Column(_))).take(4).join(", "))))
+        }
         // A derived table or CTE — `count(1) FROM (SELECT id …) t` is the shape
         // every monoscope benchmark and every top-K CTE emits, and it was the
         // largest miss class on prod (126 of 414, 2026-08-25).
@@ -2120,7 +2091,7 @@ pub(crate) async fn match_aggregates(
     // for; the inlined copy only ever answers "does this resemble a dimension".
     let inlined = inline_common_exprs(original);
     let aggregate = inlined.as_ref().unwrap_or(original);
-    let shape = || matched.display_indent_schema().to_string().lines().take(6).collect::<Vec<_>>().join(" | ");
+    let shape = || matched.display_indent_schema().to_string().lines().take(6).join(" | ");
     let mut predicates = Vec::new();
     let source = match source_and_filters(&aggregate.input, &mut predicates) {
         Ok(source) => source,
@@ -2464,7 +2435,6 @@ async fn route_with_spec(
                             .iter()
                             .filter(|(measure, _)| measure.agg == "count" && measure.column.as_deref() == column)
                             .map(|(measure, filter)| format!("{}={filter}", measure.name))
-                            .collect::<Vec<_>>()
                             .join(" | ")
                     };
                     // A residual constraining columns NO declared filter even

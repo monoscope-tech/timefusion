@@ -8006,7 +8006,8 @@ impl TailAdd {
     /// stats JSON instead.
     fn from_stats(path: String, size: i64, is_sorted_run: bool, has_dv: bool, stats: Option<&str>) -> Self {
         let range = stats.and_then(Database::event_time_range_from_stats);
-        // Same JSON blob the range comes from, so this costs nothing extra.
+        // Re-parses the blob `event_time_range_from_stats` just parsed — fine at
+        // planner frequency; a single-parse API means a compact.rs signature change.
         let rows = stats.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).and_then(|v| v.get("numRecords").and_then(serde_json::Value::as_u64));
         Self { path, size, is_sorted_run, event_range: range, rows, has_dv }
     }
@@ -11944,22 +11945,23 @@ mod writer_properties_tests {
     fn render(batches: &[RecordBatch], cols: Option<&[&str]>) -> Vec<String> {
         use arrow::util::display::{ArrayFormatter, FormatOptions};
         let opts = FormatOptions::default().with_null("<NULL>");
-        let mut out = Vec::new();
-        for b in batches {
-            let schema = b.schema();
-            let picked: Vec<(usize, &str)> = schema
-                .fields()
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| cols.is_none_or(|c| c.contains(&f.name().as_str())))
-                .map(|(i, f)| (i, f.name().as_str()))
-                .collect();
-            let fmt: Vec<_> = picked.iter().map(|(i, _)| ArrayFormatter::try_new(b.column(*i).as_ref(), &opts).unwrap()).collect();
-            for row in 0..b.num_rows() {
-                out.push(picked.iter().zip(&fmt).map(|((_, n), f)| format!("{n}={}", f.value(row))).collect::<Vec<_>>().join("|"));
-            }
-        }
-        out
+        batches
+            .iter()
+            .flat_map(|b| {
+                let schema = b.schema();
+                let picked: Vec<(usize, &str)> = schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| cols.is_none_or(|c| c.contains(&f.name().as_str())))
+                    .map(|(i, f)| (i, f.name().as_str()))
+                    .collect();
+                let fmt: Vec<_> = picked.iter().map(|(i, _)| ArrayFormatter::try_new(b.column(*i).as_ref(), &opts).unwrap()).collect();
+                (0..b.num_rows())
+                    .map(|row| picked.iter().zip(&fmt).map(|((_, n), f)| format!("{n}={}", f.value(row))).collect::<Vec<_>>().join("|"))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Equivalence check for the streaming k-way merge against the old concat + global-lexsort +

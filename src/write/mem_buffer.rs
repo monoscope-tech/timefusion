@@ -679,7 +679,6 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Optio
     // …88a1a8). Key columns (e.g. `id`) are tiny, so concatenating just those is
     // safe; superseded rows are then dropped by filtering each batch in place,
     // keeping every output array bounded by its source batch.
-    // Concatenate one named column across all batches (never the full payload).
     let concat_col = |name: &str| -> anyhow::Result<ArrayRef> {
         let cols = batches
             .iter()
@@ -789,6 +788,21 @@ fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray)
     arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(arrow_err)
 }
 
+/// Evaluate a compiled predicate to a boolean row mask over `batch`.
+fn eval_bool_mask(pred: &Arc<dyn datafusion::physical_expr::PhysicalExpr>, batch: &RecordBatch) -> DFResult<BooleanArray> {
+    pred.evaluate(batch)?
+        .into_array(batch.num_rows())?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .cloned()
+        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))
+}
+
+/// [`eval_bool_mask`] for an optional predicate — `None` matches every row.
+fn eval_bool_mask_or_all(pred: Option<&Arc<dyn datafusion::physical_expr::PhysicalExpr>>, batch: &RecordBatch) -> DFResult<BooleanArray> {
+    pred.map_or_else(|| Ok(BooleanArray::from(vec![true; batch.num_rows()])), |p| eval_bool_mask(p, batch))
+}
+
 /// Parse a SQL fragment into a DataFusion Expr. `schema` resolves column refs
 /// (column refs nested inside function args need a non-empty schema).
 /// `registry` resolves UDFs — required if the SQL has any function call.
@@ -815,6 +829,12 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistr
     // (e.g. `upper(name)` Utf8View vs a Utf8 literal), so apply the same type
     // coercion the analyzer would before this predicate is lowered to a physical expr.
     Ok(expr.rewrite(&mut datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter::new(schema))?.data)
+}
+
+/// Parse `(column, value-SQL)` assignment pairs against `schema` — the WAL
+/// replay counterpart of the live paths' pre-planned assignment exprs.
+fn parse_sql_assignments(assignments: &[(String, String)], schema: &DFSchema, registry: Option<&FnRegistry>) -> DFResult<Vec<(String, Expr)>> {
+    assignments.iter().map(|(col, sql)| parse_sql_predicate(sql, schema, registry).map(|expr| (col.clone(), expr))).collect()
 }
 
 struct RegistryContextProvider<'a> {
@@ -923,11 +943,7 @@ fn filter_batch_by_id_set(batch: &RecordBatch, ids: &std::collections::HashSet<S
 /// any evaluation error we return the original batch so DataFusion's FilterExec
 /// can finish the job.
 fn apply_predicate(batch: &RecordBatch, pred: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> RecordBatch {
-    pred.evaluate(batch)
-        .ok()
-        .and_then(|v| v.into_array(batch.num_rows()).ok())
-        .and_then(|arr| filter_record_batch(batch, arr.as_any().downcast_ref::<BooleanArray>()?).ok())
-        .unwrap_or_else(|| batch.clone())
+    eval_bool_mask(pred, batch).ok().and_then(|mask| filter_record_batch(batch, &mask).ok()).unwrap_or_else(|| batch.clone())
 }
 
 /// Apply an optional compiled predicate to a bucket snapshot, dropping
@@ -1120,11 +1136,6 @@ impl MemBuffer {
         }
     }
 
-    /// Record that `bucket_id`'s rows were committed to Delta while the
-    /// bucket was still open — see the `force_flushed` field docs. Called
-    /// before the commit so no query can race into the masked window; a
-    /// failed commit leaves a stale mark, which only costs that bucket the
-    /// brief commit-then-drain exclusion at its eventual sealed flush.
     /// Record that everything up to `ts` in this bucket is now Delta's.
     /// Monotonic: a failed commit restores the rows, and an unfloored Delta leg
     /// merely contributes nothing there — the safe direction.
@@ -1132,6 +1143,11 @@ impl MemBuffer {
         self.flushed_max.entry(key).or_default().entry(bucket_id).and_modify(|v| *v = (*v).max(ts)).or_insert(ts);
     }
 
+    /// Record that `bucket_id`'s rows were committed to Delta while the
+    /// bucket was still open — see the `force_flushed` field docs. Called
+    /// before the commit so no query can race into the masked window; a
+    /// failed commit leaves a stale mark, which only costs that bucket the
+    /// brief commit-then-drain exclusion at its eventual sealed flush.
     pub fn mark_force_flushed(&self, project_id: &str, table_name: &str, bucket_id: i64) {
         self.force_flushed.entry(table_key(project_id, table_name)).or_default().insert(bucket_id);
     }
@@ -1392,8 +1408,6 @@ impl MemBuffer {
         })
     }
 
-    /// (project_id, table_name, bucket_id) for every bucket whose id passes
-    /// `filter`. Drives the take-based flush paths.
     /// `(bucket_id, created_micros, memory_bytes)` for every bucket matching
     /// `filter`, across all tables — the flush dwell gate's input. Same id can
     /// appear once per (project, table).
@@ -1411,6 +1425,8 @@ impl MemBuffer {
             .collect()
     }
 
+    /// (project_id, table_name, bucket_id) for every bucket whose id passes
+    /// `filter`. Drives the take-based flush paths.
     pub fn bucket_keys(&self, filter: impl Fn(i64) -> bool) -> Vec<(String, String, i64)> {
         self.tables
             .iter()
@@ -2215,14 +2231,7 @@ impl MemBuffer {
                     let (rows, original_size) = (batch.num_rows(), estimate_batch_size(&batch));
                     let survived = match physical_predicate.as_ref() {
                         // Keep rows where the predicate is FALSE.
-                        Some(phys_pred) => {
-                            let mask = phys_pred.evaluate(&batch)?.into_array(rows)?;
-                            let mask = mask
-                                .as_any()
-                                .downcast_ref::<BooleanArray>()
-                                .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?;
-                            filter_record_batch(&batch, &arrow::compute::not(mask)?)?
-                        }
+                        Some(phys_pred) => filter_record_batch(&batch, &arrow::compute::not(&eval_bool_mask(phys_pred, &batch)?)?)?,
                         // No predicate = delete all rows.
                         None => RecordBatch::new_empty(batch.schema()),
                     };
@@ -2299,18 +2308,9 @@ impl MemBuffer {
                         return Ok(batch);
                     }
 
-                    let mask = if let Some(ref phys_pred) = physical_predicate {
-                        let result = phys_pred.evaluate(&batch)?;
-                        let arr = result.into_array(num_rows)?;
-                        arr.as_any()
-                            .downcast_ref::<BooleanArray>()
-                            .cloned()
-                            .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?
-                    } else {
-                        BooleanArray::from(vec![true; num_rows])
-                    };
+                    let mask = eval_bool_mask_or_all(physical_predicate.as_ref(), &batch)?;
 
-                    let matching_count = mask.iter().filter(|v| v == &Some(true)).count();
+                    let matching_count = mask.true_count();
                     if matching_count == 0 {
                         return Ok(batch);
                     }
@@ -2524,14 +2524,12 @@ impl MemBuffer {
                 // is [preserved-rows, updated-rows]; row order within the bucket
                 // is not semantically meaningful (queries sort; dedup keys on
                 // values), so splitting is safe.
-                let has_match = BooleanArray::from((0..num_rows).map(|i| !src_idxs.is_null(i)).collect::<Vec<_>>());
+                let has_match = arrow::compute::is_not_null(&src_idxs).map_err(arrow_err)?;
 
                 // Candidate rows (source matched) — widen only these.
                 let cand_batch = filter_record_batch(&batch, &has_match).map_err(arrow_err)?;
                 let cand_src_idxs = arrow::compute::filter(&src_idxs, &has_match).map_err(arrow_err)?;
                 let cand_src_idxs = cand_src_idxs.as_any().downcast_ref::<UInt32Array>().expect("filter preserves UInt32 type");
-                let cand_n = cand_batch.num_rows();
-
                 let mut widened_cols: Vec<ArrayRef> = cand_batch.columns().to_vec();
                 for i in 0..source.schema.fields().len() {
                     let taken = arrow::compute::take(source.batch.column(i).as_ref(), cand_src_idxs, None).map_err(arrow_err)?;
@@ -2540,17 +2538,9 @@ impl MemBuffer {
                 let cand_widened = RecordBatch::try_new(widened_schema.clone(), widened_cols).map_err(arrow_err)?;
 
                 // Predicate over candidates (all already have a source match).
-                let cand_pred = if let Some(ref phys_pred) = physical_predicate {
-                    let arr = phys_pred.evaluate(&cand_widened)?.into_array(cand_n)?;
-                    arr.as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .cloned()
-                        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?
-                } else {
-                    BooleanArray::from(vec![true; cand_n])
-                };
+                let cand_pred = eval_bool_mask_or_all(physical_predicate.as_ref(), &cand_widened)?;
 
-                let matching_count = cand_pred.iter().filter(|v| v == &Some(true)).count();
+                let matching_count = cand_pred.true_count();
                 if matching_count == 0 {
                     new_batches.push(batch);
                     continue;
@@ -2659,10 +2649,7 @@ impl MemBuffer {
         let widened_df_schema = DFSchema::try_from(widened_schema.as_ref().clone())?;
 
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &widened_df_schema, registry)).transpose()?;
-        let parsed_assignments: Vec<(String, Expr)> = assignments
-            .iter()
-            .map(|(col, val_sql)| parse_sql_predicate(val_sql, &widened_df_schema, registry).map(|expr| (col.clone(), expr)))
-            .collect::<DFResult<Vec<_>>>()?;
+        let parsed_assignments = parse_sql_assignments(assignments, &widened_df_schema, registry)?;
 
         let source = crate::dml::UpdateSource { schema: source_batch.schema(), batch: source_batch, join_keys: join_keys.to_vec() };
         self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source, wal_hold)
@@ -2680,10 +2667,7 @@ impl MemBuffer {
         }
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
-        let parsed_assignments: Vec<(String, Expr)> = assignments
-            .iter()
-            .map(|(col, val_sql)| parse_sql_predicate(val_sql, &df_schema, registry).map(|expr| (col.clone(), expr)))
-            .collect::<DFResult<Vec<_>>>()?;
+        let parsed_assignments = parse_sql_assignments(assignments, &df_schema, registry)?;
         self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments, wal_hold)
     }
 
@@ -3313,16 +3297,26 @@ mod tests {
         assert!(sort_partition(schema, diverse).is_none(), "a partition mixing schemas is refused, which is what retracts the ordering for the entire leg");
     }
 
-    fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
+    /// One `(timestamp, id, name)` batch — the shared shape of most tests here.
+    fn tin_batch(ts: Vec<i64>, ids: Vec<i64>, names: Vec<String>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8View, false),
         ]));
-        let ts_array = TimestampMicrosecondArray::from(vec![timestamp_micros]).with_timezone("UTC");
-        let id_array = Int64Array::from(vec![1]);
-        let name_array = StringViewArray::from(vec!["test"]);
-        RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringViewArray::from(names.iter().map(String::as_str).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn create_test_batch(timestamp_micros: i64) -> RecordBatch {
+        tin_batch(vec![timestamp_micros], vec![1], vec!["test".into()])
     }
 
     // Prod 2026-06-11: pgwire fast-insert / WAL-replay batches materialize a
@@ -4130,15 +4124,7 @@ mod tests {
 
     fn create_multi_row_batch(ids: Vec<i64>, names: Vec<&str>) -> RecordBatch {
         let ts = chrono::Utc::now().timestamp_micros();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8View, false),
-        ]));
-        let ts_array = TimestampMicrosecondArray::from(vec![ts; ids.len()]).with_timezone("UTC");
-        let id_array = Int64Array::from(ids);
-        let name_array = StringViewArray::from(names);
-        RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
+        tin_batch(vec![ts; ids.len()], ids, names.into_iter().map(Into::into).collect())
     }
 
     #[test]
@@ -4753,7 +4739,7 @@ mod tests {
         let table = buffer.get_table("p1", "t1").unwrap();
         let bucket = table.buckets.get(&bucket_id).expect("bucket exists");
 
-        let snapshot: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
+        let snapshot: Vec<RecordBatch> = bucket.batches.lock().to_vec();
         let n_batches = snapshot.len();
         let total_in_bucket: usize = snapshot.iter().map(|b| b.num_rows()).sum();
 
@@ -4771,34 +4757,12 @@ mod tests {
     }
 
     fn make_batch_with_rows(start_ts: i64, n: usize) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8View, false),
-        ]));
-        let ts_array = TimestampMicrosecondArray::from(vec![start_ts; n]).with_timezone("UTC");
-        let id_array = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-        let name_array = StringViewArray::from((0..n).map(|i| format!("row-{i}")).collect::<Vec<_>>());
-        RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
+        tin_batch(vec![start_ts; n], (0..n as i64).collect(), (0..n).map(|i| format!("row-{i}")).collect())
     }
 
     /// Single-bucket batch with a `name` Utf8View column for the OR-equality test.
     fn name_batch(ts: i64, names: Vec<&str>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8View, false),
-        ]));
-        let n = names.len();
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(TimestampMicrosecondArray::from(vec![ts; n]).with_timezone("UTC")),
-                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
-                Arc::new(StringViewArray::from(names)),
-            ],
-        )
-        .unwrap()
+        tin_batch(vec![ts; names.len()], (0..names.len() as i64).collect(), names.into_iter().map(Into::into).collect())
     }
 
     #[test]

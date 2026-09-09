@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering::Relaxed;
 
 use anyhow::Context as _;
+use itertools::Itertools;
 use serde::Serialize;
 
 use crate::maintenance_coordinator::{
@@ -79,7 +80,7 @@ impl DayShape {
     /// assert!(day.bytes(300 * 1_000_000, false) < 32_000_000);
     /// ```
     pub fn bytes(&self, width_micros: i64, floored: bool) -> u64 {
-        let width = u128::try_from(width_micros.max(0)).unwrap_or(0);
+        let width = width_micros.max(0) as u128;
         let proportional = (u128::from(self.decoded_bytes) * width / u128::from(DAY_MICROS as u64)) as u64;
         if !floored {
             return proportional;
@@ -88,7 +89,7 @@ impl DayShape {
     }
 
     fn files_overlapping(&self, width_micros: i64) -> u64 {
-        let span = u128::try_from(FILE_SPAN_MICROS.saturating_add(width_micros.max(0))).unwrap_or(0);
+        let span = FILE_SPAN_MICROS.saturating_add(width_micros.max(0)) as u128;
         ((u128::from(self.files) * span).div_ceil(u128::from(DAY_MICROS as u64)) as u64).clamp(1, self.files)
     }
 }
@@ -111,7 +112,7 @@ impl ByteModel {
     }
 
     fn day_of(key: &TaskKey) -> i64 {
-        key.slice.start_micros.div_euclid(DAY_MICROS) * DAY_MICROS
+        day_start(key.slice.start_micros)
     }
 
     /// Unmodelled partitions measure 0 — they never split, which is the right
@@ -322,40 +323,24 @@ fn duration_range_secs(operation: Operation, width_micros: i64, rng: &mut Rng) -
     //   HotPacking          68      0      0      1     13
     //   SealedConsolidation 68      0      0     14     26
     let pct = rng.next() % 100;
-    let range = match (operation, frontier) {
+    let (lo, hi) = match (operation, frontier, pct) {
         // 70% no-op, 20% cheap, 10% the long tail that actually costs.
-        (Operation::Dedup, _) => {
-            if pct < 70 {
-                (0, 6)
-            } else if pct < 90 {
-                (6, 300)
-            } else {
-                (1_910, 7_203)
-            }
-        }
+        (Operation::Dedup, _, ..70) => (0, 6),
+        (Operation::Dedup, _, ..90) => (6, 300),
+        (Operation::Dedup, ..) => (1_910, 7_203),
         // 65% no-op, then a WIDE and frequent expensive mode — this is the one
         // the old model got most wrong.
-        (Operation::BaseRollup, true) => {
-            if pct < 65 {
-                (0, 5)
-            } else {
-                (1_227, 2_368)
-            }
-        }
-        (Operation::BaseRollup, false) => (0, 11),
-        (Operation::DerivedRollup, _) => (0, 3),
-        (Operation::HotPacking, _) => (0, 13),
-        (Operation::SealedConsolidation, _) => (0, 26),
+        (Operation::BaseRollup, true, ..65) => (0, 5),
+        (Operation::BaseRollup, true, _) => (1_227, 2_368),
+        (Operation::BaseRollup, false, _) => (0, 11),
+        (Operation::DerivedRollup, ..) => (0, 3),
+        (Operation::HotPacking, ..) => (0, 13),
+        (Operation::SealedConsolidation, ..) => (0, 26),
         // Half no-op, half a long tail.
-        (Operation::Repair, _) => {
-            if pct < 50 {
-                (0, 49)
-            } else {
-                (49, 5_678)
-            }
-        }
+        (Operation::Repair, _, ..50) => (0, 49),
+        (Operation::Repair, ..) => (49, 5_678),
     };
-    rng.uniform_secs(range.0, range.1)
+    rng.uniform_secs(lo, hi)
 }
 
 /// Debt work = file rewrites that cannot advance rollup coverage
@@ -434,11 +419,9 @@ impl Coverage {
         };
         // A slice can straddle midnight after time-bisection; credit each day
         // it overlaps, clamped to that day.
-        let mut day = key.slice.start_micros.div_euclid(DAY_MICROS) * DAY_MICROS;
-        while day < key.slice.end_micros {
+        for day in (day_start(key.slice.start_micros)..key.slice.end_micros).step_by(DAY_MICROS as usize) {
             let overlap = (key.slice.end_micros.min(day + DAY_MICROS) - key.slice.start_micros.max(day)).max(0);
             self.days.entry((key.source.clone(), key.project_id.clone())).or_default().entry(day).or_default()[tier] += overlap;
-            day += DAY_MICROS;
         }
     }
 
@@ -498,11 +481,7 @@ impl Coverage {
 /// `observed_at` sets the finalization deadline — the flush time for minting,
 /// the boot time for a restart reconcile.
 fn mint_stream(journal: &mut TaskJournal, stream: &Stream, start_micros: i64, end_micros: i64, observed_at_micros: i64) {
-    for derived in [false, true] {
-        if derived && stream.derived_rollup_table.is_none() {
-            continue;
-        }
-        let rollup_table = if derived { stream.derived_rollup_table.as_deref().unwrap_or(&stream.base_rollup_table) } else { &stream.base_rollup_table };
+    for (derived, rollup_table) in [(false, stream.base_rollup_table.as_str())].into_iter().chain(stream.derived_rollup_table.as_deref().map(|t| (true, t))) {
         // Minting must not fail the sim on a pathological journal; an
         // invalidation error means a skipped window, not a crash.
         let _ = journal.invalidate(Invalidation {
@@ -527,20 +506,17 @@ fn streams_from_journal(journal: &TaskJournal) -> Vec<Stream> {
     let mut streams: Vec<Stream> = Vec::new();
     for task in journal.tasks() {
         let key = &task.key;
-        let position = match streams.iter().position(|s| s.source == key.source && s.project_id == key.project_id) {
-            Some(position) => position,
-            None => {
-                streams.push(Stream {
-                    source_table: key.source.clone(),
-                    base_rollup_table: key.physical_table.clone(),
-                    derived_rollup_table: None,
-                    source: key.source.clone(),
-                    project_id: key.project_id.clone(),
-                    last_created_ms: 0,
-                });
-                streams.len() - 1
-            }
-        };
+        let position = streams.iter().position(|s| s.source == key.source && s.project_id == key.project_id).unwrap_or_else(|| {
+            streams.push(Stream {
+                source_table: key.source.clone(),
+                base_rollup_table: key.physical_table.clone(),
+                derived_rollup_table: None,
+                source: key.source.clone(),
+                project_id: key.project_id.clone(),
+                last_created_ms: 0,
+            });
+            streams.len() - 1
+        });
         let stream = &mut streams[position];
         stream.last_created_ms = stream.last_created_ms.max(task.created_unix_ms);
         match key.operation {
@@ -611,6 +587,28 @@ fn defeat_guard(journal: &mut TaskJournal, task: &MaintenanceTask) {
     journal.upsert(task);
 }
 
+/// Midnight (in micros) of the day `micros` falls in.
+fn day_start(micros: i64) -> i64 {
+    micros.div_euclid(DAY_MICROS) * DAY_MICROS
+}
+
+/// A task with work left: not yet complete, and not superseded by a split.
+fn is_open(state: TaskState) -> bool {
+    !matches!(state, TaskState::Complete | TaskState::Superseded)
+}
+
+/// Earliest future deadline among still-claimable tasks, optionally scoped to
+/// one operation. Shared by the per-operation "known empty until" memo and the
+/// idle-worker wakeup — both jump straight to the next eligibility instant
+/// instead of polling.
+fn next_deadline(journal: &TaskJournal, now: i64, operation: Option<Operation>) -> Option<i64> {
+    journal
+        .tasks()
+        .filter(|t| operation.is_none_or(|op| t.key.operation == op) && matches!(t.state, TaskState::Pending | TaskState::Retry) && t.deadline_micros > now)
+        .map(|t| t.deadline_micros)
+        .min()
+}
+
 /// `project/operation/day` — the (project, tier, day) cell the shred is counted
 /// in.
 fn cell_of(key: &TaskKey) -> String {
@@ -618,17 +616,27 @@ fn cell_of(key: &TaskKey) -> String {
 }
 
 fn max_cell_pending(journal: &TaskJournal) -> usize {
-    let mut cells: HashMap<String, usize> = HashMap::new();
-    for task in journal.tasks().filter(|task| !matches!(task.state, TaskState::Complete | TaskState::Superseded)) {
-        *cells.entry(cell_of(&task.key)).or_default() += 1;
-    }
-    cells.into_values().max().unwrap_or_default()
+    journal.tasks().filter(|task| is_open(task.state)).map(|task| cell_of(&task.key)).counts().into_values().max().unwrap_or_default()
 }
 
 struct Worker {
     busy_until: i64,
     current: Option<(TaskKey, u64)>,
     cycle_pos: usize,
+}
+
+fn hours(micros: i64) -> f64 {
+    micros as f64 / HOUR_MICROS as f64
+}
+
+/// Record the first hour each contiguity milestone is crossed.
+fn note_contiguity_milestones(report: &mut SimReport, contiguous: u64, elapsed_micros: i64) {
+    if contiguous >= 14 {
+        report.hours_to_contiguous_14.get_or_insert(hours(elapsed_micros));
+    }
+    if contiguous >= 30 {
+        report.hours_to_contiguous_30.get_or_insert(hours(elapsed_micros));
+    }
 }
 
 /// Replayed over `[start_micros, start_micros + horizon)`. The journal's own
@@ -660,24 +668,17 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         let Some(template) = streams.iter().find(|s| s.last_created_ms >= idle_cutoff_ms).or_else(|| streams.first()).cloned() else {
             anyhow::bail!("--streams needs at least one real stream in the journal")
         };
-        let mut active = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
+        let active = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
         // Down: retire the excess actives rather than dropping streams, so the
         // journal's existing backlog for them is preserved.
-        for stream in streams.iter_mut().filter(|s| s.last_created_ms >= idle_cutoff_ms) {
-            if active <= target {
-                break;
-            }
-            stream.last_created_ms = 0;
-            active -= 1;
-        }
+        streams.iter_mut().filter(|s| s.last_created_ms >= idle_cutoff_ms).take(active.saturating_sub(target)).for_each(|s| s.last_created_ms = 0);
         // Up: synthetic clones of a stream that is genuinely ingesting.
-        while active < target {
-            let mut synthetic = template.clone();
-            synthetic.project_id = format!("synth-{}", streams.len());
-            synthetic.last_created_ms = newest_created_ms;
-            streams.push(synthetic);
-            active += 1;
-        }
+        let len = streams.len();
+        streams.extend((0..target.saturating_sub(active)).map(|extra| Stream {
+            project_id: format!("synth-{}", len + extra),
+            last_created_ms: newest_created_ms,
+            ..template.clone()
+        }));
     }
     let ingesting = streams.iter().filter(|s| s.last_created_ms >= idle_cutoff_ms).count();
 
@@ -690,17 +691,10 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
         Coverage { days: HashMap::new(), pairs: streams.iter().map(|s| (s.source.clone(), s.project_id.clone(), s.derived_rollup_table.is_some())).collect() };
     // Seed coverage from already-complete rollup tasks so a fetched journal
     // starts with the coverage prod actually has.
-    for task in journal.tasks() {
-        if task.state == TaskState::Complete {
-            coverage.record(&task.key);
-        }
-    }
+    journal.tasks().filter(|t| t.state == TaskState::Complete).for_each(|t| coverage.record(&t.key));
 
-    let mut report = SimReport {
-        hours: cfg.horizon_micros as f64 / 3_600_000_000.0,
-        pending_start: journal.tasks().filter(|t| t.state != TaskState::Complete).count(),
-        ..Default::default()
-    };
+    let mut report =
+        SimReport { hours: hours(cfg.horizon_micros), pending_start: journal.tasks().filter(|t| t.state != TaskState::Complete).count(), ..Default::default() };
     let mut workers = (0..cfg.workers).map(|_| Worker { busy_until: start_micros, current: None, cycle_pos: 0 }).collect::<Vec<_>>();
     let mut next_mint = start_micros + MINT_INTERVAL_MICROS;
     let mut next_restart = match (cfg.restart_at_micros, cfg.restart_every_micros) {
@@ -713,7 +707,6 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     let tick = (cfg.horizon_micros / 48).max(300 * MICROS);
     let mut next_tick = start_micros + tick;
     let mut next_coarsen = start_micros + COARSEN_INTERVAL_MICROS;
-    let mut report_coarsen = crate::maintenance_coordinator::CoarsenReport::default();
     let mut now = start_micros;
     // #176: (jobs * 3 / 4).max(1) — the floor keeps debt work possible at all
     // on a one-worker box.
@@ -756,16 +749,16 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             // (`database/maintain.rs:2383`): footprint-less debris carrying an
             // inflated estimate only fuses once the partition ceiling says no
             // unit over that day can decode that much.
-            let report = match cfg.byte_model.as_ref() {
+            let coarsen = match cfg.byte_model.as_ref() {
                 Some(model) => journal.coarsen_sealed_slices_capped(now, &|project, _source, date| model.partition_ceiling(project, date)),
                 None => journal.coarsen_sealed_slices_reporting(now),
             };
-            report_coarsen.subsumed += report.subsumed;
-            report_coarsen.fused += report.fused;
-            report_coarsen.candidates += report.candidates;
-            report_coarsen.blocked += report.blocked;
-            report_coarsen.over_budget += report.over_budget;
-            if report.total() != 0 {
+            report.coarsen_subsumed += coarsen.subsumed;
+            report.coarsen_fused += coarsen.fused;
+            report.coarsen_candidates += coarsen.candidates;
+            report.coarsen_blocked += coarsen.blocked;
+            report.coarsen_over_budget += coarsen.over_budget;
+            if coarsen.total() != 0 {
                 none_until = [0; 6];
             }
             next_coarsen += COARSEN_INTERVAL_MICROS;
@@ -797,12 +790,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                         // Capture milestones at the crossing event, not just at
                         // report ticks — a tick can land just short of a day
                         // boundary and read one day less.
-                        if contiguous >= 14 && report.hours_to_contiguous_14.is_none() {
-                            report.hours_to_contiguous_14 = Some((now - start_micros) as f64 / 3_600_000_000.0);
-                        }
-                        if contiguous >= 30 && report.hours_to_contiguous_30.is_none() {
-                            report.hours_to_contiguous_30 = Some((now - start_micros) as f64 / 3_600_000_000.0);
-                        }
+                        note_contiguity_milestones(&mut report, contiguous, now - start_micros);
                     }
                     *report.completions.entry(format!("{:?}", key.operation)).or_default() += 1;
                 } else {
@@ -857,12 +845,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                 }
                 // A None holds until this op's next deadline matures or any
                 // state change (all of which reset the memo above).
-                none_until[operation as usize] = journal
-                    .tasks()
-                    .filter(|t| t.key.operation == operation && matches!(t.state, TaskState::Pending | TaskState::Retry) && t.deadline_micros > now)
-                    .map(|t| t.deadline_micros)
-                    .min()
-                    .unwrap_or(i64::MAX);
+                none_until[operation as usize] = next_deadline(&journal, now, Some(operation)).unwrap_or(i64::MAX);
             }
             // The byte preflight runs between the claim and the dispatch, where
             // prod runs it. A split leaves the worker free after the cost of
@@ -904,12 +887,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     // instant instead of polling — an idle worker re-scanning
                     // 38k tasks every 5 virtual seconds is what made the sim
                     // itself slow, not any property of the schedule.
-                    let next_eligible = journal
-                        .tasks()
-                        .filter(|t| matches!(t.state, TaskState::Pending | TaskState::Retry) && t.deadline_micros > now)
-                        .map(|t| t.deadline_micros)
-                        .min();
-                    worker.busy_until = next_eligible.unwrap_or(now + IDLE_POLL_MICROS).max(now + 1);
+                    worker.busy_until = next_deadline(&journal, now, None).unwrap_or(now + IDLE_POLL_MICROS).max(now + 1);
                 }
             }
         }
@@ -918,15 +896,10 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             let lag = frontier_lag_secs(&journal, now);
             report.frontier_lag_secs_max = report.frontier_lag_secs_max.max(lag);
             let contiguous = coverage.min_contiguous_days(now);
-            if contiguous >= 14 && report.hours_to_contiguous_14.is_none() {
-                report.hours_to_contiguous_14 = Some((now - start_micros) as f64 / 3_600_000_000.0);
-            }
-            if contiguous >= 30 && report.hours_to_contiguous_30.is_none() {
-                report.hours_to_contiguous_30 = Some((now - start_micros) as f64 / 3_600_000_000.0);
-            }
+            note_contiguity_milestones(&mut report, contiguous, now - start_micros);
             report.samples.push(SimSample {
-                hour: (now - start_micros) as f64 / 3_600_000_000.0,
-                pending: journal.tasks().filter(|t| !matches!(t.state, TaskState::Complete | TaskState::Superseded)).count(),
+                hour: hours(now - start_micros),
+                pending: journal.tasks().filter(|t| is_open(t.state)).count(),
                 frontier_lag_secs: lag,
                 min_contiguous_days: contiguous,
                 split_declined_at_floor: report.split_declined_at_floor,
@@ -937,12 +910,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     }
 
     report.min_contiguous_days_end = coverage.min_contiguous_days(now);
-    report.pending_end = journal.tasks().filter(|t| !matches!(t.state, TaskState::Complete | TaskState::Superseded)).count();
-    report.coarsen_subsumed = report_coarsen.subsumed;
-    report.coarsen_fused = report_coarsen.fused;
-    report.coarsen_candidates = report_coarsen.candidates;
-    report.coarsen_blocked = report_coarsen.blocked;
-    report.coarsen_over_budget = report_coarsen.over_budget;
+    report.pending_end = journal.tasks().filter(|t| is_open(t.state)).count();
     for task in journal.tasks() {
         *report.tasks_end.entry(format!("{:?}/{:?}", task.key.operation, task.state)).or_default() += 1;
         *report.units_per_cell.entry(cell_of(&task.key)).or_default() += 1;
@@ -960,31 +928,20 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     // MANY islands at partial coverage is the shape that certifies nothing —
     // prod 2026-09-05 measured a mode of 20-24 islands per cell.
     {
-        let mut by_cell: HashMap<(String, String, i64), Vec<(i64, i64)>> = HashMap::new();
-        for task in journal.tasks() {
-            let slice = &task.key.slice;
-            if task.key.operation != Operation::Dedup || task.state != TaskState::Complete {
-                continue;
-            }
-            let age = now.saturating_sub(slice.end_micros);
-            if !(0..=14 * DAY_MICROS).contains(&age) {
-                continue;
-            }
-            by_cell
-                .entry((task.key.project_id.clone(), task.key.source.clone(), slice.start_micros.div_euclid(DAY_MICROS)))
-                .or_default()
-                .push((slice.start_micros, slice.end_micros));
-        }
-        let mut islands_total = 0usize;
-        for ((_, _, day), slices) in by_cell.iter_mut() {
+        let by_cell: HashMap<(String, String, i64), Vec<(i64, i64)>> = journal
+            .tasks()
+            .filter(|task| task.key.operation == Operation::Dedup && task.state == TaskState::Complete)
+            .filter(|task| (0..=14 * DAY_MICROS).contains(&now.saturating_sub(task.key.slice.end_micros)))
+            .map(|task| {
+                let slice = &task.key.slice;
+                ((task.key.project_id.clone(), task.key.source.clone(), slice.start_micros.div_euclid(DAY_MICROS)), (slice.start_micros, slice.end_micros))
+            })
+            .into_group_map();
+        report.dedup_island_cells = by_cell.len();
+        for ((_, _, day), mut slices) in by_cell {
             slices.sort_unstable();
-            let mut runs = 0usize;
-            let mut open_end = i64::MIN;
-            for &(start, end) in slices.iter() {
-                runs += usize::from(start > open_end);
-                open_end = open_end.max(end);
-            }
-            islands_total += runs;
+            let (runs, open_end) = slices.iter().fold((0usize, i64::MIN), |(runs, open), &(start, end)| (runs + usize::from(start > open), open.max(end)));
+            report.dedup_islands_total += runs;
             // The grant-relevant outcome: ONE run covering the whole day. The
             // island count is stock (dominated by pre-sim state); this is the
             // conversion that certification actually pays on. `open_end` is the
@@ -994,8 +951,6 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             report.dedup_cells_day_covered +=
                 usize::from(runs == 1 && slices.first().is_some_and(|&(s, _)| s <= day_start) && open_end >= day_start + DAY_MICROS);
         }
-        report.dedup_island_cells = by_cell.len();
-        report.dedup_islands_total = islands_total;
     }
     Ok(report)
 }
@@ -1007,7 +962,7 @@ fn frontier_lag_secs(journal: &TaskJournal, now_micros: i64) -> u64 {
     journal
         .tasks()
         .filter(|task| {
-            !matches!(task.state, TaskState::Complete | TaskState::Superseded)
+            is_open(task.state)
                 && task.deadline_micros <= now_micros
                 && task.key.slice.end_micros >= now_micros.saturating_sub(crate::maintenance_coordinator::LIVE_FRONTIER_WINDOW_MICROS)
         })
@@ -1145,8 +1100,6 @@ mod tests {
     use super::*;
     use crate::maintenance_coordinator::{MAX_DECODED_BYTES, TimeSlice};
 
-    const HOUR: i64 = 3_600 * MICROS;
-
     fn key(project: &str, op: Operation, start: i64, width: i64) -> TaskKey {
         let table = match op {
             Operation::BaseRollup => "otel_logs_and_spans_rollup_dashboard_1m_v3",
@@ -1197,7 +1150,7 @@ mod tests {
     }
 
     fn cfg(hours: i64) -> SimConfig {
-        SimConfig { horizon_micros: hours * HOUR, ..Default::default() }
+        SimConfig { horizon_micros: hours * HOUR_MICROS, ..Default::default() }
     }
 
     #[test]
@@ -1351,12 +1304,12 @@ mod tests {
         let mut journal = journal_with_streams(4);
         let before: HashMap<_, _> = journal.tasks().map(|task| (task.key.clone(), serde_json::to_value(task).unwrap())).collect();
         let streams = streams_from_journal(&journal);
-        let hour_start = 100 * DAY_MICROS + 7 * HOUR;
-        reconcile_restart(&mut journal, &streams, hour_start + HOUR / 2);
+        let hour_start = 100 * DAY_MICROS + 7 * HOUR_MICROS;
+        reconcile_restart(&mut journal, &streams, hour_start + HOUR_MICROS / 2);
         let added: Vec<_> = journal.tasks().filter(|task| !before.contains_key(&task.key)).collect();
         assert_eq!(added.len(), 13 * streams.len(), "each stream needs six dedup slices, six base slices, and one derived hour");
         assert!(
-            added.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + HOUR),
+            added.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + HOUR_MICROS),
             "restart must only reconcile the touched hour"
         );
         for (key, prior) in before {
@@ -1374,8 +1327,14 @@ mod tests {
     fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64) -> (SimReport, String, String) {
         let start = 100 * DAY_MICROS;
         let queue = synthetic_whale_queue(start, floored, whale_x_max, 1);
-        let cfg =
-            SimConfig { mint_frontier: false, workers: 16, horizon_micros: 6 * HOUR, byte_model: Some(queue.model), split_guard: guard, ..Default::default() };
+        let cfg = SimConfig {
+            mint_frontier: false,
+            workers: 16,
+            horizon_micros: 6 * HOUR_MICROS,
+            byte_model: Some(queue.model),
+            split_guard: guard,
+            ..Default::default()
+        };
         let report = run(queue.journal, &cfg, start).unwrap();
         (report, queue.whale_cell, queue.stamped_cell)
     }
@@ -1449,7 +1408,7 @@ mod tests {
             let cfg = SimConfig {
                 mint_frontier: false,
                 workers: 16,
-                horizon_micros: 6 * HOUR,
+                horizon_micros: 6 * HOUR_MICROS,
                 byte_model: Some(queue.model),
                 split_guard: guard,
                 duration_scale: 0.0,

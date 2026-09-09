@@ -41,7 +41,6 @@ pub enum WalError {
     Internal(String),
 }
 
-/// Magic bytes to identify the WAL format ("WAL2").
 /// TimeFusion's own metadata directory, kept alongside the walrus data files
 /// (topic list, WAL version stamp, cursor snapshot, dedup dirty bins, delta
 /// snapshots). Skipped by WAL GC.
@@ -64,6 +63,7 @@ pub fn meta_path(data_dir: &Path, file: &str) -> PathBuf {
     data_dir.join(META_DIR).join(file)
 }
 
+/// Magic bytes identifying the WAL format ("WAL2").
 const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32];
 /// Insert batches are stored as Arrow IPC stream bytes. Embeds the schema so
 /// the reader doesn't need a separate registry lookup, and round-trips every
@@ -602,11 +602,11 @@ impl WalManager {
         // Each topic is split across `shards_per_topic` walrus collections; we
         // drain each in append order, then sort the merged slice by
         // timestamp so the caller sees a topic-wide ordering. Imperative drain:
-        // `next_from_shard` threads the error counter by `&mut`, so one shard
+        // `next_from_shard_timed` threads the error counter by `&mut`, so one shard
         // must finish before the next borrows it.
         for shard in 0..self.shards_per_topic {
             let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-            while let Some((entry, _)) = Self::next_from_shard(&self.wal, &walrus_key, checkpoint, true, &mut error_count) {
+            while let Some((entry, _)) = Self::next_from_shard_timed(&self.wal, &walrus_key, checkpoint, true, &mut error_count, &mut 0, &mut 0) {
                 if entry.timestamp_micros >= cutoff {
                     results.push(entry);
                 }
@@ -657,15 +657,11 @@ impl WalManager {
     }
 
     /// Read the next entry from a shard, skipping corrupted ones. Returns
-    /// `None` at end of stream. Shared by `WalReplayIter`'s k-way merge.
-    fn next_from_shard(wal: &Walrus, key: &str, checkpoint: bool, persist_checkpoint: bool, errors: &mut usize) -> Option<(WalEntry, WalPosition)> {
-        Self::next_from_shard_timed(wal, key, checkpoint, persist_checkpoint, errors, &mut 0, &mut 0)
-    }
-
-    /// As `next_from_shard`, but attributes its wall clock to the walrus read
-    /// and the envelope decode separately — replay's long pole was neither the
-    /// Arrow decode nor the MemBuffer apply (2026-08-15), and guessing which of
-    /// these two it is instead would repeat that mistake.
+    /// `None` at end of stream. Shared by `read_entries_raw` and
+    /// `WalReplayIter`'s k-way merge. Attributes its wall clock to the walrus
+    /// read and the envelope decode separately — replay's long pole was neither
+    /// the Arrow decode nor the MemBuffer apply (2026-08-15), and guessing
+    /// which of these two it is instead would repeat that mistake.
     fn next_from_shard_timed(
         wal: &Walrus, key: &str, checkpoint: bool, persist_checkpoint: bool, errors: &mut usize, read_nanos: &mut u128, envelope_nanos: &mut u128,
     ) -> Option<(WalEntry, WalPosition)> {
@@ -1202,11 +1198,7 @@ pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalEr
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
-    let mut buffer = WAL_MAGIC.to_vec();
-    buffer.push(WAL_VERSION);
-    buffer.push(entry.operation as u8);
-    buffer.extend(bincode::encode_to_vec(entry, BINCODE_CONFIG)?);
-    Ok(buffer)
+    Ok([&WAL_MAGIC[..], &[WAL_VERSION, entry.operation as u8], &bincode::encode_to_vec(entry, BINCODE_CONFIG)?[..]].concat())
 }
 
 fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {

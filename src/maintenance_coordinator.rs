@@ -22,9 +22,6 @@ pub const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 /// the mint width stands. Each divides the one above, so an aligned unit at any
 /// width sits inside exactly one bucket at every coarser width.
 pub const COARSEN_WIDTHS: [i64; 3] = [DAY_MICROS, 6 * 60 * 60 * 1_000_000, 60 * 60 * 1_000_000];
-/// Widths a unit can be SUBSUMED at, finest first — the mint width plus every
-/// fusion width. Each divides the next, so an aligned unit at any of them sits
-/// wholly inside one bucket of every coarser one.
 /// What one `coarsen_sealed_slices` pass actually did, per stage.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoarsenReport {
@@ -74,6 +71,9 @@ pub const fn is_derived_operation(operation: Operation) -> bool {
     matches!(operation, Operation::HotPacking | Operation::SealedConsolidation)
 }
 
+/// Widths a unit can be SUBSUMED at, finest first — the mint width plus every
+/// fusion width. Each divides the next, so an aligned unit at any of them sits
+/// wholly inside one bucket of every coarser one.
 pub const SUBSUME_WIDTHS: [i64; 4] = [NORMAL_SLICE_MICROS, 60 * 60 * 1_000_000, 6 * 60 * 60 * 1_000_000, DAY_MICROS];
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
@@ -88,15 +88,14 @@ pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 /// (`FINALIZATION_DELAY + lag`).
 pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 
-/// Whether a failure means "this did not fit" rather than "this went wrong".
+/// The longest per-unit idle window any operation gets. `COORDINATOR_LOOP_TIMEOUT`
+/// is derived from this so the outer guard can never quietly become the real
+/// deadline again.
+pub const MAX_OPERATION_DEADLINE_SECS: u64 = operation_deadline_secs(Operation::Repair);
+
+/// Per-operation idle window; also bounds retry backoff so oversized units
+/// cannot monopolize a worker.
 ///
-/// Matched on the message, not the type: these errors originate in DataFusion,
-/// cross the delta-rs and `anyhow` boundaries on the way back, and arrive
-/// type-erased. The two strings are DataFusion's own — `ResourcesExhausted`'s
-/// `Display` and the `ExternalSorter`'s message — and both are asserted against
-/// verbatim prod text in `capacity_failures_are_recognised_from_prod_text`.
-/// Operation deadlines also bound retry backoff so oversized units cannot
-/// monopolize a worker.
 /// Since `run_until_idle`, this is an IDLE window, not a budget: it fires only
 /// after this long with no rows written. That makes a longer window nearly free
 /// on healthy units and changes what the number has to cover — the longest
@@ -110,11 +109,6 @@ pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 /// that a genuinely hung repair holds a worker and one of ~2 `light_rewrite_sem`
 /// permits for an hour; that is affordable for a `take(1)` lane with a finite
 /// backlog, and it is strictly better than killing a unit that was working.
-/// The longest per-unit idle window any operation gets. `COORDINATOR_LOOP_TIMEOUT`
-/// is derived from this so the outer guard can never quietly become the real
-/// deadline again.
-pub const MAX_OPERATION_DEADLINE_SECS: u64 = operation_deadline_secs(Operation::Repair);
-
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
         // Dedup's 300s was chosen when this was a BUDGET on total time. Under
@@ -135,6 +129,13 @@ pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     }
 }
 
+/// Whether a failure means "this did not fit" rather than "this went wrong".
+///
+/// Matched on the message, not the type: these errors originate in DataFusion,
+/// cross the delta-rs and `anyhow` boundaries on the way back, and arrive
+/// type-erased. The two strings are DataFusion's own — `ResourcesExhausted`'s
+/// `Display` and the `ExternalSorter`'s message — and both are asserted against
+/// verbatim prod text in `capacity_failures_are_recognised_from_prod_text`.
 pub fn is_capacity_failure(message: &str) -> bool {
     // "resource_admission" belongs here by definition: the unit's ESTIMATE
     // exceeds what admission can ever grant, so it fails identically every
@@ -160,7 +161,7 @@ pub fn is_schema_failure(message: &str) -> bool {
 }
 pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
-pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = DAY_MICROS;
 const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
 /// File-count band for hygiene benefit ranking — see `scheduling_class`.
 ///
@@ -457,6 +458,28 @@ impl MaintenanceTask {
     pub fn scheduling_width(&self) -> i64 {
         self.backfill_priority_micros.unwrap_or_else(|| self.key.slice.width())
     }
+
+    /// A freshly minted Pending unit with no history — the base every minting
+    /// site (enqueue, invalidate, fusion, tests) extends via struct update.
+    fn pending(key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) -> Self {
+        Self {
+            key,
+            state: TaskState::Pending,
+            deadline_micros,
+            estimated_decoded_bytes,
+            hash_shard: 0,
+            hash_shards: 1,
+            attempts: 0,
+            created_unix_ms,
+            retry_reason: None,
+            publication: None,
+            base_tier_present: false,
+            input: None,
+            parent_measured_bytes: None,
+            preflight_decoded_bytes: None,
+            backfill_priority_micros: None,
+        }
+    }
 }
 
 /// The file set behind a unit's byte estimate.
@@ -557,8 +580,13 @@ impl GroupPrice {
         }
     }
 
+    /// Each distinct footprint charged its unprorated whole-file cost, once.
+    fn priced(&self) -> u64 {
+        self.distinct.values().fold(0, |total, input| total.saturating_add(input.whole_file_bytes))
+    }
+
     fn bytes(&self) -> u64 {
-        self.distinct.values().fold(self.unpriced_bytes, |total, input| total.saturating_add(input.whole_file_bytes))
+        self.priced().saturating_add(self.unpriced_bytes)
     }
 
     /// Bound the price by what the partition can actually decode to.
@@ -568,13 +596,12 @@ impl GroupPrice {
     /// members are summed and pre-date the footprint entirely. Prod's stuck
     /// backlog is all unpriced.
     fn cap_at(&mut self, ceiling: u64) {
-        let priced: u64 = self.distinct.values().fold(0, |total, input| total.saturating_add(input.whole_file_bytes));
-        self.unpriced_bytes = self.unpriced_bytes.min(ceiling.saturating_sub(priced.min(ceiling)));
+        self.unpriced_bytes = self.unpriced_bytes.min(ceiling.saturating_sub(self.priced().min(ceiling)));
     }
 
     fn unanimous_input(&self) -> Option<InputFootprint> {
-        match (self.unpriced_members, self.distinct.iter().next()) {
-            (0, Some((_, &input))) if self.distinct.len() == 1 => Some(input),
+        match (self.unpriced_members, self.distinct.len()) {
+            (0, 1) => self.distinct.values().next().copied(),
             _ => None,
         }
     }
@@ -1027,20 +1054,28 @@ impl TaskJournal {
         Ok(journal)
     }
 
+    /// Has this one-shot migration already consumed its cursor?
+    fn migration_done(&self, marker: &str) -> bool {
+        self.snapshot.source_cursors.get(marker).copied().unwrap_or_default() >= 1
+    }
+
+    /// Consume a one-shot migration's cursor.
+    fn mark_migration_done(&mut self, marker: &str) {
+        self.snapshot.source_cursors.insert(marker.to_owned(), 1);
+        self.dirty_cursors.insert(marker.to_owned());
+    }
+
     /// Rebuild the completed-dedup boundary index from the snapshot. Called
     /// once at load; `note_dedup_edges` maintains it incrementally after that.
     fn rebuild_dedup_edges(&mut self) {
         self.dedup_complete_edges.clear();
-        let keys: Vec<TaskKey> = self
-            .snapshot
+        // Disjoint field borrows, so no per-key clone of the whole snapshot.
+        let edges = &mut self.dedup_complete_edges;
+        self.snapshot
             .tasks
             .iter()
             .filter(|task| task.key.operation == Operation::Dedup && task.state == TaskState::Complete)
-            .map(|task| task.key.clone())
-            .collect();
-        for key in keys {
-            self.note_dedup_edges(&key);
-        }
+            .for_each(|task| Self::insert_dedup_edges(edges, &task.key));
     }
 
     /// Record a completed Dedup slice's boundaries so `rank` can prefer the
@@ -1049,10 +1084,13 @@ impl TaskJournal {
     /// biases a future claim toward a slice that no longer extends anything —
     /// an ordering preference, never a correctness input.
     fn note_dedup_edges(&mut self, key: &TaskKey) {
-        if key.operation != Operation::Dedup {
-            return;
+        if key.operation == Operation::Dedup {
+            Self::insert_dedup_edges(&mut self.dedup_complete_edges, key);
         }
-        let edges = self.dedup_complete_edges.entry(key.project_id.clone()).or_default().entry(key.source.clone()).or_default();
+    }
+
+    fn insert_dedup_edges(map: &mut HashMap<String, HashMap<String, HashSet<i64>>>, key: &TaskKey) {
+        let edges = map.entry(key.project_id.clone()).or_default().entry(key.source.clone()).or_default();
         edges.insert(key.slice.start_micros);
         edges.insert(key.slice.end_micros);
     }
@@ -1128,15 +1166,11 @@ impl TaskJournal {
     }
 
     fn migrate_bootstrap_backlog_with_limit(&mut self, limit: usize) -> Option<usize> {
-        if self.snapshot.source_cursors.get(Self::BOOTSTRAP_BACKLOG_MIGRATION).copied().unwrap_or_default() >= 1 {
+        if self.migration_done(Self::BOOTSTRAP_BACKLOG_MIGRATION) {
             return None;
         }
-        let mut removed = 0;
-        if self.snapshot.tasks.len() > limit {
-            removed = self.retain_tasks(|task| task.state == TaskState::Complete);
-        }
-        self.snapshot.source_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned(), 1);
-        self.dirty_cursors.insert(Self::BOOTSTRAP_BACKLOG_MIGRATION.to_owned());
+        let removed = if self.snapshot.tasks.len() > limit { self.retain_tasks(|task| task.state == TaskState::Complete) } else { 0 };
+        self.mark_migration_done(Self::BOOTSTRAP_BACKLOG_MIGRATION);
         Some(removed)
     }
 
@@ -1184,7 +1218,7 @@ impl TaskJournal {
     /// the worst case is one over-sized claim that immediately right-sizes
     /// itself. That is strictly better than a queue that can never fuse.
     pub fn clear_stale_estimates(&mut self) -> Option<usize> {
-        if self.snapshot.source_cursors.get(Self::STALE_ESTIMATE_MIGRATION).copied().unwrap_or_default() >= 1 {
+        if self.migration_done(Self::STALE_ESTIMATE_MIGRATION) {
             return None;
         }
         let mut cleared = 0usize;
@@ -1193,8 +1227,7 @@ impl TaskJournal {
             cleared += 1;
         }
         self.dirty_tasks.clear();
-        self.snapshot.source_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned(), 1);
-        self.dirty_cursors.insert(Self::STALE_ESTIMATE_MIGRATION.to_owned());
+        self.mark_migration_done(Self::STALE_ESTIMATE_MIGRATION);
         Some(cleared)
     }
 
@@ -1215,7 +1248,7 @@ impl TaskJournal {
     /// Safe in the same way `clear_stale_estimates` is: zero is what a freshly
     /// minted unit carries, and the claim path re-derives everything else.
     pub fn reset_repair_attempts(&mut self) -> Option<usize> {
-        if self.snapshot.source_cursors.get(Self::REPAIR_SINGLE_PASS_MIGRATION).copied().unwrap_or_default() >= 1 {
+        if self.migration_done(Self::REPAIR_SINGLE_PASS_MIGRATION) {
             return None;
         }
         let mut reset = 0usize;
@@ -1233,8 +1266,7 @@ impl TaskJournal {
             return None;
         }
         self.dirty_tasks.clear();
-        self.snapshot.source_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned(), 1);
-        self.dirty_cursors.insert(Self::REPAIR_SINGLE_PASS_MIGRATION.to_owned());
+        self.mark_migration_done(Self::REPAIR_SINGLE_PASS_MIGRATION);
         Some(reset)
     }
 
@@ -1322,14 +1354,13 @@ impl TaskJournal {
         if previous >= 1 {
             return None;
         }
-        self.snapshot.source_cursors.insert(key.clone(), 1);
-        self.dirty_cursors.insert(key);
+        self.mark_migration_done(&key);
         let _ = self.checkpoint();
         Some(previous)
     }
 
     pub fn migrate_fine_grained_backfill(&mut self, now_micros: i64) -> Option<usize> {
-        if self.snapshot.source_cursors.get(Self::COARSE_BACKFILL_MIGRATION).copied().unwrap_or_default() >= 1 {
+        if self.migration_done(Self::COARSE_BACKFILL_MIGRATION) {
             return None;
         }
         let removed = self.retain_tasks(|task| {
@@ -1339,11 +1370,10 @@ impl TaskJournal {
                 && !is_live_frontier(task.key.slice, now_micros)
                 // A day-sized unit is what replaces these; anything already that
                 // wide came from the coarse planner and must survive.
-                && task.key.slice.width() < 24 * 60 * 60 * 1_000_000;
+                && task.key.slice.width() < DAY_MICROS;
             !drop
         });
-        self.snapshot.source_cursors.insert(Self::COARSE_BACKFILL_MIGRATION.to_owned(), 1);
-        self.dirty_cursors.insert(Self::COARSE_BACKFILL_MIGRATION.to_owned());
+        self.mark_migration_done(Self::COARSE_BACKFILL_MIGRATION);
         Some(removed)
     }
 
@@ -1728,13 +1758,10 @@ impl TaskJournal {
                 .copied()
                 .unwrap_or_else(|| u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default());
             self.upsert(MaintenanceTask {
-                key: TaskKey { physical_table, source, project_id, slice, operation },
-                state: TaskState::Pending,
-                deadline_micros: now_micros,
-                estimated_decoded_bytes: price.bytes(),
-                hash_shard: 0,
-                hash_shards: 1,
-                attempts: 0,
+                // Only when every member agreed. A fused unit over several file
+                // sets reads their union, which no scalar here can state, and
+                // guessing one would let the next width up under-price itself.
+                input: price.unanimous_input(),
                 // NOT `now`. `scheduling_class` escalates a task that has waited
                 // past STARVATION_MICROS, so stamping the fused unit with the
                 // current time makes it permanently fresh — and the narrow
@@ -1750,17 +1777,7 @@ impl TaskJournal {
                 // Inheriting the oldest member's age is what makes the fused unit
                 // represent the work rather than the moment of fusion. Same
                 // defect as ageing a re-derived hygiene task from the rescan.
-                created_unix_ms: oldest_member,
-                retry_reason: None,
-                publication: None,
-                base_tier_present: false,
-                // Only when every member agreed. A fused unit over several file
-                // sets reads their union, which no scalar here can state, and
-                // guessing one would let the next width up under-price itself.
-                input: price.unanimous_input(),
-                parent_measured_bytes: None,
-                preflight_decoded_bytes: None,
-                backfill_priority_micros: None,
+                ..MaintenanceTask::pending(TaskKey { physical_table, source, project_id, slice, operation }, now_micros, price.bytes(), oldest_member)
             });
         }
         report
@@ -1817,18 +1834,18 @@ impl TaskJournal {
     /// actionable half anyway: for a historical derived unit it is exactly what
     /// decides the dependency, and it is O(1).
     pub fn claimability_census(&self, operation: Operation, now_micros: i64) -> (usize, usize, usize, usize, usize) {
-        let (mut pending, mut sealed, mut unproven, mut quarantined, mut not_due) = (0, 0, 0, 0, 0);
-        for task in self.snapshot.tasks.iter().filter(|task| task.key.operation == operation) {
-            if !matches!(task.state, TaskState::Pending | TaskState::Retry) {
-                continue;
-            }
-            pending += 1;
-            sealed += usize::from(!is_frontier_task(task, now_micros));
-            unproven += usize::from(!task.base_tier_present);
-            quarantined += usize::from(Self::is_quarantined(task));
-            not_due += usize::from(task.deadline_micros > now_micros);
-        }
-        (pending, sealed, unproven, quarantined, not_due)
+        self.snapshot.tasks.iter().filter(|task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry)).fold(
+            (0, 0, 0, 0, 0),
+            |(pending, sealed, unproven, quarantined, not_due), task| {
+                (
+                    pending + 1,
+                    sealed + usize::from(!is_frontier_task(task, now_micros)),
+                    unproven + usize::from(!task.base_tier_present),
+                    quarantined + usize::from(Self::is_quarantined(task)),
+                    not_due + usize::from(task.deadline_micros > now_micros),
+                )
+            },
+        )
     }
 
     /// The full claim order for one task: `(class, damaged, starved, hole,
@@ -2380,21 +2397,9 @@ impl TaskJournal {
         let index = self.snapshot.tasks.len();
         self.task_indices.insert(key.clone(), index);
         self.snapshot.tasks.push(MaintenanceTask {
-            key,
-            state: TaskState::Pending,
-            deadline_micros,
-            estimated_decoded_bytes,
-            hash_shard: 0,
-            hash_shards: 1,
-            attempts: 0,
-            created_unix_ms,
-            retry_reason: None,
-            publication: None,
             base_tier_present,
             input,
-            parent_measured_bytes: None,
-            preflight_decoded_bytes: None,
-            backfill_priority_micros: None,
+            ..MaintenanceTask::pending(key, deadline_micros, estimated_decoded_bytes, created_unix_ms)
         });
         true
     }
@@ -2529,23 +2534,7 @@ impl TaskJournal {
                 } else {
                     let index = self.snapshot.tasks.len();
                     self.task_indices.insert(key.clone(), index);
-                    self.snapshot.tasks.push(MaintenanceTask {
-                        key: key.clone(),
-                        state: TaskState::Pending,
-                        deadline_micros,
-                        estimated_decoded_bytes: 0,
-                        hash_shard: 0,
-                        hash_shards: 1,
-                        attempts: 0,
-                        created_unix_ms,
-                        retry_reason: None,
-                        publication: None,
-                        base_tier_present: false,
-                        input: None,
-                        parent_measured_bytes: None,
-                        preflight_decoded_bytes: None,
-                        backfill_priority_micros: None,
-                    });
+                    self.snapshot.tasks.push(MaintenanceTask::pending(key.clone(), deadline_micros, 0, created_unix_ms));
                     self.dirty_tasks.insert(key);
                 }
             }
@@ -2880,19 +2869,20 @@ impl TaskJournal {
             best_class(self, false, false, false)
         }?;
         let cursor = self.fair_cursors.get(&operation).map(String::as_str).unwrap_or("");
+        let beats = |task: &MaintenanceTask, current: Option<&MaintenanceTask>| {
+            current.is_none_or(|current| {
+                (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
+            })
+        };
         let mut fallback: Option<&MaintenanceTask> = None;
         let mut next: Option<&MaintenanceTask> = None;
+        // One pass on purpose: `dependencies_complete` is itself a scan, so a
+        // two-pass `min_by_key` form would double the hot claim path's cost.
         for task in self.snapshot.tasks.iter().filter(|task| claimable(task) && rank(self, task) == class && self.dependencies_complete(task)) {
-            if fallback.is_none_or(|current| {
-                (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
-            }) {
+            if beats(task, fallback) {
                 fallback = Some(task);
             }
-            if task.key.project_id.as_str() > cursor
-                && next.is_none_or(|current| {
-                    (&task.key.project_id, task.deadline_micros, &task.key) < (&current.key.project_id, current.deadline_micros, &current.key)
-                })
-            {
+            if task.key.project_id.as_str() > cursor && beats(task, next) {
                 next = Some(task);
             }
         }
@@ -3053,7 +3043,7 @@ impl TaskJournal {
         // — 44% of ALL maintenance capacity, spent on units that complete
         // nothing. Rollup coverage could not advance behind that no matter how
         // the scheduling cycle was weighted.
-        let backoff_micros = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+        let backoff_micros = exponential_backoff_micros(attempts);
         // The floor applies only after a REPEAT, for the same reason the split
         // above does: a FairSpillPool can squeeze out a perfectly sized unit that
         // would succeed untouched next pass, and making that unit wait a full
@@ -3098,8 +3088,7 @@ impl TaskJournal {
         // hot loop that increments attempts every second. Escalate the delay
         // with the evidence instead — same exponential abandon_running uses.
         let when_micros = if attempts >= 2 && is_capacity_failure(&reason) {
-            let backoff = i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
-            when_micros.max(crate::support::now_micros().saturating_add(backoff))
+            when_micros.max(crate::support::now_micros().saturating_add(exponential_backoff_micros(attempts)))
         } else {
             when_micros
         };
@@ -3603,12 +3592,12 @@ pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>
 /// The claim-order tuple `claim_next` minimises: see `TaskJournal::rank`.
 type Rank = (u8, u8, u8, u8, u8, i64, i64, i64);
 
-const STARVATION_MICROS: i64 = 3 * 24 * 60 * 60 * 1_000_000;
+const STARVATION_MICROS: i64 = 3 * DAY_MICROS;
 /// The window dashboards actually read, and therefore the window maintenance has
 /// to keep clean. Measured, not assumed: the latency matrix covers 1h/6h/24h/7d
 /// /14d and monoscope's charts are 7d/14d
 /// (`docs/plans/2026-09-01-certification-coverage.md`).
-const QUERY_WINDOW_MICROS: i64 = 14 * 24 * 60 * 60 * 1_000_000;
+const QUERY_WINDOW_MICROS: i64 = 14 * DAY_MICROS;
 /// ...and an UPPER bound, because an escape valve everything fits through is
 /// not an escape valve.
 ///
@@ -3651,7 +3640,7 @@ const QUERY_WINDOW_MICROS: i64 = 14 * 24 * 60 * 60 * 1_000_000;
 /// deliberate policy. `publish_statistics` now counts
 /// beyond-horizon work separately for exactly that reason. See
 /// `docs/plans/2026-08-25-oldest-task-tail.md`.
-pub(crate) const STARVATION_HORIZON_MICROS: i64 = 31 * 24 * 60 * 60 * 1_000_000;
+pub(crate) const STARVATION_HORIZON_MICROS: i64 = 31 * DAY_MICROS;
 
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
     if is_frontier_task(task, now_micros) {
@@ -3818,6 +3807,11 @@ pub fn blocks_rollup_backfill(task: &MaintenanceTask) -> bool {
         && !matches!(task.state, TaskState::Complete | TaskState::Superseded)
 }
 
+/// The 2^attempts-seconds backoff both failure paths must agree on, capped at 256s.
+fn exponential_backoff_micros(attempts: u32) -> i64 {
+    i64::try_from((1u64 << attempts.min(8)).saturating_mul(1_000_000)).unwrap_or(i64::MAX)
+}
+
 fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
     slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && slice.start_micros <= now_micros
 }
@@ -3921,6 +3915,17 @@ struct AdmissionState {
     available: Resources,
 }
 
+impl AdmissionState {
+    fn used(&self) -> Resources {
+        Resources {
+            cpu: self.capacity.cpu.saturating_sub(self.available.cpu),
+            decoded_bytes: self.capacity.decoded_bytes.saturating_sub(self.available.decoded_bytes),
+            object_reads: self.capacity.object_reads.saturating_sub(self.available.object_reads),
+            object_writes: self.capacity.object_writes.saturating_sub(self.available.object_writes),
+        }
+    }
+}
+
 /// Non-queuing multi-resource admission. Workers that cannot reserve every
 /// resource return to the durable queue instead of sleeping on a semaphore.
 #[derive(Clone, Debug)]
@@ -3996,23 +4001,12 @@ impl AdmissionController {
     }
 
     pub fn utilization(&self) -> Resources {
-        let state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        Resources {
-            cpu: state.capacity.cpu.saturating_sub(state.available.cpu),
-            decoded_bytes: state.capacity.decoded_bytes.saturating_sub(state.available.decoded_bytes),
-            object_reads: state.capacity.object_reads.saturating_sub(state.available.object_reads),
-            object_writes: state.capacity.object_writes.saturating_sub(state.available.object_writes),
-        }
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).used()
     }
 
     fn publish_utilization(state: &AdmissionState) {
         use std::sync::atomic::Ordering::Relaxed;
-        let used = Resources {
-            cpu: state.capacity.cpu.saturating_sub(state.available.cpu),
-            decoded_bytes: state.capacity.decoded_bytes.saturating_sub(state.available.decoded_bytes),
-            object_reads: state.capacity.object_reads.saturating_sub(state.available.object_reads),
-            object_writes: state.capacity.object_writes.saturating_sub(state.available.object_writes),
-        };
+        let used = state.used();
         let stats = crate::observability::maintenance_stats();
         stats.maintenance_cpu_tokens_used.store(u64::from(used.cpu), Relaxed);
         stats.maintenance_decoded_bytes_used.store(used.decoded_bytes, Relaxed);
@@ -4496,29 +4490,14 @@ mod tests {
     }
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
-        MaintenanceTask {
-            key: TaskKey {
-                physical_table: "table".into(),
-                source: "source".into(),
-                project_id: project.into(),
-                slice: TimeSlice::new(start, end).expect("valid slice"),
-                operation,
-            },
-            state: TaskState::Pending,
-            deadline_micros: 0,
-            estimated_decoded_bytes: 0,
-            hash_shard: 0,
-            hash_shards: 1,
-            attempts: 0,
-            created_unix_ms: 0,
-            retry_reason: None,
-            publication: None,
-            base_tier_present: false,
-            input: None,
-            parent_measured_bytes: None,
-            preflight_decoded_bytes: None,
-            backfill_priority_micros: None,
-        }
+        let key = TaskKey {
+            physical_table: "table".into(),
+            source: "source".into(),
+            project_id: project.into(),
+            slice: TimeSlice::new(start, end).expect("valid slice"),
+            operation,
+        };
+        MaintenanceTask::pending(key, 0, 0, 0)
     }
 
     /// Only outstanding ROLLUP work may veto a rollup backfill.
