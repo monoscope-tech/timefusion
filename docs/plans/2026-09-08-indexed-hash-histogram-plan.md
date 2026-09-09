@@ -1795,3 +1795,53 @@ time would finish the pass in about 29 minutes and then idle until the next
 tick. Raising the budget alone would overrun the hour and the pass semaphore
 would no-op the following crons. Moving coverage requires moving both, or
 draining the sealed dates outside the pass.
+
+### The starved band, quantified from the split — 2026-09-09 18:05 UTC
+
+Reading fair_tantivy_backfill_work_split makes the rate arithmetic exact and
+replaces the vaguer "weeks" wording above.
+
+The reservation is carved from the FILE cap, not the byte budget. With
+cap = 320 and tail_share = 33%, the pass builds a list of 105 oldest-first
+and 215 newest-first entries, both round-robined fairly across every project,
+interleaved tail-first at roughly one reserved entry per three head entries.
+The byte budget then truncates that list to what fits in 2,048 MB, which was
+31 entries in the 17:00 pass. So a pass executes about 8 oldest and 23 newest
+entries, shared across the twelve or more projects with uncovered files.
+
+The unified project therefore receives roughly two to three newest entries
+and one oldest entry per hourly pass. Its newest uncovered date is Sep 8,
+with 52 uncovered files; its oldest is mid-August. Sep 2 through Sep 7 is
+reached only after Sep 8 drains. Measured by bytes the picture agrees: the
+unified project's share is on the order of 170 MB per hour against about
+7.9 GB of uncovered Sep 2 to Sep 8 columns.
+
+Both derivations give the same order: the dashboard week converges in about
+two to four days of uninterrupted running, not 70 hours and not weeks. That
+holds only if compaction does not invalidate those files first and the
+process is not restarted, and every non-docs push to master restarts it and
+spends the first twenty-five minutes re-enumerating.
+
+Two existing knobs move this without new code or a new obligation:
+timefusion_tantivy_build_concurrency, currently 2, and
+timefusion_tantivy_backfill_max_bytes_per_pass_mb, currently 2,048. Coverage
+rate is min(build rate, budget x cadence) and they are presently balanced at
+a 58-minute pass inside an hourly cron, so both must move together. Raising
+each to double would keep the cadence and double the rate, at the cost of
+twice the concurrent index builds on a box with OOM history and dedup already
+holding 52% inclusive CPU, plus one restart. That is a production risk
+decision, not a measurement, and it is left to the user.
+
+An off-box drain of the sealed Sep 1 to Sep 7 dates was evaluated and is NOT
+currently possible. Neither precondition holds. There is no index-repair
+subcommand: the CLI dispatches redrive-dml, optimize, migrate-columns,
+run-unit and retention, and run-unit's operations are base, derived, dedup,
+hot, sealed and repair, all Delta maintenance rather than index builds. And
+manifest writes are not safe across processes: save_manifest issues an
+unconditional put, and the read-modify-write is serialized only by an
+in-process DashMap of mutexes. A second writer would be last-writer-wins and
+could silently drop the entries the running server had just published. That
+degrades to lost work and orphan blobs rather than wrong query results,
+because missing coverage falls back to scanning, but it would erase the very
+progress the drain intends to make. Both a conditional manifest write and a
+new subcommand would be required first.
