@@ -1125,3 +1125,723 @@ slow tests, no retries, and no leak classification. All five passing
 attestations are published. The final gate requires no checks from GitHub.
 This documentation update changes no check input. Push, merge, deployment,
 and production acceptance follow; no production improvement is claimed yet.
+
+Progress audit 2026-09-09 11:09:48 UTC: the combined source passed all
+five local checks and merged through PR 238 as dd5647f218cbdaf676ed8ccda220bd92bc7bbb24.
+Deployment 34343939580 is live at its image-build step:
+https://github.com/monoscope-tech/timefusion/actions/runs/34343939580
+Production acceptance is pending. Root fast-forwarded to the merged source.
+
+The SQL benchmark harness is now prepared in root benches/hash_histogram_sql.rs
+with its Cargo registration. An optimized build is live in session 23306:
+`cargo bench --bench hash_histogram_sql --no-run --locked`, log
+/tmp/timefusion-hash-sql-optimized-build.log. It uses root's own target cache,
+not the private signoff worktree cache. No optimized timing is claimed yet.
+The harness checks exact buckets, duplicate array elements, overlap unions,
+version replacements, and routing for 3/7/30-day complete/partial coverage.
+Its warm uniqueness proofs are an explicit measurement condition; cold readers
+and ingestion contention still need separate measurements.
+
+Next: verify deployment and running task image dd5647f, then run
+/tmp/timefusion-production-hash-probe.py dd5647f with a JSON evidence path.
+The probe now checks actual running tasks before and after, not just the
+service's desired image. Finish the optimized build and execute the workload
+against local MinIO. Wide-query acceptance and subsequent cross-column
+CPU/memory profiling remain open. Next progress audit is due by 11:39:48 UTC.
+
+At 11:13:01 UTC, production still runs task q28k1pv1ndxgzxzi5d3odh76i
+with image 03cc1ae. Saved pre-deployment counters in
+evidence/2026-09-08-hashes/production-pre-dd5647f-counters.json.
+The cached uncovered-file gauge is 2,217; histogram completions and unique
+partitions are zero. This is a stats snapshot, not a fresh file census.
+
+The reusable production probe is now bench/hash_histogram_production.py;
+prefer it over the temporary script. It exits nonzero for incomplete
+comparisons, a mismatch, an image change, or a native query over three seconds.
+Its wrong-image guard was exercised through actual SSH before any SQL.
+The benchmark review added awaited database shutdown before releasing
+temporary storage. Both review passes are recorded in
+2026-09-09-hash-sql-benchmark-review.md. The optimized build remains live
+in session 23306; the deployment remains in its image build step.
+
+The optimized SQL harness now includes one fresh-application-cache sample
+per arm/case, in addition to four warm repetitions (240 queries total).
+It creates a new database and search service for each cold sample and
+recovers persisted proofs, following the existing real restart fixture.
+MinIO and OS caches remain warm. This is not a cold-storage benchmark.
+The current build session 23306 remains live with these source changes.
+Run the finished harness before interpreting timings or publishing signoff.
+
+PR 238's GitHub gate passed in nine seconds and reused the local checks:
+format, Clippy, test shards, and E2E were skipped remotely. The image build
+is separate and remains in progress in deployment 34343939580. No PR review
+comments were returned by either the inline or issue-comment endpoint.
+
+Release-scope correction: recent progress notes calling three seconds an
+acceptance target refer only to the initial saved-query smoke probe.
+The proposed release targets above remain p95 below one second and p99
+below two seconds, with the full recorded workload and freshness checks.
+The script now names its result probe_passed to avoid conflating these gates.
+Two smoke repetitions cannot establish tail latency. The actual chart API,
+common endpoints, log patterns, overlap predicates, non-hourly buckets,
+3/7/30-day ranges, recent tail, ingestion contention, and maintenance health
+remain required. Do not close the goal on a passing three-second probe.
+
+Application-path inspection: sibling Monoscope Pages/Anomalies.hs builds
+`hashes[*]=="<prefix><hash>" | summarize count(*) by bin_auto(timestamp)`.
+Web/Routes.hs exposes /chart_data and /chart_data/stream, with pid, query,
+from/to, and chart_type parameters. Web/Auth.hs accepts an existing CLI
+Bearer session for these browser routes. The TimeFusion matcher supports
+jsonb_path_exists(to_jsonb(column), exact-element JSONPath) as well as array
+containment, but the initial SQL probe exercises only containment. Verify
+the real chart API separately. Monoscope's default-range comments still
+describe the old array-scan limitations; do not infer current performance
+from those comments or widen defaults before production measurements.
+
+Chart-handler access is verified through the existing authenticated
+Monoscope CLI. `monoscope auth status` reports token authentication for
+the busy project; overriding the project to the saved issue also succeeds.
+The CLI chart command calls /api/v1/metrics, whose handler delegates to
+the same Charts.queryMetrics function as /chart_data. The exact issue KQL
+for 2026-09-02 08:04:30 through 08:04:31 returned one event with no error.
+Saved production-chart-handler-baseline.json records the response and
+03cc1ae observed afterward. Elapsed time and cache state were not measured;
+this is access/result evidence only. No credential was printed or saved.
+
+The chart handler caches data and refreshes partial buckets. A changed
+time bound can therefore still reuse most historical data. Do not label
+API samples cold merely because bounds differ. Combine actual chart-query
+measurements with direct SQL timing/routing evidence; record application
+cache uncertainty where it cannot be established. Both live builds remain
+pending; the optimized compiler is working on the benchmark and server
+binaries without a reported error.
+
+Progress audit 2026-09-09 11:38:39 UTC: the previous goal interval made
+concrete progress by merging the locally signed-off implementation, adding
+reviewed warm/cold SQL measurements, and verifying authenticated chart-handler
+access with the known count. The current interval is a verified wait: local
+build session 23306 remains live, compiler processes 98817/98818 are active,
+and deployment 34343939580 is live at Build and Push Docker Image. Neither
+build has reported failure. Disk availability is about 25 GiB. Do not restart
+either job merely because its output is quiet.
+
+The goal remains aligned with exact, fast hash-column queries. The next
+actions are optimized benchmark execution, running-image verification, SQL
+smoke comparisons, chart-handler measurements, and investigation of any
+failure or latency gap. Three-second smoke success is not release acceptance.
+The proposed p95/p99 targets, common/overlap/log-pattern workloads, non-hourly
+buckets, 3/7/30-day windows, recent tail, ingestion and maintenance health,
+and later cross-column CPU/memory profiles remain open. No completion or
+production speedup is claimed. Next audit is due by 12:08:39 UTC.
+
+Progress audit 2026-09-09 12:15:38 UTC: the last pull verified that remote
+master remains current and preserved local benchmark work. Since the previous
+audit, dd5647f deployed successfully, but production day/week smoke queries
+still timed out and native completion counters stayed zero. A real startup
+regression exposed the remaining backfill opt-in; removal now passes that
+regression in 0.663 seconds. Full local signoff is running in the isolated
+automatic-backfill worktree, session 6625, before any source push.
+
+Optimized 300k and 3M fixtures passed all 240 bucket/routing comparisons
+each. Complete warm rare-hash counting is fast; incomplete coverage and
+cold index preparation remain measured bottlenecks. The diagnostic 3M run
+shows cold download/unpack costs and zero index fetches on slow warm partial
+queries. A five-second CPU sample captured visibility deduplication and
+Arrow row conversion, but spans ordinary/native queries and does not assign
+per-query CPU percentages. Its whole-process footprint is not a heap profile.
+Evidence is saved alongside the benchmark summaries. The profiled process
+has ended and emitted 240 samples; its missing session does not establish
+an exit code. No profiler timings replace unprofiled latency evidence.
+
+The goal remains open: deploy automatic startup coverage, verify production
+coverage and exact chart-query behavior, fix measured visibility/cold-fetch
+costs, meet the full workload and latency scope, then profile other columns.
+Next progress audit is due by 12:45:38 UTC.
+
+Actual chart-handler follow-up on dd5647f: the saved narrow issue window
+returned one event with no error in 665.50 ms, including CLI overhead.
+The Sep 6 day and Sep 2–9 week each exceeded the 12-second client deadline.
+The running image/task matched before and after. Cache state is unknown.
+These are three observations, not tail-latency estimates. The noon cron
+selected 34 otel files within 1,938 MiB; logged units confirm that scheduled
+backfill is active despite the missing automatic startup pass.
+
+The automatic-backfill signoff exposed one first-attempt failure in
+shutdown_writes_clean_snapshot_under_deadline: no cursor snapshot was found
+after a one-second shutdown budget. The configured retry passed in 1.063 s.
+This is an unresolved timing observation, not proof of an introduced backfill
+regression or a clean test run. Inspect and rerun it after the suite finishes.
+
+Progress audit 2026-09-09 12:43:56 UTC: this interval made concrete progress.
+The automatic startup-backfill fix passed all five local checks and merged
+through PR 239 as a31c7b5. The suite retained one shutdown-test retry; ten
+independent retry-disabled stress iterations passed. Deployment 34351293065
+remains active; do not assume the new image is serving or cancel its build.
+
+The user added local production-image build and deployment reuse to remove
+the repeated CI compile delay. In /tmp/timefusion-hash-flush, branch
+build/local-production-image, native ARM64 Rust and C cross-toolchains have
+produced and executed Linux x86-64 probes, including OpenSSL/libunwind.
+Full production cross-build session 25358 remains live. The image helper
+archives stable inputs, requires matching signoff, smoke-tests before push,
+and publishes a content-tagged candidate. The workflow can reuse that image
+and pins its digest before deployment. Git-based fingerprint tests and
+actionlint pass. Full image smoke, publication, reuse, and direct local
+deployment remain unproven or unimplemented. Changes are not pushed yet.
+
+This supports the shipping loop; it does not replace the original goal.
+Still required: verify automatic backfill in production, exact fast SQL and
+chart queries across the full planned workload, fix partial-visibility and
+cold-index costs, confirm ingestion/maintenance health, then profile CPU
+and memory across other columns and time ranges. No completion is claimed.
+Next progress audit is due by 13:13:56 UTC.
+
+Production a31c7b5 follow-up: deployment 34351293065 completed successfully,
+including readiness soak. Running task lpeid8zwffglvatr39u290u83 uses the
+expected image. At 12:51:26 indexing became active; at 12:51:29 startup
+backfill selected 34 otel files within 1,910 MiB. A first completed unit for
+the saved-issue project was logged at 12:51:53. This verifies the removed
+startup opt-in in production. It does not establish complete coverage.
+The image-guarded SQL smoke probe is running in session 73563; its result
+will determine whether any latency gap has improved.
+
+The a31c7b5 post-deploy smoke completed with exit 1. Eight of sixteen
+comparison pairs completed without a mismatch; the slow Sep 6 day and
+Sep 2–9 week timed out in both ordinary and native forms. Image verification
+matched before/after. All three histogram counters remained zero. Evidence:
+production-a31c7b5-smoke.json. The startup fix is verified, but latency has
+not improved for the failing windows. Next hash investigation must establish
+physical element-index coverage for this project and these dates; broad
+index-build logs cannot prove coverage of the actual queried snapshots.
+
+Physical coverage audit after a31c7b5: the saved-project manifest has
+11,382 entries, only 153 of which declare hash elements. Reading Delta
+version 556758 found 2,294 live project files. The Sep 6 partition has
+166 live files and zero physical hash-index candidates. Sep 2–8 has 1,406
+live files and only 14 candidates, all on Sep 8. Matching used exact
+one-file URIs, schema version, hash element fields, and physical ordinal
+flags. The manifest and Delta snapshot were loaded independently; no
+Tantivy contents were decoded. The report is saved as
+production-a31c7b5-physical-hash-coverage.json.
+
+This explains the Sep 6 no-index fallback. The week has sparse usable
+coverage, so zero completed histogram counters must not be read as proof
+that the week never entered native planning. Visibility/scanning can time
+out before the completion counter increments. Next implementation must
+make physical hash coverage converge faster as well as reducing partial
+visibility cost; startup admission alone cannot resolve this backlog.
+
+Audit access note: production non-secret service settings match .env.prod
+(OVH, timefusion-eu, default timefusion table prefix). The index manifest is
+at bucket-root index_manifests/otel_logs_and_spans/<project>/manifest.json.
+create_object_store builds a bucket-scoped store and does not apply the
+URI path as a prefix. The first prefixed GET returned NoSuchKey; the
+bucket-root GET succeeded. No credential values were printed or recorded.
+
+Progress audit 2026-09-09 13:13:50 UTC: the interval made concrete progress.
+Automatic backfill is verified in production a31c7b5, but post-deploy day/week
+SQL probes still fail. An independent Delta/manifest audit established zero
+physical hash candidates on Sep 6 (166 files) and 14 among the week’s 1,406
+files. This directs the next query work toward coverage convergence and
+partial visibility cost; do not reinterpret zero completion counters as a
+global indexing disablement.
+
+Local release work now includes native ARM64-to-Linux-amd64 compilation,
+content-based image publication/reuse, shared deployment scripts, and a
+local/CI deployment runner. Git-based tests cover source snapshots and
+rollout exclusion, including retaining a lease when a submitted rollout is
+unresolved. The local client image built, but actual local rollout remains
+unverified because CapRover credentials are absent from checked local
+environments/config paths. The command rejects that state before mutation.
+The full production cross-build is still live, session 25358. A VM process
+inspection found rustc PID 85022, CPU ticks 184893 and about 1,794 MiB RSS.
+No finished image, successful smoke, or publication is claimed.
+
+The full hash workload/latency acceptance, ingestion and maintenance health,
+and later CPU/memory profiles across other columns remain open. Build and
+deployment changes are not pushed until relevant validation is complete.
+Next progress audit is due by 13:43:50 UTC.
+
+Progress audit 2026-09-09 13:42:51 UTC: native ARM64 cross-compilation produced
+a tested Linux amd64 production image. QEMU guest address placement caused
+local crashes with both the candidate and known-good production images;
+a canonical guest-base offset fixed the harness without changing runtime
+CPU or profiling settings. Full local signoff passed and published the image.
+PR 240 merged; deployment 34358189411 skipped compilation, passed native smoke,
+and completed recovery verification and 46 readiness probes without failures.
+
+A review during local preflight caught promotion wrapping the image in an
+index, which gave identical runtime bytes different outer digests. The local
+lease waiter was stopped before mutation. A real registry comparison failed
+before the normalization fix and passed afterward. PR 241 merged as 95bdacb1
+with passing local signoff and a new tested candidate. The local deployment
+command is now being exercised with the existing authorized app token read
+into memory; no secret values were printed. Its redundant new CI deployment
+is being cancelled before production work. Local completion is not yet claimed.
+
+The measured hash gaps remain unchanged: Sep 6 had zero physical candidates
+among 166 live files, and Sep 2–8 had only 14 among 1,406. Complete warm queries
+are fast, but cold index loading and repeated streamed visibility resolution
+remain expensive. After local rollout verification, resume coverage convergence
+and partial-visibility optimization with exact parity and bounded memory.
+No hash acceptance or cross-column profiling completion is claimed.
+Next progress audit is due by 14:12:51 UTC.
+
+Next bounded query experiment: cache completed-day streamed Delta winner masks,
+not memory-overlay winners. The profile already attributes slow warm partial
+queries to visibility sorting with zero index downloads. A cache must use exact
+ordered file metadata (including deletion vectors), root, projected visibility
+schema, dedup keys, tie-break, tombstone semantics, and query bounds. Bucket size
+and hash membership do not change visibility. Reject reuse when current memory
+rows or covered ranges intersect the day/window; preserve current memory masks
+and row counts separately. Use the shared query memory pool and bounded resident
+LRU ownership, with reservations retained by pinned queries after eviction.
+
+First prove the streaming cache miss/hit and invalidation behavior in the real
+MinIO histogram regression, including new Delta files, deletion vectors,
+changed bounds, tombstones, and a fresh memory overlay. Keep exact ordinary/native
+bucket parity in the 240-query benchmark. Do not claim this alone fixes production
+coverage: most historical files still require physical hash indexing. Evaluate
+hash-priority indexing only with honest per-field coverage metadata so missing
+text fields never become false negative proof. Both experiments remain proposed,
+not implemented or measured.
+
+Local release follow-through: PR 242 fixed the foreground/background rollout
+observer race without relaxing budgets. The local deployment then passed with
+2,423 ms unready, 2,525 ms old-to-new query handoff, zero WAL recovery, and 55
+passing readiness probes. A second invocation recognized the same image/boot,
+ran only record-boot plus soak, passed 55 probes, and kept the same task ID.
+Its lease was released. The failed observer and separate 56-probe recovery
+soak remain recorded in local-rollout-observer-race.json.
+
+The latest exact-digest production hash smoke still completes only 8/16 pairs,
+with no mismatch and a stable image. Sep 6 day/week queries hit the three-second
+statement limit; completed histogram counters remain zero. Resume query work
+from this evidence. The local release work is verified; the main hash-query
+performance goal remains active.
+
+Progress audit 2026-09-09 14:15:09 UTC: streamed visibility-cache work is active
+in /tmp/timefusion-hash-flush on perf/streamed-histogram-cache. The real MinIO
+regression failed before implementation and passed afterward, alongside the
+cache ownership test. First Rust reviews fixed a large enum layout, wildcard
+matches, paired file/reservation ownership, and bitmap/key memory accounting.
+Expanded memory-overlay cases are compiling; the test must move MemSnapshot
+with mem::take instead of adding Clone. No cache change is signed off or deployed.
+Production remains at the verified local release, and exact day/week hash probes
+still time out. Keep physical hash coverage and cold first-query latency in scope.
+Next progress audit is due by 14:45:09 UTC.
+
+
+### Historical backfill measurement — 2026-09-09 14:35 UTC
+
+The current healthy production container 6722ae2dc2e1 started a 24-file,
+1,971 MiB historical otel pass at 13:49:38 UTC. Direct container logs show
+15 completed historical units, two for the saved-issue project. The last
+completion is 14:11:49 UTC. Fresh-file index logs continue, but are not
+historical throughput. A single Docker statistics sample reports about
+26.7 CPU cores and 41.74 GiB resident usage; it cannot attribute that load
+to backfill. Evidence: production-current-backfill-progress.json.
+
+The 14:27 physical audit found 17 of 305 Sep 8 files covered and zero of
+166 Sep 6 files. No completion ETA is established. Full text fields still
+share the committed-file builder with hash elements, so hash-priority
+indexing must avoid those costs while preserving existing text coverage.
+A second index cannot simply be added under another manifest key: current
+histogram selection correctly rejects overlapping physical coverage, and
+text-search coverage must not treat a hash-only blob as a complete index.
+Any separate element artifact requires explicit reader, maintenance, and
+GC support, plus mixed-generation correctness tests.
+
+The streamed-visibility cache and benchmark sources match in both working
+trees. Targeted tests and lint passed; the optimized benchmark compiler
+remains active. No cache deployment or speedup is claimed yet.
+
+
+### Coverage audit correction — 2026-09-09 14:41 UTC
+
+The earlier physical audits overstated the saved project's file denominator.
+The Python Delta reader returned all table URIs despite the supplied project
+partition filter with skip_stats enabled. Comparing explicit add-action
+partition values exposed the mismatch: 2,360 table files, 367 for the target
+project. The corrected audit filters exact URI partition segments explicitly.
+This supersedes prior claims of roughly 1,400 missing files for this project
+and 166 Sep 6 files; those denominators included other projects.
+
+At Delta version 557113 the project has 367 live files. Sep 2–8 has 225 live
+files, 17 with usable physical hash coverage, leaving 208 missing files.
+Sep 6 has 33 files and zero covered. Sep 8 has 73 files and 17 covered.
+The corrected report replaces production-8524b316-physical-hash-coverage.json.
+The earlier production-a31c7b5 report is retained as superseded evidence, not
+a valid per-project census. The separate add-action volume check found
+7,389,972,212 compressed bytes in the 208 missing Sep 2–8 files. Row counts
+are unavailable with the chosen metadata-only load and must not be read as
+zero rows. Historical completion logs and query timeout results are unaffected.
+The user received an explicit correction. No completion ETA is established.
+
+
+### Hash-only build input measurement — 2026-09-09 14:43 UTC
+
+Read metadata only from the smallest, median-sized, and largest unindexed
+Sep 6 files for the saved project. Hashes, timestamp, and identity account
+for 10.8%, 16.3%, and 15.4% of compressed column bytes, respectively. The
+largest file contains 1,972,423 rows: 258,019,995 compressed column bytes
+versus 39,627,193 for the selected columns. This supports projected element
+indexing as a way to avoid most column I/O and unrelated text tokenization.
+It is not a measured build-time, heap, or network-latency improvement.
+Evidence: production-hash-column-footer-sample.json. The first PyArrow S3
+read failed because OVH rejected its checksum-mode header; bounded boto3
+footer range reads succeeded, with footer length and magic checked. No data
+pages or event payloads were read for this measurement.
+
+
+### Goal audit — 2026-09-09 14:44 UTC
+
+The goal remains active. Production is healthy on the verified local image,
+but saved day/week hash queries have not passed latency acceptance. Historical
+backfill is active and slow. The corrected per-project census leaves 208
+Sep 2–8 files unindexed, totaling about 7.4 GB compressed. Three actual file
+footers show selected hash/identity columns occupy 11–16% of compressed
+column data, supporting a separately covered element-index implementation.
+This requires reader, manifest, and GC changes; it is not implemented yet.
+
+The visibility cache passed its red/green regression, memory-overlay and
+identity invalidation checks, and two source reviews. Full local fmt and
+Clippy now passed and are attested. Full tests are still compiling in session
+23512; the optimized benchmark is compiling in session 75825. Both handles
+were confirmed live. Sources remain frozen. Complete the tests and measure
+the exact-query benchmark before image signoff and production deployment.
+All required production correctness/performance checks, coverage acceleration,
+and subsequent other-column CPU/heap profiling remain open.
+Next goal audit is due by 15:14 UTC.
+
+
+### Live indexing CPU investigation — 2026-09-09 14:53 UTC
+
+A ten-second perf cpu-clock sample at 49 Hz captured 10,169 samples from
+the current database process, with zero lost samples. Inclusive stacks
+show 52.37% under dedup_partition_range_limited, 10.54% under coordinator
+compaction, 10.18% under coordinator rollup, and 8.90% under Tantivy
+IndexMerger::write. These are overlapping whole-process stack observations,
+not additive costs or per-backfill-file attribution. The sample confirms
+substantial competing maintenance CPU and ongoing Tantivy merge work.
+It does not establish why any specific historical file has not completed.
+Raw data, self/inclusive reports, and limitations are saved in the
+production-backfill-cpu artifacts. The first attempt sampled docker-init
+and had zero CPU samples; it was corrected to the verified child database
+PID 1079501. No sampler configuration or production image was changed.
+
+Local validation now includes passing fmt, Clippy, all 1,508 main tests, ten
+doctests, and PostgreSQL smoke. End-to-end checks remain active. Benchmark
+compilation succeeded; timed execution still awaits idle validation work.
+
+
+### Optimized cache benchmark — 2026-09-09 15:02 UTC
+
+The 3-million-row SQL benchmark exited 0 with all 240 exact hourly bucket,
+route, and cache-hit assertions passing. Every repeated warm partial query
+reused all queried daily masks. Thirty-day partial warm medians were
+208.1 ms (rare), 213.0 ms (medium), 595.0 ms (common), and 259.6 ms (overlap).
+The prior uncached run measured 730.1, 757.4, 980.7, and 767.1 ms. These
+are historical-run comparisons under different host load, not isolation of
+every latency change. Within the new run, ordinary scans were still faster
+for those partial cases (173.1, 166.5, 305.3, and 177.1 ms).
+
+Complete warm histograms stayed at 9.3–147.3 ms across these predicates.
+Partial application-cold queries remained at 1.33–2.08 seconds. Warm partial
+queries had zero blob fetches and index opens, confirming the remaining
+cost is elsewhere. Whole-process peak footprint was 594,500,544 bytes,
+including setup and all queries; it is not a per-query heap profile.
+The benchmark supports deploying the cache as an improvement, while
+physical coverage, cold I/O, and residual partial counting costs remain open.
+
+Full local checks passed under the configured retry policy, but e2e reported
+one first-attempt checkpoint failure. Investigation found table creation
+explicitly enables post-commit hooks and property reconciliation uses defaults,
+contrary to the out-of-band checkpoint rule. A strengthened existing in-memory
+property test is compiling against unchanged implementation for a red run.
+New changes will need renewed checks before image signoff and deployment.
+
+
+### Follow-up fixes — 2026-09-09 15:09 UTC
+
+The deterministic property-reconciliation regression failed on the original
+implementation: nextest 69723f0b-902c-4077-8a50-d47692dc3860 exited 100 in
+0.367 seconds because checkpoint files existed after property updates with
+checkpoint interval 1. Both table creation and property reconciliation now
+reuse base_commit_properties, keeping checkpoint and expired-log hooks out
+of the foreground operation. Assertions and scheduler behavior are unchanged.
+
+The first cache benchmark still reopened every Parquet footer before cache
+lookup. Preparation now happens after a miss, or lazily for a source that
+must scan because its index is absent or fails. A cache hit retains the exact
+file/DV/window identity already validated by its captured masks. Prepared
+metadata and its memory reservation remain paired. A new operation counter
+exposes histogram_parquet_prepares in timefusion_stats and benchmark output.
+The existing real partial-index regression now requires only the unindexed
+replacement to prepare Parquet on a repeat. The SQL benchmark asserts the
+same per-day behavior over all warm partial cases.
+
+These changes are not validated yet. Targeted green tests are running in
+session 40708; the next optimized build is running in session 82809 in the primary worktree. Source
+is frozen in both worktrees. The earlier full-check attestations predate
+these changes and cannot sign off this final source. Re-run the affected
+checks and repeated source reviews before publishing or deploying an image.
+
+
+### Goal audit — 2026-09-09 15:13 UTC
+
+The goal remains active and production performance acceptance is incomplete.
+The first optimized cache run passed 240 exact SQL cases and reduced measured
+warm partial medians, but still trailed ordinary scans and did not solve cold
+latency. Source review identified redundant Parquet metadata reads on hits;
+these are now deferred until a source needs fallback. A public statistics
+counter and existing integration assertions verify the number of prepares.
+
+A real e2e failure exposed foreground table-creation/property checkpoint
+hooks. The strengthened property test failed before the fix (nextest
+69723f0b-902c-4077-8a50-d47692dc3860). After both paths reused the existing
+base commit settings, targeted nextest ed7196c6-826d-469e-ac36-555c1d61687b
+passed all three tests in 9.650 seconds, including lazy metadata reads,
+visibility invalidation, and reservation ownership. The new full local gate
+is running; the optimized build remains live in session 82809. Both source
+trees are frozen. The first cache executable is preserved for comparison.
+
+Still required: final full checks and repeated reviews, optimized comparison,
+image signoff, deployment, and production correctness/latency monitoring.
+Dedicated element indexes, historical coverage convergence, and subsequent
+other-column CPU/heap optimization remain in scope. The corrected project
+backlog and actual footer/CPU evidence supersede earlier broad estimates.
+Next goal audit is due by 15:43 UTC.
+
+### 2026-09-09 15:45 UTC goal audit
+
+The goal remains fast exact hash queries in production. Revised cache checks
+have passed formatting, clippy, and all 1508 nextest tests; the remaining
+local gate and optimized benchmark build are still in progress. No cache
+release has been deployed. Dedicated element-index implementation remains
+isolated and uncompiled; publication, GC, and scheduling integration must
+precede enablement. The measured 11–16% projected column-byte fraction is
+not a measured indexing speedup. Production acceptance and subsequent
+other-column CPU/memory profiling remain open.
+
+## Maintenance constraint — user correction, 2026-09-09 15:52 UTC
+
+Do not introduce a second permanent per-file indexing obligation or an
+independent background worker pool merely to reduce backfill latency. The
+previous separate-obligations/scheduling proposal is superseded pending a
+measured total-cost design. Continue the cache release independently: it
+reuses query work within an existing bounded memory cache and adds no
+maintenance sweep.
+
+A narrow artifact may repair missing physical hash coverage, but an existing
+usable full artifact must satisfy the same requirement. New files must not
+receive duplicate hash and full builds by default. Reuse existing admission
+limits, and measure steady-state CPU, memory, I/O, artifact count, and backlog
+under ingestion, dedup, rollups, and compaction, not just a one-file build.
+
+Source inspection identifies a critical cycle to resolve: compaction can
+carry text coverage forward without rebuilding, but forfeits physical row
+ordinals. The backfill coverage gate then rejects that artifact for element
+histograms. A narrow rebuild is still recurring work after such rewrites;
+calling it a one-time historical repair would be misleading. Investigate
+reuse across rewrites and indexing in existing write work before adding
+another maintenance obligation. Dedicated-artifact source remains isolated,
+uncompiled, and undeployed while this design is evaluated.
+
+16:09 UTC progress: dedicated historical indexes are abandoned at the user's
+request. Optimize the ordinary full-index builder; do not add another
+maintenance obligation. Source now projects only full-index columns and
+prepares variants once per batch in the isolated perf/full-index-rebuild
+branch. Microbenchmarks and footer estimates are evidence of component
+cost only; full rebuild validation is in progress.
+
+Cache commit 0ec937e8 plus evidence commit 6f13e65e passed all local checks
+and 240 revised SQL cases. Local ci-signoff is building its candidate image;
+no cache deployment has occurred. Fresh 16:07:55 production metadata shows
+Sep6 0/33 files covered, Sep8 19/73 (previously17), and Sep9 33/131.
+Historical unit events are present through 15:53:46 across projects.
+Live metadata includes dates older than 30 days; retention enforcement and
+backfill priority require checking, without assuming live files may be
+deleted. Production hash latency and full rebuild acceleration remain open.
+
+### Goal audit — 2026-09-09 16:11:48 UTC
+
+The full goal remains active and unproven. User constraints now explicitly
+exclude a special historical hash index and new maintenance obligations.
+The active rebuild source changes only full-index projection and per-batch
+variant preparation. First Rust review and cargo lint passed (7m20s);
+subsequently extended the existing test for three batches including all-null
+variants. Full local tests are compiling; rerun lint for final test source
+before signoff. The complete build benchmark baseline is compiling.
+
+Cache release local checks and 240 SQL cases passed; candidate Linux image
+is building through make ci-signoff. No new image is deployed, so production
+query latency acceptance remains open. Fresh metadata confirms historical
+backfill progress but Sep6 remains 0/33 covered in the saved project.
+Full build-time speedup, production maintenance cost, query latency, and
+later other-column CPU/memory profiles are still outstanding.
+
+### Goal audit — 2026-09-09 16:41:57 UTC
+
+Goal remains active. Cache release passed local correctness checks and 240
+SQL benchmark cases. Its Linux dependency cook finished; the final profiling
+application image build is now running. Image smoke, publication, push/merge,
+local rollout, production exact-result comparisons, and latency acceptance
+remain unproven. No new release has been deployed.
+
+Full-index rebuild changes passed 1508 tests, 10 doctests, final formatting,
+Clippy, and PGWire smoke. E2e is compiling. Both requested Rust reviews
+are recorded. Baseline benchmark compiled successfully; candidate compilation
+and a separate merge/query probe are active. Neither an end-to-end rebuild
+speedup nor acceptable multi-segment query cost has been measured yet.
+
+No special historical artifact or extra maintenance pool remains in active
+source. Source changes preserve the normal full-index format and physical
+row validity. Full production historical coverage and fast day/week queries
+remain incomplete. Subsequent popular-column CPU and memory profiling and
+optimization are still outstanding.
+
+### Coverage convergence measured, not a gate rejection — 2026-09-09 17:25 UTC
+
+Two audits of the same unified project, 76 minutes apart, answer why saved
+day and week hash queries still miss the index. Sep 1 through Sep 7 held
+exactly zero physical hash candidates in both readings, across 166 live files.
+Sep 8 moved 19 to 21. Sep 9 fell from 33 candidates over 131 live files to
+1 over 78, because compaction rewrote those files and a rewritten file
+forfeits its physical row ordinals. Evidence: the 16:07:55 and 17:23:41
+production-*-physical-hash-coverage.json artifacts.
+
+The cause is throughput and ordering, not the coverage gate. Backfill units
+did run for the unified project during this window, and the backfill path
+publishes ordinals_valid = true, so its entries can satisfy
+covers_current_elements. The bound is the pass budget. The 16:58:51 pass
+recorded built = 33, uncovered_before = 2187, oversized_skipped = 0, and
+deferred_to_next_pass = 1962. The 17:00:12 pass planned 31 files and 1,977 MB
+against cap = 320 and budget_mb = 2048, and skipped 251 files in today's
+partition. The pass is byte-bounded, not count-bounded.
+
+At roughly 31 files and 2 GB per hourly pass against 2,187 uncovered files,
+an undisturbed queue needs about 70 hours. The queue is disturbed: files are
+ordered newest-first with a reserved oldest tail share, and compaction keeps
+invalidating the recent partition the newest-first order returns to. That is
+why the Sep 2 to Sep 9 week has not converged while the tail sits untouched.
+
+This measurement does not establish which lever is correct. Raising the byte
+budget spends more of a maintenance pool that a 14:53 UTC perf sample already
+showed at 52.37% inclusive under dedup. Accelerating the ordinary full-index
+builder, the sanctioned direction from the 15:52 correction, multiplies the
+same budget instead of enlarging it. Neither is measured end-to-end yet.
+No knob was changed and no production behavior was modified for this reading.
+
+### Streamed histogram cache released — 2026-09-09 17:30 UTC
+
+The cache release merged as 73de5c6f (#244) and production now runs
+ghcr.io/monoscope-tech/timefusion@sha256:f007af8f064b3a87c2a4828cc0889de119b2153cd09b1dd8b8894a8cce369556,
+the same digest that local signoff built, smoke-tested and pushed. The master
+CI run resolved that published candidate instead of recompiling, and the
+Build and Deploy workflow completed successfully.
+
+Acceptance for this release was fixed before the probe ran: no correctness
+mismatch, no regression on the eight pairs that already completed, and
+movement in the histogram counters. The Sep 6 day and the Sep 2 to Sep 9 week
+pairs are expected to keep exceeding the three-second probe bound, because
+those dates hold zero physical hash candidates. That is the coverage
+condition measured above, and it is not evidence about the cache.
+
+### Production smoke on the released cache — 2026-09-09 17:45 UTC
+
+The probe ran against the deployed digest after ten minutes of uptime and
+reproduced the previous result exactly: eight of sixteen pairs completed,
+no mismatch, same image throughout. Narrow queries took 281-532 ms and the
+Sep 2 day took 586-1,022 ms. Sep 6 and the Sep 2 to Sep 9 week were
+cancelled at the three-second statement timeout in every arm, both
+aggregates, both repetitions. Evidence: production-f007af8f-hash-smoke.json.
+
+The release is therefore live and non-regressive, and also DORMANT. Its own
+counters say so: histogram_snapshots and histogram_delta_cache_hits are both
+still 0 after the probe, so the native histogram route has not executed once
+in production and the new cache has never been consulted. Only
+histogram_parquet_prepares moved, to 104, which is preparation performed for
+sources that must scan. No production latency improvement is claimed from
+this release. The cache can only pay once index coverage exists.
+
+The failing windows are explained by bytes alone. Sep 2 holds about 257 MB
+of uncovered compressed columns and answers in under a second; Sep 6 holds
+about 3,461 MB, roughly thirteen times as much, and exceeds three seconds.
+Scan cost scales with the bytes that have no index.
+
+### Correction to the convergence estimate
+
+The 70-hour figure recorded at 17:25 UTC is wrong and should not be quoted.
+It assumed the whole 2,187-file queue drains toward the dashboard window.
+The two audits measure otherwise: manifest hash entries rose by 39 fleet-wide
+in 76 minutes, consistent with built = 33 per pass, while the unified
+project's September dates gained exactly 2. The observed unified-project unit
+carried from_reserved_tail = true, so it served mid-August.
+
+The order explains it. Work is split fairly across projects, each project is
+sorted newest-first, and 33% of every pass is reserved for the oldest
+uncovered files. Today's partition is skipped. The newest share is therefore
+spread across every project's recent files, and the reserved share lands in
+August. Sep 2 through Sep 7 is neither newest nor oldest, so it receives
+close to zero files per pass. The dashboard band converges in weeks at these
+settings, not hours.
+
+Coverage rate is min(build rate, per-pass budget x cadence), and the two are
+currently balanced: a 2,048 MB pass takes about 58 minutes of an hourly cron.
+Commit 548920d1, which projects only indexed columns and prepares variants
+once per batch, therefore buys headroom rather than coverage. Halving build
+time would finish the pass in about 29 minutes and then idle until the next
+tick. Raising the budget alone would overrun the hour and the pass semaphore
+would no-op the following crons. Moving coverage requires moving both, or
+draining the sealed dates outside the pass.
+
+### The starved band, quantified from the split — 2026-09-09 18:05 UTC
+
+Reading fair_tantivy_backfill_work_split makes the rate arithmetic exact and
+replaces the vaguer "weeks" wording above.
+
+The reservation is carved from the FILE cap, not the byte budget. With
+cap = 320 and tail_share = 33%, the pass builds a list of 105 oldest-first
+and 215 newest-first entries, both round-robined fairly across every project,
+interleaved tail-first at roughly one reserved entry per three head entries.
+The byte budget then truncates that list to what fits in 2,048 MB, which was
+31 entries in the 17:00 pass. So a pass executes about 8 oldest and 23 newest
+entries, shared across the twelve or more projects with uncovered files.
+
+The unified project therefore receives roughly two to three newest entries
+and one oldest entry per hourly pass. Its newest uncovered date is Sep 8,
+with 52 uncovered files; its oldest is mid-August. Sep 2 through Sep 7 is
+reached only after Sep 8 drains. Measured by bytes the picture agrees: the
+unified project's share is on the order of 170 MB per hour against about
+7.9 GB of uncovered Sep 2 to Sep 8 columns.
+
+Both derivations give the same order: the dashboard week converges in about
+two to four days of uninterrupted running, not 70 hours and not weeks. That
+holds only if compaction does not invalidate those files first and the
+process is not restarted, and every non-docs push to master restarts it and
+spends the first twenty-five minutes re-enumerating.
+
+Two existing knobs move this without new code or a new obligation:
+timefusion_tantivy_build_concurrency, currently 2, and
+timefusion_tantivy_backfill_max_bytes_per_pass_mb, currently 2,048. Coverage
+rate is min(build rate, budget x cadence) and they are presently balanced at
+a 58-minute pass inside an hourly cron, so both must move together. Raising
+each to double would keep the cadence and double the rate, at the cost of
+twice the concurrent index builds on a box with OOM history and dedup already
+holding 52% inclusive CPU, plus one restart. That is a production risk
+decision, not a measurement, and it is left to the user.
+
+An off-box drain of the sealed Sep 1 to Sep 7 dates was evaluated and is NOT
+currently possible. Neither precondition holds. There is no index-repair
+subcommand: the CLI dispatches redrive-dml, optimize, migrate-columns,
+run-unit and retention, and run-unit's operations are base, derived, dedup,
+hot, sealed and repair, all Delta maintenance rather than index builds. And
+manifest writes are not safe across processes: save_manifest issues an
+unconditional put, and the read-modify-write is serialized only by an
+in-process DashMap of mutexes. A second writer would be last-writer-wins and
+could silently drop the entries the running server had just published. That
+degrades to lost work and orphan blobs rather than wrong query results,
+because missing coverage falls back to scanning, but it would erase the very
+progress the drain intends to make. Both a conditional manifest write and a
+new subcommand would be required first.
