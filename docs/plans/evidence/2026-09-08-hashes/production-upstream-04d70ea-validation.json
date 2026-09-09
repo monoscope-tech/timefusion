@@ -1,0 +1,42 @@
+{
+  "recorded_at": "2026-09-09T10:00:08.177340+00:00",
+  "image_before": "ghcr.io/monoscope-tech/timefusion:04d70ea",
+  "samples": [
+    {
+      "name": "narrow",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 432.81
+    },
+    {
+      "name": "slow_day",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-06 00:00:00' AND timestamp < TIMESTAMP '2026-09-07 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error_type": "QueryCanceled",
+      "sqlstate": "57014",
+      "elapsed_ms": 3024.53
+    }
+  ],
+  "stats": [
+    [
+      "scan",
+      "tantivy_backfill_built",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "image_after": "ghcr.io/monoscope-tech/timefusion:04d70ea"
+}

@@ -169,7 +169,7 @@ impl CapturedHistogram {
     /// Request one missing completed-day proof without delaying this query.
     /// The builder uses the maintenance runtime and shared count-build semaphore.
     /// The extra permit prevents a chart workload from queuing many days.
-    fn seed_missing_proof(&self, database: &super::Database) -> Option<tokio::task::JoinHandle<()>> {
+    fn seed_missing_proof(&self, database: &super::Database, day: i64) -> Option<tokio::task::JoinHandle<()>> {
         database.tantivy_indexer()?;
         let state = &database.histogram_proof_build;
         let permit = state.slot.clone().try_acquire_owned().ok()?;
@@ -178,19 +178,18 @@ impl CapturedHistogram {
             let now = std::time::Instant::now();
             let mut attempts = state.attempts.lock();
             attempts.retain(|(_, at)| now.duration_since(*at) < std::time::Duration::from_secs(60));
-            let key = self
-                .partitions
-                .iter()
-                .rev()
-                .filter(|(day, files)| **day < today && !files.is_empty() && !self.logical_counts.contains_key(*day))
-                .filter_map(|(_, files)| {
-                    Some(crate::read::CountPartition {
-                        project_id: self.project.clone(),
-                        table_name: self.table.clone(),
-                        date: files.first()?.partition_values.get("date")?.clone()?,
-                    })
-                })
-                .find(|key| !attempts.iter().any(|(attempt, _)| attempt == key))?;
+            let files = self.partitions.get(&day)?;
+            if day >= today || self.logical_counts.contains_key(&day) {
+                return None;
+            }
+            let key = crate::read::CountPartition {
+                project_id: self.project.clone(),
+                table_name: self.table.clone(),
+                date: files.first()?.partition_values.get("date")?.clone()?,
+            };
+            if attempts.iter().any(|(attempt, _)| attempt == &key) {
+                return None;
+            }
             if attempts.len() == 256 {
                 attempts.pop_front();
             }
@@ -226,9 +225,26 @@ impl CapturedHistogram {
     /// Counts with streamed visibility columns and the query memory pool.
     /// Unlike `count`, this limits each decoded batch rather than total decoded data.
     pub async fn count_streaming(&self) -> Result<HistogramSnapshotResult> {
+        self.count_streaming_before_visibility(|_| {}).await
+    }
+
+    async fn count_streaming_before_visibility(&self, mut before_visibility: impl FnMut(i64)) -> Result<HistogramSnapshotResult> {
         let mut total = HistogramSnapshotResult::default();
         for (&day, files) in &self.partitions {
-            let part = self.count_streaming_partition(day, files).await?;
+            let indexed = match self.count_index_only_partition(day, files).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%error, "indexed histogram declined; streaming captured visibility");
+                    None
+                }
+            };
+            let part = match indexed {
+                Some(result) => result,
+                None => {
+                    before_visibility(day);
+                    self.count_streaming_partition(day, files).await?
+                }
+            };
             crate::tantivy::histogram::merge_counts(&mut total.counts, part.counts)?;
             total.indexed_sources += part.indexed_sources;
             total.scanned_sources += part.scanned_sources;
@@ -242,11 +258,6 @@ impl CapturedHistogram {
         use datafusion::physical_plan::{streaming::StreamingTableExec, union::UnionExec};
         use futures::TryStreamExt;
 
-        match self.count_unique_partition(day, files).await {
-            Ok(Some(result)) => return Ok(result),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "indexed histogram declined; streaming captured visibility"),
-        }
         let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
         let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
         let columns =
@@ -391,6 +402,46 @@ impl CapturedHistogram {
         Ok(result)
     }
 
+    async fn count_empty_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
+        let Some(membership) = &self.membership else { return Ok(None) };
+        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
+        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
+        for batch in &self.memory.batches {
+            if histogram_timestamps(batch)?.iter().any(|&timestamp| timestamp >= lo && timestamp < hi) {
+                return Ok(None);
+            }
+        }
+        let entries = self.manifest.histogram_entries(&self.root, files)?;
+        let columns = membership.columns();
+        for (file, entry) in files.iter().zip(entries) {
+            let Some(entry) = entry else { return Ok(None) };
+            if entry.entry.min_timestamp_micros.is_none_or(|min| min < lo)
+                || entry.entry.max_timestamp_micros.is_none_or(|max| max >= hi)
+                || columns.iter().any(|column| !entry.entry.element_fields.contains(*column))
+            {
+                return Ok(None);
+            }
+            let indexed_rows = entry.entry.rows;
+            if self.search.histogram_file_has_matches(&self.table, &self.project, self.window, membership, entry).await? {
+                return Ok(None);
+            }
+            // Metadata validates complete coverage; no event rows are decoded.
+            let prepared = crate::tantivy::visibility::PreparedFileRows::open(self.log_store.clone(), file).await?;
+            let _owner = self.cache.reserve(prepared.retained_bytes()?, self.context.memory_pool())?;
+            ensure!(u64::try_from(prepared.live().len())? == indexed_rows, "empty index does not cover every physical row");
+        }
+        TantivySearchService::record_histogram_snapshot(&self.search.stats);
+        Ok(Some(HistogramSnapshotResult { indexed_sources: files.len(), ..Default::default() }))
+    }
+
+    /// Prefer the existing count witness; probe absence only when it declines.
+    async fn count_index_only_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
+        match self.count_unique_partition(day, files).await? {
+            Some(result) => Ok(Some(result)),
+            None => self.count_empty_partition(day, files).await,
+        }
+    }
+
     /// Equality with an exact logical count proves there are no live duplicate
     /// versions or tombstones: either would make the logical count smaller.
     async fn count_unique_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
@@ -452,7 +503,7 @@ impl CapturedHistogram {
     }
 
     async fn count_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<HistogramSnapshotResult> {
-        match self.count_unique_partition(day, files).await {
+        match self.count_index_only_partition(day, files).await {
             Ok(Some(result)) => return Ok(result),
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, "index-only histogram declined; resolving captured rows"),
@@ -675,8 +726,14 @@ impl super::Database {
         if !has_index {
             return Ok(None);
         }
-        drop(captured.seed_missing_proof(self));
-        let result = captured.count_streaming().await?;
+        let mut proof = None;
+        let result = captured
+            .count_streaming_before_visibility(|day| {
+                if proof.is_none() {
+                    proof = captured.seed_missing_proof(self, day);
+                }
+            })
+            .await?;
         for error in &result.index_errors {
             tracing::warn!(error = %error, "histogram used captured-row fallback");
         }
@@ -878,15 +935,43 @@ mod tests {
             db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(),
             "index coverage alone cannot prove visibility"
         );
+        let absent = Membership::Contains { column: "hashes".into(), value: "absent".into() };
+        let mut empty = db.capture_histogram(&project, table, window, Some(&absent), 64, context.clone()).await?;
+        for result in [empty.count().await, empty.count_streaming().await] {
+            let result = result?;
+            assert!(result.counts.is_empty());
+            assert_eq!(result.scanned_sources, 0, "complete empty postings must avoid decoding visibility rows");
+            assert_eq!(result.indexed_sources, 1);
+        }
+        assert_eq!(search.stats.histogram_unique_partitions.load(Ordering::Relaxed), 0, "absence is not a uniqueness proof");
+        let mut session = Arc::new(db.clone()).create_session_context();
+        db.setup_session_context(&mut session)?;
+        let sql = format!(
+            "SELECT time_bucket('1 second', timestamp), count(*) FROM {table} \
+             WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({timestamp}) \
+             AND timestamp < to_timestamp_micros({}) AND hashes @> ARRAY['absent'] GROUP BY 1",
+            timestamp + 1
+        );
+        let before = search.stats.histogram_snapshots.load(Ordering::Relaxed);
+        assert_eq!(session.sql(&sql).await?.collect().await?.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        assert!(search.stats.histogram_snapshots.load(Ordering::Relaxed) > before, "SQL must use the indexed histogram");
+        assert!(db.histogram_proof_build.attempts.lock().is_empty(), "indexed absence must not schedule a daily visibility scan");
+        empty.memory.batches.push(json_to_batch_for(table, vec![row("memory", "absent")])?);
+        empty.max_decoded_bytes = 1024 * 1024;
+        assert_eq!(empty.count_streaming().await?.counts.values().sum::<u64>(), 1, "a matching memory row must defeat indexed absence");
+        empty.memory.batches.clear();
+        empty.max_decoded_bytes = 64;
+        Arc::make_mut(&mut empty.manifest).entries.clear();
+        assert!(empty.count_streaming().await.is_err(), "missing index coverage cannot certify absence");
         let partition = crate::read::CountPartition { project_id: project.clone(), table_name: table.into(), date: date.clone() };
         let unproven = db.capture_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         let busy = db.histogram_proof_build.slot.clone().acquire_owned().await?;
-        assert!(unproven.seed_missing_proof(&db).is_none(), "busy proof builder must decline without queuing");
+        assert!(unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).is_none(), "busy proof builder must decline without queuing");
         drop(busy);
-        let build = unproven.seed_missing_proof(&db).context("completed partition must schedule a proof")?;
-        assert!(unproven.seed_missing_proof(&db).is_none(), "one query-triggered proof build holds the admission slot");
+        let build = unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).context("completed partition must schedule a proof")?;
+        assert!(unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).is_none(), "one query-triggered proof build holds the admission slot");
         build.await?;
-        assert!(unproven.seed_missing_proof(&db).is_none(), "a recent attempt must not rebuild from a stale query capture");
+        assert!(unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).is_none(), "a recent attempt must not rebuild from a stale query capture");
         assert_eq!(db.logical_count_cache.stats().0, 0, "proof seeding must not retain the complete winner index");
         let captured = db.capture_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         let result = captured.count().await?;
