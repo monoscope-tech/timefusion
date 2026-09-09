@@ -1089,3 +1089,28 @@ no completion is claimed. Continue fresh-ingest signoff session 72595
 push/deploy, and verify index use and latency. Broader optimized benchmarks,
 ingestion contention, and post-acceptance profiling remain required.
 Next progress audit is due by 10:49:08 UTC.
+
+Progress audit 2026-09-09 10:48:29 UTC: this interval reproduced the
+project-wide DML capture bottleneck seen in production and implemented
+range-aware capture protection. Review found and fixed widened coalescer
+execution gaps, with observed red and green regressions. Six targeted tests
+pass with no leak classification in the final run. The earlier transient
+classification remains unidentified, not claimed fixed.
+
+Fresh-ingest indexing and the default macOS linker passed all five local
+checks, including 1,506 tests, ten doctests, PostgreSQL smoke, and 63 E2E
+tests. Root commits 65f6bd7a, da95b526, and 200134e1 are merged with that
+work as f2368db2 in /tmp/timefusion-hash-flush. Full combined signoff is
+running in session 98582, log /tmp/timefusion-hash-integrated-final-signoff.log.
+Keep source inputs frozen. Only passing final-tree attestations may authorize
+push. No combined change is deployed yet.
+
+Production 03cc1ae's census at 10:46:29 UTC reports 2,203 uncovered files,
+zero oversized, 125 today, 1,348 in the last week, and 730 older. The 10:30:14
+census was 2,217. These totals include changing live files and are not a pure
+index-build throughput measure. Wide query acceptance still fails the latest
+three-second probes. Continue through combined signoff, push/merge/deploy,
+and verify actual routing and latency under ongoing DML. Optimized workload
+benchmarks, ingestion contention, and the requested subsequent CPU/memory
+profiles across columns and time ranges remain open.
+Next progress audit is due by 11:18:29 UTC.
