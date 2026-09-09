@@ -259,7 +259,11 @@ fn variant_json_flatten_full_text() {
         (1_000_000, "a", "INFO", "x", vec![], r#"{"msg":"timeout occurred"}"#, ""),
         (2_000_000, "b", "ERROR", "y", vec![], r#"{"msg":"db connection lost"}"#, ""),
     ]);
-    let (idx, built, _) = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
+    // Each batch prepares its own variant columns, including an entirely
+    // null batch. Text in another field must not create a body match.
+    let inputs = [b.slice(0, 1), b.slice(1, 1), batch(&[(3_000_000, "c", "INFO", "timeout", vec![], "", "")])];
+    let (idx, built, stats) = build_in_memory(&table, &inputs).unwrap();
+    assert_eq!((stats.batches, stats.rows), (3, 3));
     let body = built.user_fields.get("body").unwrap().field;
     let qp = QueryParser::for_index(&idx, vec![body]);
     let q = qp.parse_query("timeout").unwrap();

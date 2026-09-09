@@ -186,7 +186,7 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
                     uf.source.name
                 );
             }
-            Ok(UserCol { field: uf.field, column, kind: ColKind::detect(column.data_type(), cfg.flatten.as_deref())?, list_mode: cfg.list_mode })
+            Ok(UserCol { field: uf.field, column, kind: ColKind::detect(column, cfg.flatten.as_deref())?, list_mode: cfg.list_mode })
         })
         .collect::<Result<_>>()?;
 
@@ -227,20 +227,25 @@ enum ColKind {
     Utf8,
     Utf8View,
     ListUtf8,
-    VariantJson,
-    VariantKv,
+    VariantJson(VariantArray),
+    VariantKv(VariantArray),
 }
 
 impl ColKind {
-    fn detect(dt: &DataType, flatten: Option<&str>) -> Result<Self> {
-        Ok(match dt {
+    fn detect(column: &ArrayRef, flatten: Option<&str>) -> Result<Self> {
+        Ok(match column.data_type() {
             DataType::Utf8 => Self::Utf8,
             DataType::Utf8View => Self::Utf8View,
             DataType::List(_) => Self::ListUtf8,
-            DataType::Struct(_) => match flatten.unwrap_or("json") {
-                "kv" => Self::VariantKv,
-                _ => Self::VariantJson,
-            },
+            DataType::Struct(_) => {
+                // Canonicalization and schema validation are batch work. A
+                // prepared variant owns shared Arrow buffers, not copied rows.
+                let array = VariantArray::try_new(column.as_ref()).context("prepare variant index column")?;
+                match flatten.unwrap_or("json") {
+                    "kv" => Self::VariantKv(array),
+                    _ => Self::VariantJson(array),
+                }
+            }
             other => bail!("unsupported tantivy source column type {other:?}"),
         })
     }
@@ -253,8 +258,8 @@ impl ColKind {
             Self::Utf8 => Some(col.as_any().downcast_ref::<StringArray>().context("utf8 cast")?.value(row).to_string()),
             Self::Utf8View => Some(col.as_any().downcast_ref::<StringViewArray>().context("utf8view cast")?.value(row).to_string()),
             Self::ListUtf8 => Some(list_to_text(col.as_any().downcast_ref::<ListArray>().context("list cast")?, row)?),
-            Self::VariantJson => variant_to_text(col, row, false)?,
-            Self::VariantKv => variant_to_text(col, row, true)?,
+            Self::VariantJson(array) => prepared_variant_to_text(array, row, false)?,
+            Self::VariantKv(array) => prepared_variant_to_text(array, row, true)?,
         })
     }
 }
@@ -280,6 +285,10 @@ pub(crate) fn variant_to_text(col: &ArrayRef, row: usize, kv: bool) -> Result<Op
         return Ok(None);
     }
     let variant_arr = VariantArray::try_new(struct_arr).map_err(|e| anyhow!("VariantArray::try_new: {e}"))?;
+    prepared_variant_to_text(&variant_arr, row, kv)
+}
+
+fn prepared_variant_to_text(variant_arr: &VariantArray, row: usize, kv: bool) -> Result<Option<String>> {
     if variant_arr.is_null(row) {
         return Ok(None);
     }
@@ -995,13 +1004,29 @@ pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
 pub async fn build_parquet_and_pack(
     store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, level: i32, merge: MergeMode,
 ) -> Result<(Bytes, IndexBuildStats)> {
-    use deltalake::datafusion::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+    use deltalake::datafusion::parquet::arrow::{
+        ProjectionMask,
+        async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+    };
     use futures::TryStreamExt;
 
     let path = ObjPath::from(parquet_rel);
     let meta = store.head(&path).await.with_context(|| format!("head {parquet_rel}"))?;
     let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
-    let mut stream = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?.build().context("build parquet stream")?;
+    // Decode exactly the columns the full index consumes. This preserves the
+    // normal index schema and every physical row, without reading unrelated
+    // Parquet column chunks on each rebuild.
+    let fields: std::collections::HashSet<&str> = table
+        .fields
+        .iter()
+        .filter(|field| field.tantivy.as_ref().is_some_and(|config| config.indexed))
+        .map(|field| field.name.as_str())
+        .chain(["timestamp", "id"])
+        .collect();
+    let builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?;
+    let columns = builder.schema().fields().iter().enumerate().filter_map(|(index, field)| fields.contains(field.name().as_str()).then_some(index));
+    let projection = ProjectionMask::roots(builder.parquet_schema(), columns);
+    let mut stream = builder.with_projection(projection).build().context("build parquet stream")?;
     let tmp = tempfile::tempdir().context("build_parquet_and_pack: tempdir")?;
     let dir = tmp.path().to_owned();
     let (tx, rx) = tokio::sync::mpsc::channel(PARQUET_INDEX_BATCH_WINDOW);

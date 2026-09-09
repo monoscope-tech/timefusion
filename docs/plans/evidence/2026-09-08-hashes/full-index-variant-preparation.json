@@ -1,0 +1,67 @@
+{
+  "at": "2026-09-09T16:01:17.491008+00:00",
+  "library_version": "58.3.0",
+  "source_sha256": "8e5daf369b2294fae8e08a2e487cdb94bccd9309f3bbe291780b7f1e45a398e6",
+  "samples": [
+    {
+      "trial": 0,
+      "per_row": true,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 390.82
+    },
+    {
+      "trial": 0,
+      "per_row": false,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 339.68
+    },
+    {
+      "trial": 1,
+      "per_row": false,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 332.878
+    },
+    {
+      "trial": 1,
+      "per_row": true,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 390.099
+    },
+    {
+      "trial": 2,
+      "per_row": true,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 394.614
+    },
+    {
+      "trial": 2,
+      "per_row": false,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 326.635
+    },
+    {
+      "trial": 3,
+      "per_row": false,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 329.113
+    },
+    {
+      "trial": 3,
+      "per_row": true,
+      "rows": 262144,
+      "bytes": 27240960,
+      "elapsed_ms": 384.419
+    }
+  ],
+  "per_row_median_ms": 390.4595,
+  "per_batch_median_ms": 330.9955,
+  "elapsed_reduction_fraction": 0.15229236322845263,
+  "limitations": "Isolated optimized variant preparation plus JSON serialization. Unshredded nested JSON, 1024 rows/batch. Output-byte counts agree; not complete value parity proof. Alternating execution order; Docker image build concurrent. Not an end-to-end indexing speedup."
+}
