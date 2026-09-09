@@ -97,6 +97,42 @@ fn bench_build(c: &mut Criterion) {
     g.finish();
 }
 
+// Includes real variant serialization, tokenization, final merging and packing.
+// Setup is outside the timing loop; JSON and KV modes use identical source rows.
+fn bench_variant_build(c: &mut Criterion) {
+    use parquet_variant_compute::VariantArrayBuilder;
+    use parquet_variant_json::JsonToVariant;
+    use timefusion::tantivy::{MergeMode, build_and_pack};
+
+    let rows = 100_000;
+    let base = synthetic_batch(rows);
+    let mut variants = VariantArrayBuilder::new(rows);
+    for row in 0..rows {
+        variants
+            .append_json(&format!(r#"{{"http":{{"method":"GET","status":200}},"path":"/events/{row}","tags":["api","production"],"duration":12345}}"#))
+            .unwrap();
+    }
+    let column: ArrayRef = Arc::new(arrow::array::StructArray::from(variants.build()));
+    let schema = Arc::new(ArrowSchema::new(
+        base.schema().fields().iter().take(3).cloned().chain([Arc::new(Field::new("message", column.data_type().clone(), true))]).collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(schema, base.columns().iter().take(3).cloned().chain([column]).collect()).unwrap();
+    let mut group = c.benchmark_group("tantivy_variant_full_build");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(rows as u64));
+    for flatten in ["json", "kv"] {
+        let mut table = table();
+        table.fields[3].data_type = "Variant".into();
+        table.fields[3].tantivy.as_mut().unwrap().flatten = Some(flatten.into());
+        for merge in [MergeMode::Now, MergeMode::Deferred] {
+            group.bench_function(format!("{flatten}/{merge:?}"), |bench| {
+                bench.iter(|| build_and_pack(&table, std::slice::from_ref(&batch), 3, merge).unwrap());
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_query(c: &mut Criterion) {
     let table = table();
     let b = synthetic_batch(100_000);
@@ -245,5 +281,5 @@ fn bench_e2e_scan(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_build, bench_query, bench_size_ratio, bench_e2e_scan);
+criterion_group!(benches, bench_build, bench_variant_build, bench_query, bench_size_ratio, bench_e2e_scan);
 criterion_main!(benches);

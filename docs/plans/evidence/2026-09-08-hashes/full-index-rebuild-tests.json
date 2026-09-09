@@ -1,0 +1,16 @@
+{
+  "at": "2026-09-09T16:27:52.159027+00:00",
+  "command": "CARGO_TARGET_DIR=/tmp/timefusion-rebuild-target make ci CHECKS=\"test\"",
+  "exit_code": 0,
+  "compile_elapsed": "10m 30s",
+  "run_id": "b9b7c196-e450-49cf-a2bd-3cd144443478",
+  "tests_passed": 1508,
+  "tests_skipped": 17,
+  "test_elapsed_seconds": 220.038,
+  "doctests_passed": 10,
+  "retries": 0,
+  "attestations": [
+    "\u2500\u2500 attested test \u2192 refs/ci-attest/v1/test/000722e8bffd60e1af5b50757b47555c12dc289af7050de2206fa335ebd03228/darwin-aarch64/docker.minio.nextest.rust/20260909"
+  ],
+  "limitations": "Only test check for candidate source; final formatting/lint, PGWire smoke, e2e, performance comparison, image signoff, and production validation are pending."
+}
