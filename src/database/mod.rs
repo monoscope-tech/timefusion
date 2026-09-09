@@ -4063,12 +4063,11 @@ impl Database {
         }
     }
 
-    /// Count live parquet the Tantivy manifest does not cover, without building anything.
+    /// Refresh global Tantivy coverage gauges without building indexes.
     ///
-    /// `backfill_table_indexes` only runs from the daily reconcile cron, so after a deploy the
-    /// reindex has no reported remaining-work figure for hours. This is the same diff but
-    /// metadata-only: the Delta log names live files and the manifest names covered ones. No
-    /// parquet is read and no index is built, so it is safe to run far more often.
+    /// Only this all-table census writes the coverage gauges. Per-table backfills
+    /// log their progress but cannot replace the global remaining-work count.
+    /// The census reads Delta and index metadata, without reading Parquet rows.
     /// Returns `(uncovered, oversized, by_age)` where `by_age` is
     /// `[today, 1-7d, older]` — see `CENSUS_AGE_BUCKETS`.
     pub async fn tantivy_coverage_census(&self) -> anyhow::Result<(u64, u64, [u64; 3])> {
@@ -4201,7 +4200,7 @@ impl Database {
         let mut roots: Vec<String> = vec!["default".into()];
         roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()));
         let mut built = 0usize;
-        // Coverage gauges for this pass — see `tantivy_uncovered_files`.
+        // Per-table progress for this pass, reported in the completion log.
         let (mut uncovered_total, mut oversized_total) = (0u64, 0u64);
         // Work this pass deliberately left for the next one. Reported, never
         // silent: a capped pass that logged only `built` would look identical
@@ -4359,13 +4358,6 @@ impl Database {
                 Self::commit_manifest_batch(svc, table_name, &pid, &mut pending).await;
             }
         }
-        // Gauges, so each pass reports the CURRENT remaining work rather than a
-        // running total. `uncovered` reaching 0 is what "the reindex is done"
-        // means, and nothing reported it before — which is why the reindex was
-        // being chased by hand from sibling containers.
-        let stats = crate::observability::maintenance_stats();
-        stats.tantivy_uncovered_files.store(uncovered_total.saturating_sub(built as u64), std::sync::atomic::Ordering::Relaxed);
-        stats.tantivy_oversized_skipped.store(oversized_total, std::sync::atomic::Ordering::Relaxed);
         info!(
             table_name,
             built,

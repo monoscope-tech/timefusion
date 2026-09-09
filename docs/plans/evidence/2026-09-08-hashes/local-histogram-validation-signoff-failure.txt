@@ -1,0 +1,388 @@
+── starting CI services (minio)…
+ Container timefusion-ci-minio-1  Running
+ Container timefusion-ci-minio-1  Waiting
+ Container timefusion-ci-minio-1  Healthy
+── capabilities: docker minio nextest rust
+── running fmt
+── attested fmt → refs/ci-attest/v1/fmt/42b553ff127247b62f62d1607886e1eaf12d900f619f8dafdb6b9219f1eceafb/darwin-aarch64/docker.minio.nextest.rust/20260909
+── running clippy
+    Blocking waiting for file lock on build directory
+warning: method `file` is never used
+  --> vendor/walrus-rust/src/wal/storage.rs:60:19
+   |
+23 | impl FdBackend {
+   | -------------- method in this implementation
+...
+60 |     pub(crate) fn file(&self) -> &std::fs::File {
+   |                   ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `as_fd` is never used
+   --> vendor/walrus-rust/src/wal/storage.rs:111:19
+    |
+ 71 | impl StorageImpl {
+    | ---------------- method in this implementation
+...
+111 |     pub(crate) fn as_fd(&self) -> Option<&FdBackend> {
+    |                   ^^^^^
+
+warning: methods `len` and `storage` are never used
+   --> vendor/walrus-rust/src/wal/storage.rs:173:19
+    |
+149 | impl SharedMmap {
+    | --------------- methods in this implementation
+...
+173 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+...
+181 |     pub(crate) fn storage(&self) -> &StorageImpl {
+    |                   ^^^^^^^
+
+warning: function `fsync_schedule` is never used
+   --> vendor/walrus-rust/src/wal/storage.rs:235:15
+    |
+235 | pub(crate) fn fsync_schedule() -> Option<FsyncSchedule> {
+    |               ^^^^^^^^^^^^^^
+
+warning: `walrus-rust` (lib) generated 4 warnings
+    Checking timefusion v0.1.0 (/Users/tonyalaribe/Projects/apitoolkit/timefusion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 25s
+── attested clippy → refs/ci-attest/v1/clippy/c33eefe77e5af2a40e70a66e4cdd2ad50d4d089e530c2c0f04a5ee2eacb918d3/darwin-aarch64/docker.minio.nextest.rust/20260909
+── running test
+warning: method `file` is never used
+  --> vendor/walrus-rust/src/wal/storage.rs:60:19
+   |
+23 | impl FdBackend {
+   | -------------- method in this implementation
+...
+60 |     pub(crate) fn file(&self) -> &std::fs::File {
+   |                   ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `as_fd` is never used
+   --> vendor/walrus-rust/src/wal/storage.rs:111:19
+    |
+ 71 | impl StorageImpl {
+    | ---------------- method in this implementation
+...
+111 |     pub(crate) fn as_fd(&self) -> Option<&FdBackend> {
+    |                   ^^^^^
+
+warning: methods `len` and `storage` are never used
+   --> vendor/walrus-rust/src/wal/storage.rs:173:19
+    |
+149 | impl SharedMmap {
+    | --------------- methods in this implementation
+...
+173 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+...
+181 |     pub(crate) fn storage(&self) -> &StorageImpl {
+    |                   ^^^^^^^
+
+warning: function `fsync_schedule` is never used
+   --> vendor/walrus-rust/src/wal/storage.rs:235:15
+    |
+235 | pub(crate) fn fsync_schedule() -> Option<FsyncSchedule> {
+    |               ^^^^^^^^^^^^^^
+
+warning: `walrus-rust` (lib) generated 4 warnings
+   Compiling timefusion v0.1.0 (/Users/tonyalaribe/Projects/apitoolkit/timefusion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 58s
+────────────
+ Nextest run ID a3903d37-be84-4357-9276-117f69bf2c57 with nextest profile: ci
+    Starting 1483 tests across 3 binaries (17 tests skipped)
+  TRY 1 SEGV [   1.522s] (─────────) timefusion database::tests::test_batch_queue_under_load
+  stdout ───
+
+    running 1 test
+  stderr ───
+
+    thread 'tokio-rt-worker' (5043347) panicked at /Users/tonyalaribe/.cargo/git/checkouts/delta-kernel-rs-8c7e34c150dec868/6817692/kernel/src/engine/default/executor.rs:286:22:
+    TokioMultiThreadExecutor has crashed: RecvError
+    stack backtrace:
+       0: __rustc::rust_begin_unwind
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/std/src/panicking.rs:698:5
+       1: core::panicking::panic_fmt
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/panicking.rs:75:14
+       2: core::result::unwrap_failed
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/result.rs:1855:5
+       3: expect<(core::option::Option<core::result::Result<alloc::boxed::Box<dyn buoyant_kernel::engine_data::EngineData, alloc::alloc::Global>, buoyant_kernel::error::Error>>, core::pin::Pin<alloc::boxed::Box<(dyn futures_core::stream::Stream<Item=core::result::Result<alloc::boxed::Box<dyn buoyant_kernel::engine_data::EngineData, alloc::alloc::Global>, buoyant_kernel::error::Error>> + core::marker::Send), alloc::alloc::Global>>), std::sync::mpsc::RecvError>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/result.rs:1178:23
+       4: {closure#1}<buoyant_kernel::engine::default::{impl#0}::next::{async_block_env#0}<core::result::Result<alloc::boxed::Box<dyn buoyant_kernel::engine_data::EngineData, alloc::alloc::Global>, buoyant_kernel::error::Error>, buoyant_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor>>
+                 at /Users/tonyalaribe/.cargo/git/checkouts/delta-kernel-rs-8c7e34c150dec868/6817692/kernel/src/engine/default/executor.rs:286:22
+       5: call_once<buoyant_kernel::engine::default::executor::tokio::{impl#6}::block_on::{closure_env#1}<buoyant_kernel::engine::default::{impl#0}::next::{async_block_env#0}<core::result::Result<alloc::boxed::Box<dyn buoyant_kernel::engine_data::EngineData, alloc::alloc::Global>, buoyant_kernel::error::Error>, buoyant_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor>>, ()>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+
+    (test aborted with signal 11: SIGSEGV)
+
+  TRY 2 PASS [   1.166s] ( 351/1483) timefusion database::tests::test_batch_queue_under_load
+  TRY 1 FAIL [   1.854s] (─────────) timefusion::suite dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans
+  stdout ───
+
+    running 1 test
+    test dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans ... FAILED
+
+    failures:
+
+    failures:
+        dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 239 filtered out; finished in 1.83s
+    
+  stderr ───
+
+    thread 'dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans' (5055650) panicked at tests/suite/dedup_compaction_test.rs:1739:5:
+    assertion `left == right` failed: backfilling an empty table must not erase the all-table coverage census
+      left: 0
+     right: 2
+    stack backtrace:
+       0: __rustc::rust_begin_unwind
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/std/src/panicking.rs:698:5
+       1: core::panicking::panic_fmt
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/panicking.rs:75:14
+       2: core::panicking::assert_failed_inner
+       3: core::panicking::assert_failed
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/panicking.rs:394:5
+       4: {async_fn#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1739:5
+       5: {async_fn#0}<(), anyhow::Error, suite::dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans::{async_block#0}::_tantivy_reconcile_backfills_new_files_and_gcs_orphans_internal::{async_fn_env#0}>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serial_test-3.3.1/src/serial_code_lock.rs:47:9
+       6: {async_block#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1694:1
+       7: poll<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+       8: poll<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+       9: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:778:70
+      10: with_budget<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/task/coop/mod.rs:167:5
+      11: budget<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/task/coop/mod.rs:133:5
+      12: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:778:25
+      13: enter<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:451:19
+      14: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:777:44
+      15: {closure#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:865:68
+      16: set<tokio::runtime::scheduler::Context, tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context/scoped.rs:40:9
+      17: {closure#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context.rs:181:38
+      18: try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:315:12
+      19: with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:279:20
+      20: set_scheduler<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context.rs:181:17
+      21: enter<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:865:27
+      22: block_on<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:765:24
+      23: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:205:33
+      24: enter_runtime<tokio::runtime::scheduler::current_thread::{impl#0}::block_on::{closure_env#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>, core::result::Result<(), anyhow::Error>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context/runtime.rs:65:16
+      25: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:193:9
+      26: block_on_inner<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/runtime.rs:371:52
+      27: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/runtime.rs:345:18
+      28: tantivy_reconcile_backfills_new_files_and_gcs_orphans
+                 at ./tests/suite/dedup_compaction_test.rs:1694:1
+      29: {closure#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1696:69
+      30: call_once<suite::dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans::{closure_env#0}, ()>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+      31: core::ops::function::FnOnce::call_once
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/ops/function.rs:250:5
+    note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+  TRY 2 FAIL [   4.374s] (1327/1483) timefusion::suite dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans
+  stdout ───
+
+    running 1 test
+    test dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans ... FAILED
+
+    failures:
+
+    failures:
+        dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 239 filtered out; finished in 4.35s
+    
+  stderr ───
+
+    thread 'dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans' (5056150) panicked at tests/suite/dedup_compaction_test.rs:1739:5:
+    assertion `left == right` failed: backfilling an empty table must not erase the all-table coverage census
+      left: 0
+     right: 2
+    stack backtrace:
+       0: __rustc::rust_begin_unwind
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/std/src/panicking.rs:698:5
+       1: core::panicking::panic_fmt
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/panicking.rs:75:14
+       2: core::panicking::assert_failed_inner
+       3: core::panicking::assert_failed
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/panicking.rs:394:5
+       4: {async_fn#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1739:5
+       5: {async_fn#0}<(), anyhow::Error, suite::dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans::{async_block#0}::_tantivy_reconcile_backfills_new_files_and_gcs_orphans_internal::{async_fn_env#0}>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serial_test-3.3.1/src/serial_code_lock.rs:47:9
+       6: {async_block#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1694:1
+       7: poll<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+       8: poll<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+       9: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:778:70
+      10: with_budget<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/task/coop/mod.rs:167:5
+      11: budget<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/task/coop/mod.rs:133:5
+      12: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:778:25
+      13: enter<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:451:19
+      14: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:777:44
+      15: {closure#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:865:68
+      16: set<tokio::runtime::scheduler::Context, tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context/scoped.rs:40:9
+      17: {closure#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context.rs:181:38
+      18: try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:315:12
+      19: with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:279:20
+      20: set_scheduler<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context.rs:181:17
+      21: enter<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:865:27
+      22: block_on<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:765:24
+      23: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:205:33
+      24: enter_runtime<tokio::runtime::scheduler::current_thread::{impl#0}::block_on::{closure_env#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>, core::result::Result<(), anyhow::Error>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context/runtime.rs:65:16
+      25: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:193:9
+      26: block_on_inner<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/runtime.rs:371:52
+      27: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/runtime.rs:345:18
+      28: tantivy_reconcile_backfills_new_files_and_gcs_orphans
+                 at ./tests/suite/dedup_compaction_test.rs:1694:1
+      29: {closure#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1696:69
+      30: call_once<suite::dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans::{closure_env#0}, ()>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+      31: core::ops::function::FnOnce::call_once
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/ops/function.rs:250:5
+    note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+────────────
+     Summary [ 143.424s] 1483 tests run: 1482 passed (1 slow, 1 flaky), 1 failed, 17 skipped
+        SLOW [  61.775s] (1483/1483) timefusion::suite kill_recovery::acked_rows_survive_sigkill_under_memory_pressure
+   FLAKY 2/2 [   1.166s] ( 351/1483) timefusion database::tests::test_batch_queue_under_load
+  TRY 2 FAIL [   4.374s] (1327/1483) timefusion::suite dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans
+  stdout ───
+
+    running 1 test
+    test dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans ... FAILED
+
+    failures:
+
+    failures:
+        dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 239 filtered out; finished in 4.35s
+    
+  stderr ───
+
+    thread 'dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans' (5056150) panicked at tests/suite/dedup_compaction_test.rs:1739:5:
+    assertion `left == right` failed: backfilling an empty table must not erase the all-table coverage census
+      left: 0
+     right: 2
+    stack backtrace:
+       0: __rustc::rust_begin_unwind
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/std/src/panicking.rs:698:5
+       1: core::panicking::panic_fmt
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/panicking.rs:75:14
+       2: core::panicking::assert_failed_inner
+       3: core::panicking::assert_failed
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/panicking.rs:394:5
+       4: {async_fn#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1739:5
+       5: {async_fn#0}<(), anyhow::Error, suite::dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans::{async_block#0}::_tantivy_reconcile_backfills_new_files_and_gcs_orphans_internal::{async_fn_env#0}>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serial_test-3.3.1/src/serial_code_lock.rs:47:9
+       6: {async_block#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1694:1
+       7: poll<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+       8: poll<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+       9: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:778:70
+      10: with_budget<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/task/coop/mod.rs:167:5
+      11: budget<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/task/coop/mod.rs:133:5
+      12: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:778:25
+      13: enter<core::task::poll::Poll<core::result::Result<(), anyhow::Error>>, tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure#0}::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:451:19
+      14: {closure#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:777:44
+      15: {closure#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:865:68
+      16: set<tokio::runtime::scheduler::Context, tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context/scoped.rs:40:9
+      17: {closure#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context.rs:181:38
+      18: try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:315:12
+      19: with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>, (alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>)>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:279:20
+      20: set_scheduler<(alloc::boxed::Box<tokio::runtime::scheduler::current_thread::Core, alloc::alloc::Global>, core::option::Option<core::result::Result<(), anyhow::Error>>), tokio::runtime::scheduler::current_thread::{impl#9}::enter::{closure_env#0}<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context.rs:181:17
+      21: enter<tokio::runtime::scheduler::current_thread::{impl#9}::block_on::{closure_env#0}<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>, core::option::Option<core::result::Result<(), anyhow::Error>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:865:27
+      22: block_on<core::pin::Pin<&mut core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:765:24
+      23: {closure#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:205:33
+      24: enter_runtime<tokio::runtime::scheduler::current_thread::{impl#0}::block_on::{closure_env#0}<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>, core::result::Result<(), anyhow::Error>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/context/runtime.rs:65:16
+      25: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/scheduler/current_thread/mod.rs:193:9
+      26: block_on_inner<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/runtime.rs:371:52
+      27: block_on<core::pin::Pin<&mut dyn core::future::future::Future<Output=core::result::Result<(), anyhow::Error>>>>
+                 at /Users/tonyalaribe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.52.3/src/runtime/runtime.rs:345:18
+      28: tantivy_reconcile_backfills_new_files_and_gcs_orphans
+                 at ./tests/suite/dedup_compaction_test.rs:1694:1
+      29: {closure#0}
+                 at ./tests/suite/dedup_compaction_test.rs:1696:69
+      30: call_once<suite::dedup_compaction_test::tantivy_reconcile_backfills_new_files_and_gcs_orphans::{closure_env#0}, ()>
+                 at /Users/tonyalaribe/.rustup/toolchains/1.91-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+      31: core::ops::function::FnOnce::call_once
+                 at /rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb/library/core/src/ops/function.rs:250:5
+    note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+error: test run failed
+── FAILED test
+skip  fmt                refs/ci-attest/v1/fmt/42b553ff127247b62f62d1607886e1eaf12d900f619f8dafdb6b9219f1eceafb/darwin-aarch64/docker.minio.nextest.rust/20260909
+skip  clippy             refs/ci-attest/v1/clippy/c33eefe77e5af2a40e70a66e4cdd2ad50d4d089e530c2c0f04a5ee2eacb918d3/darwin-aarch64/docker.minio.nextest.rust/20260909
+run   test               (fingerprint 3d199121b988f6eb6ccc7af7441363e58ce4344a0510a5ca976ace89989d89a9)
+run   pg-smoke           (fingerprint 69c918913d7c4aa47715d528f0e363085965af3891600a369d62a5f31afe00c8)
+run   e2e                (fingerprint 79c7c1493703b8842e6b70f0256df32abb2dd16e9e2fac0a5addda6b23b58fd5)
+make: *** [ci-signoff] Error 1
