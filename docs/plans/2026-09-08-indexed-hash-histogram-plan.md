@@ -996,3 +996,8 @@ Evidence: production-wider-window-validation.json, production-day-week-validatio
 and production-daily-window-validation.json. Production was observed on
 e44e08c immediately after the daily probes. Backfill unit logs continued
 through 09:23:56, so the pass was progressing rather than known stopped.
+
+The combined-tree make ci-signoff completed successfully: formatting,
+Clippy, 1,506 tests, ten doctests, PostgreSQL smoke, and all 63 e2e tests.
+All five checks are locally attested; none remains for GitHub. E2e nextest
+5128033f-d790-43ec-b0c7-a96f0c311d46. The committed tree is ready to push.
