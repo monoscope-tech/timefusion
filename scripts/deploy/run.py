@@ -49,7 +49,7 @@ def main():
         execute('python3', 'scripts/production-image.py', 'smoke', image)
         execute('docker', 'build', '-f', 'ci/deploy.Dockerfile', '-t', CLIENT, 'ci')
     else:
-        image = os.environ['IMAGE_URL']
+        image = output('python3', 'scripts/production-image.py', 'digest', os.environ['IMAGE_URL'])
     if not re.fullmatch(r'ghcr\.io/monoscope-tech/timefusion@sha256:[0-9a-f]{64}', image):
         parser.error('Deployment requires an immutable production image digest')
     values = {name: os.environ[name] for name in CREDENTIALS}
@@ -97,7 +97,8 @@ def main():
 
         previous = stage('record-boot')
         receipt = lease.record(RECEIPT_REF)
-        if receipt and receipt.get('image') == image and previous.get('boot_micros') and receipt.get('boot_micros') == previous['boot_micros']:
+        receipt_image = output('python3', 'scripts/production-image.py', 'digest', receipt['image']) if receipt else None
+        if receipt_image == image and previous.get('boot_micros') and receipt.get('boot_micros') == previous['boot_micros']:
             stage('soak')
             print('The tested image is already deployed on this boot; readiness soak passed.')
             return
