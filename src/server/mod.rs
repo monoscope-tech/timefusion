@@ -4,7 +4,7 @@ pub mod pg_compat;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use tokio_util::sync::CancellationToken;
@@ -76,7 +76,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
         let tcfg = Arc::new(cfg.tantivy.clone());
         let svc = Arc::new(crate::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone()));
-        layer = layer.with_tantivy_indexer(svc.clone().callback());
+        layer = layer.with_tantivy_indexer(tantivy_index_callback(&db, Arc::clone(&svc)));
         let search = Arc::new(crate::tantivy::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone(), tcfg));
         // Two halves of one process: let a publish seed the reader's cache and
         // invalidate its manifest instead of round-tripping through S3.
@@ -132,6 +132,29 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.spawn_deferred_tantivy_reindex(Arc::clone(&buffered_layer));
 
     Ok(Bootstrapped { db, buffered_layer, session_ctx: Arc::new(session_context), shutdown: CancellationToken::new() })
+}
+
+/// Builds sidecar indexes from committed Parquet files with physical row ordinals.
+/// The write layer invokes this callback after commit under its background semaphore.
+pub fn tantivy_index_callback(db: &Database, indexer: Arc<crate::tantivy::search::TantivyIndexService>) -> crate::write::TantivyIndexCallback {
+    let db = db.clone();
+    Arc::new(move |project_id, table_name, _, added_files| {
+        let db = db.clone();
+        let indexer = Arc::clone(&indexer);
+        Box::pin(async move {
+            if added_files.is_empty() || !indexer.config.is_table_indexed(&table_name) {
+                return Ok(());
+            }
+            let table = db.resolve_table(&project_id, &table_name).await?;
+            let store = table.read().await.log_store().object_store(None);
+            // One streamed build at a time per callback keeps multi-file commits bounded.
+            for uri in added_files {
+                let relative = crate::tantivy::search::parquet_rel_of_uri(&uri).context("committed file has no relative Parquet path")?;
+                indexer.build_index_for_file(&table_name, &project_id, relative, &uri, Arc::clone(&store)).await?;
+            }
+            Ok(())
+        })
+    })
 }
 
 /// Creates the per-bucket Delta writer shared by production and tests.

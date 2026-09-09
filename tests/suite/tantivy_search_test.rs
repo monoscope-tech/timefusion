@@ -232,7 +232,7 @@ async fn callback_builds_index_and_search_returns_hits() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
 
     // here are timestamp/id/level — the rest of the columns can be missing
     // because schema validation is on the Delta side, not tantivy.
@@ -268,7 +268,7 @@ async fn multi_pred_and_is_single_pass_and_conjunctive() {
     let project_id = "p-multipred";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
-    let cb = svc.callback();
+    let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "ERROR")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
 
@@ -291,7 +291,7 @@ async fn single_file_flush_publishes_partition_mirrored_blob() {
     let project_id = "p-mirrored";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
-    let cb = svc.callback();
+    let cb = svc.batch_callback();
     let uri = format!("s3://bucket/timefusion/default/{table_name}/project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
     let rel = format!("project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
     let b = batch(&[(1_000_000, "a", "ERROR")]);
@@ -316,7 +316,7 @@ async fn reader_cache_avoids_reopen_across_queries() {
     let project_id = "p-readercache";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
-    let cb = svc.callback();
+    let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "ERROR")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
 
@@ -349,7 +349,7 @@ async fn seeded_cache_serves_first_query_without_object_store_reads() {
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
 
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
     cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
     assert_eq!(search.stats.cache_seeded.load(Relaxed), 1, "publish must seed the reader's extracted-index cache");
     assert_eq!(search.stats.cache_seed_failures.load(Relaxed), 0);
@@ -375,7 +375,7 @@ async fn rebuilding_the_same_file_replaces_cached_terms_without_overwriting_old_
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().into(), cfg.clone()));
     let indexer = Arc::new(TantivyIndexService::new(store.clone(), cfg));
     indexer.with_reader(&search);
-    let callback = indexer.clone().callback();
+    let callback = indexer.clone().batch_callback();
     let uri = format!("s3://bucket/{table}/project_id={project}/date=2026-09-08/part-file.parquet");
     let mut previous_blob = None;
     for level in ["ERROR", "INFO"] {
@@ -423,7 +423,7 @@ async fn concurrent_install_of_same_index_is_idempotent() {
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
 
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
     cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
 
     // Publish again over the top: same key, same blob path, dir already present.
@@ -451,7 +451,7 @@ async fn publishing_keeps_the_manifest_cache_warm_and_current() {
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
 
     // First publish + query: populates the manifest cache.
     cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
@@ -488,7 +488,7 @@ async fn a_batched_manifest_commit_lands_every_deferred_entry() {
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
 
     // Three files, published normally, give us real blobs to point entries at.
     for (ts, id, uri) in [(1_000_000, "a", "f1"), (2_000_000, "b", "f2"), (3_000_000, "c", "f3")] {
@@ -533,7 +533,7 @@ async fn gc_after_compaction_drops_the_cached_manifest() {
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
 
     for (ts, id, uri) in [(1_000_000, "a", "f1"), (2_000_000, "b", "f2")] {
         cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
@@ -625,7 +625,7 @@ async fn callback_skips_when_table_not_indexed() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig::default();
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.callback();
+    let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "INFO")]);
     cb("p1".into(), "no_such_table".into(), vec![b], vec![]).await.expect("noop callback");
     let m = load_manifest(store.as_ref(), "no_such_table", "p1").await.unwrap();
@@ -671,7 +671,7 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
     cb(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "INFO")])], vec!["file_a".into()]).await.unwrap();
     cb(project_id.into(), table_name.into(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["file_b".into()]).await.unwrap();
     let m_before = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
@@ -708,7 +708,7 @@ async fn carry_forward_matches_relative_and_absolute_paths_alike() {
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
     // Covered under an ABSOLUTE uri, exactly as the flush/optimize paths record it.
     let abs = "s3://bucket/timefusion/default/otel_logs_and_spans/project_id=p-relpaths/date=2026-08-01/in.parquet";
-    svc.clone().callback()(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec![abs.into()]).await.unwrap();
+    svc.clone().batch_callback()(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec![abs.into()]).await.unwrap();
 
     // Removed given RELATIVE, as `StagedBin::target_paths` holds it.
     let rel = "project_id=p-relpaths/date=2026-08-01/in.parquet";
@@ -729,7 +729,7 @@ async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.clone().callback();
+    let cb = svc.clone().batch_callback();
     for (ts, id, uri) in [(1_000_000, "a", "in_a"), (2_000_000, "b", "in_b")] {
         cb(project_id.into(), table_name.into(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
     }
@@ -770,7 +770,7 @@ async fn gc_keeps_a_multi_file_entry_for_its_surviving_files() {
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
     // Two added files in ONE commit => one entry covering both.
-    svc.clone().callback()(
+    svc.clone().batch_callback()(
         project_id.into(),
         table_name.into(),
         vec![batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR")])],
@@ -804,7 +804,7 @@ async fn search_time_prunes_non_overlapping_indexes() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.callback();
+    let cb = svc.batch_callback();
 
     let old_ts = 1_000_000_000i64; // ~16:40 1970
     let new_ts = 2_000_000_000_000i64; // ~2033 — far from the old window
@@ -838,7 +838,7 @@ async fn search_skips_indexes_that_dont_have_the_field() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.callback();
+    let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "INFO")]);
     cb(project_id.into(), table_name.into(), vec![b], vec!["uri".into()]).await.unwrap();
 
@@ -862,7 +862,7 @@ async fn a_fat_needle_aborts_before_materializing_hits() {
     let project_id = "p-fatneedle";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(prod_defaults())));
-    let cb = svc.callback();
+    let cb = svc.batch_callback();
     let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
     let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
     cb(project_id.to_string(), table_name.to_string(), vec![batch(&rows_ref)], vec!["fat-uri".into()]).await.unwrap();

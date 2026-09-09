@@ -1268,8 +1268,9 @@ impl TantivyIndexService {
         Some(self.newest_indexed_micros.load(Ordering::Relaxed)).filter(|&v| v != i64::MIN)
     }
 
-    /// Build the callback to attach via `BufferedWriteLayer::with_tantivy_indexer`.
-    pub fn callback(self: Arc<Self>) -> TantivyIndexCallback {
+    /// Index supplied batches without claiming physical Parquet row order.
+    /// Server flushes use `server::tantivy_index_callback` to index committed files.
+    pub fn batch_callback(self: Arc<Self>) -> TantivyIndexCallback {
         Arc::new(move |project_id, table_name, batches, added_files| {
             let svc = self.clone();
             Box::pin(async move {
