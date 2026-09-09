@@ -309,6 +309,24 @@ impl CapturedHistogram {
                 memory_plan,
             ])?
         };
+        // Timestamp is part of the immutable key, so out-of-window rows
+        // cannot defeat an in-window version. Filter before retaining sort rows.
+        let (start, end) = self.window.bounds();
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if start > lo || end < hi {
+            use datafusion::{
+                common::ScalarValue,
+                logical_expr::Operator,
+                physical_expr::expressions::{Column, binary, lit},
+            };
+            let schema = input.schema();
+            let timestamp = Arc::new(Column::new_with_schema("timestamp", &schema)?);
+            let data_type = schema.field_with_name("timestamp")?.data_type();
+            let bound = |value, op| -> Result<_> { Ok(binary(timestamp.clone(), op, lit(ScalarValue::Int64(Some(value)).cast_to(data_type)?), &schema)?) };
+            let predicate = binary(bound(start, Operator::GtEq)?, Operator::And, bound(end, Operator::Lt)?, &schema)?;
+            Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(predicate, input)?)
+        } else {
+            input
+        };
         let masks = stream_winner_masks(input, source_rows, &self.keys, self.tiebreak.as_deref(), self.tombstone.as_deref(), self.context.clone()).await?;
         let mask_bytes = masks.iter().map(|mask| mask.inner().capacity()).try_fold(0_usize, usize::checked_add).context("histogram mask size overflow")?;
         let _mask_owner = self.cache.reserve(mask_bytes, self.context.memory_pool())?;
@@ -913,7 +931,12 @@ mod tests {
         let wide_window = HistogramWindow::new(wide_timestamp, wide_timestamp + 1, 1_000_000, 0, 2)?;
         let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
             Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(32 * 1024 * 1024));
-        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new().with_memory_pool(pool.clone()).build_arc()?;
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_memory_pool(pool.clone())
+            .with_disk_manager_builder(
+                datafusion::execution::disk_manager::DiskManagerBuilder::default().with_mode(datafusion::execution::disk_manager::DiskManagerMode::Disabled),
+            )
+            .build_arc()?;
         let wide_context = datafusion::prelude::SessionContext::new_with_config_rt(Default::default(), runtime).task_ctx();
         let wide = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context.clone()).await?;
         let Err(error) = wide.count().await else { anyhow::bail!("wide hashes must exceed the old decoded budget") };
@@ -922,12 +945,27 @@ mod tests {
         assert_eq!(result.counts.values().sum::<u64>(), 64);
         assert_eq!(result.scanned_sources, 0, "wide hashes stay in the index during version resolution");
         db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![wide_row(1, "b")])?], true, None).await?;
-        let partial = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context).await?;
+        let partial = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context.clone()).await?;
         let result = partial.count_streaming().await?;
         assert_eq!(result.counts.values().sum::<u64>(), 63, "an unindexed replacement must suppress its indexed old version");
         assert_eq!(result.scanned_sources, 1);
         assert_eq!(wide.count_streaming().await?.counts.values().sum::<u64>(), 64, "later writes cannot replace captured sources");
         assert_eq!(pool.reserved(), 0, "streaming query reservations must release after counting");
+        // Irrelevant keys in the same day must not consume the query's sort
+        // budget. Keep a partial index and the same one-microsecond window.
+        let outside_timestamp = wide_timestamp.div_euclid(DAY_MICROS) * DAY_MICROS + (wide_timestamp.rem_euclid(DAY_MICROS) + 1) % DAY_MICROS;
+        let records = (0..20_000)
+            .map(|id| {
+                let mut record = wide_row(id, "outside");
+                record["id"] = serde_json::json!(format!("outside-{id}-{}", "x".repeat(2048)));
+                record["timestamp"] = serde_json::json!(outside_timestamp);
+                record
+            })
+            .collect();
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, records)?], true, None).await?;
+        let narrow = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context).await?;
+        assert_eq!(narrow.count_streaming().await?.counts.values().sum::<u64>(), 63, "out-of-window keys must not force a daily sort or spill");
+        assert_eq!(pool.reserved(), 0);
         // Removing the superseded physical row makes the partition unique.
         // The same Parquet paths now have a different DV identity.
         let mut table_guard = table_ref.write().await;
