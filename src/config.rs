@@ -11,6 +11,11 @@ fn read_parsed<T>(path: &str, parse: impl FnOnce(&str) -> Option<T>) -> Option<T
     std::fs::read_to_string(path).ok().and_then(|s| parse(&s))
 }
 
+/// `None` for unset or unparseable — every env knob here treats both the same.
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
 fn parse_cgroup_v2_memory_max(content: &str) -> Option<usize> {
     content.trim().parse().ok()
 }
@@ -76,7 +81,7 @@ fn detect_memory_limit_bytes() -> usize {
 /// exists (see `detect_memory_limit_bytes`) — a containerized deployment can
 /// never be resized by env var.
 fn env_memory_override_bytes() -> Option<usize> {
-    std::env::var("TIMEFUSION_MEMORY_LIMIT_GB").ok()?.parse::<usize>().ok().filter(|gb| *gb > 0).map(|gb| gb * GIB)
+    env_parse::<usize>("TIMEFUSION_MEMORY_LIMIT_GB").filter(|gb| *gb > 0).map(|gb| gb * GIB)
 }
 
 /// `TIMEFUSION_MEMORY_BUDGET_GB`: sizes the whole tree BELOW the cgroup limit.
@@ -92,7 +97,7 @@ fn env_memory_override_bytes() -> Option<usize> {
 /// Only ever LOWERS the effective limit — an over-large value is clamped,
 /// never honoured.
 fn env_memory_budget_bytes() -> Option<usize> {
-    std::env::var("TIMEFUSION_MEMORY_BUDGET_GB").ok()?.parse::<f64>().ok().filter(|gb| *gb > 0.0).map(|gb| (gb * GIB as f64) as usize)
+    env_parse::<f64>("TIMEFUSION_MEMORY_BUDGET_GB").filter(|gb| *gb > 0.0).map(|gb| (gb * GIB as f64) as usize)
 }
 
 fn detect_memory_limit_clamped() -> usize {
@@ -146,7 +151,7 @@ pub enum BudgetProfile {
 
 /// Anything unrecognised (including unset) is the server profile.
 fn profile_from_env() -> BudgetProfile {
-    std::env::var("TIMEFUSION_BUDGET_PROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or_default()
+    env_parse("TIMEFUSION_BUDGET_PROFILE").unwrap_or_default()
 }
 
 // 0.20, down from 0.25: sampled pool usage sat at 0 while the 70% memory
@@ -258,14 +263,6 @@ const REPAIR_REWRITE_TARGET_FILES: usize = 2;
 /// 1.79 is the passing point, not a midpoint guess — the cliff is between these
 /// two rungs and this takes the safe side of it.
 const SAFE_DECODED_PER_POOL_BYTE: f64 = 1.79;
-/// Heavy maintenance's minimum share of the maintenance pool. 0.40, up from
-/// 0.25 — a REBALANCE inside the existing pool (total unchanged), following
-/// the workload: hot-tail packing (light share) converged once unstarved,
-/// while the dedup queue kept growing, so heavy is where the backlog lives.
-/// 0.40 specifically because `light_optimize_k` divides light's share by
-/// `PER_SORT_BUDGET_BYTES`; going lower still yields the same K for packing
-/// while buying heavy little, since heavy's concurrency is bounded by
-/// rewrite permits, not bytes.
 /// Heavy maintenance's slice of the whole maintenance pool. 0.30 is what the
 /// old `0.40 of the residual` came to before the coordinator's share grew; see
 /// `heavy_share_bytes` for why it is no longer expressed against the residual.
@@ -325,47 +322,30 @@ impl DerivedBudget {
     }
 
     fn from_limits_with_profile(memory_limit_bytes: usize, cores: usize, profile: BudgetProfile) -> Self {
-        if profile == BudgetProfile::MaintenanceCli {
-            // No queries/ingest: token slices for query pool and foyer, the
-            // full writer-reserve cap (delta-rs output buffers are real in a
-            // CLI), rest to maintenance. An 8 GiB pod derives ~6 GiB of
-            // sort/spill instead of the 1 GiB floor.
-            let query_pool_bytes = (memory_limit_bytes as f64 * 0.08) as usize;
-            let ingest_buffer_bytes = (memory_limit_bytes as f64 * 0.02) as usize;
-            let foyer_memory_bytes = (memory_limit_bytes as f64 * 0.02) as usize;
-            let writer_reserve_bytes = (HEAVY_REWRITE_PERMITS * OPTIMIZE_MERGE_TASKS * WRITER_RESERVE_PER_TASK_BYTES).min(memory_limit_bytes / 10);
-            let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes;
-            let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
-            return Self {
-                memory_limit_bytes,
-                cores,
-                query_pool_bytes,
-                ingest_buffer_bytes,
-                foyer_memory_bytes,
-                writer_reserve_bytes,
-                maintenance_pool_bytes,
-                profile,
-            };
-        }
-        // Fixed fraction, not the old TIMEFUSION_MEMORY_FRACTION knob: that
-        // 0.75 was calibrated against a hand-set limit and, applied to the
-        // real cgroup, would crush maintenance to K=1 — the drift-class bug
-        // this tree exists to kill. 0.20 of the real limit is ~1.25x the old
-        // effective pool.
-        let query_pool_bytes = (memory_limit_bytes as f64 * QUERY_POOL_FRACTION) as usize;
-        let ingest_buffer_bytes = (memory_limit_bytes as f64 * INGEST_BUFFER_FRACTION) as usize;
-        let foyer_memory_bytes = (memory_limit_bytes as f64 * FOYER_MEMORY_FRACTION) as usize;
+        let share = |fraction: f64| (memory_limit_bytes as f64 * fraction) as usize;
+        // Server fractions are fixed, not the old TIMEFUSION_MEMORY_FRACTION
+        // knob: that 0.75 was calibrated against a hand-set limit and, applied
+        // to the real cgroup, would crush maintenance to K=1 — the drift-class
+        // bug this tree exists to kill. 0.20 of the real limit is ~1.25x the
+        // old effective pool. The last term is UNTRACKED-CONSUMER SLACK, carved
+        // out BEFORE maintenance takes the remainder: without it the tree hands
+        // maintenance everything left and consumers no pool tracks (parquet
+        // decode, giant-INSERT parse ASTs, allocator overhead) push the box over
+        // the cgroup limit — every subsystem behaved "legally", the sum was the
+        // bug. 15% covers the measured untracked peak; the resulting maintenance
+        // shrink was proven harmless (512MB bins sort+spill fine on smaller pools).
+        //
+        // MaintenanceCli has no queries/ingest: token slices for query pool and
+        // foyer, no slack, rest to maintenance — an 8 GiB pod derives ~6 GiB of
+        // sort/spill instead of the 1 GiB floor.
+        let (query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, untracked_slack_bytes) = match profile {
+            BudgetProfile::MaintenanceCli => (share(0.08), share(0.02), share(0.02), 0),
+            BudgetProfile::Server => (share(QUERY_POOL_FRACTION), share(INGEST_BUFFER_FRACTION), share(FOYER_MEMORY_FRACTION), share(UNTRACKED_SLACK_FRACTION)),
+        };
         // Capped at 10% of the limit: the full 6 GiB reserve on an 8 GiB dev
         // box budgeted 142% of the container — the drift class this tree kills.
+        // (delta-rs output buffers are real in a CLI too, so the cap is shared.)
         let writer_reserve_bytes = (HEAVY_REWRITE_PERMITS * OPTIMIZE_MERGE_TASKS * WRITER_RESERVE_PER_TASK_BYTES).min(memory_limit_bytes / 10);
-        // UNTRACKED-CONSUMER SLACK, carved out BEFORE maintenance takes the
-        // remainder. Without it the tree hands maintenance everything left,
-        // and consumers no pool tracks (parquet decode, giant-INSERT parse
-        // ASTs, allocator overhead) push the box over the cgroup limit —
-        // every subsystem behaved "legally", the sum was the bug. 15% covers
-        // the measured untracked peak; the resulting maintenance shrink was
-        // proven harmless (512MB bins sort+spill fine on smaller pools).
-        let untracked_slack_bytes = (memory_limit_bytes as f64 * UNTRACKED_SLACK_FRACTION) as usize;
         let reserved = query_pool_bytes + ingest_buffer_bytes + foyer_memory_bytes + writer_reserve_bytes + untracked_slack_bytes;
         let maintenance_pool_bytes = memory_limit_bytes.saturating_sub(reserved).max(MAINTENANCE_FLOOR_BYTES);
         Self { memory_limit_bytes, cores, query_pool_bytes, ingest_buffer_bytes, foyer_memory_bytes, writer_reserve_bytes, maintenance_pool_bytes, profile }
@@ -644,7 +624,7 @@ impl DerivedBudget {
     /// `TIMEFUSION_COORDINATOR_JOB_WORKERS=1` restores the old serialized
     /// behavior.
     pub fn coordinator_jobs(&self) -> usize {
-        std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or_else(|| {
+        env_parse::<usize>("TIMEFUSION_COORDINATOR_JOB_WORKERS").filter(|n| *n > 0).unwrap_or_else(|| {
             let mem_bound = self.maintenance_pool_bytes / (512 * 1024 * 1024);
             // cores/3 (cap 16): jobs are only useful up to the inner
             // rewrite/sort permit pool (HEAVY_REWRITE_PERMITS) — going wider
@@ -715,35 +695,35 @@ impl DerivedBudget {
         const BASELINE_FILES: f64 = 200.0;
         (BASELINE_FILES * (self.ingest_buffer_bytes as f64 / BASELINE_BUFFER_BYTES as f64)).round().max(BASELINE_FILES) as usize
     }
-}
 
-/// Startup log of the whole derived tree so a misread cgroup limit is
-/// immediately visible (doc §4 hard requirement). `hot_project_count` uses
-/// prod's current 11 as the illustrative K.
-pub fn log_derived_budget(b: &DerivedBudget) {
-    tracing::info!(
-        profile = ?b.profile,
-        detected_limit_gb = detect_memory_limit_clamped() / GIB,
-        effective_limit_gb = b.memory_limit_bytes / GIB,
-        cores = b.cores,
-        query_pool_gb = b.query_pool_bytes() / GIB,
-        ingest_buffer_gb = b.buffer_max_bytes() / GIB,
-        cache_memory_gb = b.foyer_memory_bytes() / GIB,
-        foyer_memory_gb = b.object_cache_memory_bytes() / GIB,
-        logical_count_memory_gb = b.logical_count_memory_bytes() / GIB,
-        writer_reserve_gb = b.writer_reserve_bytes() / GIB,
-        maintenance_pool_gb = b.maintenance_pool_bytes() / GIB,
-        coordinator_share_gb = b.coordinator_share_bytes() / GIB,
-        heavy_share_gb = b.heavy_share_bytes() / GIB,
-        light_share_gb = b.light_share_bytes() / GIB,
-        rewrite_permits = b.rewrite_permits(),
-        optimize_merge_tasks = b.optimize_merge_tasks(),
-        light_optimize_k_at_11_hot_projects = b.light_optimize_k(11),
-        memory_brake_limit_gb = b.memory_brake_limit_bytes() / GIB,
-        wal_flush_byte_threshold_gb = b.wal_flush_byte_threshold() / GIB as u64,
-        wal_flush_file_threshold = b.wal_flush_file_threshold(),
-        "self-sizing budget tree derived at startup"
-    );
+    /// Startup log of the whole derived tree so a misread cgroup limit is
+    /// immediately visible (doc §4 hard requirement). `hot_project_count` uses
+    /// prod's current 11 as the illustrative K.
+    pub fn log(&self) {
+        tracing::info!(
+            profile = ?self.profile,
+            detected_limit_gb = detect_memory_limit_clamped() / GIB,
+            effective_limit_gb = self.memory_limit_bytes / GIB,
+            cores = self.cores,
+            query_pool_gb = self.query_pool_bytes() / GIB,
+            ingest_buffer_gb = self.buffer_max_bytes() / GIB,
+            cache_memory_gb = self.foyer_memory_bytes() / GIB,
+            foyer_memory_gb = self.object_cache_memory_bytes() / GIB,
+            logical_count_memory_gb = self.logical_count_memory_bytes() / GIB,
+            writer_reserve_gb = self.writer_reserve_bytes() / GIB,
+            maintenance_pool_gb = self.maintenance_pool_bytes() / GIB,
+            coordinator_share_gb = self.coordinator_share_bytes() / GIB,
+            heavy_share_gb = self.heavy_share_bytes() / GIB,
+            light_share_gb = self.light_share_bytes() / GIB,
+            rewrite_permits = self.rewrite_permits(),
+            optimize_merge_tasks = self.optimize_merge_tasks(),
+            light_optimize_k_at_11_hot_projects = self.light_optimize_k(11),
+            memory_brake_limit_gb = self.memory_brake_limit_bytes() / GIB,
+            wal_flush_byte_threshold_gb = self.wal_flush_byte_threshold() / GIB as u64,
+            wal_flush_file_threshold = self.wal_flush_file_threshold(),
+            "self-sizing budget tree derived at startup"
+        );
+    }
 }
 
 /// Load config from environment variables.
@@ -769,9 +749,9 @@ pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(cfg);
     }
-    // `&mut` is autotune's API (cross-module), so the mutation stays here.
+    // `&mut` is autotune's API, so the mutation stays here.
     let mut cfg = load_config_from_env()?;
-    crate::config::apply(&mut cfg);
+    apply(&mut cfg);
     let _ = CONFIG.set(cfg);
     Ok(config())
 }
@@ -796,8 +776,8 @@ pub fn set_config_for_test(cfg: AppConfig) {
 }
 
 /// Whether the operator has opted into open auth for local dev via
-/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`.
-/// paths gate their fail-secure defaults on this flag.
+/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Auth paths gate their fail-secure
+/// defaults on this flag.
 pub fn is_insecure_auth_allowed() -> bool {
     std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").is_ok_and(|v| v.eq_ignore_ascii_case("true"))
 }
@@ -1132,7 +1112,7 @@ impl TantivyConfig {
     }
     /// Floored at 1: a zero-capacity LRU would make every open a cold open.
     pub fn reader_cache_entries(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.timefusion_tantivy_reader_cache_entries.max(1)).expect("max(1) is non-zero")
+        NonZeroUsize::new(self.timefusion_tantivy_reader_cache_entries).unwrap_or(NonZeroUsize::MIN)
     }
     /// Floored at 1: zero concurrency would deadlock the per-index fan-out.
     pub fn search_concurrency(&self) -> usize {
@@ -1504,11 +1484,6 @@ pub struct BufferConfig {
     /// a writer that committed after the last snapshot was written.
     #[serde_inline_default(8)]
     pub timefusion_delta_scan_depth: usize,
-    /// Decline a flush whose batch set is provably already committed (the
-    /// duplicates WAL replay manufactures after an unclean exit — see
-    /// `docs/plans/2026-09-02-stop-manufacturing-duplicates.md`). Off until
-    /// staging proves it: the skip only fires after an unclean restart, which
-    /// cannot be induced on the read-only prod host.
     /// Reject a compaction candidate that would push the merged output's UNION
     /// SPAN past this many dedup bins. **0 disables it, which is the default.**
     ///
@@ -3071,16 +3046,6 @@ pub struct MemoryConfig {
     /// this makes the window usable while that happens.
     #[serde_inline_default(1024)]
     pub timefusion_read_sort_unordered_leg_max_mb: u64,
-    /// Selected bytes above which a single scan is REFUSED outright, rather than admitted
-    /// into the gate above. **0 disables it, and 0 is the default.**
-    ///
-    /// The gate bounds how many wide scans decode concurrently; it has never bounded how
-    /// much any one of them decodes, and `wide_scan_oversize_total` was pure observation.
-    /// That gap is a distinct failure mode from a slow query: on 2026-08-18 one scan
-    /// selected 514 files / 32.8 GB and, while it ran, NEW CONNECTIONS TIMED OUT — the box
-    /// became unreachable, so every other tenant paid for one query. Refusing it instead
-    /// costs one client an error naming the limit and what to do about it.
-    ///
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
     /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
     /// set with room to spare. Each entry is one LogicalPlan (~KBs).
@@ -3680,9 +3645,6 @@ mod tests {
 use sysinfo::Disks;
 use tracing::{info, warn};
 
-const MB: usize = 1024 * 1024;
-const GB: usize = 1024 * MB;
-
 const RAM_FRACTION_FOYER_META: f64 = 0.02;
 const DISK_FRACTION_FOYER: f64 = 0.40;
 const DISK_FRACTION_FOYER_META: f64 = 0.02;
@@ -3717,9 +3679,9 @@ pub fn apply(config: &mut AppConfig) {
     // ONE memory source: the derived budget tree's cgroup-clamped detection. A
     // second (sysinfo) reading here once let the oversubscription audit warn
     // against a different denominator than the budgets were derived from.
-    let total_ram_mb = config.derived.memory_limit_bytes() / MB;
+    let total_ram_mb = config.derived.memory_limit_bytes() / MIB;
 
-    let cpus = crate::config::detect_cores();
+    let cpus = detect_cores();
 
     // Probe free space on the data dir's mount point. Falls back to "unknown"
     // (no disk-derived overrides) if the mount can't be located.
@@ -3750,13 +3712,13 @@ pub fn apply(config: &mut AppConfig) {
     tune(
         "TIMEFUSION_BUFFER_MAX_MEMORY_MB",
         &mut config.buffer.timefusion_buffer_max_memory_mb,
-        (config.derived.buffer_max_bytes() / MB).max(MIN_BUFFER_MB),
+        (config.derived.buffer_max_bytes() / MIB).max(MIN_BUFFER_MB),
         "MB",
     );
     tune(
         "TIMEFUSION_FOYER_MEMORY_MB",
         &mut config.cache.timefusion_foyer_memory_mb,
-        (config.derived.object_cache_memory_bytes() / MB).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB),
+        (config.derived.object_cache_memory_bytes() / MIB).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB),
         "MB",
     );
     tune(
@@ -3830,8 +3792,8 @@ pub fn apply(config: &mut AppConfig) {
     // so take the overage back from the residual claimant that absorbed it.
     let mut audit = budget_audit(config, total_ram_mb);
     if audit.oversubscribed() {
-        let overage = audit.committed_mb.saturating_sub(audit.warn_at_mb) * MB;
-        let reclaimed = config.derived.reclaim_maintenance_pool(overage) / MB;
+        let overage = audit.committed_mb.saturating_sub(audit.warn_at_mb) * MIB;
+        let reclaimed = config.derived.reclaim_maintenance_pool(overage) / MIB;
         audit = budget_audit(config, total_ram_mb);
         warn!(
             "bootstrap.phase=budget_reclaim reclaimed_mb={reclaimed} from the maintenance pool              (it is the residual claimant, so it is what absorbed the unreserved MemBuffer overshoot,              tantivy peak and metadata cache) — maintenance_pool now {}mb, committed {}mb vs warn_at {}mb",
@@ -3908,17 +3870,17 @@ pub fn boot_budget_audit() -> Option<&'static BudgetAudit> {
 /// The light-optimize slice is deliberately NOT added: it is carved *out of*
 /// `maintenance_pool_bytes()`, so counting it again would double-count.
 pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
-    let foyer_mb = if config.cache.is_disabled() { 0 } else { (config.cache.memory_size_bytes() + config.cache.metadata_memory_size_bytes()) / MB };
+    let foyer_mb = if config.cache.is_disabled() { 0 } else { (config.cache.memory_size_bytes() + config.cache.metadata_memory_size_bytes()) / MIB };
     // Peak tantivy writer heap: one writer per in-flight flush.
     let tantivy_peak_mb =
-        if config.tantivy.indexed_tables().is_empty() { 0 } else { crate::tantivy::WRITER_HEAP_BYTES * config.buffer.flush_parallelism() / MB };
+        if config.tantivy.indexed_tables().is_empty() { 0 } else { crate::tantivy::WRITER_HEAP_BYTES * config.buffer.flush_parallelism() / MIB };
     // Mirror `BufferedWriteLayer::max_memory_bytes`: the configured knob is
     // reduced by foyer + tantivy (which are counted separately below, so using
     // the raw knob here would double-count them), then admission runs to a 120%
     // hard ceiling (HARD_LIMIT_HEADROOM_DIVISOR).
     let mem_buffer_hard_mb = config.buffer.max_memory_mb().saturating_sub(foyer_mb + tantivy_peak_mb).max(64) * 6 / 5;
-    let query_pool_mb = config.derived.query_pool_bytes() / MB;
-    let maintenance_pool_mb = config.derived.maintenance_pool_bytes() / MB;
+    let query_pool_mb = config.derived.query_pool_bytes() / MIB;
+    let maintenance_pool_mb = config.derived.maintenance_pool_bytes() / MIB;
     let df_metadata_cache_mb = config.cache.timefusion_df_metadata_cache_mb;
     BudgetAudit {
         query_pool_mb,
@@ -3942,7 +3904,7 @@ fn available_disk_for(path: &std::path::Path) -> Option<usize> {
         .iter()
         .filter(|d| canonical.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| (d.available_space() / GB as u64) as usize)
+        .map(|d| (d.available_space() / GIB as u64) as usize)
 }
 
 #[cfg(test)]
@@ -3977,8 +3939,8 @@ mod autotune_tests {
 
         // The container limit, not the 188GB host: this is what the kernel kills on.
         let a = budget_audit(&cfg, 24 * 1024);
-        assert_eq!(a.query_pool_mb, cfg.derived.query_pool_bytes() / MB);
-        assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / MB, "was missing entirely");
+        assert_eq!(a.query_pool_mb, cfg.derived.query_pool_bytes() / MIB);
+        assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / MIB, "was missing entirely");
         assert_eq!(a.foyer_mb, 4560);
         // MemBuffer's ceiling is on its EFFECTIVE budget (knob − foyer −
         // tantivy peak), then x1.2 — not the raw knob, which would count foyer
@@ -4008,7 +3970,7 @@ mod autotune_tests {
         assert!(before.oversubscribed(), "fixture must start oversubscribed: {before:?}");
 
         let overage = before.committed_mb.saturating_sub(before.warn_at_mb);
-        let reclaimed = cfg.derived.reclaim_maintenance_pool(overage * MB) / MB;
+        let reclaimed = cfg.derived.reclaim_maintenance_pool(overage * MIB) / MIB;
         let after = budget_audit(&cfg, ram_mb);
 
         assert!(reclaimed > 0, "something must actually be surrendered");
@@ -4022,7 +3984,7 @@ mod autotune_tests {
         // negative — a 1 GB maintenance pool still sorts and spills.
         let floored = cfg.derived.reclaim_maintenance_pool(usize::MAX);
         assert!(cfg.derived.maintenance_pool_bytes() >= 1024 * 1024 * 1024, "must not reclaim below the floor");
-        assert!(floored <= after.maintenance_pool_mb * MB);
+        assert!(floored <= after.maintenance_pool_mb * MIB);
     }
 
     #[test]
