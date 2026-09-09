@@ -720,7 +720,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
     // up to 12 full scans per wake event). One side effect is lost: the
     // skipped calls would have bumped `claim_tick`, so the sealed-reservation
     // parity shifts slightly — reservation SHARE over time is unchanged.
-    let mut none_until = [0i64; 6];
+    let mut none_until = [0i64; <Operation as strum::EnumCount>::COUNT];
     // Evaluated before any claim, so the initial cycle matches the journal's
     // seeded coverage.
     let mut coverage_short = coverage.coverage_is_short(now);

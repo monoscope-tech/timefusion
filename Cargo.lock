@@ -8403,6 +8403,7 @@ dependencies = [
  "foyer",
  "fs4 0.13.1",
  "futures",
+ "hex",
  "include_dir",
  "insta",
  "instrumented-object-store",

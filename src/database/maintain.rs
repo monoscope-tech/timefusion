@@ -3257,7 +3257,7 @@ impl Database {
             }
         }
 
-        let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
         let mut journal = self.journal();
         if journal.state(&key) == Some(TaskState::Running) {
             self.rollup_slice_coverage.insert(
@@ -3879,7 +3879,7 @@ impl Database {
         // recent-slice, dependency, and project fairness.
         let cycle = crate::maintenance_coordinator::operation_cycle(coverage_is_short());
         let start = self.maintenance_schedule_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cycle.len();
-        let mut attempted = [false; 6];
+        let mut attempted = [false; <crate::maintenance_coordinator::Operation as strum::EnumCount>::COUNT];
         for offset in 0..cycle.len() {
             let operation = cycle[(start + offset) % cycle.len()];
             let index = operation as usize;
@@ -3943,14 +3943,7 @@ impl Database {
             // through three rewrite paths. It is also the ONE spelling of the
             // operation's name: the work counters below read it rather than
             // re-deriving it via `{operation:?}`, so the two cannot drift.
-            let label: &'static str = match operation {
-                Operation::Dedup => "Dedup",
-                Operation::BaseRollup => "BaseRollup",
-                Operation::DerivedRollup => "DerivedRollup",
-                Operation::HotPacking => "HotPacking",
-                Operation::SealedConsolidation => "SealedConsolidation",
-                Operation::Repair => "Repair",
-            };
+            let label: &'static str = operation.into();
             let work = UNIT_OPERATION.scope(label, async {
                 match operation {
                     Operation::Dedup => self.run_coordinator_dedup_once().await,
@@ -4023,7 +4016,7 @@ impl Database {
     }
 
     pub(crate) fn invalidate_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
-        let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         // The mutation tells us exactly which hours became dirty. Expanding a
         // project's first observed hour to the full day creates 456 durable
@@ -4090,7 +4083,7 @@ impl Database {
         if get_schema(source).is_none_or(|schema| schema.rollups.is_empty()) {
             return Ok(());
         }
-        let _journal_guard = self.rollup_journal_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
         let keys: Vec<_> =
             self.rollup_source_epochs.iter().filter(|entry| entry.key().0 == project_id && entry.key().1 == source).map(|entry| entry.key().clone()).collect();
         for key in &keys {
@@ -5197,7 +5190,7 @@ impl Database {
                 masked.map(|_| Self::partition_dv_state(&table, project_id, &format!("date={date}"))).transpose()?,
             )
         };
-        let fp = partition_file_fp(post.clone());
+        let fp = partition_file_fp(&post);
         // DV-visibility guard, masked arm only: the URI fp cannot see a foreign
         // same-path DV commit (DML DELETE/UPDATE write DVs too), so compare the
         // live (path, dv_unique_id) set instead — fail-closed, like fp_moved.
@@ -5205,7 +5198,7 @@ impl Database {
         if dv_moved {
             metrics::counter!(scan_metric_names::CERT_SLICE_DV_MOVED).increment(1);
         }
-        if slice_pass_dirty(dropped, masked.is_some(), post.is_empty(), partition_file_fp(pre.to_vec()) != fp, dv_moved) {
+        if slice_pass_dirty(dropped, masked.is_some(), post.is_empty(), partition_file_fp(pre) != fp, dv_moved) {
             metrics::counter!(scan_metric_names::CERT_SLICE_DIRTY).increment(1);
             if self.dedup_slice_coverage.remove(&key).is_some() {
                 self.persist_slice_coverage();
@@ -5353,8 +5346,8 @@ impl Database {
             let table = table_ref.read().await;
             Self::partition_files_by_pid(&table, &format!("date={date}"))?.remove(project_id).unwrap_or_default()
         };
-        let fp_post = partition_file_fp(post.clone());
-        if dropped == 0 && complete && !post.is_empty() && partition_file_fp(pre.to_vec()) == fp_post {
+        let fp_post = partition_file_fp(&post);
+        if dropped == 0 && complete && !post.is_empty() && partition_file_fp(pre) == fp_post {
             // Re-certifying at the SAME fingerprint continues the existing
             // certification rather than starting a new one: the sweep re-proved a
             // partition nothing had touched. Keeping the original `since` is what
@@ -5486,7 +5479,7 @@ impl Database {
                 // `!cert.stale` is required, not decorative: a slice-derived
                 // certification proves one time window, never the day, and its
                 // fingerprint can still match the live partition.
-                Some(cert) if !cert.stale && cert.fp == partition_file_fp(files) => {
+                Some(cert) if !cert.stale && cert.fp == partition_file_fp(&files) => {
                     certified_any = true;
                     certified_dates.insert(date.to_string());
                     continue;
@@ -5832,7 +5825,7 @@ impl Database {
             // under continuous ingest; this per-partition check does (sealed
             // lookback days, and today between flushes).
             let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
-            let current_fp = partition_file_fp(cur_files.clone());
+            let current_fp = partition_file_fp(cur_files);
             if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|entry| entry.value().fp) == Some(current_fp) {
                 continue;
             }
@@ -5942,7 +5935,7 @@ impl Database {
         if !self.config.maintenance.timefusion_dedup_certification_persist {
             return;
         }
-        let _persist = self.dedup_certification_persist_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _persist = crate::support::lock(&self.dedup_certification_persist_lock);
         let mut entries: Vec<_> = self
             .dedup_slice_coverage
             .iter()
@@ -5972,7 +5965,7 @@ impl Database {
         if !self.config.maintenance.timefusion_dedup_certification_persist {
             return;
         }
-        let _persist = self.dedup_certification_persist_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _persist = crate::support::lock(&self.dedup_certification_persist_lock);
         let now_ms = crate::storage::now_unix_ms();
         let mut entries: Vec<_> = self
             .dedup_clean_fp
@@ -6421,7 +6414,7 @@ impl Database {
                 // clean without a commit, and a commit moves the fingerprint.
                 // Re-probing it is pure waste, and at 64 probes a pass it would be
                 // most of the budget.
-                let (file_count, fp) = (files.len(), partition_file_fp(files));
+                let (file_count, fp) = (files.len(), partition_file_fp(&files));
                 let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| *entry.value() == fp);
                 if uncertified && !known_dirty {
                     let entry = by_project.entry(project).or_insert_with(|| (0usize, Vec::new()));
@@ -6628,7 +6621,7 @@ impl Database {
                         // commit moves the fingerprint, so re-probing it before then
                         // is pure waste — at 64 probes a pass it would crowd out
                         // every candidate that has never been examined.
-                        self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), partition_file_fp(pre.clone()));
+                        self.dedup_probe_declined.insert((project.clone(), table_name.to_string(), date.clone()), partition_file_fp(&pre));
                         metrics::counter!(scan_metric_names::CERT_PROBE_DECLINED).increment(1);
                         // HOW dirty, not just that it is dirty — this decides the
                         // removal mechanism and cannot be measured from outside,
@@ -8313,7 +8306,7 @@ impl Database {
     /// a write failure costs re-probing, never correctness.
     pub(crate) fn persist_verified_sorted(&self, paths: &[String]) {
         use std::io::Write;
-        let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::support::lock(&self.repair_verified_lock);
         let file_path = self.repair_verified_path();
         let write = crate::support::without_blocking_the_worker(|| -> std::io::Result<()> {
             if let Some(dir) = file_path.parent() {
@@ -8378,7 +8371,7 @@ impl Database {
     /// it has grown past [`REPAIR_VERIFIED_PERSIST_CAP`]. Newest entries win: the
     /// tail of the file is the most recently probed.
     pub fn load_verified_sorted(&self) {
-        let _guard = self.repair_verified_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::support::lock(&self.repair_verified_lock);
         let (kept, dropped) = self.truncate_verified_file_locked();
         for path in &kept {
             self.repair_verified_sorted.insert(path.clone());
@@ -8398,7 +8391,7 @@ impl Database {
         // entry indistinguishable from a pre-upgrade one and lose its resume to
         // the legacy age gate forever (see `resume_guarded`).
         let entry = StagedIntent { instance: Some(crate::observability::instance_id().to_owned()), ..entry };
-        let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
         let path = self.staged_intent_path();
         let write = crate::support::without_blocking_the_worker(|| -> std::io::Result<()> {
             if let Some(dir) = path.parent() {
@@ -8416,7 +8409,7 @@ impl Database {
     /// after the wave commits or after its staged parquet is cleaned up, i.e.
     /// once the entry can no longer describe an orphan.
     fn clear_staged_intent(&self, wave_ids: &[&str]) {
-        let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
         let path = self.staged_intent_path();
         // Read the whole manifest, re-encode every surviving entry, rewrite it —
         // once per committed wave, from an async maintenance task.
@@ -8465,7 +8458,7 @@ impl Database {
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
         let contents = {
-            let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
             let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else {
                 stats.rollup_resume_no_intent.fetch_add(1, Relaxed);
                 return Ok(false);
@@ -8598,7 +8591,7 @@ impl Database {
             return None;
         }
         let contents = {
-            let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
             std::fs::read_to_string(self.staged_intent_path()).ok()?
         };
         let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
@@ -8712,7 +8705,7 @@ impl Database {
         use object_store::ObjectStoreExt;
         let path = self.staged_intent_path();
         let contents = {
-            let _manifest_guard = self.staged_intent_manifest_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
             let Ok(contents) = std::fs::read_to_string(&path) else { return };
             contents
         };

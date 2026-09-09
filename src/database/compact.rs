@@ -451,11 +451,11 @@ impl Database {
             .collect())
     }
 
-    /// `[min, max]` event time (micros) of a file from its raw Add stats JSON.
+    /// `[min, max]` event time (micros) of a file from its parsed Add stats.
     /// Timestamp stats serialize as RFC3339 strings (epoch numbers accepted for
-    /// long-typed columns).
-    pub(crate) fn event_time_range_from_stats(stats: &str) -> Option<(i64, i64)> {
-        let stats: serde_json::Value = serde_json::from_str(stats).ok()?;
+    /// long-typed columns). Takes the parsed `Value` so a caller that also wants
+    /// `numRecords` out of the same blob parses it exactly once.
+    pub(crate) fn event_time_range_from_stats(stats: &serde_json::Value) -> Option<(i64, i64)> {
         let get = |key: &str| {
             let v = &stats[key]["timestamp"];
             v.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_micros()).or_else(|| v.as_i64())

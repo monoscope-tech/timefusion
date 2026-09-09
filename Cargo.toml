@@ -21,6 +21,7 @@ uuid = { version = "1.17", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_arrow = { version = "0.14", features = ["arrow-58"] }
 serde_json = "1.0.141"
+hex = "0.4"
 serde_with = "3.14"
 serde_yaml = "0.9"
 async-trait = "0.1.86"
@@ -104,7 +105,7 @@ bincode = { version = "2.0", features = ["serde"] }
 walrus-rust = { path = "vendor/walrus-rust" }
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
-derive_more = { version = "2", features = ["debug", "display"] }
+derive_more = { version = "2", features = ["debug", "display", "deref", "deref_mut"] }
 # Official datafusion-contrib/datafusion-variant — supports DataFusion 54 / arrow
 # 58.3 as of #62. We carry no local changes, so use upstream directly (pinned).
 datafusion-variant = { git = "https://github.com/datafusion-contrib/datafusion-variant.git", rev = "9e1c84698150eaef7b640f50f907dd8e585174f5" }
