@@ -92,6 +92,13 @@ Two differences worth knowing:
   Docker and is capped at two threads. It is the slowest check by far; `make ci
   CHECKS="fmt clippy test"` is the usual pre-push sweep.
 
+## PostgreSQL smoke networking
+
+The PostgreSQL 18 client runs in Docker against the local native server.
+It uses `host.docker.internal` with Docker’s `host-gateway` mapping on Linux
+and macOS. No environment setting is needed. Both platforms run the same
+smoke assertions.
+
 ## macOS: root certificates
 
 `make ci` exports `SSL_CERT_FILE=/etc/ssl/cert.pem` when it is unset and that

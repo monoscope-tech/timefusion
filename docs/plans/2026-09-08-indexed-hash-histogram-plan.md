@@ -635,3 +635,75 @@ end-to-end tests passed. All four requested checks were attested for the final
 source, including the 32 MiB streaming regression. Final gate status requires
 only canonical `pg-smoke` on GitHub due to the documented macOS networking
 limitation. No failed check was attested.
+
+
+### Goal audit — 2026-09-09 06:19 UTC
+
+Integration is merged to master at `97235f16`. Local fmt, Clippy, full tests,
+doctests, and e2e passed. GitHub reused those attestations and passed canonical
+PostgreSQL smoke. Build/deploy run `34317126834` is still building the image.
+The live service remains on `ed6e56b`; production deployment is not yet proven.
+
+The user rejected manual hash-index activation and reiterated local signoff.
+The production schema now declares exact hash elements by default, without a
+new environment variable or runtime switch. Existing coverage checks reject
+legacy manifests that lack these elements, so maintenance backfills them.
+Correct captured-row fallback remains available during incomplete coverage.
+Full local signoff for this schema change is running. This instruction
+supersedes the earlier plan to leave activation off until a separate rollout.
+Reviews, complete-path benchmarks, production validation, and subsequent
+CPU/memory profiles remain required. Next goal audit: 06:49 UTC.
+
+
+Local validation follow-up: the first full run failed, but a pre-existing TCP
+probe redirected subsequent stderr to `/dev/null`. A before/after probe
+against local MinIO reproduced the loss and verified the fix. Keep the socket
+open/close inside the subshell so caller stderr remains intact.
+
+The visible rerun executed 1,474 tests: 1,457 passed and 17 search-service tests
+failed because their shared fixture omitted `hashes`. The index builder's
+missing-element-column guard remains unchanged. The fixture now includes a
+nullable string-list column, matching the newly indexed production schema.
+Targeted search-service tests and canonical local pg-smoke are running.
+No failed check was attested as passing; fmt and Clippy passed independently.
+
+
+The corrected shared fixture passed all 20 search-service tests in 3.357s
+(nextest `e2d0160e-0117-4a39-94d8-7f1d41aedd91`). Canonical `make ci-signoff
+CHECKS="pg-smoke"` passed on macOS and published its attestation, using the
+same SELECT 1 and five PostgreSQL 18 catalog assertions as Linux. No remote
+smoke fallback is needed for the current source. Full signoff is still running.
+
+Production service inspection now reports image `97235f1` with 1/1 replicas.
+A read-only pgwire `SELECT 1` returned 1 in 27.18ms after that observation.
+This confirms basic connectivity for the streaming integration deployment;
+it does not prove indexed histogram latency. The always-on production schema
+change is still local pending final signoff.
+
+
+### 30-minute goal audit — 2026-09-09 06:49 UTC
+
+The streaming integration deployed successfully at `97235f1`; service state,
+pgwire connectivity, and the deployment readiness soak passed. Production
+hash indexing still awaits the local schema change. That change requires no
+user switch and automatically invalidates legacy element coverage.
+
+All 1,474 main tests and eight doctests passed. Canonical PostgreSQL smoke
+passed locally after fixing Docker Desktop networking. All 63 e2e tests are
+running. The first failed suite exposed a fixture that lacked the now-indexed
+hashes column; its correction passed all 20 search-service tests. The runner's
+stderr redirection bug was also reproduced and fixed without suppressing any
+failure or weakening the index builder's missing-column guard.
+
+Master advanced to `90d314f4` with a separate Rust refactor and attestation GC
+workflow. Incorporate those changes, then validate the combined source locally
+before pushing. Production histogram correctness and latency, complete-path
+benchmarks, remaining full-feature reviews, and subsequent CPU/memory profiles
+remain open. Next goal audit: 07:19 UTC.
+
+
+Before rebasing onto the concurrent master refactor, full local validation
+passed: 1,474 tests, eight doctests, 63 e2e tests, fmt, Clippy, and canonical
+PostgreSQL smoke. Both signoff commands exited 0. The final gate marked all
+five checks proven locally, with none left for GitHub. These attestations
+cover this source only; combined-source validation follows the rebase.

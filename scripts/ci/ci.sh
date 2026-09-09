@@ -131,7 +131,7 @@ fingerprint() { # <check>
 # ---------------------------------------------------------------- capabilities
 
 probe_tcp() { # host port
-  (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && exec 3<&- 2>/dev/null || return 1
+  (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null
 }
 
 # Split a postgres URL into host/port for probing without needing psql.

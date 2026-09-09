@@ -95,6 +95,7 @@ fields:
   - name: hashes
     data_type: "List(Utf8)"
     nullable: true
+    tantivy: { indexed: true, tokenizer: raw, list_mode: elements }
     # The one column production UPDATEs on this table (monoscope's enrichment
     # appends tags). Columns are immutable by DEFAULT, because a filter on an
     # immutable column can be pushed below the merge-on-read dedup and pruned at
