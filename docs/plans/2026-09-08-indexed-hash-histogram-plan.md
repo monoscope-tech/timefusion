@@ -966,3 +966,33 @@ coverage. Optimized timings, fresh-ingest physical indices, production
 validation of the follow-up, shutdown-crash investigation, and broader CPU
 and memory profiles remain open. The full goal is not achieved.
 Next audit: 09:49 UTC.
+
+### Combined signoff — 2026-09-09 09:22 UTC
+
+The rebuilt pre-integration tree passed all 1,483 tests in 120.785s and
+ten doctests without retries (nextest 7712865a-dc20-4217-b34b-e539c952a082).
+The remaining checks were deliberately stopped during the pgwire binary
+build because upstream integration changed the deployable tree. No pgwire
+or e2e result is claimed for that run.
+
+The main checkout fast-forwarded to 567664f3, containing both hash fixes and
+upstream 3e37227e. A full make ci-signoff is now running there, session
+86509, log /tmp/timefusion-histogram-integrated-signoff.log. This is the
+required combined-tree signoff before push.
+
+### Wider production baselines — 2026-09-09 09:24 UTC
+
+On e44e08c, the saved hash predicate returned count 1 over one minute
+(426.64/479.52 ms), one hour (483.72/471.91 ms), and one day
+(766.77/712.59 ms), ordinary count(timestamp) followed by count(*).
+Both seven-day forms hit the three-second timeout (3028.24/3113.22 ms);
+histogram completion and unique-partition counters stayed zero.
+
+Daily count(*) probes then returned no matching rows on September 3, 4, 5,
+and 7 in 545.95, 1369.70, 1545.64, and 1673.93 ms. September 6 and 8
+timed out in 3087.80 and 3045.72 ms. These isolate further investigation;
+they do not prove indexed execution or overall production acceptance.
+Evidence: production-wider-window-validation.json, production-day-week-validation.json,
+and production-daily-window-validation.json. Production was observed on
+e44e08c immediately after the daily probes. Backfill unit logs continued
+through 09:23:56, so the pass was progressing rather than known stopped.
