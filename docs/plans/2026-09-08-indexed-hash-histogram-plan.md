@@ -707,3 +707,18 @@ passed: 1,474 tests, eight doctests, 63 e2e tests, fmt, Clippy, and canonical
 PostgreSQL smoke. Both signoff commands exited 0. The final gate marked all
 five checks proven locally, with none left for GitHub. These attestations
 cover this source only; combined-source validation follows the rebase.
+
+
+Final signoff after pulling `74295465`: `make ci-signoff` exited 0 for
+`14eaddea`. All 1,474 main tests, eight doctests, 63 e2e tests, fmt, Clippy,
+and canonical PostgreSQL smoke passed locally. Every check is attested;
+the final gate leaves none for GitHub. Main nextest run:
+`d9c584c8-f237-470e-8cb8-aa9849e86b3b` (147.551s). E2E run:
+`a11bd581-cfbd-4ebe-872e-c2bce35ed2ae` (212.474s).
+
+The pull retained master's shared host-gateway smoke implementation and our
+TCP-probe stderr fix. The existing production baseline is saved in
+`evidence/2026-09-08-hashes/production-integration-bounded-probes.json`:
+image `7429546`, one matching event in a one-second hash histogram (754.13ms),
+confirmed by ID lookup (1246.52ms). These timings precede automatic indexing.
+Push, merge, and production verification of the schema change follow.
