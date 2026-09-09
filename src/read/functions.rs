@@ -1257,7 +1257,7 @@ impl ScalarUDFImpl for TimeBucketUDF {
 /// strictly worse than the error it replaces. TimescaleDB refuses month widths
 /// in this form for the same reason (it has `time_bucket_ng` for calendar
 /// buckets). Days and nanoseconds are exact.
-fn interval_to_micros(months: i32, days: i32, nanoseconds: i64) -> datafusion::error::Result<i64> {
+pub(crate) fn interval_to_micros(months: i32, days: i32, nanoseconds: i64) -> datafusion::error::Result<i64> {
     if months != 0 {
         return Err(DataFusionError::Execution(
             "time_bucket does not support month or year intervals (a month is not a fixed width); use days or smaller, e.g. INTERVAL '30 days'".to_string(),
@@ -1271,7 +1271,7 @@ fn interval_to_micros(months: i32, days: i32, nanoseconds: i64) -> datafusion::e
 }
 
 /// Parse interval string to microseconds
-fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64> {
+pub(crate) fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64> {
     let bad_format = || DataFusionError::Execution("Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string());
     let parts: Vec<&str> = interval_str.split_whitespace().collect();
     let (num_str, unit_str) = match *parts.as_slice() {

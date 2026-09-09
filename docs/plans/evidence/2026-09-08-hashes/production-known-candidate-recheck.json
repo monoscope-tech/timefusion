@@ -1,0 +1,7 @@
+{
+  "recorded_at": "2026-09-08T21:05:56.474313+00:00",
+  "note": "Read-only repeat of the recorded seven-day known-ID probe. This feature branch is not deployed. Server revision is not established.",
+  "sql": "SELECT extract(epoch from time_bucket('1 hour',timestamp))::integer, count(*)::float FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 15:53:24.566813' - INTERVAL '7 days' AND timestamp <= TIMESTAMP '2026-09-08 15:53:24.566813' AND hashes @> ARRAY['err:e03848c6'] AND id IN ('1da21fbb-1d78-555f-ae88-a10edfc3afdf') GROUP BY time_bucket('1 hour',timestamp) ORDER BY time_bucket('1 hour',timestamp) DESC",
+  "error": "canceling statement due to statement timeout",
+  "seconds": 10.043
+}

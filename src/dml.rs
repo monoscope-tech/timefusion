@@ -221,6 +221,11 @@ impl QueryPlanner for DmlQueryPlanner {
         if let Some(exec) = crate::read::try_count_pushdown(logical_plan, &self.database).await? {
             return Ok(exec);
         }
+        match self.database.histogram_plan(logical_plan, session_state).await {
+            Ok(Some(plan)) => return self.planner.create_physical_plan(&plan, session_state).await,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "indexed histogram declined; using ordinary planning"),
+        }
         match self.database.rollup_sql(logical_plan, session_state).await {
             Ok(Some(crate::database::RollupRewrite { sql, grain, mode, matched, ticket })) => {
                 let rewritten = async {
@@ -736,6 +741,7 @@ impl ExecutionPlan for DmlExec {
 
         let future = async move {
             let DmlExec { op_type, table_name, project_id, predicate, assignments, source, database, buffered_layer, session, .. } = this;
+            let _histogram_dml = database.histogram_dml_guard(&project_id, &table_name);
             // A merge-on-read table re-appends every affected row through
             // `insert_records_batch`, which already invalidates each date those
             // rows land in — and the append carries each row's ORIGINAL
@@ -1155,7 +1161,7 @@ async fn perform_update_with_buffer(
                     |layer, pred| layer.update_with_source(project_id, table_name, pred, assignments, &src_for_mem),
                     |delta_pred| async move {
                         if let Some(coalescer) = coalescer {
-                            coalescer.enqueue(project_id, table_name, delta_pred.as_ref(), assignments, &src_for_delta, session);
+                            coalescer.enqueue(database, (project_id, table_name), delta_pred.as_ref(), assignments, &src_for_delta, session);
                             return Ok(0);
                         }
                         perform_delta_merge_update(database, table_name, project_id, delta_pred, assignments.clone(), src_for_delta, session)
@@ -2312,6 +2318,9 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
                 continue;
             }
         };
+        // Recovery bypasses SQL DML and can replay several projects and slices.
+        // Keep their capture fences until the entire replay finishes or fails.
+        let _histogram_guards: Vec<_> = meta.projects.iter().map(|project| db.histogram_dml_guard(project, &meta.table_name)).collect();
         // Sequential awaits with `?`: the first failed slice leaves the group parked.
         let outcome = async {
             for (si, &(lo, hi, hi_incl)) in slice_bounds.iter().enumerate() {
@@ -2430,6 +2439,8 @@ struct GroupKey {
 
 #[derive(Clone)]
 struct PendingGroup {
+    /// Keep capture fenced until every split, folded, or retried merge finishes.
+    histogram_guards: Vec<Arc<crate::database::HistogramDmlGuard>>,
     join_keys: Vec<(String, String)>,
     assignments: Vec<(String, Expr)>,
     predicate: DecomposedPredicate,
@@ -2601,6 +2612,7 @@ fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGr
     projects.hash(&mut h);
     let key = GroupKey { project_id: rep_key.project_id.clone(), table_name: table_name.to_string(), fingerprint: h.finish() };
     let group = PendingGroup {
+        histogram_guards: members.iter().flat_map(|(_, g, _)| g.histogram_guards.iter().cloned()).collect(),
         join_keys: base.join_keys.iter().cloned().chain(std::iter::once(("project_id".to_string(), "project_id".to_string()))).collect(),
         assignments: base.assignments.clone(),
         predicate,
@@ -2661,8 +2673,10 @@ impl DmlCoalescer {
     /// Defer a statement's Delta merge. The caller has already applied the
     /// mem leg (and its WAL append) and verified committed data exists.
     pub fn enqueue(
-        &self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)], source: &UpdateSource, session: Arc<dyn Session>,
+        &self, database: &Database, target: (&str, &str), predicate: Option<&Expr>, assignments: &[(String, Expr)], source: &UpdateSource,
+        session: Arc<dyn Session>,
     ) {
+        let (project_id, table_name) = target;
         let time_col = table_time_column(table_name);
         let decomposed = DecomposedPredicate::decompose(predicate, time_col);
         let key = GroupKey {
@@ -2683,6 +2697,7 @@ impl DmlCoalescer {
                 }
                 Entry::Vacant(v) => {
                     v.insert(PendingGroup {
+                        histogram_guards: vec![Arc::new(database.histogram_dml_guard(project_id, table_name))],
                         join_keys: source.join_keys.clone(),
                         assignments: assignments.to_vec(),
                         predicate: decomposed,
@@ -2811,6 +2826,7 @@ impl DmlCoalescer {
             Entry::Occupied(mut g) => {
                 let newer = g.get_mut();
                 newer.batches = group.batches.into_iter().chain(std::mem::take(&mut newer.batches)).collect();
+                newer.histogram_guards.extend(group.histogram_guards);
                 newer.predicate.widen(&group.predicate);
                 newer.attempts = newer.attempts.max(group.attempts);
             }
@@ -2872,6 +2888,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a", "b"])), Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
         let key = GroupKey { project_id: "proj/1".into(), table_name: "otel_logs_and_spans".into(), fingerprint: 7 };
         let group = PendingGroup {
+            histogram_guards: Vec::new(),
             join_keys: vec![("id".into(), "id".into())],
             assignments: vec![("n".into(), lit(9i64))],
             predicate: DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp"),
@@ -2922,6 +2939,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
         let key = GroupKey { project_id: "p".into(), table_name: "t".into(), fingerprint: 1 };
         let mut group = PendingGroup {
+            histogram_guards: Vec::new(),
             join_keys: vec![("n".into(), "n".into())],
             assignments: vec![("n".into(), lit(1i64))],
             predicate: DecomposedPredicate::decompose(None, "timestamp"),
@@ -3119,6 +3137,7 @@ mod tests {
             assert!(stripped.is_empty());
             let bounds = (d.lower.clone(), d.upper.clone());
             let group = PendingGroup {
+                histogram_guards: Vec::new(),
                 join_keys: vec![("context___span_id".into(), "span_id".into())],
                 assignments: vec![("hashes".into(), col("source.tag"))],
                 predicate: d,
@@ -3179,6 +3198,7 @@ mod tests {
             p
         });
         PendingGroup {
+            histogram_guards: Vec::new(),
             join_keys: vec![("id".into(), "id".into())],
             assignments: vec![("n".into(), lit(9i64))],
             predicate,
@@ -3189,6 +3209,38 @@ mod tests {
             attempts: 2,
             folded_projects: None,
         }
+    }
+
+    #[tokio::test]
+    async fn coalesced_histogram_guards_survive_folding_splitting_and_retry() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::with_config(crate::support::test_helpers::minio_test_config("histogram-coalescer", &dir.path().to_string_lossy())).await?;
+        let coalescer = DmlCoalescer::new(60, true);
+        let template = group_with_windows(&[(0, Some(60))]);
+        let source = UpdateSource { batch: template.batches[0].0.clone(), schema: template.schema.clone(), join_keys: template.join_keys.clone() };
+        for project in ["p1", "p2"] {
+            for lo in [0, 2 * B] {
+                coalescer.enqueue(&db, (project, "otel_logs_and_spans"), Some(&window(lo, lo + 60)), &template.assignments, &source, template.session.clone());
+            }
+        }
+        let pending: Vec<_> = coalescer.groups.lock().unwrap().drain().collect();
+        let guards: Vec<_> = pending.iter().flat_map(|(_, g)| g.histogram_guards.iter().map(Arc::downgrade)).collect();
+        assert_eq!(guards.len(), 2, "each project's pending work retains its capture fence");
+        let mut folded = fold_groups(pending, &HashSet::new());
+        assert_eq!(folded.len(), 1);
+        let (key, group) = folded.pop().unwrap();
+        let mut units = bucket_group(group);
+        assert_eq!(units.len(), 2);
+        let retry = units.pop().unwrap();
+        assert!(guards.iter().all(|g| g.upgrade().is_some()));
+        coalescer.requeue(key.clone(), units.pop().unwrap());
+        coalescer.requeue(key, retry);
+        assert!(guards.iter().all(|g| g.upgrade().is_some()), "retry must retain every folded project's fence");
+        let queued: Vec<_> = coalescer.groups.lock().unwrap().drain().collect();
+        assert!(guards.iter().all(|g| g.upgrade().is_some()), "dequeue must not release the fence before execution");
+        drop(queued);
+        assert!(guards.iter().all(|g| g.upgrade().is_none()), "finished work must release all capture fences");
+        Ok(())
     }
 
     const B: i64 = DML_MERGE_BUCKET_MICROS;

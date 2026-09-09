@@ -44,6 +44,9 @@ use crate::tantivy::{
 /// could not be attributed in-process at all.
 #[derive(Debug, Default)]
 pub struct SearchStats {
+    pub histogram_snapshots: AtomicU64,
+    pub histogram_delta_cache_hits: AtomicU64,
+    pub histogram_unique_partitions: AtomicU64,
     pub manifest_loads: AtomicU64,
     pub manifest_load_us: AtomicU64,
     pub manifest_hits: AtomicU64,
@@ -131,6 +134,31 @@ pub struct SearchResult {
     pub field_coverage_gap: bool,
 }
 
+/// One file and its winner mask, captured by the query's visibility resolver.
+/// The entry is pinned by the caller rather than refreshed from the manifest TTL cache.
+pub struct HistogramFile<'a> {
+    pub table_root: &'a url::Url,
+    pub manifest_key: &'a str,
+    pub entry: &'a crate::tantivy::ManifestEntry,
+    pub source_file: &'a str,
+    pub visible: arrow::buffer::BooleanBuffer,
+}
+
+/// All inputs are retained from one resolved query view, with memory last.
+pub struct HistogramSnapshot<'a> {
+    pub table_root: &'a url::Url,
+    pub files: &'a [super::visibility::SnapshotFile],
+    pub manifest: &'a Manifest,
+    pub rows: &'a super::visibility::ResolvedSnapshot,
+}
+
+pub struct HistogramSnapshotResult {
+    pub counts: std::collections::BTreeMap<i64, u64>,
+    pub indexed_sources: usize,
+    pub scanned_sources: usize,
+    pub index_errors: Vec<anyhow::Error>,
+}
+
 #[derive(Debug)]
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
@@ -161,6 +189,61 @@ pub struct ReapReport {
 }
 
 impl TantivySearchService {
+    /// Combines indexed files, uncovered files, and memory using pinned winners.
+    /// An unavailable sidecar falls back to the captured rows of that source.
+    pub async fn histogram_snapshot(
+        &self, table: &str, project_id: &str, window: super::histogram::HistogramWindow, membership: Option<&super::histogram::Membership>,
+        snapshot: HistogramSnapshot<'_>,
+    ) -> Result<HistogramSnapshotResult> {
+        Self::record_histogram_snapshot(&self.stats);
+        anyhow::ensure!(snapshot.rows.sources.len() == snapshot.files.len() + 1, "histogram snapshot must contain files followed by memory");
+        anyhow::ensure!(snapshot.rows.winners.len() == snapshot.rows.sources.len(), "histogram snapshot is missing winner masks");
+        let entries = snapshot.manifest.histogram_entries(snapshot.table_root, snapshot.files)?;
+        let mut result = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        for (ordinal, (source, visible)) in snapshot.rows.sources.iter().zip(&snapshot.rows.winners).enumerate() {
+            let indexed = if let Some(Some(entry)) = entries.get(ordinal) {
+                self.histogram_file(
+                    table,
+                    project_id,
+                    window,
+                    membership,
+                    HistogramFile {
+                        table_root: snapshot.table_root,
+                        manifest_key: entry.key,
+                        entry: entry.entry,
+                        source_file: &snapshot.files[ordinal].path,
+                        visible: visible.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| result.index_errors.push(error.context(format!("histogram source {}", snapshot.files[ordinal].path))))
+                .ok()
+            } else {
+                None
+            };
+            let counts = match indexed {
+                Some(counts) => {
+                    result.indexed_sources += 1;
+                    counts
+                }
+                None => {
+                    result.scanned_sources += 1;
+                    crate::support::without_blocking_the_worker(|| window.count_rows(&source.batches, visible, membership))?
+                }
+            };
+            for (bucket, count) in counts {
+                let total = result.counts.entry(bucket).or_default();
+                *total = total.checked_add(count).context("histogram snapshot count overflow")?;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn record_histogram_snapshot(stats: &SearchStats) {
+        SearchStats::add(&stats.histogram_snapshots, 1);
+        metrics::counter!("timefusion_tantivy_histogram_snapshots_total").increment(1);
+    }
+
     pub fn new(object_store: Arc<dyn ObjectStore>, cache_root: PathBuf, config: Arc<TantivyConfig>) -> Self {
         Self {
             object_store,
@@ -177,6 +260,45 @@ impl TantivySearchService {
     pub async fn search(&self, table: &str, project_id: &str, field: &str, query_str: &str) -> Result<Option<Vec<Hit>>> {
         let node = PredNode::Leaf(TextMatchPred { column: field.to_string(), query: query_str.to_string() });
         Ok(self.search_with_stats(table, project_id, &node, usize::MAX, None).await?.map(|r| r.hits))
+    }
+
+    /// Returns buckets directly from one snapshot-bound sidecar. No event IDs,
+    /// hit cap, or selectivity threshold participate in this path.
+    ///
+    /// The caller must obtain `file.visible` from complete version resolution
+    /// across its Delta/memory snapshot, or equivalent certification. Errors
+    /// require canonical fallback for that same source snapshot.
+    pub async fn histogram_file(
+        &self, table: &str, project_id: &str, window: super::histogram::HistogramWindow, membership: Option<&super::histogram::Membership>,
+        file: HistogramFile<'_>,
+    ) -> Result<std::collections::BTreeMap<i64, u64>> {
+        let entry = file.entry;
+        anyhow::ensure!(entry.schema_version == SCHEMA_VERSION && entry.error.is_none(), "histogram index is not usable");
+        let covered = match entry.covered_files.as_slice() {
+            [source] => super::visibility::relative_source_path(file.table_root, source)?,
+            _ => None,
+        };
+        anyhow::ensure!(entry.ordinals_valid && covered.as_deref() == Some(file.source_file), "histogram requires exact single-file ordinal coverage");
+        anyhow::ensure!(u64::try_from(file.visible.len())? == entry.rows, "histogram mask does not cover the physical source rows");
+        let blob = entry.index.as_deref().context("histogram index is missing")?;
+        let dir = self.ensure_cached(table, project_id, file_uuid(file.manifest_key), blob).await?;
+        crate::support::without_blocking_the_worker(|| {
+            let (index, reader) = self.open_cached(&dir)?;
+            let searcher = reader.searcher();
+            anyhow::ensure!(searcher.num_docs() == entry.rows, "histogram index row count differs from its manifest");
+            for segment in searcher.segment_readers() {
+                if segment.num_docs() != 0 {
+                    let ordinals = segment.fast_fields().u64(super::ROW_ORDINAL_FIELD)?;
+                    anyhow::ensure!(ordinals.max_value() < entry.rows, "histogram index ordinal exceeds its physical source");
+                }
+            }
+            let query = match membership {
+                Some(predicate) => predicate.query(&index.schema(), &entry.element_fields)?,
+                None => Box::new(tantivy::query::AllQuery),
+            };
+            let visible = file.visible;
+            window.search(&searcher, query, move |row| visible.value(row as usize))
+        })
     }
 
     /// Search every usable in-window index with ONE combined boolean query
@@ -219,6 +341,13 @@ impl TantivySearchService {
         }
         let plan_started = Instant::now();
         let current = || m.entries.iter().filter(|(_, e)| e.schema_version == SCHEMA_VERSION);
+        // This API evaluates joined-text predicates. Element indexes require
+        // their own exact-membership query; a field name alone is not coverage.
+        if current().any(|(_, e)| {
+            entry_overlaps(e.min_timestamp_micros, e.max_timestamp_micros, time_range) && node.columns().iter().any(|column| e.element_fields.contains(*column))
+        }) {
+            return Ok(Err("field_representation_mismatch"));
+        }
         // Coverage ignores the time-prune below: a pruned entry still covers its
         // file, its rows are merely out of window (see SearchResult docs).
         let covered_files: HashSet<String> =
@@ -393,7 +522,7 @@ impl TantivySearchService {
 
     /// TTL-cached manifest read (see `MANIFEST_CACHE_TTL` for the staleness
     /// argument). Removes the per-query S3 GET + JSON parse.
-    async fn load_manifest_cached(&self, table: &str, project_id: &str) -> Result<Arc<Manifest>> {
+    pub(crate) async fn load_manifest_cached(&self, table: &str, project_id: &str) -> Result<Arc<Manifest>> {
         let key = (table.to_string(), project_id.to_string());
         if let Some(m) = self.manifests.get(&key).filter(|e| e.0.elapsed() < self.config.manifest_ttl()).map(|e| e.1.clone()) {
             SearchStats::add(&self.stats.manifest_hits, 1);
@@ -473,7 +602,7 @@ impl TantivySearchService {
     }
 
     async fn ensure_cached(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> Result<PathBuf> {
-        let dir = super::local_cache_path(&self.cache_root, table, project_id, file_uuid);
+        let dir = super::local_cache_path(&self.cache_root, table, project_id, &cache_generation_key(file_uuid, blob_path));
         // Stamped on every hit, not only on miss: recency is what the reaper
         // sorts by, and a dir serving a query every minute must never look as
         // old as its unpack time.
@@ -611,6 +740,13 @@ fn entry_overlaps(min: Option<i64>, max: Option<i64>, range: Option<(i64, i64)>)
 /// (see `service.rs`'s `bucket_key` format).
 fn file_uuid(key: &str) -> &str {
     key.strip_prefix("bucket-").unwrap_or(key)
+}
+
+fn cache_generation_key(key: &str, blob: &str) -> String {
+    match super::split_blob_generation(blob) {
+        Some((_, generation)) => format!("{key}.generation-{generation}"),
+        None => key.to_string(), // retain existing caches for legacy manifests
+    }
 }
 
 /// Unpack `blob` into a temp dir adjacent to `dir`, then atomically rename it
@@ -993,7 +1129,12 @@ mod reader_tests {
                     data_type: "String".into(),
                     nullable: true,
                     // body → ngram3 (default), level → raw single token.
-                    tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: (name == "level").then(|| "raw".to_string()), flatten: None }),
+                    tantivy: Some(TantivyFieldConfig {
+                        indexed: true,
+                        tokenizer: (name == "level").then(|| "raw".to_string()),
+                        flatten: None,
+                        list_mode: Default::default(),
+                    }),
                     dictionary: None,
                     bloom_filter: false,
                     mutable: false,
@@ -1271,9 +1412,11 @@ impl TantivyIndexService {
         // S3 first, always: it is the source of truth and the local copy is
         // only ever a cache. Seeding after a failed upload would leave a
         // locally-readable index no manifest entry points at.
+        let blob_path = super::generation_blob_path(&blob_path, uuid::Uuid::new_v4());
         super::upload(self.object_store.as_ref(), &blob_path, blob.clone()).await?;
-        self.seed_reader_cache(table_name, project_id, manifest_key, blob).await;
+        self.seed_reader_cache(table_name, project_id, manifest_key, blob_path.as_ref(), blob).await;
         let entry = ManifestEntry {
+            element_fields: stats.element_fields,
             index: Some(blob_path.to_string()),
             rows: stats.rows,
             built_at: Utc::now(),
@@ -1306,12 +1449,12 @@ impl TantivyIndexService {
     /// Strictly best-effort: every failure path leaves the pre-existing
     /// behaviour (download on first read) intact, so this can never fail a
     /// flush. Unpack is CPU + disk, hence `spawn_blocking`.
-    async fn seed_reader_cache(&self, table: &str, project_id: &str, manifest_key: &str, blob: bytes::Bytes) {
+    async fn seed_reader_cache(&self, table: &str, project_id: &str, manifest_key: &str, blob_path: &str, blob: bytes::Bytes) {
         if !self.config.seed_cache_on_publish() {
             return;
         }
         let Some(reader) = self.reader() else { return };
-        let dir = super::local_cache_path(&reader.cache_root, table, project_id, file_uuid(manifest_key));
+        let dir = super::local_cache_path(&reader.cache_root, table, project_id, &cache_generation_key(file_uuid(manifest_key), blob_path));
         let installed = tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob)).await;
         match installed {
             Ok(Ok(())) => SearchStats::add(&reader.stats.cache_seeded, 1),
@@ -1324,6 +1467,24 @@ impl TantivyIndexService {
                 debug!("tantivy cache seed join failed for {project_id}/{table}: {e}");
             }
         }
+    }
+
+    pub(crate) async fn publish_count_proof(
+        &self, table: &str, project: &str, date: chrono::NaiveDate, proof: super::visibility::PartitionCountProof,
+    ) -> Result<()> {
+        super::mutate(self.object_store.as_ref(), table, project, |manifest| {
+            manifest.count_proofs.insert(date, proof);
+            // A thirty-day chart can intersect thirty-one UTC partitions.
+            while manifest.count_proofs.len() > 32 {
+                manifest.count_proofs.pop_first();
+            }
+            ((), true)
+        })
+        .await?;
+        if let Some(reader) = self.reader() {
+            reader.invalidate_manifest(table, project);
+        }
+        Ok(())
     }
 
     /// Carry existing coverage FORWARD across a compaction instead of
@@ -1421,7 +1582,7 @@ impl TantivyIndexService {
         // Under the per-manifest lock: this is a read-modify-write like every
         // other manifest mutation, and doing it outside `mutate` raced concurrent
         // upserts (last writer wins, silently un-covering files).
-        let (stale, kept_len, changed) = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
+        let (stale, retired, kept_len, changed) = super::mutate(self.object_store.as_ref(), table, project_id, |m| {
             let (stale, mut kept): (BTreeMap<_, _>, BTreeMap<_, _>) =
                 std::mem::take(&mut m.entries).into_iter().partition(|(_, e)| !e.covered_files.iter().any(|u| live.contains(u.as_str())));
             let pruned = kept
@@ -1434,29 +1595,44 @@ impl TantivyIndexService {
                 .count();
             let (kept_len, dirty) = (kept.len(), !stale.is_empty() || pruned > 0);
             m.entries = kept;
-            ((stale, kept_len, dirty), dirty)
+            // A day exceeds the normal manifest TTL and statement lifetime.
+            // Cold reads racing later collection fail back to the canonical scan;
+            // warm readers retain their own mappings to the immutable generation.
+            let cutoff = Utc::now() - chrono::Duration::days(1);
+            let active: HashSet<&str> = m.entries.values().filter_map(|entry| entry.index.as_deref()).collect();
+            let retired: Vec<String> =
+                m.retired_blobs.iter().filter(|(blob, at)| **at < cutoff && !active.contains(blob.as_str())).map(|(blob, _)| blob.clone()).collect();
+            ((stale, retired, kept_len, dirty), dirty)
         })
         .await?;
         let mut report = GcReport { kept: kept_len, entries_removed: stale.len(), ..Default::default() };
         // Effectful: delete stale blobs concurrently (serial deletes made a
         // 100k-blob GC take hours). A blob already gone counts as deleted —
         // re-runs after an interrupted GC must not report errors.
-        let results: Vec<bool> = futures::stream::iter(stale.into_values().filter_map(|e| e.index))
+        let results: Vec<(String, bool)> = futures::stream::iter(stale.into_values().filter_map(|e| e.index).chain(retired))
             .map(|blob| async move {
-                match super::delete(self.object_store.as_ref(), &object_store::path::Path::from(blob.as_str())).await {
+                let deleted = match super::delete(self.object_store.as_ref(), &object_store::path::Path::from(blob.as_str())).await {
                     Ok(()) => true,
                     Err(e) if matches!(e.downcast_ref::<object_store::Error>(), Some(object_store::Error::NotFound { .. })) => true,
                     Err(e) => {
                         warn!("gc: failed to delete {blob}: {e}");
                         false
                     }
-                }
+                };
+                (blob, deleted)
             })
             .buffer_unordered(16)
             .collect()
             .await;
-        report.blobs_deleted = results.iter().filter(|ok| **ok).count();
+        report.blobs_deleted = results.iter().filter(|(_, ok)| *ok).count();
         report.blob_delete_errors = results.len() - report.blobs_deleted;
+        if results.iter().any(|(_, ok)| *ok) {
+            super::mutate(self.object_store.as_ref(), table, project_id, |m| {
+                let removed = results.iter().filter(|(_, ok)| *ok).filter(|(blob, _)| m.retired_blobs.remove(blob).is_some()).count();
+                ((), removed > 0)
+            })
+            .await?;
+        }
         // A pruned entry changes what the plan path may consult, so the cached
         // manifest must go whenever the stored one did.
         if changed && let Some(reader) = self.reader() {

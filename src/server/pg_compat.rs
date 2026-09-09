@@ -1260,6 +1260,9 @@ impl StatsTableProvider {
                 "hits_materialized" => s.hits_materialized.load(Relaxed),
                 "manifest_loads" => ml,
                 "manifest_hits" => mh,
+                "histogram_snapshots" => s.histogram_snapshots.load(Relaxed),
+                "histogram_delta_cache_hits" => s.histogram_delta_cache_hits.load(Relaxed),
+                "histogram_unique_partitions" => s.histogram_unique_partitions.load(Relaxed),
                 "manifest_hit_pct" => pct(mh, mh + ml),
                 "manifest_load_us_avg" => mean(&s.manifest_load_us, &s.manifest_loads),
                 // Every blob fetch is an S3 round trip on the planning path that

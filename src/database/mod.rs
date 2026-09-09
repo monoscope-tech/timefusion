@@ -52,11 +52,14 @@ use crate::{
 };
 
 mod compact;
+mod histogram;
 /// Re-exported so `storage.rs`'s serde default for a sidecar's recorded bin
 /// width has ONE definition — the last time this constant was copied it lived in
 /// three files that had to agree, and a bin marked at one width and looked up at
 /// another is never found.
 pub(crate) use compact::DEFAULT_BIN_MINUTES;
+pub use histogram::CapturedHistogram;
+pub(crate) use histogram::HistogramDmlGuard;
 mod maintain;
 mod write;
 
@@ -461,6 +464,8 @@ pub mod scan_metric_names {
         PREFILTER_SKIP_EMPTY_INDEX = "timefusion.scan.prefilter_skipped.empty_index" as scan.prefilter_skipped_empty_index when "empty_index";
         PREFILTER_SKIP_LOW_SELECTIVITY = "timefusion.scan.prefilter_skipped.low_selectivity" as scan.prefilter_skipped_low_selectivity when "low_selectivity";
         PREFILTER_SKIP_FIELD_COVERAGE_GAP = "timefusion.scan.prefilter_skipped.field_coverage_gap" as scan.prefilter_skipped_field_coverage_gap when "field_coverage_gap";
+        PREFILTER_SKIP_FIELD_REPRESENTATION = "timefusion.scan.prefilter_skipped.field_representation" as scan.prefilter_skipped_field_representation when "field_representation_mismatch";
+        PREFILTER_SKIP_MUTABLE_VISIBILITY = "timefusion.scan.prefilter_skipped.mutable_visibility" as scan.prefilter_skipped_mutable_visibility when "mutable_visibility";
         PREFILTER_SKIP_NO_INDEX = "timefusion.scan.prefilter_skipped.no_index" as scan.prefilter_skipped_no_index when "delta_no_index";
         PREFILTER_SKIP_NO_USABLE_INDEX = "timefusion.scan.prefilter_skipped.no_usable_index" as scan.prefilter_skipped_no_usable_index when "delta_no_usable_index";
         PREFILTER_SKIP_CAP_EXCEEDED_ONE_INDEX = "timefusion.scan.prefilter_skipped.cap_exceeded_one_index" as scan.prefilter_skipped_cap_exceeded_one_index when "delta_cap_exceeded_one_index";
@@ -2994,6 +2999,11 @@ pub struct Database {
     /// merges would OCC-conflict and redo full rewrites. Queuing here leaves
     /// the table's RwLock free for readers and insert commits.
     dml_locks: DmlLocks,
+    histogram_dml: Arc<dashmap::DashMap<(String, String), Arc<histogram::HistogramDmlState>>>,
+    histogram_delta: Arc<histogram::HistogramDeltaCache>,
+    /// At most one query-triggered proof build, including time waiting for the
+    /// shared count-builder budget. Admission never queues query requests.
+    histogram_proof_build: Arc<histogram::HistogramProofBuilds>,
     /// Last snapshot-persist time per table URL; throttles `persist_snapshot`.
     /// The on-disk snapshot is only a boot-recovery seed, so staleness just
     /// means boot replays a few more sub-second commits.
@@ -3726,6 +3736,9 @@ impl Database {
             commit_locks: Arc::new(dashmap::DashMap::new()),
             flush_waiter_counts: Arc::new(dashmap::DashMap::new()),
             dml_locks: Arc::new(dashmap::DashMap::new()),
+            histogram_dml: Arc::new(dashmap::DashMap::new()),
+            histogram_delta: Arc::new(histogram::HistogramDeltaCache::default()),
+            histogram_proof_build: Arc::new(histogram::HistogramProofBuilds::default()),
             snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
             bypass_buffer: false,
@@ -3994,6 +4007,7 @@ impl Database {
         &self, svc: &crate::tantivy::search::TantivyIndexService, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, oversized: &mut u64,
         warn_skipped: bool,
     ) -> anyhow::Result<(HashMap<String, Vec<String>>, HashMap<String, u64>, Arc<dyn object_store::ObjectStore>)> {
+        let schema = crate::schema::get_schema(table_name).ok_or_else(|| anyhow::anyhow!("missing schema for index coverage: {table_name}"))?;
         let (uris, sizes, delta_store) = {
             let t = table_ref.read().await;
             let sizes: HashMap<String, u64> = match t.snapshot() {
@@ -4012,7 +4026,7 @@ impl Database {
         for (pid, mut uris) in by_pid {
             let manifest = crate::tantivy::load_manifest(svc.object_store.as_ref(), table_name, &pid).await?;
             let covered: HashSet<&String> =
-                manifest.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
+                manifest.entries.values().filter(|e| e.covers_current_elements(schema)).flat_map(|e| e.covered_files.iter()).collect();
             uris.retain(|uri| !covered.contains(uri));
             if max_bytes > 0 {
                 let before = uris.len();
@@ -10867,22 +10881,10 @@ enum PrefilterDecision {
     Used { ids: HashSet<String>, covered_files: HashSet<String>, exclude_files: Option<HashSet<String>>, row_selections: Option<HashMap<String, Vec<u64>>> },
 }
 
-/// Pure decision over an already-completed tantivy search's stats — no IO, mirrors the branches
-/// in `ProjectRoutingTable::scan`'s prefilter block exactly (skip reasons in the same order).
-///
-/// `is_mutable`: whether the ROUTED PREDICATE touches a version-mutable column —
-/// not merely whether the table has one. Narrowed 2026-08-22: the table-wide
-/// form was true for `otel_logs_and_spans`, which silently disabled both
-/// optimisations below on the busiest table in production. On such a
-/// table a "hitless" file may hold the NEWEST version of a key whose match lives only in an
-/// older version, and dropping it below `DedupExec` would serve the stale row — so file
-/// exclusion/row-selection narrowing NEVER applies there; only the id-set does (sound at
-/// whole-key granularity).
-/// Does the routed predicate reference a version-mutable column?
-///
-/// The prefilter's file pruning is only unsound when it does. `None` mutable set
-/// means the table is not merge-on-read at all; `None` tree means nothing was
-/// routed, so there is no predicate to be unsound about.
+/// Whether the routed predicate can differ between versions of the same key.
+/// Such predicates cannot safely narrow only the indexed storage leg: a newer
+/// nonmatching row could be removed while an older matching row remains in memory
+/// or an uncovered file. They require global candidate discovery or winner masks.
 fn routed_touches_mutable(mutable: Option<&HashSet<String>>, tree: Option<&crate::tantivy::udf::PredNode>) -> bool {
     match (mutable, tree) {
         (Some(m), Some(t)) => t.columns().iter().any(|c| m.contains(*c)),
@@ -11004,18 +11006,11 @@ fn decide_prefilter(
     if field_gap {
         return PrefilterDecision::Skipped("field_coverage_gap");
     }
-    // A zero-hit covering index proves its own files hold no matches. Complete
-    // coverage excludes those files from the single Delta leg; partial
-    // coverage excludes them only from the indexed leg while uncovered files
-    // scan raw.
-    let (exclude_files, row_selections) = if is_mutable {
-        (None, None)
-    } else {
-        (
-            (file_pruning_enabled && !zero_hit_files.is_empty()).then_some(zero_hit_files),
-            (row_selection_enabled && !row_selections.is_empty()).then_some(row_selections),
-        )
-    };
+    if is_mutable {
+        return PrefilterDecision::Skipped("mutable_visibility");
+    }
+    let exclude_files = (file_pruning_enabled && !zero_hit_files.is_empty()).then_some(zero_hit_files);
+    let row_selections = (row_selection_enabled && !row_selections.is_empty()).then_some(row_selections);
     PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections }
 }
 
@@ -11077,13 +11072,7 @@ mod decide_prefilter_tests {
         assert!(!mutable.is_empty(), "otel declares mutable columns; an empty set would make this test prove nothing");
     }
 
-    /// The mutable gate is what keeps merge-on-read correct, and narrowing it
-    /// from table-wide to predicate-aware is the whole point of the change — so
-    /// pin BOTH directions. A predicate on a mutable column must still refuse
-    /// to prune (a newer version could match where the indexed one did not);
-    /// an immutable-only predicate must prune, because every version of a
-    /// matching row carries the same values and a zero-hit file therefore holds
-    /// no version of one.
+    /// Indexed-only candidate discovery cannot drop competing mutable versions.
     #[test]
     fn only_a_mutable_predicate_blocks_file_pruning() {
         let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 100, false) else {
@@ -11092,11 +11081,7 @@ mod decide_prefilter_tests {
         assert!(exclude_files.is_some(), "an immutable-only predicate must prune zero-hit files");
         assert!(row_selections.is_some(), "...and push row selections");
 
-        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 100, true) else {
-            panic!("mutable predicate still uses the prefilter, just without pruning");
-        };
-        assert!(exclude_files.is_none(), "a mutable predicate must NOT prune: a newer version may match");
-        assert!(row_selections.is_none(), "...nor push row selections");
+        assert!(matches!(decide(&["a"], 100, true), PrefilterDecision::Skipped("mutable_visibility")));
     }
 
     /// Each skip reason fires independently and in the documented priority order —
@@ -11150,19 +11135,6 @@ mod decide_prefilter_tests {
         let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 10, false) else { panic!("expected Used") };
         assert_eq!(exclude_files, Some(HashSet::from(["zero_hit.parquet".to_string()])));
         assert_eq!(row_selections, Some(HashMap::from([("row_sel.parquet".to_string(), vec![1, 2])])));
-    }
-
-    /// A merge-on-read (`version_append`) table's Used decision NEVER carries file
-    /// exclusion or row selection — a "hitless" file may hold the newest version of a
-    /// key whose match lives only in an older version, and either narrowing would
-    /// serve the stale row instead of the current one. Only the id-set narrows, and
-    /// only at whole-key granularity.
-    #[test]
-    fn mutable_table_never_gets_file_exclusion_or_row_selection() {
-        let PrefilterDecision::Used { exclude_files, row_selections, ids, .. } = decide(&["a"], 10, true) else { panic!("expected Used") };
-        assert!(exclude_files.is_none());
-        assert!(row_selections.is_none());
-        assert_eq!(ids, HashSet::from(["a".to_string()]));
     }
 
     /// Disabled config knobs suppress narrowing even when the data would otherwise justify it.
@@ -11290,15 +11262,9 @@ impl TableProvider for ProjectRoutingTable {
             }
         }
 
-        // Second line of defence behind `supports_filters_pushdown`: predicates
-        // on the tombstone marker or any version-mutable column must not reach
-        // a scan leg however they arrived (silent resurrection / stale-version
-        // serving). For the tantivy prefilter the invariant is: leaf pruning
-        // below DedupExec commutes with keep-greatest only when the predicate
-        // evaluates identically on every version of a key — so file exclusion
-        // and row selections stay OFF on mutable columns, while the id-set half
-        // stays sound (`id` is a dedup key: `id IN (hits)` admits whole keys
-        // atomically and the above-dedup filter rejects stale-only matches).
+        // Mutable predicates must run after version resolution. Narrowing only
+        // the indexed leg can remove the winning version of a matching raw row.
+        // `decide_prefilter` therefore refuses mutable predicates entirely.
         let mutable = Self::version_mutable_columns(&self.table_name);
         let unstripped_filters = filters;
         let leg_safe = |f: &Expr| {
@@ -11315,8 +11281,8 @@ impl TableProvider for ProjectRoutingTable {
         // `id IN (delta_ids)` for the Delta scan only (MemBuffer rows are never
         // in the index, so applying it there would drop valid rows); the
         // MemBuffer side prefilters atomically under its own bucket lock. On a
-        // MOR table collect the tree from the UNSTRIPPED filters — the id-set
-        // (the only output allowed below on such tables) is sound for them.
+        // MOR table retain the unstripped tree so the decision can identify and
+        // report mutable predicates that require global visibility resolution.
         let text_match_tree = match mutable.is_some() {
             false => crate::tantivy::udf::collect_text_match_tree(&optimized_filters),
             true => crate::tantivy::udf::collect_text_match_tree(&self.apply_time_series_optimizations(unstripped_filters)?),
@@ -11797,7 +11763,7 @@ impl TableProvider for ProjectRoutingTable {
         // delta-side IDs only and would drop legitimate MemBuffer rows).
         // On a MOR table the per-bucket ROW prefilter is below DedupExec and
         // the tree may reference mutable columns (it was collected unstripped
-        // for the delta id-set) — dropping a stale version's row here while
+        // for the prefilter decision) — dropping a stale version's row here while
         // its match-bearing sibling sits in another leg breaks keep-greatest,
         // so the mem leg gets no tree.
         let mem_tree = text_match_tree.as_ref().filter(|_| mutable.is_none());

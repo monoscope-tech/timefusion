@@ -1,0 +1,71 @@
+{
+  "window_end_utc": "2026-09-08 16:49:19.701883",
+  "results": [
+    {
+      "name": "array_lengths",
+      "seconds": 0.484,
+      "rows": [
+        [
+          "0",
+          9
+        ],
+        [
+          "2",
+          57493
+        ],
+        [
+          "1",
+          25297
+        ]
+      ],
+      "sql": "SELECT array_length(hashes,1),count(*) FROM otel_logs_and_spans WHERE project_id='87576849-4941-49d3-a15d-680fef88a1a8' AND timestamp >= TIMESTAMP '2026-09-08 16:49:19.701883' - INTERVAL '10 minutes' AND timestamp <= TIMESTAMP '2026-09-08 16:49:19.701883' GROUP BY 1"
+    },
+    {
+      "name": "top_tags",
+      "seconds": 0.489,
+      "rows": [
+        [
+          "f14abbef",
+          80277
+        ],
+        [
+          "pat:8394ff71",
+          13720
+        ],
+        [
+          "pat:4debc343",
+          8056
+        ],
+        [
+          "pat:d8390473",
+          7906
+        ],
+        [
+          "pat:5fd620dd",
+          6605
+        ],
+        [
+          "pat:7bef92da",
+          6356
+        ],
+        [
+          "pat:07af2fc8",
+          2558
+        ],
+        [
+          "a1324cbb",
+          2103
+        ],
+        [
+          "pat:3ee107fa",
+          1302
+        ],
+        [
+          "pat:a53b0222",
+          696
+        ]
+      ],
+      "sql": "SELECT tag,count(*) FROM (SELECT unnest(hashes) AS tag FROM otel_logs_and_spans WHERE project_id='87576849-4941-49d3-a15d-680fef88a1a8' AND timestamp >= TIMESTAMP '2026-09-08 16:49:19.701883' - INTERVAL '10 minutes' AND timestamp <= TIMESTAMP '2026-09-08 16:49:19.701883') GROUP BY tag ORDER BY count(*) DESC LIMIT 10"
+    }
+  ]
+}

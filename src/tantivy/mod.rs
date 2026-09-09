@@ -6,8 +6,11 @@
 //! Indexes always store `_timestamp` (i64, fast) and `_id` (text raw); user
 //! columns are indexed-only unless explicitly marked `stored: true`.
 
+pub mod histogram;
+pub(crate) mod planner;
 pub mod search;
 pub mod udf;
+pub mod visibility;
 
 pub use search::{Hit, query_index};
 
@@ -39,7 +42,7 @@ use parquet_variant_json::VariantToJson;
 use tantivy::{Index, IndexWriter, doc, merge_policy::NoMergePolicy};
 use tracing::{debug, warn};
 
-use crate::schema::TableSchema;
+use crate::schema::{TableSchema, TantivyListMode};
 
 /// Heap reserved per writer and charged against the MemBuffer budget.
 pub const WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
@@ -60,6 +63,8 @@ pub enum MergeMode {
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexBuildStats {
+    /// Fields actually encoded as separate exact array elements in this build.
+    pub element_fields: std::collections::BTreeSet<String>,
     pub rows: u64,
     pub batches: u32,
     pub min_timestamp_micros: Option<i64>,
@@ -85,7 +90,7 @@ pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatc
     let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
     // Explicit merges keep `TermMerger` off the ingest path.
     writer.set_merge_policy(Box::new(NoMergePolicy));
-    let mut stats = IndexBuildStats::default();
+    let mut stats = IndexBuildStats { element_fields: built.element_fields(), ..Default::default() };
     batches.iter().try_for_each(|batch| index_batch(built, &mut writer, batch, &mut stats))?;
     stats.batches = batches.len() as u32;
     finish_writer(index, writer, stats, merge)
@@ -108,7 +113,7 @@ pub fn build_stream_to_dir(
     crate::tantivy::register_tokenizers(&index);
     let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
-    let mut stats = IndexBuildStats::default();
+    let mut stats = IndexBuildStats { element_fields: built.element_fields(), ..Default::default() };
     while let Some(batch) = batches.blocking_recv() {
         index_batch(&built, &mut writer, &batch, &mut stats)?;
         stats.batches = stats.batches.saturating_add(1);
@@ -149,6 +154,10 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
         .downcast_ref::<TimestampMicrosecondArray>()
         .ok_or_else(|| anyhow!("timestamp column is not TimestampMicrosecondArray (got {:?})", batch.column(ts_idx).data_type()))?;
     let id_col = batch.column(id_idx);
+    anyhow::ensure!(ts_col.null_count() == 0, "index timestamp column contains nulls");
+    for name in built.element_fields() {
+        anyhow::ensure!(schema.index_of(&name).is_ok(), "missing element index column: {name}");
+    }
     let id_kind = match id_col.data_type() {
         DataType::Utf8 => ColKind::Utf8,
         DataType::Utf8View => ColKind::Utf8View,
@@ -160,13 +169,24 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
         field: tantivy::schema::Field,
         column: &'a ArrayRef,
         kind: ColKind,
+        list_mode: TantivyListMode,
     }
     let user_cols: Vec<UserCol> = built
         .user_fields
         .iter()
         .filter_map(|(name, uf)| schema.index_of(name).ok().map(|idx| (batch.column(idx), uf)))
         .map(|(column, uf)| {
-            Ok(UserCol { field: uf.field, column, kind: ColKind::detect(column.data_type(), uf.source.tantivy.as_ref().and_then(|t| t.flatten.as_deref()))? })
+            let cfg = uf.source.tantivy.as_ref().context("indexed field lacks configuration")?;
+            if cfg.list_mode == TantivyListMode::Elements {
+                anyhow::ensure!(
+                    matches!(column.data_type(), DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::Utf8View))
+                        && canonical_tokenizer(cfg) == RAW_TOKENIZER
+                        && cfg.flatten.is_none(),
+                    "element index `{}` requires List(Utf8), raw tokenizer and no flattening",
+                    uf.source.name
+                );
+            }
+            Ok(UserCol { field: uf.field, column, kind: ColKind::detect(column.data_type(), cfg.flatten.as_deref())?, list_mode: cfg.list_mode })
         })
         .collect::<Result<_>>()?;
 
@@ -179,7 +199,19 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
         // one, valid as a parquet row index only for read-back builds.
         let mut doc = doc!(built.timestamp => ts, built.id => id, built.row_ordinal => stats.rows);
         for uc in &user_cols {
-            if let Some(text) = uc.kind.extract(uc.column, row)?
+            if uc.list_mode == TantivyListMode::Elements {
+                if !uc.column.is_null(row) {
+                    let arr = uc.column.as_any().downcast_ref::<ListArray>().context("element index requires list")?;
+                    let inner = arr.value(row);
+                    // Raw terms preserve punctuation, whitespace and empty strings.
+                    // Repeated terms share a document posting, so they count once.
+                    if let Some(values) = inner.as_any().downcast_ref::<StringArray>() {
+                        values.iter().flatten().for_each(|value| doc.add_text(uc.field, value));
+                    } else if let Some(values) = inner.as_any().downcast_ref::<StringViewArray>() {
+                        values.iter().flatten().for_each(|value| doc.add_text(uc.field, value));
+                    }
+                }
+            } else if let Some(text) = uc.kind.extract(uc.column, row)?
                 && !text.is_empty()
             {
                 doc.add_text(uc.field, &text);
@@ -333,7 +365,7 @@ mod builder_tests {
             fields: vec![
                 f("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", None),
                 f("id", "Utf8", None),
-                f("level", "Utf8", Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None })),
+                f("level", "Utf8", Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None, list_mode: Default::default() })),
             ],
         }
     }
@@ -356,6 +388,81 @@ mod builder_tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn list_elements_preserve_exact_terms_and_legacy_text() -> Result<()> {
+        use arrow::array::{ListBuilder, StringBuilder};
+        for (mode, cases) in [
+            (TantivyListMode::Elements, vec![("err:a", 2), ("x y", 1), ("err:a x y", 0), ("", 1), ("*", 1), ("α", 1)]),
+            (TantivyListMode::JoinedText, vec![("err:a", 0), ("x y", 0), ("err:a x y", 1), ("", 0), ("* α", 1)]),
+        ] {
+            let mut table = table();
+            table.fields[2].data_type = "List(Utf8)".into();
+            table.fields[2].tantivy.as_mut().unwrap().list_mode = mode;
+            let mut lists = ListBuilder::new(StringBuilder::new());
+            for values in [
+                Some(vec![Some("err:a"), Some("x y")]),
+                Some(vec![Some("err:a"), Some("err:a")]),
+                Some(vec![Some("")]),
+                Some(vec![None]),
+                Some(vec![]),
+                None,
+                Some(vec![Some("*"), Some("α")]),
+            ] {
+                if let Some(values) = values {
+                    values.into_iter().for_each(|value| lists.values().append_option(value));
+                    lists.append(true);
+                } else {
+                    lists.append(false);
+                }
+            }
+            let values: ArrayRef = Arc::new(lists.finish());
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+                Field::new("id", DataType::Utf8, false),
+                Field::new("level", values.data_type().clone(), true),
+            ]));
+            let input = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(TimestampMicrosecondArray::from(vec![0; 7]).with_timezone("UTC")),
+                    Arc::new(StringArray::from_iter_values((0..7).map(|i| i.to_string()))),
+                    values,
+                ],
+            )?;
+            let (index, built, stats) = build_in_memory(&table, std::slice::from_ref(&input))?;
+            assert_eq!(stats.element_fields.contains("level"), mode == TantivyListMode::Elements);
+            let mut entry = ManifestEntry::failed("old build".into(), vec!["file".into()]);
+            entry.index = Some("index".into());
+            entry.error = None;
+            assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "legacy index must not stop element backfill");
+            entry.element_fields = stats.element_fields.clone();
+            assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "element histograms need physical ordinals");
+            entry.ordinals_valid = true;
+            assert!(entry.covers_current_elements(&table));
+            entry.schema_version = SCHEMA_VERSION + 1;
+            assert!(!entry.covers_current_elements(&table));
+            let reader = index.reader()?;
+            for (term, expected) in cases {
+                let q = TermQuery::new(Term::from_field_text(built.user_fields["level"].field, term), IndexRecordOption::Basic);
+                assert_eq!(reader.searcher().search(&q, &tantivy::collector::Count)?, expected, "{mode:?}: {term:?}");
+                if mode == TantivyListMode::Elements {
+                    let predicate = histogram::Membership::Contains { column: "level".into(), value: term.into() };
+                    let counts = histogram::HistogramWindow::new(-1, 1, 1, 0, 2)?.count_rows(
+                        std::slice::from_ref(&input),
+                        &arrow::buffer::BooleanBuffer::new_set(7),
+                        Some(&predicate),
+                    )?;
+                    assert_eq!(counts.values().sum::<u64>(), expected as u64, "captured-row membership must match exact indexed elements");
+                }
+            }
+            if mode == TantivyListMode::Elements {
+                table.fields[2].tantivy.as_mut().unwrap().tokenizer = Some("default".into());
+                assert!(build_in_memory(&table, &[input]).is_err(), "element mode must reject tokenized text");
+            }
+        }
+        Ok(())
     }
 
     fn error_hits(index: &Index, built: &BuiltSchema) -> Vec<Hit> {
@@ -483,6 +590,16 @@ pub struct BuiltSchema {
     pub user_fields: HashMap<String, UserField>,
 }
 
+impl BuiltSchema {
+    fn element_fields(&self) -> std::collections::BTreeSet<String> {
+        self.user_fields
+            .iter()
+            .filter(|(_, f)| f.source.tantivy.as_ref().is_some_and(|c| c.list_mode == TantivyListMode::Elements))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UserField {
     pub field: Field,
@@ -590,10 +707,65 @@ pub struct Manifest {
     #[educe(Default = SCHEMA_VERSION)]
     pub version: u32,
     pub entries: BTreeMap<String, ManifestEntry>,
+    /// Replaced generations stay readable through manifest caches and in-flight
+    /// queries. GC removes them after the grace period, retrying failed deletes.
+    #[serde(default)]
+    pub retired_blobs: BTreeMap<String, DateTime<Utc>>,
+    /// Bounded daily proofs survive eviction of the large logical-count cache.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) count_proofs: BTreeMap<chrono::NaiveDate, visibility::PartitionCountProof>,
+}
+
+impl Manifest {
+    /// Selects at most one physical-ordinal index for each captured file.
+    /// Results preserve source order; missing or obsolete coverage stays uncovered.
+    /// Absolute manifest URIs are resolved against the captured table root.
+    pub fn histogram_entries<'a>(&'a self, root: &url::Url, files: &[visibility::SnapshotFile]) -> Result<Vec<Option<HistogramEntry<'a>>>> {
+        anyhow::ensure!(self.version == SCHEMA_VERSION, "unsupported histogram manifest version");
+        let paths = files.iter().map(|file| file.path.as_str()).collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(paths.len() == files.len(), "histogram snapshot has duplicate physical file paths");
+        let mut selected = BTreeMap::new();
+        for (key, entry) in &self.entries {
+            if entry.schema_version != SCHEMA_VERSION || entry.index.is_none() || entry.error.is_some() || !entry.ordinals_valid {
+                continue;
+            }
+            let [source] = entry.covered_files.as_slice() else { continue };
+            let Some(source) = visibility::relative_source_path(root, source)? else { continue };
+            if paths.contains(source.as_str()) {
+                anyhow::ensure!(
+                    selected.insert(source.clone(), HistogramEntry { key, entry }).is_none(),
+                    "histogram manifest has overlapping ordinal coverage for {source}"
+                );
+            }
+        }
+        Ok(files.iter().map(|file| selected.remove(file.path.as_str())).collect())
+    }
+
+    fn insert(&mut self, key: String, entry: ManifestEntry) {
+        if let Some(blob) = &entry.index {
+            self.retired_blobs.remove(blob);
+        }
+        if let Some(old) = self.entries.insert(key.clone(), entry)
+            && let Some(blob) = old.index
+            && self.entries[&key].index.as_ref() != Some(&blob)
+        {
+            self.retired_blobs.entry(blob).or_insert_with(Utc::now);
+        }
+    }
+}
+
+/// An entry borrowed from the manifest retained by the query snapshot.
+pub struct HistogramEntry<'a> {
+    pub key: &'a str,
+    pub entry: &'a ManifestEntry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
+    /// Missing in legacy manifests: those indexes store joined list text and
+    /// cannot answer exact element predicates, even if the field name exists.
+    #[serde(default)]
+    pub element_fields: std::collections::BTreeSet<String>,
     /// Object-store path to the index tar.zst, or `None` if build failed.
     pub index: Option<String>,
     pub rows: u64,
@@ -674,10 +846,27 @@ pub async fn mutate<R, F: FnOnce(&mut Manifest) -> (R, bool)>(store: &dyn Object
 
 /// Idempotent upsert: load, mutate, save.
 impl ManifestEntry {
+    /// Whether this entry has the list representation requested by the table.
+    /// Used by both the coverage census and maintenance backfill.
+    /// Element histograms also require one-file physical ordinal coverage.
+    pub fn covers_current_elements(&self, table: &TableSchema) -> bool {
+        self.index.is_some()
+            && self.error.is_none()
+            && self.schema_version == SCHEMA_VERSION
+            && (self.element_fields.is_empty() || (self.ordinals_valid && self.covered_files.len() == 1))
+            && self.element_fields
+                == table
+                    .fields
+                    .iter()
+                    .filter(|field| field.tantivy.as_ref().is_some_and(|config| config.indexed && config.list_mode == TantivyListMode::Elements))
+                    .map(|field| field.name.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+    }
     /// Entry recorded when the index build itself failed: no index, no rows,
     /// but the covered files are still tracked so GC can reap it later.
     pub fn failed(error: String, covered_files: Vec<String>) -> Self {
         Self {
+            element_fields: Default::default(),
             index: None,
             rows: 0,
             built_at: Utc::now(),
@@ -693,7 +882,7 @@ impl ManifestEntry {
 
 pub async fn upsert_manifest(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_key: &str, entry: ManifestEntry) -> Result<()> {
     mutate(store, table, project_id, |m| {
-        m.entries.insert(parquet_key.to_string(), entry);
+        m.insert(parquet_key.to_string(), entry);
         ((), true)
     })
     .await
@@ -713,7 +902,7 @@ pub async fn upsert_manifest_many(store: &dyn ObjectStore, table: &str, project_
     }
     mutate(store, table, project_id, |m| {
         for (key, entry) in entries {
-            m.entries.insert(key, entry);
+            m.insert(key, entry);
         }
         ((), true)
     })
@@ -776,12 +965,26 @@ pub fn index_path_for_parquet(table: &str, parquet_rel: &str) -> ObjPath {
     ObjPath::from(format!("{INDEX_PREFIX}/{table}/{INDEX_VERSION}/{stem}{BLOB_SUFFIX}"))
 }
 
+/// Gives each successful build an immutable object identity. A rebuild can
+/// change field representation or physical ordinals while retaining its source file.
+fn generation_blob_path(base: &ObjPath, generation: uuid::Uuid) -> ObjPath {
+    let stem = base.as_ref().strip_suffix(BLOB_SUFFIX).unwrap_or(base.as_ref());
+    ObjPath::from(format!("{stem}.generation-{generation}{BLOB_SUFFIX}"))
+}
+
+fn split_blob_generation(blob: &str) -> Option<(&str, &str)> {
+    let (stem, generation) = blob.strip_suffix(BLOB_SUFFIX)?.rsplit_once(".generation-")?;
+    uuid::Uuid::parse_str(generation).ok()?;
+    Some((stem, generation))
+}
+
 /// Inverse of `index_path_for_parquet`: recover the table-relative parquet
 /// path from an index blob path, or `None` if it isn't a partition-mirrored
 /// blob for `table`. Used by reconcile to detect orphan blobs (no live parquet).
 pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
     let prefix = format!("{INDEX_PREFIX}/{table}/{INDEX_VERSION}/");
-    let stem = blob_path.strip_prefix(&prefix)?.strip_suffix(BLOB_SUFFIX)?;
+    let blob = blob_path.strip_prefix(&prefix)?;
+    let stem = split_blob_generation(blob).map(|(stem, _)| stem).or_else(|| blob.strip_suffix(BLOB_SUFFIX))?;
     Some(format!("{stem}.parquet"))
 }
 

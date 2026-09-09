@@ -9,7 +9,7 @@ use arrow::{
     array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray},
     datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
 };
-use object_store::memory::InMemory;
+use object_store::{ObjectStoreExt, memory::InMemory};
 use tempfile::TempDir;
 use timefusion::{
     config::TantivyConfig,
@@ -63,7 +63,12 @@ fn schema_with(level_indexed: bool) -> TableSchema {
                 name: "level".into(),
                 data_type: "Utf8".into(),
                 nullable: true,
-                tantivy: level_indexed.then(|| TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
+                tantivy: level_indexed.then(|| TantivyFieldConfig {
+                    indexed: true,
+                    tokenizer: Some("raw".into()),
+                    flatten: None,
+                    list_mode: Default::default(),
+                }),
                 dictionary: None,
                 bloom_filter: false,
                 mutable: false,
@@ -82,6 +87,136 @@ fn batch(rows: &[(i64, &str, &str)]) -> RecordBatch {
         Field::new("level", DataType::Utf8, true),
     ]));
     RecordBatch::try_new(schema, vec![ts, id, level]).unwrap()
+}
+
+#[tokio::test]
+async fn histogram_reads_masked_buckets_without_materializing_hits() -> anyhow::Result<()> {
+    use arrow::{
+        array::{Array, ListBuilder, StringBuilder},
+        buffer::BooleanBuffer,
+    };
+    use timefusion::tantivy::{
+        MergeMode, build_and_pack,
+        histogram::{HistogramWindow, Membership},
+        search::HistogramFile,
+        upload,
+    };
+
+    let mut table = schema_with(true);
+    table.fields[2].data_type = "List(Utf8)".into();
+    table.fields[2].tantivy.as_mut().unwrap().list_mode = timefusion::schema::TantivyListMode::Elements;
+    let base = batch(&[(1, "one", "a"), (2, "two", "b"), (3, "three", "a")]);
+    let mut lists = ListBuilder::new(StringBuilder::new());
+    for tag in ["a", "b", "a"] {
+        lists.values().append_value(tag);
+        lists.values().append_value(tag);
+        lists.append(true);
+    }
+    let lists = Arc::new(lists.finish());
+    let input_schema =
+        Arc::new(ArrowSchema::new(vec![base.schema().field(0).clone(), base.schema().field(1).clone(), Field::new("level", lists.data_type().clone(), true)]));
+    let input = RecordBatch::try_new(input_schema, vec![base.column(0).clone(), base.column(1).clone(), lists])?;
+    let (blob, stats) = build_and_pack(&table, std::slice::from_ref(&input), 3, MergeMode::Now)?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    upload(store.as_ref(), &object_store::path::Path::from("histogram"), blob).await?;
+    let mut entry = ManifestEntry::failed("pending".into(), vec!["file".into()]);
+    entry.index = Some("histogram".into());
+    entry.error = None;
+    entry.rows = stats.rows;
+    entry.element_fields = stats.element_fields;
+    entry.ordinals_valid = true;
+    let files = ["file", "uncovered"].map(|path| timefusion::tantivy::visibility::SnapshotFile {
+        path: path.into(),
+        size: 0,
+        partition_values: Default::default(),
+        deletion_vector: None,
+    });
+    let mut manifest = timefusion::tantivy::Manifest::default();
+    manifest.entries.insert("current".into(), entry.clone());
+    let mut obsolete = entry.clone();
+    obsolete.ordinals_valid = false;
+    manifest.entries.insert("old-flush".into(), obsolete);
+    let root = url::Url::parse("s3://bucket/tables/logs")?;
+    let selected = manifest.histogram_entries(&root, &files)?;
+    assert_eq!(selected[0].as_ref().unwrap().key, "current");
+    assert!(selected[1].is_none(), "uncovered sources must remain available to fallback");
+    entry.covered_files = vec!["s3://bucket/tables/logs/file".into()];
+    manifest.entries.insert("overlap".into(), entry.clone());
+    assert!(manifest.histogram_entries(&root, &files).is_err(), "overlapping entries must not double count a source");
+    manifest.entries.remove("overlap");
+    assert!(manifest.histogram_entries(&root, &[files[0].clone(), files[0].clone()]).is_err());
+    let cache = TempDir::new()?;
+    let mut config = prod_defaults();
+    config.timefusion_tantivy_prefilter_max_hits = 1;
+    let service = TantivySearchService::new(store, cache.path().into(), Arc::new(config));
+    let predicate = Membership::Contains { column: "level".into(), value: "a".into() };
+    let union = Membership::Or(Box::new(predicate.clone()), Box::new(predicate.clone()));
+    let window = HistogramWindow::new(0, 4, 2, 0, 2)?;
+    for predicate in [Some(&predicate), Some(&union), None] {
+        let result = service
+            .histogram_file(
+                "logs",
+                "p",
+                window,
+                predicate,
+                HistogramFile {
+                    table_root: &root,
+                    manifest_key: "file",
+                    source_file: "file",
+                    entry: &entry,
+                    visible: BooleanBuffer::from(vec![true, false, true]),
+                },
+            )
+            .await?;
+        assert_eq!(result, std::collections::BTreeMap::from([(0, 1), (2, 1)]));
+        assert_eq!(window.count_rows(std::slice::from_ref(&input), &BooleanBuffer::from(vec![true, false, true]), predicate)?, result);
+    }
+    assert_eq!(service.stats.hits_materialized.load(Relaxed), 0);
+    let rows = timefusion::tantivy::visibility::ResolvedSnapshot {
+        sources: vec![
+            timefusion::tantivy::visibility::SourceRows { batches: vec![input.clone()], live: BooleanBuffer::new_set(3) },
+            timefusion::tantivy::visibility::SourceRows { batches: vec![input.slice(1, 1)], live: BooleanBuffer::new_set(1) },
+        ],
+        winners: vec![BooleanBuffer::from(vec![true, false, true]), BooleanBuffer::new_set(1)],
+    };
+    for mode in ["indexed", "uncovered", "missing_blob"] {
+        if mode != "indexed" {
+            manifest.entries.clear();
+        }
+        if mode == "missing_blob" {
+            let mut missing = entry.clone();
+            missing.index = Some("absent-index".into());
+            manifest.entries.insert("absent-file".into(), missing);
+        }
+        let result = service
+            .histogram_snapshot(
+                "logs",
+                "p",
+                window,
+                None,
+                timefusion::tantivy::search::HistogramSnapshot { table_root: &root, files: &files[..1], manifest: &manifest, rows: &rows },
+            )
+            .await?;
+        assert_eq!(result.counts, std::collections::BTreeMap::from([(0, 1), (2, 2)]));
+        assert_eq!(result.indexed_sources, usize::from(mode == "indexed"));
+        assert_eq!(result.scanned_sources, if mode == "indexed" { 1 } else { 2 });
+        assert_eq!(result.index_errors.len(), usize::from(mode == "missing_blob"));
+    }
+    entry.ordinals_valid = false;
+    assert!(
+        service
+            .histogram_file(
+                "logs",
+                "p",
+                window,
+                Some(&predicate),
+                HistogramFile { table_root: &root, manifest_key: "file", source_file: "file", entry: &entry, visible: BooleanBuffer::new_set(3) }
+            )
+            .await
+            .is_err(),
+        "flush-order indexes cannot use physical masks"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -164,7 +299,7 @@ async fn single_file_flush_publishes_partition_mirrored_blob() {
     let entry = m.entries.get(&rel).expect("manifest keyed by table-relative parquet path");
     assert_eq!(entry.covered_files, vec![uri], "covered_files must keep the absolute URI");
     let blob = entry.index.as_ref().expect("index built");
-    assert_eq!(blob, &timefusion::tantivy::index_path_for_parquet(table_name, &rel).to_string(), "blob must live at the partition-mirrored path");
+    assert_eq!(timefusion::tantivy::index_to_parquet_rel(table_name, blob).as_deref(), Some(rel.as_str()), "generation must retain source identity");
 
     // And the read side must find + query it.
     let cache = TempDir::new().unwrap();
@@ -226,6 +361,51 @@ async fn seeded_cache_serves_first_query_without_object_store_reads() {
     assert_eq!(hits.len(), 1);
     assert_eq!(search.stats.blob_fetches.load(Relaxed), fetches_before, "a seeded index must never be re-downloaded");
     assert_eq!(fetches_before, 0, "the very first query must already be served locally");
+}
+
+#[tokio::test]
+async fn rebuilding_the_same_file_replaces_cached_terms_without_overwriting_old_blob() {
+    let table = "otel_logs_and_spans";
+    let project = "generation-test";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cfg = Arc::new(prod_defaults());
+    let cache = TempDir::new().unwrap();
+    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().into(), cfg.clone()));
+    let indexer = Arc::new(TantivyIndexService::new(store.clone(), cfg));
+    indexer.with_reader(&search);
+    let callback = indexer.clone().callback();
+    let uri = format!("s3://bucket/{table}/project_id={project}/date=2026-09-08/part-file.parquet");
+    let mut previous_blob = None;
+    for level in ["ERROR", "INFO"] {
+        callback(project.into(), table.into(), vec![batch(&[(0, "event", level)])], vec![uri.clone()]).await.unwrap();
+        let manifest = load_manifest(store.as_ref(), table, project).await.unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        let blob = manifest.entries.values().next().unwrap().index.clone().unwrap();
+        if let Some(old) = previous_blob {
+            assert_ne!(blob, old, "replacement must have a distinct immutable identity");
+            store.head(&object_store::path::Path::from(old)).await.expect("old snapshot can still read its blob");
+        }
+        previous_blob = Some(blob);
+        assert_eq!(search.search(table, project, "level", "ERROR").await.unwrap().unwrap().len(), usize::from(level == "ERROR"));
+        assert_eq!(search.search(table, project, "level", "INFO").await.unwrap().unwrap().len(), usize::from(level == "INFO"));
+    }
+    assert_eq!(search.stats.blob_fetches.load(Relaxed), 0, "both generations use their own seeded cache");
+    let manifest = load_manifest(store.as_ref(), table, project).await.unwrap();
+    assert_eq!(manifest.retired_blobs.len(), 1, "replaced generation must remain tracked for collection");
+    let retired = manifest.retired_blobs.keys().next().unwrap().clone();
+    let grace = indexer.gc_after_compaction(table, project, std::slice::from_ref(&uri)).await.unwrap();
+    assert_eq!(grace.blobs_deleted, 0, "recent snapshots retain the old generation");
+    timefusion::tantivy::mutate(store.as_ref(), table, project, |manifest| {
+        manifest.retired_blobs.values_mut().for_each(|at| *at = chrono::Utc::now() - chrono::Duration::days(2));
+        ((), true)
+    })
+    .await
+    .unwrap();
+    let collected = indexer.gc_after_compaction(table, project, &[uri]).await.unwrap();
+    assert_eq!(collected.blobs_deleted, 1);
+    assert!(matches!(store.head(&object_store::path::Path::from(retired)).await, Err(object_store::Error::NotFound { .. })));
+    store.head(&object_store::path::Path::from(previous_blob.unwrap())).await.expect("current generation must remain readable");
+    assert!(load_manifest(store.as_ref(), table, project).await.unwrap().retired_blobs.is_empty());
 }
 
 /// Installing the same blob twice — the indexer seeding while a query
@@ -461,6 +641,7 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
         "p1",
         "bucket-bad",
         ManifestEntry {
+            element_fields: Default::default(),
             index: None,
             rows: 0,
             built_at: chrono::Utc::now(),

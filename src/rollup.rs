@@ -1828,7 +1828,7 @@ fn parse_bucket_micros(value: &str) -> Option<i64> {
 /// class could not be attributed to a shape without a deploy. Describing the
 /// refusal at the point of refusal keeps that description single-sourced — a
 /// parallel "explain why it refused" walk drifts from the walk it explains.
-fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mut Vec<datafusion::logical_expr::Expr>) -> Result<String, String> {
+pub(crate) fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, filters: &mut Vec<datafusion::logical_expr::Expr>) -> Result<String, String> {
     use datafusion::logical_expr::{Expr, LogicalPlan};
     match plan {
         // Only a rename-free projection may be walked through. `hash AS name`
@@ -1931,7 +1931,7 @@ fn truncated(text: &str) -> String {
 /// column: only CSE's own generated aliases are inlined, any other alias
 /// declines, and the rebuilt aggregate must still carry field-for-field the same
 /// names and types — it stands in for the original only where they agree.
-fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregate) -> Option<datafusion::logical_expr::Aggregate> {
+pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregate) -> Option<datafusion::logical_expr::Aggregate> {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
 

@@ -337,6 +337,7 @@ pub mod test_helpers {
         let json_data = records.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
 
         let batch = ReaderBuilder::new(json_read_schema)
+            .with_batch_size(records.len().max(1))
             .build(std::io::Cursor::new(json_data.as_bytes()))?
             .next()
             .ok_or_else(|| anyhow::anyhow!("Failed to read batch"))??;

@@ -1,6 +1,7 @@
 //! Maintenance: rollup planning/coordinator ticks, dedup sweeps + wave commits,
 //! hot-tail packing/repair passes, vacuum, checkpoint/reconcile, shutdown.
 use super::*;
+use anyhow::Context;
 use tap::Tap;
 
 #[derive(Clone, Copy)]
@@ -5663,6 +5664,7 @@ impl Database {
             let (fingerprint, files) = Self::logical_count_partition_snapshot(&table, &key.project_id, &key.date)?;
             (fingerprint, files, Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
         };
+        let root = log_store.root_url().clone();
 
         // Restart warm-up first tries the persistent Arrow tier off the async
         // worker. A valid file installs its memory front without scanning Delta.
@@ -5750,9 +5752,28 @@ impl Database {
         let logical_rows = index.logical_rows();
         let estimated_bytes = index.estimated_heap_bytes();
         let file_count = files.len();
+        let proof = if self.tantivy_indexer().is_some()
+            && declared
+                .fields
+                .iter()
+                .any(|field| field.tantivy.as_ref().is_some_and(|config| config.indexed && config.list_mode == crate::schema::TantivyListMode::Elements))
+        {
+            let date = key.date.parse::<chrono::NaiveDate>()?;
+            let lo = date.and_hms_opt(0, 0, 0).context("invalid proof date")?.and_utc().timestamp_micros();
+            let hi = lo.checked_add(86_400_000_000).context("proof date overflow")?;
+            Some((date, crate::tantivy::visibility::PartitionCountProof::new(root, files.clone(), declared, index.count(lo, hi))?))
+        } else {
+            None
+        };
         let cache = Arc::clone(&self.logical_count_cache);
         let install_key = key.clone();
         tokio::task::spawn_blocking(move || cache.install(install_key, fingerprint, files, index)).await??;
+        if let Some((date, proof)) = proof
+            && let Some(indexer) = self.tantivy_indexer()
+            && let Err(error) = indexer.publish_count_proof(&key.table_name, &key.project_id, date, proof).await
+        {
+            warn!(%error, project_id = key.project_id, table_name = key.table_name, %date, "histogram count proof publication failed");
+        }
         info!(
             project_id = key.project_id,
             table_name = key.table_name,
