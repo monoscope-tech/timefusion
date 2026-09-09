@@ -20,6 +20,7 @@ use datafusion::{
         sqlparser::{dialect::GenericDialect, parser::Parser as SqlParser},
     },
 };
+use itertools::Itertools;
 use parking_lot::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -83,12 +84,13 @@ fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
     }
     // New fields are OK only if nullable (SchemaMode::Merge) — a new NOT NULL
     // field would break the already-buffered rows.
-    let new_fields = incoming.fields().iter().filter(|f| existing.field_with_name(f.name()).is_err()).collect::<Vec<_>>();
-    if new_fields.iter().any(|f| !f.is_nullable()) {
+    let Some(added) =
+        incoming.fields().iter().filter(|f| existing.field_with_name(f.name()).is_err()).try_fold(0usize, |n, f| f.is_nullable().then_some(n + 1))
+    else {
         return false;
-    }
-    if !new_fields.is_empty() {
-        info!("Schema evolution: {} new nullable field(s) added", new_fields.len());
+    };
+    if added > 0 {
+        info!("Schema evolution: {added} new nullable field(s) added");
     }
     true
 }
@@ -570,29 +572,33 @@ pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
 /// views into exact-size buffers; compact arrays pass through as Arc clones.
 /// Recurses into List/LargeList/FixedSizeList/Struct children.
 fn compact_view_arrays(arr: &ArrayRef) -> ArrayRef {
-    use arrow::array::{Array, BinaryViewArray, FixedSizeListArray, LargeListArray, ListArray, StringViewArray, StructArray};
+    use arrow::{
+        array::{Array, FixedSizeListArray, GenericByteViewArray, GenericListArray, OffsetSizeTrait, StructArray},
+        datatypes::{BinaryViewType, ByteViewType, StringViewType},
+    };
     fn wasteful(buffers: &[arrow::buffer::Buffer], used: usize) -> bool {
         buffers.iter().map(|b| b.capacity()).sum::<usize>() > used * 2 + 1024
     }
+    /// Utf8View / BinaryView share one representation, hence one arm.
+    fn gc_view<T: ByteViewType + ?Sized>(arr: &ArrayRef) -> ArrayRef {
+        let v = arr.as_any().downcast_ref::<GenericByteViewArray<T>>().unwrap();
+        if wasteful(v.data_buffers(), v.total_buffer_bytes_used()) { Arc::new(v.gc()) } else { arr.clone() }
+    }
+    /// List / LargeList differ only in offset width.
+    fn compact_list<O: OffsetSizeTrait>(arr: &ArrayRef, field: &FieldRef) -> ArrayRef {
+        let l = arr.as_any().downcast_ref::<GenericListArray<O>>().unwrap();
+        let vals = compact_view_arrays(l.values());
+        if Arc::ptr_eq(&vals, l.values()) {
+            arr.clone()
+        } else {
+            Arc::new(GenericListArray::<O>::new(field.clone(), l.offsets().clone(), vals, l.nulls().cloned()))
+        }
+    }
     match arr.data_type() {
-        DataType::Utf8View => {
-            let v = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
-            if wasteful(v.data_buffers(), v.total_buffer_bytes_used()) { Arc::new(v.gc()) } else { arr.clone() }
-        }
-        DataType::BinaryView => {
-            let v = arr.as_any().downcast_ref::<BinaryViewArray>().unwrap();
-            if wasteful(v.data_buffers(), v.total_buffer_bytes_used()) { Arc::new(v.gc()) } else { arr.clone() }
-        }
-        DataType::List(f) => {
-            let l = arr.as_any().downcast_ref::<ListArray>().unwrap();
-            let vals = compact_view_arrays(l.values());
-            if Arc::ptr_eq(&vals, l.values()) { arr.clone() } else { Arc::new(ListArray::new(f.clone(), l.offsets().clone(), vals, l.nulls().cloned())) }
-        }
-        DataType::LargeList(f) => {
-            let l = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
-            let vals = compact_view_arrays(l.values());
-            if Arc::ptr_eq(&vals, l.values()) { arr.clone() } else { Arc::new(LargeListArray::new(f.clone(), l.offsets().clone(), vals, l.nulls().cloned())) }
-        }
+        DataType::Utf8View => gc_view::<StringViewType>(arr),
+        DataType::BinaryView => gc_view::<BinaryViewType>(arr),
+        DataType::List(f) => compact_list::<i32>(arr, f),
+        DataType::LargeList(f) => compact_list::<i64>(arr, f),
         DataType::FixedSizeList(f, size) => {
             let l = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             let vals = compact_view_arrays(l.values());
@@ -1019,10 +1025,8 @@ pub fn sort_partition(schema: &crate::schema::TableSchema, batches: Vec<RecordBa
     };
     let sort_cols: Vec<SortColumn> = spec.into_iter().map(|(i, options)| SortColumn { values: combined.column(i).clone(), options: Some(options) }).collect();
     let indices = lexsort_to_indices(&sort_cols, None).ok()?;
-    let sorted = match indices.values().iter().enumerate().all(|(i, &v)| v as usize == i) {
-        true => combined,
-        false => take_record_batch(&combined, &indices).ok()?,
-    };
+    let already_ordered = indices.values().iter().enumerate().all(|(i, &v)| v as usize == i);
+    let sorted = if already_ordered { combined } else { take_record_batch(&combined, &indices).ok()? };
     // Hand back BATCHES, not the one concatenated monolith: a global lexsort has
     // to materialize the partition once, but nothing downstream should have to
     // hold it as a single value. Slicing is zero-copy and order-preserving, so
@@ -1408,40 +1412,27 @@ impl MemBuffer {
         })
     }
 
+    /// Project every bucket whose id passes `filter`, across all tables,
+    /// through `mk`. The per-table `collect` is load-bearing: the DashMap refs
+    /// can't outlive the closure.
+    fn buckets_where<T>(&self, filter: impl Fn(i64) -> bool, mk: impl Fn(&TableKey, i64, &TimeBucket) -> T) -> Vec<T> {
+        self.tables
+            .iter()
+            .flat_map(|t| t.value().buckets.iter().filter(|b| filter(*b.key())).map(|b| mk(t.key(), *b.key(), b.value())).collect::<Vec<_>>())
+            .collect()
+    }
+
     /// `(bucket_id, created_micros, memory_bytes)` for every bucket matching
     /// `filter`, across all tables — the flush dwell gate's input. Same id can
     /// appear once per (project, table).
     pub fn bucket_flush_meta(&self, filter: impl Fn(i64) -> bool) -> Vec<(i64, i64, usize)> {
-        self.tables
-            .iter()
-            .flat_map(|t| {
-                t.value()
-                    .buckets
-                    .iter()
-                    .filter(|b| filter(*b.key()))
-                    .map(|b| (*b.key(), b.value().created_micros, b.value().memory_bytes.load(std::sync::atomic::Ordering::Relaxed)))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        self.buckets_where(filter, |_, id, b| (id, b.created_micros, b.memory_bytes.load(Ordering::Relaxed)))
     }
 
     /// (project_id, table_name, bucket_id) for every bucket whose id passes
     /// `filter`. Drives the take-based flush paths.
     pub fn bucket_keys(&self, filter: impl Fn(i64) -> bool) -> Vec<(String, String, i64)> {
-        self.tables
-            .iter()
-            .flat_map(|t| {
-                let (project_id, table_name) = t.key();
-                // Collect per table: the DashMap ref can't outlive this closure.
-                t.value()
-                    .buckets
-                    .iter()
-                    .map(|b| *b.key())
-                    .filter(|id| filter(*id))
-                    .map(|id| (project_id.to_string(), table_name.to_string(), id))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        self.buckets_where(filter, |(project_id, table_name), id, _| (project_id.to_string(), table_name.to_string(), id))
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
@@ -1637,11 +1628,14 @@ impl MemBuffer {
         // filtered to matching rows before returning. Best-effort: anything that
         // fails to compile is left for FilterExec on top to evaluate.
         let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
-        let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
-        bucket_ids.sort_unstable();
 
-        let partitions = bucket_ids
-            .into_iter()
+        // `sorted_unstable` is eager, so the DashMap iterator is fully consumed
+        // and dropped before the per-bucket `get` below re-locks the same shard.
+        let partitions = table
+            .buckets
+            .iter()
+            .map(|b| *b.key())
+            .sorted_unstable()
             .filter_map(|bucket_id| table.buckets.get(&bucket_id).filter(|b| bucket_overlaps_range(b, &ts_range)).map(|b| (bucket_id, b)))
             .map(|(bucket_id, bucket)| {
                 // Hold the lock only long enough to clone Arc'd batch refs (and,
@@ -1840,6 +1834,9 @@ impl MemBuffer {
         let Some(table) = self.get_table(&b.project_id, &b.table_name) else {
             return true;
         };
+        // Greatest row timestamp this commit handed to Delta — both the flushed
+        // watermark and the floor the survivor's mask must start above.
+        let drained_max = b.batches.iter().filter_map(batch_timestamp_range).map(|(_, hi)| hi).max();
         let mut emptied = false;
         let mut flushed_through: Option<i64> = None;
         if let Some(bucket_ref) = table.buckets.get(&b.bucket_id) {
@@ -1863,9 +1860,7 @@ impl MemBuffer {
             emptied = g.is_empty();
             // Recorded whether or not anything survived: a bucket drained CLEAN
             // still takes later inserts, and the branch below never runs for it.
-            if let Some(hi) = b.batches.iter().filter_map(batch_timestamp_range).map(|(_, hi)| hi).max() {
-                flushed_through = Some(hi);
-            }
+            flushed_through = drained_max;
             if !emptied {
                 // Narrow the surviving bucket's time range to the remaining
                 // (late-arrival) rows: the old span still covered the DRAINED
@@ -1896,7 +1891,6 @@ impl MemBuffer {
                 // Trading a rare double-count for a certain disappearance is the
                 // right side of this: a masked row is WRONG, a duplicated one is
                 // deduped.
-                let drained_max = b.batches.iter().filter_map(batch_timestamp_range).map(|(_, hi)| hi).max();
                 let min = drained_max.map_or(min, |hi| min.max(hi.saturating_add(1)));
                 bucket.min_timestamp.store(min, Ordering::Relaxed);
                 bucket.max_timestamp.store(max, Ordering::Relaxed);
@@ -3468,6 +3462,23 @@ mod tests {
         );
     }
 
+    /// Every row's `name` column across `batches`, in order. The dedup tests
+    /// all assert on a Utf8View payload plus (sometimes) an Int64 key, so they
+    /// share these two extractors instead of re-deriving the downcast each time.
+    fn col_strings(batches: &[RecordBatch], name: &str) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let a = b.column_by_name(name).unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
+                (0..b.num_rows()).map(|i| a.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn col_i64(batches: &[RecordBatch], name: &str) -> Vec<i64> {
+        batches.iter().flat_map(|b| b.column_by_name(name).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect()
+    }
+
     #[test]
     fn dedup_batches_keep_last_on_composite_key() {
         let schema = Arc::new(Schema::new(vec![
@@ -3493,14 +3504,7 @@ mod tests {
         // survivors come back as multiple batches — collect across all of them.
         let total: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 3, "should collapse to 3 unique (id,ts)");
-        let got: Vec<(i64, String)> = out
-            .iter()
-            .flat_map(|b| {
-                let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-                let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
-                (0..b.num_rows()).map(move |i| (ids.value(i), pl.value(i).to_string())).collect::<Vec<_>>()
-            })
-            .collect();
+        let got: Vec<(i64, String)> = col_i64(&out, "id").into_iter().zip(col_strings(&out, "payload")).collect();
         // Surviving global indices [2,3,4] → batch1 keeps (1,new),(3,v3); batch2 keeps (2,new).
         assert_eq!(got, vec![(1, "v1-new".into()), (3, "v3".into()), (2, "v2-new".into())]);
     }
@@ -3533,14 +3537,7 @@ mod tests {
         for (batches, want) in [(vec![mk(None, "legacy"), mk(Some(10), "stamped")], "stamped"), (vec![mk(Some(10), "stamped"), mk(None, "legacy")], "stamped")]
         {
             let out = dedup_batches(batches, &keys, Some("updated_at"), None).expect("dedup ok");
-            let survivors: Vec<String> = out
-                .iter()
-                .flat_map(|b| {
-                    let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
-                    (0..b.num_rows()).map(|i| pl.value(i).to_string()).collect::<Vec<_>>()
-                })
-                .collect();
-            assert_eq!(survivors, vec![want.to_string()], "NULL tiebreak must lose regardless of arrival order");
+            assert_eq!(col_strings(&out, "payload"), vec![want.to_string()], "NULL tiebreak must lose regardless of arrival order");
         }
     }
 
@@ -3594,14 +3591,7 @@ mod tests {
         };
         let batches = vec![mk(vec![1], vec!["old"]), mk(vec![1], vec!["new"])];
         let out = dedup_batches(batches, &["id".to_string()], Some("updated_at"), None).expect("a legacy batch must flush, not fail the whole commit");
-        let got: Vec<String> = out
-            .iter()
-            .flat_map(|b| {
-                let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
-                (0..b.num_rows()).map(|i| pl.value(i).to_string()).collect::<Vec<_>>()
-            })
-            .collect();
-        assert_eq!(got, vec!["new".to_string()], "with no tiebreak available the last occurrence must win");
+        assert_eq!(col_strings(&out, "payload"), vec!["new".to_string()], "with no tiebreak available the last occurrence must win");
 
         // A missing dedup KEY stays fatal — that is a schema fault, not legacy data.
         assert!(dedup_batches(vec![mk(vec![1], vec!["x"])], &["nope".to_string()], None, None).is_err(), "a missing dedup key must still fail loudly");
@@ -3630,14 +3620,7 @@ mod tests {
         let batches =
             vec![mk(vec![1, 2], vec![Some(200), None], vec!["1-enriched", "2-base"]), mk(vec![1, 2], vec![Some(100), Some(50)], vec!["1-base", "2-enriched"])];
         let out = dedup_batches(batches, &["id".to_string()], Some("observed"), None).expect("dedup ok");
-        let mut got: Vec<(i64, String)> = out
-            .iter()
-            .flat_map(|b| {
-                let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-                let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
-                (0..b.num_rows()).map(move |i| (ids.value(i), pl.value(i).to_string())).collect::<Vec<_>>()
-            })
-            .collect();
+        let mut got: Vec<(i64, String)> = col_i64(&out, "id").into_iter().zip(col_strings(&out, "payload")).collect();
         got.sort();
         assert_eq!(got, vec![(1, "1-enriched".into()), (2, "2-enriched".into())]);
     }
@@ -3674,15 +3657,14 @@ mod tests {
 
         fn collapse(batches: Vec<RecordBatch>, drop_tombstones: Option<&str>) -> Vec<(i64, String, Option<bool>)> {
             let out = dedup_batches(batches, &["id".to_string()], Some("updated_at"), drop_tombstones).expect("collapse ok");
-            let mut got: Vec<(i64, String, Option<bool>)> = out
+            let deleted: Vec<Option<bool>> = out
                 .iter()
                 .flat_map(|b| {
-                    let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-                    let del = b.column_by_name("deleted").unwrap().as_any().downcast_ref::<BooleanArray>().unwrap();
-                    let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
-                    (0..b.num_rows()).map(move |i| (ids.value(i), pl.value(i).to_string(), del.is_valid(i).then(|| del.value(i)))).collect::<Vec<_>>()
+                    let d = b.column_by_name("deleted").unwrap().as_any().downcast_ref::<BooleanArray>().unwrap();
+                    (0..b.num_rows()).map(|i| d.is_valid(i).then(|| d.value(i))).collect::<Vec<_>>()
                 })
                 .collect();
+            let mut got: Vec<(i64, String, Option<bool>)> = itertools::izip!(col_i64(&out, "id"), col_strings(&out, "payload"), deleted).collect();
             got.sort();
             got
         }
@@ -4539,42 +4521,22 @@ mod tests {
         assert!(!buffer.has_table("project2", "table1"));
     }
 
+    /// A window is half-open: the last microsecond before a boundary belongs to
+    /// the previous bucket, and the boundary itself opens the next one — so two
+    /// rows one microsecond apart across it must land in two separate buckets.
     #[test]
-    fn test_bucket_boundary_exact() {
+    fn bucket_boundaries_are_half_open() {
+        for (ts, want) in [(0, 0), (BUCKET_DURATION_MICROS - 1, 0), (BUCKET_DURATION_MICROS, 1), (BUCKET_DURATION_MICROS * 2, 2)] {
+            assert_eq!(MemBuffer::compute_bucket_id(ts), want, "ts {ts}");
+        }
+
         let buffer = MemBuffer::new();
+        buffer.insert("project1", "table1", create_test_batch(BUCKET_DURATION_MICROS), BUCKET_DURATION_MICROS).unwrap();
+        assert_eq!(buffer.get_stats().total_buckets, 1, "the boundary instant alone opens exactly one bucket");
 
-        // Test timestamps exactly at bucket boundaries
-        let bucket_0_start = 0i64;
-        let bucket_1_start = BUCKET_DURATION_MICROS;
-        let bucket_2_start = BUCKET_DURATION_MICROS * 2;
-
-        assert_eq!(MemBuffer::compute_bucket_id(bucket_0_start), 0);
-        assert_eq!(MemBuffer::compute_bucket_id(bucket_1_start), 1);
-        assert_eq!(MemBuffer::compute_bucket_id(bucket_2_start), 2);
-
-        // Insert at exact boundary
-        buffer.insert("project1", "table1", create_test_batch(bucket_1_start), bucket_1_start).unwrap();
-
-        let stats = buffer.get_stats();
-        assert_eq!(stats.total_buckets, 1);
-    }
-
-    #[test]
-    fn test_bucket_boundary_one_before() {
-        let buffer = MemBuffer::new();
-
-        // Test timestamp one microsecond before bucket boundary
-        let just_before_bucket_1 = BUCKET_DURATION_MICROS - 1;
-        let bucket_1_start = BUCKET_DURATION_MICROS;
-
-        assert_eq!(MemBuffer::compute_bucket_id(just_before_bucket_1), 0);
-        assert_eq!(MemBuffer::compute_bucket_id(bucket_1_start), 1);
-
-        buffer.insert("project1", "table1", create_test_batch(just_before_bucket_1), just_before_bucket_1).unwrap();
-        buffer.insert("project1", "table1", create_test_batch(bucket_1_start), bucket_1_start).unwrap();
-
-        let stats = buffer.get_stats();
-        assert_eq!(stats.total_buckets, 2, "Should have 2 separate buckets");
+        let just_before = BUCKET_DURATION_MICROS - 1;
+        buffer.insert("project1", "table1", create_test_batch(just_before), just_before).unwrap();
+        assert_eq!(buffer.get_stats().total_buckets, 2, "one microsecond earlier belongs to the previous bucket");
     }
 
     /// The rollup read path splits a window at the oldest buffered row:
