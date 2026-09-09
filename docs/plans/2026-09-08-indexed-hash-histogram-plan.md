@@ -722,3 +722,21 @@ TCP-probe stderr fix. The existing production baseline is saved in
 image `7429546`, one matching event in a one-second hash histogram (754.13ms),
 confirmed by ID lookup (1246.52ms). These timings precede automatic indexing.
 Push, merge, and production verification of the schema change follow.
+
+
+### 30-minute goal audit — 2026-09-09 07:19 UTC
+
+Automatic production hash-element indexing is merged in PR #231 at
+`413f1ef3`. Every required check passed locally, including canonical
+PostgreSQL smoke and 63 e2e tests; the remote CI run completed successfully.
+Build/deploy run `34323175414` is currently building its image. Production
+still serves `7429546`, so automatic indexing is not yet verified live.
+
+Saved pre-deployment counters in
+`evidence/2026-09-08-hashes/production-before-automatic-index-stats.json`.
+Histogram snapshots are zero. Uncovered and oversized files are both zero
+under the old schema; that does not prove hash-element coverage. After the
+schema deploy, verify new coverage convergence and histogram routing, then
+repeat the saved bounded correctness/latency probe before widening ranges.
+The remaining reviews, complete-path benchmarks, and CPU/memory profiling
+remain open. Next audit: 07:49 UTC.

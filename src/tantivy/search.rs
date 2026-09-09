@@ -152,6 +152,7 @@ pub struct HistogramSnapshot<'a> {
     pub rows: &'a super::visibility::ResolvedSnapshot,
 }
 
+#[derive(Default)]
 pub struct HistogramSnapshotResult {
     pub counts: std::collections::BTreeMap<i64, u64>,
     pub indexed_sources: usize,
@@ -199,7 +200,7 @@ impl TantivySearchService {
         anyhow::ensure!(snapshot.rows.sources.len() == snapshot.files.len() + 1, "histogram snapshot must contain files followed by memory");
         anyhow::ensure!(snapshot.rows.winners.len() == snapshot.rows.sources.len(), "histogram snapshot is missing winner masks");
         let entries = snapshot.manifest.histogram_entries(snapshot.table_root, snapshot.files)?;
-        let mut result = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        let mut result = HistogramSnapshotResult::default();
         for (ordinal, (source, visible)) in snapshot.rows.sources.iter().zip(&snapshot.rows.winners).enumerate() {
             let indexed = if let Some(Some(entry)) = entries.get(ordinal) {
                 self.histogram_file(
@@ -231,10 +232,7 @@ impl TantivySearchService {
                     crate::support::without_blocking_the_worker(|| window.count_rows(&source.batches, visible, membership))?
                 }
             };
-            for (bucket, count) in counts {
-                let total = result.counts.entry(bucket).or_default();
-                *total = total.checked_add(count).context("histogram snapshot count overflow")?;
-            }
+            crate::tantivy::histogram::merge_counts(&mut result.counts, counts)?;
         }
         Ok(result)
     }
