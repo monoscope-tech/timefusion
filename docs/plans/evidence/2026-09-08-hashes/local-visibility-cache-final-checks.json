@@ -1,0 +1,28 @@
+{
+  "at": "2026-09-09T15:55:11.756252+00:00",
+  "source_commit": "0ec937e8",
+  "command": "CARGO_TARGET_DIR=/tmp/timefusion-isolated-target make ci CHECKS=\"fmt clippy test pg-smoke e2e\"",
+  "exit_code": 0,
+  "nextest": {
+    "run_id": "09d9438b-7ac9-451b-8033-d1b88cf3460f",
+    "passed": 1508,
+    "skipped": 17,
+    "seconds": 469.286
+  },
+  "doctests_passed": 10,
+  "e2e": {
+    "run_id": "682c4dfa-4f0e-4e97-a5b6-d93ebbc60fee",
+    "passed": 63,
+    "skipped": 1,
+    "seconds": 194.284,
+    "retries": 0
+  },
+  "attestations": [
+    "\u2500\u2500 attested fmt \u2192 refs/ci-attest/v1/fmt/6780329f7978e61780f456784aae93e271de4afff0a5650f586d745f78760c9a/darwin-aarch64/docker.minio.nextest.rust/20260909",
+    "\u2500\u2500 attested clippy \u2192 refs/ci-attest/v1/clippy/b9f62f5652a4bea768055d4aca3336bae6a7c46107c68bd4d116115feb9efd7e/darwin-aarch64/docker.minio.nextest.rust/20260909",
+    "\u2500\u2500 attested test \u2192 refs/ci-attest/v1/test/02a9a265aad3b413ab7db0693d408caac38c9752bebdbd93969034d3f8df84c7/darwin-aarch64/docker.minio.nextest.rust/20260909",
+    "\u2500\u2500 attested pg-smoke \u2192 refs/ci-attest/v1/pg-smoke/f97e88633a8fd4a7ff64f362e3623c15bf6d9257473e94cf1dcf63f0fb1e171a/darwin-aarch64/docker.minio.nextest.rust/20260909",
+    "\u2500\u2500 attested e2e \u2192 refs/ci-attest/v1/e2e/ebdd7191280abe22ee8174ea991628c04442338f68256d635eace1e32127c0d5/darwin-aarch64/docker.minio.nextest.rust/20260909"
+  ],
+  "limitations": "macOS arm64 local checks. Linux candidate image and production acceptance still pending."
+}

@@ -1,0 +1,10 @@
+{
+  "at": "2026-09-09T15:45:47.937415+00:00",
+  "command": "CARGO_TARGET_DIR=target cargo rustc --release --bench hash_histogram_sql -- -C strip=none",
+  "exit_code": 0,
+  "elapsed": "34m 33s",
+  "histogram_source_sha256": "05ceda655a5e295024e9e3fb4c66b692937fa3b457e05fcbd5952d59d6c6bf65",
+  "benchmark_source_sha256": "8c27fef207cbad7565f628dc0653cdcd22af3c1ae7b4316b407a2041df99bf5f",
+  "binary_sha256": "32eaf65bb9c3c6db35a8ec394339b6a08c2d7aa6972de8d8f82490600cecb9f6",
+  "binary_mtime": "2026-09-09T15:42:02.560876+00:00"
+}

@@ -1,0 +1,1931 @@
+{
+  "at": "2026-09-09T15:56:44.195416+00:00",
+  "samples": 240,
+  "rows_per_day": 100000,
+  "setup_ms": 39880.056417,
+  "warmup_ms": 5013.078208999999,
+  "raw_sha256": "e112696626380026dd8ac6a1b4c6b802dcff4fbd86269e96e635e1e11df0de56",
+  "groups": [
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 67.7206245,
+      "first_cache_median_ms": 43.2853745,
+      "first_cache_over_current": 0.6391756546781402,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 2.841875,
+      "first_cache_median_ms": 1.8824375,
+      "first_cache_over_current": 0.6623927864526061,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 95.497792,
+      "first_cache_median_ms": 68.338792,
+      "first_cache_over_current": 0.7156059901364001,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 115.5375,
+      "first_cache_median_ms": 74.744625,
+      "first_cache_over_current": 0.6469295683219735,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 67.672479,
+      "first_cache_median_ms": 46.389333500000006,
+      "first_cache_over_current": 0.6854977708146321,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 3.851146,
+      "first_cache_median_ms": 3.613625,
+      "first_cache_over_current": 0.9383245922122921,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 85.007917,
+      "first_cache_median_ms": 69.70512500000001,
+      "first_cache_over_current": 0.8199839198506652,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 172.678959,
+      "first_cache_median_ms": 86.000459,
+      "first_cache_over_current": 0.49803670058029487,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 88.8261875,
+      "first_cache_median_ms": 51.729729500000005,
+      "first_cache_over_current": 0.5823702553934335,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 23.0534585,
+      "first_cache_median_ms": 16.202312499999998,
+      "first_cache_over_current": 0.7028148292803874,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 158.475792,
+      "first_cache_median_ms": 72.302542,
+      "first_cache_over_current": 0.4562371393606917,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 138.177916,
+      "first_cache_median_ms": 94.918125,
+      "first_cache_over_current": 0.686926882006239,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 59.5343955,
+      "first_cache_median_ms": 37.5129795,
+      "first_cache_over_current": 0.6301059947774224,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 4.1627295,
+      "first_cache_median_ms": 3.1135205,
+      "first_cache_over_current": 0.747951674496265,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 92.934208,
+      "first_cache_median_ms": 58.151125,
+      "first_cache_over_current": 0.6257235764036425,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 126.765042,
+      "first_cache_median_ms": 75.551083,
+      "first_cache_over_current": 0.5959930419933913,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 161.970396,
+      "first_cache_median_ms": 100.28966700000001,
+      "first_cache_over_current": 0.6191851688749345,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 5.4093124999999995,
+      "first_cache_median_ms": 3.3713125,
+      "first_cache_over_current": 0.6232423251568476,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 169.373084,
+      "first_cache_median_ms": 138.020791,
+      "first_cache_over_current": 0.8148921170969526,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 204.957541,
+      "first_cache_median_ms": 164.835708,
+      "first_cache_over_current": 0.8042431968873007,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 131.4866665,
+      "first_cache_median_ms": 96.2748335,
+      "first_cache_over_current": 0.7322022533744894,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 6.4549164999999995,
+      "first_cache_median_ms": 5.0792915,
+      "first_cache_over_current": 0.7868872509814806,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 292.648083,
+      "first_cache_median_ms": 139.374833,
+      "first_cache_over_current": 0.47625404400820903,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 201.558167,
+      "first_cache_median_ms": 167.15379199999998,
+      "first_cache_over_current": 0.8293079585308989,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 206.431625,
+      "first_cache_median_ms": 112.61431250000001,
+      "first_cache_over_current": 0.545528392270322,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 55.240188,
+      "first_cache_median_ms": 37.126354,
+      "first_cache_over_current": 0.6720895663859796,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 220.33054199999998,
+      "first_cache_median_ms": 138.11075,
+      "first_cache_over_current": 0.6268343405609197,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 256.966,
+      "first_cache_median_ms": 183.15716700000002,
+      "first_cache_over_current": 0.712768097724991,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 159.7020205,
+      "first_cache_median_ms": 83.7869165,
+      "first_cache_over_current": 0.5246453127999091,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 7.6335205,
+      "first_cache_median_ms": 5.510521,
+      "first_cache_over_current": 0.7218846140519305,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 215.61370799999997,
+      "first_cache_median_ms": 126.94587500000002,
+      "first_cache_over_current": 0.5887653256257716,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 249.736833,
+      "first_cache_median_ms": 183.99183399999998,
+      "first_cache_over_current": 0.7367428816557468,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 274.481917,
+      "first_cache_median_ms": 214.1986665,
+      "first_cache_over_current": 0.7803744189822166,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 11.403082999999999,
+      "first_cache_median_ms": 9.312875,
+      "first_cache_over_current": 0.8166979929901415,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 417.717875,
+      "first_cache_median_ms": 255.59966699999998,
+      "first_cache_over_current": 0.6118954497697758,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 857.667333,
+      "first_cache_median_ms": 661.910375,
+      "first_cache_over_current": 0.7717565418805569,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 228.7145835,
+      "first_cache_median_ms": 171.579062,
+      "first_cache_over_current": 0.7501885510505717,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 24.788020500000002,
+      "first_cache_median_ms": 17.8723335,
+      "first_cache_over_current": 0.7210068871776186,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 328.42166699999996,
+      "first_cache_median_ms": 222.304834,
+      "first_cache_over_current": 0.676888452673252,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 797.879833,
+      "first_cache_median_ms": 753.182125,
+      "first_cache_over_current": 0.9439793987122871,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 258.93804150000005,
+      "first_cache_median_ms": 159.1054585,
+      "first_cache_over_current": 0.6144537804422993,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 200.12739599999998,
+      "first_cache_median_ms": 147.329292,
+      "first_cache_over_current": 0.7361775296371719,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 415.342958,
+      "first_cache_median_ms": 223.011417,
+      "first_cache_over_current": 0.5369331842626305,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 1137.5626670000001,
+      "first_cache_median_ms": 790.1749169999999,
+      "first_cache_over_current": 0.6946209997237891,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 264.30512450000003,
+      "first_cache_median_ms": 137.007229,
+      "first_cache_over_current": 0.5183676603288861,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 30.322375,
+      "first_cache_median_ms": 19.2527505,
+      "first_cache_over_current": 0.6349354395887525,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 412.21329099999997,
+      "first_cache_median_ms": 206.420417,
+      "first_cache_over_current": 0.5007611872466285,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 962.541625,
+      "first_cache_median_ms": 768.030709,
+      "first_cache_over_current": 0.7979194759499363,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 62.274417,
+      "first_cache_median_ms": 42.378375,
+      "first_cache_over_current": 0.6805101844630677,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 21.1706665,
+      "first_cache_median_ms": 21.2730205,
+      "first_cache_over_current": 1.0048347084396234,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        3,
+        3,
+        3
+      ],
+      "parquet_prepares": [
+        6,
+        3,
+        3,
+        3
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 92.27025,
+      "first_cache_median_ms": 63.897167,
+      "first_cache_over_current": 0.6925002045621422,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 191.026166,
+      "first_cache_median_ms": 145.317625,
+      "first_cache_over_current": 0.7607210469795013,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        6
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 59.378479,
+      "first_cache_median_ms": 43.633167,
+      "first_cache_over_current": 0.7348313351037503,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 26.2559795,
+      "first_cache_median_ms": 31.1279375,
+      "first_cache_over_current": 1.1855561320803134,
+      "samples": 4,
+      "cache_hits": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "parquet_prepares": [
+        3,
+        3,
+        3,
+        3
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 91.63537500000001,
+      "first_cache_median_ms": 63.568875,
+      "first_cache_over_current": 0.6937154455907447,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 210.98879100000002,
+      "first_cache_median_ms": 157.77225,
+      "first_cache_over_current": 0.7477755062353052,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        6
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 76.305958,
+      "first_cache_median_ms": 49.057375,
+      "first_cache_over_current": 0.6429035986940889,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 65.7127285,
+      "first_cache_median_ms": 48.7435835,
+      "first_cache_over_current": 0.7417677611727841,
+      "samples": 4,
+      "cache_hits": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "parquet_prepares": [
+        3,
+        3,
+        3,
+        3
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 125.66629100000002,
+      "first_cache_median_ms": 81.002583,
+      "first_cache_over_current": 0.6445848155095147,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 256.483625,
+      "first_cache_median_ms": 167.498208,
+      "first_cache_over_current": 0.6530561473466385,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        6
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 69.5921455,
+      "first_cache_median_ms": 39.070958000000005,
+      "first_cache_over_current": 0.5614276973254115,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 33.064625,
+      "first_cache_median_ms": 23.339999499999998,
+      "first_cache_over_current": 0.7058903435317956,
+      "samples": 4,
+      "cache_hits": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "parquet_prepares": [
+        3,
+        3,
+        3,
+        3
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 100.13862499999999,
+      "first_cache_median_ms": 71.266875,
+      "first_cache_over_current": 0.7116821805771749,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 304.912917,
+      "first_cache_median_ms": 192.212541,
+      "first_cache_over_current": 0.63038503875518,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        6
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 158.46529149999998,
+      "first_cache_median_ms": 101.81174999999999,
+      "first_cache_over_current": 0.6424861181667659,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 43.715708500000005,
+      "first_cache_median_ms": 50.434062,
+      "first_cache_over_current": 1.1536828231892888,
+      "samples": 4,
+      "cache_hits": [
+        3,
+        7,
+        7,
+        7
+      ],
+      "parquet_prepares": [
+        11,
+        7,
+        7,
+        7
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 232.050791,
+      "first_cache_median_ms": 150.611667,
+      "first_cache_over_current": 0.6490461262853442,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 442.778542,
+      "first_cache_median_ms": 386.797042,
+      "first_cache_over_current": 0.8735677213553857,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        14
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 163.308896,
+      "first_cache_median_ms": 117.15087449999999,
+      "first_cache_over_current": 0.7173575804468115,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 61.7634585,
+      "first_cache_median_ms": 62.08177049999999,
+      "first_cache_over_current": 1.0051537269403394,
+      "samples": 4,
+      "cache_hits": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "parquet_prepares": [
+        7,
+        7,
+        7,
+        7
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 286.279,
+      "first_cache_median_ms": 196.683584,
+      "first_cache_over_current": 0.6870346200734249,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 541.0625,
+      "first_cache_median_ms": 582.8895,
+      "first_cache_over_current": 1.0773053020676908,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        14
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 216.390021,
+      "first_cache_median_ms": 118.53087500000001,
+      "first_cache_over_current": 0.5477649775726027,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 151.094625,
+      "first_cache_median_ms": 116.83016649999999,
+      "first_cache_over_current": 0.7732251660176528,
+      "samples": 4,
+      "cache_hits": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "parquet_prepares": [
+        7,
+        7,
+        7,
+        7
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 286.21895800000004,
+      "first_cache_median_ms": 154.378958,
+      "first_cache_over_current": 0.5393736287726965,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 746.724916,
+      "first_cache_median_ms": 450.81591599999996,
+      "first_cache_over_current": 0.603724218035869,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        14
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 171.919896,
+      "first_cache_median_ms": 106.5855835,
+      "first_cache_over_current": 0.6199723591038003,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 92.2888545,
+      "first_cache_median_ms": 61.251521,
+      "first_cache_over_current": 0.6636935882653089,
+      "samples": 4,
+      "cache_hits": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "parquet_prepares": [
+        7,
+        7,
+        7,
+        7
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 266.138375,
+      "first_cache_median_ms": 114.288875,
+      "first_cache_over_current": 0.42943403032351124,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 981.9662500000001,
+      "first_cache_median_ms": 337.648,
+      "first_cache_over_current": 0.3438488848267443,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        14
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 370.85264600000005,
+      "first_cache_median_ms": 173.0706665,
+      "first_cache_over_current": 0.46668311084397646,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 326.4667085,
+      "first_cache_median_ms": 208.11260449999997,
+      "first_cache_over_current": 0.6374696074102146,
+      "samples": 4,
+      "cache_hits": [
+        7,
+        30,
+        30,
+        30
+      ],
+      "parquet_prepares": [
+        53,
+        30,
+        30,
+        30
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 540.568375,
+      "first_cache_median_ms": 262.458625,
+      "first_cache_over_current": 0.48552345482659803,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 1859.6364589999998,
+      "first_cache_median_ms": 1484.5982920000001,
+      "first_cache_over_current": 0.7983271594913381,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        60
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 369.353479,
+      "first_cache_median_ms": 166.552854,
+      "first_cache_over_current": 0.4509307843828378,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 272.50262449999997,
+      "first_cache_median_ms": 212.982375,
+      "first_cache_over_current": 0.7815791697081436,
+      "samples": 4,
+      "cache_hits": [
+        30,
+        30,
+        30,
+        30
+      ],
+      "parquet_prepares": [
+        30,
+        30,
+        30,
+        30
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 545.2005829999999,
+      "first_cache_median_ms": 349.077083,
+      "first_cache_over_current": 0.6402727617772926,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 1895.443542,
+      "first_cache_median_ms": 2078.45075,
+      "first_cache_over_current": 1.0965511258683536,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        60
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 305.96524999999997,
+      "first_cache_median_ms": 305.265625,
+      "first_cache_over_current": 0.9977133841179677,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 631.967521,
+      "first_cache_median_ms": 595.042646,
+      "first_cache_over_current": 0.9415715621879245,
+      "samples": 4,
+      "cache_hits": [
+        30,
+        30,
+        30,
+        30
+      ],
+      "parquet_prepares": [
+        30,
+        30,
+        30,
+        30
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 551.497209,
+      "first_cache_median_ms": 311.333333,
+      "first_cache_over_current": 0.564523859630267,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 2102.27925,
+      "first_cache_median_ms": 1805.909292,
+      "first_cache_over_current": 0.8590244573835755,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        60
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 287.50362500000006,
+      "first_cache_median_ms": 177.1046045,
+      "first_cache_over_current": 0.616008248591648,
+      "samples": 4,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "parquet_prepares": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 263.1439375,
+      "first_cache_median_ms": 259.58579149999997,
+      "first_cache_over_current": 0.9864783280443236,
+      "samples": 4,
+      "cache_hits": [
+        30,
+        30,
+        30,
+        30
+      ],
+      "parquet_prepares": [
+        30,
+        30,
+        30,
+        30
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 406.312084,
+      "first_cache_median_ms": 404.626458,
+      "first_cache_over_current": 0.995851400767101,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        0
+      ]
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 1983.783375,
+      "first_cache_median_ms": 1329.4480420000002,
+      "first_cache_over_current": 0.6701578704378447,
+      "samples": 1,
+      "cache_hits": [
+        0
+      ],
+      "parquet_prepares": [
+        60
+      ]
+    }
+  ],
+  "limitations": "Local MinIO. Historical first-cache comparison has different host load. Fresh application readers retain OS and object-store caches. Whole-process memory includes setup and all cases."
+}

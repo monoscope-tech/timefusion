@@ -214,3 +214,75 @@ project, Sep 2–8 has 225 files, 17 covered and 208 missing (about 7.4 GB
 compressed). Sep 6 has 33 files and zero covered. Earlier claims of about
 1,400 missing project files and 166 Sep 6 files are superseded. The checked
 audit tool and corrected metadata report are included with this change.
+
+## Review pass 3 — revised cache and checkpoint hooks
+
+Mechanical gate: fmt passed. cargo lint passed in 12m05s with no added
+warning suppressions. Full tests and the optimized benchmark remain active.
+
+Reuse: prepare_file owns the one metadata-open/reservation path used by both
+visibility misses and scan fallback. Table creation and property updates
+reuse base_commit_properties instead of maintaining different hook settings.
+
+Algebraic: Option<Vec<prepared source>> records whether visibility resolution
+already prepared the sources. Each source stays paired with its reservation;
+there is no second parallel vector or dummy prepared record on a cache hit.
+The visibility key still uses exact ordered Add metadata, DV, schema, key,
+tiebreak, tombstone, and clipped bounds. Relevant memory prevents admission.
+
+Functional: ordered file preparation remains a loop because source order is
+part of equal-version tie handling. Cache hits avoid that work. An absent or
+failed index prepares only its own fallback source. Indexed reads can skip
+Parquet metadata because the cache retains masks for the same immutable Add
+identity; fallback still validates the physical object's size and metadata.
+
+Tests and observability: the existing real partial-index case checks one
+Parquet prepare on a repeat, exact buckets, overlapping memory, and bounded
+reservations. The SQL benchmark checks prepares and cache hits per day.
+The counter counts preparation attempts and is exposed as a statistic, not
+an enable switch. The checkpoint regression failed before the two hook fixes
+and passed afterwards; no assertion or retry setting was weakened.
+
+Evasion review: no new allow, unsafe, ignored test, serialized key substitute,
+public read-view escape, or opt-out was introduced. Lazy metadata reads do
+not bypass snapshot capture, membership filtering, tombstones, or fallback.
+The isolated element-index branch is unfinished and is outside this release
+review. No additional source issue was identified in this pass. Full gate,
+final timing, production image signoff, and production acceptance are still
+required; this review does not establish those outcomes.
+
+### 2026-09-09 15:45 UTC goal audit
+
+The goal remains fast exact hash queries in production. Revised cache checks
+have passed formatting, clippy, and all 1508 nextest tests; the remaining
+local gate and optimized benchmark build are still in progress. No cache
+release has been deployed. Dedicated element-index implementation remains
+isolated and uncompiled; publication, GC, and scheduling integration must
+precede enablement. The measured 11–16% projected column-byte fraction is
+not a measured indexing speedup. Production acceptance and subsequent
+other-column CPU/memory profiling remain open.
+
+Revised full local gate completed successfully: fmt, Clippy, 1508 tests,
+10 doctests, PGWire smoke, and all 63 e2e tests. E2e run
+682c4dfa-4f0e-4e97-a5b6-d93ebbc60fee passed in 194.284 seconds without
+retries. Attestation references are recorded in local-visibility-cache-final-checks.json.
+The optimized lazy-metadata benchmark completed compilation in 34m33s and
+is now running the full 240-query matrix. Image signoff and deployment remain
+pending. User rejected a special historical index: full-index rebuild cost
+will be optimized separately, without a second artifact or worker pool.
+
+Revised optimized benchmark passed all 240 exact-bucket and execution-route
+checks over 3 million rows. Repeated warm partial queries reused every
+day's mask and prepared only one unindexed replacement per day (30 for
+30 days). The 30-day partial medians were rare 326.5 ms, medium 272.5 ms,
+common 632.0 ms, and overlap 263.1 ms. Ordinary-query medians were 370.9,
+369.4, 306.0, and 287.5 ms respectively. The common case remains slower
+than ordinary SQL. This run does not establish an incremental latency
+speedup over the first cache build: both native and ordinary controls
+changed with host conditions. It proves exact results and eliminated
+redundant preparations. Whole-process peak footprint was 595172288 bytes,
+including setup and every query; this is not a query heap profile.
+
+Production latency acceptance remains open. The candidate is ready for
+local image signoff based on the completed correctness gate and benchmark;
+no claim is made that cache optimization alone completes the hash goal.

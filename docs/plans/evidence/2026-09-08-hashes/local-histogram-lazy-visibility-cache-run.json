@@ -1,0 +1,41 @@
+{
+  "at": "2026-09-09T15:54:42.620034+00:00",
+  "load_average": [
+    18.5185546875,
+    60.2060546875,
+    139.09423828125
+  ],
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "/Users/tonyalaribe/Projects/apitoolkit/timefusion/target/release/deps/hash_histogram_sql-b0f1217e96d29072",
+    "100000"
+  ],
+  "build": {
+    "at": "2026-09-09T15:45:47.937415+00:00",
+    "command": "CARGO_TARGET_DIR=target cargo rustc --release --bench hash_histogram_sql -- -C strip=none",
+    "exit_code": 0,
+    "elapsed": "34m 33s",
+    "histogram_source_sha256": "05ceda655a5e295024e9e3fb4c66b692937fa3b457e05fcbd5952d59d6c6bf65",
+    "benchmark_source_sha256": "8c27fef207cbad7565f628dc0653cdcd22af3c1ae7b4316b407a2041df99bf5f",
+    "binary_sha256": "32eaf65bb9c3c6db35a8ec394339b6a08c2d7aa6972de8d8f82490600cecb9f6",
+    "binary_mtime": "2026-09-09T15:42:02.560876+00:00"
+  },
+  "limits": "Local MinIO; fresh application readers do not clear OS or object-store caches. Whole-process RSS includes setup and all query cases.",
+  "system": [
+    "Processes: 581 total, 51 running, 530 sleeping, 5090 threads ",
+    "2026/09/09 17:54:44",
+    "Load Avg: 22.80, 60.40, 138.70 ",
+    "CPU usage: 40.20% user, 28.96% sys, 30.83% idle ",
+    "SharedLibs: 527M resident, 109M data, 82M linkedit.",
+    "MemRegions: 1408821 total, 9785M resident, 207M private, 4469M shared.",
+    "PhysMem: 31G used (3161M wired, 11G compressor), 136M unused.",
+    "VM: 352T vsize, 5363M framework vsize, 5638337(0) swapins, 7399228(0) swapouts.",
+    "Networks: packets: 31492593/28G in, 23021440/18G out.",
+    "Disks: 151868644/1958G read, 100076532/1757G written.",
+    "",
+    ""
+  ],
+  "exit_code": 0,
+  "finished_at": "2026-09-09T15:56:28.156919+00:00"
+}
