@@ -47,3 +47,53 @@ Tantivy/search/bloom selection passed 35 tests in 10.675s, nextest
 classification. A rerun with per-test output and a multi-file callback
 case is pending. The added case commits two date-partitioned files and
 requires a separate valid physical index for each.
+
+The multi-file case passed. The full 35-test selection passed again in
+11.146s without a leaky classification; the earlier classification did not
+reproduce. The follow-up is committed as a17593ec (shutdown) and d72a4fa5
+(physical flush indexes), then integrated with master 03cc1ae at e787f2a7.
+Full local signoff is running against that combined tree using the isolated
+cache. No follow-up push or deployment is claimed yet.
+
+Full signoff caught the remaining callback rename in benches/tantivy_benchmarks.rs.
+The real buffered-write benchmark now uses the same physical-file callback
+and paired reader configuration as production. This missed consumer blocked
+Clippy; no Clippy/test/pgwire/e2e attestation was published for that run.
+The full signoff is being rerun after correcting it.
+
+Full signoff rerun passed formatting, Clippy, 1,506 tests in 125.389s,
+ten doctests, and PostgreSQL smoke tests. E2E failed with SIGSEGV during
+bootstrap; no E2E pass is attested. Crash reports show libunwind decodeFDE
+at a null address while anyhow captures the expected missing-table error.
+The isolated cache_warmth::second_read_after_flush_hits_foyer test passed
+without RUST_BACKTRACE and reproduced the crash with RUST_BACKTRACE=1
+in 0.877s. Backtrace capture remains enabled for acceptance.
+
+A first attempted system-linker experiment was invalid: LC_BUILD_VERSION
+still reported LLVM 15.0.7 because Cargo's configured flag took precedence.
+A private wrapper now selects Apple's linker; the resulting binary reports
+1115.7.3. Its targeted run is pending. No repository linker configuration
+has changed. Rust issue https://github.com/rust-lang/rust/issues/104388
+reports similar symptoms, but that does not establish this failure's cause.
+
+The verified Apple-linked binary passed the same test with backtraces enabled
+in 4.035s. The configured LLVM 15.0.7 binary failed in 0.877s. Removed the
+macOS-specific linker override, restoring the platform default. Full local
+signoff is running against that actual configuration, rebuilding dependencies
+as needed. The experimental metadata run was diagnostic only and was not
+used to attest E2E. Review: removing the override adds no suppression or knob,
+and the failing existing E2E remains part of the standard check.
+
+Default-linker full signoff progress: Clippy passed; 1,506 tests passed in
+133.752s (nextest b830f683-df5a-4736-a925-2382fea33dd8); ten doctests
+passed; PostgreSQL smoke passed and was attested. E2E run
+91a7df12-8991-4f33-9947-2ab019fafce3 is executing 63 tests. The source
+inputs remain frozen. Root's empty-query and DML-range fixes are separate
+until this diagnostic signoff finishes, then will receive combined signoff.
+
+Default-linker full signoff completed successfully. All 63 E2E tests passed
+in 222.964s, nextest 91a7df12-8991-4f33-9947-2ab019fafce3, with no retry
+or leak classification. All five checks are attested; no checks remain for
+GitHub on this tree. This establishes the standard E2E path works with
+backtraces enabled after removing the LLVM 15 linker override. Combined
+source will receive its own full signoff before push.
