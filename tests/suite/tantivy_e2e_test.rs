@@ -18,7 +18,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow::array::{Array, RecordBatch};
 use datafusion::{arrow::array::AsArray, execution::context::SessionContext};
 use serde_json::json;
@@ -81,6 +81,7 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
         layer = layer.with_tantivy_indexer(s.clone().callback());
         let cache_root = cfg_arc.core.timefusion_data_dir.clone();
         let search = Arc::new(TantivySearchService::new(obj_store, cache_root, Arc::new(cfg_arc.tantivy.clone())));
+        s.with_reader(&search);
         db = db.with_tantivy_search(search).with_tantivy_indexer(s.clone());
         svc = Some(s);
     }
@@ -218,19 +219,46 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
     // Direct writes bypass index construction. The update is appended through
     // the buffer, whose flush creates the only indexed file.
     db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("changed", "a")])?], true, None).await?;
+    let unindexed_sql = format!(
+        "SELECT time_bucket('1 second', timestamp), count(*) FROM {table} WHERE project_id='{project}' AND timestamp >= TIMESTAMP '{}' AND timestamp < TIMESTAMP '{}' AND array_has(hashes, 'a') GROUP BY 1",
+        now.format("%Y-%m-%d %H:%M:%S%.6f"),
+        (now + chrono::Duration::microseconds(1)).format("%Y-%m-%d %H:%M:%S%.6f")
+    );
+    let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
+    let result = ctx.sql(&unindexed_sql).await?.collect().await?;
+    assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 1);
+    assert_eq!(
+        db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "without usable indexes, narrow SQL must avoid whole-day histogram visibility work"
+    );
     let mut newer = vec![row("changed", "b")];
     newer.extend((0..9).map(|i| row(&format!("filler-{i}"), "b")));
     db.insert_records_batch(&project, table, vec![json_to_batch_for(table, newer)?], false, None).await?;
     db.buffered_layer().unwrap().flush_all_now().await?;
     let svc = svc.unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
+    let manifest = loop {
         let manifest = timefusion::tantivy::load_manifest(svc.object_store.as_ref(), table, &project).await?;
         if manifest.entries.values().any(|entry| entry.index.is_some()) {
-            break;
+            break manifest;
         }
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "index publication timed out");
         tokio::task::yield_now().await;
+    };
+    let result = ctx.sql(&unindexed_sql).await?.collect().await?;
+    assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 0, "the newer nonmatching version must suppress the old match");
+    assert_eq!(
+        db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "a flush index without physical ordinals cannot accelerate the histogram"
+    );
+    // Backfill only the newer file, preserving the uncovered older version.
+    let table_ref = db.resolve_table(&project, table).await?;
+    let store = table_ref.read().await.log_store().object_store(None);
+    for uri in manifest.entries.values().flat_map(|entry| &entry.covered_files) {
+        let relative = timefusion::tantivy::search::parquet_rel_of_uri(uri).context("missing relative Parquet path")?;
+        svc.build_index_for_file(table, &project, relative, uri, store.clone()).await?;
     }
     let result = db
         .tantivy_search()

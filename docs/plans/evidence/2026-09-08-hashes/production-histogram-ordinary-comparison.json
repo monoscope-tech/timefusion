@@ -1,0 +1,23 @@
+{
+  "recorded_at": "2026-09-09T07:57:59.064524+00:00",
+  "image": "413f1ef",
+  "samples": [
+    {
+      "name": "ordinary_count_timestamp",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 314.46
+    },
+    {
+      "name": "histogram_count_star",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "error_type": "QueryCanceled",
+      "elapsed_ms": 3140.29
+    }
+  ]
+}

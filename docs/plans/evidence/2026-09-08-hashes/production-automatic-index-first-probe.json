@@ -1,0 +1,76 @@
+{
+  "recorded_at": "2026-09-09T07:40:48.750355+00:00",
+  "service_image": "ghcr.io/monoscope-tech/timefusion:413f1ef",
+  "queries": [
+    {
+      "name": "hash_histogram_one_second",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "error_type": "QueryCanceled",
+      "elapsed_ms": 3113.41
+    },
+    {
+      "name": "known_event_control",
+      "sql": "SELECT id FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND id='1da21fbb-1d78-555f-ae88-a10edfc3afdf' AND hashes @> ARRAY['err:e03848c6'] LIMIT 1",
+      "rows": [
+        [
+          "1da21fbb-1d78-555f-ae88-a10edfc3afdf"
+        ]
+      ],
+      "elapsed_ms": 1091.47
+    }
+  ],
+  "stats_before": [
+    [
+      "maintenance",
+      "tantivy_uncovered_files",
+      "2391"
+    ],
+    [
+      "maintenance",
+      "tantivy_oversized_skipped",
+      "0"
+    ],
+    [
+      "scan",
+      "tantivy_backfill_built",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "stats_after": [
+    [
+      "maintenance",
+      "tantivy_uncovered_files",
+      "2391"
+    ],
+    [
+      "maintenance",
+      "tantivy_oversized_skipped",
+      "0"
+    ],
+    [
+      "scan",
+      "tantivy_backfill_built",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ]
+}

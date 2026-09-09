@@ -740,3 +740,107 @@ schema deploy, verify new coverage convergence and histogram routing, then
 repeat the saved bounded correctness/latency probe before widening ranges.
 The remaining reviews, complete-path benchmarks, and CPU/memory profiling
 remain open. Next audit: 07:49 UTC.
+
+
+### First live automatic-index validation — 2026-09-09 07:42 UTC
+
+Production now serves `413f1ef`. The saved one-second histogram probe timed
+out at 3113.41ms; its ID control returned the expected event in 1091.47ms.
+Two repeats returned the correct count in 367.20ms, then timed out at
+3119.62ms. Histogram execution counters remained zero. Coverage reported
+2,391 uncovered files, zero oversized skips, and zero backfill builds.
+
+Logs show the first request triggered a uniqueness proof for 2026-09-02,
+which completed in about five seconds with 3,031,107 rows. The source also
+resolves daily visibility before fallback. Investigate that work for narrow
+queries without usable element indexes; do not treat a successful repeat
+or the running service as production performance success. The probe JSON
+files record the exact SQL and results. Count-merging cleanup PR #232 is
+merged at `21a458c5` after complete local signoff.
+
+
+### Goal audit — 2026-09-09 07:49 UTC
+
+The previous turn verified the requested remote pull; it made no feature
+change. This turn reproduced unnecessary histogram execution locally: a
+one-microsecond SQL query against an unindexed Delta file returned the
+correct count but incremented the histogram execution counter. The new
+regression assertion failed with 1 versus the expected 0. The planner now
+checks captured physical-ordinal element coverage before executing the
+histogram or seeding a proof. Targeted verification is running. The same
+test subsequently exercises partial indexed coverage and newer versions.
+
+Deployment run 34323175414 completed successfully. Production logs show
+automatic backfill started at 07:45:11 with 52 files (1,959 MiB) selected,
+and index builds completed at 07:45:35. A follow-up statistics connection
+timed out; this does not establish a service failure or coverage convergence.
+The narrow-query fix, repeated reviews, local signoff, deployment validation,
+full-range benchmarks, and CPU/memory profiles remain open. Next audit:
+08:19 UTC.
+
+
+### Local no-coverage regression — 2026-09-09 07:55 UTC
+
+The regression passed in 3.015s after adding automatic SQL admission and
+correcting the integration fixture. The fixture now checks three states:
+no index, a flush index without physical ordinals, and a Parquet-backed
+index for only the newer file. Existing version, memory, and membership
+assertions still pass. The first two states use ordinary SQL; the third
+uses the histogram service automatically. Full `make ci-signoff` is running.
+
+The next performance investigation must retain the original scope: partial
+coverage still sorts daily visibility. Timestamp belongs to the immutable
+key, so rows outside the requested timestamp interval cannot compete with
+rows inside it. Test narrowing visibility before the sort while preserving
+physical ordinals, DV exclusions, tombstones, and memory authority. Do not
+claim that the no-coverage admission fix resolves partial-coverage latency.
+
+
+### Production routing comparison — 2026-09-09 07:58 UTC
+
+The production task changed at 07:54:49 without changing image `413f1ef`.
+The old task exited 0; startup reported a clean cursor snapshot. The old
+container has already been removed, so the restart cause is unverified.
+The statistics query now succeeds in 265ms: 2,380 uncovered files, zero
+oversized skips, four completed histogram snapshots, and no unique-partition
+counts. The restart reset process counters, so they cannot establish build
+throughput across the restart.
+
+On the same connection, ordinary SQL using `count(timestamp)` returned
+the known count 1 in 314.46ms. The otherwise identical `count(*)` histogram
+query timed out in 3140.29ms. Both include explicit timestamp bounds, so
+null timestamps cannot change the count. This strengthens the evidence
+that histogram routing adds work for this narrow query. Exact SQL and
+results are saved in `production-histogram-ordinary-comparison.json`.
+
+
+### Combined narrow-query fixes — 2026-09-09 08:15 UTC
+
+No-coverage admission passed complete local signoff and was pushed as
+`7a112910` in PR #234. Before merge, master advanced to `a56f0be8` with
+a substantial read-path refactor. That upstream change was merged locally.
+
+A separate checkout reproduced the remaining daily-sort problem: 20,000
+out-of-window keys exhausted the 32 MiB query pool with spill disabled.
+Filtering the captured visibility input before the sort made the same test
+pass, including the expected count 63 and zero retained reservations. This
+filter preserves physical lineage and relies on timestamp being an immutable
+key. The two fixes are now combined for a fresh local signoff and one release.
+Production serves `21a458c`; these fixes are not deployed yet.
+
+
+### Goal audit — 2026-09-09 08:19 UTC
+
+The previous goal turn made concrete progress: admission was pushed in PR
+#234 after full local signoff, and a resource regression proved the need to
+filter narrow windows before sorting. The filter passed that regression.
+Both fixes and upstream `a56f0be8` are now under a fresh local signoff.
+Formatting and Clippy have passed; the full test build is running. No
+production performance claim is justified yet.
+
+The next release must pass the combined local checks, merge, deploy, and
+repeat the saved ordinary-SQL/histogram comparison. Coverage convergence,
+partial-coverage latency, full SQL 3/7/30-day benchmarks, repeated broader
+reviews, and CPU/memory profiles remain open. Benchmark preparation now
+targets real SQL planning and Delta visibility, with independent expected
+bucket counts. Next audit: 08:49 UTC.
