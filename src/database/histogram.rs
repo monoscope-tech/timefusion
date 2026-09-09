@@ -642,6 +642,21 @@ impl super::Database {
         let Some(query) = crate::tantivy::planner::match_query(plan) else { return Ok(None) };
         let captured =
             self.capture_histogram(&query.project, &query.table, query.window, Some(&query.membership), 64 * 1024 * 1024, session.task_ctx()).await?;
+        // With no usable element index, ordinary SQL can prune a narrow time
+        // window without sorting daily visibility or starting a daily proof.
+        let columns = query.membership.columns();
+        let has_index = captured.partitions.values().try_fold(false, |found, files| -> Result<bool> {
+            Ok(found
+                || captured
+                    .manifest
+                    .histogram_entries(&captured.root, files)?
+                    .iter()
+                    .flatten()
+                    .any(|entry| columns.iter().all(|column| entry.entry.element_fields.contains(*column))))
+        })?;
+        if !has_index {
+            return Ok(None);
+        }
         drop(captured.seed_missing_proof(self));
         let result = captured.count_streaming().await?;
         for error in &result.index_errors {

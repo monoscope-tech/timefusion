@@ -217,3 +217,60 @@ Full local `make ci-signoff` passed all checks for the cleanup: fmt, Clippy,
 1,474 tests, eight doctests, PostgreSQL smoke, and 63 e2e tests. E2E nextest
 `12ac8937-f007-4785-af19-e6d953234d67` passed in 264.468s. All checks are
 attested locally; no failed check was attested.
+
+
+### No-coverage SQL admission — 2026-09-09
+
+Scoped rs-distill pass 1: the planner reuses `Manifest::histogram_entries`
+to select physical-ordinal coverage from the captured manifest. It uses the
+existing membership column set, `try_fold`, `flatten`, and `all`; no new
+configuration or index-selection abstraction is needed. The regression
+extends the existing real SQL/Delta test and preserves its later partial
+coverage, mutable-version, and routing assertions. No consolidation finding.
+
+Scoped rs-evasion pass 1: `histogram_plan` returns its existing `Ok(None)`
+when no captured file has coverage for all predicate columns. The caller
+then performs ordinary SQL planning. Invalid manifest errors still propagate
+to the existing logged planner fallback. The direct captured histogram APIs
+retain their fallback semantics and budgets. No unsafe code, suppression,
+sentinel, or weakened version mask was added. The new regression failed
+before the fix: histogram execution count 1 versus expected 0.
+
+This is an admission fix for zero usable coverage. Partial coverage can
+still incur daily visibility work, and capture still loads the manifest.
+Production latency validation and further narrow-window work remain open.
+
+
+Second scoped pass found two fixture limitations. `build_db` did not call
+`TantivyIndexService::with_reader`, unlike production startup, so it could
+retain an empty cached manifest after publication. Adding that wiring alone
+did not restore the routing assertion: flush indexes deliberately have
+`ordinals_valid: false`. The previous assertion proved histogram fallback
+execution, not use of an ordinal index.
+
+The test now asserts ordinary SQL for the flush-only state, then uses the
+real Parquet index builder to backfill only the newer file. It retains the
+uncovered older file and all existing mutable-version and routing assertions.
+No assertion was relaxed, and no sleep or cache-TTL workaround was added.
+
+rs-distill: the fixture reuses production reader wiring and the existing
+Parquet builder; no new cache or index-building mechanism. rs-evasion:
+publication still uses real Parquet and object storage. The reader remains
+a weak reference, and the fixture never marks flush ordinals valid by fiat.
+Targeted verification is pending.
+
+
+Final targeted run passed: `cargo nextest run --test suite
+mutable_index_filter_cannot_resurrect_an_uncovered_version`, nextest
+`8fe46d7a-ddb8-48ab-813c-5a0698a1bf56`, 3.015s. The test verifies no
+usable coverage, flush-only unusable ordinals, then real partial Parquet
+index coverage with mutable versions, memory rows, and SQL predicate forms.
+A final reread found no additional scoped rs-distill or rs-evasion finding.
+The complete local signoff remains required before pushing.
+
+
+Complete local signoff passed for no-coverage admission: `make ci-signoff`
+exited 0. Formatting, Clippy, 1,474 tests, eight doctests, PostgreSQL smoke,
+and 63 e2e tests passed. Every check was attested locally; final status
+leaves nothing for GitHub. Nextest runs: `e6066424-a057-4119-9366-997afd76a457`
+(full suite) and `59ace074-928a-4245-ac40-4b7774e96168` (e2e).

@@ -1,0 +1,33 @@
+{
+  "recorded_at": "2026-09-09T07:57:41.018709+00:00",
+  "image": "413f1ef",
+  "task": "d4a6ys7pcwt6dyeo8lllz5k5m",
+  "stats": [
+    [
+      "maintenance",
+      "tantivy_uncovered_files",
+      "2380"
+    ],
+    [
+      "maintenance",
+      "tantivy_oversized_skipped",
+      "0"
+    ],
+    [
+      "scan",
+      "tantivy_backfill_built",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "4"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "elapsed_ms": 265.35
+}

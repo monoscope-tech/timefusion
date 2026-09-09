@@ -1,0 +1,41 @@
+{
+  "recorded_at": "2026-09-09T07:41:55.078333+00:00",
+  "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+  "samples": [
+    {
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 367.2
+    },
+    {
+      "error_type": "QueryCanceled",
+      "elapsed_ms": 3119.62
+    }
+  ],
+  "stats": [
+    [
+      "maintenance",
+      "tantivy_uncovered_files",
+      "2391"
+    ],
+    [
+      "scan",
+      "tantivy_backfill_built",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ]
+}
