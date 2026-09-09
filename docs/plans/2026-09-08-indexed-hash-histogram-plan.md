@@ -1927,3 +1927,37 @@ So the full-index rebuild work on 548920d1, which projects only indexed
 columns and prepares variants once per batch, converts directly into coverage
 rate rather than merely creating idle headroom. Its end-to-end speedup is
 still unmeasured, and that measurement is what should decide whether it ships.
+
+### Three and a half hours on the raised knobs — 2026-09-09 22:12 UTC
+
+The knob raise is working at fleet level and is not reaching the dashboard
+band. Between 18:45 and 22:12 the manifest gained 98 hash entries fleet-wide,
+while the unified project's Sep 8 went from 24 to 29 covered files and Sep 1
+through Sep 7 stayed at exactly zero for the third consecutive reading.
+Sep 9 fell from 15 to 2 as compaction rewrote today's partition.
+
+Five files in three and a half hours is 1.4 per hour. Sep 8 alone has 44
+files left, about 31 hours at that rate, and Sep 1 to Sep 7 holds 166 more,
+which is roughly five days. Cumulative builds were 107 in the 4.2 hours since
+the restart, about 25 per hour, below the 48 to 52 per hour measured in the
+first pass, so the early rate did not hold.
+
+The reserved oldest-first share is not the whole cause, and the earlier
+entries here should be read with that correction.
+fair_tantivy_backfill_work round-robins projects EQUALLY, so the unified
+project receives about one twelfth of every pass regardless of holding the
+overwhelming majority of the queried data and of the uncovered backlog.
+Removing the 33% reservation raises its share from two thirds of one twelfth
+to one twelfth, roughly three times on the band, which puts Sep 8 near eleven
+hours and the week near two days. That is a real improvement and it is not
+the order-of-magnitude the band needs.
+
+Weighting each project's share by its uncovered backlog, rather than giving
+every project an equal slice, is the remaining ordering lever. It is not
+implemented and is deliberately held back so that the newest-first default
+can be measured on its own.
+
+One clear positive: the cache release stopped being dormant. histogram_
+snapshots reached 13 and histogram_delta_cache_hits reached 3, both from 0
+at the 17:45 probe, so the native route now completes in production and the
+released cache is being consulted.
