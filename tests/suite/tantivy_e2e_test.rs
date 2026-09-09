@@ -342,6 +342,32 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
             );
         }
     }
+    let lo = (now - chrono::Duration::days(30)).timestamp_micros();
+    let mid = (now - chrono::Duration::days(15)).timestamp_micros();
+    let hi = now.timestamp_micros() + 1;
+    let branch = |lo, hi, hash| {
+        format!(
+            "SELECT timestamp FROM {table} WHERE project_id='{project}' AND timestamp >= TIMESTAMP '{}' AND timestamp < TIMESTAMP '{}' AND array_has(hashes, '{hash}')",
+            chrono::DateTime::from_timestamp_micros(lo).unwrap().format("%Y-%m-%d %H:%M:%S%.6f"),
+            chrono::DateTime::from_timestamp_micros(hi).unwrap().format("%Y-%m-%d %H:%M:%S%.6f")
+        )
+    };
+    let union = |left, right| format!("SELECT time_bucket('1 hour', timestamp), count(*) FROM ({left} UNION ALL {right}) q GROUP BY 1");
+    let left = branch(lo, mid, "b");
+    let right = branch(mid, hi, "b");
+    for (query, expected, routed) in [
+        (format!("{} GROUP BY 1", branch(lo, hi, "b").replacen("SELECT timestamp", "SELECT time_bucket('1 hour', timestamp), count(*)", 1)), 10, true),
+        (union(&right, &left), 10, true),
+        (union(&right, &right), 20, false),
+        (union(&branch(lo, mid - 1, "b"), &right), 10, false),
+        (union(&left, &branch(mid, hi, "c")), 1, false),
+        (union(&left, &right.replacen("SELECT timestamp", "SELECT updated_at", 1)), 10, false),
+    ] {
+        let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
+        let result = ctx.sql(&query).await?.collect().await?;
+        assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), expected, "{query}");
+        assert_eq!(db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed), before + u64::from(routed), "{query}");
+    }
     let predicate = timefusion::tantivy::histogram::Membership::Contains { column: "hashes".into(), value: "c".into() };
     let captured = db.capture_histogram(&project, table, window, Some(&predicate), 16 * 1024 * 1024, ctx.task_ctx()).await?;
     let (count, write) = tokio::join!(captured.count(), async {

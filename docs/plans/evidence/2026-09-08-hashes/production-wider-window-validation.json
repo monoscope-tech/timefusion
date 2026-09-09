@@ -1,0 +1,55 @@
+{
+  "recorded_at": "2026-09-09T09:24:00.963105+00:00",
+  "image_before": "ghcr.io/monoscope-tech/timefusion:e44e08c",
+  "samples": [
+    {
+      "window": "minute",
+      "count": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:00' AND timestamp < TIMESTAMP '2026-09-02 08:05:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 426.64
+    },
+    {
+      "window": "minute",
+      "count": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:00' AND timestamp < TIMESTAMP '2026-09-02 08:05:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 479.52
+    },
+    {
+      "window": "hour",
+      "count": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:00:00' AND timestamp < TIMESTAMP '2026-09-02 09:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 483.72
+    },
+    {
+      "window": "hour",
+      "count": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:00:00' AND timestamp < TIMESTAMP '2026-09-02 09:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 471.91
+    }
+  ],
+  "image_after": "ghcr.io/monoscope-tech/timefusion:e44e08c"
+}

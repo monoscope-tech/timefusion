@@ -26,7 +26,7 @@ pub(crate) fn merge_counts(target: &mut BTreeMap<i64, u64>, counts: BTreeMap<i64
 
 /// Exact list membership. Binary operators cannot accidentally express an empty
 /// conjunction, whose SQL semantics depend on null-array presence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Membership {
     Contains { column: String, value: String },
     And(Box<Self>, Box<Self>),
