@@ -72,3 +72,26 @@ A Delta/manifest audit found only 14 physical hash candidates among 1,406 live
 project files for Sep 2–8. Sep 6 had none. Complete warm benchmark queries are
 fast, but partial coverage and cold index loading remain expensive. Continue
 coverage and visibility optimization after the local release path is usable.
+
+## First production deployment and digest correction
+
+PR 240 merged as 750742d6. GitHub run 34358189411 found the local candidate,
+skipped compilation, passed native smoke, deployed, and passed its readiness
+soak: 46 probes with zero transient failures. The workflow completed successfully.
+
+During concurrent local preflight, inspection found that promotion wrapped the
+single image in a manifest index. Its outer digest differed from the candidate
+although the amd64 image manifest was identical. The local lease waiter was
+stopped before it acquired ownership or changed production. Comparing the two
+registry references reproduced a failing assertion before the fix.
+
+Digest resolution now selects exactly one Linux amd64 manifest. It rejects
+missing or ambiguous platform matches. Existing receipts are normalized too,
+so the first index-based receipt remains usable. The real registry comparison
+now passes; a regression test covers index wrappers and ambiguous platforms.
+
+Updated local signoff passed, reusing all five matching Rust results and running
+both helper suites. Image smoke passed and published digest
+`sha256:5f00b4db1acefb426fc8522b540fa4b75a8961805b3fee91087e98915d4d1c2d`.
+No required check remains for GitHub. The next rollout will exercise the local
+command directly; production hash latency acceptance remains open.

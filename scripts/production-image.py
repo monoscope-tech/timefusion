@@ -41,10 +41,23 @@ def digest(image):
     if not image.startswith((REGISTRY + ':', REGISTRY + '@')):
         raise ValueError('Only production-registry images can be resolved')
     manifest = json.loads(output('docker', 'buildx', 'imagetools', 'inspect', image, '--format', '{{json .Manifest}}'))
+    return REGISTRY + '@' + runtime_digest(manifest)
+
+
+def runtime_digest(manifest):
+    # Promotion may wrap an unchanged image in an index. Deployment receipts
+    # identify the actual Linux amd64 manifest, not that incidental wrapper.
+    if 'manifests' in manifest:
+        candidates = [entry for entry in manifest['manifests']
+                      if entry.get('platform', {}).get('os') == 'linux'
+                      and entry['platform'].get('architecture') == 'amd64']
+        if len(candidates) != 1:
+            raise RuntimeError('Production index must identify exactly one Linux amd64 image')
+        manifest = candidates[0]
     value = manifest['digest']
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', value):
         raise RuntimeError('Registry returned an invalid image digest')
-    return REGISTRY + '@' + value
+    return value
 
 
 def smoke(image, recipe=ROOT / 'ci/smoke.Dockerfile'):

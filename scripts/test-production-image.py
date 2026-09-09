@@ -9,6 +9,18 @@ import unittest
 
 
 class ImageSnapshotTest(unittest.TestCase):
+    def test_promoted_index_identifies_runtime_image(self):
+        spec = importlib.util.spec_from_file_location('production_image', Path(__file__).with_name('production-image.py'))
+        image = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(image)
+        runtime = {'digest': 'sha256:' + 'a' * 64, 'platform': {'os': 'linux', 'architecture': 'amd64'}}
+        attestation = {'digest': 'sha256:' + 'b' * 64, 'platform': {'os': 'unknown', 'architecture': 'unknown'}}
+        index = {'digest': 'sha256:' + 'c' * 64, 'manifests': [attestation, runtime]}
+        self.assertEqual(image.runtime_digest(index), image.runtime_digest(runtime))
+        for entries in ([], [attestation], [runtime, runtime]):
+            with self.subTest(entries=entries), self.assertRaises(RuntimeError):
+                image.runtime_digest(dict(index, manifests=entries))
+
     def test_build_inputs_and_frozen_context(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
