@@ -1,0 +1,1499 @@
+{
+  "at": "2026-09-09T15:02:48.169027+00:00",
+  "samples": 240,
+  "rows_per_day": 100000,
+  "setup_ms": 31139.500917,
+  "warmup_ms": 4588.207625,
+  "raw_sha256": "8499c34bb4a0c11628bf99823b991aaa57ca8f17dc2ad993065d1a94fa9c692a",
+  "groups": [
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 43.2853745,
+      "previous_median_ms": 46.502562499999996,
+      "previous_over_current": 1.0743250586869704,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 1.8824375,
+      "previous_median_ms": 1.9755204999999998,
+      "previous_over_current": 1.0494481224476244,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 68.338792,
+      "previous_median_ms": 78.413917,
+      "previous_over_current": 1.1474290765923987,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 74.744625,
+      "previous_median_ms": 114.692958,
+      "previous_over_current": 1.5344642909105506,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 46.389333500000006,
+      "previous_median_ms": 46.6437915,
+      "previous_over_current": 1.0054852695824998,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 3.613625,
+      "previous_median_ms": 2.6796665000000006,
+      "previous_over_current": 0.7415452627209521,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 69.70512500000001,
+      "previous_median_ms": 62.871333,
+      "previous_over_current": 0.9019614124499453,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 86.000459,
+      "previous_median_ms": 84.714625,
+      "previous_over_current": 0.9850485216596343,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 51.729729500000005,
+      "previous_median_ms": 52.6006455,
+      "previous_over_current": 1.016835889311967,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 16.202312499999998,
+      "previous_median_ms": 16.062416499999998,
+      "previous_over_current": 0.9913656769674082,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 72.302542,
+      "previous_median_ms": 70.14658299999999,
+      "previous_over_current": 0.9701814218371463,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 94.918125,
+      "previous_median_ms": 87.892292,
+      "previous_over_current": 0.9259800696653036,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 37.5129795,
+      "previous_median_ms": 38.488146,
+      "previous_over_current": 1.0259954424574567,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 3.1135205,
+      "previous_median_ms": 3.163125,
+      "previous_over_current": 1.0159319651179428,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 58.151125,
+      "previous_median_ms": 58.306833000000005,
+      "previous_over_current": 1.0026776438117062,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 75.551083,
+      "previous_median_ms": 101.85900000000001,
+      "previous_over_current": 1.3482136318284148,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 100.28966700000001,
+      "previous_median_ms": 102.780771,
+      "previous_over_current": 1.0248390893550379,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 3.3713125,
+      "previous_median_ms": 2.8086659999999997,
+      "previous_over_current": 0.8331075805046253,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 138.020791,
+      "previous_median_ms": 149.377458,
+      "previous_over_current": 1.0822822918034138,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 164.835708,
+      "previous_median_ms": 159.964625,
+      "previous_over_current": 0.9704488605102481,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 96.2748335,
+      "previous_median_ms": 97.94862549999999,
+      "previous_over_current": 1.0173855610978542,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 5.0792915,
+      "previous_median_ms": 5.2279795,
+      "previous_over_current": 1.0292733740522668,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 139.374833,
+      "previous_median_ms": 143.419625,
+      "previous_over_current": 1.0290209639210832,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 167.15379199999998,
+      "previous_median_ms": 210.606917,
+      "previous_over_current": 1.2599589544459753,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 112.61431250000001,
+      "previous_median_ms": 117.594208,
+      "previous_over_current": 1.0442208045269554,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 37.126354,
+      "previous_median_ms": 35.933458,
+      "previous_over_current": 0.9678692930633588,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 138.11075,
+      "previous_median_ms": 136.545709,
+      "previous_over_current": 0.9886682173545506,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 183.15716700000002,
+      "previous_median_ms": 192.63649999999998,
+      "previous_over_current": 1.0517551846606144,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 83.7869165,
+      "previous_median_ms": 85.9805625,
+      "previous_over_current": 1.0261812475220997,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 5.510521,
+      "previous_median_ms": 5.391208000000001,
+      "previous_over_current": 0.9783481453024135,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 126.94587500000002,
+      "previous_median_ms": 100.03608299999999,
+      "previous_over_current": 0.7880215327989191,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 183.99183399999998,
+      "previous_median_ms": 1160.708875,
+      "previous_over_current": 6.30848038071081,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 214.1986665,
+      "previous_median_ms": 133.715979,
+      "previous_over_current": 0.6242614913758112,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 9.312875,
+      "previous_median_ms": 8.47225,
+      "previous_over_current": 0.90973517844919,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 255.59966699999998,
+      "previous_median_ms": 204.153792,
+      "previous_over_current": 0.7987247964607092,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 661.910375,
+      "previous_median_ms": 749.806667,
+      "previous_over_current": 1.1327918330332862,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 171.579062,
+      "previous_median_ms": 136.1845835,
+      "previous_over_current": 0.7937132999363291,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 17.8723335,
+      "previous_median_ms": 18.230354,
+      "previous_over_current": 1.0200321071672034,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 222.304834,
+      "previous_median_ms": 212.385708,
+      "previous_over_current": 0.9553805204253902,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 753.182125,
+      "previous_median_ms": 838.412959,
+      "previous_over_current": 1.1131609887847511,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 159.1054585,
+      "previous_median_ms": 156.40195799999998,
+      "previous_over_current": 0.9830081222511922,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 147.329292,
+      "previous_median_ms": 142.813063,
+      "previous_over_current": 0.9693460211564716,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 223.011417,
+      "previous_median_ms": 216.621416,
+      "previous_over_current": 0.9713467539646189,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 790.1749169999999,
+      "previous_median_ms": 812.726458,
+      "previous_over_current": 1.0285399352913147,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 137.007229,
+      "previous_median_ms": 122.9720835,
+      "previous_over_current": 0.8975590879222877,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 19.2527505,
+      "previous_median_ms": 18.822312,
+      "previous_over_current": 0.9776427529147068,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 206.420417,
+      "previous_median_ms": 207.015959,
+      "previous_over_current": 1.0028850925148554,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "complete",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 768.030709,
+      "previous_median_ms": 682.8435830000001,
+      "previous_over_current": 0.8890836980842651,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 42.378375,
+      "previous_median_ms": 49.9097915,
+      "previous_over_current": 1.1777183882109685,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 21.2730205,
+      "previous_median_ms": 74.480917,
+      "previous_over_current": 3.5011914269532154,
+      "cache_hits": [
+        0,
+        3,
+        3,
+        3
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 63.897167,
+      "previous_median_ms": 68.17774999999999,
+      "previous_over_current": 1.0669917494151187,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 145.317625,
+      "previous_median_ms": 181.358459,
+      "previous_over_current": 1.248014196488554,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 43.633167,
+      "previous_median_ms": 48.571270999999996,
+      "previous_over_current": 1.1131731739756592,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 31.1279375,
+      "previous_median_ms": 83.6371045,
+      "previous_over_current": 2.6868823062883624,
+      "cache_hits": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 63.568875,
+      "previous_median_ms": 70.777375,
+      "previous_over_current": 1.113396689810855,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 157.77225,
+      "previous_median_ms": 207.23487500000002,
+      "previous_over_current": 1.3135064943296428,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 49.057375,
+      "previous_median_ms": 50.205104000000006,
+      "previous_over_current": 1.0233956464242127,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 48.7435835,
+      "previous_median_ms": 104.2198745,
+      "previous_over_current": 2.1381250005962325,
+      "cache_hits": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 81.002583,
+      "previous_median_ms": 76.08175,
+      "previous_over_current": 0.9392509125295424,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 167.498208,
+      "previous_median_ms": 195.749333,
+      "previous_over_current": 1.168665237302121,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 39.070958000000005,
+      "previous_median_ms": 45.209625,
+      "previous_over_current": 1.1571158557207633,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 23.339999499999998,
+      "previous_median_ms": 79.96852100000001,
+      "previous_over_current": 3.4262434752837083,
+      "cache_hits": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 71.266875,
+      "previous_median_ms": 63.199875000000006,
+      "previous_over_current": 0.886805756531348,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 3,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 192.212541,
+      "previous_median_ms": 158.883833,
+      "previous_over_current": 0.8266049248056089,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 101.81174999999999,
+      "previous_median_ms": 99.79875,
+      "previous_over_current": 0.9802282153091368,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 50.434062,
+      "previous_median_ms": 174.5407715,
+      "previous_over_current": 3.460771640801013,
+      "cache_hits": [
+        3,
+        7,
+        7,
+        7
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 150.611667,
+      "previous_median_ms": 145.148583,
+      "previous_over_current": 0.9637273518790546,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 386.797042,
+      "previous_median_ms": 362.856084,
+      "previous_over_current": 0.9381045990522338,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 117.15087449999999,
+      "previous_median_ms": 107.944875,
+      "previous_over_current": 0.921417577638313,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 62.08177049999999,
+      "previous_median_ms": 170.83125,
+      "previous_over_current": 2.751713564612337,
+      "cache_hits": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 196.683584,
+      "previous_median_ms": 153.4685,
+      "previous_over_current": 0.7802811850327072,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 582.8895,
+      "previous_median_ms": 361.2085,
+      "previous_over_current": 0.6196860639966923,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 118.53087500000001,
+      "previous_median_ms": 113.7345,
+      "previous_over_current": 0.959534804750239,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 116.83016649999999,
+      "previous_median_ms": 231.2156455,
+      "previous_over_current": 1.9790748607723676,
+      "cache_hits": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 154.378958,
+      "previous_median_ms": 141.029416,
+      "previous_over_current": 0.9135274510662262,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 450.81591599999996,
+      "previous_median_ms": 401.130333,
+      "previous_over_current": 0.8897874248965071,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 106.5855835,
+      "previous_median_ms": 94.779354,
+      "previous_over_current": 0.88923239792556,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 61.251521,
+      "previous_median_ms": 182.628917,
+      "previous_over_current": 2.981622562482979,
+      "cache_hits": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 114.288875,
+      "previous_median_ms": 124.964833,
+      "previous_over_current": 1.0934120490730177,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 7,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 337.648,
+      "previous_median_ms": 349.269542,
+      "previous_over_current": 1.0344191051035396,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 173.0706665,
+      "previous_median_ms": 165.7840625,
+      "previous_over_current": 0.9578980993870502,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 208.11260449999997,
+      "previous_median_ms": 730.077479,
+      "previous_over_current": 3.5080887135790957,
+      "cache_hits": [
+        7,
+        30,
+        30,
+        30
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "ordinary",
+      "median_ms": 262.458625,
+      "previous_median_ms": 272.894917,
+      "previous_over_current": 1.039763570353232,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "rare",
+      "route": "histogram",
+      "median_ms": 1484.5982920000001,
+      "previous_median_ms": 1479.7164579999999,
+      "previous_over_current": 0.9967116801721335,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 166.552854,
+      "previous_median_ms": 163.691729,
+      "previous_over_current": 0.9828215192277643,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 212.982375,
+      "previous_median_ms": 757.4034795,
+      "previous_over_current": 3.556179141583899,
+      "cache_hits": [
+        30,
+        30,
+        30,
+        30
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "ordinary",
+      "median_ms": 349.077083,
+      "previous_median_ms": 291.81570800000003,
+      "previous_over_current": 0.835963522704239,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "medium",
+      "route": "histogram",
+      "median_ms": 2078.45075,
+      "previous_median_ms": 1801.50925,
+      "previous_over_current": 0.8667558035714823,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 305.265625,
+      "previous_median_ms": 175.2000835,
+      "previous_over_current": 0.5739266696012694,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 595.042646,
+      "previous_median_ms": 980.741229,
+      "previous_over_current": 1.6481864545217824,
+      "cache_hits": [
+        30,
+        30,
+        30,
+        30
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "ordinary",
+      "median_ms": 311.333333,
+      "previous_median_ms": 295.325917,
+      "previous_over_current": 0.9485843168614394,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "common",
+      "route": "histogram",
+      "median_ms": 1805.909292,
+      "previous_median_ms": 1445.01225,
+      "previous_over_current": 0.8001577135691486,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 177.1046045,
+      "previous_median_ms": 152.9004375,
+      "previous_over_current": 0.8633340614246989,
+      "cache_hits": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "warm",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 259.58579149999997,
+      "previous_median_ms": 767.1202295,
+      "previous_over_current": 2.9551703314239375,
+      "cache_hits": [
+        30,
+        30,
+        30,
+        30
+      ],
+      "samples": 4
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "ordinary",
+      "median_ms": 404.626458,
+      "previous_median_ms": 271.102833,
+      "previous_over_current": 0.6700076765617733,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    },
+    {
+      "coverage": "partial",
+      "reader_state": "cold",
+      "days": 30,
+      "predicate": "overlap",
+      "route": "histogram",
+      "median_ms": 1329.4480420000002,
+      "previous_median_ms": 1416.893833,
+      "previous_over_current": 1.0657760124784177,
+      "cache_hits": [
+        0
+      ],
+      "samples": 1
+    }
+  ],
+  "limitations": "Historical baseline used the same local workload but a different time and host load; within-run ordinary/native comparison is stronger than attributing every timing difference to the cache. Application-cold readers do not clear OS or S3 caches. Whole-process memory includes setup."
+}

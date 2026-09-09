@@ -1,0 +1,43 @@
+{
+  "at": "2026-09-09T15:00:20.515522+00:00",
+  "load_average": [
+    95.568359375,
+    128.44140625,
+    179.6669921875
+  ],
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "/Users/tonyalaribe/Projects/apitoolkit/timefusion/target/release/deps/hash_histogram_sql-b0f1217e96d29072",
+    "100000"
+  ],
+  "build": {
+    "at": "2026-09-09T14:49:17.361642+00:00",
+    "command": "CARGO_TARGET_DIR=/Users/tonyalaribe/Projects/apitoolkit/timefusion/target cargo rustc --release --bench hash_histogram_sql -- -C strip=none",
+    "exit_code": 0,
+    "histogram_source_sha256": "b5e926ed3e5a248667caa7740b45e26218bc493639cbf9309d6d35b9d2ec8b70",
+    "benchmark_source_sha256": "f302b4d92eba606446eb02d666206a7d320a18b4bf7f45ece44f862231590bc0",
+    "binary": "target/release/deps/hash_histogram_sql-b0f1217e96d29072",
+    "build_log_tail": [
+      "   Compiling timefusion v0.1.0 (/Users/tonyalaribe/Projects/apitoolkit/timefusion)",
+      "    Finished `release` profile [optimized] target(s) in 23m 29s"
+    ]
+  },
+  "limits": "Local MinIO; fresh application readers do not clear OS or object-store caches. Whole-process RSS includes setup and all query cases.",
+  "system": [
+    "Processes: 620 total, 57 running, 563 sleeping, 5294 threads ",
+    "2026/09/09 17:00:22",
+    "Load Avg: 98.49, 128.50, 179.39 ",
+    "CPU usage: 48.86% user, 33.42% sys, 17.70% idle ",
+    "SharedLibs: 479M resident, 103M data, 84M linkedit.",
+    "MemRegions: 1472019 total, 5117M resident, 137M private, 8536M shared.",
+    "PhysMem: 31G used (3310M wired, 10G compressor), 662M unused.",
+    "VM: 374T vsize, 5363M framework vsize, 4697593(0) swapins, 6404514(0) swapouts.",
+    "Networks: packets: 29753214/26G in, 21774729/17G out.",
+    "Disks: 145890129/1848G read, 95433784/1667G written.",
+    "",
+    ""
+  ],
+  "exit_code": 0,
+  "finished_at": "2026-09-09T15:01:39.869376+00:00"
+}
