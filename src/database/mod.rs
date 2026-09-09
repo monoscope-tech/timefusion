@@ -3005,6 +3005,8 @@ pub struct Database {
     /// At most one query-triggered proof build, including time waiting for the
     /// shared count-builder budget. Admission never queues query requests.
     histogram_proof_build: Arc<histogram::HistogramProofBuilds>,
+    /// Startup and scheduled backfill share one pass per indexed table.
+    tantivy_backfill_slots: Arc<dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Last snapshot-persist time per table URL; throttles `persist_snapshot`.
     /// The on-disk snapshot is only a boot-recovery seed, so staleness just
     /// means boot replays a few more sub-second commits.
@@ -3740,6 +3742,7 @@ impl Database {
             histogram_dml: Arc::new(dashmap::DashMap::new()),
             histogram_delta: Arc::new(histogram::HistogramDeltaCache::default()),
             histogram_proof_build: Arc::new(histogram::HistogramProofBuilds::default()),
+            tantivy_backfill_slots: Default::default(),
             snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
             bypass_buffer: false,
@@ -3841,16 +3844,13 @@ impl Database {
         self.bloom_prune.get().filter(|_| self.config.maintenance.timefusion_file_bloom_pruning)
     }
 
-    /// Startup backfill (gated on `timefusion_tantivy_backfill`): build
+    /// Automatically backfill existing files when an indexer is attached: build
     /// partition-mirrored indexes for live parquet files that no successful
     /// manifest entry covers, newest partition first. Every covered file
     /// widens the windows where the coverage gate lets the prefilter engage
     /// (pre-tantivy history, failed builds, pre-reindex compactions).
     pub fn spawn_tantivy_backfill(&self) {
         let Some(svc) = self.tantivy_indexer().cloned() else { return };
-        if !self.config.tantivy.timefusion_tantivy_backfill {
-            return;
-        }
         let db = self.clone();
         tokio::spawn(async move {
             for table_name in svc.config.indexed_tables() {
@@ -4196,6 +4196,11 @@ impl Database {
 
     async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy::search::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
         use crate::tantivy::search::parquet_rel_of_uri;
+        let slot = self.tantivy_backfill_slots.entry(table_name.to_owned()).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1))).clone();
+        let Ok(_pass) = slot.try_acquire_owned() else {
+            info!(table_name, event = "tantivy_backfill_already_active");
+            return Ok(0);
+        };
         // Unified table ("default") holds every default-routed project's
         // files; custom project tables are resolved separately.
         let mut roots: Vec<String> = vec!["default".into()];

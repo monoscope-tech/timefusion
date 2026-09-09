@@ -878,3 +878,48 @@ async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Re
     assert_eq!(r_on, vec!["c1".to_string(), "c2".to_string()], "both matching rows survive the coverage gate");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_backfills_existing_hashes_without_an_opt_in() -> Result<()> {
+    use timefusion::support::test_helpers::{json_to_batch_for, minio_test_config};
+
+    let dir = tempfile::tempdir()?;
+    let project = unique_project();
+    let mut config = (*minio_test_config(&project, dir.path().to_str().unwrap())).clone();
+    config.tantivy = serde_json::from_str("{}")?;
+    let config = Arc::new(config);
+    let db = Database::with_config(config.clone()).await?;
+    let uri = format!("s3://timefusion-tests/{}/tantivy", config.core.timefusion_table_prefix);
+    let store = db.create_object_store(&uri, &config.aws.build_storage_options(None)).await?;
+    let indexer = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(config.tantivy.clone())));
+    let search = Arc::new(TantivySearchService::new(store.clone(), dir.path().join("indexes"), Arc::new(config.tantivy.clone())));
+    indexer.with_reader(&search);
+    let db = Arc::new(db.with_tantivy_indexer(indexer).with_tantivy_search(search.clone()));
+    let table = "mor_versioned";
+    let timestamp = chrono::Utc::now() - chrono::Duration::days(2);
+    let row = json!({"project_id": project, "id": "existing", "timestamp": timestamp.timestamp_micros(), "date": timestamp.date_naive().to_string(), "hashes": ["needle", "needle"]});
+    db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row])?], true, None).await?;
+    assert!(timefusion::tantivy::load_manifest(store.as_ref(), table, &project).await?.entries.is_empty());
+    db.spawn_tantivy_backfill();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let manifest = timefusion::tantivy::load_manifest(store.as_ref(), table, &project).await?;
+        if manifest.entries.values().any(|entry| entry.covers_current_elements(timefusion::schema::get_schema(table).unwrap())) {
+            break;
+        }
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "default startup must publish a physical hash index without an opt-in");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let mut ctx = db.clone().create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let sql = format!(
+        "SELECT time_bucket('1 hour', timestamp), count(*) FROM {table} WHERE project_id='{project}' AND timestamp >= TIMESTAMP '{}' AND timestamp < TIMESTAMP '{}' AND hashes @> ARRAY['needle'] GROUP BY 1",
+        timestamp.format("%Y-%m-%d %H:%M:%S%.6f"),
+        (timestamp + chrono::Duration::microseconds(1)).format("%Y-%m-%d %H:%M:%S%.6f")
+    );
+    let result = ctx.sql(&sql).await?.collect().await?;
+    assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 1);
+    assert_eq!(search.stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed), 1, "backfilled hashes must reach native SQL counting");
+    db.shutdown().await?;
+    Ok(())
+}

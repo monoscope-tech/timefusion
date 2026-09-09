@@ -884,12 +884,6 @@ pub struct TantivyConfig {
     /// bloom/stats-only equality pruning.
     #[serde_inline_default(true)]
     pub timefusion_tantivy_route_equality: bool,
-    /// Startup backfill: build partition-mirrored indexes for live parquet
-    /// files no manifest entry covers (pre-tantivy history, failed builds,
-    /// files landed while the feature was off). Oldest-first, bounded
-    /// concurrency. Off by default — reads every uncovered file back from S3.
-    #[serde(default)]
-    pub timefusion_tantivy_backfill: bool,
     /// Concurrent index builds during backfill/reconcile/post-optimize
     /// reindex. 2 is safe alongside prod query load; the off-box repair CLI
     /// raises it (each 1 GB parquet takes ~2-3 min to index).
