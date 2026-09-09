@@ -946,3 +946,23 @@ of the current database module. This supports stale shared-worktree artifacts
 as the cause; a new full signoff is running without competing worktree builds.
 A separate shutdown regression now checks that BatchQueue releases its
 database worker before shutdown returns. It has not been run yet.
+
+### Goal audit — 2026-09-09 09:19 UTC
+
+The preceding goal turn made progress: the failed gauge check passed after
+recompilation, fixes were committed locally as ad925175, and fresh-ingest
+and shutdown regressions were prepared in isolated checkouts. The renewed
+local signoff is confirmed live (session 17832). It has not passed yet.
+
+Upstream PRs #235 and #236 merged at 3e37227e. Their integration with the
+fixes merged cleanly at df2f9655 in the integrated checkout; the combined
+tree still needs local signoff. No competing worktree builds may use the
+shared target until the current checks finish.
+
+Production e44e08c returned the narrow query correctly through ordinary
+fallback. The 09:10 census reported 2,238 uncovered files. Local benchmark
+validation passed all 192 cases, including 30-day native routing and partial
+coverage. Optimized timings, fresh-ingest physical indices, production
+validation of the follow-up, shutdown-crash investigation, and broader CPU
+and memory profiles remain open. The full goal is not achieved.
+Next audit: 09:49 UTC.
