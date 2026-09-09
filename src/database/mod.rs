@@ -21159,6 +21159,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
             queue.shutdown().await;
+            assert_eq!(Arc::strong_count(&db), 1, "queue shutdown must release its database worker before the runtime can stop");
             db.shutdown().await?;
 
             Ok(())
