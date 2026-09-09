@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use arrow::{array::Array, record_batch::RecordBatch};
@@ -83,36 +83,75 @@ impl HistogramDeltaCache {
     }
 }
 
-#[derive(Debug, Default)]
-pub(super) struct HistogramDmlState {
-    generation: AtomicU64,
-    active: AtomicUsize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistogramDmlScope {
+    All,
+    Timestamps(std::ops::RangeInclusive<i64>),
 }
 
-pub(crate) struct HistogramDmlGuard(Arc<HistogramDmlState>);
-
-impl Drop for HistogramDmlGuard {
-    fn drop(&mut self) {
-        self.0.generation.fetch_add(1, Ordering::SeqCst);
-        self.0.active.fetch_sub(1, Ordering::SeqCst);
+impl HistogramDmlScope {
+    fn overlaps(&self, range: &std::ops::RangeInclusive<i64>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Timestamps(active) => active.start() <= range.end() && range.start() <= active.end(),
+        }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct HistogramDmlGuard(HistogramDmlScope);
+
+#[derive(Debug)]
+struct HistogramDmlCapture {
+    range: std::ops::RangeInclusive<i64>,
+    invalidated: AtomicBool,
+}
+
+impl HistogramDmlCapture {
+    fn validate(&self) -> Result<()> {
+        ensure!(!self.invalidated.load(Ordering::SeqCst), "SQL DML changed while capturing histogram sources");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct HistogramDmlActivity {
+    writes: Vec<std::sync::Weak<HistogramDmlGuard>>,
+    captures: Vec<std::sync::Weak<HistogramDmlCapture>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct HistogramDmlState(parking_lot::Mutex<HistogramDmlActivity>);
 
 impl HistogramDmlState {
-    fn enter(self: Arc<Self>) -> HistogramDmlGuard {
-        self.active.fetch_add(1, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        HistogramDmlGuard(self)
+    fn enter(&self, scope: HistogramDmlScope) -> Arc<HistogramDmlGuard> {
+        // Registration and invalidation are atomic with respect to capture.
+        // Weak entries retain no completed statements or finished read views.
+        let mut activity = self.0.lock();
+        activity.captures.retain(|weak| {
+            let Some(capture) = weak.upgrade() else { return false };
+            if scope.overlaps(&capture.range) {
+                capture.invalidated.store(true, Ordering::SeqCst);
+            }
+            true
+        });
+        activity.writes.retain(|weak| weak.strong_count() != 0);
+        let guard = Arc::new(HistogramDmlGuard(scope));
+        activity.writes.push(Arc::downgrade(&guard));
+        guard
     }
 
-    fn stamp(&self) -> Result<u64> {
-        ensure!(self.active.load(Ordering::SeqCst) == 0, "histogram capture overlaps active SQL DML");
-        Ok(self.generation.load(Ordering::SeqCst))
-    }
-
-    fn validate(&self, stamp: u64) -> Result<()> {
-        ensure!(self.stamp()? == stamp, "SQL DML changed while capturing histogram sources");
-        Ok(())
+    fn capture(&self, range: std::ops::RangeInclusive<i64>) -> Result<Arc<HistogramDmlCapture>> {
+        let mut activity = self.0.lock();
+        activity.writes.retain(|weak| weak.strong_count() != 0);
+        ensure!(
+            !activity.writes.iter().filter_map(std::sync::Weak::upgrade).any(|guard| guard.0.overlaps(&range)),
+            "histogram capture overlaps active SQL DML"
+        );
+        activity.captures.retain(|weak| weak.strong_count() != 0);
+        let capture = Arc::new(HistogramDmlCapture { range, invalidated: AtomicBool::new(false) });
+        activity.captures.push(Arc::downgrade(&capture));
+        Ok(capture)
     }
 }
 
@@ -696,8 +735,8 @@ impl super::Database {
         Ok(Some(count))
     }
 
-    pub(crate) fn histogram_dml_guard(&self, project: &str, table: &str) -> HistogramDmlGuard {
-        self.histogram_dml.entry((project.to_owned(), table.to_owned())).or_default().clone().enter()
+    pub(crate) fn histogram_dml_guard(&self, project: &str, table: &str, scope: HistogramDmlScope) -> Arc<HistogramDmlGuard> {
+        self.histogram_dml.entry((project.to_owned(), table.to_owned())).or_default().enter(scope)
     }
 
     pub(crate) async fn histogram_plan(
@@ -762,14 +801,14 @@ impl super::Database {
     ) -> Result<CapturedHistogram> {
         let search = self.tantivy_search().context("Tantivy search service is unavailable")?.clone();
         let dml = self.histogram_dml.entry((project.to_owned(), table_name.to_owned())).or_default().clone();
-        let stamp = dml.stamp()?;
+        let (lo, hi) = window.bounds();
+        let capture = dml.capture(lo..=hi - 1)?;
         let schema = crate::schema::get_schema(table_name).context("unknown histogram table")?;
         ensure!(schema.dedup_keys.iter().any(|key| key == "timestamp"), "histogram requires timestamp in the immutable key");
         ensure!(
             schema.partitions.iter().any(|key| key == "project_id") && schema.partitions.iter().any(|key| key == "date"),
             "histogram requires project/date partitions"
         );
-        let (lo, hi) = window.bounds();
         let first_date = chrono::DateTime::from_timestamp_micros(lo).context("histogram start is outside calendar range")?.date_naive().to_string();
         let last_date = chrono::DateTime::from_timestamp_micros(hi - 1).context("histogram end is outside calendar range")?.date_naive().to_string();
         // Flush removes memory only after publishing Delta. Capture memory first
@@ -791,7 +830,8 @@ impl super::Database {
         };
         // All subsequent source reads use pinned immutable file metadata and
         // retained Arrow batches. Only the capture interval needs this fence.
-        dml.validate(stamp)?;
+        capture.validate()?;
+        drop(capture);
         let mut columns = schema
             .dedup_keys
             .iter()
@@ -952,10 +992,18 @@ mod tests {
              AND timestamp < to_timestamp_micros({}) AND hashes @> ARRAY['absent'] GROUP BY 1",
             timestamp + 1
         );
+        let unrelated_window = datafusion::prelude::col("timestamp")
+            .gt_eq(datafusion::prelude::lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(timestamp + DAY_MICROS), None)))
+            .and(
+                datafusion::prelude::col("timestamp")
+                    .lt(datafusion::prelude::lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(timestamp + DAY_MICROS + 1), None))),
+            );
+        let unrelated_update = db.histogram_dml_guard(&project, table, crate::dml::histogram_dml_scope(Some(&unrelated_window), &[], None));
         let before = search.stats.histogram_snapshots.load(Ordering::Relaxed);
         assert_eq!(session.sql(&sql).await?.collect().await?.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
         assert!(search.stats.histogram_snapshots.load(Ordering::Relaxed) > before, "SQL must use the indexed histogram");
         assert!(db.histogram_proof_build.attempts.lock().is_empty(), "indexed absence must not schedule a daily visibility scan");
+        drop(unrelated_update);
         empty.memory.batches.push(json_to_batch_for(table, vec![row("memory", "absent")])?);
         empty.max_decoded_bytes = 1024 * 1024;
         assert_eq!(empty.count_streaming().await?.counts.values().sum::<u64>(), 1, "a matching memory row must defeat indexed absence");
@@ -1168,18 +1216,27 @@ mod tests {
 
     #[test]
     fn histogram_capture_detects_overlapping_dml_and_guard_cancellation() {
-        let state = std::sync::Arc::new(super::HistogramDmlState::default());
-        let before = state.stamp().unwrap();
-        let first = state.clone().enter();
-        let second = std::sync::Arc::new(state.clone().enter());
+        let state = super::HistogramDmlState::default();
+        let before = state.capture(0..=9).unwrap();
+        let unrelated = state.enter(HistogramDmlScope::Timestamps(10..=19));
+        before.validate().unwrap();
+        state.capture(0..=9).unwrap().validate().unwrap();
+        let first = state.enter(HistogramDmlScope::Timestamps(9..=10));
+        let second = state.enter(HistogramDmlScope::All);
         let queued = second.clone();
-        assert!(state.stamp().is_err());
+        assert!(state.capture(0..=9).is_err());
         drop(first);
-        assert!(state.validate(before).is_err(), "another DML remains active");
+        assert!(before.validate().is_err(), "another DML remains active");
         drop(second);
-        assert!(state.stamp().is_err(), "queued work must remain fenced after the statement returns");
+        assert!(state.capture(0..=9).is_err(), "queued work must remain fenced after the statement returns");
         drop(queued);
-        assert!(state.validate(before).is_err(), "completed writes must invalidate an earlier capture");
-        state.validate(state.stamp().unwrap()).unwrap();
+        assert!(before.validate().is_err(), "completed writes must invalidate an earlier capture");
+        state.capture(0..=9).unwrap().validate().unwrap();
+        drop(unrelated);
+        drop(before);
+        let fresh = state.capture(10..=19).unwrap();
+        let overlapping = state.enter(HistogramDmlScope::Timestamps(19..=20));
+        drop(overlapping);
+        assert!(fresh.validate().is_err(), "even a completed overlap must invalidate capture");
     }
 }
