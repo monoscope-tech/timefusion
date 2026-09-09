@@ -360,17 +360,26 @@ run_pg_smoke() {
     return 0
   }
   trap cleanup RETURN
+  # Reaching the host from a container is not portable. `--network host` shares the
+  # host's stack on Linux, but on Docker Desktop the container keeps its own inside
+  # the VM, so 127.0.0.1 was the CONTAINER: the readiness loop could never connect
+  # and the check was unrunnable on macOS, reporting it as a 19k-line dump of a
+  # perfectly healthy server log. host-gateway resolves host.docker.internal on
+  # both, and the server binds 0.0.0.0 (main.rs), so either host reaches it.
+  # Verified on both: docker-in-docker for the Linux-host path, Desktop for macOS.
+  smoke_psql() {
+    docker run --rm --add-host=host.docker.internal:host-gateway -e PGPASSWORD=postgres postgres:18.4 \
+      psql "postgresql://postgres@host.docker.internal:$PGWIRE_PORT/postgres" "$@"
+  }
   for _ in $(seq 1 60); do
-    if docker run --rm --network host -e PGPASSWORD=postgres postgres:18.4 \
-        psql "postgresql://postgres@127.0.0.1:$PGWIRE_PORT/postgres" -Atqc 'SELECT 1' >/dev/null 2>&1; then
+    if smoke_psql -Atqc 'SELECT 1' >/dev/null 2>&1; then
       ready=true; break
     fi
     sleep 1
   done
   "$ready" || { cat "$log"; return 1; }
   for command in '\dt' '\d otel_logs_and_spans' '\l' '\du' '\dn'; do
-    docker run --rm --network host -e PGPASSWORD=postgres postgres:18.4 \
-      psql "postgresql://postgres@127.0.0.1:$PGWIRE_PORT/postgres" -v ON_ERROR_STOP=1 -c "$command" || return 1
+    smoke_psql -v ON_ERROR_STOP=1 -c "$command" || return 1
   done
 }
 
