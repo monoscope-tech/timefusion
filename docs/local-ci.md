@@ -4,7 +4,7 @@ Run checks locally before pushing. Use `make ci-signoff` to run the CI checks an
 The final status output shows which checks still need a remote run.
 
 GitHub runs checks without matching attestations on standard GitHub-hosted runners.
-All workflows use GitHub runners, including releases and image builds.
+Remote workflows use GitHub runners. Production builds and deployment can also run locally.
 
 A signoff records passing checks for specific file contents. It does not bypass failed checks or approve different contents.
 Repository push access identifies who can publish these records. A Git `Signed-off-by` trailer does not replace CI results.
@@ -12,7 +12,7 @@ Repository push access identifies who can publish these records. A Git `Signed-o
 ## The short version
 
 ```bash
-make ci-signoff     # local checks, published results, then remaining remote checks
+make ci-signoff     # checks, passing records, and a tested production image
 make ci                      # everything CI runs
 make ci CHECKS="fmt clippy"  # just these
 make ci-status               # what CI would run right now, without running it
@@ -172,3 +172,35 @@ silently narrows what a check depends on, which is how an untested change ships.
 Narrow a check's `inputs` only where it is provably sound: a too-wide set costs a
 rerun, a too-narrow one ships an untested change. `fmt` is the one clear case —
 rustfmt reads `.rs` files and `rustfmt.toml`, not `Cargo.lock` and not `proto/`.
+
+## Production images
+
+`make ci-signoff` runs local checks, cross-compiles the production Linux
+amd64 image, checks that it reaches PGWire, and publishes a candidate to GHCR.
+Docker must have registry push access. This command does not update `latest`
+or restart production. The build uses an archived source snapshot, so edits
+during compilation cannot change the published candidate.
+
+The candidate tag contains a fingerprint of the Dockerfile, Rust manifests,
+source, schemas, vendor code, image helper, and smoke recipe. On master, deployment first
+looks for this candidate. If found, it skips compilation and promotes the
+image. Otherwise it builds in GitHub as before. Both paths resolve a digest
+and smoke-test it before the existing handoff and readiness checks.
+
+The compiler runs on the builder CPU. On an ARM64 laptop it produces Linux
+x86-64 code with target C libraries; amd64 container execution is required
+for the final smoke test. ARM64 Docker hosts automatically use a native QEMU
+emulator with an x86-64 guest address offset. The unchanged production image
+must stay running and pass its PGWire protocol probe. The first cross-build
+took about 40 minutes; warm rebuild speed is not yet measured.
+The publication and deployment path remains under validation. After the checked change is merged,
+`make deploy` runs the shared handoff, rollout, recovery, and readiness soak
+from a clean checkout of the current master commit. It requires PGURL,
+CAPROVER_SERVER, CAPROVER_APP, and CAPROVER_TOKEN in the environment.
+Local rollout has not yet been exercised with production credentials.
+
+Local and GitHub rollouts share a Git lease. A completed digest and live
+boot receipt avoids a duplicate restart. Failure after handoff begins
+retains the lease because the remote state may be unresolved. Inspect the
+rollout and release only the recorded owner after recovery. Diagnostics stay
+under .ci/deploy with private directory permissions.

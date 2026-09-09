@@ -32,6 +32,9 @@ concurrency:
   group: deploy-master
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -62,7 +65,17 @@ jobs:
           # This workflow only runs on master push, so :latest == latest master.
           echo "IMAGE_LATEST=${REPO}:latest" >> $GITHUB_ENV
 
+      - name: Find locally signed-off image
+        id: candidate
+        run: |
+          if image="$(python3 scripts/production-image.py resolve)"; then
+            echo "image=$image" >> "$GITHUB_OUTPUT"
+          else
+            echo "No matching published candidate; building the production image here"
+          fi
+
       - name: Build and Push Docker Image
+        if: steps.candidate.outputs.image == ''
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -74,37 +87,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Pull the published image and verify the binary actually starts.
-      # We previously shipped images that exited at the dynamic linker
-      # (GLIBC mismatch from a builder/runtime base skew) because nothing
-      # between "image pushed" and "CapRover deploys it" had ever executed
-      # the binary. With TIMEFUSION_ALLOW_INSECURE_AUTH the process can
-      # boot without secrets, reach the PGWire listen call, then we kill
-      # it. SIGTERM via `timeout` exits 124; anything else means the
-      # binary crashed and we must NOT deploy it.
-      - name: Smoke test pushed image
+      - name: Promote locally built image
+        if: steps.candidate.outputs.image != ''
+        env:
+          CANDIDATE_IMAGE: ${{ steps.candidate.outputs.image }}
         run: |
-          docker pull "$IMAGE_URL"
-          set +e
-          docker run -d \
-            -e TIMEFUSION_ALLOW_INSECURE_AUTH=true \
-            -e AWS_S3_BUCKET=smoke -e AWS_REGION=us-east-1 \
-            -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
-            -e RUST_LOG=info \
-            --name tf-smoke "$IMAGE_URL"
-          trap 'docker rm -f tf-smoke >/dev/null 2>&1 || true' EXIT
-          # Give it 12s to reach the PGWire listen log; then kill.
-          for i in $(seq 1 12); do
-            if docker logs tf-smoke 2>&1 | grep -Eq \
-              "(Listening on|Bound PGWire listener on) 0.0.0.0:5432"; then
-              echo "smoke: PGWire listening, image OK"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "smoke: binary never reached PGWire listen — last logs:"
-          docker logs tf-smoke 2>&1 | tail -40
-          exit 1
+          docker buildx imagetools create --tag "$IMAGE_URL" --tag "$IMAGE_LATEST" "$CANDIDATE_IMAGE"
+
+      # Pin the digest before smoke and deployment. Moving a tag afterward must
+      # never make CapRover deploy bytes different from the tested image.
+      - name: Smoke test production image
+        run: |
+          image="$(python3 scripts/production-image.py digest "$IMAGE_URL")"
+          docker pull "$image"
+          python3 scripts/production-image.py smoke "$image"
+          echo "IMAGE_URL=$image" >> "$GITHUB_ENV"
 
       # Install the same CLI used by caprover/deploy-from-github@v1.1.2 before
       # starting the handoff clock. Pin it: the upstream action installs an
@@ -113,278 +110,10 @@ jobs:
       - name: Install CapRover deploy client
         run: npm install --global caprover@2.3.1
 
-      # First pay the large backlog flush while reads+writes remain online.
-      # New binaries then HANDOFF-fence writes and drain only arrivals from that
-      # online flush; SIGTERM becomes local snapshot-only. Old binaries use the
-      # successful FLUSH as the compatibility path for the first rollout.
-      - name: Prepare production handoff
-        id: handoff
-        env:
-          PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
-        run: |
-          set -euo pipefail
-          : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
-          # Best-effort pre-deploy flush. The unflushed tail is WAL-durable and the
-          # replacement replays it, so this must NOT fail the deploy when prod is
-          # unreachable — most often it's mid-boot from the *previous* deploy
-          # (psql: "the database system is starting up"). Failing here deadlocked
-          # every deploy after a slow boot (2026-07-20). Retry briefly, then proceed.
-          # timeout: a hung psql (e.g. protocol negotiation with newer psql,
-          # which needs max_protocol_version=3.0 against TF, or a wedged FLUSH)
-          # otherwise pins attempt 1 forever and the retry loop never runs
-          # (2026-07-30: flush step sat 25+ min on a single psql call).
-          # PGMAXPROTOCOLVERSION: env form (not URI param) — older libpq ignores
-          # unknown env vars but rejects unknown URI params.
-          export PGMAXPROTOCOLVERSION=3.0
-          flush_ok=false
-          for attempt in $(seq 1 3); do
-            if timeout 300 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH' 2>&1; then
-              echo "online flush ok (attempt $attempt)"
-              flush_ok=true
-              break
-            fi
-            echo "flush attempt $attempt failed or timed out; retrying in 15s"
-            sleep 15
-          done
-          if timeout 300 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'HANDOFF' 2>&1; then
-            echo "write-fenced tail drain ready; production remains read-available"
-            echo "drained=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if $flush_ok; then
-            echo "HANDOFF unsupported by outgoing binary; using successful FLUSH compatibility path"
-            echo "drained=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "drained=false" >> "$GITHUB_OUTPUT"
-          echo "::warning::neither pre-deploy FLUSH nor HANDOFF succeeded; proceeding (tail is WAL-durable, replay will recover it)"
-
-      - name: Record production boot
-        id: production_before
-        env:
-          PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
-        run: |
-          set -euo pipefail
-          : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
-          boot_micros="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" || true)"
-          last_old_response_epoch_ms="$(date +%s%3N)"
-          echo "boot_micros=${boot_micros}" >> "$GITHUB_OUTPUT"
-          echo "last_old_response_epoch_ms=${last_old_response_epoch_ms}" >> "$GITHUB_OUTPUT"
-          # Record total rollout wall time separately from the concurrent SQL
-          # probe's actual client-visible unready interval.
-          echo "handoff_started_epoch_ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
-
-      - id: deploy
-        name: Deploy Image to CapRover
+      - name: Deploy and verify production
         env:
           CAPROVER_SERVER: ${{ secrets.CAPTAINROVER_SERVER }}
           CAPROVER_APP: ${{ secrets.CAPTAINROVER_APP_NAME }}
           CAPROVER_TOKEN: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
           PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
-          PREVIOUS_BOOT_MICROS: ${{ steps.production_before.outputs.boot_micros }}
-          LAST_OLD_RESPONSE_EPOCH_MS: ${{ steps.production_before.outputs.last_old_response_epoch_ms }}
-        run: |
-          set -euo pipefail
-          : "${CAPROVER_SERVER:?CAPTAINROVER_SERVER is required}"
-          : "${CAPROVER_APP:?CAPTAINROVER_APP_NAME is required}"
-          : "${CAPROVER_TOKEN:?CAPTAINROVER_APP_TOKEN is required}"
-          : "${PGURL:?TIMEFUSION_PG_URL is required}"
-          export PGMAXPROTOCOLVERSION=3.0
-
-          # Measure client-visible unavailability concurrently with the opaque
-          # CapRover rollout. Total deploy wall time includes image pull while
-          # the old task is healthy; it is not database downtime. Persist the
-          # longest continuous SELECT failure interval for the verification
-          # step instead.
-          probe_dir="$(mktemp -d)"
-          probe_stop="$probe_dir/stop"
-          probe_result="$probe_dir/max_unready_ms"
-          handoff_result="$probe_dir/query_handoff_ms"
-          (
-            unready_started_ms=0
-            max_unready_ms=0
-            # The preceding step already proved this exact old boot answered a
-            # query. Seed from that timestamp so a very short handoff remains
-            # measurable even when the first concurrent sample hits 57P03.
-            last_old_response_ms="$LAST_OLD_RESPONSE_EPOCH_MS"
-            query_handoff_ms=0
-            while [ ! -e "$probe_stop" ]; do
-              attempt_started_ms="$(date +%s%3N)"
-              responding_boot="$(timeout 1 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
-              if [ -n "$responding_boot" ]; then
-                if (( unready_started_ms > 0 )); then
-                  interval_ms=$(( $(date +%s%3N) - unready_started_ms ))
-                  (( interval_ms > max_unready_ms )) && max_unready_ms=$interval_ms
-                  unready_started_ms=0
-                fi
-                if [ "$responding_boot" = "$PREVIOUS_BOOT_MICROS" ]; then
-                  last_old_response_ms="$(date +%s%3N)"
-                elif (( query_handoff_ms == 0 )); then
-                  query_handoff_ms=$(( $(date +%s%3N) - last_old_response_ms ))
-                fi
-              elif (( unready_started_ms == 0 )); then
-                unready_started_ms="$attempt_started_ms"
-              fi
-              sleep 0.1
-            done
-            if (( unready_started_ms > 0 )); then
-              interval_ms=$(( $(date +%s%3N) - unready_started_ms ))
-              (( interval_ms > max_unready_ms )) && max_unready_ms=$interval_ms
-            fi
-            echo "$max_unready_ms" > "$probe_result"
-            echo "$query_handoff_ms" > "$handoff_result"
-          ) &
-          probe_pid=$!
-          stop_probe() {
-            touch "$probe_stop"
-            wait "$probe_pid"
-          }
-          trap stop_probe EXIT
-
-          # The image is already built, pushed, pulled by the smoke test, and
-          # the outgoing process is HANDOFF-drained when supported. Submit the
-          # Swarm update immediately so the leased fence cannot expire. The
-          # first compatibility rollout may use FLUSH; its shutdown path still
-          # fences and drains any tail with the full correctness budget.
-          caprover deploy \
-            --caproverUrl "$CAPROVER_SERVER" \
-            --appToken "$CAPROVER_TOKEN" \
-            --appName "$CAPROVER_APP" \
-            -i "$IMAGE_URL" >caprover-deploy.log 2>&1 &
-          deploy_pid=$!
-
-          deploy_status=0
-          wait "$deploy_pid" || deploy_status=$?
-
-          # CapRover can return after it has submitted the Swarm update but
-          # before the replacement owns PGWire. Keep the concurrent probe alive
-          # until a query proves that a DIFFERENT boot completed recovery;
-          # otherwise stopping it here reports a false 0ms outage.
-          replacement_deadline=$((SECONDS + 720))
-          while (( deploy_status == 0 && SECONDS < replacement_deadline )); do
-            boot_micros="$(timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
-            recovery_complete="$(timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_complete'" 2>/dev/null || true)"
-            if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ]; then
-              break
-            fi
-            sleep 0.5
-          done
-          stop_probe
-          trap - EXIT
-          observed_unready_ms="$(cat "$probe_result")"
-          query_handoff_ms="$(cat "$handoff_result")"
-          echo "observed_unready_ms=$observed_unready_ms" >> "$GITHUB_OUTPUT"
-          echo "query_handoff_ms=$query_handoff_ms" >> "$GITHUB_OUTPUT"
-          cat caprover-deploy.log
-          (( deploy_status == 0 )) || exit "$deploy_status"
-
-      - name: Verify production recovery
-        env:
-          PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
-          PREVIOUS_BOOT_MICROS: ${{ steps.production_before.outputs.boot_micros }}
-          HANDOFF_STARTED_EPOCH_MS: ${{ steps.production_before.outputs.handoff_started_epoch_ms }}
-          OBSERVED_UNREADY_MS: ${{ steps.deploy.outputs.observed_unready_ms }}
-          QUERY_HANDOFF_MS: ${{ steps.deploy.outputs.query_handoff_ms }}
-          # A planned deploy is pre-flushed. Exact local cursor/tail equality
-          # now skips both Delta reconciliation and replay, so minutes-class
-          # recovery is a regression, not an expected operating mode.
-          MAX_WAL_RECOVERY_MS: '5000'
-          # Whether the OUTGOING process reported a drained WAL before the
-          # rollout. Only then is a ~0ms recovery a promise rather than a hope.
-          PREFLUSHED_HANDOFF: ${{ steps.handoff.outputs.drained }}
-          MAX_READY_WAIT_SECS: '10'
-          RECOVERY_WAIT_SECS: '720'
-        run: |
-          set -euo pipefail
-          : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
-          export PGMAXPROTOCOLVERSION=3.0
-          boot_micros=""
-          recovery_complete=""
-          recovery_ms=""
-          deadline=$((SECONDS + RECOVERY_WAIT_SECS))
-          while (( SECONDS < deadline )); do
-            if ! timeout 5 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
-              sleep 2
-              continue
-            fi
-            boot_micros="$(timeout 5 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" || true)"
-            recovery_complete="$(timeout 5 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_complete'" || true)"
-            recovery_ms="$(timeout 5 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_duration_ms'" || true)"
-            if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ] && [[ "$recovery_ms" =~ ^[0-9]+$ ]]; then
-              ready_elapsed_ms=$(( $(date +%s%3N) - HANDOFF_STARTED_EPOCH_MS ))
-              ready_wait=$(( (ready_elapsed_ms + 999) / 1000 ))
-              echo "rollout measurement: total ${ready_elapsed_ms}ms; last-old-query to first-new-query ${QUERY_HANDOFF_MS}ms; longest client-visible unready interval ${OBSERVED_UNREADY_MS}ms; WAL recovery ${recovery_ms}ms"
-              [[ "$QUERY_HANDOFF_MS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::rollout probe did not observe the old-to-new query handoff: '$QUERY_HANDOFF_MS'"; exit 1; }
-              [[ "$OBSERVED_UNREADY_MS" =~ ^[0-9]+$ ]] || { echo "::error::rollout readiness probe did not produce a valid downtime measurement: '$OBSERVED_UNREADY_MS'"; exit 1; }
-              (( OBSERVED_UNREADY_MS <= MAX_READY_WAIT_SECS * 1000 )) || { echo "::error::replacement returned 57P03/not-ready continuously for ${OBSERVED_UNREADY_MS}ms (budget $((MAX_READY_WAIT_SECS * 1000))ms)"; exit 1; }
-              # A PLANNED deploy drains the WAL first, so recovery is 0ms and this
-              # budget is the assertion that the drain actually happened. It is NOT
-              # a bound on crash recovery: after an OOM or SIGKILL the replacement
-              # legitimately replays a real backlog (64,427ms on 2026-08-14), and
-              # failing the deploy for that told us nothing we could act on while
-              # marking every post-incident rollout red — which is how a genuine
-              # deploy failure would have been missed.
-              #
-              # So: fail only when a DRAINED handoff was expected and did not
-              # happen, and otherwise surface the replay as a warning with the
-              # number attached.
-              if (( recovery_ms > MAX_WAL_RECOVERY_MS )); then
-                if [ "$PREFLUSHED_HANDOFF" = "true" ]; then
-                  echo "::error::WAL recovery took ${recovery_ms}ms (budget ${MAX_WAL_RECOVERY_MS}ms) after a DRAINED handoff — the drain did not take"
-                  exit 1
-                fi
-                echo "::warning::WAL recovery took ${recovery_ms}ms — the predecessor did not exit cleanly, so this rollout replayed a real backlog"
-              fi
-              echo "rollout completed within recovery and availability budgets"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::replacement did not finish WAL recovery within ${RECOVERY_WAIT_SECS}s (boot=${boot_micros:-missing}, complete=${recovery_complete:-missing}, duration=${recovery_ms:-missing})"
-          exit 1
-
-      # A process can open PGWire and complete WAL recovery before deferred
-      # startup/background work begins competing for the runtime. The
-      # 2026-08-15 incident passed the point-in-time recovery check, then
-      # stopped serving queries seconds later. Require sustained availability
-      # before a deployment can be called successful.
-      - name: Soak production readiness
-        env:
-          PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
-          SOAK_SECS: '120'
-          PROBE_INTERVAL_SECS: '2'
-          MAX_CONSECUTIVE_FAILURES: '2'
-        run: |
-          set -euo pipefail
-          : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
-          export PGMAXPROTOCOLVERSION=3.0
-
-          deadline=$((SECONDS + SOAK_SECS))
-          probes=0
-          failures=0
-          consecutive_failures=0
-          max_consecutive_failures=0
-          while (( SECONDS < deadline )); do
-            probes=$((probes + 1))
-            if timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc \
-              "SELECT CASE WHEN EXISTS (SELECT 1 FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_complete' AND value = 'true') THEN 1 ELSE 0 END" \
-              | grep -qx 1; then
-              consecutive_failures=0
-            else
-              failures=$((failures + 1))
-              consecutive_failures=$((consecutive_failures + 1))
-              if (( consecutive_failures > max_consecutive_failures )); then
-                max_consecutive_failures=$consecutive_failures
-              fi
-              if (( consecutive_failures > MAX_CONSECUTIVE_FAILURES )); then
-                echo "::error::production failed ${consecutive_failures} consecutive readiness probes during the post-deploy soak"
-                exit 1
-              fi
-            fi
-            sleep "$PROBE_INTERVAL_SECS"
-          done
-
-          echo "post-deploy soak passed: ${probes} probes, ${failures} transient failures, max ${max_consecutive_failures} consecutive"
-
-      - name: Show Deployment Output
-        run: 'echo "CapRover deployment and recovery verification completed"'
+        run: python3 scripts/deploy/run.py ci
