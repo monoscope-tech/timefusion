@@ -1,0 +1,43 @@
+{
+  "recorded_at": "2026-09-09T09:25:23.793159+00:00",
+  "samples": [
+    {
+      "day": "2026-09-03",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-03 00:00:00' AND timestamp < TIMESTAMP '2026-09-04 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [],
+      "elapsed_ms": 545.95
+    },
+    {
+      "day": "2026-09-04",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-04 00:00:00' AND timestamp < TIMESTAMP '2026-09-05 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [],
+      "elapsed_ms": 1369.7
+    },
+    {
+      "day": "2026-09-05",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-05 00:00:00' AND timestamp < TIMESTAMP '2026-09-06 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [],
+      "elapsed_ms": 1545.64
+    },
+    {
+      "day": "2026-09-06",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-06 00:00:00' AND timestamp < TIMESTAMP '2026-09-07 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error_type": "QueryCanceled",
+      "sqlstate": "57014",
+      "elapsed_ms": 3087.8
+    },
+    {
+      "day": "2026-09-07",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-07 00:00:00' AND timestamp < TIMESTAMP '2026-09-08 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [],
+      "elapsed_ms": 1673.93
+    },
+    {
+      "day": "2026-09-08",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-08 00:00:00' AND timestamp < TIMESTAMP '2026-09-09 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error_type": "QueryCanceled",
+      "sqlstate": "57014",
+      "elapsed_ms": 3045.72
+    }
+  ]
+}

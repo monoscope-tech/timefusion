@@ -313,3 +313,67 @@ The combined tree, including upstream `a56f0be8`, passed full local
 smoke, and 63 e2e tests. All checks are attested; none remains for GitHub.
 Full-suite nextest: `0db7b705-7f3b-46d1-8001-84369ca1084b`; e2e:
 `9b29b1d3-b5b7-4a0c-9482-049da39bc1ca`.
+
+
+### Global coverage gauge ownership — 2026-09-09
+
+Production census logs reported 2,282 uncovered files at 08:29:36. An
+empty `mor_versioned` backfill completed at 08:30:00; the saved 08:36
+statistics query then reported zero. Source confirmed that per-table
+backfill completion overwrote both global coverage gauges.
+
+The existing real reconciliation test now runs an empty-table reconciliation
+after a census counted two uncovered files in another table. Before the
+fix, the gauge assertion failed with 0 versus 2. After removing the per-table
+gauge writes, the fixture passed in 3.887s (nextest
+`12589607-bc07-4481-a256-1ebfaa528f9d`). The later zero assertion follows
+an actual census and retains the independent returned-count and age checks.
+
+rs-distill pass 1: remove duplicate writers instead of adding a per-table
+cache or extra synchronization. Reuse the all-table census and existing
+reconciliation fixture. rs-evasion pass 1: no new sentinel, feature flag,
+ignored test, error suppression, or weakened result assertion. Build counts
+and per-table progress logs remain intact.
+
+Second scoped pass found no additional issue. The gauge describes the last
+complete census, which maintenance refreshes every 15 minutes; it is not
+a query-snapshot coverage proof. Only the census now writes these gauges.
+Full local signoff remains required before pushing this follow-up.
+
+### Contiguous Union histogram matching — 2026-09-09
+
+Scope: match_query, extracted match_source, Membership equality, and the
+SQL cases in mutable_index_filter_cannot_resurrect_an_uncovered_version.
+
+rs-distill pass 1: reuse source_and_filters and HistogramWindow validation.
+Derive membership equality; collect parsed branches once, sort in place,
+and combine with try_fold. The mutable accumulator moves its owned fields
+without cloning membership trees; sorting needs the bounded branch vector.
+The alias walk is iterative, with no new recursive traversal. The existing
+real SQL fixture supplies the indices and version conflicts for all cases.
+
+rs-evasion pass 1: Union maps columns by position. Require equivalent names
+and types before parsing each branch, then identical table, project, and
+membership with exact adjacency. Overlaps, gaps, changed predicates, and
+changed source columns retain ordinary SQL semantics. The constructor still
+checks bucket limits, and unsupported input returns the existing matcher
+miss rather than a fabricated count. No new flags, unsafe, lint suppression,
+or weakened assertions. Structural predicate equality may conservatively
+decline equivalent reordered predicates; it cannot admit unequal ones.
+
+Second scoped pass checked source_and_filters and DataFusion's schema
+comparison implementation. Projections still reject aliases/computed fields;
+the schema comparison checks each position's name and semantic type. No
+additional finding. The adjacent-Union test failed before the matcher fix
+and passes after it: nextest 23c1ef5e-e170-4258-9cfe-316828aaa48f, 2.915s.
+The direct wide-window fixture alone did not reproduce the generated-Union
+miss; the independent benchmark's optimized plan supplies that evidence.
+Full local signoff and the benchmark rerun remain pending.
+
+The fixed matcher passed the independent full SQL benchmark: 192 samples
+across 3/7/30 days, four predicates, ordinary/native routes, complete/partial
+coverage, and four repetitions. Every bucket matched arithmetic expectations;
+native and uniqueness counters matched each case. Newer unindexed versions
+were included in the partial phase. This 30,000-row debug run is correctness
+evidence only, especially while local compilation shared the machine. Saved
+results: evidence/2026-09-08-hashes/local-histogram-sql-debug-validation.json.

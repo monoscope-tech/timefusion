@@ -6,6 +6,8 @@ use datafusion::{
 
 use super::histogram::{HistogramWindow, Membership};
 
+const MAX_BUCKETS: usize = 100_000;
+
 pub(crate) struct HistogramQuery<'a> {
     pub matched: &'a LogicalPlan,
     pub table: String,
@@ -134,8 +136,37 @@ pub(crate) fn match_query(plan: &LogicalPlan) -> Option<HistogramQuery<'_>> {
         }
         value => crate::read::functions::parse_interval_to_micros(string(value)?).ok()?,
     };
+    let mut input = aggregate.input.as_ref();
+    while let LogicalPlan::SubqueryAlias(alias) = input {
+        input = alias.input.as_ref();
+    }
+    let LogicalPlan::Union(union) = input else { return match_source(matched, input, width) };
+    // RangeParallelDedup splits wide windows below the aggregate. Only exact
+    // adjacent ranges with the same source and predicate can be recombined.
+    // UNION maps columns by position, so names must agree before walking them.
+    if !union.inputs.iter().all(|branch| union.schema.has_equivalent_names_and_types(branch.schema()).is_ok()) {
+        return None;
+    }
+    let mut sources = union.inputs.iter().map(|input| match_source(matched, input, width)).collect::<Option<Vec<_>>>()?;
+    sources.sort_unstable_by_key(|source| source.window.bounds().0);
+    let mut sources = sources.into_iter();
+    let first = sources.next()?;
+    sources.try_fold(first, |mut combined, source| {
+        if combined.table != source.table
+            || combined.project != source.project
+            || combined.membership != source.membership
+            || combined.window.bounds().1 != source.window.bounds().0
+        {
+            return None;
+        }
+        combined.window = HistogramWindow::new(combined.window.bounds().0, source.window.bounds().1, width, 0, MAX_BUCKETS).ok()?;
+        Some(combined)
+    })
+}
+
+fn match_source<'a>(matched: &'a LogicalPlan, input: &LogicalPlan, width: i64) -> Option<HistogramQuery<'a>> {
     let mut filters = Vec::new();
-    let table = crate::rollup::source_and_filters(&aggregate.input, &mut filters).ok()?;
+    let table = crate::rollup::source_and_filters(input, &mut filters).ok()?;
     let schema = crate::schema::get_schema(&table)?;
     let mut pending = filters.iter().collect::<Vec<_>>();
     let (mut lo, mut hi, mut project, mut predicates) = (None::<i64>, None::<i64>, None::<String>, Vec::new());
@@ -181,7 +212,7 @@ pub(crate) fn match_query(plan: &LogicalPlan) -> Option<HistogramQuery<'_>> {
     }) {
         return None;
     }
-    Some(HistogramQuery { matched, table, project: project?, window: HistogramWindow::new(lo?, hi?, width, 0, 100_000).ok()?, membership })
+    Some(HistogramQuery { matched, table, project: project?, window: HistogramWindow::new(lo?, hi?, width, 0, MAX_BUCKETS).ok()?, membership })
 }
 
 #[cfg(test)]

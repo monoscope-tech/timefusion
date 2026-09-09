@@ -1,0 +1,104 @@
+{
+  "recorded_at": "2026-09-09T09:01:51.768967+00:00",
+  "image": "e44e08c",
+  "samples": [
+    {
+      "name": "ordinary_count_timestamp",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 1357.46
+    },
+    {
+      "name": "histogram_count_star_0",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 674.85
+    },
+    {
+      "name": "histogram_count_star_1",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 676.03
+    },
+    {
+      "name": "histogram_count_star_2",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 08:04:30' AND timestamp < TIMESTAMP '2026-09-02 08:04:31' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 551.39
+    }
+  ],
+  "before_stats": [
+    [
+      "maintenance",
+      "tantivy_uncovered_files",
+      "0"
+    ],
+    [
+      "maintenance",
+      "tantivy_oversized_skipped",
+      "0"
+    ],
+    [
+      "scan",
+      "tantivy_backfill_built",
+      "3"
+    ],
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "after_stats": [
+    [
+      "maintenance",
+      "tantivy_uncovered_files",
+      "0"
+    ],
+    [
+      "maintenance",
+      "tantivy_oversized_skipped",
+      "0"
+    ],
+    [
+      "scan",
+      "tantivy_backfill_built",
+      "3"
+    ],
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "recorded_at": "2026-09-09T09:24:38.817393+00:00",
+  "image_before": "ghcr.io/monoscope-tech/timefusion:e44e08c",
+  "samples": [
+    {
+      "days": 1,
+      "count": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 00:00:00' AND timestamp < TIMESTAMP '2026-09-03 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 766.77
+    },
+    {
+      "days": 1,
+      "count": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 00:00:00' AND timestamp < TIMESTAMP '2026-09-03 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 712.59
+    },
+    {
+      "days": 7,
+      "count": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 00:00:00' AND timestamp < TIMESTAMP '2026-09-09 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error_type": "QueryCanceled",
+      "sqlstate": "57014",
+      "elapsed_ms": 3028.24
+    },
+    {
+      "days": 7,
+      "count": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMP '2026-09-02 00:00:00' AND timestamp < TIMESTAMP '2026-09-09 00:00:00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error_type": "QueryCanceled",
+      "sqlstate": "57014",
+      "elapsed_ms": 3113.22
+    }
+  ],
+  "before_stats": [
+    [
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "after_stats": [
+    [
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "image_after": "ghcr.io/monoscope-tech/timefusion:e44e08c"
+}

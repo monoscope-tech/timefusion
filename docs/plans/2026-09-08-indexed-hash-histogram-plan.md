@@ -844,3 +844,160 @@ partial-coverage latency, full SQL 3/7/30-day benchmarks, repeated broader
 reviews, and CPU/memory profiles remain open. Benchmark preparation now
 targets real SQL planning and Delta visibility, with independent expected
 bucket counts. Next audit: 08:49 UTC.
+
+
+### Deployment and further validation — 2026-09-09 08:48 UTC
+
+PR #234 merged to master at `e44e08cd` after complete combined local
+signoff. Deployment run `34329798739` is building its image. Production
+currently serves `a56f0be`; the saved immediate baseline returned count 1
+in 343.51ms through ordinary SQL and timed out in 3115.47ms through the
+histogram form.
+
+The global coverage gauge is unreliable before the follow-up fix: an
+empty table's backfill overwrites the full census. Production logs and
+a failing-then-passing local regression confirm this. The follow-up makes
+the census its sole writer and still needs full local signoff.
+
+A real SQL benchmark harness in a separate checkout compiles and validates
+buckets against arithmetic expectations. Its first run rejected a 30-day
+query that returned correct buckets through ordinary fallback. Diagnose
+that route before treating any timing as indexed performance. Wider
+benchmarks, production validation, and CPU/memory profiling remain open.
+
+
+### Goal audit — 2026-09-09 08:53 UTC
+
+This audit was recorded four minutes after its scheduled time.
+The narrow-window fixes are merged at `e44e08cd`; deployment run
+`34329798739` is confirmed active in image build. The immediate production
+baseline still reproduces the timeout. Production validation of the new
+image remains pending.
+
+Further work produced two concrete findings. First, an empty-table backfill
+overwrote a 2,282-file global census; the regression and sole-census-writer
+fix pass locally. Second, the full SQL benchmark rejects 30-day histogram
+measurements because the range-parallel optimizer introduces a Union that
+the histogram matcher cannot traverse. The saved optimized plan proves
+this routing gap. Implement exact handling of disjoint, contiguous branches
+with identical source/project/membership; do not disable range splitting
+or accept overlapping unions.
+
+The overall goal remains incomplete: wide native routing, production
+performance, coverage convergence, full benchmark measurements, broader
+reviews, and CPU/memory profiles remain open. Next audit: 09:19 UTC.
+
+### Production validation — 2026-09-09 09:01 UTC
+
+Deployment 34329798739 completed successfully with readiness soak; production
+serves e44e08c. The saved one-second query returned count 1 in all three
+histogram-form samples: 674.85, 676.03, and 551.39 ms. The ordinary control
+returned count 1 in 1357.46 ms. Histogram counters stayed zero: these samples
+prove the automatic ordinary fallback removed the observed timeout, not
+indexed production speed. Evidence: production-narrow-window-first-validation.json.
+
+The contiguous-Union matcher regression passed in 2.915s, nextest
+23c1ef5e-e170-4258-9cfe-316828aaa48f. The separate 30-day SQL benchmark
+is being rerun with this matcher and retains strict bucket and routing checks.
+
+The fixed matcher passed the independent full SQL benchmark: 192 samples
+across 3/7/30 days, four predicates, ordinary/native routes, complete/partial
+coverage, and four repetitions. Every bucket matched arithmetic expectations;
+native and uniqueness counters matched each case. Newer unindexed versions
+were included in the partial phase. This 30,000-row debug run is correctness
+evidence only, especially while local compilation shared the machine. Saved
+results: evidence/2026-09-08-hashes/local-histogram-sql-debug-validation.json.
+
+### Fresh-ingest coverage follow-up
+
+The production flush callback builds from pre-Parquet batches and publishes
+IndexSource::Flush with untrusted physical ordinals. Single-file manifest
+paths do not prove row order. Preserve that guard; investigate building
+from committed files or carrying exact writer lineage instead. Both
+src/server/mod.rs and src/main.rs wire the callback, and the write layer
+already runs it after commit under a bounded semaphore. Avoid a new flag
+or a synchronous index build on the Delta commit path. This is open work,
+not covered by the current matcher/gauge signoff.
+
+At 09:00 production scheduled 37 otel files (1,950 MiB) within the existing
+2,048 MiB backfill budget. The 08:55 census reported 2,296 uncovered files.
+Production coverage has not converged. Upstream PR #235 also touches Tantivy
+and bootstrap modules; re-fetch before integrating follow-up changes.
+
+### Local signoff failure — 2026-09-09
+
+The first follow-up signoff stopped: 1,482 tests passed, the coverage-gauge
+regression failed twice with 0 versus 2, and the batch-queue load test
+crashed once before passing its automatic retry. No test attestation was
+published; pgwire/e2e were not reached. The suite took 143.424s, nextest
+a3903d37-be84-4357-9276-117f69bf2c57. Full failure output is saved beside
+the other evidence.
+
+Current source has only the census writer. The benchmark checkout still
+has the old per-table writer and shared this target directory. Rebuild the
+current database module before deciding whether this is stale artifact reuse
+or another writer path. Do not weaken the regression. Separately, BatchQueue
+shutdown only cancels its worker and does not await completion; investigate
+that lifetime against the Delta executor RecvError/segmentation-fault trace.
+The fixes remain unpushed.
+
+The unchanged gauge regression passed in 1.993s after forcing recompilation
+of the current database module. This supports stale shared-worktree artifacts
+as the cause; a new full signoff is running without competing worktree builds.
+A separate shutdown regression now checks that BatchQueue releases its
+database worker before shutdown returns. It has not been run yet.
+
+### Goal audit — 2026-09-09 09:19 UTC
+
+The preceding goal turn made progress: the failed gauge check passed after
+recompilation, fixes were committed locally as ad925175, and fresh-ingest
+and shutdown regressions were prepared in isolated checkouts. The renewed
+local signoff is confirmed live (session 17832). It has not passed yet.
+
+Upstream PRs #235 and #236 merged at 3e37227e. Their integration with the
+fixes merged cleanly at df2f9655 in the integrated checkout; the combined
+tree still needs local signoff. No competing worktree builds may use the
+shared target until the current checks finish.
+
+Production e44e08c returned the narrow query correctly through ordinary
+fallback. The 09:10 census reported 2,238 uncovered files. Local benchmark
+validation passed all 192 cases, including 30-day native routing and partial
+coverage. Optimized timings, fresh-ingest physical indices, production
+validation of the follow-up, shutdown-crash investigation, and broader CPU
+and memory profiles remain open. The full goal is not achieved.
+Next audit: 09:49 UTC.
+
+### Combined signoff — 2026-09-09 09:22 UTC
+
+The rebuilt pre-integration tree passed all 1,483 tests in 120.785s and
+ten doctests without retries (nextest 7712865a-dc20-4217-b34b-e539c952a082).
+The remaining checks were deliberately stopped during the pgwire binary
+build because upstream integration changed the deployable tree. No pgwire
+or e2e result is claimed for that run.
+
+The main checkout fast-forwarded to 567664f3, containing both hash fixes and
+upstream 3e37227e. A full make ci-signoff is now running there, session
+86509, log /tmp/timefusion-histogram-integrated-signoff.log. This is the
+required combined-tree signoff before push.
+
+### Wider production baselines — 2026-09-09 09:24 UTC
+
+On e44e08c, the saved hash predicate returned count 1 over one minute
+(426.64/479.52 ms), one hour (483.72/471.91 ms), and one day
+(766.77/712.59 ms), ordinary count(timestamp) followed by count(*).
+Both seven-day forms hit the three-second timeout (3028.24/3113.22 ms);
+histogram completion and unique-partition counters stayed zero.
+
+Daily count(*) probes then returned no matching rows on September 3, 4, 5,
+and 7 in 545.95, 1369.70, 1545.64, and 1673.93 ms. September 6 and 8
+timed out in 3087.80 and 3045.72 ms. These isolate further investigation;
+they do not prove indexed execution or overall production acceptance.
+Evidence: production-wider-window-validation.json, production-day-week-validation.json,
+and production-daily-window-validation.json. Production was observed on
+e44e08c immediately after the daily probes. Backfill unit logs continued
+through 09:23:56, so the pass was progressing rather than known stopped.
+
+The combined-tree make ci-signoff completed successfully: formatting,
+Clippy, 1,506 tests, ten doctests, PostgreSQL smoke, and all 63 e2e tests.
+All five checks are locally attested; none remains for GitHub. E2e nextest
+5128033f-d790-43ec-b0c7-a96f0c311d46. The committed tree is ready to push.
