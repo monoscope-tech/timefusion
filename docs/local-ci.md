@@ -193,11 +193,14 @@ for the final smoke test. ARM64 Docker hosts automatically use a native QEMU
 emulator with an x86-64 guest address offset. The unchanged production image
 must stay running and pass its PGWire protocol probe. The first cross-build
 took about 40 minutes; warm rebuild speed is not yet measured.
-The publication and deployment path remains under validation. After the checked change is merged,
+Local cross-compilation, image publication, CI reuse, and production rollout
+have passed verification. After the checked change is merged,
 `make deploy` runs the shared handoff, rollout, recovery, and readiness soak
 from a clean checkout of the current master commit. It requires PGURL,
 CAPROVER_SERVER, CAPROVER_APP, and CAPROVER_TOKEN in the environment.
-Local rollout has not yet been exercised with production credentials.
+A verified local rollout measured 2,423 ms of continuous unavailability,
+zero WAL recovery time, and 55 passing readiness probes. A repeated invocation
+recognized the same image and boot, passed its soak, and did not restart it.
 
 Local and GitHub rollouts share a Git lease. A completed digest and live
 boot receipt avoids a duplicate restart. Failure after handoff begins

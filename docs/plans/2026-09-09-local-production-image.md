@@ -111,3 +111,28 @@ updated local signoff passed; matching Rust checks and the tested production
 image were reused. A separate recovery soak and a new local rollout will
 verify the live state and correction. Do not reinterpret the failed observer
 as a passing rollout.
+
+## Verified local rollout
+
+The failed observer run received a separate recovery soak: 56 probes, zero
+failures. A live query confirmed boot 1788961446354900, completed WAL recovery,
+and zero recovery duration. The expected digest was running. Only then was
+lease 309522a14d1c5d1b931b4ae211c704439206f50b explicitly released with an
+owner-checked push. No successful receipt was created for the failed rollout.
+
+PR 242 merged as 8524b316. Its redundant CI rollout 34359412366 was cancelled
+before deployment work. The corrected `make deploy` exited 0: 2,525 ms between
+old/new query replies, 2,423 ms longest unready interval, zero WAL recovery,
+and a 55-probe readiness soak with no failures. The running task is
+wnq9wino83lpcb11ig1gx3qa0 at digest 5f00b4db. A successful receipt was published.
+
+The saved hash smoke ran against that exact digest and reproduced the known
+performance gap: 8/16 complete pairs, no mismatches, stable image, and day/week
+statement timeouts. Local release success does not close the hash latency goal.
+
+A second `make deploy` exited 0 without HANDOFF or rollout. It invoked only
+record-boot and soak, recognized the same digest and live boot, and passed
+55 more readiness probes with zero failures. This verifies duplicate invocation
+reuse. Documentation-only signoff (`CHECKS=fmt`) passed; the complete gate found
+all five matching Rust check records, helper tests passed, and the tested image
+was reused. No required check remains for GitHub.
