@@ -85,8 +85,10 @@ fn batch(rows: &[(i64, &str, &str)]) -> RecordBatch {
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
         Field::new("id", DataType::Utf8, false),
         Field::new("level", DataType::Utf8, true),
+        Field::new("hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
     ]));
-    RecordBatch::try_new(schema, vec![ts, id, level]).unwrap()
+    let hashes = arrow::array::new_null_array(schema.field(3).data_type(), rows.len());
+    RecordBatch::try_new(schema, vec![ts, id, level, hashes]).unwrap()
 }
 
 #[tokio::test]
