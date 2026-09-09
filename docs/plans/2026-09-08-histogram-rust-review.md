@@ -274,3 +274,42 @@ exited 0. Formatting, Clippy, 1,474 tests, eight doctests, PostgreSQL smoke,
 and 63 e2e tests passed. Every check was attested locally; final status
 leaves nothing for GitHub. Nextest runs: `e6066424-a057-4119-9366-997afd76a457`
 (full suite) and `59ace074-928a-4245-ac40-4b7774e96168` (e2e).
+
+
+### Narrow-window visibility — 2026-09-09
+
+rs-distill pass 1: use DataFusion's existing `FilterExec` before the sort.
+This avoids a new filtering field or a custom stream adapter. A small bound
+expression closure reuses scalar casts and binary comparisons for the two
+endpoints. Whole-day windows retain the existing plan without an extra filter.
+The regression extends the real captured-histogram fixture.
+
+rs-evasion pass 1: capture requires timestamp in the immutable key. Thus an
+excluded timestamp cannot compete with an included version. The filter
+preserves the complete schema and the already attached source/row ordinals.
+File-date validation, memory authority, DVs, greatest-version ordering, and
+tombstone removal remain intact. The test disables disk spill in its query
+runtime to prove that unrelated same-day keys do not require sort storage;
+this adds no production configuration.
+
+The regression adds 20,000 unique out-of-window keys, each over 2 KiB, to
+the same day as a one-microsecond query with partial index coverage. Before
+the filter, it failed with `Memory Exhausted while Sorting (DiskManager is
+disabled)`. After the filter, it returned the expected count 63 under the
+same 32 MiB pool and released all reservations. The full targeted fixture
+passed in 11.253s, nextest `fcb19cf2-f9f5-40d3-8472-088ae28495d6`. This
+is a resource regression, not a production latency measurement.
+
+Second scoped rs-distill and rs-evasion pass: no additional finding. Bounds
+are cast to the existing timestamp field type, errors propagate, and the
+filter uses inclusive start/exclusive end. No masks, assertions, or budget
+checks were weakened. Further file/row-group pruning and production timing
+remain open. The complete combined change now includes upstream read-path
+refactor `a56f0be8` and requires a fresh local signoff before merge.
+
+
+The combined tree, including upstream `a56f0be8`, passed full local
+`make ci-signoff`: formatting, Clippy, 1,483 tests, ten doctests, PostgreSQL
+smoke, and 63 e2e tests. All checks are attested; none remains for GitHub.
+Full-suite nextest: `0db7b705-7f3b-46d1-8001-84369ca1084b`; e2e:
+`9b29b1d3-b5b7-4a0c-9482-049da39bc1ca`.

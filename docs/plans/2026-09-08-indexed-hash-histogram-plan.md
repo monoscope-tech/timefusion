@@ -812,3 +812,35 @@ query timed out in 3140.29ms. Both include explicit timestamp bounds, so
 null timestamps cannot change the count. This strengthens the evidence
 that histogram routing adds work for this narrow query. Exact SQL and
 results are saved in `production-histogram-ordinary-comparison.json`.
+
+
+### Combined narrow-query fixes — 2026-09-09 08:15 UTC
+
+No-coverage admission passed complete local signoff and was pushed as
+`7a112910` in PR #234. Before merge, master advanced to `a56f0be8` with
+a substantial read-path refactor. That upstream change was merged locally.
+
+A separate checkout reproduced the remaining daily-sort problem: 20,000
+out-of-window keys exhausted the 32 MiB query pool with spill disabled.
+Filtering the captured visibility input before the sort made the same test
+pass, including the expected count 63 and zero retained reservations. This
+filter preserves physical lineage and relies on timestamp being an immutable
+key. The two fixes are now combined for a fresh local signoff and one release.
+Production serves `21a458c`; these fixes are not deployed yet.
+
+
+### Goal audit — 2026-09-09 08:19 UTC
+
+The previous goal turn made concrete progress: admission was pushed in PR
+#234 after full local signoff, and a resource regression proved the need to
+filter narrow windows before sorting. The filter passed that regression.
+Both fixes and upstream `a56f0be8` are now under a fresh local signoff.
+Formatting and Clippy have passed; the full test build is running. No
+production performance claim is justified yet.
+
+The next release must pass the combined local checks, merge, deploy, and
+repeat the saved ordinary-SQL/histogram comparison. Coverage convergence,
+partial-coverage latency, full SQL 3/7/30-day benchmarks, repeated broader
+reviews, and CPU/memory profiles remain open. Benchmark preparation now
+targets real SQL planning and Delta visibility, with independent expected
+bucket counts. Next audit: 08:49 UTC.
