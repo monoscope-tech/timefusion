@@ -70,7 +70,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     tracing::info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
 
     // The sidecar requires both indexed tables and object storage.
-    let bucket = cfg.aws.aws_s3_bucket.clone().unwrap_or_default();
+    let bucket = cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default();
     if !cfg.tantivy.indexed_tables().is_empty() && !bucket.is_empty() {
         let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
         let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
@@ -180,7 +180,7 @@ use datafusion_postgres::{
     hooks::{QueryHook, cursor::CursorStatementHook, set_show::SetShowHook, transactions::TransactionStatementHook},
     pgwire::{
         api::{
-            ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers,
+            ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers, Type,
             auth::{AuthSource, LoginInfo, Password, StartupHandler, cleartext::CleartextPasswordAuthStartupHandler},
             portal::Portal,
             query::{ExtendedQueryHandler, SimpleQueryHandler},
@@ -319,9 +319,6 @@ impl LoggingHandlerFactory {
                 .build(),
         )
     }
-    pub fn plan_cache(&self) -> Arc<PlanCacheHook> {
-        self.plan_cache.clone()
-    }
 }
 
 /// pgwire calls these factory methods **per connection**, so their cost is
@@ -429,8 +426,7 @@ fn client_statement_timeout(client: &(impl ClientInfo + ?Sized)) -> Option<std::
 /// dropping a future cannot, so the deadline only covers read-only statements.
 /// `classify_query` errs toward matching DML, which errs toward no timeout.
 fn statement_timeout_applies(query: &str) -> bool {
-    let (kind, _) = classify_query(query);
-    !matches!(kind, "DML" | "DDL")
+    !matches!(classify_query(query).0, "DML" | "DDL")
 }
 
 async fn run_with_statement_timeout<T>(
@@ -476,10 +472,6 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
         }
         response => response,
     }
-}
-
-fn with_response_deadlines(responses: Vec<Response>, deadline: Option<tokio::time::Instant>) -> Vec<Response> {
-    responses.into_iter().map(|response| with_response_deadline(response, deadline)).collect()
 }
 
 /// Simple query handler with tracing
@@ -573,45 +565,29 @@ impl LoggingSimpleQueryHandler {
     /// Read recent Delta commit metadata without requiring direct object-store
     /// credentials on the operator's machine.
     async fn run_delta_history(&self, cmd: DeltaHistoryCmd) -> PgWireResult<Vec<Response>> {
-        use datafusion_postgres::pgwire::api::Type;
-
         let db = require_available(self.db.as_ref(), "DELTA HISTORY")?;
         let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA HISTORY: open table '{}': {e}", cmd.table)))?;
         let table = table_ref.read().await;
         let commits: Vec<_> = table.history(Some(cmd.limit)).await.map_err(|e| admin_err(format!("DELTA HISTORY '{}': {e}", cmd.table)))?.collect();
         drop(table);
 
-        let fields = Arc::new(
-            ["version", "timestamp_utc", "operation", "read_version", "is_blind_append", "operation_parameters", "commit_info"]
-                .into_iter()
-                .map(|name| FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text))
-                .collect::<Vec<_>>(),
-        );
-        let rows = commits.into_iter().map({
-            let fields = fields.clone();
-            move |commit| {
-                let mut encoder = DataRowEncoder::new(fields.clone());
-                let timestamp = commit.timestamp.and_then(chrono::DateTime::from_timestamp_millis).map(|v| v.to_rfc3339()).unwrap_or_default();
-                let read_version = commit.read_version.map(|v| v.to_string()).unwrap_or_default();
-                let version = commit.read_version.map(|v| (v + 1).to_string()).unwrap_or_default();
-                let operation = commit.operation.clone().unwrap_or_default();
-                let blind_append = commit.is_blind_append.map(|v| v.to_string()).unwrap_or_default();
-                let parameters = serde_json::to_string(&commit.operation_parameters).unwrap_or_default();
-                let info = serde_json::to_string(&commit).unwrap_or_default();
-                for value in [&version, &timestamp, &operation, &read_version, &blind_append, &parameters, &info] {
-                    encoder.encode_field(value)?;
-                }
-                Ok(encoder.take_row())
-            }
+        let rows = commits.into_iter().map(|commit| {
+            let timestamp = commit.timestamp.and_then(chrono::DateTime::from_timestamp_millis).map(|v| v.to_rfc3339()).unwrap_or_default();
+            let read_version = commit.read_version.map(|v| v.to_string()).unwrap_or_default();
+            let version = commit.read_version.map(|v| (v + 1).to_string()).unwrap_or_default();
+            let blind_append = commit.is_blind_append.map(|v| v.to_string()).unwrap_or_default();
+            let parameters = serde_json::to_string(&commit.operation_parameters).unwrap_or_default();
+            let info = serde_json::to_string(&commit).unwrap_or_default();
+            // Last, so the field can be moved out rather than cloned.
+            let operation = commit.operation.unwrap_or_default();
+            Ok(vec![version, timestamp, operation, read_version, blind_append, parameters, info])
         });
-        Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
+        Ok(text_response(["version", "timestamp_utc", "operation", "read_version", "is_blind_append", "operation_parameters", "commit_info"], rows))
     }
 
     /// Return every raw action in one Delta commit. This is an audit primitive:
     /// it reads the transaction log only and never constructs a transaction.
-    async fn run_delta_actions(&self, cmd: DeltaActionsCmd) -> PgWireResult<Vec<Response>> {
-        use datafusion_postgres::pgwire::api::Type;
-
+    async fn run_delta_actions(&self, cmd: DeltaVersionCmd) -> PgWireResult<Vec<Response>> {
         let db = require_available(self.db.as_ref(), "DELTA ACTIONS")?;
         let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA ACTIONS: open table '{}': {e}", cmd.table)))?;
         let log_store = table_ref.read().await.log_store();
@@ -620,44 +596,22 @@ impl LoggingSimpleQueryHandler {
             .await
             .map_err(|e| admin_err(format!("DELTA ACTIONS '{}' VERSION {}: {e}", cmd.table, cmd.version)))?
             .ok_or_else(|| admin_err(format!("DELTA ACTIONS '{}' VERSION {}: commit not found", cmd.table, cmd.version)))?;
-        let actions = bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_slice::<deltalake::kernel::Action>(line).map_err(|e| admin_err(format!("decode Delta action: {e}"))))
-            .collect::<PgWireResult<Vec<_>>>()?;
-
-        let fields = Arc::new(
-            ["version", "action", "path", "size_bytes", "action_json"]
-                .into_iter()
-                .map(|name| FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text))
-                .collect::<Vec<_>>(),
-        );
-        let rows = actions.into_iter().map({
-            let fields = fields.clone();
-            move |action| {
-                let (kind, path, size) = match &action {
-                    deltalake::kernel::Action::Add(add) => ("add", add.path.as_str(), add.size.to_string()),
-                    deltalake::kernel::Action::Remove(remove) => ("remove", remove.path.as_str(), remove.size.map(|v| v.to_string()).unwrap_or_default()),
-                    deltalake::kernel::Action::CommitInfo(_) => ("commitInfo", "", String::new()),
-                    _ => ("other", "", String::new()),
-                };
-                let version = cmd.version.to_string();
-                let json = serde_json::to_string(&action).map_err(|e| admin_err(format!("encode Delta action: {e}")))?;
-                let mut encoder = DataRowEncoder::new(fields.clone());
-                for value in [&version, kind, path, &size, &json] {
-                    encoder.encode_field(&value)?;
-                }
-                Ok(encoder.take_row())
-            }
+        let rows = decode_commit_actions(&bytes)?.into_iter().map(move |action| {
+            let (kind, path, size) = match &action {
+                deltalake::kernel::Action::Add(add) => ("add", add.path.as_str(), add.size.to_string()),
+                deltalake::kernel::Action::Remove(remove) => ("remove", remove.path.as_str(), remove.size.map(|v| v.to_string()).unwrap_or_default()),
+                deltalake::kernel::Action::CommitInfo(_) => ("commitInfo", "", String::new()),
+                _ => ("other", "", String::new()),
+            };
+            let json = serde_json::to_string(&action).map_err(|e| admin_err(format!("encode Delta action: {e}")))?;
+            Ok(vec![cmd.version.to_string(), kind.to_string(), path.to_string(), size, json])
         });
-        Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
+        Ok(text_response(["version", "action", "path", "size_bytes", "action_json"], rows))
     }
 
     /// Reconstruct the full pre-commit Add actions for files removed by
     /// `version`. This is read-only and fails unless every removal has a source.
-    async fn run_delta_recovery_audit(&self, cmd: DeltaRecoveryAuditCmd) -> PgWireResult<Vec<Response>> {
-        use datafusion_postgres::pgwire::api::Type;
-
+    async fn run_delta_recovery_audit(&self, cmd: DeltaVersionCmd) -> PgWireResult<Vec<Response>> {
         let db = require_available(self.db.as_ref(), "DELTA RECOVERY AUDIT")?;
         let table_ref =
             db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT: open table '{}': {e}", cmd.table)))?;
@@ -668,11 +622,7 @@ impl LoggingSimpleQueryHandler {
             .await
             .map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT '{}' VERSION {}: {e}", cmd.table, cmd.version)))?
             .ok_or_else(|| admin_err(format!("DELTA RECOVERY AUDIT '{}' VERSION {}: commit not found", cmd.table, cmd.version)))?;
-        let removed = bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_slice::<deltalake::kernel::Action>(line).map_err(|e| admin_err(format!("decode Delta action: {e}"))))
-            .collect::<PgWireResult<Vec<_>>>()?
+        let removed = decode_commit_actions(&bytes)?
             .into_iter()
             .filter_map(|action| match action {
                 deltalake::kernel::Action::Remove(remove) => Some(remove.path),
@@ -710,26 +660,12 @@ impl LoggingSimpleQueryHandler {
         }
         sources.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 
-        let fields = Arc::new(
-            ["removed_by_version", "path", "size_bytes", "source_add_json"]
-                .into_iter()
-                .map(|name| FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text))
-                .collect::<Vec<_>>(),
-        );
-        let rows = sources.into_iter().map({
-            let fields = fields.clone();
-            move |add| {
-                let version = cmd.version.to_string();
-                let size = add.size.to_string();
-                let json = serde_json::to_string(&deltalake::kernel::Action::Add(add.clone())).map_err(|e| admin_err(format!("encode source Add: {e}")))?;
-                let mut encoder = DataRowEncoder::new(fields.clone());
-                for value in [&version, &add.path, &size, &json] {
-                    encoder.encode_field(value)?;
-                }
-                Ok(encoder.take_row())
-            }
+        let rows = sources.into_iter().map(move |add| {
+            let size = add.size.to_string();
+            let json = serde_json::to_string(&deltalake::kernel::Action::Add(add.clone())).map_err(|e| admin_err(format!("encode source Add: {e}")))?;
+            Ok(vec![cmd.version.to_string(), add.path, size, json])
         });
-        Ok(vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))])
+        Ok(text_response(["removed_by_version", "path", "size_bytes", "source_add_json"], rows))
     }
 }
 
@@ -761,47 +697,38 @@ pub(crate) fn parse_delta_history(query: &str) -> Result<Option<DeltaHistoryCmd>
     Ok(Some(DeltaHistoryCmd { table: table.to_string(), limit }))
 }
 
+/// `<table> VERSION <n>`, shared by `DELTA ACTIONS` and `DELTA RECOVERY AUDIT`.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct DeltaActionsCmd {
+pub(crate) struct DeltaVersionCmd {
     pub table: String,
     pub version: u64,
 }
 
-pub(crate) fn parse_delta_actions(query: &str) -> Result<Option<DeltaActionsCmd>, String> {
+fn parse_delta_version_cmd(rest: &str, command: &str) -> Result<DeltaVersionCmd, String> {
+    let usage = || format!("expected: {command} <table> VERSION <n>");
+    let mut parts = rest.split_whitespace();
+    let (Some(table), Some(keyword), Some(value), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return Err(usage());
+    };
+    if !keyword.eq_ignore_ascii_case("version") {
+        return Err(usage());
+    }
+    Ok(DeltaVersionCmd { table: table.to_string(), version: value.parse().map_err(|_| format!("invalid Delta version '{value}'"))? })
+}
+
+pub(crate) fn parse_delta_actions(query: &str) -> Result<Option<DeltaVersionCmd>, String> {
     let Some(rest) = strip_command(query, "delta") else { return Ok(None) };
     let Some(rest) = strip_keyword(rest, "actions", char::is_whitespace) else { return Ok(None) };
-    let mut parts = rest.split_whitespace();
-    let table = parts.next().ok_or("DELTA ACTIONS requires: DELTA ACTIONS <table> VERSION <n>")?;
-    let keyword = parts.next().ok_or("DELTA ACTIONS requires a VERSION")?;
-    let value = parts.next().ok_or("DELTA ACTIONS requires a numeric VERSION")?;
-    if !keyword.eq_ignore_ascii_case("version") || parts.next().is_some() {
-        return Err("expected: DELTA ACTIONS <table> VERSION <n>".to_string());
-    }
-    let version = value.parse::<u64>().map_err(|_| format!("invalid Delta version '{value}'"))?;
-    Ok(Some(DeltaActionsCmd { table: table.to_string(), version }))
+    parse_delta_version_cmd(rest, "DELTA ACTIONS").map(Some)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct DeltaRecoveryAuditCmd {
-    pub table: String,
-    pub version: u64,
-}
-
-pub(crate) fn parse_delta_recovery_audit(query: &str) -> Result<Option<DeltaRecoveryAuditCmd>, String> {
+pub(crate) fn parse_delta_recovery_audit(query: &str) -> Result<Option<DeltaVersionCmd>, String> {
     let Some(rest) = strip_command(query, "delta") else { return Ok(None) };
     let Some(rest) = strip_keyword(rest, "recovery", char::is_whitespace) else { return Ok(None) };
     let Some(rest) = strip_keyword(rest.trim(), "audit", char::is_whitespace) else {
         return Err("DELTA RECOVERY supports only: DELTA RECOVERY AUDIT <table> VERSION <n>".to_string());
     };
-    let mut parts = rest.split_whitespace();
-    let table = parts.next().ok_or("DELTA RECOVERY AUDIT requires a table")?;
-    let keyword = parts.next().ok_or("DELTA RECOVERY AUDIT requires a VERSION")?;
-    let value = parts.next().ok_or("DELTA RECOVERY AUDIT requires a numeric VERSION")?;
-    if !keyword.eq_ignore_ascii_case("version") || parts.next().is_some() {
-        return Err("expected: DELTA RECOVERY AUDIT <table> VERSION <n>".to_string());
-    }
-    let version = value.parse::<u64>().map_err(|_| format!("invalid Delta version '{value}'"))?;
-    Ok(Some(DeltaRecoveryAuditCmd { table: table.to_string(), version }))
+    parse_delta_version_cmd(rest, "DELTA RECOVERY AUDIT").map(Some)
 }
 
 /// An intercepted `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'` admin command.
@@ -814,6 +741,32 @@ pub(crate) struct OptimizeCmd {
     /// busy day, which doesn't fit in-process next to serving load
     /// (2026-07-27: two OOMs). One (project, date) partition is a few GB.
     pub project_id: Option<String>,
+}
+
+/// Decode the newline-delimited action list of one Delta commit entry.
+fn decode_commit_actions(bytes: &[u8]) -> PgWireResult<Vec<deltalake::kernel::Action>> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).map_err(|e| admin_err(format!("decode Delta action: {e}"))))
+        .collect()
+}
+
+/// The all-VARCHAR `Response::Query` shared by the read-only admin commands:
+/// `names` are the columns, and each row yields one already-formatted value per
+/// column (or an error to surface in place of that row).
+fn text_response<const N: usize>(names: [&str; N], rows: impl Iterator<Item = PgWireResult<Vec<String>>> + Send + 'static) -> Vec<Response> {
+    let fields: Arc<Vec<FieldInfo>> =
+        Arc::new(names.into_iter().map(|name| FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text)).collect());
+    let row_fields = fields.clone();
+    let rows = rows.map(move |values| {
+        let mut encoder = DataRowEncoder::new(row_fields.clone());
+        for value in values? {
+            encoder.encode_field(&value)?;
+        }
+        Ok(encoder.take_row())
+    });
+    vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))]
 }
 
 fn admin_err(msg: impl Into<String>) -> PgWireError {
@@ -1044,40 +997,41 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
     // Emitted here, inside the span, so a resource-exhaustion failure names the
     // query that caused it. Failures are rare relative to traffic; a retrying
     // client is a handful per minute.
+    const SLOW_QUERY_US: u64 = 1_000_000;
+    let slow = duration_us >= SLOW_QUERY_US;
+    if success && !slow {
+        return;
+    }
+    let (_, operation) = classify_query(query);
+    let (tables, project_id) = query_dimensions(query);
+    let (fingerprint, template) = (query_fingerprint(query), query_template(query));
     if !success {
-        let (_, op) = classify_query(query);
-        let (tbls, proj) = query_dimensions(query);
         warn!(
             event = "pgwire.failed_statement",
-            query.class = op,
-            query.fingerprint = %query_fingerprint(query),
-            query.template = %query_template(query),
-            query.tables = %tbls,
-            project.id = %proj,
+            query.class = operation,
+            query.fingerprint = %fingerprint,
+            query.template = %template,
+            query.tables = %tables,
+            project.id = %project_id,
             protocol,
             duration_us,
             "PostgreSQL statement failed"
         );
     }
-    const SLOW_QUERY_US: u64 = 1_000_000;
-    if duration_us < SLOW_QUERY_US {
-        return;
+    if slow {
+        info!(
+            event = "pgwire.slow_statement",
+            query.class = operation,
+            query.fingerprint = %fingerprint,
+            query.template = %template,
+            query.tables = %tables,
+            project.id = %project_id,
+            protocol,
+            duration_us,
+            success,
+            "slow PostgreSQL statement"
+        );
     }
-
-    let (_, operation) = classify_query(query);
-    let (tables, project_id) = query_dimensions(query);
-    info!(
-        event = "pgwire.slow_statement",
-        query.class = operation,
-        query.fingerprint = %query_fingerprint(query),
-        query.template = %query_template(query),
-        query.tables = %tables,
-        project.id = %project_id,
-        protocol,
-        duration_us,
-        success,
-        "slow PostgreSQL statement"
-    );
 }
 
 fn query_dimensions(query: &str) -> (String, &str) {
@@ -1139,7 +1093,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let result =
             run_with_statement_timeout(timeout, <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span))
                 .await
-                .map(|(responses, deadline)| with_response_deadlines(responses, deadline));
+                .map(|(responses, deadline)| responses.into_iter().map(|response| with_response_deadline(response, deadline)).collect());
         record_statement_latency(self.scan_metrics.as_deref(), query, "simple", t0.elapsed().as_micros() as u64, result.is_ok());
         log_statement_failure("simple", &result);
         result
@@ -1191,7 +1145,7 @@ pub struct RewritingQueryParser {
 impl datafusion_postgres::pgwire::api::stmt::QueryParser for RewritingQueryParser {
     type Statement = <DfSessionService as ExtendedQueryHandler>::Statement;
 
-    async fn parse_sql<C>(&self, client: &C, sql: &str, types: &[Option<datafusion_postgres::pgwire::api::Type>]) -> PgWireResult<Self::Statement>
+    async fn parse_sql<C>(&self, client: &C, sql: &str, types: &[Option<Type>]) -> PgWireResult<Self::Statement>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
@@ -1199,7 +1153,7 @@ impl datafusion_postgres::pgwire::api::stmt::QueryParser for RewritingQueryParse
         self.inner.parse_sql(client, rewritten.as_deref().unwrap_or(sql), types).await
     }
 
-    fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<datafusion_postgres::pgwire::api::Type>> {
+    fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<Type>> {
         self.inner.get_parameter_types(statement)
     }
 

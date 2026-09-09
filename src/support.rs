@@ -5,6 +5,12 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+/// Lock without letting a poisoned mutex propagate: the mutexes in this crate
+/// guard plain data, so a panicking holder leaves the data usable.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// An impossible epoch value marks wall-clock mode.
 const WALL_SENTINEL: i64 = i64::MIN;
 
@@ -16,8 +22,7 @@ fn frozen_micros() -> Option<i64> {
 
 pub fn init_from_env() {
     let Ok(s) = std::env::var("TIMEFUSION_FROZEN_TIME") else { return };
-    let t = chrono::DateTime::parse_from_rfc3339(&s).unwrap_or_else(|e| panic!("TIMEFUSION_FROZEN_TIME must be RFC3339 ({s:?}): {e}")).timestamp_micros();
-    set_micros(t);
+    set_micros(chrono::DateTime::parse_from_rfc3339(&s).unwrap_or_else(|e| panic!("TIMEFUSION_FROZEN_TIME must be RFC3339 ({s:?}): {e}")).timestamp_micros());
     tracing::warn!(frozen_at = %s, "TIMEFUSION_FROZEN_TIME set; clock is frozen (test mode)");
 }
 
@@ -187,6 +192,7 @@ pub mod test_helpers {
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
+    use itertools::Itertools;
     use serde_json::{Value, json};
 
     use crate::{config::AppConfig, schema::get_default_schema};
@@ -200,13 +206,12 @@ pub mod test_helpers {
     pub struct TestConfigBuilder {
         test_name: String,
         buffer_mode: BufferMode,
-        rollups: bool,
         deletion_vectors: bool,
     }
 
     impl TestConfigBuilder {
         pub fn new(test_name: &str) -> Self {
-            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled, rollups: false, deletion_vectors: true }
+            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled, deletion_vectors: true }
         }
 
         pub fn with_buffer_mode(mut self, mode: BufferMode) -> Self {
@@ -214,8 +219,9 @@ pub mod test_helpers {
             self
         }
 
-        pub fn with_rollups(mut self) -> Self {
-            self.rollups = true;
+        /// Rollups are unconditional now, so this gates nothing — it stays as a
+        /// declaration of intent at the call sites.
+        pub fn with_rollups(self) -> Self {
             self
         }
 
@@ -234,9 +240,6 @@ pub mod test_helpers {
             let mut cfg = minio_base_config(&id, &format!("/tmp/timefusion-{id}"));
             cfg.buffer.timefusion_flush_immediately = self.buffer_mode == BufferMode::FlushImmediately;
             cfg.maintenance.timefusion_use_deletion_vectors = self.deletion_vectors;
-            // Rollups are unconditional now, so `with_rollups()` no longer gates
-            // anything — it stays as a declaration of intent at the call sites.
-            let _ = self.rollups;
             Arc::new(cfg)
         }
     }
@@ -277,15 +280,15 @@ pub mod test_helpers {
     /// budget-blocked (no DV written, no rewrite) still counts both copies.
     pub async fn delta_physical_row_count(table_ref: &tokio::sync::RwLock<deltalake::DeltaTable>) -> anyhow::Result<i64> {
         let guard = table_ref.read().await;
-        let snapshot = guard.snapshot()?.snapshot().clone();
         // Per active file: numRecords minus its deletion-vector cardinality (the
         // masked rows), same accounting as the dedup verify path in maintain.rs.
-        let live = snapshot.log_data().iter().fold(0i64, |acc, f| {
-            let records = f.num_records().and_then(|n| i64::try_from(n).ok()).unwrap_or(0);
-            let masked = f.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality);
-            acc + records - masked
-        });
-        Ok(live)
+        Ok(guard
+            .snapshot()?
+            .snapshot()
+            .log_data()
+            .iter()
+            .map(|f| f.num_records().and_then(|n| i64::try_from(n).ok()).unwrap_or(0) - f.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality))
+            .sum())
     }
 
     /// Build a BufferedWriteLayer for tests/benches without repeating the registry boilerplate.
@@ -324,17 +327,22 @@ pub mod test_helpers {
                 .fields()
                 .iter()
                 .map(|f| {
-                    let data_type = match f.data_type() {
-                        DataType::Utf8View => DataType::Utf8,
-                        DataType::List(inner) if inner.data_type() == &DataType::Utf8View => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                        other => other.clone(),
-                    };
-                    Field::new(f.name(), data_type, f.is_nullable())
+                    Field::new(
+                        f.name(),
+                        match f.data_type() {
+                            DataType::Utf8View => DataType::Utf8,
+                            DataType::List(inner) if inner.data_type() == &DataType::Utf8View => {
+                                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+                            }
+                            other => other.clone(),
+                        },
+                        f.is_nullable(),
+                    )
                 })
                 .collect::<Vec<_>>(),
         ));
 
-        let json_data = records.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+        let json_data = records.iter().join("\n");
 
         let batch = ReaderBuilder::new(json_read_schema)
             .with_batch_size(records.len().max(1))

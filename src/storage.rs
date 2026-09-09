@@ -16,6 +16,7 @@ use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, Location, PsyncIoEngineConfig,
 };
 use futures::stream::BoxStream;
+use itertools::Itertools;
 use object_store::{
     Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
@@ -319,21 +320,9 @@ pub struct FoyerRuntimeStats {
 
 impl CacheStats {
     fn log(&self) {
-        let hit_rate = if self.hits + self.misses > 0 { (self.hits as f64 / (self.hits + self.misses) as f64) * 100.0 } else { 0.0 };
-        info!(
-            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, Range hits: {}, Range misses: {}, Bytes served: {}, Inner bytes read: {}, Range bytes read: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
-            hit_rate,
-            self.hits,
-            self.misses,
-            self.range_hits,
-            self.range_misses,
-            self.bytes_served,
-            self.inner_bytes_read,
-            self.range_bytes_read,
-            self.ttl_expirations,
-            self.inner_gets,
-            self.inner_puts
-        );
+        let lookups = self.hits + self.misses;
+        let hit_rate = if lookups > 0 { (self.hits as f64 / lookups as f64) * 100.0 } else { 0.0 };
+        info!(hit_rate, stats = ?self, "Foyer cache stats");
     }
 }
 
@@ -577,6 +566,10 @@ impl SharedFoyerCache {
         self.metadata_stats.read().await.log();
     }
 
+    /// How long Foyer's close may take before it is abandoned. Small on purpose:
+    /// see the note in `shutdown_by`.
+    const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// Close the caches, bounded by `deadline`. Foyer's `close()` flushes
     /// in-memory entries to disk; on a large cache / slow disk this can run for
     /// minutes (prod 2026-07-13: 377MB → 8.5min), and because it blocks process
@@ -584,10 +577,6 @@ impl SharedFoyerCache {
     /// a redeploy. The disk cache is a rebuildable READ cache, so abandoning an
     /// in-progress flush loses only warmth, never durable data — prioritize
     /// releasing the WAL lock over cache completeness.
-    /// How long Foyer's close may take before it is abandoned. Small on purpose:
-    /// see the note in `shutdown_by`.
-    const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
     pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
@@ -651,8 +640,7 @@ impl SharedFoyerCache {
 /// Strip the `scheme://` prefix and trailing slashes from a table URI, yielding
 /// the bare table path used to build `_delta_log` cache keys.
 fn table_path_from_uri(table_uri: &str) -> &str {
-    let table_path = table_uri.find("://").map(|idx| &table_uri[idx + 3..]).unwrap_or(table_uri);
-    table_path.trim_end_matches('/')
+    table_uri.split_once("://").map_or(table_uri, |(_, path)| path).trim_end_matches('/')
 }
 
 /// Cache key (and object path) of a table's mutable `_last_checkpoint` file.
@@ -795,11 +783,8 @@ pub fn date_partition_within(s: &str, cutoff: Option<chrono::NaiveDate>) -> bool
 /// Keeps cold-tier rewrites (recompress of week+-old partitions) out of the
 /// cache so recent data stays local and old data is served from S3.
 fn is_within_recent_window(location: &Path, recent_days: usize) -> bool {
-    if recent_days == 0 {
-        return true;
-    }
-    let cutoff = Utc::now().date_naive() - chrono::Duration::days(recent_days as i64);
-    date_partition_within(location.as_ref(), Some(cutoff))
+    let cutoff = (recent_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recent_days as i64));
+    date_partition_within(location.as_ref(), cutoff)
 }
 
 /// Insert into the main full-file cache, steering large entries to disk-only
@@ -819,6 +804,20 @@ fn insert_main(cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_
 /// a post-write GET just to learn the metadata.
 fn put_result_meta(location: Path, size: u64, result: &PutResult) -> ObjectMeta {
     ObjectMeta { location, last_modified: Utc::now(), size, e_tag: result.e_tag.clone(), version: result.version.clone() }
+}
+
+/// A cached byte range, stamped with the file's identity (etag/version/mtime)
+/// but the *range's* length as its size. Takes `Bytes` so admitting a range
+/// shares the fetched buffer instead of copying it.
+fn range_value(location: &Path, data: Bytes, file: &ObjectMeta) -> CacheValue {
+    let meta = ObjectMeta {
+        location: location.clone(),
+        last_modified: file.last_modified,
+        size: data.len() as u64,
+        e_tag: file.e_tag.clone(),
+        version: file.version.clone(),
+    };
+    CacheValue::new(data, meta)
 }
 
 /// Foyer-based hybrid cache implementation for object store
@@ -952,18 +951,12 @@ impl FoyerObjectStoreCache {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down foyer hybrid cache");
 
-        // Cancel all background refresh tasks
         let mut tasks = self.background_tasks.lock().await;
         debug!("Cancelling {} background refresh tasks", tasks.len());
         tasks.abort_all();
-        // Wait for all tasks to complete or be cancelled
         while tasks.join_next().await.is_some() {}
-
-        // Clear the refreshing set
         self.refreshing.clear();
-
-        // Note: We don't close the caches here because they're shared
-        // and owned by SharedFoyerCache
+        // The caches themselves are owned by SharedFoyerCache and closed there.
         Ok(())
     }
 
@@ -979,9 +972,7 @@ impl FoyerObjectStoreCache {
         *self.stats.write().await = CacheStats::default();
         *self.metadata_stats.write().await = CacheStats::default();
     }
-}
 
-impl FoyerObjectStoreCache {
     /// Read a payload body into bytes, propagating IO/stream errors.
     async fn read_payload(payload: GetResultPayload) -> ObjectStoreResult<Vec<u8>> {
         use futures::TryStreamExt;
@@ -1298,7 +1289,7 @@ impl FoyerObjectStoreCache {
                 );
 
                 bump(&self.metadata_stats, |s| s.inner_bytes_read += data.len() as u64).await;
-                self.admit_range(location, range_cache_key, &data, &file_meta);
+                self.admit_range(location, range_cache_key, data.clone(), &file_meta);
 
                 return Ok(data);
             }
@@ -1375,7 +1366,7 @@ impl FoyerObjectStoreCache {
         record_range_miss(&self.stats, result.len() as u64).await;
         bump(&self.stats, |s| s.inner_bytes_read += result.len() as u64).await;
         if let Some(meta) = range_meta.as_ref() {
-            self.admit_data_range(location, range_cache_key, &result, meta);
+            self.admit_data_range(location, range_cache_key, result.clone(), meta);
         }
         Ok(match response_slice {
             Some((start, end)) => result.slice(start..end),
@@ -1449,10 +1440,7 @@ impl FoyerObjectStoreCache {
         // known payload size; no post-write GET. insert_main_value applies the
         // recent-days window and large-entry disk steering.
         if payload_size > 0 {
-            let data = payload_for_cache.iter().fold(Vec::with_capacity(payload_size), |mut acc, chunk| {
-                acc.extend_from_slice(chunk);
-                acc
-            });
+            let data = payload_for_cache.as_ref().concat();
             let meta = put_result_meta(location.clone(), payload_size as u64, &result);
             self.insert_main_value(location, CacheValue::new(data, meta));
             debug!("Warmed cache from write payload: {} (size: {} bytes)", location, payload_size);
@@ -1522,33 +1510,18 @@ impl FoyerObjectStoreCache {
         !self.bypass_seen.insert(key.to_string())
     }
 
-    /// Cache a fetched byte range under `key`, stamped with the file's identity
-    /// (etag/version/mtime) but the *range's* length as its size.
-    fn admit_range(&self, location: &Path, key: String, data: &[u8], file: &ObjectMeta) {
-        let meta = ObjectMeta {
-            location: location.clone(),
-            last_modified: file.last_modified,
-            size: data.len() as u64,
-            e_tag: file.e_tag.clone(),
-            version: file.version.clone(),
-        };
-        self.admit(&self.metadata_cache, key, CacheValue::new(data.to_vec(), meta), 0);
+    /// Cache a fetched metadata byte range under `key`.
+    fn admit_range(&self, location: &Path, key: String, data: Bytes, file: &ObjectMeta) {
+        self.admit(&self.metadata_cache, key, range_value(location, data, file), 0);
     }
 
     /// Admit an exact parquet data range to the main cache. This is the
     /// fallback for files whose full-file post-commit warm has not landed.
-    fn admit_data_range(&self, location: &Path, key: String, data: &[u8], file: &ObjectMeta) {
+    fn admit_data_range(&self, location: &Path, key: String, data: Bytes, file: &ObjectMeta) {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        let meta = ObjectMeta {
-            location: location.clone(),
-            last_modified: file.last_modified,
-            size: data.len() as u64,
-            e_tag: file.e_tag.clone(),
-            version: file.version.clone(),
-        };
-        self.admit(&self.cache, key, CacheValue::new(data.to_vec(), meta), self.config.l1_max_entry_bytes);
+        self.admit(&self.cache, key, range_value(location, data, file), self.config.l1_max_entry_bytes);
     }
 
     /// Cache a path's `ObjectMeta` (body-less entry) so later reads skip the HEAD.
@@ -1797,7 +1770,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             // reads use) and the immutable-meta cache, so the next footer read is
             // a pure cache hit.
             if is_parquet_file(location) {
-                self.admit_range(location, Self::make_range_cache_key(location, &abs_range), &bytes, &meta);
+                self.admit_range(location, Self::make_range_cache_key(location, &abs_range), bytes.clone(), &meta);
                 self.admit_meta(location, meta.clone());
             }
             return Ok(Self::make_get_result_at(bytes, meta, attributes, abs_range.start));
@@ -2077,48 +2050,53 @@ mod tests {
         Ok(())
     }
 
+    /// Writing through the cache warms it from the payload, so every later read
+    /// is a hit and the inner store is never touched — whatever the file count,
+    /// the file size, or how small the L1 budget is.
+    #[test_case::test_case("basic_ops", 10 * 1024 * 1024, &[9] ; "one small file")]
+    #[test_case::test_case("s3_bypass", 10 * 1024 * 1024, &[1024, 2048, 4096] ; "several files")]
+    #[test_case::test_case("disk", 1024, &[10 * 1024] ; "file larger than the memory budget")]
     #[tokio::test]
-    async fn test_basic_operations() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let cache = FoyerObjectStoreCache::new(inner, FoyerCacheConfig::test_config("basic_ops")).await?;
+    async fn writes_warm_the_cache_so_reads_never_reach_the_inner_store(name: &str, memory_bytes: usize, sizes: &[usize]) -> anyhow::Result<()> {
+        let config = FoyerCacheConfig::test_config_with(name, |c| c.memory_size_bytes = memory_bytes);
+        let _dir = CacheDirGuard(config.cache_dir.clone());
+        let cache = FoyerObjectStoreCache::new(Arc::new(InMemory::new()), config).await?;
         cache.reset_stats().await;
 
-        let path = Path::from("test/file.parquet");
-        let data = Bytes::from("test data");
+        let files: Vec<(Path, Bytes)> =
+            sizes.iter().enumerate().map(|(i, &n)| (Path::from(format!("table/part-{i}.parquet")), Bytes::from(vec![b'a'; n]))).collect();
+        for (path, data) in &files {
+            cache.put(path, PutPayload::from(data.clone())).await?;
+        }
+        assert_eq!(cache.get_stats().await.main.inner_puts, files.len() as u64);
 
-        cache.put(&path, PutPayload::from(data.clone())).await?;
+        // Two read passes: both served from the write payload, so no re-fetch.
+        for _ in 0..2 {
+            for (path, data) in &files {
+                assert_eq!(&cache.get(path).await?.bytes().await?[..], &data[..]);
+            }
+        }
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_puts, 1);
-        assert_eq!(stats.main.inner_gets, 0); // Cached directly from the write payload — no re-fetch
-
-        // First get - cache hit (since we cache on write)
-        assert_eq!(cache.get(&path).await?.bytes().await?, data);
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 0); // No fetch needed - cached from write payload
+        assert_eq!(stats.main.inner_gets, 0, "nothing is ever fetched back from the inner store");
         assert_eq!(stats.main.misses, 0);
-        assert_eq!(stats.main.hits, 1);
-
-        // Second get - cache hit
-        assert_eq!(cache.get(&path).await?.bytes().await?, data);
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 0); // Still no fetch - served from cache
-        assert_eq!(stats.main.hits, 2); // Two cache hits total
-        assert_eq!(stats.main.misses, 0);
-        assert_eq!(stats.main.bytes_served, (data.len() * 2) as u64);
+        assert_eq!(stats.main.hits, 2 * files.len() as u64);
+        assert_eq!(stats.main.bytes_served, 2 * sizes.iter().sum::<usize>() as u64);
         assert_eq!(cache.try_get_stats().main.bytes_served, stats.main.bytes_served);
 
+        cache.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_object_is_no_longer_served_from_cache() -> anyhow::Result<()> {
+        let cache = FoyerObjectStoreCache::new(Arc::new(InMemory::new()), FoyerCacheConfig::test_config("delete")).await?;
+        let path = Path::from("test/file.parquet");
+        cache.put(&path, PutPayload::from(Bytes::from_static(b"test data"))).await?;
         cache.delete(&path).await?;
+        tokio::time::sleep(Duration::from_millis(10)).await; // deletion is processed off the call
 
-        // Give cache time to process deletion
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // After deletion, get should fail
-        let get_result = cache.get(&path).await;
-        assert!(get_result.is_err(), "Expected error after delete, got: {:?}", get_result);
-
+        assert!(cache.get(&path).await.is_err(), "a deleted object must not be served from cache");
         cache.shutdown().await?;
         Ok(())
     }
@@ -2128,7 +2106,7 @@ mod tests {
     #[tokio::test]
     async fn cache_hit_serves_the_requested_range() -> anyhow::Result<()> {
         let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("hit_range")).await?;
-        let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(object_store::memory::InMemory::new()), &cache);
+        let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(InMemory::new()), &cache);
         let path = Path::from("test/zc.parquet");
         let body: Vec<u8> = (0u8..=255).collect();
         let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: body.len() as u64, e_tag: None, version: None };
@@ -2151,7 +2129,7 @@ mod tests {
     #[tokio::test]
     async fn held_slice_does_not_pin_the_cache_entry() -> anyhow::Result<()> {
         let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("no_pin")).await?;
-        let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(object_store::memory::InMemory::new()), &cache);
+        let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(InMemory::new()), &cache);
         let path = Path::from("test/pin.parquet");
         let body: Vec<u8> = (0u8..=255).collect();
         let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: body.len() as u64, e_tag: None, version: None };
@@ -2204,54 +2182,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_prevents_s3_access() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config_with("s3_bypass", |c| {
-            c.memory_size_bytes = 10 * 1024 * 1024;
-            c.disk_size_bytes = 100 * 1024 * 1024;
-            c.ttl = Duration::from_secs(300);
-        });
-
-        let cache = FoyerObjectStoreCache::new(inner, config).await?;
-        cache.reset_stats().await;
-
-        let files =
-            vec![("table/part-001.parquet", vec![b'a'; 1024]), ("table/part-002.parquet", vec![b'b'; 2048]), ("table/part-003.parquet", vec![b'c'; 4096])];
-
-        // Write all files
-        for (path_str, data) in &files {
-            let path = Path::from(*path_str);
-            cache.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
-        }
-
-        // First read - cache hit (since we cache on write)
-        for (path_str, data) in &files {
-            let path = Path::from(*path_str);
-            assert_eq!(cache.get(&path).await?.bytes().await?.len(), data.len());
-        }
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 0); // Cached from write payloads — no re-fetch
-        assert_eq!(stats.main.misses, 0);
-        assert_eq!(stats.main.hits, 3);
-
-        // Second read - cache hit
-        for (path_str, data) in &files {
-            let path = Path::from(*path_str);
-            assert_eq!(cache.get(&path).await?.bytes().await?.len(), data.len());
-        }
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 0); // No inner gets at all
-        assert_eq!(stats.main.hits, 6); // Total 6 hits (3 per read)
-
-        info!("Cache successfully prevented {} S3 accesses", stats.main.hits);
-
-        cache.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_ttl_expiration() -> anyhow::Result<()> {
         let config = FoyerCacheConfig::test_config_with("ttl", |c| {
             c.ttl = Duration::from_millis(100);
@@ -2263,53 +2193,18 @@ mod tests {
         let cache = FoyerObjectStoreCache::new(inner, config).await?;
 
         let path = Path::from("test/ttl_file.parquet");
-        let data = Bytes::from("test data");
+        cache.put(&path, PutPayload::from(Bytes::from_static(b"test data"))).await?;
+        let _ = cache.get(&path).await?;
+        cache.reset_stats().await; // normalize: only the post-expiry read is under test
 
-        cache.put(&path, PutPayload::from(data.clone())).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await; // 2x the TTL
         let _ = cache.get(&path).await?;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let _ = cache.get(&path).await?;
-
         let stats = cache.get_stats().await;
-        info!("TTL test - main cache hits: {}, misses: {}", stats.main.hits, stats.main.misses);
+        assert_eq!(stats.main.ttl_expirations, 1, "the stale entry must be counted as expired");
+        assert_eq!(stats.main.misses, 1, "an expired entry is re-fetched, not served");
+        assert_eq!(stats.main.hits, 0);
 
-        cache.shutdown().await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_large_file_disk_cache() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config_with("disk", |c| {
-            c.memory_size_bytes = 1024; // Very small memory
-        });
-
-        let cache = FoyerObjectStoreCache::new(inner, config).await?;
-        cache.reset_stats().await;
-
-        let large_data = Bytes::from(vec![b'x'; 10 * 1024]); // 10KB
-        let path = Path::from("test/large_file.parquet");
-
-        cache.put(&path, PutPayload::from(large_data.clone())).await?;
-
-        // First get - cache hit (since we cache on write)
-        assert_eq!(cache.get(&path).await?.bytes().await?.len(), large_data.len());
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 0); // Cached from write payload — no re-fetch
-        assert_eq!(stats.main.hits, 1);
-
-        // Second get - cache hit
-        assert_eq!(cache.get(&path).await?.bytes().await?.len(), large_data.len());
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 0); // Still no fetch - served from cache
-        assert_eq!(stats.main.hits, 2); // Two cache hits total
-
-        info!("Large file test - main cache hits: {}, misses: {}", stats.main.hits, stats.main.misses);
         cache.shutdown().await?;
         Ok(())
     }
@@ -2376,78 +2271,7 @@ mod tests {
         assert_eq!(stats.main.inner_gets, 1); // No additional inner get
         assert_eq!(stats.main.hits, 1); // Cache hit on full file
 
-        info!("Parquet metadata optimization test passed");
-        info!("Main cache - hits: {}, misses: {}", stats.main.hits, stats.main.misses);
-        info!("Metadata cache - hits: {}, misses: {}", stats.metadata.hits, stats.metadata.misses);
         cache.shutdown().await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_metadata_cache_separation() -> anyhow::Result<()> {
-        // Use in-memory store for testing
-        let inner = Arc::new(InMemory::new());
-
-        // Configure cache with small limits to test separation
-        let config = FoyerCacheConfig::test_config_with("metadata_separation", |c| {
-            c.memory_size_bytes = 10 * 1024 * 1024; // 10MB
-            c.disk_size_bytes = 50 * 1024 * 1024; // 50MB
-            c.metadata_memory_size_bytes = 5 * 1024 * 1024; // 5MB
-            c.metadata_disk_size_bytes = 20 * 1024 * 1024; // 20MB
-            c.parquet_metadata_size_hint = 1024; // 1KB
-        });
-
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
-        cache.reset_stats().await;
-
-        // Create a parquet file
-        let path = Path::from("test.parquet");
-        let file_size = 1024 * 1024; // 1MB
-        let data = vec![b'a'; file_size];
-        inner.put(&path, PutPayload::from(Bytes::from(data))).await?;
-
-        // Test 1: Read metadata range (should use metadata cache)
-        let metadata_range = (file_size - 1024) as u64..file_size as u64;
-        let result = cache.get_range(&path, metadata_range.clone()).await?;
-        assert_eq!(result.len(), 1024, "Should get correct range size");
-
-        let stats = cache.get_stats().await;
-        info!(
-            "After first get_range - metadata.misses: {}, metadata.hits: {}, main.misses: {}, main.hits: {}",
-            stats.metadata.misses, stats.metadata.hits, stats.main.misses, stats.main.hits
-        );
-        assert_eq!(stats.metadata.misses, 1, "Should have 1 metadata cache miss");
-        assert_eq!(stats.metadata.hits, 0, "Should have 0 metadata cache hits");
-        assert_eq!(stats.main.hits, 0, "Should have 0 main cache hits");
-
-        // Test 2: Read same metadata range again (should hit metadata cache)
-        let _ = cache.get_range(&path, metadata_range.clone()).await?;
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.metadata.hits, 1, "Should have 1 metadata cache hit");
-        assert_eq!(stats.metadata.misses, 1, "Should still have 1 metadata cache miss");
-
-        // Test 3: Read data range (should use main cache)
-        let data_range = 0..1024;
-        let _ = cache.get_range(&path, data_range).await?;
-
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.misses, 1, "Should have 1 main cache miss");
-
-        // Test 4: Read full file (should use main cache)
-        let _ = cache.get(&path).await?;
-
-        let stats = cache.get_stats().await;
-        assert!(stats.main.hits > 0 || stats.main.misses > 0, "Main cache should be used for full file");
-
-        info!("Main cache stats: hits={}, misses={}", stats.main.hits, stats.main.misses);
-        info!("Metadata cache stats: hits={}, misses={}", stats.metadata.hits, stats.metadata.misses);
-
-        cache.shutdown().await?;
-
         Ok(())
     }
 
@@ -2478,10 +2302,6 @@ mod tests {
         assert_eq!(result.len(), 1024, "Should get correct range size");
 
         let stats = cache.get_stats().await;
-        info!(
-            "After first get_range - metadata.misses: {}, metadata.hits: {}, main.misses: {}, main.hits: {}",
-            stats.metadata.misses, stats.metadata.hits, stats.main.misses, stats.main.hits
-        );
         assert_eq!(stats.metadata.misses, 1, "Should have metadata cache miss");
         assert_eq!(stats.metadata.hits, 0, "Should have no metadata cache hits yet");
 
@@ -2500,21 +2320,12 @@ mod tests {
         // The range will be served from the main cache since put() caches the full file
         assert_eq!(stats.main.hits, 1, "Should hit main cache after put");
 
-        info!("Metadata cache invalidation test passed");
-        info!(
-            "Final stats - Main: hits={}, misses={}, Metadata: hits={}, misses={}",
-            stats.main.hits, stats.main.misses, stats.metadata.hits, stats.metadata.misses
-        );
-
         cache.shutdown().await?;
-
         Ok(())
     }
 
     #[tokio::test]
     async fn test_multipart_capture_warms_cache() -> anyhow::Result<()> {
-        use object_store::MultipartUpload;
-
         let inner = Arc::new(InMemory::new());
         // Tighten the inline cap to 1MB (below the 4MB block size) so we can
         // exercise both the captured and skipped paths.
@@ -2564,8 +2375,6 @@ mod tests {
     /// 256MB compaction output sat in heap per concurrent upload.
     #[tokio::test]
     async fn test_write_capture_cap_bounds_tee() -> anyhow::Result<()> {
-        use object_store::MultipartUpload;
-
         let inner = Arc::new(InMemory::new());
         // Block size stays 4MB; only the write-capture cap is tightened.
         let config = FoyerCacheConfig::test_config_with("wcap_cap", |c| {
@@ -2611,8 +2420,6 @@ mod tests {
     /// capture silently stops entirely.
     #[tokio::test]
     async fn test_write_capture_cap_is_clamped_to_budget() -> anyhow::Result<()> {
-        use object_store::MultipartUpload;
-
         let inner = Arc::new(InMemory::new());
         let config = FoyerCacheConfig::test_config_with("wcap_clamp", |c| {
             c.write_capture_max_bytes = 0; // bounded by the (4MB) block size
@@ -2638,8 +2445,6 @@ mod tests {
     /// exhausted, further uploads skip capture — but never block and never fail.
     #[tokio::test]
     async fn test_write_capture_budget_skips_without_failing_uploads() -> anyhow::Result<()> {
-        use object_store::MultipartUpload;
-
         let inner = Arc::new(InMemory::new());
         // Budget fits exactly one concurrent capture (1x the per-upload cap).
         let config = FoyerCacheConfig::test_config_with("wcap_budget", |c| {
@@ -2908,8 +2713,6 @@ mod tests {
     /// entry would either never be read back or never be evicted.
     #[tokio::test]
     async fn test_multipart_warm_read_and_evict_key_consistency() -> anyhow::Result<()> {
-        use object_store::MultipartUpload;
-
         let inner = Arc::new(InMemory::new());
         let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("mpu_key_consistency")).await?;
         let cache = FoyerObjectStoreCache::new_with_shared_cache(inner, &shared);
@@ -2951,8 +2754,8 @@ mod tests {
     #[display("CountingStore")]
     struct CountingStore {
         inner: Arc<InMemory>,
-        heads: Arc<std::sync::atomic::AtomicUsize>,
-        gets: Arc<std::sync::atomic::AtomicUsize>,
+        heads: Arc<AtomicUsize>,
+        gets: Arc<AtomicUsize>,
         delay: Duration,
     }
 
@@ -2967,7 +2770,6 @@ mod tests {
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-            use std::sync::atomic::Ordering;
             if options.head {
                 self.heads.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -3007,8 +2809,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_cold_gets_share_one_inner_fetch() -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let inner = Arc::new(InMemory::new());
         let path = Path::from(format!("table/date={}/part.parquet", Utc::now().date_naive()));
         inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; 1024]))).await?;
@@ -3035,8 +2835,6 @@ mod tests {
     /// zero S3 round-trips (no HEAD to classify, no GET).
     #[tokio::test]
     async fn test_warm_footer_eliminates_read_path_heads() -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let mem = Arc::new(InMemory::new());
         let file_size = 10 * 1024usize;
         let path = Path::from("table/date=2026-06-05/part-heads.parquet");
@@ -3139,7 +2937,6 @@ mod tests {
     /// GETs).
     #[tokio::test]
     async fn tiny_parquet_file_is_cached_whole_not_per_range() -> anyhow::Result<()> {
-        use std::sync::atomic::AtomicUsize;
         let mem = Arc::new(InMemory::new());
         let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
@@ -3230,7 +3027,6 @@ mod tests {
     // free to confirm: only the write-capture gap may cost a fetch.
     #[tokio::test]
     async fn warm_full_if_absent_fetches_only_the_uncaptured_files() -> anyhow::Result<()> {
-        use std::sync::atomic::AtomicUsize;
         let mem = Arc::new(InMemory::new());
         let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
@@ -3743,8 +3539,6 @@ pub trait CoverageLedger: Send + Sync {
     fn coverage(&self, cell: &CoverageCell) -> Vec<CoverageEntry>;
     /// Record a slice that is ALREADY COMMITTED. See the ordering note above.
     fn record(&self, cell: &CoverageCell, entry: CoverageEntry);
-    /// Drop a cell entirely — its partition aged out, or its coverage is being
-    /// rebuilt from scratch.
     /// Replace a cell's coverage wholesale with what a replay just proved.
     ///
     /// `record` alone is APPEND-ONLY, and coverage is not: a slice rebuilt under
@@ -3784,10 +3578,10 @@ pub trait CoverageLedger: Send + Sync {
 /// a range no single build ever produced.
 pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
     entries.sort_by(|a, b| (&a.generation, a.start_micros).cmp(&(&b.generation, b.start_micros)));
-    let mut merged: Vec<CoverageEntry> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        match merged.last_mut() {
-            Some(last) if last.generation == entry.generation && entry.start_micros <= last.end_micros => {
+    entries
+        .into_iter()
+        .coalesce(|mut last, entry| {
+            if last.generation == entry.generation && entry.start_micros <= last.end_micros {
                 last.end_micros = last.end_micros.max(entry.end_micros);
                 // A merged range is only as trustworthy as its weakest part: one
                 // witness-less contributor makes the whole span unverifiable,
@@ -3803,11 +3597,12 @@ pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
                 last.files.extend(entry.files);
                 last.files.sort_unstable();
                 last.files.dedup();
+                Ok(last)
+            } else {
+                Err((last, entry))
             }
-            _ => merged.push(entry),
-        }
-    }
-    merged
+        })
+        .collect()
 }
 
 /// One `(cell -> entries)` row as it is persisted. Flat on purpose: a tuple key
@@ -3882,15 +3677,14 @@ impl JsonCoverageLedger {
     /// and two entries there. The covered SET is identical, which is the only
     /// thing routing asks.
     pub fn routing_view(&self, source: &str, table_name: &str) -> std::collections::HashMap<String, Vec<CoverageEntry>> {
-        let mut by_project: std::collections::HashMap<String, Vec<CoverageEntry>> = std::collections::HashMap::new();
-        for cell in self.cells.iter() {
-            let (cell_source, project_id, cell_table, _date) = cell.key();
-            if cell_source != source || cell_table != table_name {
-                continue;
-            }
-            by_project.entry(project_id.clone()).or_default().extend(cell.value().iter().cloned());
-        }
-        by_project.into_iter().map(|(project, entries)| (project, merge_coverage(entries))).collect()
+        self.cells
+            .iter()
+            .filter(|cell| cell.key().0 == source && cell.key().2 == table_name)
+            .map(|cell| (cell.key().1.clone(), cell.value().clone()))
+            .into_group_map()
+            .into_iter()
+            .map(|(project, entries)| (project, merge_coverage(entries.into_iter().flatten().collect())))
+            .collect()
     }
 
     /// Drop cells whose date is older than `keep_from` (a `YYYY-MM-DD` bound),
@@ -3919,10 +3713,11 @@ impl CoverageLedger for JsonCoverageLedger {
     }
 
     fn record(&self, cell: &CoverageCell, entry: CoverageEntry) {
-        self.cells.entry(cell.clone()).or_default().push(entry);
-        if let Some(mut entries) = self.cells.get_mut(cell) {
-            let merged = merge_coverage(std::mem::take(&mut *entries));
-            *entries = merged;
+        {
+            // Scoped so the map guard is released before `persist` iterates the map.
+            let mut entries = self.cells.entry(cell.clone()).or_default();
+            entries.push(entry);
+            *entries = merge_coverage(std::mem::take(&mut *entries));
         }
         self.persist();
     }

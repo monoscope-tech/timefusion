@@ -9,6 +9,7 @@ use deltalake::{
     kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField},
 };
 use include_dir::{Dir, include_dir};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 /// One continuous-aggregate rollup, declared on the SOURCE table.
@@ -119,27 +120,23 @@ impl RollupSpec {
 
     fn validate(&self, source: &TableSchema) -> anyhow::Result<()> {
         const IDENTITY_FIELDS: [&str; 7] = ["project_id", "timestamp", "date", "id", "updated_at", "deleted", "rollup_generation"];
+        let target = self.table_name(&source.table_name);
         let field = |name: &str| source.fields.iter().find(|f| f.name == name);
         let is_ident = |name: &str| {
             let mut chars = name.chars();
             matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_')) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
         };
 
-        anyhow::ensure!(self.grain_micros().is_some(), "rollup {}: invalid grain `{}`", self.table_name(&source.table_name), self.grain);
-        anyhow::ensure!(self.name.as_deref().is_none_or(is_ident), "rollup {}: name must be an SQL identifier", self.table_name(&source.table_name));
+        anyhow::ensure!(self.grain_micros().is_some(), "rollup {target}: invalid grain `{}`", self.grain);
+        anyhow::ensure!(self.name.as_deref().is_none_or(is_ident), "rollup {target}: name must be an SQL identifier");
         let mut names = HashSet::new();
         for dimension in &self.dimensions {
-            anyhow::ensure!(field(dimension).is_some(), "rollup {}: unknown dimension `{dimension}`", self.table_name(&source.table_name));
-            anyhow::ensure!(names.insert(dimension), "rollup {}: duplicate dimension `{dimension}`", self.table_name(&source.table_name));
-            anyhow::ensure!(
-                !IDENTITY_FIELDS.contains(&dimension.as_str()),
-                "rollup {}: dimension `{dimension}` collides with an identity field",
-                self.table_name(&source.table_name)
-            );
+            anyhow::ensure!(field(dimension).is_some(), "rollup {target}: unknown dimension `{dimension}`");
+            anyhow::ensure!(names.insert(dimension), "rollup {target}: duplicate dimension `{dimension}`");
+            anyhow::ensure!(!IDENTITY_FIELDS.contains(&dimension.as_str()), "rollup {target}: dimension `{dimension}` collides with an identity field");
         }
-        anyhow::ensure!(!self.measures.is_empty(), "rollup {}: needs at least one measure", self.table_name(&source.table_name));
+        anyhow::ensure!(!self.measures.is_empty(), "rollup {target}: needs at least one measure");
         if let Some(base) = &self.derive_from {
-            let target = self.table_name(&source.table_name);
             let base_spec = source
                 .rollups
                 .iter()
@@ -180,48 +177,35 @@ impl RollupSpec {
             }
         }
         for measure in &self.measures {
-            anyhow::ensure!(is_ident(&measure.name), "rollup {}: measure `{}` must be an SQL identifier", self.table_name(&source.table_name), measure.name);
-            anyhow::ensure!(names.insert(&measure.name), "rollup {}: duplicate or colliding measure `{}`", self.table_name(&source.table_name), measure.name);
+            let (name, agg) = (&measure.name, &measure.agg);
+            anyhow::ensure!(is_ident(name), "rollup {target}: measure `{name}` must be an SQL identifier");
+            anyhow::ensure!(names.insert(name), "rollup {target}: duplicate or colliding measure `{name}`");
             anyhow::ensure!(
-                matches!(measure.agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest" | "hll" | "first"),
-                "rollup {}: unsupported aggregate `{}`",
-                self.table_name(&source.table_name),
-                measure.agg
+                matches!(agg.as_str(), "count" | "sum" | "min" | "max" | "tdigest" | "hll" | "first"),
+                "rollup {target}: unsupported aggregate `{agg}`"
             );
             // Refused at load rather than building a tier whose coarse buckets
             // are wrong — see `first_companion` for why the pair is needed.
             anyhow::ensure!(
-                measure.agg != "first" || self.first_companion(measure).is_some(),
-                "rollup {}: `first` measure `{}` needs a companion `{{agg: min, column: timestamp}}` measure carrying the same filter",
-                self.table_name(&source.table_name),
-                measure.name
+                agg != "first" || self.first_companion(measure).is_some(),
+                "rollup {target}: `first` measure `{name}` needs a companion `{{agg: min, column: timestamp}}` measure carrying the same filter"
             );
-            match (&measure.agg[..], measure.column.as_deref()) {
+            match (agg.as_str(), measure.column.as_deref()) {
                 ("count", None) => {}
-                ("count", Some(column)) | ("sum" | "min" | "max" | "hll" | "first", Some(column)) => {
-                    anyhow::ensure!(field(column).is_some(), "rollup {}: unknown column `{column}`", self.table_name(&source.table_name));
+                ("count" | "sum" | "min" | "max" | "hll" | "first", Some(column)) => {
+                    anyhow::ensure!(field(column).is_some(), "rollup {target}: unknown column `{column}`")
                 }
                 ("tdigest", Some(column)) => {
-                    let Some(data_type) = field(column).map(|f| f.data_type.as_str()) else {
-                        anyhow::bail!("rollup {}: unknown column `{column}`", self.table_name(&source.table_name))
-                    };
+                    let Some(data_type) = field(column).map(|f| f.data_type.as_str()) else { anyhow::bail!("rollup {target}: unknown column `{column}`") };
                     anyhow::ensure!(
                         matches!(data_type, "Int32" | "Int64" | "UInt32" | "UInt64" | "Float64"),
-                        "rollup {}: tdigest column `{column}` must be numeric",
-                        self.table_name(&source.table_name)
+                        "rollup {target}: tdigest column `{column}` must be numeric"
                     );
                 }
-                (_, None) => {
-                    anyhow::bail!("rollup {}: `{}` measure `{}` needs a source column", self.table_name(&source.table_name), measure.agg, measure.name)
-                }
-                (aggregate, Some(_)) => anyhow::bail!("rollup {}: unsupported aggregate `{aggregate}`", self.table_name(&source.table_name)),
+                (_, None) => anyhow::bail!("rollup {target}: `{agg}` measure `{name}` needs a source column"),
+                (aggregate, Some(_)) => anyhow::bail!("rollup {target}: unsupported aggregate `{aggregate}`"),
             }
-            anyhow::ensure!(
-                measure.filter.as_deref().is_none_or(|f| !f.trim().is_empty()),
-                "rollup {}: measure `{}` has an empty filter",
-                self.table_name(&source.table_name),
-                measure.name
-            );
+            anyhow::ensure!(measure.filter.as_deref().is_none_or(|f| !f.trim().is_empty()), "rollup {target}: measure `{name}` has an empty filter");
         }
         Ok(())
     }
@@ -249,32 +233,32 @@ impl RollupSpec {
             // A tier is rebuilt wholesale, never UPDATEd.
             mutable: false,
         };
-        let mut fields = vec![
-            plain("project_id", "Utf8", true),
-            plain("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", false),
-            plain("date", "Date32", false),
-            plain("id", "Utf8", false),
-            plain("updated_at", "Timestamp(Microsecond, Some(\"UTC\"))", false),
-            plain("deleted", "Boolean", true),
-            plain("rollup_generation", "Utf8", false),
-        ];
-        for d in &self.dimensions {
-            let f = src_field(d)?;
-            // Always nullable in the rollup: GROUP BY emits a NULL group for
-            // rows missing the dimension, even when the source column is not.
-            //
-            // `tantivy: None` explicitly, against the struct update: `kind` and
-            // `status_code` are tantivy-indexed on the source, so inheriting the
-            // config put every rollup tier into `indexed_set()` — 52% of the
-            // indexed file population — and turned a dimension equality into a
-            // `text_match` the prefilter then serves. Measured on prod
-            // 2026-08-24, same rows, 5 reps: `kind = 'server'` over a 2-day
-            // rollup window took 8.2-10.9s against 0.28-1.8s for an opaque
-            // control, and a routed 7d dashboard went 7.2s -> 14.5s when a
-            // dimension filter was added. The index is read, used, and a loss.
-            fields.push(FieldDef { nullable: true, tantivy: None, ..f });
-        }
-        for m in &self.measures {
+        let fields = [
+            ("project_id", "Utf8", true),
+            ("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", false),
+            ("date", "Date32", false),
+            ("id", "Utf8", false),
+            ("updated_at", "Timestamp(Microsecond, Some(\"UTC\"))", false),
+            ("deleted", "Boolean", true),
+            ("rollup_generation", "Utf8", false),
+        ]
+        .into_iter()
+        .map(|(name, data_type, nullable)| Ok(plain(name, data_type, nullable)))
+        // Dimensions are always nullable in the rollup: GROUP BY emits a NULL
+        // group for rows missing the dimension, even when the source column is
+        // not.
+        //
+        // `tantivy: None` explicitly, against the struct update: `kind` and
+        // `status_code` are tantivy-indexed on the source, so inheriting the
+        // config put every rollup tier into `indexed_set()` — 52% of the
+        // indexed file population — and turned a dimension equality into a
+        // `text_match` the prefilter then serves. Measured on prod 2026-08-24,
+        // same rows, 5 reps: `kind = 'server'` over a 2-day rollup window took
+        // 8.2-10.9s against 0.28-1.8s for an opaque control, and a routed 7d
+        // dashboard went 7.2s -> 14.5s when a dimension filter was added. The
+        // index is read, used, and a loss.
+        .chain(self.dimensions.iter().map(|d| Ok(FieldDef { nullable: true, tantivy: None, ..src_field(d)? })))
+        .chain(self.measures.iter().map(|m| {
             let ty = match (m.agg.as_str(), &m.column) {
                 ("count", _) => "Int64".to_string(),
                 // `src_field` for its error, not its type: a sketch column is
@@ -286,8 +270,9 @@ impl RollupSpec {
                 (a, None) => anyhow::bail!("rollup {}: `{a}` measure `{}` needs a source column", self.table_name(&source.table_name), m.name),
             };
             // A measure over an empty group is NULL, and count is never NULL.
-            fields.push(plain(&m.name, &ty, m.agg != "count"));
-        }
+            Ok(plain(&m.name, &ty, m.agg != "count"))
+        }))
+        .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(TableSchema {
             table_name: self.table_name(&source.table_name),
             // Same partitioning as the source, so ProjectRoutingTable gives
@@ -484,12 +469,11 @@ impl TableSchema {
                 .find(|f| f.name == name)
                 .ok_or_else(|| anyhow::anyhow!("schema `{}`: {role} references unknown field `{}`", self.table_name, name))
         };
-        self.dedup_keys.iter().map(|k| ("dedup_keys", k)).chain(self.dedup_tiebreak.iter().map(|tb| ("dedup_tiebreak", tb))).try_for_each(
-            |(role, name)| -> anyhow::Result<()> {
-                anyhow::ensure!(field(role, name)?.data_type != "Variant", "schema `{}`: {role} cannot be a Variant column `{}`", self.table_name, name);
-                Ok(())
-            },
-        )?;
+        // A `for` with `?`: each item both fails fast and needs the `?` on
+        // `field(..)` inside the check itself.
+        for (role, name) in self.dedup_keys.iter().map(|k| ("dedup_keys", k)).chain(self.dedup_tiebreak.iter().map(|tb| ("dedup_tiebreak", tb))) {
+            anyhow::ensure!(field(role, name)?.data_type != "Variant", "schema `{}`: {role} cannot be a Variant column `{}`", self.table_name, name);
+        }
         if let Some(tc) = &self.tombstone_column {
             let f = field("tombstone_column", tc)?;
             // Nullable Boolean is load-bearing: NULL must be a legal "live"
@@ -502,6 +486,90 @@ impl TableSchema {
             self.table_name
         );
         Ok(())
+    }
+
+    pub fn fields(&self) -> anyhow::Result<Vec<FieldRef>> {
+        self.fields
+            .iter()
+            .map(|f| {
+                let field = Field::new(&f.name, parse_arrow_data_type(&f.data_type)?, f.nullable);
+                // Without the ExtensionType marker fresh tables (variant_bench)
+                // crash on the first INSERT — see `VARIANT_EXT_KEY`.
+                Ok(Arc::new(match f.data_type.as_str() {
+                    "Variant" => field.with_metadata(HashMap::from([(VARIANT_EXT_KEY.to_string(), VARIANT_EXT_VALUE.to_string())])),
+                    _ => field,
+                }) as FieldRef)
+            })
+            .collect()
+    }
+
+    pub fn columns(&self) -> anyhow::Result<Vec<StructField>> {
+        self.fields.iter().map(|f| Ok(StructField::new(&f.name, parse_delta_data_type(&f.data_type)?, f.nullable))).collect()
+    }
+
+    pub fn schema_ref(&self) -> SchemaRef {
+        // Partition columns move to the end to match Delta Lake's output order,
+        // order preserved within each group.
+        let all_fields = self.fields().unwrap_or_else(|e| panic!("Failed to build schema for table {}: {e:?}", self.table_name));
+        let partition_set = self.partition_set();
+        let (partition_fields, data_fields): (Vec<_>, Vec<_>) = all_fields.into_iter().partition(|f| partition_set.contains(f.name().as_str()));
+        Arc::new(Schema::new(data_fields.into_iter().chain(partition_fields).collect::<Vec<_>>()))
+    }
+
+    fn partition_set(&self) -> HashSet<&str> {
+        self.partitions.iter().map(String::as_str).collect()
+    }
+
+    pub fn sorting_columns(&self) -> Vec<SortingColumn> {
+        // Parquet data files omit partition columns (they live in the path), so
+        // the `SortingColumn.column_idx` the footer records must be the column's
+        // position among the *non-partition* fields — the physical parquet leaf
+        // order the reader (`ordering_from_parquet_metadata`) indexes into. Using
+        // the raw fields-list index over-counts by every partition column that
+        // precedes a sort key (e.g. `date` at field 0), so the footer points at
+        // the wrong column and the sort-order pushdown silently never fires.
+        // ...and a LEAF is not a FIELD. A Variant/struct column occupies as many
+        // parquet leaves as it has children, so counting fields under-shoots for
+        // every sort key that follows one. On a real prod file (97 leaves, 90
+        // fields) `resource___service___name` was recorded as leaf 76 — which is
+        // `attributes___user___email`. The reader then cannot find that name in
+        // the scan's schema, drops the entry, and the file advertises
+        // `[timestamp, id, level, status_code]`: an ordering the data does not
+        // have (within one timestamp, ids do not ascend across services). It
+        // also blocks the `SortPreservingMerge` that would remove the dedup
+        // rewrite's last sort. `timestamp` was correct only because nothing
+        // nested precedes it.
+        fn leaves(data_type: &ArrowDataType) -> i32 {
+            use arrow::datatypes::DataType::*;
+            match data_type {
+                Struct(fields) => fields.iter().map(|f| leaves(f.data_type())).sum(),
+                List(f) | LargeList(f) | FixedSizeList(f, _) | ListView(f) | LargeListView(f) => leaves(f.data_type()),
+                Map(entries, _) => leaves(entries.data_type()),
+                RunEndEncoded(_, values) => leaves(values.data_type()),
+                _ => 1,
+            }
+        }
+        let partition_set = self.partition_set();
+        let Ok(fields) = self.fields() else { return Vec::new() };
+        // Filter BEFORE the scan: partition columns live in the path, so they
+        // must not advance the leaf counter.
+        let leaf_of: HashMap<&str, i32> = self
+            .fields
+            .iter()
+            .zip(&fields)
+            .filter(|(d, _)| !partition_set.contains(d.name.as_str()))
+            .scan(0i32, |next, (declared, field)| {
+                let idx = *next;
+                *next += leaves(field.data_type());
+                Some((declared.name.as_str(), idx))
+            })
+            .collect();
+        self.sorting_columns
+            .iter()
+            .filter_map(|col| {
+                leaf_of.get(col.name.as_str()).map(|&column_idx| SortingColumn { column_idx, descending: col.descending, nulls_first: col.nulls_first })
+            })
+            .collect()
     }
 }
 
@@ -587,88 +655,6 @@ pub enum TantivyListMode {
     Elements,
 }
 
-impl TableSchema {
-    pub fn fields(&self) -> anyhow::Result<Vec<FieldRef>> {
-        self.fields
-            .iter()
-            .map(|f| {
-                let field = Field::new(&f.name, parse_arrow_data_type(&f.data_type)?, f.nullable);
-                // Without the ExtensionType marker fresh tables (variant_bench)
-                // crash on the first INSERT — see `VARIANT_EXT_KEY`.
-                Ok(Arc::new(match f.data_type.as_str() {
-                    "Variant" => field.with_metadata(HashMap::from([(VARIANT_EXT_KEY.to_string(), VARIANT_EXT_VALUE.to_string())])),
-                    _ => field,
-                }) as FieldRef)
-            })
-            .collect()
-    }
-
-    pub fn columns(&self) -> anyhow::Result<Vec<StructField>> {
-        self.fields.iter().map(|f| Ok(StructField::new(&f.name, parse_delta_data_type(&f.data_type)?, f.nullable))).collect()
-    }
-
-    pub fn schema_ref(&self) -> SchemaRef {
-        // Partition columns move to the end to match Delta Lake's output order,
-        // order preserved within each group.
-        let all_fields = self.fields().unwrap_or_else(|e| panic!("Failed to build schema for table {}: {e:?}", self.table_name));
-        let partition_set = self.partition_set();
-        let (partition_fields, data_fields): (Vec<_>, Vec<_>) = all_fields.into_iter().partition(|f| partition_set.contains(f.name().as_str()));
-        Arc::new(Schema::new(data_fields.into_iter().chain(partition_fields).collect::<Vec<_>>()))
-    }
-
-    fn partition_set(&self) -> HashSet<&str> {
-        self.partitions.iter().map(String::as_str).collect()
-    }
-
-    pub fn sorting_columns(&self) -> Vec<SortingColumn> {
-        // Parquet data files omit partition columns (they live in the path), so
-        // the `SortingColumn.column_idx` the footer records must be the column's
-        // position among the *non-partition* fields — the physical parquet leaf
-        // order the reader (`ordering_from_parquet_metadata`) indexes into. Using
-        // the raw fields-list index over-counts by every partition column that
-        // precedes a sort key (e.g. `date` at field 0), so the footer points at
-        // the wrong column and the sort-order pushdown silently never fires.
-        // ...and a LEAF is not a FIELD. A Variant/struct column occupies as many
-        // parquet leaves as it has children, so counting fields under-shoots for
-        // every sort key that follows one. On a real prod file (97 leaves, 90
-        // fields) `resource___service___name` was recorded as leaf 76 — which is
-        // `attributes___user___email`. The reader then cannot find that name in
-        // the scan's schema, drops the entry, and the file advertises
-        // `[timestamp, id, level, status_code]`: an ordering the data does not
-        // have (within one timestamp, ids do not ascend across services). It
-        // also blocks the `SortPreservingMerge` that would remove the dedup
-        // rewrite's last sort. `timestamp` was correct only because nothing
-        // nested precedes it.
-        let partition_set = self.partition_set();
-        let leaves = |data_type: &arrow_schema::DataType| -> usize {
-            fn count(data_type: &arrow_schema::DataType) -> usize {
-                use arrow_schema::DataType::*;
-                match data_type {
-                    Struct(fields) => fields.iter().map(|f| count(f.data_type())).sum(),
-                    List(f) | LargeList(f) | FixedSizeList(f, _) | ListView(f) | LargeListView(f) => count(f.data_type()),
-                    Map(entries, _) => count(entries.data_type()),
-                    RunEndEncoded(_, values) => count(values.data_type()),
-                    _ => 1,
-                }
-            }
-            count(data_type)
-        };
-        let Ok(fields) = self.fields() else { return Vec::new() };
-        let mut leaf_of: HashMap<&str, i32> = HashMap::new();
-        let mut next = 0usize;
-        for (declared, field) in self.fields.iter().zip(&fields).filter(|(d, _)| !partition_set.contains(d.name.as_str())) {
-            leaf_of.insert(declared.name.as_str(), next as i32);
-            next += leaves(field.data_type());
-        }
-        self.sorting_columns
-            .iter()
-            .filter_map(|col| {
-                leaf_of.get(col.name.as_str()).map(|idx| SortingColumn { column_idx: *idx, descending: col.descending, nulls_first: col.nulls_first })
-            })
-            .collect()
-    }
-}
-
 fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
     Ok(match s {
         // Use Utf8View for better performance with zero-copy string operations
@@ -740,8 +726,8 @@ impl SchemaRegistry {
             .files()
             .filter(|f| f.path().extension().and_then(|s| s.to_str()) == Some("yaml"))
             .map(|file| {
-                let content = file.contents_utf8().expect("Schema file should be UTF-8");
-                let schema: TableSchema = serde_yaml::from_str(content).unwrap_or_else(|e| panic!("Failed to parse schema {:?}: {}", file.path(), e));
+                let schema: TableSchema = serde_yaml::from_str(file.contents_utf8().expect("Schema file should be UTF-8"))
+                    .unwrap_or_else(|e| panic!("Failed to parse schema {:?}: {}", file.path(), e));
                 schema.validate().unwrap_or_else(|e| panic!("Invalid schema {:?}: {}", file.path(), e));
                 schema.rollups.iter().try_for_each(|rollup| rollup.validate(&schema)).unwrap_or_else(|e| panic!("Invalid rollup on {:?}: {}", file.path(), e));
                 (schema.table_name.clone(), schema)
@@ -754,23 +740,22 @@ impl SchemaRegistry {
         // is depends on whether they group the same way — so say so, rather
         // than making the operator infer it from a name collision.
         for src in schemas.values() {
-            for (i, a) in src.rollups.iter().enumerate() {
-                if let Some(b) = src.rollups[i + 1..].iter().find(|b| b.table_name(&src.table_name) == a.table_name(&src.table_name)) {
-                    let name = a.table_name(&src.table_name);
-                    assert!(
-                        a.dimensions != b.dimensions,
-                        "{}: two rollups both generate `{name}` with the SAME dimensions. Same grain + same dimensions is the same GROUP BY, so \
-                         add the extra measures to the existing rollup instead of declaring a second one — a second table would duplicate every \
-                         identity and dimension column and make a query wanting both measures read two tables.",
-                        src.table_name
-                    );
-                    panic!(
-                        "{}: two rollups both generate `{name}` but group differently ({:?} vs {:?}). Different dimensions ARE different tables; \
-                         give one of them a `name:` to distinguish it.",
-                        src.table_name, a.dimensions, b.dimensions
-                    );
-                }
-            }
+            let Some((a, b)) = src.rollups.iter().tuple_combinations().find(|(a, b)| a.table_name(&src.table_name) == b.table_name(&src.table_name)) else {
+                continue;
+            };
+            let name = a.table_name(&src.table_name);
+            assert!(
+                a.dimensions != b.dimensions,
+                "{}: two rollups both generate `{name}` with the SAME dimensions. Same grain + same dimensions is the same GROUP BY, so \
+                 add the extra measures to the existing rollup instead of declaring a second one — a second table would duplicate every \
+                 identity and dimension column and make a query wanting both measures read two tables.",
+                src.table_name
+            );
+            panic!(
+                "{}: two rollups both generate `{name}` but group differently ({:?} vs {:?}). Different dimensions ARE different tables; \
+                 give one of them a `name:` to distinguish it.",
+                src.table_name, a.dimensions, b.dimensions
+            );
         }
         let synthesized: Vec<TableSchema> = schemas
             .values()
@@ -782,13 +767,11 @@ impl SchemaRegistry {
             })
             .collect();
         for r in synthesized {
-            let name = r.table_name.clone();
-            if schemas.insert(name.clone(), r).is_some() {
-                // A hand-written file under a generated name would silently win
-                // or lose depending on iteration order. (Same-source rollup
-                // collisions are already reported above, with a better message.)
-                panic!("rollup table `{name}` collides with a hand-written schema file of the same name");
-            }
+            // A hand-written file under a generated name would silently win or
+            // lose depending on iteration order. (Same-source rollup collisions
+            // are already reported above, with a better message.)
+            assert!(!schemas.contains_key(&r.table_name), "rollup table `{}` collides with a hand-written schema file of the same name", r.table_name);
+            schemas.insert(r.table_name.clone(), r);
         }
         // Migration aliases remain queryable while v3/v2 slice generations
         // shadow-build and canary. They are read-only schema aliases: source
@@ -800,9 +783,8 @@ impl SchemaRegistry {
             ("otel_metrics_rollup_metrics_1m_v2", "otel_metrics_rollup_metrics_1m_v1"),
             ("otel_metrics_rollup_metrics_1h_v2", "otel_metrics_rollup_metrics_1h_v1"),
         ] {
-            if let Some(mut schema) = schemas.get(current).cloned() {
-                schema.table_name = legacy.to_owned();
-                schemas.entry(legacy.to_owned()).or_insert(schema);
+            if let Some(schema) = schemas.get(current).cloned() {
+                schemas.entry(legacy.to_owned()).or_insert(TableSchema { table_name: legacy.to_owned(), ..schema });
             }
         }
         Self { schemas }
@@ -893,21 +875,22 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
     // the tag, bare Variant columns surface text OID 25 and strict drivers
     // (hasql) reject the row (expected jsonb 3802). vendor/arrow-pg maps the
     // tag to OID 3802 + the 0x01 binary jsonb version byte.
-    let fields: Vec<FieldRef> = schema
-        .fields()
-        .iter()
-        .map(|f| {
-            if is_variant_type(f.data_type()) {
-                Arc::new(
-                    Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable())
-                        .with_metadata(HashMap::from([("tf.pg_type".to_string(), "jsonb".to_string())])),
-                )
-            } else {
-                f.clone()
-            }
-        })
-        .collect();
-    Arc::new(Schema::new(fields))
+    Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if is_variant_type(f.data_type()) {
+                    Arc::new(
+                        Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable())
+                            .with_metadata(HashMap::from([("tf.pg_type".to_string(), "jsonb".to_string())])),
+                    )
+                } else {
+                    f.clone()
+                }
+            })
+            .collect::<Vec<FieldRef>>(),
+    ))
 }
 
 #[cfg(test)]
@@ -919,6 +902,19 @@ mod tests {
 
     fn parse_schema(extra: &str, fields: &str) -> TableSchema {
         serde_yaml::from_str(&format!("{BASE_YAML}{extra}{fields}")).expect("yaml parses")
+    }
+
+    fn source() -> &'static TableSchema {
+        get_schema("otel_logs_and_spans").expect("source schema")
+    }
+
+    fn measure(name: &str, agg: &str, column: Option<&str>, filter: Option<&str>) -> RollupMeasure {
+        RollupMeasure { name: name.into(), agg: agg.into(), column: column.map(str::to_owned), filter: filter.map(str::to_owned) }
+    }
+
+    /// A 1m rollup over `kind` — the shape every spec test varies one part of.
+    fn spec(name: &str, measures: Vec<RollupMeasure>) -> RollupSpec {
+        RollupSpec { grain: "1m".into(), name: Some(name.into()), dimensions: vec!["kind".into()], measures, derive_from: None }
     }
 
     #[test]
@@ -939,16 +935,7 @@ mod tests {
 
     #[test]
     fn synthesized_rollup_stores_a_generation_and_tdigest() {
-        let source = get_schema("otel_logs_and_spans").expect("source schema");
-        let spec = RollupSpec {
-            grain: "1m".into(),
-            name: Some("digest_test".into()),
-            dimensions: vec!["kind".into()],
-            measures: vec![RollupMeasure { name: "digest".into(), agg: "tdigest".into(), column: Some("duration".into()), filter: None }],
-            derive_from: None,
-        };
-
-        let rollup = spec.synthesize(source).expect("valid rollup");
+        let rollup = spec("digest_test", vec![measure("digest", "tdigest", Some("duration"), None)]).synthesize(source()).expect("valid rollup");
         assert_eq!(rollup.field_def("rollup_generation"), Some((ArrowDataType::Utf8View, false)));
         assert_eq!(rollup.field_def("digest"), Some((ArrowDataType::Binary, true)));
         // `kind` is tantivy-indexed on the source and must NOT inherit it here:
@@ -963,40 +950,24 @@ mod tests {
     /// is refused at load rather than building a tier whose buckets are wrong.
     #[test]
     fn a_first_measure_is_refused_without_its_companion() {
-        let source = get_schema("otel_logs_and_spans").expect("source schema");
-        let landing = |filter: Option<&str>| RollupMeasure {
-            name: "landing_url".into(),
-            agg: "first".into(),
-            column: Some("attributes___url___path".into()),
-            filter: filter.map(str::to_owned),
-        };
-        let companion = |name: &str, filter: Option<&str>| RollupMeasure {
-            name: name.into(),
-            agg: "min".into(),
-            column: Some("timestamp".into()),
-            filter: filter.map(str::to_owned),
-        };
-        let spec = |measures: Vec<RollupMeasure>| RollupSpec {
-            grain: "1m".into(),
-            name: Some("first_test".into()),
-            dimensions: vec!["kind".into()],
-            measures,
-            derive_from: None,
-        };
+        let source = source();
+        let landing = |filter: Option<&str>| measure("landing_url", "first", Some("attributes___url___path"), filter);
+        let companion = |filter: Option<&str>| measure("at", "min", Some("timestamp"), filter);
+        let spec = |measures| spec("first_test", measures);
 
         assert!(spec(vec![landing(None)]).validate(source).is_err(), "a `first` measure alone must not validate");
-        assert!(spec(vec![landing(None), companion("at", None)]).validate(source).is_ok(), "the companion makes it valid");
+        assert!(spec(vec![landing(None), companion(None)]).validate(source).is_ok(), "the companion makes it valid");
 
         // "earliest row" and "earliest row MATCHING the filter" are different
         // rows, and it is the second one whose value was stored -- so a
         // companion carrying a different filter cannot order this measure.
         let filter = "attributes___url___path <> ''";
-        assert!(spec(vec![landing(Some(filter)), companion("at", None)]).validate(source).is_err(), "the companion's filter must match the measure's");
-        assert!(spec(vec![landing(Some(filter)), companion("at", Some(filter))]).validate(source).is_ok());
+        assert!(spec(vec![landing(Some(filter)), companion(None)]).validate(source).is_err(), "the companion's filter must match the measure's");
+        assert!(spec(vec![landing(Some(filter)), companion(Some(filter))]).validate(source).is_ok());
 
         // The stored value keeps the source column's own type -- it IS a value
         // from that column, not a sketch over it.
-        let rollup = spec(vec![landing(None), companion("at", None)]).synthesize(source).expect("valid rollup");
+        let rollup = spec(vec![landing(None), companion(None)]).synthesize(source).expect("valid rollup");
         assert_eq!(rollup.field_def("landing_url").map(|(ty, _)| ty), Some(ArrowDataType::Utf8View));
     }
 
@@ -1018,33 +989,18 @@ mod tests {
     /// name) are all strings.
     #[test]
     fn an_hll_measure_stores_a_sketch_over_any_column_type() {
-        let source = get_schema("otel_logs_and_spans").expect("source schema");
-        let spec = |column: &str| RollupSpec {
-            grain: "1m".into(),
-            name: Some("hll_test".into()),
-            dimensions: vec!["kind".into()],
-            measures: vec![RollupMeasure { name: "traces".into(), agg: "hll".into(), column: Some(column.into()), filter: None }],
-            derive_from: None,
-        };
+        let sketch = |column: &str| spec("hll_test", vec![measure("traces", "hll", Some(column), None)]);
         for column in ["context___trace_id", "duration"] {
-            let rollup = spec(column).synthesize(source).expect("valid rollup");
+            let rollup = sketch(column).synthesize(source()).expect("valid rollup");
             assert_eq!(rollup.field_def("traces"), Some((ArrowDataType::Binary, true)), "column {column}");
         }
-        assert!(spec("no_such_column").synthesize(source).is_err(), "an unknown column must still be rejected");
+        assert!(sketch("no_such_column").synthesize(source()).is_err(), "an unknown column must still be rejected");
     }
 
     #[test]
     fn invalid_rollup_aggregate_fails_validation() {
-        let source = get_schema("otel_logs_and_spans").expect("source schema");
-        let spec = RollupSpec {
-            grain: "1m".into(),
-            name: None,
-            dimensions: vec![],
-            measures: vec![RollupMeasure { name: "bad".into(), agg: "median".into(), column: Some("duration".into()), filter: None }],
-            derive_from: None,
-        };
-
-        assert!(spec.validate(source).unwrap_err().to_string().contains("unsupported aggregate"));
+        let bad = spec("bad_agg", vec![measure("bad", "median", Some("duration"), None)]);
+        assert!(bad.validate(source()).unwrap_err().to_string().contains("unsupported aggregate"));
     }
 
     /// The tombstone column must be nullable Boolean (NULL = live, so no

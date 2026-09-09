@@ -33,6 +33,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
+use itertools::Itertools;
 use timefusion::{
     config::{self, AppConfig},
     database::{Database, RecompressOutcome},
@@ -65,17 +66,14 @@ fn main() -> anyhow::Result<()> {
     server::raise_file_limit();
 
     let subcommand = std::env::args().nth(1);
-    if subcommand.as_deref() == Some("healthcheck") {
-        return run_pgwire_healthcheck();
-    }
-    if subcommand.as_deref() == Some("encrypt-secret") {
-        return config::run_cli();
-    }
-    // Replays a prod maintenance journal through the real scheduler on virtual
-    // time — must stay config/bucket-free, that's what lets it answer
-    // scheduler questions without a deploy.
-    if subcommand.as_deref() == Some("sim") {
-        return run_sim_cli();
+    match subcommand.as_deref() {
+        Some("healthcheck") => return run_pgwire_healthcheck(),
+        Some("encrypt-secret") => return config::run_cli(),
+        // Replays a prod maintenance journal through the real scheduler on
+        // virtual time — must stay config/bucket-free, that's what lets it
+        // answer scheduler questions without a deploy.
+        Some("sim") => return run_sim_cli(),
+        _ => {}
     }
 
     // Maintenance CLIs get the maintenance-heavy budget shape (the server shape
@@ -208,6 +206,41 @@ fn pgwire_ready_at(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     anyhow::bail!("PGWire returned unexpected response tag {:?}", tag[0] as char)
 }
 
+/// Argument cursor shared by every subcommand CLI below. Two-token flags need
+/// lookahead, so `next()` yields the flag and `value`/`parse` pull the token
+/// after it; a struct rather than a closure keeps the borrow from overlapping
+/// the `next()` that drives the loop.
+struct Args(std::iter::Skip<std::env::Args>);
+
+impl Args {
+    fn new() -> Self {
+        Self(std::env::args().skip(2))
+    }
+
+    fn value(&mut self, flag: &str) -> anyhow::Result<String> {
+        self.0.next().with_context(|| format!("{flag} needs a value"))
+    }
+
+    fn parse<T>(&mut self, flag: &str, what: &str) -> anyhow::Result<T>
+    where
+        T: std::str::FromStr,
+        T::Err: std::error::Error + Send + Sync + 'static,
+    {
+        self.value(flag)?.parse().with_context(|| format!("{flag} must be {what}"))
+    }
+
+    fn hours_micros(&mut self, flag: &str) -> anyhow::Result<i64> {
+        Ok((self.parse::<f64>(flag, "a number")? * 3_600_000_000.0) as i64)
+    }
+}
+
+impl Iterator for Args {
+    type Item = String;
+    fn next(&mut self) -> Option<String> {
+        self.0.next()
+    }
+}
+
 fn init_cli_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
@@ -233,7 +266,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
     if std::env::var_os("TIMEFUSION_DEDUP_CONTIGUITY_RANK").is_some() {
         timefusion::config::init_config().map_err(|e| anyhow::anyhow!("kill-switch env set but config failed to load: {e}"))?;
     }
-    let mut it = std::env::args().skip(2);
+    let mut it = Args::new();
     let usage = "usage: timefusion sim <journal.json|data-dir|synth:whale> [--hours N] [--workers N] [--streams N] [--scale F] [--seed N] [--no-mint] [--mint] [--debris-slice-minutes N] [--floorless] [--guard-off] [--json]";
     let input = it.next().context(usage)?;
     let mut cfg = SimConfig::default();
@@ -242,21 +275,14 @@ fn run_sim_cli() -> anyhow::Result<()> {
     let mut mint = false;
     let mut debris_slice = 1i64;
     while let Some(a) = it.next() {
-        let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
         match a.as_str() {
-            "--hours" => cfg.horizon_micros = (value("--hours")?.parse::<f64>().context("--hours must be a number")? * 3_600_000_000.0) as i64,
-            "--workers" => cfg.workers = value("--workers")?.parse().context("--workers must be an integer")?,
-            "--streams" => cfg.streams = Some(value("--streams")?.parse().context("--streams must be an integer")?),
-            "--scale" => cfg.duration_scale = value("--scale")?.parse().context("--scale must be a number")?,
-            "--seed" => cfg.seed = u64::from_str_radix(value("--seed")?.trim_start_matches("0x"), 16).context("--seed must be hex")?,
-            "--restarts-every-hours" => {
-                cfg.restart_every_micros =
-                    (value("--restarts-every-hours")?.parse::<f64>().context("--restarts-every-hours must be a number")? * 3_600_000_000.0) as i64
-            }
-            "--restart-at-hours" => {
-                cfg.restart_at_micros =
-                    Some((value("--restart-at-hours")?.parse::<f64>().context("--restart-at-hours must be a number")? * 3_600_000_000.0) as i64)
-            }
+            "--hours" => cfg.horizon_micros = it.hours_micros("--hours")?,
+            "--workers" => cfg.workers = it.parse("--workers", "an integer")?,
+            "--streams" => cfg.streams = Some(it.parse("--streams", "an integer")?),
+            "--scale" => cfg.duration_scale = it.parse("--scale", "a number")?,
+            "--seed" => cfg.seed = u64::from_str_radix(it.value("--seed")?.trim_start_matches("0x"), 16).context("--seed must be hex")?,
+            "--restarts-every-hours" => cfg.restart_every_micros = it.hours_micros("--restarts-every-hours")?,
+            "--restart-at-hours" => cfg.restart_at_micros = Some(it.hours_micros("--restart-at-hours")?),
             "--no-mint" => cfg.mint_frontier = false,
             // `synth:whale` disables minting by default (below). `--mint`
             // turns arrivals back on, which is what makes `--streams` — and so
@@ -264,7 +290,7 @@ fn run_sim_cli() -> anyhow::Result<()> {
             "--mint" => mint = true,
             // The bin-width axis: same total debris work as `600 / n` units of
             // `n` minutes. See `synthetic_whale_queue`.
-            "--debris-slice-minutes" => debris_slice = value("--debris-slice-minutes")?.parse().context("--debris-slice-minutes must be an integer")?,
+            "--debris-slice-minutes" => debris_slice = it.parse("--debris-slice-minutes", "an integer")?,
             // The floorless control, and the pre-69e6503 behaviour, for
             // `synth:whale`.
             "--floorless" => floorless = true,
@@ -281,15 +307,11 @@ fn run_sim_cli() -> anyhow::Result<()> {
         anyhow::ensure!(shape == "whale", "the only synthetic queue is `synth:whale`");
         // `--streams` scales the INGESTING streams discovered in a real
         // journal. A synthetic queue has none and sets `mint_frontier = false`
-        // below, so the flag was silently inert — while the summary line still
-        // printed the count it was given. A "10x" run reported 260 streams and
-        // modelled 1x: `--streams 26` and `--streams 260` produced BYTE-IDENTICAL
-        // reports at the same seed (2026-09-04). Refuse it rather than answer a
-        // capacity question with the baseline.
-        // Without minting there are no arrivals, so extra streams change
-        // nothing: `--streams 26` and `--streams 260` produced BYTE-IDENTICAL
-        // reports at the same seed (2026-09-04) while the summary line still
-        // printed the count it was given — a "10x" run that modelled 1x.
+        // below, so without minting there are no arrivals and the flag is
+        // silently inert: `--streams 26` and `--streams 260` produced
+        // BYTE-IDENTICAL reports at the same seed (2026-09-04) while the summary
+        // line still printed the count it was given — a "10x" run that modelled
+        // 1x. Refuse it rather than answer a capacity question with the baseline.
         anyhow::ensure!(
             cfg.streams.is_none() || mint,
             "--streams needs arrivals to scale: pass --mint (a synthetic queue disables minting by default), or use a real journal."
@@ -319,13 +341,10 @@ fn run_sim_cli() -> anyhow::Result<()> {
         "coarsen: subsumed {} fused {} | candidates {} blocked {} over_budget {}",
         report.coarsen_subsumed, report.coarsen_fused, report.coarsen_candidates, report.coarsen_blocked, report.coarsen_over_budget
     );
-    let mut completions = report.completions.iter().collect::<Vec<_>>();
-    completions.sort();
-    println!("completions: {}", completions.iter().map(|(op, n)| format!("{op}={n}")).collect::<Vec<_>>().join(" "));
+    let tally = |counts: &std::collections::HashMap<String, u64>| counts.iter().sorted().map(|(op, n)| format!("{op}={n}")).join(" ");
+    println!("completions: {}", tally(&report.completions));
     if !report.timeouts.is_empty() {
-        let mut timeouts = report.timeouts.iter().collect::<Vec<_>>();
-        timeouts.sort();
-        println!("timeouts:    {}", timeouts.iter().map(|(op, n)| format!("{op}={n}")).collect::<Vec<_>>().join(" "));
+        println!("timeouts:    {}", tally(&report.timeouts));
     }
     println!(
         "claims by data age: frontier={} mid_band(3-31d)={} privileged(>31d)={} | day-wide claims={}",
@@ -359,23 +378,23 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut operation = timefusion::maintenance_coordinator::Operation::BaseRollup;
     let mut slice_hours: i64 = 24;
     let mut offset_hours: i64 = 0;
-    let mut it = std::env::args().skip(2);
+    let mut it = Args::new();
     while let Some(a) = it.next() {
-        let mut value = |name: &str| -> anyhow::Result<String> { it.next().with_context(|| format!("{name} needs a value")) };
         match a.as_str() {
-            "--source" => source = value("--source")?,
-            "--project" => project = Some(value("--project")?),
-            "--date" => date = Some(value("--date")?.parse().context("--date must be YYYY-MM-DD")?),
-            "--slice-hours" => slice_hours = value("--slice-hours")?.parse().context("--slice-hours must be an integer")?,
-            "--offset-hours" => offset_hours = value("--offset-hours")?.parse().context("--offset-hours must be an integer")?,
+            "--source" => source = it.value("--source")?,
+            "--project" => project = Some(it.value("--project")?),
+            "--date" => date = Some(it.parse("--date", "YYYY-MM-DD")?),
+            "--slice-hours" => slice_hours = it.parse("--slice-hours", "an integer")?,
+            "--offset-hours" => offset_hours = it.parse("--offset-hours", "an integer")?,
             "--op" => {
-                operation = match value("--op")?.as_str() {
-                    "base" => timefusion::maintenance_coordinator::Operation::BaseRollup,
-                    "derived" => timefusion::maintenance_coordinator::Operation::DerivedRollup,
-                    "dedup" => timefusion::maintenance_coordinator::Operation::Dedup,
-                    "hot" => timefusion::maintenance_coordinator::Operation::HotPacking,
-                    "sealed" => timefusion::maintenance_coordinator::Operation::SealedConsolidation,
-                    "repair" => timefusion::maintenance_coordinator::Operation::Repair,
+                use timefusion::maintenance_coordinator::Operation;
+                operation = match it.value("--op")?.as_str() {
+                    "base" => Operation::BaseRollup,
+                    "derived" => Operation::DerivedRollup,
+                    "dedup" => Operation::Dedup,
+                    "hot" => Operation::HotPacking,
+                    "sealed" => Operation::SealedConsolidation,
+                    "repair" => Operation::Repair,
                     other => anyhow::bail!("unknown --op {other}: base|derived|dedup|hot|sealed|repair"),
                 }
             }
@@ -402,13 +421,12 @@ async fn run_unit_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
 /// enrichment groups (see [`timefusion::dml::redrive_dml_quarantine`]).
 async fn run_redrive_dml_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     init_cli_tracing();
-    // Two-token flags need lookahead into the arg iterator, so this stays a loop.
     let mut dir = cfg.core.wal_dir().join(timefusion::write::wal::QUARANTINE_DIR_NAME).join("dml");
     let mut dry_run = false;
-    let mut it = std::env::args().skip(2);
+    let mut it = Args::new();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--dir" => dir = it.next().map(std::path::PathBuf::from).context("--dir needs a value")?,
+            "--dir" => dir = it.value("--dir")?.into(),
             "--dry-run" => dry_run = true,
             other => anyhow::bail!("unknown argument: {other} (usage: timefusion redrive-dml [--dir PATH] [--dry-run])"),
         }
@@ -426,7 +444,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // logging the tree at derivation time is silently swallowed — which is why
     // prod could carry TIMEFUSION_MEMORY_LIMIT_GB=26 while actually budgeting
     // 120 GiB with nothing on the box revealing the gap (2026-07-31).
-    config::log_derived_budget(&cfg.derived);
+    cfg.derived.log();
     support::init_from_env();
 
     // Start heap+CPU profiling (no-op unless --features profiling on Linux).
@@ -870,10 +888,10 @@ async fn run_migrate_columns_cli(cfg: &'static AppConfig) -> anyhow::Result<()> 
     let mut table = "otel_logs_and_spans".to_string();
     let mut adds: Vec<(String, String)> = Vec::new();
     let mut dry_run = false;
-    let mut it = std::env::args().skip(2);
+    let mut it = Args::new();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--table" => table = it.next().context("--table needs a value")?,
+            "--table" => table = it.value("--table")?,
             "--dry-run" => dry_run = true,
             "--add" => {
                 let spec = it.next().context("--add needs NAME:TYPE")?;
@@ -933,13 +951,11 @@ async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut older_than_days: Option<i64> = None;
     let mut dry_run = false;
     let mut yes = false;
-    let mut it = std::env::args().skip(2);
+    let mut it = Args::new();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--table" => tables.extend(it.next().context("--table needs a value")?.split(',').map(str::to_owned)),
-            "--older-than-days" => {
-                older_than_days = Some(it.next().context("--older-than-days needs a value")?.parse().context("--older-than-days must be an integer")?)
-            }
+            "--table" => tables.extend(it.value("--table")?.split(',').map(str::to_owned)),
+            "--older-than-days" => older_than_days = Some(it.parse("--older-than-days", "an integer")?),
             "--dry-run" => dry_run = true,
             "--yes" => yes = true,
             other => anyhow::bail!("unknown argument: {other} (usage: timefusion retention --older-than-days N --table A[,B,...] [--dry-run] [--yes])"),
@@ -948,34 +964,25 @@ async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let days = older_than_days.context("--older-than-days is required")?;
     anyhow::ensure!(days >= 7, "refusing a cutoff under 7 days — that is not retention, that is data loss");
     anyhow::ensure!(!tables.is_empty(), "--table is required; retention never guesses at a table list");
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).date_naive();
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).date_naive().to_string();
     let predicate = format!("date < '{cutoff}'");
 
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
     println!("retention cutoff: {predicate}  (today - {days}d)\n");
 
     // Inventory first, from the same snapshot the delete will run against.
-    let mut plan: Vec<(String, usize, i64, usize)> = Vec::new();
+    let mut plan: Vec<(String, usize, i64)> = Vec::new();
     for t in &tables {
         let table_ref = db.get_or_create_unified_table(t).await?;
         let (old_files, old_bytes, total) = {
             let table = table_ref.read().await;
-            let mut old_files = 0usize;
-            let mut old_bytes = 0i64;
-            let mut total = 0usize;
-            for f in table.snapshot()?.log_data().iter() {
-                total += 1;
-                let path = f.path();
-                let Some(date) = path.split("date=").nth(1).and_then(|s| s.split('/').next()) else { continue };
-                if date < cutoff.to_string().as_str() {
-                    old_files += 1;
-                    old_bytes += f.size();
-                }
-            }
-            (old_files, old_bytes, total)
+            table.snapshot()?.log_data().iter().fold((0usize, 0i64, 0usize), |(files, bytes, total), f| {
+                let past_cutoff = f.path().split("date=").nth(1).and_then(|s| s.split('/').next()).is_some_and(|date| date < cutoff.as_str());
+                (files + past_cutoff as usize, bytes + if past_cutoff { f.size() } else { 0 }, total + 1)
+            })
         };
         println!("  {t:52} {old_files:>6}/{total:<6} files past cutoff, {:.2} GB", old_bytes as f64 / 1e9);
-        plan.push((t.clone(), old_files, old_bytes, total));
+        plan.push((t.clone(), old_files, old_bytes));
     }
     let (files, bytes): (usize, i64) = plan.iter().fold((0, 0), |(f, b), p| (f + p.1, b + p.2));
     println!("\nTOTAL: {files} files, {:.2} GB across {} table(s)", bytes as f64 / 1e9, plan.len());
@@ -986,7 +993,7 @@ async fn run_retention_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
     anyhow::ensure!(yes, "pass --yes to commit the deletion (or --dry-run to stop here)");
 
-    for (t, old_files, _, _) in &plan {
+    for (t, old_files, _) in &plan {
         if *old_files == 0 {
             println!("  {t}: nothing past cutoff, skipping");
             continue;
@@ -1026,33 +1033,26 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut dedup = false;
     let mut recompress = false;
     let mut target_size_mb: Option<i64> = None;
-    // Two-token flags need lookahead into the arg iterator, so this stays a loop.
-    let mut it = std::env::args().skip(2);
+    let mut it = Args::new();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--table" => table = it.next().context("--table needs a value")?,
-            "--date" => only_date = Some(it.next().context("--date needs a value")?.parse().context("--date must be YYYY-MM-DD")?),
-            "--older-than-hours" => {
-                older_than_hours = it.next().context("--older-than-hours needs a value")?.parse().context("--older-than-hours must be an integer")?
-            }
+            "--table" => table = it.value("--table")?,
+            "--date" => only_date = Some(it.parse("--date", "YYYY-MM-DD")?),
+            "--older-than-hours" => older_than_hours = it.parse("--older-than-hours", "an integer")?,
             "--all" => all = true,
             "--dry-run" => dry_run = true,
-            "--project" => project = Some(it.next().context("--project needs a value")?),
-            "--concurrency" => concurrency = Some(it.next().context("--concurrency needs a value")?.parse().context("--concurrency must be an integer")?),
+            "--project" => project = Some(it.value("--project")?),
+            "--concurrency" => concurrency = Some(it.parse("--concurrency", "an integer")?),
             "--consolidate" => consolidate = true,
             "--dedup" => dedup = true,
             "--recompress" => recompress = true,
-            "--target-size-mb" => {
-                target_size_mb = Some(it.next().context("--target-size-mb needs a value")?.parse().context("--target-size-mb must be an integer")?)
-            }
+            "--target-size-mb" => target_size_mb = Some(it.parse("--target-size-mb", "an integer")?),
             other => anyhow::bail!(
                 "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--concurrency N] [--consolidate [--target-size-mb N]] [--dedup] [--recompress] [--dry-run])"
             ),
         }
     }
-    if target_size_mb.is_some() && !consolidate {
-        anyhow::bail!("--target-size-mb only applies to --consolidate");
-    }
+    anyhow::ensure!(target_size_mb.is_none() || consolidate, "--target-size-mb only applies to --consolidate");
 
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
     // Attach the tantivy sidecar service exactly like the server bootstrap.
@@ -1114,9 +1114,9 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // predicate to `date = '...' AND project_id = '...'`, which is what makes
     // the job small enough to run on an ordinary runner.
     if recompress {
+        let level = cfg.parquet.timefusion_zstd_compression_level;
+        let scope = project.as_deref().map_or(String::new(), |p| format!(" project={p}"));
         for d in &dates {
-            let level = cfg.parquet.timefusion_zstd_compression_level;
-            let scope = project.as_deref().map(|p| format!(" project={p}")).unwrap_or_default();
             match db.recompress_partition(&table_ref, &table, *d, level, project.as_deref()).await {
                 Ok(RecompressOutcome::Rewritten { files }) => println!("  recompress date={d}{scope}: rewritten from {files} file(s) (sorted footer restored)"),
                 Ok(RecompressOutcome::Skipped(why)) => println!("  recompress date={d}{scope}: SKIPPED — {why}"),
@@ -1218,20 +1218,16 @@ mod healthcheck_tests {
         addr
     }
 
-    #[test]
-    fn liveness_accepts_authentication_and_startup_error_only() {
-        assert!(pgwire_ready_at(one_response(vec![b'R'])).is_ok());
-        let error = |code: &[u8]| {
-            let mut payload = vec![b'C'];
-            payload.extend_from_slice(code);
-            payload.extend_from_slice(&[0, 0]);
-            let mut response = vec![b'E'];
-            response.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
-            response.extend_from_slice(&payload);
-            response
-        };
-        assert!(pgwire_ready_at(one_response(error(b"57P03"))).is_ok());
-        assert!(pgwire_ready_at(one_response(error(b"XX000"))).is_err());
+    fn error_frame(code: &[u8]) -> Vec<u8> {
+        let payload = [&b"C"[..], code, &[0, 0]].concat();
+        [&[b'E'][..], &((payload.len() + 4) as u32).to_be_bytes(), &payload[..]].concat()
+    }
+
+    #[test_case::test_case(vec![b'R'] => true ; "authentication request")]
+    #[test_case::test_case(error_frame(b"57P03") => true ; "starting-up error is alive enough")]
+    #[test_case::test_case(error_frame(b"XX000") => false ; "any other error is unhealthy")]
+    fn liveness_accepts_authentication_and_startup_error_only(response: Vec<u8>) -> bool {
+        pgwire_ready_at(one_response(response)).is_ok()
     }
 
     /// The probe and the Dockerfile are one budget split across two files, and

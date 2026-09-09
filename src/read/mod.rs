@@ -47,7 +47,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 
-use crate::observability::arrow_err;
+use crate::{database::scan_metric_names, observability::arrow_err};
 
 /// Encoded Arrow keys, allocated only on first sight.
 type SeenSet = HashSet<Box<[u8]>, ahash::RandomState>;
@@ -202,7 +202,7 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     // One uncertified file without statistics has an unknown span, which
     // overlaps everything, so nothing in the scan can skip.
     if uncertified.iter().any(Option::is_none) {
-        metrics::counter!(crate::database::scan_metric_names::CERT_SKIP_BLOCKED_NO_STATS).increment(1);
+        metrics::counter!(scan_metric_names::CERT_SKIP_BLOCKED_NO_STATS).increment(1);
         return HashSet::new();
     }
     let (skippable, blocked): (Vec<_>, Vec<_>) =
@@ -211,8 +211,8 @@ pub(crate) fn skippable_certified_files<'a>(certified: impl IntoIterator<Item = 
     // certification is too SPARSE (a certified file still has an uncertified
     // neighbour, so contiguous runs are what pay), while the no-stats return
     // above says one file poisoned the whole scan regardless of coverage.
-    metrics::counter!(crate::database::scan_metric_names::CERT_SKIP_BLOCKED_OVERLAP).increment(blocked.len() as u64);
-    metrics::counter!(crate::database::scan_metric_names::CERT_SKIP_FILES).increment(skippable.len() as u64);
+    metrics::counter!(scan_metric_names::CERT_SKIP_BLOCKED_OVERLAP).increment(blocked.len() as u64);
+    metrics::counter!(scan_metric_names::CERT_SKIP_FILES).increment(skippable.len() as u64);
     skippable.into_iter().map(|(path, _)| path).collect()
 }
 
@@ -571,8 +571,8 @@ impl ExecutionPlan for DedupExec {
         // no footer `sorting_columns` and ONE unordered branch erases the ordering
         // the whole leg declares.
         metrics::counter!(match bound {
-            Some(_) => crate::database::scan_metric_names::DEDUP_BOUNDED_TOTAL,
-            None => crate::database::scan_metric_names::DEDUP_FULL_SET_TOTAL,
+            Some(_) => scan_metric_names::DEDUP_BOUNDED_TOTAL,
+            None => scan_metric_names::DEDUP_FULL_SET_TOTAL,
         })
         .increment(1);
         let key_idxs = dedup_key_idxs(&self.key_idxs);
@@ -941,8 +941,8 @@ impl Greatest {
             std::cmp::Ordering::Equal => {}
         }
         self.bytes = kept_bytes;
-        metrics::counter!(crate::database::scan_metric_names::DEDUP_WINNER_COMPACTIONS_TOTAL).increment(1);
-        metrics::counter!(crate::database::scan_metric_names::DEDUP_WINNER_COMPACTION_ROWS_DROPPED).increment(dropped as u64);
+        metrics::counter!(scan_metric_names::DEDUP_WINNER_COMPACTIONS_TOTAL).increment(1);
+        metrics::counter!(scan_metric_names::DEDUP_WINNER_COMPACTION_ROWS_DROPPED).increment(dropped as u64);
         Ok(())
     }
 
@@ -2668,12 +2668,7 @@ impl LogicalCountCache {
         // path; if their 64-bit file-set fingerprints happened to match, one
         // tenant could consume the other's exact-count index. Hex is injective
         // over UTF-8 bytes and contains no path separators.
-        use std::fmt::Write;
-        let mut encoded = String::with_capacity(value.len() * 2);
-        for byte in value.bytes() {
-            write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
-        }
-        encoded
+        hex::encode(value)
     }
 
     fn path(&self, key: &CountPartition) -> PathBuf {

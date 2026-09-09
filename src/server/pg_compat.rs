@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StringBuilder},
+        array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     },
     catalog::{MemTable, SchemaProvider, TableFunctionImpl, TableProvider},
@@ -35,6 +35,7 @@ use datafusion_postgres::{
     },
 };
 use futures::stream;
+use itertools::Itertools;
 
 pub const PG_COMPAT_VERSION: &str = "16.6";
 pub const PG_COMPAT_VERSION_NUM: &str = "160006";
@@ -114,8 +115,7 @@ fn overlay_runtime_stat_views(ctx: &SessionContext) -> DFResult<()> {
     let catalog = ctx.catalog("datafusion").ok_or_else(|| DataFusionError::Internal("catalog 'datafusion' missing after pg_catalog setup".to_string()))?;
     let inner = catalog.schema("pg_catalog").ok_or_else(|| DataFusionError::Internal("schema 'pg_catalog' missing after setup".to_string()))?;
     let extra = RUNTIME_STAT_VIEWS.iter().map(|(name, spec)| Ok((*name, empty_pg_table(spec)?))).collect::<DFResult<HashMap<_, _>>>()?;
-    catalog.register_schema("pg_catalog", Arc::new(PgCatalogOverlay { inner, extra }))?;
-    Ok(())
+    catalog.register_schema("pg_catalog", Arc::new(PgCatalogOverlay { inner, extra })).map(|_| ())
 }
 
 fn empty_pg_table(spec: &str) -> DFResult<Arc<dyn TableProvider>> {
@@ -152,9 +152,7 @@ struct PgCatalogOverlay {
 #[async_trait]
 impl SchemaProvider for PgCatalogOverlay {
     fn table_names(&self) -> Vec<String> {
-        let mut names = self.inner.table_names();
-        names.extend(self.extra.keys().map(ToString::to_string));
-        names
+        self.inner.table_names().into_iter().chain(self.extra.keys().map(ToString::to_string)).collect()
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
@@ -183,11 +181,7 @@ pub fn effective_statement_timeout(client_timeout: Option<Duration>, max_stateme
     let client_timeout = client_timeout.filter(|timeout| !timeout.is_zero());
     let ceiling = max_statement_secs.max(if client_timeout.is_some() { batch_statement_secs } else { 0 });
     let server_timeout = (ceiling != 0).then(|| Duration::from_secs(ceiling));
-    match (client_timeout, server_timeout) {
-        (Some(client), Some(server)) => Some(client.min(server)),
-        (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
-        (None, None) => None,
-    }
+    [client_timeout, server_timeout].into_iter().flatten().min()
 }
 
 /// The configured batch ceiling, or 0 before the config singleton is
@@ -273,7 +267,7 @@ impl PgCompatibilityHook {
             })
             .collect::<Option<Vec<_>>>()?;
         aliases.iter().any(|alias| alias == ROLE_PROBE_ALIAS).then_some(())?;
-        aliases.into_iter().map(|alias| Some((alias.clone(), self.role_field(&alias)?))).collect()
+        aliases.into_iter().map(|alias| self.role_field(&alias).map(|field| (alias, field))).collect()
     }
 
     fn role_field(&self, alias: &str) -> Option<RoleField> {
@@ -325,12 +319,12 @@ impl QueryHook for PgCompatibilityHook {
     }
 
     async fn handle_extended_parse_query(
-        &self, statement: &Statement, _session_context: &SessionContext, _client: &(dyn ClientInfo + Send + Sync),
+        &self, statement: &Statement, _session_context: &SessionContext, client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
         if let Some(fields) = self.role_probe(statement) {
             return Some(role_probe_plan(statement, &fields));
         }
-        self.show(statement, _client).map(|_| show_plan())
+        self.show(statement, client).map(|_| show_plan())
     }
 
     async fn handle_extended_query(
@@ -373,27 +367,25 @@ fn is_pg_roles(relation: &TableFactor) -> bool {
     matches!(relation, TableFactor::Table { name, .. } if name.to_string().to_ascii_lowercase().ends_with("pg_roles"))
 }
 
-fn role_probe_field_type(value: &RoleField) -> (Type, DataType) {
+fn role_probe_field_type(value: &RoleField) -> Type {
     match value {
-        RoleField::Oid(_) => (Type::INT4, DataType::Int32),
-        RoleField::Text(_) => (Type::VARCHAR, DataType::Utf8),
-        RoleField::Bool(_) => (Type::BOOL, DataType::Boolean),
+        RoleField::Oid(_) => Type::INT4,
+        RoleField::Text(_) => Type::VARCHAR,
+        RoleField::Bool(_) => Type::BOOL,
     }
 }
 
 fn role_probe_response(fields: &[(String, RoleField)]) -> PgWireResult<QueryResponse> {
     let infos = Arc::new(
-        fields.iter().map(|(name, value)| FieldInfo::new(name.clone(), None, None, role_probe_field_type(value).0, FieldFormat::Text)).collect::<Vec<_>>(),
+        fields.iter().map(|(name, value)| FieldInfo::new(name.clone(), None, None, role_probe_field_type(value), FieldFormat::Text)).collect::<Vec<_>>(),
     );
     let row = {
         let mut encoder = DataRowEncoder::new(Arc::clone(&infos));
-        for (_, value) in fields {
-            match value {
-                RoleField::Oid(oid) => encoder.encode_field(&Some(*oid))?,
-                RoleField::Text(text) => encoder.encode_field(&Some(text.as_str()))?,
-                RoleField::Bool(flag) => encoder.encode_field(&Some(*flag))?,
-            }
-        }
+        fields.iter().try_for_each(|(_, value)| match value {
+            RoleField::Oid(oid) => encoder.encode_field(&Some(*oid)),
+            RoleField::Text(text) => encoder.encode_field(&Some(text.as_str())),
+            RoleField::Bool(flag) => encoder.encode_field(&Some(*flag)),
+        })?;
         encoder.take_row()
     };
     Ok(QueryResponse::new(infos, stream::once(async move { Ok(row) })))
@@ -452,13 +444,7 @@ fn show_plan() -> PgWireResult<LogicalPlan> {
 }
 
 fn show_response(name: &str, value: &str) -> PgWireResult<QueryResponse> {
-    let fields = Arc::new(vec![FieldInfo::new(name.to_string(), None, None, Type::VARCHAR, FieldFormat::Text)]);
-    let row = {
-        let mut encoder = DataRowEncoder::new(Arc::clone(&fields));
-        encoder.encode_field(&Some(value))?;
-        encoder.take_row()
-    };
-    Ok(QueryResponse::new(fields, stream::once(async move { Ok(row) })))
+    role_probe_response(&[(name.to_string(), RoleField::Text(value.to_string()))])
 }
 
 fn register_identity_udfs(ctx: &SessionContext, role: &str, max_statement_secs: u64) {
@@ -532,19 +518,20 @@ impl ScalarUDFImpl for CurrentSettingUdf {
                     .ok_or_else(|| DataFusionError::Execution("current_setting missing_ok must be Boolean".to_string()))
             })
             .transpose()?;
-        let mut result = StringBuilder::new();
-        for index in 0..names.len() {
-            let name = (!names.is_null(index))
-                .then(|| ScalarValue::try_from_array(&names, index))
-                .transpose()?
-                .and_then(|value| crate::read::optimizers::extract_utf8_string(&value));
-            match name.and_then(|name| compatibility_setting(&name, self.max_statement_secs)) {
-                Some(value) => result.append_value(value),
-                None if missing_ok.is_some_and(|values| values.value(index)) => result.append_null(),
-                None => return Err(DataFusionError::Execution("unrecognized configuration parameter".to_string())),
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(result.finish())))
+        let values = (0..names.len())
+            .map(|index| {
+                let name = (!names.is_null(index))
+                    .then(|| ScalarValue::try_from_array(&names, index))
+                    .transpose()?
+                    .and_then(|value| crate::read::optimizers::extract_utf8_string(&value));
+                match name.and_then(|name| compatibility_setting(&name, self.max_statement_secs)) {
+                    Some(value) => Ok(Some(value)),
+                    None if missing_ok.is_some_and(|values| values.value(index)) => Ok(None),
+                    None => Err(DataFusionError::Execution("unrecognized configuration parameter".to_string())),
+                }
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
     }
 }
 
@@ -625,27 +612,31 @@ impl PgShowAllSettingsFunction {
     fn batch(&self) -> DFResult<RecordBatch> {
         let rows: Vec<(&str, String)> =
             COMPATIBILITY_SETTING_NAMES.iter().filter_map(|name| compatibility_setting(name, self.max_statement_secs).map(|value| (*name, value))).collect();
+        let n = rows.len();
         let strings = |values: Vec<Option<String>>| Arc::new(StringArray::from(values)) as ArrayRef;
-        let settings: Vec<Option<String>> = rows.iter().map(|(_, value)| Some(value.clone())).collect();
-        let nulls = || vec![None; rows.len()];
+        let repeat = |value: &str| strings(vec![Some(value.to_string()); n]);
+        // Computed once and Arc-cloned at each use site rather than rebuilt per
+        // column: `nulls`/`settings` each recur 8/3 times below.
+        let nulls = strings(vec![None; n]);
+        let settings = strings(rows.iter().map(|(_, value)| Some(value.clone())).collect());
         let columns = vec![
             strings(rows.iter().map(|(name, _)| Some((*name).to_string())).collect()),
-            strings(settings.clone()),
-            strings(nulls()),
-            strings(nulls()),
-            strings(nulls()),
-            strings(nulls()),
-            strings(vec![Some("user".to_string()); rows.len()]),
+            Arc::clone(&settings),
+            Arc::clone(&nulls),
+            Arc::clone(&nulls),
+            Arc::clone(&nulls),
+            Arc::clone(&nulls),
+            repeat("user"),
             strings(rows.iter().map(|(_, value)| Some(if matches!(value.as_str(), "on" | "off") { "bool" } else { "string" }.to_string())).collect()),
-            strings(vec![Some("default".to_string()); rows.len()]),
-            strings(nulls()),
-            strings(nulls()),
-            strings(nulls()),
-            strings(settings.clone()),
-            strings(settings),
-            strings(nulls()),
-            Arc::new(Int32Array::from(vec![None::<i32>; rows.len()])) as ArrayRef,
-            Arc::new(BooleanArray::from(vec![Some(false); rows.len()])) as ArrayRef,
+            repeat("default"),
+            Arc::clone(&nulls),
+            Arc::clone(&nulls),
+            Arc::clone(&nulls),
+            Arc::clone(&settings),
+            settings,
+            nulls,
+            Arc::new(Int32Array::from(vec![None::<i32>; n])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![Some(false); n])) as ArrayRef,
         ];
         RecordBatch::try_new(Self::schema(), columns).map_err(Into::into)
     }
@@ -662,33 +653,27 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::AsArray;
 
-    #[test]
-    fn effective_timeout_uses_the_smaller_nonzero_value() {
-        let secs = |n| Some(Duration::from_secs(n));
-        // Batch ceiling off: exactly the old min(client, server).
-        assert_eq!(effective_statement_timeout(None, 60, 0), secs(60));
-        assert_eq!(effective_statement_timeout(Some(Duration::ZERO), 60, 0), secs(60));
-        assert_eq!(effective_statement_timeout(secs(5), 60, 0), secs(5));
-        assert_eq!(effective_statement_timeout(secs(120), 60, 0), secs(60));
-        assert_eq!(effective_statement_timeout(None, 0, 0), None);
-    }
-
-    /// A session raises the cap only by ASKING, and never past the configured
-    /// batch ceiling. The silent case is the one that matters: a dashboard
-    /// connection that sets nothing must keep the interactive cap even while
-    /// batch work is allowed, or enabling this would lift the limit on all the
-    /// traffic it was meant to protect.
-    #[test]
-    fn only_a_session_that_asks_may_raise_past_the_interactive_cap() {
-        let secs = |n| Some(Duration::from_secs(n));
-        assert_eq!(effective_statement_timeout(None, 60, 600), secs(60), "silence must not raise anything");
-        assert_eq!(effective_statement_timeout(secs(300), 60, 600), secs(300), "asking within the batch ceiling is granted");
-        assert_eq!(effective_statement_timeout(secs(900), 60, 600), secs(600), "the batch ceiling still bounds the ask");
-        assert_eq!(effective_statement_timeout(secs(5), 60, 600), secs(5), "asking for less still gets less");
-        // A batch ceiling below the interactive cap cannot lower it -- that is
-        // what `max_statement_secs` is for, and a misconfiguration here must not
-        // quietly tighten every query.
-        assert_eq!(effective_statement_timeout(secs(120), 60, 30), secs(60));
+    /// With the batch ceiling off this is exactly `min(client, server)`.
+    ///
+    /// With it on, a session raises the cap only by ASKING, and never past the
+    /// configured batch ceiling. The silent case is the one that matters: a
+    /// dashboard connection that sets nothing must keep the interactive cap even
+    /// while batch work is allowed, or enabling this would lift the limit on all
+    /// the traffic it was meant to protect. A batch ceiling *below* the
+    /// interactive cap cannot lower it either -- that is what `max_statement_secs`
+    /// is for, and a misconfiguration must not quietly tighten every query.
+    #[test_case::test_case(None, 60, 0 => Some(60) ; "server cap applies when the client is silent")]
+    #[test_case::test_case(Some(0), 60, 0 => Some(60) ; "a zero client timeout means unlimited, so the server caps")]
+    #[test_case::test_case(Some(5), 60, 0 => Some(5) ; "the smaller client value wins")]
+    #[test_case::test_case(Some(120), 60, 0 => Some(60) ; "the server caps a larger ask")]
+    #[test_case::test_case(None, 0, 0 => None ; "no cap configured anywhere")]
+    #[test_case::test_case(None, 60, 600 => Some(60) ; "silence must not raise anything")]
+    #[test_case::test_case(Some(300), 60, 600 => Some(300) ; "asking within the batch ceiling is granted")]
+    #[test_case::test_case(Some(900), 60, 600 => Some(600) ; "the batch ceiling still bounds the ask")]
+    #[test_case::test_case(Some(5), 60, 600 => Some(5) ; "asking for less still gets less")]
+    #[test_case::test_case(Some(120), 60, 30 => Some(60) ; "a batch ceiling under the interactive cap cannot lower it")]
+    fn effective_timeout_is_the_smaller_nonzero_cap(client_secs: Option<u64>, max_statement_secs: u64, batch_statement_secs: u64) -> Option<u64> {
+        effective_statement_timeout(client_secs.map(Duration::from_secs), max_statement_secs, batch_statement_secs).map(|timeout| timeout.as_secs())
     }
 
     #[test]
@@ -1052,20 +1037,26 @@ impl StatsTableProvider {
         ];
 
         let m = crate::observability::maintenance_stats();
-        let mut maintenance = atomic_rows(m.stats_rows());
-        maintenance.push(("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason()));
-        // DERIVED, not hand-listed. `rollup_witnessless_slices` above is one
-        // number for a population that sat byte-identical across four hourly
-        // passes and a restart; these say why, in two dimensions that each sum to
-        // it. Iterating the bucket lists is the point: a reason added without a
-        // row is the bug class that cost 53% of prefilter skips their attribution
-        // on 2026-08-24, and it cannot happen here.
-        maintenance.extend(crate::database::rollup_unverifiable::gauge_rows().map(|(key, value)| ("maintenance", key, value.to_string())));
-        // Same reason, same shape: one row per (operation, retry reason) the
-        // process has actually seen, rather than a hand-kept list that a new
-        // reason silently misses.
-        maintenance.extend(crate::observability::maintenance_retry_rows().into_iter().map(|(key, value)| ("maintenance", key, value.to_string())));
-        maintenance.extend(crate::observability::maintenance_work_rows().into_iter().map(|(key, value)| ("maintenance", key, value.to_string())));
+        let maintenance: Vec<Row> = atomic_rows(m.stats_rows())
+            .into_iter()
+            .chain([("maintenance", "retry_reason".to_owned(), crate::observability::maintenance_retry_reason())])
+            // DERIVED, not hand-listed. `rollup_witnessless_slices` above is one
+            // number for a population that sat byte-identical across four hourly
+            // passes and a restart; these say why, in two dimensions that each sum to
+            // it. Iterating the bucket lists is the point: a reason added without a
+            // row is the bug class that cost 53% of prefilter skips their attribution
+            // on 2026-08-24, and it cannot happen here.
+            .chain(crate::database::rollup_unverifiable::gauge_rows().map(|(key, value)| ("maintenance", key, value.to_string())))
+            // Same reason, same shape: one row per (operation, retry reason) the
+            // process has actually seen, rather than a hand-kept list that a new
+            // reason silently misses.
+            .chain(
+                crate::observability::maintenance_retry_rows()
+                    .into_iter()
+                    .chain(crate::observability::maintenance_work_rows())
+                    .map(|(key, value)| ("maintenance", key, value.to_string())),
+            )
+            .collect();
 
         let plan_cache = crate::read::plan_cache::global().map_or_else(Vec::new, |pc| {
             let (hits, misses) = pc.counters();
@@ -1358,10 +1349,9 @@ impl StatsTableProvider {
 
         // `block` = a worker was occupied that long; `section` = wall time only,
         // awaits included. Same shape, different claim — see `SECTION_STATS`.
-        let mut sections = crate::observability::section_stats();
-        sections.sort_unstable_by_key(|s| s.0);
-        let block: Vec<Row> = sections
+        let block: Vec<Row> = crate::observability::section_stats()
             .into_iter()
+            .sorted_unstable_by_key(|section| section.0)
             .flat_map(|((component, name), count, total_us, max_us)| {
                 [("count", count), ("total_ms", total_us / 1000), ("max_ms", max_us / 1000), ("avg_us", total_us.checked_div(count).unwrap_or(0))]
                     .map(|(k, v)| (component, format!("{name}.{k}"), v.to_string()))

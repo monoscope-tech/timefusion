@@ -6,7 +6,7 @@
 //! a unit whose decoded-byte reservation fits the configured ceiling.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
@@ -15,11 +15,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-/// Lock without letting a poisoned mutex propagate: every mutex here guards
-/// plain data, so a panicking holder leaves it usable.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+use crate::support::lock;
 
 pub const NORMAL_SLICE_MICROS: i64 = 10 * 60 * 1_000_000;
 pub const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
@@ -234,7 +230,7 @@ const JOURNAL_VERSION: u32 = 1;
 const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 static THROUGHPUT_SAMPLE: std::sync::OnceLock<Mutex<(i64, u64)>> = std::sync::OnceLock::new();
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize, strum::EnumCount, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Dedup,
@@ -243,19 +239,6 @@ pub enum Operation {
     HotPacking,
     SealedConsolidation,
     Repair,
-}
-
-impl Operation {
-    const fn priority(self) -> u8 {
-        match self {
-            Self::Dedup => 0,
-            Self::BaseRollup => 1,
-            Self::DerivedRollup => 2,
-            Self::HotPacking => 3,
-            Self::SealedConsolidation => 4,
-            Self::Repair => 5,
-        }
-    }
 }
 
 /// The operation mix a maintenance worker rotates through. One definition for
@@ -3476,45 +3459,6 @@ impl TaskJournal {
     }
 }
 
-/// `(class, starved, operation priority, -width, benefit, recency)` -> project ->
-/// that project's queue. Ordered so smaller tuples run first; see `scheduling_class`.
-type ReadyGroups<'a> = BTreeMap<(u8, u8, u8, i64, i64, i64), HashMap<&'a str, VecDeque<&'a MaintenanceTask>>>;
-
-/// Deadline ordering with round-robin selection among projects at the same
-/// operation priority. This prevents one whale from consuming an entire pass.
-pub fn fair_ready_tasks<'a>(tasks: impl IntoIterator<Item = &'a MaintenanceTask>, now_micros: i64) -> Vec<&'a MaintenanceTask> {
-    let mut groups: ReadyGroups<'_> = BTreeMap::new();
-    for task in tasks {
-        if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
-            let (class, starved, width_key, benefit_key, order_key) = scheduling_class(task, now_micros);
-            groups
-                .entry((class, starved, task.key.operation.priority(), width_key, benefit_key, order_key))
-                .or_default()
-                .entry(&task.key.project_id)
-                .or_default()
-                .push_back(task);
-        }
-    }
-    let mut ready = Vec::new();
-    for projects in groups.values_mut() {
-        let mut names: Vec<_> = projects.keys().copied().collect();
-        names.sort_unstable();
-        loop {
-            let mut progressed = false;
-            for name in &names {
-                if let Some(task) = projects.get_mut(name).and_then(VecDeque::pop_front) {
-                    ready.push(task);
-                    progressed = true;
-                }
-            }
-            if !progressed {
-                break;
-            }
-        }
-    }
-    ready
-}
-
 /// Keep the live finalized frontier ahead of historical debt. Within the
 /// frontier, newest eligible slices run first so sustained backfill cannot make
 /// the raw tail grow without bound; tasks in the same minute still rotate by
@@ -4326,8 +4270,7 @@ mod tests {
     /// at 2. Ageing does not cover it: both are starved, and width decides
     /// within the starved set.
     ///
-    /// Asserted on the WIDTH TERM of `scheduling_class` rather than on the order
-    /// `fair_ready_tasks` returns. The original fixture compared a recent split
+    /// Asserted on the WIDTH TERM of `scheduling_class` rather than on     /// `fair_ready_tasks` returns. The original fixture compared a recent split
     /// day against an older day-wide one and asserted the recent won; that has
     /// since become the wrong expectation for a reason unrelated to this fix —
     /// `starved` is now a per-day SLOPE past the 31-day horizon, so a 39-day
@@ -4717,14 +4660,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_rotates_projects_within_a_deadline() {
-        let tasks =
-            [task("a", 0, 1, Operation::Dedup), task("a", 1, 2, Operation::Dedup), task("b", 0, 1, Operation::Dedup), task("b", 1, 2, Operation::Dedup)];
-        let order: Vec<_> = fair_ready_tasks(&tasks, 0).into_iter().map(|task| task.key.project_id.as_str()).collect();
-        assert_eq!(order, ["a", "b", "a", "b"]);
-    }
-
-    #[test]
     fn journal_claims_rotate_projects_instead_of_restarting_at_first() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut journal = TaskJournal::load(dir.path()).expect("journal");
@@ -4783,8 +4718,7 @@ mod tests {
         let now = 10 * 24 * 60 * 60 * 1_000_000;
         let old = task("old", 0, MIN_SLICE_MICROS, Operation::Dedup);
         let recent = task("recent", now - MIN_SLICE_MICROS, now, Operation::BaseRollup);
-        let ready = fair_ready_tasks([&old, &recent], now);
-        assert_eq!(ready.first().expect("ready task").key.project_id, "recent");
+        assert!(scheduling_class(&recent, now) < scheduling_class(&old, now), "a recent slice outranks overdue historical work");
     }
 
     #[test]
@@ -4793,19 +4727,7 @@ mod tests {
         let older_start = now - 12 * 60 * 60 * 1_000_000;
         let older = task("older", older_start, older_start + MIN_SLICE_MICROS, Operation::BaseRollup);
         let newest = task("newest", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        let ready = fair_ready_tasks([&older, &newest], now);
-        assert_eq!(ready.first().expect("ready task").key.project_id, "newest");
-    }
-
-    #[test]
-    fn frontier_minute_rotates_fairly_across_projects() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let start = now - 2 * MIN_SLICE_MICROS;
-        let a = task("a", start, start + MIN_SLICE_MICROS, Operation::BaseRollup);
-        let b = task("b", start, start + MIN_SLICE_MICROS, Operation::BaseRollup);
-        let c = task("c", start, start + MIN_SLICE_MICROS, Operation::BaseRollup);
-        let ready = fair_ready_tasks([&c, &a, &b], now);
-        assert_eq!(ready.iter().map(|task| task.key.project_id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert!(scheduling_class(&newest, now) < scheduling_class(&older, now));
     }
 
     #[test]
@@ -4815,8 +4737,7 @@ mod tests {
         correction.deadline_micros = now - 1;
         let mut frontier = task("frontier", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
         frontier.deadline_micros = now - 60 * 1_000_000;
-        let ready = fair_ready_tasks([&correction, &frontier], now);
-        assert_eq!(ready.first().expect("ready task").key.project_id, "frontier");
+        assert!(scheduling_class(&frontier, now) < scheduling_class(&correction, now));
     }
 
     #[test]
@@ -4824,8 +4745,7 @@ mod tests {
         let now = 10 * 24 * 60 * 60 * 1_000_000;
         let future = task("future", now + 24 * 60 * 60 * 1_000_000, now + 24 * 60 * 60 * 1_000_000 + MIN_SLICE_MICROS, Operation::BaseRollup);
         let frontier = task("frontier", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        let ready = fair_ready_tasks([&future, &frontier], now);
-        assert_eq!(ready.first().expect("ready task").key.project_id, "frontier");
+        assert!(scheduling_class(&frontier, now) < scheduling_class(&future, now));
     }
 
     /// Historical debt runs newest SLICE first, not oldest deadline first.
@@ -5072,8 +4992,7 @@ mod tests {
         older_slice.deadline_micros = now - 2 * 60 * 1_000_000;
         let mut newer_slice = task("b", base + MIN_SLICE_MICROS, base + 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
         newer_slice.deadline_micros = now - 60 * 1_000_000;
-        let ready = fair_ready_tasks([&older_slice, &newer_slice], now);
-        assert_eq!(ready.first().expect("ready task").key.project_id, "b", "the more recent slice is the one a dashboard query needs");
+        assert!(scheduling_class(&newer_slice, now) < scheduling_class(&older_slice, now), "the more recent slice is the one a dashboard query needs");
     }
 
     #[test]
