@@ -189,6 +189,9 @@ ci-signoff:
 	./scripts/ci/ci.sh local $(CHECKS) || result=$$?; \
 	./scripts/ci/ci.sh gate || exit $$?; \
 	exit $$result
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-production-image.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_lease.py
+	python3 scripts/production-image.py signoff
 
 # What CI would run right now, without running any of it.
 ci-status:
@@ -199,3 +202,7 @@ ci-down:
 
 ci-selftest:
 	./scripts/ci/ci.sh selftest
+
+.PHONY: deploy
+deploy:
+	python3 scripts/deploy/run.py local

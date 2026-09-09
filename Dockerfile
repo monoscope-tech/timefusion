@@ -3,14 +3,36 @@
 ##############################
 #         Chef base          #
 ##############################
-FROM rust:1.91-slim-bookworm AS chef
+FROM --platform=$BUILDPLATFORM rust:1.91-slim-bookworm AS chef
+ARG TARGETARCH
 WORKDIR /app
 # make is required by tikv-jemalloc-sys (jemalloc compiles from C source under --features
 # profiling); the slim image ships cc but not make. libunwind-dev backs the
 # heap profiler's unwinder (see JEMALLOC_SYS_PROF_BACKTRACE below).
-RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev make libunwind-dev && \
+# Compile on the builder CPU. Only the output and runtime use TARGETARCH.
+# Debian supplies matching target headers/libraries and the cross C linker.
+RUN case "$TARGETARCH" in \
+      amd64) rust_target=x86_64-unknown-linux-gnu; gnu_target=x86_64-linux-gnu ;; \
+      arm64) rust_target=aarch64-unknown-linux-gnu; gnu_target=aarch64-linux-gnu ;; \
+      *) echo "unsupported production architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    compiler_packages="gcc g++" && \
+    if [ "$(dpkg --print-architecture)" != "$TARGETARCH" ]; then \
+      package_target=$(printf %s "$gnu_target" | tr _ -); \
+      compiler_packages="gcc-$package_target g++-$package_target"; \
+    fi && \
+    dpkg --add-architecture "$TARGETARCH" && apt-get update && \
+    apt-get install -y pkg-config make $compiler_packages \
+      "libssl-dev:$TARGETARCH" "libunwind-dev:$TARGETARCH" && \
+    rustup target add "$rust_target" && \
+    printf '%s\n' "$rust_target" > /rust-target && \
+    printf '%s\n' "$gnu_target" > /gnu-target && \
+    printf '[target.%s]\nlinker = "%s-gcc"\n' "$rust_target" "$gnu_target" > /usr/local/cargo/config.toml && \
     rm -rf /var/lib/apt/lists/*
+# cc-rs and pkg-config must resolve target C libraries, including the profilers.
+ENV PKG_CONFIG_ALLOW_CROSS=1
+RUN printf '#!/bin/sh\nset -eu\ngnu_target=$(cat /gnu-target)\nexport TARGET_CC="$gnu_target-gcc" TARGET_CXX="$gnu_target-g++" TARGET_AR="$gnu_target-ar"\nexport PKG_CONFIG_LIBDIR="/usr/lib/$gnu_target/pkgconfig:/usr/share/pkgconfig"\nexec cargo "$@" --target "$(cat /rust-target)"\n' > /usr/local/bin/target-cargo && \
+    chmod +x /usr/local/bin/target-cargo
 RUN cargo install cargo-chef --version 0.1.77 --locked
 
 ##############################
@@ -45,6 +67,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 #         Builder            #
 ##############################
 FROM chef AS builder
+ARG CARGO_BUILD_JOBS
 # Cook compiles only dependencies. Docker layer-caches this step; cache-to:
 # type=gha,mode=max in deploy.yml persists the layer across CI runs. Layer
 # invalidates only when recipe.json changes (i.e. the dep graph changes),
@@ -89,21 +112,23 @@ ENV RUSTFLAGS="-C force-frame-pointers=yes -C target-cpu=${TARGET_CPU}"
 # `--enable-prof-libunwind`. Fallback needing no libs: `gcc` (uses the frame
 # pointers above). Verify with scripts/verify-jemalloc-prof.sh.
 ENV JEMALLOC_SYS_PROF_BACKTRACE=libunwind
-RUN cargo chef cook --release --locked --features profiling --recipe-path recipe.json
+RUN target-cargo chef cook --release --locked --features profiling --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
 # the crate itself when src/ changes.
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY schemas/ schemas/
-RUN cargo build --release --locked --features profiling
+RUN target-cargo build --release --locked --features profiling && \
+    mkdir -p /output && cp "target/$(cat /rust-target)/release/timefusion" /output/timefusion
 
 # App state dirs (distroless runtime has no shell to mkdir at runtime).
 RUN mkdir -p /queue_db /data
 # jemalloc's profiler links libunwind dynamically; distroless ships neither it
 # nor its liblzma dep, so stage both (cp -a keeps the soname symlinks) for the
 # runtime stage. Arch-agnostic glob: /usr/lib/{x86_64,aarch64}-linux-gnu.
-RUN mkdir -p /profdeps && cp -a /usr/lib/*/libunwind.so.8* /usr/lib/*/liblzma.so.5* /profdeps/
+RUN mkdir -p /profdeps && \
+    cp -a /usr/lib/$(cat /gnu-target)/libunwind.so.8* /usr/lib/$(cat /gnu-target)/liblzma.so.5* /profdeps/
 
 ##############################
 #         Runtime            #
@@ -115,7 +140,7 @@ RUN mkdir -p /profdeps && cp -a /usr/lib/*/libunwind.so.8* /usr/lib/*/liblzma.so
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 
-COPY --from=builder --chown=nonroot:nonroot /app/target/release/timefusion /usr/local/bin/timefusion
+COPY --from=builder --chown=nonroot:nonroot /output/timefusion /usr/local/bin/timefusion
 COPY --from=builder --chown=nonroot:nonroot /queue_db /app/queue_db
 COPY --from=builder --chown=nonroot:nonroot /data     /app/data
 COPY --from=builder /profdeps/ /usr/local/lib/
