@@ -30,6 +30,8 @@ pub struct RollupInvalidation {
     pub invalidated_unix_ms: u64,
 }
 
+// Generic over `entries` so `store` can serialize a borrowed slice without
+// cloning into a `Vec` (the default, used for deserializing in `load`).
 #[derive(Deserialize, Serialize)]
 struct Snapshot<E = Vec<RollupInvalidation>> {
     version: u32,
@@ -76,43 +78,42 @@ pub fn store(data_dir: &Path, entries: &[RollupInvalidation]) -> std::io::Result
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
-    #[test]
-    fn round_trips_entries() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let entries = vec![RollupInvalidation {
+    fn entry(invalidated_unix_ms: u64) -> RollupInvalidation {
+        RollupInvalidation {
             project_id: "p".into(),
             source: "s".into(),
             date: "2026-08-15".into(),
             epoch: 7,
             dirty_hours: 5,
             unknown: false,
-            invalidated_unix_ms: 123,
-        }];
+            invalidated_unix_ms,
+        }
+    }
+
+    #[test]
+    fn round_trips_entries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let entries = vec![entry(123)];
         store(dir.path(), &entries).expect("store journal");
         assert_eq!(load(dir.path()), entries);
     }
 
-    #[test]
-    fn corrupt_state_falls_back_to_full_rebuild_semantics() {
+    /// Every unreadable shape must load as empty — which the builder already reads
+    /// as "full rebuild required" — and a pre-timestamp journal must still load,
+    /// with an unknown (zero) invalidation time rather than a manufactured one.
+    #[test_case(b"not json" => Vec::<RollupInvalidation>::new() ; "corrupt falls back to full rebuild semantics")]
+    #[test_case(br#"{"version":2,"entries":[]}"# => Vec::<RollupInvalidation>::new() ; "unsupported version discarded")]
+    #[test_case(br#"{"version":1,"entries":[{"project_id":"p","source":"s","date":"2026-08-15","epoch":7,"dirty_hours":5,"unknown":false}]}"#
+        => vec![entry(0)] ; "journal written before invalidation timestamps")]
+    fn loads_raw_journal(bytes: &[u8]) -> Vec<RollupInvalidation> {
         let dir = tempfile::tempdir().expect("temp dir");
         let target = path(dir.path());
         fs::create_dir_all(target.parent().expect("metadata parent")).expect("create metadata dir");
-        fs::write(target, b"not json").expect("write corrupt journal");
-        assert!(load(dir.path()).is_empty());
-    }
-
-    #[test]
-    fn journal_written_before_invalidation_timestamps_remains_readable() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let target = path(dir.path());
-        fs::create_dir_all(target.parent().expect("metadata parent")).expect("create metadata dir");
-        fs::write(target, br#"{"version":1,"entries":[{"project_id":"p","source":"s","date":"2026-08-15","epoch":2,"dirty_hours":1,"unknown":false}]}"#)
-            .expect("write old journal");
-
-        let entries = load(dir.path());
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].invalidated_unix_ms, 0);
+        fs::write(&target, bytes).expect("write journal");
+        load(dir.path())
     }
 }

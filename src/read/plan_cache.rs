@@ -6,11 +6,14 @@
 //! Cached plans embed schemas. This is safe while the compile-time schema
 //! registry is immutable; schema hot reload must invalidate this cache.
 
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{
-        AtomicBool, AtomicU64, AtomicUsize,
-        Ordering::{AcqRel, Relaxed, Release},
+use std::{
+    cmp::Reverse,
+    sync::{
+        Arc, OnceLock,
+        atomic::{
+            AtomicBool, AtomicU64, AtomicUsize,
+            Ordering::{AcqRel, Relaxed, Release},
+        },
     },
 };
 
@@ -47,16 +50,10 @@ use datafusion_postgres::{
         types::format::FormatOptions,
     },
 };
+use itertools::Itertools;
 use tracing::{debug, warn};
 
 use crate::observability::{api_err, arrow_err};
-
-/// Randomly halves a map once it reaches its soft cap.
-fn soft_cap<K: Eq + std::hash::Hash, V>(map: &DashMap<K, V>, cap: usize) {
-    if map.len() >= cap {
-        map.retain(|_, _| fastrand::bool());
-    }
-}
 
 /// Approximate retained bytes per expression, calibrated against production.
 const PLAN_BYTES_PER_EXPR: usize = 384;
@@ -135,7 +132,7 @@ impl<V: Clone> WeighedMap<V> {
 
     /// Evict HEAVIEST-FIRST down to the low-water mark.
     ///
-    /// Heaviest-first, not `soft_cap`'s random half: the bytes are owed by a
+    /// Heaviest-first, not a random half: the bytes are owed by a
     /// handful of bulk INSERTs while the population is mostly small dashboard
     /// SELECTs, so a random half would keep paying the pressure AND throw away
     /// the hot templates that make the cache worth having. Dropping the biggest
@@ -155,8 +152,10 @@ impl<V: Clone> WeighedMap<V> {
             low_water,
             "plan_cache over budget — evicting heaviest-first down to the low-water mark. If this fires steadily, the workload's plan-template variety has grown past the cache budget."
         );
-        let mut by_weight: Vec<(usize, String)> = self.map.iter().map(|e| (e.value().1, e.key().clone())).collect();
-        by_weight.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        // `sorted_unstable_by_key` is EAGER (it collects, then sorts): every
+        // DashMap shard guard is released before the loop below calls `remove`.
+        // A lazy sort would hold a guard across `remove` and deadlock.
+        let by_weight = self.map.iter().map(|e| (e.value().1, e.key().clone())).sorted_unstable_by_key(|&(weight, _)| Reverse(weight));
         // Both bounds are swept in one pass: drop while EITHER is exceeded.
         let mut held = self.bytes();
         let mut len = self.map.len();
@@ -320,7 +319,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
     // constant array for projection cells the optimizer folded to a literal.
     let (final_schema, columns) = match column_plan {
         Some(plan) => {
-            let (fields, cols): (Vec<Arc<Field>>, Vec<ArrayRef>) = plan
+            let (fields, cols) = plan
                 .iter()
                 .map(|(src, name)| match src {
                     ColumnSource::Values(idx) => {
@@ -332,9 +331,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
                         Ok((Arc::new(Field::new(name, arr.data_type().clone(), true)), arr))
                     }
                 })
-                .collect::<DfResult<Vec<_>>>()?
-                .into_iter()
-                .unzip();
+                .collect::<DfResult<(Vec<Arc<Field>>, Vec<ArrayRef>)>>()?;
             (Arc::new(Schema::new(fields)), cols)
         }
         None => (values_schema, values_columns),
@@ -653,16 +650,13 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     // cached path, and uncached means the literal survives to the planner where
     // `VariantAwareExprPlanner::plan_substring` rewrites it correctly.
     // The offset forms carry `Value::Number` and are unaffected.
-    let mut has_regex_substring = false;
-    let _: ControlFlow<()> = visit_expressions(stmt, |e: &SqlExpr| {
-        if let SqlExpr::Substring { substring_from: Some(from), .. } = e
-            && let SqlExpr::Value(vs) = &**from
-            && matches!(vs.value, Value::SingleQuotedString(_))
-        {
-            has_regex_substring = true;
+    let has_regex_substring = visit_expressions(stmt, |e: &SqlExpr| match e {
+        SqlExpr::Substring { substring_from: Some(from), .. } if matches!(&**from, SqlExpr::Value(vs) if matches!(vs.value, Value::SingleQuotedString(_))) => {
+            ControlFlow::Break(())
         }
-        ControlFlow::Continue(())
-    });
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break();
     if has_regex_substring {
         return None;
     }
@@ -725,9 +719,8 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
             // Expr::Literal — a `$N` placeholder slips past it and gets mis-cast to a
             // single-element list (COALESCE(list_col, '{a,b}') → ['{a,b}'] instead of
             // ['a','b']). Cheap to skip: array-literal COALESCE is not a hot cached path.
-            SqlExpr::Value(vs) => {
-                if include_strings
-                    && let Value::SingleQuotedString(s) = &vs.value
+            SqlExpr::Value(vs) if include_strings => {
+                if let Value::SingleQuotedString(s) = &vs.value
                     && !s.trim_start().starts_with('{')
                 {
                     vs.value = placeholder_for(&mut values, base, ScalarValue::Utf8(Some(s.clone())));
@@ -757,22 +750,24 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
             // standalone Number (ordinals / LIMIT / OFFSET). Gated on
             // `include_strings`: the mixed now()+`$N` execute path calls with
             // `false` and binds only time-fn placeholders positionally, so it must
-            // not gain extra numeric placeholders.
-            SqlExpr::BinaryOp { left, right, .. } if include_strings => {
+            // not gain extra numeric placeholders. EVERY arm below this sentinel
+            // requires `include_strings` — the time-fn arm above deliberately does not.
+            _ if !include_strings => {}
+            SqlExpr::BinaryOp { left, right, .. } => {
                 take_number(left, base, &mut values);
                 take_number(right, base, &mut values);
             }
-            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } if include_strings => take_number(expr, base, &mut values),
-            SqlExpr::Between { expr, low, high, .. } if include_strings => {
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } => take_number(expr, base, &mut values),
+            SqlExpr::Between { expr, low, high, .. } => {
                 take_number(expr, base, &mut values);
                 take_number(low, base, &mut values);
                 take_number(high, base, &mut values);
             }
-            SqlExpr::InList { expr, list, .. } if include_strings => {
+            SqlExpr::InList { expr, list, .. } => {
                 take_number(expr, base, &mut values);
                 list.iter_mut().for_each(|e| take_number(e, base, &mut values));
             }
-            SqlExpr::Case { operand, conditions, else_result, .. } if include_strings => {
+            SqlExpr::Case { operand, conditions, else_result, .. } => {
                 // Walk order (operand → conditions → else) fixes `$N` numbering; keep it.
                 operand.iter_mut().for_each(|e| take_number(e, base, &mut values));
                 conditions.iter_mut().for_each(|w| {
@@ -781,7 +776,7 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
                 });
                 else_result.iter_mut().for_each(|e| take_number(e, base, &mut values));
             }
-            SqlExpr::Function(f) if include_strings => {
+            SqlExpr::Function(f) => {
                 if let FunctionArguments::List(list) = &mut f.args {
                     list.args
                         .iter_mut()
@@ -868,7 +863,11 @@ impl PlanCacheHook {
     /// tells the handler to skip `state.optimize()`.
     fn mark_served(&self, canonical: &str) {
         self.shape_hits.fetch_add(1, Relaxed);
-        soft_cap(&self.served, SERVED_CAP);
+        // Soft cap: drop a random half. These texts are one-shot, so losing a
+        // memo only costs a redundant re-optimize.
+        if self.served.len() >= SERVED_CAP {
+            self.served.retain(|_, _| fastrand::bool());
+        }
         self.served.insert(canonical.to_string(), ());
     }
 
@@ -1158,6 +1157,8 @@ impl QueryHook for PlanCacheHook {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     fn parse(sql: &str) -> Statement {
@@ -1214,37 +1215,19 @@ mod tests {
         assert!(!out.contains("COUNT(*)"), "no wildcard call survives: {out}");
     }
 
-    /// Only statements DataFusion rejects today may be rewritten — a working
-    /// query must keep its exact output column names. See `normalize_count_star`.
-    #[test]
-    fn normalize_count_star_never_touches_a_query_that_already_works() {
-        for sql in [
-            // No ORDER BY at all.
-            "SELECT COUNT(*)::int8 FROM t",
-            // Ordinal resolves to a BARE count(*), which DataFusion handles.
-            "SELECT src, COUNT(*) FROM t GROUP BY src ORDER BY 2 DESC",
-            // Ordinal points at a different select item than the wrapped count.
-            "SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 1 ASC",
-            // ORDER BY by name/alias already resolves.
-            "SELECT src, COUNT(*)::int8 AS c FROM t GROUP BY src ORDER BY c DESC",
-        ] {
-            assert!(normalize_count_star(&parse(sql)).is_none(), "must decline: {sql}");
-        }
-    }
-
-    /// A statement with nothing to rewrite must return `None` — that is what
-    /// keeps it on the ordinary cache path instead of forcing a fresh plan.
-    #[test]
-    fn normalize_count_star_declines_when_there_is_no_wildcard_count() {
-        for sql in [
-            "SELECT COUNT(id)::int8 FROM t ORDER BY 1",
-            "SELECT COUNT(DISTINCT level)::int8 FROM t ORDER BY 1",
-            "SELECT SUM(d)::int8 FROM t ORDER BY 1",
-            // A qualified wildcard is not the count(*) idiom and is left alone.
-            "SELECT COUNT(t.*)::int8 FROM t ORDER BY 1",
-        ] {
-            assert!(normalize_count_star(&parse(sql)).is_none(), "must decline: {sql}");
-        }
+    /// Only statements DataFusion rejects today may be rewritten: a working query
+    /// must keep its exact output column names, and declining is also what keeps
+    /// a statement on the ordinary cache path. See `normalize_count_star`.
+    #[test_case("SELECT COUNT(*)::int8 FROM t" ; "no order by at all")]
+    #[test_case("SELECT src, COUNT(*) FROM t GROUP BY src ORDER BY 2 DESC" ; "ordinal resolves to a bare count(*)")]
+    #[test_case("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 1 ASC" ; "ordinal points elsewhere")]
+    #[test_case("SELECT src, COUNT(*)::int8 AS c FROM t GROUP BY src ORDER BY c DESC" ; "order by alias resolves")]
+    #[test_case("SELECT COUNT(id)::int8 FROM t ORDER BY 1" ; "counts a column")]
+    #[test_case("SELECT COUNT(DISTINCT level)::int8 FROM t ORDER BY 1" ; "count distinct")]
+    #[test_case("SELECT SUM(d)::int8 FROM t ORDER BY 1" ; "not a count at all")]
+    #[test_case("SELECT COUNT(t.*)::int8 FROM t ORDER BY 1" ; "qualified wildcard is not the idiom")]
+    fn normalize_count_star_declines(sql: &str) {
+        assert!(normalize_count_star(&parse(sql)).is_none(), "must decline: {sql}");
     }
 
     /// The reason this is an AST rewrite and not a text rewrite: monoscope

@@ -227,7 +227,6 @@ impl Database {
                     if c.nulls_first { "FIRST" } else { "LAST" }
                 )
             })
-            .collect::<Vec<_>>()
             .join(", ");
         if order_by.is_empty() {
             return None;
@@ -499,10 +498,7 @@ impl Database {
         // accepts the schema.
         let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
 
-        // Get or create the table
         let table_ref = self.get_or_create_table(project_id, table_name).await?;
-
-        // Get the appropriate schema for this table
         let schema = schema_or_default(table_name);
 
         let dirty_bins: Vec<(String, i64)> = if schema.dedup_keys.is_empty() {
@@ -952,23 +948,27 @@ impl Database {
         // Schema-evolution units never reach here: they are split out to the solo
         // (locked WriteBuilder) path so one project's merge can't stall the rest.
         let mut solo: Vec<usize> = Vec::new();
-        let mut stageable: Vec<(usize, PreparedWrite, (String, String))> = Vec::new();
+        let mut stageable: Vec<(usize, PreparedWrite, deltalake::writer::RecordBatchWriter, (String, String))> = Vec::new();
         for (i, prep) in prepared {
             match prep {
                 Err(e) => results[i] = Err(e),
-                Ok((p, _)) if p.staged_writer.is_none() => {
-                    debug!("coalesced flush: {}/{} needs schema evolution — splitting out of the shared commit", units[i].project_id, units[i].table_name);
-                    solo.push(i);
-                }
-                Ok((p, key)) => stageable.push((i, p, key)),
+                // `take()` here (not a `staged_writer.is_none()` peek + a later
+                // `.expect()`) so the writer's presence is carried in `stageable`'s
+                // type, not re-asserted at the point of use.
+                Ok((mut p, key)) => match p.staged_writer.take() {
+                    Some(writer) => stageable.push((i, p, writer, key)),
+                    None => {
+                        debug!("coalesced flush: {}/{} needs schema evolution — splitting out of the shared commit", units[i].project_id, units[i].table_name);
+                        solo.push(i);
+                    }
+                },
             }
         }
 
         let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
         let staged: Vec<(usize, (String, String), Result<StagedUnit>)> = stream::iter(stageable)
-            .map(|(i, prep, key)| async move {
-                let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, staged_writer, sorted, .. } = prep;
-                let mut writer = staged_writer.expect("filtered above");
+            .map(|(i, prep, mut writer, key)| async move {
+                let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, sorted, .. } = prep;
                 let adds: Result<Vec<Action>> =
                     Self::stage_batches(&mut writer, batches, max_file_bytes).await.map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
                 (i, key, adds.map(|adds| StagedUnit { table_ref, schema, dirty_bins, adds, stage_store, sorted }))
@@ -1390,30 +1390,31 @@ impl Database {
         };
         drop(table);
 
-        let mut total_advanced = 0;
-        for (project_id, table_name) in topics {
-            // Same scan, second (independent) reading: the batch-set identities
-            // these commits contain. Feeds ONLY the flush-time decline — never
-            // the cursor advance below, which stays governed by the conservative
-            // watermark. See `LANDED_DIGESTS_KEY`.
-            if self.config.buffer.landed_skip_enabled()
-                && let Some(layer) = layer
-            {
-                let digests: Vec<crate::write::LandedDigest> =
-                    commits.iter().flat_map(|ci| parse_landed_digests_from_json(&ci.info, &project_id, &table_name)).collect();
-                if !digests.is_empty() {
-                    info!("Loaded {} landed-batch identities for {}.{}", digests.len(), project_id, table_name);
-                    layer.note_landed_digests(&project_id, &table_name, digests);
+        topics
+            .into_iter()
+            .map(|(project_id, table_name)| {
+                // Same scan, second (independent) reading: the batch-set identities
+                // these commits contain. Feeds ONLY the flush-time decline — never
+                // the cursor advance below, which stays governed by the conservative
+                // watermark. See `LANDED_DIGESTS_KEY`.
+                if self.config.buffer.landed_skip_enabled()
+                    && let Some(layer) = layer
+                {
+                    let digests: Vec<crate::write::LandedDigest> =
+                        commits.iter().flat_map(|ci| parse_landed_digests_from_json(&ci.info, &project_id, &table_name)).collect();
+                    if !digests.is_empty() {
+                        info!("Loaded {} landed-batch identities for {}.{}", digests.len(), project_id, table_name);
+                        layer.note_landed_digests(&project_id, &table_name, digests);
+                    }
                 }
-            }
-            let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic(), &project_id, &table_name);
-            let advanced = wal.merge_persisted_positions(&project_id, &table_name, &delta_max)?;
-            if advanced > 0 {
-                info!("Delta-derived cursor advance: project={}, table={}, shards_advanced={}", project_id, table_name, advanced);
-            }
-            total_advanced += advanced;
-        }
-        Ok(total_advanced)
+                let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic(), &project_id, &table_name);
+                let advanced = wal.merge_persisted_positions(&project_id, &table_name, &delta_max)?;
+                if advanced > 0 {
+                    info!("Delta-derived cursor advance: project={}, table={}, shards_advanced={}", project_id, table_name, advanced);
+                }
+                Ok(advanced)
+            })
+            .sum()
     }
 }
 
