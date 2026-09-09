@@ -226,6 +226,162 @@ impl CapturedHistogram {
         Ok(total)
     }
 
+    /// Counts with streamed visibility columns and the query memory pool.
+    /// Unlike `count`, this limits each decoded batch rather than total decoded data.
+    pub async fn count_streaming(&self) -> Result<HistogramSnapshotResult> {
+        let mut total = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        for (&day, files) in &self.partitions {
+            let part = self.count_streaming_partition(day, files).await?;
+            for (bucket, count) in part.counts {
+                let value = total.counts.entry(bucket).or_default();
+                *value = value.checked_add(count).context("streaming histogram count overflow")?;
+            }
+            total.indexed_sources += part.indexed_sources;
+            total.scanned_sources += part.scanned_sources;
+            total.index_errors.extend(part.index_errors);
+        }
+        Ok(total)
+    }
+
+    async fn count_streaming_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<HistogramSnapshotResult> {
+        use crate::tantivy::visibility::{FileVisibilitySource, PreparedFileRows, VisibilityFiles, lineage_batch, lineage_schema, stream_winner_masks};
+        use datafusion::physical_plan::{streaming::StreamingTableExec, union::UnionExec};
+        use futures::TryStreamExt;
+
+        match self.count_unique_partition(day, files).await {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "indexed histogram declined; streaming captured visibility"),
+        }
+        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
+        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
+        let columns =
+            self.keys.iter().map(String::as_str).chain(self.tiebreak.as_deref()).chain(self.tombstone.as_deref()).collect::<std::collections::BTreeSet<_>>();
+        let projection = columns.into_iter().map(|name| self.projected.index_of(name)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let narrow = Arc::new(self.projected.project(&projection)?);
+        let schema = lineage_schema(&narrow)?;
+        let ranges = Arc::new(self.memory.covered_ranges.clone());
+        let mut prepared = Vec::new();
+        let mut owners = Vec::new();
+        let mut partitions = Vec::new();
+        let mut source_rows = Vec::new();
+        for (source, file) in files.iter().enumerate() {
+            let file = Arc::new(PreparedFileRows::open(self.log_store.clone(), file).await?);
+            let owner = Arc::new(self.cache.reserve(file.retained_bytes()?, self.context.memory_pool())?);
+            source_rows.push(file.live().len());
+            partitions.push(FileVisibilitySource {
+                file: file.clone(),
+                schema: schema.clone(),
+                source: u32::try_from(source)?,
+                covered_ranges: ranges.clone(),
+                partition: (lo, hi),
+                max_batch_bytes: self.max_decoded_bytes,
+                owner: owner.clone(),
+            });
+            prepared.push(file);
+            owners.push(owner);
+        }
+        let mut memory = Vec::new();
+        let mut offset = 0_usize;
+        for batch in &self.memory.batches {
+            let arrays = narrow
+                .fields()
+                .iter()
+                .map(|field| -> Result<_> {
+                    match batch.column_by_name(field.name()) {
+                        Some(array) => Ok(arrow::compute::cast(array, field.data_type())?),
+                        None => {
+                            ensure!(field.is_nullable(), "missing required memory visibility column");
+                            Ok(arrow::array::new_null_array(field.data_type(), batch.num_rows()))
+                        }
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batch = RecordBatch::try_new(narrow.clone(), arrays)?;
+            let live = arrow::buffer::BooleanBuffer::from_iter(histogram_timestamps(&batch)?.iter().map(|&t| t >= lo && t < hi));
+            memory.push(lineage_batch(&batch, &live, schema.clone(), u32::try_from(files.len())?, offset)?);
+            offset = offset.checked_add(batch.num_rows()).context("memory visibility row overflow")?;
+        }
+        source_rows.push(offset);
+        let memory_bytes =
+            memory.iter().map(RecordBatch::get_array_memory_size).try_fold(0_usize, usize::checked_add).context("memory visibility size overflow")?;
+        let _memory_owner = self.cache.reserve(memory_bytes, self.context.memory_pool())?;
+        let memory_plan = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[memory], schema.clone(), None)?;
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if partitions.is_empty() {
+            memory_plan
+        } else {
+            UnionExec::try_new(vec![
+                Arc::new(StreamingTableExec::try_new(schema.clone(), vec![Arc::new(VisibilityFiles { schema, sources: partitions })], None, [], false, None)?),
+                memory_plan,
+            ])?
+        };
+        let masks = stream_winner_masks(input, source_rows, &self.keys, self.tiebreak.as_deref(), self.tombstone.as_deref(), self.context.clone()).await?;
+        let mask_bytes = masks.iter().map(|mask| mask.inner().capacity()).try_fold(0_usize, usize::checked_add).context("histogram mask size overflow")?;
+        let _mask_owner = self.cache.reserve(mask_bytes, self.context.memory_pool())?;
+        let entries = self.manifest.histogram_entries(&self.root, files)?;
+        let mut result = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        for (index, file) in prepared.iter().enumerate() {
+            let indexed = match &entries[index] {
+                Some(entry) => {
+                    self.search
+                        .histogram_file(
+                            &self.table,
+                            &self.project,
+                            self.window,
+                            self.membership.as_ref(),
+                            HistogramFile {
+                                table_root: &self.root,
+                                manifest_key: entry.key,
+                                entry: entry.entry,
+                                source_file: &files[index].path,
+                                visible: masks[index].clone(),
+                            },
+                        )
+                        .await
+                }
+                None => Err(anyhow::anyhow!("snapshot file has no histogram index")),
+            };
+            let counts = match indexed {
+                Ok(counts) => {
+                    result.indexed_sources += 1;
+                    counts
+                }
+                Err(error) => {
+                    result.index_errors.push(error);
+                    result.scanned_sources += 1;
+                    let mut counts = std::collections::BTreeMap::<i64, u64>::new();
+                    let mut rows = file.stream(self.projected.clone())?;
+                    let mut offset = 0;
+                    while let Some(batch) = rows.try_next().await? {
+                        let bytes = batch.get_array_memory_size();
+                        ensure!(bytes <= self.max_decoded_bytes, "histogram fallback batch exceeds decoded budget");
+                        let _owner = self.cache.reserve(bytes, self.context.memory_pool())?;
+                        let visible = masks[index].slice(offset, batch.num_rows());
+                        for (bucket, count) in self.window.count_rows(std::slice::from_ref(&batch), &visible, self.membership.as_ref())? {
+                            let total = counts.entry(bucket).or_default();
+                            *total = total.checked_add(count).context("streaming fallback count overflow")?;
+                        }
+                        offset += batch.num_rows();
+                    }
+                    counts
+                }
+            };
+            for (bucket, count) in counts {
+                let total = result.counts.entry(bucket).or_default();
+                *total = total.checked_add(count).context("streaming indexed count overflow")?;
+            }
+        }
+        for (bucket, count) in self.window.count_rows(&self.memory.batches, masks.last().context("missing memory winner mask")?, self.membership.as_ref())? {
+            let total = result.counts.entry(bucket).or_default();
+            *total = total.checked_add(count).context("streaming memory count overflow")?;
+        }
+        if !self.memory.batches.is_empty() {
+            result.scanned_sources += 1;
+        }
+        TantivySearchService::record_histogram_snapshot(&self.search.stats);
+        Ok(result)
+    }
+
     /// Equality with an exact logical count proves there are no live duplicate
     /// versions or tombstones: either would make the logical count smaller.
     async fn count_unique_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
@@ -499,7 +655,7 @@ impl super::Database {
         let captured =
             self.capture_histogram(&query.project, &query.table, query.window, Some(&query.membership), 64 * 1024 * 1024, session.task_ctx()).await?;
         drop(captured.seed_missing_proof(self));
-        let result = captured.count().await?;
+        let result = captured.count_streaming().await?;
         for error in &result.index_errors {
             tracing::warn!(error = %error, "histogram used captured-row fallback");
         }
@@ -732,6 +888,43 @@ mod tests {
             "logical count smaller than physical count cannot authorize index-only counting"
         );
         assert_eq!(db.indexed_histogram(&project, table, window, Some(&membership), 1024 * 1024, context.clone()).await?.counts.values().sum::<u64>(), 3);
+        // One dirty day's hash arrays exceed the former 64 MiB decoded limit.
+        let wide_timestamp = timestamp - 3 * DAY_MICROS;
+        let wide_date = chrono::DateTime::from_timestamp_micros(wide_timestamp).unwrap().date_naive().to_string();
+        let wide_row = |id: usize, tag: &str| {
+            let mut record = row(&id.to_string(), tag);
+            record["timestamp"] = serde_json::json!(wide_timestamp);
+            record["date"] = serde_json::json!(wide_date);
+            record
+        };
+        let records = (0..65)
+            .map(|id| {
+                let mut record = wide_row(id, &hash);
+                record["hashes"] = serde_json::json!(vec![hash.as_str(); 512]);
+                record
+            })
+            .collect();
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, records)?], true, None).await?;
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![wide_row(0, "b")])?], true, None).await?;
+        build_indexes().await?;
+        let wide_window = HistogramWindow::new(wide_timestamp, wide_timestamp + 1, 1_000_000, 0, 2)?;
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(32 * 1024 * 1024));
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new().with_memory_pool(pool.clone()).build_arc()?;
+        let wide_context = datafusion::prelude::SessionContext::new_with_config_rt(Default::default(), runtime).task_ctx();
+        let wide = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context.clone()).await?;
+        let Err(error) = wide.count().await else { anyhow::bail!("wide hashes must exceed the old decoded budget") };
+        assert!(error.to_string().contains("budget"), "the old path must fail at its decoded budget: {error}");
+        let result = wide.count_streaming().await?;
+        assert_eq!(result.counts.values().sum::<u64>(), 64);
+        assert_eq!(result.scanned_sources, 0, "wide hashes stay in the index during version resolution");
+        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![wide_row(1, "b")])?], true, None).await?;
+        let partial = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context).await?;
+        let result = partial.count_streaming().await?;
+        assert_eq!(result.counts.values().sum::<u64>(), 63, "an unindexed replacement must suppress its indexed old version");
+        assert_eq!(result.scanned_sources, 1);
+        assert_eq!(wide.count_streaming().await?.counts.values().sum::<u64>(), 64, "later writes cannot replace captured sources");
+        assert_eq!(pool.reserved(), 0, "streaming query reservations must release after counting");
         // Removing the superseded physical row makes the partition unique.
         // The same Parquet paths now have a different DV identity.
         let mut table_guard = table_ref.write().await;

@@ -161,3 +161,28 @@ bound is claimed by this reader API.
 All 136 selected tests passed in 9.317 seconds (nextest
 `be958064-0dd1-4562-9701-53c98848a3d8`). Final lint is running. This remains a
 scoped review, not completion of the required full-feature reviews.
+
+
+### SQL streaming integration checkpoint — 2026-09-09
+
+Scoped rs-distill review: collecting and streaming visibility now share
+`lineage_schema` and `lineage_batch`. File execution is sequential, so adding
+files does not add simultaneously active decoder streams. Bucket accumulation
+still repeats across collecting and streaming paths; consolidation is open.
+
+Scoped rs-evasion review: the collecting API retains its total decoded-data
+contract. The new streaming API explicitly documents a per-batch limit and
+uses query-pool reservations. Prepared DV state remains private. No new
+unsafe code, lint suppression, ignored tests, or weakened assertions appear.
+Metadata accounting is an estimate of retained allocations, not an RSS limit.
+The 8 MiB trial exposed DataFusion's 10 MiB minimum sort reservation; the test
+uses 32 MiB while retaining a hash fixture larger than 64 MiB. Full-feature
+reviews remain open; this checkpoint does not claim the entire branch clean.
+
+
+Final integration validation: `make ci-signoff CHECKS="fmt clippy test e2e"`
+exited 0. Formatting, Clippy, the full nextest suite, all eight doctests, and
+end-to-end tests passed. All four requested checks were attested for the final
+source, including the 32 MiB streaming regression. Final gate status requires
+only canonical `pg-smoke` on GitHub due to the documented macOS networking
+limitation. No failed check was attested.

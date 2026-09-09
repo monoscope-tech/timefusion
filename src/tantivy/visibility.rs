@@ -244,6 +244,20 @@ impl PreparedFileRows {
         Ok(Self { store, path, size: meta.size, metadata, partitions: add.partition_values.clone(), live })
     }
 
+    pub fn live(&self) -> &BooleanBuffer {
+        &self.live
+    }
+
+    pub fn retained_bytes(&self) -> Result<usize> {
+        [self.metadata.metadata().memory_size(), self.live.inner().capacity(), std::mem::size_of::<Schema>()]
+            .into_iter()
+            .chain(self.metadata.schema().fields().iter().map(|field| field.size()))
+            .chain(self.metadata.schema().metadata().iter().flat_map(|(key, value)| [key.capacity(), value.capacity()]))
+            .chain(self.partitions.iter().flat_map(|(key, value)| [key.capacity(), value.as_ref().map_or(0, String::capacity)]))
+            .try_fold(std::mem::size_of::<Self>(), usize::checked_add)
+            .context("prepared source size overflow")
+    }
+
     pub fn stream(&self, schema: arrow::datatypes::SchemaRef) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         use deltalake::datafusion::parquet::arrow::{
             ProjectionMask,
@@ -356,18 +370,7 @@ pub async fn winner_masks(
         }
     }
     let narrow_schema = source_schema.project(&projection)?;
-    // These are physical lineage columns, carried through DedupExec alongside the
-    // keys. They never enter the user schema or influence version comparison.
-    let lineage_names = VISIBILITY_LINEAGE;
-    ensure!(lineage_names.iter().all(|name| narrow_schema.index_of(name).is_err()), "visibility lineage column conflicts with source schema");
-    let schema = Arc::new(Schema::new(
-        narrow_schema
-            .fields()
-            .iter()
-            .cloned()
-            .chain([Arc::new(Field::new(lineage_names[0], DataType::UInt32, false)), Arc::new(Field::new(lineage_names[1], DataType::UInt64, false))])
-            .collect::<Vec<_>>(),
-    ));
+    let schema = lineage_schema(&Arc::new(narrow_schema))?;
     let mut batches = Vec::new();
     for (source_id, source) in sources.iter().enumerate() {
         let source_id = u32::try_from(source_id)?;
@@ -378,12 +381,7 @@ pub async fn winner_masks(
         for batch in &source.batches {
             ensure!(batch.schema() == source_schema, "visibility sources have incompatible schemas");
             let len = batch.num_rows();
-            let mut columns = batch.project(&projection)?.columns().to_vec();
-            columns.push(Arc::new(UInt32Array::from_value(source_id, len)) as ArrayRef);
-            columns.push(Arc::new(UInt64Array::from_iter_values((offset..offset + len).map(|row| row as u64))) as ArrayRef);
-            let augmented = RecordBatch::try_new(schema.clone(), columns)?;
-            let live = BooleanArray::new(source.live.slice(offset, len), None);
-            batches.push(filter_record_batch(&augmented, &live)?);
+            batches.push(lineage_batch(&batch.project(&projection)?, &source.live.slice(offset, len), schema.clone(), source_id, offset)?);
             offset += len;
         }
     }
@@ -392,6 +390,100 @@ pub async fn winner_masks(
 }
 
 pub(crate) const VISIBILITY_LINEAGE: [&str; 2] = ["__timefusion_visibility_source", "__timefusion_visibility_ordinal"];
+
+pub(crate) fn lineage_schema(schema: &arrow::datatypes::SchemaRef) -> Result<arrow::datatypes::SchemaRef> {
+    ensure!(VISIBILITY_LINEAGE.iter().all(|name| schema.index_of(name).is_err()), "visibility lineage column conflicts with source schema");
+    Ok(Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .cloned()
+            .chain([Arc::new(Field::new(VISIBILITY_LINEAGE[0], DataType::UInt32, false)), Arc::new(Field::new(VISIBILITY_LINEAGE[1], DataType::UInt64, false))])
+            .collect::<Vec<_>>(),
+    )))
+}
+
+pub(crate) fn lineage_batch(batch: &RecordBatch, live: &BooleanBuffer, schema: arrow::datatypes::SchemaRef, source: u32, offset: usize) -> Result<RecordBatch> {
+    ensure!(batch.num_rows() == live.len(), "lineage mask differs from batch rows");
+    let end = offset.checked_add(batch.num_rows()).context("lineage ordinal overflow")?;
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(UInt32Array::from_value(source, batch.num_rows())));
+    columns.push(Arc::new(UInt64Array::from_iter_values((u64::try_from(offset)?)..u64::try_from(end)?)));
+    Ok(filter_record_batch(&RecordBatch::try_new(schema, columns)?, &BooleanArray::new(live.clone(), None))?)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileVisibilitySource {
+    pub file: Arc<PreparedFileRows>,
+    pub schema: arrow::datatypes::SchemaRef,
+    pub source: u32,
+    pub covered_ranges: Arc<Vec<(i64, i64)>>,
+    pub partition: (i64, i64),
+    pub max_batch_bytes: usize,
+    pub owner: Arc<datafusion::execution::memory_pool::MemoryReservation>,
+}
+
+/// Read files sequentially so input buffers do not grow with the file count.
+#[derive(Debug)]
+pub(crate) struct VisibilityFiles {
+    pub schema: arrow::datatypes::SchemaRef,
+    pub sources: Vec<FileVisibilitySource>,
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for VisibilityFiles {
+    fn schema(&self) -> &arrow::datatypes::SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, context: Arc<TaskContext>) -> datafusion::physical_plan::SendableRecordBatchStream {
+        use futures::StreamExt;
+        let streams = futures::stream::iter(self.sources.clone()).map(move |source| source.execute(context.clone())).flatten();
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(self.schema.clone(), streams))
+    }
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for FileVisibilitySource {
+    fn schema(&self) -> &arrow::datatypes::SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, context: Arc<TaskContext>) -> datafusion::physical_plan::SendableRecordBatchStream {
+        use futures::TryStreamExt;
+        let source = self.clone();
+        let schema = self.schema.clone();
+        let input = futures::stream::once(async move {
+            ensure!(source.owner.size() >= source.file.retained_bytes()?, "prepared source lacks metadata reservation");
+            let projection = (0..source.schema.fields().len().checked_sub(2).context("missing lineage schema")?).collect::<Vec<_>>();
+            let stream = source.file.stream(Arc::new(source.schema.project(&projection)?))?;
+            Ok::<_, anyhow::Error>(stream)
+        })
+        .try_flatten();
+        let source = self.clone();
+        let reservation = datafusion::execution::memory_pool::MemoryConsumer::new("TantivyVisibilityBatch").register(context.memory_pool());
+        let stream = futures::stream::try_unfold((Box::pin(input), 0_usize, source, reservation), |(mut input, offset, source, reservation)| async move {
+            let Some(batch) = input.try_next().await? else { return Ok(None) };
+            let bytes = batch.get_array_memory_size();
+            ensure!(bytes <= source.max_batch_bytes, "visibility batch needs {bytes} bytes, budget is {}", source.max_batch_bytes);
+            reservation.try_resize(bytes)?;
+            let timestamp = batch.column_by_name("timestamp").context("missing visibility timestamp")?;
+            let values = crate::read::bound_slice(timestamp).context("invalid visibility timestamp")?;
+            ensure!(
+                timestamp.null_count() == 0 && values.iter().all(|&t| t >= source.partition.0 && t < source.partition.1),
+                "histogram file timestamp differs from its date partition"
+            );
+            let len = batch.num_rows();
+            let end = offset.checked_add(len).context("visibility ordinal overflow")?;
+            ensure!(end <= source.file.live.len(), "visibility batch exceeds file rows");
+            let mut rows = SourceRows { batches: vec![batch], live: source.file.live.slice(offset, len) };
+            rows.exclude_memory_ranges("timestamp", &source.covered_ranges)?;
+            let batch = lineage_batch(&rows.batches[0], &rows.live, source.schema.clone(), source.source, offset)?;
+            reservation.try_resize(bytes.checked_add(batch.get_array_memory_size()).context("visibility batch allocation overflow")?)?;
+            Ok(Some((batch, (input, end, source, reservation))))
+        })
+        .map_err(|error: anyhow::Error| datafusion::error::DataFusionError::External(error.into()));
+        datafusion::physical_plan::coop::make_cooperative(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
 
 /// Resolve physical lineage from a complete source plan without collecting its output.
 /// The explicit sort preserves source/ordinal ties and lets canonical deduplication

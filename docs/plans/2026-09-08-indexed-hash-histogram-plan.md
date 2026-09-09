@@ -604,3 +604,34 @@ follows production hash validation. Next goal audit: 2026-09-08 23:10 UTC.
 
 For `113a4d91`, `make ci-signoff CHECKS="fmt clippy"` passed and attested both
 checks. Final status leaves full test, pg-smoke, and e2e to GitHub.
+
+
+### Goal audit — 2026-09-09 05:41 UTC
+
+SQL histogram execution now calls `count_streaming`. Prepared Parquet sources
+stream visibility columns into sorted winner masks. Missing-index fallback
+reads membership columns from the same capture. Files execute sequentially;
+metadata, deletion vectors, masks, and batches retain query-pool reservations.
+The collecting API preserves its total decoded-data limit. Streaming uses a
+per-batch limit; this is not a whole-process RSS guarantee.
+
+The new dirty-day fixture contains more than 64 MiB of hash arrays. It checks
+indexed counting, an unindexed replacement, and old-capture stability. The
+initial integration passed 136 selected regressions. A later 8 MiB query-pool
+trial failed because DataFusion reserves 10 MiB for external-sort merging.
+The final test uses 32 MiB, still below the fixture size, and checks reservation
+release. Full local signoff is running; no passing result is claimed yet.
+
+The user explicitly requested committing and pushing to master. This advances
+integration deployment; production `hashes` Elements activation remains off.
+Warm/cold/ingest benchmarks, full-feature reviews, activation, production
+validation, and subsequent CPU/memory profiling remain open. No audits were
+recorded between the prior checkpoint and this audit. Next audit: 06:11 UTC.
+
+
+Final integration validation: `make ci-signoff CHECKS="fmt clippy test e2e"`
+exited 0. Formatting, Clippy, the full nextest suite, all eight doctests, and
+end-to-end tests passed. All four requested checks were attested for the final
+source, including the 32 MiB streaming regression. Final gate status requires
+only canonical `pg-smoke` on GitHub due to the documented macOS networking
+limitation. No failed check was attested.
