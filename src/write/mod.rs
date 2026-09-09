@@ -7034,6 +7034,7 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct BatchQueue {
     tx: mpsc::Sender<RecordBatch>,
     shutdown: CancellationToken,
+    worker: tokio_util::task::TaskTracker,
 }
 
 /// Row-wise partition of a chunk: one queued batch may carry rows for many projects.
@@ -7055,7 +7056,8 @@ impl BatchQueue {
         let shutdown = CancellationToken::new();
         let cancelled = shutdown.clone();
 
-        tokio::spawn(async move {
+        let worker = tokio_util::task::TaskTracker::new();
+        worker.spawn(async move {
             // Fully qualified: this module already has futures' `StreamExt` in scope.
             let stream = tokio_stream::StreamExt::chunks_timeout(ReceiverStream::new(rx), max_rows, Duration::from_millis(interval_ms));
             tokio::pin!(stream);
@@ -7075,7 +7077,8 @@ impl BatchQueue {
             }
         });
 
-        Self { tx, shutdown }
+        worker.close();
+        Self { tx, shutdown, worker }
     }
 
     pub fn queue(&self, batch: RecordBatch) -> Result<()> {
@@ -7084,6 +7087,7 @@ impl BatchQueue {
 
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
+        self.worker.wait().await;
     }
 }
 

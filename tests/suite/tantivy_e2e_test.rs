@@ -18,7 +18,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow::array::{Array, RecordBatch};
 use datafusion::{arrow::array::AsArray, execution::context::SessionContext};
 use serde_json::json;
@@ -78,7 +78,7 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
         let storage_opts = cfg_arc.aws.build_storage_options(None);
         let obj_store = db.create_object_store(&storage_uri, &storage_opts).await?;
         let s = Arc::new(TantivyIndexService::new(obj_store.clone(), Arc::new(cfg_arc.tantivy.clone())));
-        layer = layer.with_tantivy_indexer(s.clone().callback());
+        layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&s)));
         let cache_root = cfg_arc.core.timefusion_data_dir.clone();
         let search = Arc::new(TantivySearchService::new(obj_store, cache_root, Arc::new(cfg_arc.tantivy.clone())));
         s.with_reader(&search);
@@ -246,20 +246,17 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "index publication timed out");
         tokio::task::yield_now().await;
     };
+    assert!(
+        manifest.entries.values().all(|entry| entry.ordinals_valid && entry.covered_files.len() == 1),
+        "flush-created indexes must preserve physical Parquet row ordinals without manual backfill"
+    );
     let result = ctx.sql(&unindexed_sql).await?.collect().await?;
     assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 0, "the newer nonmatching version must suppress the old match");
     assert_eq!(
         db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
-        before,
-        "a flush index without physical ordinals cannot accelerate the histogram"
+        before + 1,
+        "freshly flushed hashes must reach the histogram path without manual backfill"
     );
-    // Backfill only the newer file, preserving the uncovered older version.
-    let table_ref = db.resolve_table(&project, table).await?;
-    let store = table_ref.read().await.log_store().object_store(None);
-    for uri in manifest.entries.values().flat_map(|entry| &entry.covered_files) {
-        let relative = timefusion::tantivy::search::parquet_rel_of_uri(uri).context("missing relative Parquet path")?;
-        svc.build_index_for_file(table, &project, relative, uri, store.clone()).await?;
-    }
     let result = db
         .tantivy_search()
         .unwrap()
@@ -478,6 +475,27 @@ async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buff
     let entry = m.entries.values().next().unwrap();
     assert!(entry.index.is_some(), "entry should have an index blob URI: {entry:?}");
     assert_eq!(entry.rows, 1);
+    assert!(entry.ordinals_valid, "server flushes must index physical file order");
+
+    // A single callback may receive several date-partitioned files.
+    let now = chrono::Utc::now();
+    let batch = timefusion::support::test_helpers::json_to_batch(
+        [1, 2]
+            .into_iter()
+            .map(|days| {
+                timefusion::support::test_helpers::test_span_ts(&format!("multi-{days}"), "n", &p, (now - chrono::Duration::days(days)).timestamp_micros())
+            })
+            .collect(),
+    )?;
+    let added = db.insert_records_batch(&p, TABLE, vec![batch.clone()], true, None).await?;
+    assert_eq!(added.len(), 2, "the fixture must commit two physical files");
+    timefusion::server::tantivy_index_callback(&db, Arc::clone(&svc))(p.clone(), TABLE.into(), vec![batch], added.clone()).await?;
+    let manifest = timefusion::tantivy::load_manifest(store.as_ref(), TABLE, &p).await?;
+    for file in added {
+        let entry = manifest.entries.values().find(|entry| entry.covered_files.as_slice() == [file.as_str()]).expect("every file needs its own index");
+        assert!(entry.index.is_some() && entry.ordinals_valid);
+        assert_eq!(entry.rows, 1);
+    }
     Ok(())
 }
 

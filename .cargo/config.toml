@@ -1,11 +1,3 @@
-# Faster linking on macOS arm64. The system linker spends a large slice of every
-# leaf recompile linking a ~100MB binary with 1200+ deps' symbols. ld64.lld is
-# substantially faster. Full path is required — clang rejects the bare
-# `-fuse-ld=ld64.lld` shortname (only `lld`/`gold`/etc. are recognized).
-# Install: `brew install llvm@15` (or any llvm providing ld64.lld).
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm@15/bin/ld64.lld"]
-
 # THE lint definition. CI (`.github/workflows/ci.yml`) and the autofix workflow
 # both invoke these aliases, so `cargo lint` locally is byte-for-byte what CI
 # runs — there is no second copy of the flags to drift.

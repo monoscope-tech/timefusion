@@ -151,7 +151,7 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     let b1 = json_to_batch(vec![row("a1", &project_id, ts, "trace-covered")])?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b1.clone()], true, None).await?;
     let file1: Vec<String> = db.list_file_uris(&project_id, "otel_logs_and_spans").await?;
-    svc.clone().callback()(project_id.clone(), "otel_logs_and_spans".into(), vec![b1], file1.clone()).await?;
+    svc.clone().batch_callback()(project_id.clone(), "otel_logs_and_spans".into(), vec![b1], file1.clone()).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![row("b1", &project_id, ts, "trace-raw")])?], true, None).await?;
     let all: Vec<String> = db.list_file_uris(&project_id, "otel_logs_and_spans").await?;
     assert!(all.len() > file1.len(), "second insert must add an uncovered file");

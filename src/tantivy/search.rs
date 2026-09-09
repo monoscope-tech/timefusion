@@ -272,15 +272,38 @@ impl TantivySearchService {
         file: HistogramFile<'_>,
     ) -> Result<std::collections::BTreeMap<i64, u64>> {
         let entry = file.entry;
-        anyhow::ensure!(entry.schema_version == SCHEMA_VERSION && entry.error.is_none(), "histogram index is not usable");
         let covered = match entry.covered_files.as_slice() {
             [source] => super::visibility::relative_source_path(file.table_root, source)?,
             _ => None,
         };
         anyhow::ensure!(entry.ordinals_valid && covered.as_deref() == Some(file.source_file), "histogram requires exact single-file ordinal coverage");
         anyhow::ensure!(u64::try_from(file.visible.len())? == entry.rows, "histogram mask does not cover the physical source rows");
+        let (index, searcher) = self.histogram_reader(table, project_id, file.manifest_key, entry).await?;
+        crate::support::without_blocking_the_worker(|| {
+            let query = match membership {
+                Some(predicate) => predicate.query(&index.schema(), &entry.element_fields)?,
+                None => Box::new(tantivy::query::AllQuery),
+            };
+            let visible = file.visible;
+            window.search(&searcher, query, move |row| visible.value(row as usize))
+        })
+    }
+
+    /// Checks physical candidates in an entry pinned by the captured manifest.
+    /// A false result needs complete file coverage and memory checks at the caller.
+    pub(crate) async fn histogram_file_has_matches(
+        &self, table: &str, project_id: &str, window: super::histogram::HistogramWindow, membership: &super::histogram::Membership,
+        entry: super::HistogramEntry<'_>,
+    ) -> Result<bool> {
+        let (index, searcher) = self.histogram_reader(table, project_id, entry.key, entry.entry).await?;
+        crate::support::without_blocking_the_worker(|| window.has_physical_matches(&searcher, membership.query(&index.schema(), &entry.entry.element_fields)?))
+    }
+
+    async fn histogram_reader(&self, table: &str, project_id: &str, key: &str, entry: &super::ManifestEntry) -> Result<(Index, tantivy::Searcher)> {
+        anyhow::ensure!(entry.schema_version == SCHEMA_VERSION && entry.error.is_none(), "histogram index is not usable");
+        anyhow::ensure!(entry.ordinals_valid && entry.covered_files.len() == 1, "histogram requires physical single-file coverage");
         let blob = entry.index.as_deref().context("histogram index is missing")?;
-        let dir = self.ensure_cached(table, project_id, file_uuid(file.manifest_key), blob).await?;
+        let dir = self.ensure_cached(table, project_id, file_uuid(key), blob).await?;
         crate::support::without_blocking_the_worker(|| {
             let (index, reader) = self.open_cached(&dir)?;
             let searcher = reader.searcher();
@@ -291,12 +314,7 @@ impl TantivySearchService {
                     anyhow::ensure!(ordinals.max_value() < entry.rows, "histogram index ordinal exceeds its physical source");
                 }
             }
-            let query = match membership {
-                Some(predicate) => predicate.query(&index.schema(), &entry.element_fields)?,
-                None => Box::new(tantivy::query::AllQuery),
-            };
-            let visible = file.visible;
-            window.search(&searcher, query, move |row| visible.value(row as usize))
+            Ok((index, searcher))
         })
     }
 
@@ -1268,8 +1286,9 @@ impl TantivyIndexService {
         Some(self.newest_indexed_micros.load(Ordering::Relaxed)).filter(|&v| v != i64::MIN)
     }
 
-    /// Build the callback to attach via `BufferedWriteLayer::with_tantivy_indexer`.
-    pub fn callback(self: Arc<Self>) -> TantivyIndexCallback {
+    /// Index supplied batches without claiming physical Parquet row order.
+    /// Server flushes use `server::tantivy_index_callback` to index committed files.
+    pub fn batch_callback(self: Arc<Self>) -> TantivyIndexCallback {
         Arc::new(move |project_id, table_name, batches, added_files| {
             let svc = self.clone();
             Box::pin(async move {

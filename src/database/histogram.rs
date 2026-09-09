@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use arrow::{array::Array, record_batch::RecordBatch};
@@ -83,36 +83,75 @@ impl HistogramDeltaCache {
     }
 }
 
-#[derive(Debug, Default)]
-pub(super) struct HistogramDmlState {
-    generation: AtomicU64,
-    active: AtomicUsize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistogramDmlScope {
+    All,
+    Timestamps(std::ops::RangeInclusive<i64>),
 }
 
-pub(crate) struct HistogramDmlGuard(Arc<HistogramDmlState>);
-
-impl Drop for HistogramDmlGuard {
-    fn drop(&mut self) {
-        self.0.generation.fetch_add(1, Ordering::SeqCst);
-        self.0.active.fetch_sub(1, Ordering::SeqCst);
+impl HistogramDmlScope {
+    fn overlaps(&self, range: &std::ops::RangeInclusive<i64>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Timestamps(active) => active.start() <= range.end() && range.start() <= active.end(),
+        }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct HistogramDmlGuard(HistogramDmlScope);
+
+#[derive(Debug)]
+struct HistogramDmlCapture {
+    range: std::ops::RangeInclusive<i64>,
+    invalidated: AtomicBool,
+}
+
+impl HistogramDmlCapture {
+    fn validate(&self) -> Result<()> {
+        ensure!(!self.invalidated.load(Ordering::SeqCst), "SQL DML changed while capturing histogram sources");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct HistogramDmlActivity {
+    writes: Vec<std::sync::Weak<HistogramDmlGuard>>,
+    captures: Vec<std::sync::Weak<HistogramDmlCapture>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct HistogramDmlState(parking_lot::Mutex<HistogramDmlActivity>);
 
 impl HistogramDmlState {
-    fn enter(self: Arc<Self>) -> HistogramDmlGuard {
-        self.active.fetch_add(1, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        HistogramDmlGuard(self)
+    fn enter(&self, scope: HistogramDmlScope) -> Arc<HistogramDmlGuard> {
+        // Registration and invalidation are atomic with respect to capture.
+        // Weak entries retain no completed statements or finished read views.
+        let mut activity = self.0.lock();
+        activity.captures.retain(|weak| {
+            let Some(capture) = weak.upgrade() else { return false };
+            if scope.overlaps(&capture.range) {
+                capture.invalidated.store(true, Ordering::SeqCst);
+            }
+            true
+        });
+        activity.writes.retain(|weak| weak.strong_count() != 0);
+        let guard = Arc::new(HistogramDmlGuard(scope));
+        activity.writes.push(Arc::downgrade(&guard));
+        guard
     }
 
-    fn stamp(&self) -> Result<u64> {
-        ensure!(self.active.load(Ordering::SeqCst) == 0, "histogram capture overlaps active SQL DML");
-        Ok(self.generation.load(Ordering::SeqCst))
-    }
-
-    fn validate(&self, stamp: u64) -> Result<()> {
-        ensure!(self.stamp()? == stamp, "SQL DML changed while capturing histogram sources");
-        Ok(())
+    fn capture(&self, range: std::ops::RangeInclusive<i64>) -> Result<Arc<HistogramDmlCapture>> {
+        let mut activity = self.0.lock();
+        activity.writes.retain(|weak| weak.strong_count() != 0);
+        ensure!(
+            !activity.writes.iter().filter_map(std::sync::Weak::upgrade).any(|guard| guard.0.overlaps(&range)),
+            "histogram capture overlaps active SQL DML"
+        );
+        activity.captures.retain(|weak| weak.strong_count() != 0);
+        let capture = Arc::new(HistogramDmlCapture { range, invalidated: AtomicBool::new(false) });
+        activity.captures.push(Arc::downgrade(&capture));
+        Ok(capture)
     }
 }
 
@@ -169,7 +208,7 @@ impl CapturedHistogram {
     /// Request one missing completed-day proof without delaying this query.
     /// The builder uses the maintenance runtime and shared count-build semaphore.
     /// The extra permit prevents a chart workload from queuing many days.
-    fn seed_missing_proof(&self, database: &super::Database) -> Option<tokio::task::JoinHandle<()>> {
+    fn seed_missing_proof(&self, database: &super::Database, day: i64) -> Option<tokio::task::JoinHandle<()>> {
         database.tantivy_indexer()?;
         let state = &database.histogram_proof_build;
         let permit = state.slot.clone().try_acquire_owned().ok()?;
@@ -178,19 +217,18 @@ impl CapturedHistogram {
             let now = std::time::Instant::now();
             let mut attempts = state.attempts.lock();
             attempts.retain(|(_, at)| now.duration_since(*at) < std::time::Duration::from_secs(60));
-            let key = self
-                .partitions
-                .iter()
-                .rev()
-                .filter(|(day, files)| **day < today && !files.is_empty() && !self.logical_counts.contains_key(*day))
-                .filter_map(|(_, files)| {
-                    Some(crate::read::CountPartition {
-                        project_id: self.project.clone(),
-                        table_name: self.table.clone(),
-                        date: files.first()?.partition_values.get("date")?.clone()?,
-                    })
-                })
-                .find(|key| !attempts.iter().any(|(attempt, _)| attempt == key))?;
+            let files = self.partitions.get(&day)?;
+            if day >= today || self.logical_counts.contains_key(&day) {
+                return None;
+            }
+            let key = crate::read::CountPartition {
+                project_id: self.project.clone(),
+                table_name: self.table.clone(),
+                date: files.first()?.partition_values.get("date")?.clone()?,
+            };
+            if attempts.iter().any(|(attempt, _)| attempt == &key) {
+                return None;
+            }
             if attempts.len() == 256 {
                 attempts.pop_front();
             }
@@ -226,9 +264,26 @@ impl CapturedHistogram {
     /// Counts with streamed visibility columns and the query memory pool.
     /// Unlike `count`, this limits each decoded batch rather than total decoded data.
     pub async fn count_streaming(&self) -> Result<HistogramSnapshotResult> {
+        self.count_streaming_before_visibility(|_| {}).await
+    }
+
+    async fn count_streaming_before_visibility(&self, mut before_visibility: impl FnMut(i64)) -> Result<HistogramSnapshotResult> {
         let mut total = HistogramSnapshotResult::default();
         for (&day, files) in &self.partitions {
-            let part = self.count_streaming_partition(day, files).await?;
+            let indexed = match self.count_index_only_partition(day, files).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%error, "indexed histogram declined; streaming captured visibility");
+                    None
+                }
+            };
+            let part = match indexed {
+                Some(result) => result,
+                None => {
+                    before_visibility(day);
+                    self.count_streaming_partition(day, files).await?
+                }
+            };
             crate::tantivy::histogram::merge_counts(&mut total.counts, part.counts)?;
             total.indexed_sources += part.indexed_sources;
             total.scanned_sources += part.scanned_sources;
@@ -242,11 +297,6 @@ impl CapturedHistogram {
         use datafusion::physical_plan::{streaming::StreamingTableExec, union::UnionExec};
         use futures::TryStreamExt;
 
-        match self.count_unique_partition(day, files).await {
-            Ok(Some(result)) => return Ok(result),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "indexed histogram declined; streaming captured visibility"),
-        }
         let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
         let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
         let columns =
@@ -391,6 +441,46 @@ impl CapturedHistogram {
         Ok(result)
     }
 
+    async fn count_empty_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
+        let Some(membership) = &self.membership else { return Ok(None) };
+        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
+        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
+        for batch in &self.memory.batches {
+            if histogram_timestamps(batch)?.iter().any(|&timestamp| timestamp >= lo && timestamp < hi) {
+                return Ok(None);
+            }
+        }
+        let entries = self.manifest.histogram_entries(&self.root, files)?;
+        let columns = membership.columns();
+        for (file, entry) in files.iter().zip(entries) {
+            let Some(entry) = entry else { return Ok(None) };
+            if entry.entry.min_timestamp_micros.is_none_or(|min| min < lo)
+                || entry.entry.max_timestamp_micros.is_none_or(|max| max >= hi)
+                || columns.iter().any(|column| !entry.entry.element_fields.contains(*column))
+            {
+                return Ok(None);
+            }
+            let indexed_rows = entry.entry.rows;
+            if self.search.histogram_file_has_matches(&self.table, &self.project, self.window, membership, entry).await? {
+                return Ok(None);
+            }
+            // Metadata validates complete coverage; no event rows are decoded.
+            let prepared = crate::tantivy::visibility::PreparedFileRows::open(self.log_store.clone(), file).await?;
+            let _owner = self.cache.reserve(prepared.retained_bytes()?, self.context.memory_pool())?;
+            ensure!(u64::try_from(prepared.live().len())? == indexed_rows, "empty index does not cover every physical row");
+        }
+        TantivySearchService::record_histogram_snapshot(&self.search.stats);
+        Ok(Some(HistogramSnapshotResult { indexed_sources: files.len(), ..Default::default() }))
+    }
+
+    /// Prefer the existing count witness; probe absence only when it declines.
+    async fn count_index_only_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
+        match self.count_unique_partition(day, files).await? {
+            Some(result) => Ok(Some(result)),
+            None => self.count_empty_partition(day, files).await,
+        }
+    }
+
     /// Equality with an exact logical count proves there are no live duplicate
     /// versions or tombstones: either would make the logical count smaller.
     async fn count_unique_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
@@ -452,7 +542,7 @@ impl CapturedHistogram {
     }
 
     async fn count_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<HistogramSnapshotResult> {
-        match self.count_unique_partition(day, files).await {
+        match self.count_index_only_partition(day, files).await {
             Ok(Some(result)) => return Ok(result),
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, "index-only histogram declined; resolving captured rows"),
@@ -645,8 +735,8 @@ impl super::Database {
         Ok(Some(count))
     }
 
-    pub(crate) fn histogram_dml_guard(&self, project: &str, table: &str) -> HistogramDmlGuard {
-        self.histogram_dml.entry((project.to_owned(), table.to_owned())).or_default().clone().enter()
+    pub(crate) fn histogram_dml_guard(&self, project: &str, table: &str, scope: HistogramDmlScope) -> Arc<HistogramDmlGuard> {
+        self.histogram_dml.entry((project.to_owned(), table.to_owned())).or_default().enter(scope)
     }
 
     pub(crate) async fn histogram_plan(
@@ -675,8 +765,14 @@ impl super::Database {
         if !has_index {
             return Ok(None);
         }
-        drop(captured.seed_missing_proof(self));
-        let result = captured.count_streaming().await?;
+        let mut proof = None;
+        let result = captured
+            .count_streaming_before_visibility(|day| {
+                if proof.is_none() {
+                    proof = captured.seed_missing_proof(self, day);
+                }
+            })
+            .await?;
         for error in &result.index_errors {
             tracing::warn!(error = %error, "histogram used captured-row fallback");
         }
@@ -705,14 +801,14 @@ impl super::Database {
     ) -> Result<CapturedHistogram> {
         let search = self.tantivy_search().context("Tantivy search service is unavailable")?.clone();
         let dml = self.histogram_dml.entry((project.to_owned(), table_name.to_owned())).or_default().clone();
-        let stamp = dml.stamp()?;
+        let (lo, hi) = window.bounds();
+        let capture = dml.capture(lo..=hi - 1)?;
         let schema = crate::schema::get_schema(table_name).context("unknown histogram table")?;
         ensure!(schema.dedup_keys.iter().any(|key| key == "timestamp"), "histogram requires timestamp in the immutable key");
         ensure!(
             schema.partitions.iter().any(|key| key == "project_id") && schema.partitions.iter().any(|key| key == "date"),
             "histogram requires project/date partitions"
         );
-        let (lo, hi) = window.bounds();
         let first_date = chrono::DateTime::from_timestamp_micros(lo).context("histogram start is outside calendar range")?.date_naive().to_string();
         let last_date = chrono::DateTime::from_timestamp_micros(hi - 1).context("histogram end is outside calendar range")?.date_naive().to_string();
         // Flush removes memory only after publishing Delta. Capture memory first
@@ -734,7 +830,8 @@ impl super::Database {
         };
         // All subsequent source reads use pinned immutable file metadata and
         // retained Arrow batches. Only the capture interval needs this fence.
-        dml.validate(stamp)?;
+        capture.validate()?;
+        drop(capture);
         let mut columns = schema
             .dedup_keys
             .iter()
@@ -878,15 +975,51 @@ mod tests {
             db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(),
             "index coverage alone cannot prove visibility"
         );
+        let absent = Membership::Contains { column: "hashes".into(), value: "absent".into() };
+        let mut empty = db.capture_histogram(&project, table, window, Some(&absent), 64, context.clone()).await?;
+        for result in [empty.count().await, empty.count_streaming().await] {
+            let result = result?;
+            assert!(result.counts.is_empty());
+            assert_eq!(result.scanned_sources, 0, "complete empty postings must avoid decoding visibility rows");
+            assert_eq!(result.indexed_sources, 1);
+        }
+        assert_eq!(search.stats.histogram_unique_partitions.load(Ordering::Relaxed), 0, "absence is not a uniqueness proof");
+        let mut session = Arc::new(db.clone()).create_session_context();
+        db.setup_session_context(&mut session)?;
+        let sql = format!(
+            "SELECT time_bucket('1 second', timestamp), count(*) FROM {table} \
+             WHERE project_id = '{project}' AND timestamp >= to_timestamp_micros({timestamp}) \
+             AND timestamp < to_timestamp_micros({}) AND hashes @> ARRAY['absent'] GROUP BY 1",
+            timestamp + 1
+        );
+        let unrelated_window = datafusion::prelude::col("timestamp")
+            .gt_eq(datafusion::prelude::lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(timestamp + DAY_MICROS), None)))
+            .and(
+                datafusion::prelude::col("timestamp")
+                    .lt(datafusion::prelude::lit(datafusion::common::ScalarValue::TimestampMicrosecond(Some(timestamp + DAY_MICROS + 1), None))),
+            );
+        let unrelated_update = db.histogram_dml_guard(&project, table, crate::dml::histogram_dml_scope(Some(&unrelated_window), &[], None));
+        let before = search.stats.histogram_snapshots.load(Ordering::Relaxed);
+        assert_eq!(session.sql(&sql).await?.collect().await?.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        assert!(search.stats.histogram_snapshots.load(Ordering::Relaxed) > before, "SQL must use the indexed histogram");
+        assert!(db.histogram_proof_build.attempts.lock().is_empty(), "indexed absence must not schedule a daily visibility scan");
+        drop(unrelated_update);
+        empty.memory.batches.push(json_to_batch_for(table, vec![row("memory", "absent")])?);
+        empty.max_decoded_bytes = 1024 * 1024;
+        assert_eq!(empty.count_streaming().await?.counts.values().sum::<u64>(), 1, "a matching memory row must defeat indexed absence");
+        empty.memory.batches.clear();
+        empty.max_decoded_bytes = 64;
+        Arc::make_mut(&mut empty.manifest).entries.clear();
+        assert!(empty.count_streaming().await.is_err(), "missing index coverage cannot certify absence");
         let partition = crate::read::CountPartition { project_id: project.clone(), table_name: table.into(), date: date.clone() };
         let unproven = db.capture_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         let busy = db.histogram_proof_build.slot.clone().acquire_owned().await?;
-        assert!(unproven.seed_missing_proof(&db).is_none(), "busy proof builder must decline without queuing");
+        assert!(unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).is_none(), "busy proof builder must decline without queuing");
         drop(busy);
-        let build = unproven.seed_missing_proof(&db).context("completed partition must schedule a proof")?;
-        assert!(unproven.seed_missing_proof(&db).is_none(), "one query-triggered proof build holds the admission slot");
+        let build = unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).context("completed partition must schedule a proof")?;
+        assert!(unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).is_none(), "one query-triggered proof build holds the admission slot");
         build.await?;
-        assert!(unproven.seed_missing_proof(&db).is_none(), "a recent attempt must not rebuild from a stale query capture");
+        assert!(unproven.seed_missing_proof(&db, timestamp.div_euclid(DAY_MICROS)).is_none(), "a recent attempt must not rebuild from a stale query capture");
         assert_eq!(db.logical_count_cache.stats().0, 0, "proof seeding must not retain the complete winner index");
         let captured = db.capture_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         let result = captured.count().await?;
@@ -1083,18 +1216,27 @@ mod tests {
 
     #[test]
     fn histogram_capture_detects_overlapping_dml_and_guard_cancellation() {
-        let state = std::sync::Arc::new(super::HistogramDmlState::default());
-        let before = state.stamp().unwrap();
-        let first = state.clone().enter();
-        let second = std::sync::Arc::new(state.clone().enter());
+        let state = super::HistogramDmlState::default();
+        let before = state.capture(0..=9).unwrap();
+        let unrelated = state.enter(HistogramDmlScope::Timestamps(10..=19));
+        before.validate().unwrap();
+        state.capture(0..=9).unwrap().validate().unwrap();
+        let first = state.enter(HistogramDmlScope::Timestamps(9..=10));
+        let second = state.enter(HistogramDmlScope::All);
         let queued = second.clone();
-        assert!(state.stamp().is_err());
+        assert!(state.capture(0..=9).is_err());
         drop(first);
-        assert!(state.validate(before).is_err(), "another DML remains active");
+        assert!(before.validate().is_err(), "another DML remains active");
         drop(second);
-        assert!(state.stamp().is_err(), "queued work must remain fenced after the statement returns");
+        assert!(state.capture(0..=9).is_err(), "queued work must remain fenced after the statement returns");
         drop(queued);
-        assert!(state.validate(before).is_err(), "completed writes must invalidate an earlier capture");
-        state.validate(state.stamp().unwrap()).unwrap();
+        assert!(before.validate().is_err(), "completed writes must invalidate an earlier capture");
+        state.capture(0..=9).unwrap().validate().unwrap();
+        drop(unrelated);
+        drop(before);
+        let fresh = state.capture(10..=19).unwrap();
+        let overlapping = state.enter(HistogramDmlScope::Timestamps(19..=20));
+        drop(overlapping);
+        assert!(fresh.validate().is_err(), "even a completed overlap must invalidate capture");
     }
 }

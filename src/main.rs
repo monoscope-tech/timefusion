@@ -554,7 +554,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
         let tcfg = Arc::new(cfg.tantivy.clone());
         let svc = Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone()));
-        layer = layer.with_tantivy_indexer(svc.clone().callback());
+        layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&svc)));
         let search = Arc::new(timefusion::tantivy::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone(), tcfg));
         // Two halves of one process: let a publish seed the reader's cache and
         // invalidate its manifest instead of round-tripping through S3.
