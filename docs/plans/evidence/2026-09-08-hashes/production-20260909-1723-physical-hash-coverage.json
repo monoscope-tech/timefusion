@@ -1,0 +1,186 @@
+{
+  "at": "2026-09-09T17:23:41.508364+00:00",
+  "project": "00000000-0000-0000-0000-000000000000",
+  "delta_version": 557547,
+  "live_project_files": 363,
+  "manifest_entries": 11521,
+  "manifest_hash_entries": 295,
+  "by_date": {
+    "2026-08-06": {
+      "live_files": 1,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-07": {
+      "live_files": 1,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-08": {
+      "live_files": 1,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-09": {
+      "live_files": 1,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-10": {
+      "live_files": 1,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-11": {
+      "live_files": 1,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-12": {
+      "live_files": 1,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-13": {
+      "live_files": 2,
+      "physical_hash_candidates": 2,
+      "missing_compressed_bytes": 0
+    },
+    "2026-08-14": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 237255926
+    },
+    "2026-08-15": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 233461527
+    },
+    "2026-08-16": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 271844398
+    },
+    "2026-08-17": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 272285686
+    },
+    "2026-08-18": {
+      "live_files": 2,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 277637882
+    },
+    "2026-08-19": {
+      "live_files": 2,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 271901327
+    },
+    "2026-08-20": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 268317102
+    },
+    "2026-08-21": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 267308346
+    },
+    "2026-08-22": {
+      "live_files": 2,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 269829327
+    },
+    "2026-08-23": {
+      "live_files": 2,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 270877319
+    },
+    "2026-08-24": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 269038444
+    },
+    "2026-08-25": {
+      "live_files": 2,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 273329534
+    },
+    "2026-08-26": {
+      "live_files": 1,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 252097422
+    },
+    "2026-08-27": {
+      "live_files": 4,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 779980452
+    },
+    "2026-08-28": {
+      "live_files": 4,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 866585256
+    },
+    "2026-08-29": {
+      "live_files": 4,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 786204554
+    },
+    "2026-08-30": {
+      "live_files": 4,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 815408628
+    },
+    "2026-08-31": {
+      "live_files": 3,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 692090726
+    },
+    "2026-09-01": {
+      "live_files": 14,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 810174414
+    },
+    "2026-09-02": {
+      "live_files": 26,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 429265327
+    },
+    "2026-09-03": {
+      "live_files": 21,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 257588291
+    },
+    "2026-09-04": {
+      "live_files": 22,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 768498972
+    },
+    "2026-09-05": {
+      "live_files": 19,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 810832101
+    },
+    "2026-09-06": {
+      "live_files": 33,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 3461676219
+    },
+    "2026-09-07": {
+      "live_files": 31,
+      "physical_hash_candidates": 0,
+      "missing_compressed_bytes": 867764557
+    },
+    "2026-09-08": {
+      "live_files": 73,
+      "physical_hash_candidates": 21,
+      "missing_compressed_bytes": 514467811
+    },
+    "2026-09-09": {
+      "live_files": 78,
+      "physical_hash_candidates": 1,
+      "missing_compressed_bytes": 604709145
+    }
+  },
+  "limitations": "Delta and manifest read independently. Project URI selection cross-checked against add actions. Exact one-file URI/schema/ordinal/element metadata checked; index contents not decoded. Compressed file bytes are not projected I/O or build cost."
+}
