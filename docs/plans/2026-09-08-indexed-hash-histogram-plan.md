@@ -1114,3 +1114,14 @@ and verify actual routing and latency under ongoing DML. Optimized workload
 benchmarks, ingestion contention, and the requested subsequent CPU/memory
 profiles across columns and time ranges remain open.
 Next progress audit is due by 11:18:29 UTC.
+
+Combined local signoff completed successfully on 2026-09-09. Command:
+`CARGO_TARGET_DIR=/tmp/timefusion-isolated-target make ci-signoff` in
+/tmp/timefusion-hash-flush. Formatting, Clippy, 1,507 tests in 150.385s,
+ten doctests, PostgreSQL smoke, and 63 E2E tests in 231.137s passed.
+Test run: 3176000b-3a28-4a8c-af8c-1bab4d2758d5. E2E run:
+de88eb4f-233d-4518-bf34-765528b3de56. The final E2E run reports three
+slow tests, no retries, and no leak classification. All five passing
+attestations are published. The final gate requires no checks from GitHub.
+This documentation update changes no check input. Push, merge, deployment,
+and production acceptance follow; no production improvement is claimed yet.
