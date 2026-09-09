@@ -95,3 +95,19 @@ both helper suites. Image smoke passed and published digest
 `sha256:5f00b4db1acefb426fc8522b540fa4b75a8961805b3fee91087e98915d4d1c2d`.
 No required check remains for GitHub. The next rollout will exercise the local
 command directly; production hash latency acceptance remains open.
+
+## Local observer race
+
+The local command on 95bdacb1 successfully flushed, drained HANDOFF, and
+submitted digest 5f00b4db. The replacement ran, but verification failed because
+the concurrent probe reported no first-new-boot observation. The foreground
+readiness query completed first and stopped the slower observer. Recorded
+unready time was 2,208 ms and WAL recovery was zero. The lease was retained;
+no successful deployment receipt was published for this failed verification.
+
+The rollout now waits for the background probe to observe the new boot before
+stopping it. Readiness and recovery budgets are unchanged. Bash syntax and
+updated local signoff passed; matching Rust checks and the tested production
+image were reused. A separate recovery soak and a new local rollout will
+verify the live state and correction. Do not reinterpret the failed observer
+as a passing rollout.

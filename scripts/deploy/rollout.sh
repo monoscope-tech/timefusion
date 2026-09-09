@@ -15,6 +15,7 @@ probe_dir="$(mktemp -d)"
 probe_stop="$probe_dir/stop"
 probe_result="$probe_dir/max_unready_ms"
 handoff_result="$probe_dir/query_handoff_ms"
+handoff_observed="$probe_dir/handoff-observed"
 (
   unready_started_ms=0
   max_unready_ms=0
@@ -36,6 +37,7 @@ handoff_result="$probe_dir/query_handoff_ms"
         last_old_response_ms="$(date +%s%3N)"
       elif (( query_handoff_ms == 0 )); then
         query_handoff_ms=$(( $(date +%s%3N) - last_old_response_ms ))
+        touch "$handoff_observed"
       fi
     elif (( unready_started_ms == 0 )); then
       unready_started_ms="$attempt_started_ms"
@@ -79,7 +81,9 @@ replacement_deadline=$((SECONDS + 720))
 while (( deploy_status == 0 && SECONDS < replacement_deadline )); do
   boot_micros="$(timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" 2>/dev/null || true)"
   recovery_complete="$(timeout 3 psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_complete'" 2>/dev/null || true)"
-  if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ]; then
+  # The foreground readiness query can win the race against the background
+  # probe. Do not stop that probe before it observes the replacement itself.
+  if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ] && [ -e "$handoff_observed" ]; then
     break
   fi
   sleep 0.5
