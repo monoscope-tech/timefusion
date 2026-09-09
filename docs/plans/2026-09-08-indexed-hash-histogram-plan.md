@@ -1001,3 +1001,91 @@ The combined-tree make ci-signoff completed successfully: formatting,
 Clippy, 1,506 tests, ten doctests, PostgreSQL smoke, and all 63 e2e tests.
 All five checks are locally attested; none remains for GitHub. E2e nextest
 5128033f-d790-43ec-b0c7-a96f0c311d46. The committed tree is ready to push.
+
+### Matcher deployment and fresh-ingest follow-up — 2026-09-09 09:39 UTC
+
+PR #237 merged at 03cc1ae68cd88aa3efca4984e7679453760cdd5b after all
+five local checks passed. Deployment run 34335914742 is pending behind
+the active Build and Deploy run 34333464243 for 04d70eaf. The previously
+watched Push on master run 34333837490 was CodeQL, not deployment; its
+status cannot prove deployment progress. Production was last observed at e44e08c.
+
+In the isolated fresh-ingest checkout, both new regressions failed before
+implementation and passed afterward (2.308s, nextest
+3f5f2726-8486-48b8-87d3-1ec1395602e8). Server flushes now use a shared
+post-commit callback that builds physical Parquet indexes. Queue shutdown
+waits for its tracked worker; that separate fix is committed locally as
+a17593ec. Neither follow-up is pushed or deployed.
+
+The broader Tantivy/search/bloom test selection passed 35 tests in 10.675s
+(nextest 1425be4c-ba39-4a18-b950-278f24f04668), with one leaky-process
+classification. A rerun with per-test output and an added multi-file callback
+case is running. Full signoff for this follow-up remains required.
+
+### Goal audit — 2026-09-09 09:49 UTC
+
+The preceding goal turn made concrete progress: fresh physical indexing
+and worker shutdown passed their regressions, broader tests, and multi-file
+coverage; the matcher fixes merged to master at 03cc1ae. Deployment
+34335914742 remains pending behind the confirmed live image build
+34333464243. Production acceptance is still incomplete.
+
+Fresh-ingest signoff caught a missed callback rename in the buffered-write
+benchmark. The benchmark now uses the production physical-file factory
+and paired reader. Clippy failed, so no later checks were attested; a full
+rerun is starting. The private cache isolates these builds from root work.
+
+Saved EXPLAIN plans for September 6 and 8 show scans of hashes and version
+keys, deduplication, then membership filtering. Printed file groups are
+truncated, so their visible file names are not a full file count. A new
+absent-hash regression is compiling at root: complete indexes must return
+zero without decoding visibility rows; missing coverage must decline.
+
+The overall goal remains open: deploy and test both follow-ups, resolve
+slow historical days and incomplete coverage, obtain optimized timings,
+then profile popular columns and time ranges. Next audit: 10:19 UTC.
+
+EXPLAIN qualification: the histogram matcher accepts aggregate/projection/
+sort/limit roots, not an Explain wrapper. The saved plans describe ordinary
+execution and are not proof of the route entered by a cancelled query.
+Zero completion counters show no completed histogram, not necessarily no
+attempt. Keep this distinction when diagnosing the slow production days.
+
+Production 04d70ea was confirmed before and after the 10:00 probe. The
+narrow query returned count 1 in 432.81ms; September 6 still timed out in
+3024.53ms. Snapshot and uniqueness completion counters were zero. Evidence:
+production-upstream-04d70ea-validation.json. Matcher deployment 34335914742
+is now actively building; the preceding 04d70ea deployment succeeded.
+
+2026-09-09 10:17 UTC production check: image 03cc1ae is running and the
+deployment readiness soak is active. Saved narrow count(timestamp)/count(*)
+queries both return count 1 in 365.61/278.50ms. September 6 and the seven-day
+range still time out at three seconds in both formulations. Histogram
+completion and uniqueness counters remain zero before and after the probe.
+This does not identify the route of canceled queries. Evidence:
+`evidence/2026-09-08-hashes/production-03cc1ae-validation.json`.
+
+The empty-index SQL optimization now avoids scheduling daily uniqueness
+maintenance for certified-empty partitions. Its regression failed before
+that scheduling change and passes afterward. All five histogram unit tests
+pass in 12.782s (nextest 73fa6cb5-2aff-4118-9625-8f9aa7fdab30).
+Fresh physical flush indexing remains local: its signoff exposed a macOS
+LLVM 15 unwind crash, reproduced with backtraces and resolved in the targeted
+Apple-linked binary. Default-linker full signoff is rebuilding. Neither
+pending change is claimed deployed. Wide-range acceptance, optimized SQL
+benchmarking, ingestion contention, and subsequent CPU/memory profiling of
+popular queries across other columns and time ranges remain open.
+
+Progress audit 2026-09-09 10:19:08 UTC: the active goal remains fast hash
+queries through Tantivy, deployed and verified, followed by ongoing CPU and
+memory profiling across popular columns and time ranges. This interval made
+concrete progress: reproduced and fixed redundant empty-query proof seeding,
+passed targeted SQL/visibility tests, diagnosed the local E2E unwind failure,
+and verified production image 03cc1ae. Deployment 34335914742 now completed
+successfully. Wider production queries still fail the three-second target;
+no completion is claimed. Continue fresh-ingest signoff session 72595
+(`/tmp/timefusion-fresh-index-apple-signoff.log`), integrate local commit
+65f6bd7a after the fresh branch is ready, sign off the combined source,
+push/deploy, and verify index use and latency. Broader optimized benchmarks,
+ingestion contention, and post-acceptance profiling remain required.
+Next progress audit is due by 10:49:08 UTC.

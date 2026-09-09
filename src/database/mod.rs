@@ -59,7 +59,7 @@ mod histogram;
 /// another is never found.
 pub(crate) use compact::DEFAULT_BIN_MINUTES;
 pub use histogram::CapturedHistogram;
-pub(crate) use histogram::HistogramDmlGuard;
+pub(crate) use histogram::{HistogramDmlGuard, HistogramDmlScope};
 mod maintain;
 mod write;
 

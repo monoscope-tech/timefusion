@@ -182,10 +182,19 @@ impl HistogramWindow {
         for segment in searcher.segment_readers() {
             segment.fast_fields().u64(ROW_ORDINAL_FIELD)?;
         }
-        let time = RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(self.start), Bound::Excluded(self.end));
-        let query = BooleanQuery::new(vec![(Occur::Must, predicate), (Occur::Must, Box::new(time))]);
         let collector = FilterCollector::new(ROW_ORDINAL_FIELD.into(), visible, HistogramCollector(*self));
-        Ok(searcher.search(&query, &collector)?)
+        Ok(searcher.search(&self.query(predicate), &collector)?)
+    }
+
+    /// Tests physical candidates, including superseded versions and tombstones.
+    /// Only a false result can establish absence without resolving visibility.
+    pub(crate) fn has_physical_matches(&self, searcher: &Searcher, predicate: Box<dyn Query>) -> Result<bool> {
+        Ok(searcher.search(&self.query(predicate), &tantivy::collector::Count)? != 0)
+    }
+
+    fn query(&self, predicate: Box<dyn Query>) -> BooleanQuery {
+        let time = RangeQuery::new_i64_bounds(TS_FIELD.into(), Bound::Included(self.start), Bound::Excluded(self.end));
+        BooleanQuery::new(vec![(Occur::Must, predicate), (Occur::Must, Box::new(time))])
     }
 }
 

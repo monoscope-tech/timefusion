@@ -741,7 +741,11 @@ impl ExecutionPlan for DmlExec {
 
         let future = async move {
             let DmlExec { op_type, table_name, project_id, predicate, assignments, source, database, buffered_layer, session, .. } = this;
-            let _histogram_dml = database.histogram_dml_guard(&project_id, &table_name);
+            let _histogram_dml = database.histogram_dml_guard(
+                &project_id,
+                &table_name,
+                histogram_dml_scope(predicate.as_ref(), &assignments, source.as_ref().map(|source| source.schema.as_ref())),
+            );
             // A merge-on-read table re-appends every affected row through
             // `insert_records_batch`, which already invalidates each date those
             // rows land in — and the append carries each row's ORIGINAL
@@ -1887,6 +1891,32 @@ pub(crate) fn table_time_column(table_name: &str) -> &'static str {
     crate::schema::get_schema(table_name).map_or("timestamp", |s| s.time_column_name())
 }
 
+/// Only proven target timestamp bounds can narrow a histogram capture fence.
+pub(crate) fn histogram_dml_scope(
+    predicate: Option<&Expr>, assignments: &[(String, Expr)], source_schema: Option<&Schema>,
+) -> crate::database::HistogramDmlScope {
+    use crate::database::HistogramDmlScope;
+    let bounds = || -> Option<std::ops::RangeInclusive<i64>> {
+        if assignments.iter().any(|(column, _)| column == "timestamp")
+            || source_schema.is_some_and(|schema| schema.fields().iter().any(|field| field.name() == "timestamp"))
+        {
+            return None;
+        }
+        let predicate = DecomposedPredicate::decompose(predicate, "timestamp");
+        let exact_micros = |bound: &TimeBound| {
+            if matches!(bound.value, ScalarValue::TimestampNanosecond(Some(ns), _) if ns.rem_euclid(1_000) != 0) {
+                return None;
+            }
+            scalar_micros(&bound.value)
+        };
+        let (lower, upper) = (predicate.lower.as_ref()?, predicate.upper.as_ref()?);
+        let lo = exact_micros(lower)?.checked_add(i64::from(!lower.inclusive))?;
+        let hi = exact_micros(upper)?.checked_sub(i64::from(!upper.inclusive))?;
+        (lo <= hi).then_some(lo..=hi)
+    };
+    bounds().map_or(HistogramDmlScope::All, HistogramDmlScope::Timestamps)
+}
+
 /// One extracted `time_col CMP literal` conjunct.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TimeBound {
@@ -2316,7 +2346,8 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
         };
         // Recovery bypasses SQL DML and can replay several projects and slices.
         // Keep their capture fences until the entire replay finishes or fails.
-        let _histogram_guards: Vec<_> = meta.projects.iter().map(|project| db.histogram_dml_guard(project, &meta.table_name)).collect();
+        let _histogram_guards: Vec<_> =
+            meta.projects.iter().map(|project| db.histogram_dml_guard(project, &meta.table_name, crate::database::HistogramDmlScope::All)).collect();
         // Sequential awaits with `?`: the first failed slice leaves the group parked.
         let outcome = async {
             for (si, &(lo, hi, hi_incl)) in slice_bounds.iter().enumerate() {
@@ -2456,6 +2487,16 @@ struct PendingGroup {
     /// provably buffer-only only when it is unflushed for EVERY member).
     /// `None` for ordinary single-project statement groups.
     folded_projects: Option<Vec<String>>,
+}
+
+impl PendingGroup {
+    fn fence_histogram(&mut self, db: &Database, key: &GroupKey, predicate: Option<&Expr>) {
+        // Folding and widening can touch gaps outside original statement ranges.
+        // Retain the effective merge scope through every retry as well.
+        let scope = histogram_dml_scope(predicate, &self.assignments, Some(self.schema.as_ref()));
+        let projects = self.folded_projects.as_deref().unwrap_or_else(|| std::slice::from_ref(&key.project_id));
+        self.histogram_guards.extend(projects.iter().map(|project| db.histogram_dml_guard(project, &key.table_name, scope.clone())));
+    }
 }
 
 /// Hash of everything that must match exactly for two statements to share
@@ -2683,18 +2724,20 @@ impl DmlCoalescer {
         };
         let rows = source.batch.num_rows();
         let bounds = (decomposed.lower.clone(), decomposed.upper.clone());
+        let histogram_guard = database.histogram_dml_guard(project_id, table_name, histogram_dml_scope(predicate, assignments, Some(source.schema.as_ref())));
         {
             let mut groups = self.groups.lock().expect("dml coalescer mutex poisoned");
             match groups.entry(key) {
                 Entry::Occupied(mut g) => {
                     let g = g.get_mut();
                     g.predicate.widen(&decomposed);
+                    g.histogram_guards.push(histogram_guard);
                     g.batches.push((source.batch.clone(), bounds));
                     g.session = session;
                 }
                 Entry::Vacant(v) => {
                     v.insert(PendingGroup {
-                        histogram_guards: vec![Arc::new(database.histogram_dml_guard(project_id, table_name))],
+                        histogram_guards: vec![histogram_guard],
                         join_keys: source.join_keys.clone(),
                         assignments: assignments.to_vec(),
                         predicate: decomposed,
@@ -2771,6 +2814,7 @@ impl DmlCoalescer {
                 }
             };
             let predicate = group.predicate.reconstruct(group.time_col);
+            group.fence_histogram(db, &key, predicate.as_ref());
             // Chunk each round to bound per-MERGE memory (see MAX_MERGE_ROWS).
             // Sequential awaits with `?`: the first failure abandons the group.
             let outcome = async {
@@ -3207,26 +3251,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn histogram_scope_requires_exact_target_timestamp_bounds() {
+        use crate::database::HistogramDmlScope::{All, Timestamps};
+        let micros = |n| lit(ScalarValue::TimestampMicrosecond(Some(n), None));
+        for (predicate, expected) in [
+            (window(0, 60), Timestamps(0..=59)),
+            (col("timestamp").gt(micros(0)).and(col("timestamp").lt_eq(micros(60))), Timestamps(1..=60)),
+            (window(0, 60).or(window(120, 180)), All),
+            (col("timestamp").gt_eq(micros(0)), All),
+            (window(60, 0), All),
+            (window(i64::MIN, i64::MIN), All),
+            (col("timestamp").gt_eq(micros(0)).and(col("timestamp").lt(lit(ScalarValue::TimestampNanosecond(Some(1_500), None)))), All),
+        ] {
+            assert_eq!(histogram_dml_scope(Some(&predicate), &[], None), expected);
+        }
+        assert_eq!(histogram_dml_scope(None, &[], None), All);
+        assert_eq!(histogram_dml_scope(Some(&window(0, 60)), &[("timestamp".into(), micros(120))], None), All);
+        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None), false)]));
+        assert_eq!(histogram_dml_scope(Some(&window(0, 60)), &[], Some(schema.as_ref())), All, "source-side bounds cannot prove a target range");
+    }
+
     #[tokio::test]
     async fn coalesced_histogram_guards_survive_folding_splitting_and_retry() -> anyhow::Result<()> {
+        use anyhow::Context;
         let dir = tempfile::tempdir()?;
-        let db = Database::with_config(crate::support::test_helpers::minio_test_config("histogram-coalescer", &dir.path().to_string_lossy())).await?;
+        let config = crate::support::test_helpers::minio_test_config("histogram-coalescer", &dir.path().to_string_lossy());
+        let search = Arc::new(crate::tantivy::search::TantivySearchService::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            dir.path().join("indexes"),
+            Arc::new(config.tantivy.clone()),
+        ));
+        let db = Database::with_config(config).await?.with_tantivy_search(search);
         let coalescer = DmlCoalescer::new(60, true);
         let template = group_with_windows(&[(0, Some(60))]);
         let source = UpdateSource { batch: template.batches[0].0.clone(), schema: template.schema.clone(), join_keys: template.join_keys.clone() };
         for project in ["p1", "p2"] {
-            for lo in [0, 2 * B] {
+            for lo in [0, 120, 2 * B] {
                 coalescer.enqueue(&db, (project, "otel_logs_and_spans"), Some(&window(lo, lo + 60)), &template.assignments, &source, template.session.clone());
             }
         }
         let pending: Vec<_> = coalescer.groups.lock().unwrap().drain().collect();
         let guards: Vec<_> = pending.iter().flat_map(|(_, g)| g.histogram_guards.iter().map(Arc::downgrade)).collect();
-        assert_eq!(guards.len(), 2, "each project's pending work retains its capture fence");
+        assert_eq!(guards.len(), 6, "each queued statement retains its own capture fence");
         let mut folded = fold_groups(pending, &HashSet::new());
         assert_eq!(folded.len(), 1);
         let (key, group) = folded.pop().unwrap();
         let mut units = bucket_group(group);
         assert_eq!(units.len(), 2);
+        let capture_gap = |project: &str| {
+            let project = project.to_string();
+            let db = &db;
+            async move {
+                db.capture_histogram(
+                    &project,
+                    "otel_logs_and_spans",
+                    crate::tantivy::histogram::HistogramWindow::new(90, 100, 10, 0, 1)?,
+                    None,
+                    1024 * 1024,
+                    Arc::new(TaskContext::default()),
+                )
+                .await
+            }
+        };
+        for project in ["p1", "p2"] {
+            capture_gap(project).await?;
+        }
+        for unit in &mut units {
+            let predicate = unit.predicate.reconstruct(unit.time_col);
+            unit.fence_histogram(&db, &key, predicate.as_ref());
+        }
+        for project in ["p1", "p2"] {
+            let error = capture_gap(project).await.err().context("folded execution must fence gaps in the widened range for every project")?;
+            assert_eq!(error.to_string(), "histogram capture overlaps active SQL DML");
+        }
         let retry = units.pop().unwrap();
         assert!(guards.iter().all(|g| g.upgrade().is_some()));
         coalescer.requeue(key.clone(), units.pop().unwrap());
@@ -3236,6 +3334,9 @@ mod tests {
         assert!(guards.iter().all(|g| g.upgrade().is_some()), "dequeue must not release the fence before execution");
         drop(queued);
         assert!(guards.iter().all(|g| g.upgrade().is_none()), "finished work must release all capture fences");
+        for project in ["p1", "p2"] {
+            capture_gap(project).await?;
+        }
         Ok(())
     }
 

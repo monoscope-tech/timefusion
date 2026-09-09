@@ -1,0 +1,95 @@
+{
+  "at": "2026-09-09T10:16:17.274606+00:00",
+  "image_before": "ghcr.io/monoscope-tech/timefusion:03cc1ae",
+  "queries": [
+    {
+      "window": "narrow",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 365.61
+    },
+    {
+      "window": "narrow",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 278.5
+    },
+    {
+      "window": "slow_day",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3023.23
+    },
+    {
+      "window": "slow_day",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3026.88
+    },
+    {
+      "window": "week",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3100.0
+    },
+    {
+      "window": "week",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3042.52
+    }
+  ],
+  "stats_before": [
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "stats_after": [
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "image_after": "ghcr.io/monoscope-tech/timefusion:03cc1ae"
+}
