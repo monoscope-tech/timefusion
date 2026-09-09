@@ -212,13 +212,10 @@ impl CapturedHistogram {
 
     /// Counts daily partitions sequentially against the same captured read view.
     pub async fn count(&self) -> Result<HistogramSnapshotResult> {
-        let mut total = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        let mut total = HistogramSnapshotResult::default();
         for (&day, files) in &self.partitions {
             let part = self.count_partition(day, files).await?;
-            for (bucket, count) in part.counts {
-                let value = total.counts.entry(bucket).or_default();
-                *value = value.checked_add(count).context("histogram partition count overflow")?;
-            }
+            crate::tantivy::histogram::merge_counts(&mut total.counts, part.counts)?;
             total.indexed_sources += part.indexed_sources;
             total.scanned_sources += part.scanned_sources;
             total.index_errors.extend(part.index_errors);
@@ -229,13 +226,10 @@ impl CapturedHistogram {
     /// Counts with streamed visibility columns and the query memory pool.
     /// Unlike `count`, this limits each decoded batch rather than total decoded data.
     pub async fn count_streaming(&self) -> Result<HistogramSnapshotResult> {
-        let mut total = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        let mut total = HistogramSnapshotResult::default();
         for (&day, files) in &self.partitions {
             let part = self.count_streaming_partition(day, files).await?;
-            for (bucket, count) in part.counts {
-                let value = total.counts.entry(bucket).or_default();
-                *value = value.checked_add(count).context("streaming histogram count overflow")?;
-            }
+            crate::tantivy::histogram::merge_counts(&mut total.counts, part.counts)?;
             total.indexed_sources += part.indexed_sources;
             total.scanned_sources += part.scanned_sources;
             total.index_errors.extend(part.index_errors);
@@ -319,7 +313,7 @@ impl CapturedHistogram {
         let mask_bytes = masks.iter().map(|mask| mask.inner().capacity()).try_fold(0_usize, usize::checked_add).context("histogram mask size overflow")?;
         let _mask_owner = self.cache.reserve(mask_bytes, self.context.memory_pool())?;
         let entries = self.manifest.histogram_entries(&self.root, files)?;
-        let mut result = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        let mut result = HistogramSnapshotResult::default();
         for (index, file) in prepared.iter().enumerate() {
             let indexed = match &entries[index] {
                 Some(entry) => {
@@ -357,24 +351,21 @@ impl CapturedHistogram {
                         ensure!(bytes <= self.max_decoded_bytes, "histogram fallback batch exceeds decoded budget");
                         let _owner = self.cache.reserve(bytes, self.context.memory_pool())?;
                         let visible = masks[index].slice(offset, batch.num_rows());
-                        for (bucket, count) in self.window.count_rows(std::slice::from_ref(&batch), &visible, self.membership.as_ref())? {
-                            let total = counts.entry(bucket).or_default();
-                            *total = total.checked_add(count).context("streaming fallback count overflow")?;
-                        }
+                        crate::tantivy::histogram::merge_counts(
+                            &mut counts,
+                            self.window.count_rows(std::slice::from_ref(&batch), &visible, self.membership.as_ref())?,
+                        )?;
                         offset += batch.num_rows();
                     }
                     counts
                 }
             };
-            for (bucket, count) in counts {
-                let total = result.counts.entry(bucket).or_default();
-                *total = total.checked_add(count).context("streaming indexed count overflow")?;
-            }
+            crate::tantivy::histogram::merge_counts(&mut result.counts, counts)?;
         }
-        for (bucket, count) in self.window.count_rows(&self.memory.batches, masks.last().context("missing memory winner mask")?, self.membership.as_ref())? {
-            let total = result.counts.entry(bucket).or_default();
-            *total = total.checked_add(count).context("streaming memory count overflow")?;
-        }
+        crate::tantivy::histogram::merge_counts(
+            &mut result.counts,
+            self.window.count_rows(&self.memory.batches, masks.last().context("missing memory winner mask")?, self.membership.as_ref())?,
+        )?;
         if !self.memory.batches.is_empty() {
             result.scanned_sources += 1;
         }
@@ -413,7 +404,7 @@ impl CapturedHistogram {
         if physical_count != logical_count {
             return Ok(None);
         }
-        let mut result = HistogramSnapshotResult { counts: Default::default(), indexed_sources: 0, scanned_sources: 0, index_errors: Vec::new() };
+        let mut result = HistogramSnapshotResult::default();
         for (file, entry) in files.iter().zip(entries) {
             let entry = entry.context("validated histogram entry disappeared")?;
             let rows = usize::try_from(entry.entry.rows)?;
@@ -433,10 +424,7 @@ impl CapturedHistogram {
                     HistogramFile { table_root: &self.root, manifest_key: entry.key, entry: entry.entry, source_file: &file.path, visible },
                 )
                 .await?;
-            for (bucket, count) in counts {
-                let total = result.counts.entry(bucket).or_default();
-                *total = total.checked_add(count).context("histogram unique partition overflow")?;
-            }
+            crate::tantivy::histogram::merge_counts(&mut result.counts, counts)?;
             result.indexed_sources += 1;
         }
         TantivySearchService::record_histogram_snapshot(&self.search.stats);

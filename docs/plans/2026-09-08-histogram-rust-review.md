@@ -186,3 +186,34 @@ end-to-end tests passed. All four requested checks were attested for the final
 source, including the 32 MiB streaming regression. Final gate status requires
 only canonical `pg-smoke` on GitHub due to the documented macOS networking
 limitation. No failed check was attested.
+
+
+### Bucket accumulation follow-up — 2026-09-09
+
+rs-distill scoped pass: seven copies of checked bucket accumulation in
+`database/histogram.rs` and `tantivy/search.rs` now reuse `merge_counts` in
+`tantivy/histogram.rs`. `HistogramSnapshotResult` derives its empty default.
+This consolidates the overflow rule across indexed and captured-row paths.
+
+rs-evasion scoped pass: the helper retains `checked_add` and propagates errors
+through `try_for_each`. No saturating/wrapping substitution, new unsafe code,
+ignored tests, or lint suppression was introduced. Overflow errors now share
+one diagnostic, `histogram count overflow`; no caller was found parsing the
+previous per-path strings. Source masks, query budgets, and routing are intact.
+Targeted regression validation is running. This is not a full-feature clean
+bill of health; remaining whole-path reviews and performance measurements
+continue with production deployment.
+
+
+Second scoped pass after implementation: no further rs-distill or
+rs-evasion finding in the count-merging change. The helper owns incoming
+counts, preserves ordered bucket keys, checks every addition, and propagates
+errors. Existing source counters and captured-mask behavior are untouched.
+All 136 targeted regressions passed in 11.710s (nextest
+`2b7522fb-0d73-49d2-909b-2048c9247684`). Full local signoff follows.
+
+
+Full local `make ci-signoff` passed all checks for the cleanup: fmt, Clippy,
+1,474 tests, eight doctests, PostgreSQL smoke, and 63 e2e tests. E2E nextest
+`12ac8937-f007-4785-af19-e6d953234d67` passed in 264.468s. All checks are
+attested locally; no failed check was attested.

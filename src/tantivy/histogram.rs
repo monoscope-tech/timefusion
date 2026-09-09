@@ -16,6 +16,14 @@ use tantivy::{
 
 use super::{ROW_ORDINAL_FIELD, TS_FIELD};
 
+pub(crate) fn merge_counts(target: &mut BTreeMap<i64, u64>, counts: BTreeMap<i64, u64>) -> Result<()> {
+    counts.into_iter().try_for_each(|(bucket, count)| {
+        let total = target.entry(bucket).or_default();
+        *total = total.checked_add(count).context("histogram count overflow")?;
+        Ok(())
+    })
+}
+
 /// Exact list membership. Binary operators cannot accidentally express an empty
 /// conjunction, whose SQL semantics depend on null-array presence.
 #[derive(Debug, Clone)]
