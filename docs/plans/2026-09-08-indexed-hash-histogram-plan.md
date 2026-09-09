@@ -1075,3 +1075,17 @@ Apple-linked binary. Default-linker full signoff is rebuilding. Neither
 pending change is claimed deployed. Wide-range acceptance, optimized SQL
 benchmarking, ingestion contention, and subsequent CPU/memory profiling of
 popular queries across other columns and time ranges remain open.
+
+Progress audit 2026-09-09 10:19:08 UTC: the active goal remains fast hash
+queries through Tantivy, deployed and verified, followed by ongoing CPU and
+memory profiling across popular columns and time ranges. This interval made
+concrete progress: reproduced and fixed redundant empty-query proof seeding,
+passed targeted SQL/visibility tests, diagnosed the local E2E unwind failure,
+and verified production image 03cc1ae. Deployment 34335914742 now completed
+successfully. Wider production queries still fail the three-second target;
+no completion is claimed. Continue fresh-ingest signoff session 72595
+(`/tmp/timefusion-fresh-index-apple-signoff.log`), integrate local commit
+65f6bd7a after the fresh branch is ready, sign off the combined source,
+push/deploy, and verify index use and latency. Broader optimized benchmarks,
+ingestion contention, and post-acceptance profiling remain required.
+Next progress audit is due by 10:49:08 UTC.
