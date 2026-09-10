@@ -1994,3 +1994,36 @@ This measurement is not yet a clean rate. It spans a restart, and the first
 twenty-five minutes of any process are spent re-enumerating. A mature-process
 window is being measured to 01:45 UTC before deciding whether the
 backlog-weighted share in the follow-up is needed at all.
+
+### The mature-process rate, and why weighting still shipped — 2026-09-10 01:46 UTC
+
+The restart flattered the first reading, as expected. Over the mature window
+00:15 to 01:46 the fleet gained 81 manifest hash entries and Sep 8 gained
+seven, which is 4.6 an hour rather than the 18 an hour the post-restart burst
+suggested. Sep 9 gained 19 and Sep 10 gained 13. Sep 1 through Sep 7 is still
+zero, because newest-first is still working down Sep 9.
+
+The unified project took 39 of those 81 entries, about 48%. That is already
+far better than the one twelfth equal round-robin gave it, because its files
+ARE the newest ones and newest-first now reaches them. So the earlier
+"1/12 of every pass" framing describes the pre-#249 world and should not be
+quoted for the current one.
+
+Sep 10 is today and is excluded from backfill, so its 13 came from the flush
+path indexing new files at birth and cost the pass nothing. Backfill-eligible
+unified work is therefore Sep 9's remaining 42 files, then Sep 8's 17, then
+the 166 across Sep 1 to Sep 7. At the measured 26 entries an hour on
+backfill-eligible dates that is about thirteen hours, so the dashboard band
+would converge around midday rather than by morning.
+
+On that basis the backlog weighting merged as #251 rather than being held
+overnight. A pass places about 48 files; weighting is expected to move the
+unified share from roughly 23 of them to the high thirties, which is about
+1.6x on the band and turns thirteen hours into eight. The cost is one restart,
+whose first twenty-five minutes are re-enumeration.
+
+What this does NOT establish: the weighting's effect in production. That needs
+its own mature-process window, measured the same way, and the result should be
+compared against the 4.6 an hour recorded here. Fleet build throughput held at
+223 an hour across this window (450 builds in the 121 minutes since the
+restart), so build rate is not the constraint on the band — placement is.
