@@ -1,0 +1,43 @@
+{
+  "at": "2026-09-09T15:59:46.848750+00:00",
+  "indexed_fields": [
+    "attributes",
+    "body",
+    "context___span_id",
+    "context___trace_id",
+    "hashes",
+    "id",
+    "kind",
+    "level",
+    "name",
+    "parent_id",
+    "status_code",
+    "status_message",
+    "summary",
+    "timestamp"
+  ],
+  "samples": [
+    {
+      "selection": "smallest",
+      "rows": 129,
+      "all_column_compressed_bytes": 28458,
+      "full_index_column_compressed_bytes": 16324,
+      "selected_fraction": 0.5736172605242814
+    },
+    {
+      "selection": "median",
+      "rows": 48990,
+      "all_column_compressed_bytes": 6220419,
+      "full_index_column_compressed_bytes": 4336199,
+      "selected_fraction": 0.6970911445032882
+    },
+    {
+      "selection": "largest",
+      "rows": 1972423,
+      "all_column_compressed_bytes": 258019995,
+      "full_index_column_compressed_bytes": 183626857,
+      "selected_fraction": 0.7116768489201777
+    }
+  ],
+  "limitations": "Three previously captured production Parquet footers; byte estimate for all configured full-index columns, not measured rebuild speed. Inline schema declarations cross-checked; no data pages read."
+}

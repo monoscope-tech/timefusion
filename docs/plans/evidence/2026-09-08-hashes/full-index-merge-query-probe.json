@@ -1,0 +1,75 @@
+{
+  "at": "2026-09-09T16:42:43.290298+00:00",
+  "load_average": [
+    356.2744140625,
+    263.54296875,
+    215.001953125
+  ],
+  "source_sha256": "7cf2944a3443d165d3adea2b7ed0362fd435c4dbcde2d3f81b14d61ed4451e02",
+  "binary_sha256": "6569d3a4fc7617e87fdaaaebd86c04b877600a4683c34dfdf4a42bd157663fdb",
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "/tmp/timefusion-merge-query-probe"
+  ],
+  "limitations": "Diagnostic run during concurrent image and candidate builds; synthetic hash-only source columns with normal full schema. Supports ordinal/count correctness and segment counts, not production latency or full text rebuild speed.",
+  "exit_code": 0,
+  "finished_at": "2026-09-09T16:43:26.949793+00:00",
+  "builds": [
+    {
+      "trial": 0,
+      "mode": "Now",
+      "rows": 300000,
+      "segments": 1,
+      "elapsed_ms": 7155.034
+    },
+    {
+      "trial": 0,
+      "mode": "Deferred",
+      "rows": 300000,
+      "segments": 16,
+      "elapsed_ms": 2476.145
+    },
+    {
+      "trial": 1,
+      "mode": "Deferred",
+      "rows": 300000,
+      "segments": 16,
+      "elapsed_ms": 2206.219
+    },
+    {
+      "trial": 1,
+      "mode": "Now",
+      "rows": 300000,
+      "segments": 1,
+      "elapsed_ms": 7836.517
+    }
+  ],
+  "exact_histogram_checks": 64,
+  "warm_query_groups": [
+    {
+      "mode": "Now",
+      "term": "rare",
+      "median_ms": 1.3325,
+      "samples": 14
+    },
+    {
+      "mode": "Now",
+      "term": "common",
+      "median_ms": 30.232,
+      "samples": 14
+    },
+    {
+      "mode": "Deferred",
+      "term": "rare",
+      "median_ms": 1.3119999999999998,
+      "samples": 14
+    },
+    {
+      "mode": "Deferred",
+      "term": "common",
+      "median_ms": 9.1735,
+      "samples": 14
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-09T16:03:57.495691+00:00",
+  "variant": "baseline_full_builder",
+  "builder_sha256": "0e58ea4c63b3d5804be79eef5fc1db3de81195f6c7ab8ec9e221a4fddd9960d4",
+  "benchmark_sha256": "06abab76a8ca94e1e4776212034ced9469908adc577a5a42e8e5b475b5f711c0",
+  "command": "CARGO_TARGET_DIR=target cargo rustc --release --bench tantivy_benchmarks -- -C strip=none",
+  "status": "built",
+  "exit_code": 0,
+  "elapsed": "15m 10s",
+  "binary": "/Users/tonyalaribe/Projects/apitoolkit/timefusion/target/release/deps/tantivy_benchmarks-c4db4803e4747a81",
+  "binary_sha256": "ff4675e5f209fe8e63e1ab9f1ea04c695fcc239d8c6873cd79e2e91afaca6259",
+  "finished_at": "2026-09-09T16:19:05.242527+00:00"
+}
