@@ -2027,3 +2027,50 @@ its own mature-process window, measured the same way, and the result should be
 compared against the 4.6 an hour recorded here. Fleet build throughput held at
 223 an hour across this window (450 builds in the 121 minutes since the
 restart), so build rate is not the constraint on the band — placement is.
+
+### A docs merge silently cancels a code deploy — 2026-09-10 02:20 UTC
+
+Worth knowing before it costs someone else an hour. #251 merged at 01:49 and
+its Build and Deploy run reported SUCCESS, yet production kept running the
+previous image. The run log says why: "A newer master commit superseded this
+rollout; production is unchanged."
+
+The newer commit was #254, a documentation-only merge landed about a minute
+later. scripts/deploy/run.py compares the checked-out commit against
+refs/heads/master and declines to deploy when they differ, which is correct
+for a real code push that supersedes an older one. It does not distinguish a
+commit that CANNOT change the image. Documentation and bench paths are in
+deploy.yml's paths-ignore precisely because they cannot, so they never start a
+rollout of their own — and they cancel the one already in flight.
+
+The failure is silent in both directions: the deploy job is green and the docs
+push produces no run at all. Nothing reports that a merged code change is not
+running. It was caught only because the live digest was checked directly.
+
+The workflow has no workflow_dispatch trigger, so the only way to deploy the
+stranded commit is another non-docs push. Here that was #252, which was
+independently verified and wanted anyway, so #251 and #252 deployed together
+at 02:42 as sha256:792094edfa73e283792157f4c63e7c1dfdac7cd942a8f9897d1c7e.
+The cost is attribution: the weighting and the builder change now share one
+measurement window.
+
+Practical rule until run.py distinguishes the two cases: after merging a code
+change, hold every documentation merge until the live digest has actually
+moved. Verify the digest rather than trusting a green deploy job.
+
+### Where newest-first spends the budget — 01:46 to 02:38 UTC
+
+The window isolates the ordering cleanly. Sep 8 gained NOTHING while Sep 9
+gained twenty, and Sep 1 through Sep 7 stayed at zero. Newest-first drains
+strictly by date, so Sep 9's seventy-six files come before Sep 8's remainder,
+which comes before the band. Fleet entries rose 596 to 638.
+
+Sep 10 fell from seventeen covered to seven as its live file count went from
+fifty-two to sixteen, which is today's partition being consolidated by
+compaction rather than coverage being lost to a defect.
+
+Projecting the band from this window alone: about twenty entries an hour on
+backfill-eligible dates, Sep 9's remaining twenty-two and Sep 8's seventeen
+first, then the band's one hundred sixty-six, which lands near 12:45 UTC.
+That projection is what the weighting is meant to improve on, and it is the
+number the next window should be compared against.
