@@ -191,6 +191,7 @@ ci-signoff:
 	exit $$result
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-production-image.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_lease.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/deploy/test_run.py
 	python3 scripts/production-image.py signoff
 
 # What CI would run right now, without running any of it.
