@@ -449,7 +449,9 @@ The scripts used `psycopg`, `pyroaring`, and Python binding `tantivy==0.22.2`, w
 TimeFusion pins the 0.22 release family, but these are library-level experiments rather than a build of TimeFusion itself.
 Python 3.13 could not build that older binding. Python 3.11 installed and ran it successfully.
 
-[The evidence directory](evidence/2026-09-08-hashes/) contains all timing samples, PostgreSQL plans, sizes, bucket checks, production queries, and correctness counterexamples.
+The evidence files named throughout this plan hold all timing samples, PostgreSQL plans, sizes, bucket checks, production queries, and correctness counterexamples.
+They are test artifacts and are no longer kept in the working tree.
+Each one stays retrievable from the commit that recorded it, so read a filename here as provenance and fetch it with `git log --all --diff-filter=A -- '*<filename>'` followed by `git show <commit>:<path>`.
 The scripts do not preserve raw production event payloads.
 The production-known-ID evidence stores only the selected event identity and aggregate results.
 
