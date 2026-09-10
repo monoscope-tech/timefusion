@@ -1,0 +1,1533 @@
+{
+  "at": "2026-09-09T12:54:09.116011+00:00",
+  "image_before": "ghcr.io/monoscope-tech/timefusion:a31c7b5",
+  "tasks_before": [
+    {
+      "CurrentState": "Running 2 minutes ago",
+      "DesiredState": "Running",
+      "Error": "",
+      "ID": "lpeid8zwffglvatr39u290u83",
+      "Image": "ghcr.io/monoscope-tech/timefusion:a31c7b5",
+      "Name": "srv-captain--timefusion.1",
+      "Node": "server1",
+      "Ports": ""
+    }
+  ],
+  "queries": [
+    {
+      "repeat": 0,
+      "window": "narrow",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 378.46,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "narrow",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 342.24,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "narrow",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 305.04,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "narrow",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 385.04,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "positive_day",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 780.56,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "positive_day",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 834.22,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "positive_day",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 896.14,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "positive_day",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 834.36,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "slow_day",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3025.89,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "slow_day",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3022.62,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "slow_day",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3026.29,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "slow_day",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3024.95,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "week",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3023.28,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "week",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3169.64,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "week",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3024.95,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 0,
+      "window": "week",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3099.69,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "narrow",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 355.17,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "narrow",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 319.79,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "narrow",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 344.01,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "narrow",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 08:04:30+00' AND timestamp < TIMESTAMPTZ '2026-09-02 08:04:31+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 313.98,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "positive_day",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 782.31,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "positive_day",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [
+        [
+          "2026-09-02 08:00:00+00:00",
+          1
+        ]
+      ],
+      "elapsed_ms": 627.89,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "positive_day",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 742.48,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "positive_day",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-03 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "rows": [],
+      "elapsed_ms": 687.31,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "slow_day",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3091.63,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "slow_day",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3026.47,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "slow_day",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3053.28,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "slow_day",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-06 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-07 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3042.77,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "week",
+      "tag_kind": "saved",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3317.61,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "week",
+      "tag_kind": "saved",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['err:e03848c6'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3028.71,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "week",
+      "tag_kind": "absent",
+      "aggregate": "count(*)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(*) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3298.5,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    },
+    {
+      "repeat": 1,
+      "window": "week",
+      "tag_kind": "absent",
+      "aggregate": "count(timestamp)",
+      "sql": "SELECT time_bucket('1 hour',timestamp), count(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' AND timestamp >= TIMESTAMPTZ '2026-09-02 00:00:00+00' AND timestamp < TIMESTAMPTZ '2026-09-09 00:00:00+00' AND hashes @> ARRAY['probe:971c52643be04858a43c969caaee5a72'] GROUP BY 1 ORDER BY 1",
+      "stats_before": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ],
+      "error": {
+        "type": "QueryCanceled",
+        "sqlstate": "57014"
+      },
+      "elapsed_ms": 3022.8,
+      "stats_after": [
+        [
+          "tantivy",
+          "histogram_snapshots",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_delta_cache_hits",
+          "0"
+        ],
+        [
+          "tantivy",
+          "histogram_unique_partitions",
+          "0"
+        ]
+      ]
+    }
+  ],
+  "completed_pairs": 8,
+  "mismatch": false,
+  "stats_before": [
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_delta_cache_hits",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "stats_after": [
+    [
+      "tantivy",
+      "histogram_snapshots",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_delta_cache_hits",
+      "0"
+    ],
+    [
+      "tantivy",
+      "histogram_unique_partitions",
+      "0"
+    ]
+  ],
+  "image_after": "ghcr.io/monoscope-tech/timefusion:a31c7b5",
+  "tasks_after": [
+    {
+      "CurrentState": "Running 3 minutes ago",
+      "DesiredState": "Running",
+      "Error": "",
+      "ID": "lpeid8zwffglvatr39u290u83",
+      "Image": "ghcr.io/monoscope-tech/timefusion:a31c7b5",
+      "Name": "srv-captain--timefusion.1",
+      "Node": "server1",
+      "Ports": ""
+    }
+  ],
+  "same_image": true,
+  "probe_passed": false
+}
