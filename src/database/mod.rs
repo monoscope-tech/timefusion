@@ -892,6 +892,17 @@ struct RollupCoverage {
     /// answer only ever DECLINES the skip, so an absent proof costs one rebuild
     /// rather than freezing a stale cell.
     content_fp: Option<u64>,
+    /// How many files this cell published, so the no-op skip can confirm the
+    /// OUTPUT still stands and not only that the INPUT has not moved.
+    ///
+    /// Coverage is in-memory and can outlive the files it describes: a vacuum, a
+    /// rewrite that strips tags, or a wider sibling publish all leave the entry
+    /// intact over a tier that no longer holds the cell. An input-only proof
+    /// would then skip forever over damage — which is what
+    /// `rollup_routing_rejects_legacy_materialization_generations` caught.
+    /// `0` is an empty publication, which has no files to confirm and therefore
+    /// never skips; it is also the cheapest possible rebuild.
+    output_files: u32,
 }
 
 #[derive(Debug)]
@@ -14044,7 +14055,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn republishing_a_base_slice_reopens_the_derived_cell_from_the_publish_site() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskState};
-        let db = Database::with_config(create_test_config("reopen-derived-wiring")).await?;
+        // The vehicle is a deliberate NO-OP republish over an unmoved source,
+        // which is exactly what the no-op skip now declines — with it on, the
+        // second base run never reaches the publish site and this test would pin
+        // nothing. Turned off here so the wiring stays under test; the skip's own
+        // behaviour is covered by `rollup_noop_skip_tests`.
+        let cfg = {
+            let mut cfg = (*create_test_config("reopen-derived-wiring")).clone();
+            cfg.maintenance.timefusion_rollup_noop_skip_enabled = false;
+            Arc::new(cfg)
+        };
+        let db = Database::with_config(cfg).await?;
         db.cancel_maintenance();
         let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
         let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();

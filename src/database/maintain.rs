@@ -2885,28 +2885,39 @@ impl Database {
         // commit observation does not. So a real change cannot be skipped and a
         // bookkeeping re-mint cannot cost a scan.
         //
-        // Two conditions, both necessary:
+        // Three conditions, all necessary:
         //   * `content_fp` — the input file set INCLUDING deletion vectors, so a
         //     DV'd file (path-identical, row-different) is never mistaken for an
         //     unchanged one. `None` for coverage recovered from tier tags at
         //     boot, which cannot carry it, and `None` declines the skip.
         //   * the generation is still current, so a spec or measure change
         //     rebuilds rather than freezing the old materialization.
+        //   * the OUTPUT still stands — see `tier_still_holds_slice`. An
+        //     input-only proof is one-sided: coverage is in-memory and outlives
+        //     the files it describes, so a tier damaged behind its back would be
+        //     skipped forever.
         // DERIVED units are excluded: their input is the base tier and their
         // correctness also depends on `base_covered`, which this does not check.
-        if !derived
-            && self.config.maintenance.timefusion_rollup_noop_skip_enabled
-            && let Some(coverage) = self.rollup_slice_coverage.get(&(
-                key.project_id.clone(),
-                key.source.clone(),
-                key.physical_table.clone(),
-                key.slice.start_micros,
-                key.slice.end_micros,
-            ))
-            && coverage.content_fp == Some(content_fp)
-            && Self::rollup_generation_current(&key.source, &key.physical_table, &key.project_id, &date.to_string(), coverage.value())
+        // The published cell this input would reproduce, if there is one. Read
+        // out of the map and the guard dropped BEFORE the tier check awaits — a
+        // DashMap reference held across an await is a deadlock waiting for the
+        // one caller that also writes this map.
+        let reproduces = (!derived && self.config.maintenance.timefusion_rollup_noop_skip_enabled)
+            .then(|| {
+                let coverage = self.rollup_slice_coverage.get(&(
+                    key.project_id.clone(),
+                    key.source.clone(),
+                    key.physical_table.clone(),
+                    key.slice.start_micros,
+                    key.slice.end_micros,
+                ))?;
+                let current = Self::rollup_generation_current(&key.source, &key.physical_table, &key.project_id, &date.to_string(), coverage.value());
+                (current && coverage.content_fp == Some(content_fp) && coverage.output_files > 0).then(|| (coverage.generation.clone(), coverage.output_files))
+            })
+            .flatten();
+        if let Some((generation, output_files)) = reproduces
+            && self.tier_still_holds_slice(&key, &generation, output_files).await
         {
-            drop(coverage);
             crate::observability::maintenance_stats().rollup_noop_rebuild_skipped.fetch_add(1, Relaxed);
             info!(
                 table = %key.physical_table, project_id = %key.project_id,
@@ -3375,6 +3386,7 @@ impl Database {
                     // from. Every other constructor rebuilds coverage from tags
                     // or the journal, neither of which records the input set.
                     content_fp: Some(content_fp),
+                    output_files: u32::try_from(output_files).unwrap_or(u32::MAX),
                 },
             );
             // DATE-level coverage, the second routing route. It had no producer
@@ -3415,6 +3427,7 @@ impl Database {
                         covered_through: key.slice.end_micros,
                         measures: Some(materialized.iter().cloned().collect()),
                         content_fp: None,
+                        output_files: 0,
                     },
                 );
             }
@@ -3542,6 +3555,50 @@ impl Database {
             }
         }
         Ok(true)
+    }
+
+    /// Whether the rollup tier still holds exactly the files a cell published —
+    /// the OUTPUT half of the no-op-rebuild proof.
+    ///
+    /// `rollup_slice_coverage` is in-memory and outlives the files it describes.
+    /// A vacuum, a wider sibling publish that supersedes this slice, or a
+    /// rewrite that strips tags all leave the entry standing over a tier that no
+    /// longer holds the cell — and an input-only proof would then skip forever
+    /// over exactly that damage. `rollup_routing_rejects_legacy_materialization_generations`
+    /// is that case: the tier's files are copied to new paths with their tags
+    /// removed while the SOURCE never moves, so the input fingerprint agrees and
+    /// only the tier can tell you the cell is gone.
+    ///
+    /// Counts files carrying this unit's own publish tags — same project, this
+    /// exact slice, this generation — and requires the count to match. Anything
+    /// else (fewer, more, none) declines and the unit rebuilds. Metadata only:
+    /// the tier snapshot is already resident, and a tier that will not resolve
+    /// declines rather than erroring, because a missing tier is precisely "the
+    /// output is not there".
+    ///
+    /// Can-fail proof, run red then restored: replacing this call with a
+    /// constant `true` turns
+    /// `rollup_routing_rejects_legacy_materialization_generations` red on "base
+    /// rebuilding must unblock the derived tier". That test failed first and is
+    /// why this check exists — an input-only proof shipped without it.
+    async fn tier_still_holds_slice(&self, key: &crate::maintenance_coordinator::TaskKey, generation: &str, output_files: u32) -> bool {
+        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START};
+        let Ok(target) = self.resolve_table(&key.project_id, &key.physical_table).await else { return false };
+        let table = target.read().await;
+        let Ok(snapshot) = table.snapshot() else { return false };
+        let tag = |add: &deltalake::kernel::Add, name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::clone);
+        let live = snapshot
+            .log_data()
+            .iter()
+            .map(|file| add_action(&file))
+            .filter(|add| {
+                tag(add, TAG_PROJECT).as_deref() == Some(key.project_id.as_str())
+                    && tag(add, TAG_GENERATION).as_deref() == Some(generation)
+                    && tag(add, TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()) == Some(key.slice.start_micros)
+                    && tag(add, TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()) == Some(key.slice.end_micros)
+            })
+            .count();
+        u32::try_from(live).is_ok_and(|live| live == output_files)
     }
 
     /// The `RuntimeEnv` a coordinator compaction unit stages under.
@@ -4650,6 +4707,7 @@ impl Database {
                     covered_through,
                     measures: measures.flatten(),
                     content_fp: None,
+                    output_files: 0,
                 },
             );
             recovered += 1;
@@ -4746,6 +4804,7 @@ impl Database {
                     covered_through: entry.end_micros,
                     measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
                     content_fp: None,
+                    output_files: 0,
                 };
                 if !Self::rollup_generation_current(&source, &table_name, &project_id, &date, &coverage) {
                     crate::observability::maintenance_stats().rollup_ledger_seed_rejected_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5127,6 +5186,7 @@ impl Database {
                     // evidence when available, including partial measure sets.
                     measures: measures_by_identity.get(&identity).and_then(Option::as_ref).map(|names| names.iter().cloned().collect()),
                     content_fp: None,
+                    output_files: 0,
                 };
                 if !Self::rollup_generation_current(source, &target, &key.project_id, &date, &coverage) {
                     // The tagged loop queues identities it sees. A journal-only
@@ -5226,6 +5286,7 @@ impl Database {
                             covered_through: slice_end,
                             measures: measures.map(|names| names.into_iter().collect()),
                             content_fp: None,
+                            output_files: 0,
                         },
                     );
                     recovered += 1;
@@ -10150,6 +10211,13 @@ mod rollup_noop_skip_tests {
     /// Can-fail proof, run red then restored: with
     /// `timefusion_rollup_noop_skip_enabled = false` the skip assertion goes red
     /// — which is exactly the production behaviour being fixed.
+    ///
+    /// The skip has three conjuncts and each is pinned by a DIFFERENT test, so
+    /// none of them is decoration:
+    /// - the switch, here;
+    /// - `content_fp`, by the deletion-vector test below;
+    /// - `tier_still_holds_slice`, by
+    ///   `rollup_routing_rejects_legacy_materialization_generations`.
     ///
     /// What this test does NOT prove, measured rather than assumed: weakening
     /// the skip's `content_fp` equality to `.is_some()` leaves it GREEN. Its
