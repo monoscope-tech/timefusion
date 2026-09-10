@@ -1961,3 +1961,36 @@ One clear positive: the cache release stopped being dormant. histogram_
 snapshots reached 13 and histogram_delta_cache_hits reached 3, both from 0
 at the 17:45 probe, so the native route now completes in production and the
 released cache is being consulted.
+
+### Newest-first is live and the band is moving — 2026-09-10 00:15 UTC
+
+#249 deployed at about 23:37 UTC as sha256:9343561035cab38c003483cb5c8b537e
+ece08085ef6182183d3dca106e79d18c. The ordering change is confirmed live from
+the logs rather than inferred: the outgoing task logged
+from_reserved_tail=true for the unified project at 23:24:03, and every unit on
+the incoming task logs from_reserved_tail=false, which is what an empty
+reservation produces.
+
+The first effect is larger than predicted. The unified project's Sep 8 went
+from 32 covered files at 23:19 to 49 at 00:15, so plus seventeen in
+fifty-six minutes against plus three in the sixty-seven minutes before the
+change. That is roughly six times, where three was forecast.
+
+Fleet build throughput rose further than the file count alone explains:
+211 builds in the 59 minutes after the restart, about 215 an hour, against
+about 33 an hour before tonight's changes and 48 to 52 after the knob raise.
+The extra comes from WHICH files the pass now takes. The reserved third was
+serving mid-August, whose files are the largest in the corpus, so removing it
+buys both more slots for the recent window and cheaper work per slot.
+
+Sep 8 still holds 24 uncovered files at this reading, so it remains in the
+partial regime and its chart query still pays for it: three repetitions of the
+Sep 8 one-hour window measured 9,208, 2,442 and 1,711 ms on count(*) against
+769, 815 and 871 ms on count(timestamp). The native arm improving across
+repetitions while the ordinary arm stays flat is the released visibility cache
+warming, which is the first direct latency evidence that it works.
+
+This measurement is not yet a clean rate. It spans a restart, and the first
+twenty-five minutes of any process are spent re-enumerating. A mature-process
+window is being measured to 01:45 UTC before deciding whether the
+backlog-weighted share in the follow-up is needed at all.
