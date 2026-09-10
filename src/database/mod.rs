@@ -66,7 +66,7 @@ mod write;
 /// The decode ratio every sort budget is denominated in — re-exported so
 /// `config` can DERIVE the repair budget from it rather than hand-copy a 12.
 pub(crate) use maintain::DECODED_BYTES_PER_COMPRESSED;
-pub use maintain::{note_probe_cost_into, probe_groups_for_budget};
+pub use maintain::{file_content_hash, note_probe_cost_into, probe_groups_for_budget};
 pub use write::spill_disk_builder;
 
 /// Delta tables shared by default projects and partitioned by `project_id`.
@@ -879,6 +879,19 @@ struct RollupCoverage {
     /// `TAG_MEASURES`. `None` is a legacy cell that carries no such evidence —
     /// see `RoutedRollup::measures_available` for what each answer permits.
     measures: Option<HashSet<String>>,
+    /// The input file set this cell was AGGREGATED from, deletion vectors
+    /// included — the no-op-rebuild proof in `run_coordinator_rollup_selected`.
+    ///
+    /// Deliberately NOT `source_fp`: that one hashes paths alone (and, on the
+    /// DATE map, is a different quantity entirely — the partition's logical
+    /// `(rows, min_ts, max_ts, stamp)`), so it cannot see a deletion vector
+    /// superseding an `Add` under an unchanged path.
+    ///
+    /// `None` wherever the value is not recoverable — every cell rebuilt from
+    /// tier tags at boot, and the DATE map, which has no single input set. That
+    /// answer only ever DECLINES the skip, so an absent proof costs one rebuild
+    /// rather than freezing a stale cell.
+    content_fp: Option<u64>,
 }
 
 #[derive(Debug)]

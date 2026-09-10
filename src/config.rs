@@ -2519,6 +2519,23 @@ pub struct MaintenanceConfig {
     #[serde_inline_default(true)]
     pub timefusion_repair_resume_enabled: bool,
 
+    /// Complete a rollup unit without rebuilding when its input file set —
+    /// deletion vectors included — is unchanged since the live slice coverage
+    /// was published, and that coverage's generation is still current.
+    ///
+    /// Defaults ON. Prod 2026-09-11: BaseRollup held 59% of maintenance
+    /// worker-seconds and **72.6% of its decoded bytes republished a slice
+    /// already published in the same three hours**, 99.6% of consecutive
+    /// republications emitting an identical row count. The work was never wrong;
+    /// it was never asked whether it was needed.
+    ///
+    /// A kill switch because the failure it could cause is the silent one — a
+    /// cell that should have rebuilt and did not. Off restores the unconditional
+    /// rebuild. Watch `rollup_noop_rebuild_skipped_total` against
+    /// `rollup_staged_projects_total`.
+    #[serde_inline_default(true)]
+    pub timefusion_rollup_noop_skip_enabled: bool,
+
     /// Record a file as verified-sorted when the WRITE that produced it stamped a
     /// `sorting_columns` footer, and sweep the files that predate that. False leaves
     /// `repair_verified_sorted` fed only by the footer probe — the pre-2026-08-28 behaviour.

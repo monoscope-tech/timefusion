@@ -547,6 +547,47 @@ fn stats_disjoint_from(add: &deltalake::kernel::Add, slice: crate::maintenance_c
     matches!(add_ts_bounds(add), (Some(min), Some(max)) if min >= slice.end_micros || max < slice.start_micros)
 }
 
+/// One live file's contribution to a rollup unit's CONTENT fingerprint — what it
+/// would aggregate, as opposed to what it would read.
+///
+/// `InputFootprint::fp` and the unit's `source_fp` both hash paths alone. That is
+/// right for pricing and wrong for the no-op-rebuild proof, because a deletion
+/// vector supersedes an `Add` under the SAME path: a DV'd file is
+/// path-identical and row-different, so a paths-only fingerprint would report
+/// "nothing changed" over a partition that just lost rows and freeze a rollup
+/// that still counts them.
+///
+/// `path_or_inline_dv` names the bitmap (a UUID for a file-stored DV, the
+/// encoded bitmap itself when inline), so with `offset` and `size_in_bytes` it
+/// identifies WHICH rows are masked, and `cardinality` says how many.
+///
+/// ```
+/// # use deltalake::kernel::{DeletionVectorDescriptor, StorageType};
+/// # use timefusion::database::file_content_hash;
+/// let dv = |id: &str, cardinality| DeletionVectorDescriptor {
+///     storage_type: StorageType::UuidRelativePath,
+///     path_or_inline_dv: id.to_owned(),
+///     offset: Some(1),
+///     size_in_bytes: 32,
+///     cardinality,
+/// };
+/// // The same path with no mask is the same file.
+/// assert_eq!(file_content_hash("a.parquet", None), file_content_hash("a.parquet", None));
+/// // Attaching a mask, changing WHICH rows it hides, or changing HOW MANY it
+/// // hides each make it a different file. This is the property the paths-only
+/// // fingerprint does not have.
+/// assert_ne!(file_content_hash("a.parquet", None), file_content_hash("a.parquet", Some(&dv("u1", 5))));
+/// assert_ne!(file_content_hash("a.parquet", Some(&dv("u1", 5))), file_content_hash("a.parquet", Some(&dv("u2", 5))));
+/// assert_ne!(file_content_hash("a.parquet", Some(&dv("u1", 5))), file_content_hash("a.parquet", Some(&dv("u1", 6))));
+/// ```
+pub fn file_content_hash(path: &str, deletion_vector: Option<&deltalake::kernel::DeletionVectorDescriptor>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let dv = deletion_vector.map(|dv| (&dv.path_or_inline_dv, dv.offset, dv.size_in_bytes, dv.cardinality));
+    (path, dv).hash(&mut hasher);
+    hasher.finish()
+}
+
 /// `micros` truncated to unix milliseconds, as the u64 the journal stores.
 fn unix_ms(micros: i64) -> u64 {
     u64::try_from(micros.div_euclid(1_000)).unwrap_or_default()
@@ -2561,7 +2602,7 @@ impl Database {
         } else {
             Vec::new()
         };
-        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes) = {
+        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes, content_fp) = {
             let table = from_table.read().await;
             let witness_guard = match &witness_table {
                 Some(table) => Some(table.read().await),
@@ -2597,6 +2638,7 @@ impl Database {
             let mut selected = Vec::new();
             let mut estimated = 0u64;
             let mut whole_file_bytes = 0u64;
+            let mut content_fp = 0u64;
             for file in snapshot.log_data().iter() {
                 let path = file.path().to_string();
                 if !partition_paths.contains(&path) {
@@ -2688,9 +2730,12 @@ impl Database {
                 // re-read. `coarsen_to_width` charges that once per distinct
                 // file set instead of once per child.
                 whole_file_bytes = whole_file_bytes.saturating_add(projected);
+                // XOR-folded, so file order — which a snapshot does not promise
+                // — cannot change the answer.
+                content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes)
+            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes, content_fp)
         };
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(&selected, whole_file_bytes);
         // Same reason as the dedup preflight: record it on every claim, not only
@@ -2812,6 +2857,63 @@ impl Database {
         // saving — including skipping the bisection below, which would otherwise
         // shred a unit whose answer is already written.
         if self.resume_rollup_unit(&key, source_rows.and_then(|rows| u64::try_from(rows).ok())).await? {
+            let mut journal = self.journal();
+            journal.complete(&key);
+            journal.checkpoint()?;
+            return Ok(true);
+        }
+        // A rebuild whose INPUT is unchanged reproduces its own output. Prod
+        // 2026-09-11 spent 59% of maintenance worker-seconds in BaseRollup and
+        // **72.6% of its decoded bytes republishing a slice already published in
+        // the same three hours** — 2,428 publications over 968 unique slices,
+        // with 99.6% of consecutive republication pairs emitting an IDENTICAL
+        // row count. One traced slice rebuilt every 32 minutes for 51-60s each
+        // time, `input_fp` byte-identical across all three cycles.
+        //
+        // Nothing was wrong with the work; nothing ASKED whether it was needed.
+        // A unit is re-pended by observing a COMMIT (`invalidate` upserts it
+        // back to Pending), and the commit that re-pends it is usually another
+        // maintenance operation on the same partition — so the queue re-mints
+        // work whose answer is already live. The mint that drove the traced loop
+        // is the derived unit's `skipped_generation` path above: it enqueues a
+        // fresh base rebuild and retries at `60 << 5` = 1920s = the 32 minutes.
+        //
+        // The proof is the live SLICE coverage, which is the same map the read
+        // path routes on, and it is exactly right for this test because of what
+        // clears it: `invalidate_rollup_hours` — the CONTENT-change path, taken
+        // by ingest and DML — drops the covering entries, while the reconciler's
+        // commit observation does not. So a real change cannot be skipped and a
+        // bookkeeping re-mint cannot cost a scan.
+        //
+        // Two conditions, both necessary:
+        //   * `content_fp` — the input file set INCLUDING deletion vectors, so a
+        //     DV'd file (path-identical, row-different) is never mistaken for an
+        //     unchanged one. `None` for coverage recovered from tier tags at
+        //     boot, which cannot carry it, and `None` declines the skip.
+        //   * the generation is still current, so a spec or measure change
+        //     rebuilds rather than freezing the old materialization.
+        // DERIVED units are excluded: their input is the base tier and their
+        // correctness also depends on `base_covered`, which this does not check.
+        if !derived
+            && self.config.maintenance.timefusion_rollup_noop_skip_enabled
+            && let Some(coverage) = self.rollup_slice_coverage.get(&(
+                key.project_id.clone(),
+                key.source.clone(),
+                key.physical_table.clone(),
+                key.slice.start_micros,
+                key.slice.end_micros,
+            ))
+            && coverage.content_fp == Some(content_fp)
+            && Self::rollup_generation_current(&key.source, &key.physical_table, &key.project_id, &date.to_string(), coverage.value())
+        {
+            drop(coverage);
+            crate::observability::maintenance_stats().rollup_noop_rebuild_skipped.fetch_add(1, Relaxed);
+            info!(
+                table = %key.physical_table, project_id = %key.project_id,
+                slice_start = key.slice.start_micros, slice_end = key.slice.end_micros, content_fp,
+                event = "maintenance_rollup_noop_skipped",
+                "input unchanged since the live coverage was published; completing without rebuilding"
+            );
             let mut journal = self.journal();
             journal.complete(&key);
             journal.checkpoint()?;
@@ -3269,6 +3371,10 @@ impl Database {
                     source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                     covered_through: key.slice.end_micros,
                     measures: Some(materialized.iter().cloned().collect()),
+                    // The ONLY site that knows what this cell was aggregated
+                    // from. Every other constructor rebuilds coverage from tags
+                    // or the journal, neither of which records the input set.
+                    content_fp: Some(content_fp),
                 },
             );
             // DATE-level coverage, the second routing route. It had no producer
@@ -3308,6 +3414,7 @@ impl Database {
                         source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
                         covered_through: key.slice.end_micros,
                         measures: Some(materialized.iter().cloned().collect()),
+                        content_fp: None,
                     },
                 );
             }
@@ -4542,6 +4649,7 @@ impl Database {
                     source_rows: Some(current_rows),
                     covered_through,
                     measures: measures.flatten(),
+                    content_fp: None,
                 },
             );
             recovered += 1;
@@ -4637,6 +4745,7 @@ impl Database {
                     source_rows: entry.source_rows.and_then(|rows| u64::try_from(rows).ok()),
                     covered_through: entry.end_micros,
                     measures: entry.measures.as_ref().map(|names| names.iter().cloned().collect()),
+                    content_fp: None,
                 };
                 if !Self::rollup_generation_current(&source, &table_name, &project_id, &date, &coverage) {
                     crate::observability::maintenance_stats().rollup_ledger_seed_rejected_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5017,6 +5126,7 @@ impl Database {
                     // The journal alone has no measure proof. Use matching file
                     // evidence when available, including partial measure sets.
                     measures: measures_by_identity.get(&identity).and_then(Option::as_ref).map(|names| names.iter().cloned().collect()),
+                    content_fp: None,
                 };
                 if !Self::rollup_generation_current(source, &target, &key.project_id, &date, &coverage) {
                     // The tagged loop queues identities it sees. A journal-only
@@ -5115,6 +5225,7 @@ impl Database {
                             source_rows,
                             covered_through: slice_end,
                             measures: measures.map(|names| names.into_iter().collect()),
+                            content_fp: None,
                         },
                     );
                     recovered += 1;
@@ -9959,6 +10070,176 @@ mod certify_on_completion_tests {
             batches[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0)
         };
         assert_eq!(victims, 0, "the DML's deletion must survive the dedup wave (landed={}, failed={})", result.landed.len(), result.failed.len());
+        Ok(())
+    }
+}
+
+/// The no-op-rebuild skip: a rollup unit whose input has not moved since the
+/// live coverage was published must complete without touching the tier.
+#[cfg(test)]
+mod rollup_noop_skip_tests {
+    use serial_test::serial;
+
+    use super::*;
+    use crate::{
+        maintenance_coordinator::{MAX_DECODED_BYTES, TaskState},
+        support::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span_ts},
+    };
+
+    const TIER: &str = "otel_logs_and_spans_rollup_dashboard_1m_v3";
+
+    fn skips() -> u64 {
+        crate::observability::maintenance_stats().rollup_noop_rebuild_skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `None` until the tier exists — which is itself the "nothing published"
+    /// answer, and must not be confused with a version.
+    async fn tier_version(db: &Database) -> Option<u64> {
+        let table = db.resolve_table("default", TIER).await.ok()?;
+        table.read().await.version()
+    }
+
+    /// The re-mint prod actually performs, verbatim: the derived tier's
+    /// `skipped_generation` branch calls `journal.enqueue` on the BASE key it
+    /// could not verify, which upserts an already-Complete unit back to Pending
+    /// over the SAME slice. Coverage is untouched — unlike the CONTENT-change
+    /// path (`invalidate_rollup_hours`), which drops it — so the rebuild it asks
+    /// for is the one that must be proved needless rather than paid for. Prod
+    /// repeats this every 32 minutes (`60 << 5`, the branch's backoff cap).
+    fn remint_published_base_slices(db: &Database) -> Result<()> {
+        let published: Vec<_> = {
+            let journal = db.journal();
+            journal
+                .tasks()
+                .filter(|task| task.key.operation == crate::maintenance_coordinator::Operation::BaseRollup && task.state == TaskState::Complete)
+                .map(|task| task.key.clone())
+                .collect()
+        };
+        assert!(!published.is_empty(), "no BaseRollup unit completed, so there is no published slice to re-mint");
+        let now = crate::support::now_micros();
+        let mut journal = db.journal();
+        for key in published {
+            journal.enqueue(key, now, MAX_DECODED_BYTES, unix_ms(now));
+        }
+        journal.checkpoint()
+    }
+
+    /// Insert one span on `date` and drive every rollup unit the day produces.
+    async fn build_day(db: &Database, project_id: &str, date: chrono::NaiveDate, id: &str) -> Result<usize> {
+        let ts = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        let batch = json_to_batch(vec![test_span_ts(id, "op", project_id, ts)])?;
+        db.insert_records_batch(project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        db.plan_rollup_backfill().await?;
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await
+    }
+
+    /// Prod 2026-09-11: BaseRollup held 59% of maintenance worker-seconds and
+    /// **72.6% of its decoded bytes republished a slice already published in the
+    /// same three hours**, 99.6% of consecutive republications emitting an
+    /// IDENTICAL row count. One traced slice rebuilt every 32 minutes for 51-60s
+    /// with a byte-identical `input_fp`, because a re-mint (here: the reconciler
+    /// observing any commit on the partition) puts a Complete task back to
+    /// Pending and nothing then asks whether the answer already exists.
+    ///
+    /// Both directions are asserted, because a skip that never rebuilds is the
+    /// silent failure this guards against, not a pass.
+    ///
+    /// Can-fail proof, run red then restored: with
+    /// `timefusion_rollup_noop_skip_enabled = false` the skip assertion goes red
+    /// — which is exactly the production behaviour being fixed.
+    ///
+    /// What this test does NOT prove, measured rather than assumed: weakening
+    /// the skip's `content_fp` equality to `.is_some()` leaves it GREEN. Its
+    /// rebuild case changes the source through the write path, which drops the
+    /// coverage entry outright, so the skip declines for a reason that has
+    /// nothing to do with the fingerprint. The fingerprint's own guard is
+    /// `a_deletion_vector_that_masks_rows_in_place_still_forces_a_rebuild`,
+    /// which does go red under that edit.
+    #[serial]
+    #[tokio::test]
+    async fn a_rollup_whose_input_has_not_moved_completes_without_rebuilding() -> Result<()> {
+        let mut cfg = (*TestConfigBuilder::new("rollup_noop_skip").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 7;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+
+        // A drain of zero units would make every assertion below vacuous.
+        assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about rebuilding");
+        let published_at = tier_version(&db).await.expect("the rollup tier must exist once a unit has published into it");
+
+        // The re-mint prod actually performs, verbatim: the derived tier's
+        // `skipped_generation` branch calls `journal.enqueue` on the BASE key it
+        // could not verify, which upserts an already-Complete unit back to
+        // Pending over the SAME slice. Coverage is untouched — unlike the
+        // CONTENT-change path (`invalidate_rollup_hours`), which drops it — so
+        // the rebuild it asks for is provably needless. Re-minting every
+        // published slice is the same fact at 32-minute cadence.
+        let before = skips();
+        remint_published_base_slices(&db)?;
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?;
+        assert!(skips() > before, "a re-pended unit over an unmoved input must be proved redundant, not rebuilt");
+        assert_eq!(tier_version(&db).await, Some(published_at), "the skip must not write to the tier at all");
+
+        // The other direction. A real row lands, the write path invalidates the
+        // hour and drops its coverage, so the proof is gone and the day rebuilds.
+        assert!(build_day(&db, &project_id, date, "late-arrival").await? > 0, "the changed day must still produce units");
+        assert!(tier_version(&db).await > Some(published_at), "a day whose source actually changed must be rebuilt, not skipped");
+        Ok(())
+    }
+
+    /// A deletion vector changes a partition's CONTENT without changing a single
+    /// file PATH — the resurrection trap the DV-dedup design named. The rollup's
+    /// coverage is not dropped by a dedup wave either (that wave reaches the
+    /// journal through `reconcile_maintenance_task_cursors`, not through
+    /// `invalidate_rollup_hours`), so a paths-only fingerprint would report
+    /// "nothing moved" over a partition that just lost rows and freeze a rollup
+    /// that still counts the duplicates.
+    ///
+    /// This is the case that makes `content_fp` load-bearing, and the sibling
+    /// test above cannot reach it: there the source change also clears coverage,
+    /// so the skip declines for a reason that has nothing to do with the
+    /// fingerprint.
+    ///
+    /// Can-fail proof, run red then restored: weakening the skip's
+    /// `coverage.content_fp == Some(content_fp)` conjunct to `.is_some()` turns
+    /// the final assertion red — the masked day is skipped instead of rebuilt.
+    #[serial]
+    #[tokio::test]
+    async fn a_deletion_vector_that_masks_rows_in_place_still_forces_a_rebuild() -> Result<()> {
+        let mut cfg = (*TestConfigBuilder::new("rollup_noop_dv").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 7;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let ts = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+
+        // The same id twice, in two commits, so the duplicate spans two files and
+        // dedup has a loser to mask.
+        for name in ["first", "second"] {
+            let batch = json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)])?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+        }
+        db.plan_rollup_backfill().await?;
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        assert!(db.drain_coordinator_rollups(64).await? > 0, "no rollup unit ran, so nothing here says anything about masking");
+        let before_dedup = tier_version(&db).await.expect("the rollup tier must exist once a unit has published into it");
+
+        // Mask the loser. Paths do not move; `numRecords` does not move either.
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+        remint_published_base_slices(&db)?;
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?;
+        assert!(
+            tier_version(&db).await > Some(before_dedup),
+            "a deletion vector masked a duplicate this rollup had already counted; a paths-only fingerprint would have called that unchanged"
+        );
         Ok(())
     }
 }

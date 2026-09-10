@@ -1039,6 +1039,17 @@ atomic_stats! {
         /// byte-identical. This is the direct measure of the wasted rollup rebuild
         /// tax removed (prod 2026-09-07: BaseRollup +111 in 100 min from this).
         rollup_remint_skipped as "rollup_remint_skipped_total",
+        /// Rollup units COMPLETED without rebuilding because their input file set
+        /// (deletion vectors included) was unchanged since the live slice coverage
+        /// was published. `rollup_remint_skipped` prevents a task being created;
+        /// this catches the ones created anyway — by the reconciler observing any
+        /// commit, or by the derived tier's `skipped_generation` mint — and proves
+        /// the rebuild redundant at claim time instead of paying for it.
+        ///
+        /// Read against `rollup_staged_projects_total`: the two sum to the units
+        /// claimed, so the ratio is the share of rollup work that was bookkeeping.
+        /// Prod 2026-09-11 measured that share at 72.6% of BaseRollup bytes.
+        rollup_noop_rebuild_skipped as "rollup_noop_rebuild_skipped_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.
