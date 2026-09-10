@@ -5,6 +5,14 @@ use anyhow::{Context, Result, ensure};
 use arrow::{array::Array, record_batch::RecordBatch};
 use datafusion::execution::TaskContext;
 
+/// Daily partitions probed concurrently inside one histogram query.
+///
+/// Each day separately fans its own files out `search_concurrency` wide, so
+/// this multiplies rather than replaces that bound; 8 keeps worst-case
+/// outstanding object-store GETs in the low hundreds while collapsing a 7-day
+/// chart from seven serial rounds into one.
+const HISTOGRAM_PARTITION_CONCURRENCY: usize = 8;
+
 use crate::tantivy::{
     histogram::{HistogramWindow, Membership},
     search::{HistogramFile, HistogramSnapshot, HistogramSnapshotResult, TantivySearchService},
@@ -356,15 +364,36 @@ impl CapturedHistogram {
     }
 
     async fn count_streaming_before_visibility(&self, mut before_visibility: impl FnMut(i64)) -> Result<HistogramSnapshotResult> {
+        // The index-only probes run CONCURRENTLY across days; the streaming
+        // fallback stays sequential. That split is the whole point.
+        //
+        // A probe is object-store IO — fetch the blob, open the reader, search
+        // it — and a day's own files already fan out `search_concurrency` wide.
+        // Days were awaited one after another, so a covered 7-day chart paid
+        // seven cold rounds end to end and a 30-day chart thirty. Measured on
+        // prod 2026-09-10 against a project covered for every day in the window:
+        // a single day answered in about 1 s once warm, while five days
+        // exceeded a 30 s statement timeout, and the ladder warmed itself
+        // (2 days ran faster than 1 because the wider run had already fetched
+        // the overlap). Single-day charts were never the complaint; 7- and
+        // 30-day ones were.
+        //
+        // The fallback is NOT parallelised. It decodes Parquet and reserves
+        // against the query memory pool per batch, so running days together
+        // would multiply peak decode memory on a box with OOM history. It keeps
+        // its existing order, and `before_visibility` still fires in day order.
+        let days: Vec<_> = self.partitions.iter().collect();
+        let mut probes = Vec::with_capacity(days.len());
+        for chunk in days.chunks(HISTOGRAM_PARTITION_CONCURRENCY) {
+            probes.extend(futures::future::join_all(chunk.iter().map(|(day, files)| self.count_index_only_partition(**day, files))).await);
+        }
+
         let mut total = HistogramSnapshotResult::default();
-        for (&day, files) in &self.partitions {
-            let indexed = match self.count_index_only_partition(day, files).await {
-                Ok(result) => result,
-                Err(error) => {
-                    tracing::warn!(%error, "indexed histogram declined; streaming captured visibility");
-                    None
-                }
-            };
+        for ((&day, files), probe) in self.partitions.iter().zip(probes) {
+            let indexed = probe.unwrap_or_else(|error| {
+                tracing::warn!(%error, "indexed histogram declined; streaming captured visibility");
+                None
+            });
             let part = match indexed {
                 Some(result) => result,
                 None => {
