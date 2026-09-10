@@ -2074,3 +2074,35 @@ backfill-eligible dates, Sep 9's remaining twenty-two and Sep 8's seventeen
 first, then the band's one hundred sixty-six, which lands near 12:45 UTC.
 That projection is what the weighting is meant to improve on, and it is the
 number the next window should be compared against.
+
+### The first fully covered production date, and the payoff — 2026-09-10 03:20 UTC
+
+Sep 9 reached 76 covered files of 76 live at 03:15, the first date in
+production ever to hold complete physical hash coverage. Measuring the whole
+twenty-four hour day with arms alternated:
+
+| repetition | native count(*) | ordinary count(timestamp) |
+|---|---:|---:|
+| 1 | 4,555 ms | 1,543 ms |
+| 2 | 592 ms | 1,462 ms |
+| 3 | 647 ms | 1,467 ms |
+
+Warm native answers a full day in 592 to 647 ms against 1,462 to 1,543 ms for
+the ordinary scan, so the index is about 2.3 times faster. The ordinary arm is
+flat across repetitions, which is what says the difference is the index rather
+than page cache.
+
+Set against the partial-coverage measurement at 18:35, this is the whole
+argument in two numbers: the same route is three to five times SLOWER while a
+date is half covered and 2.3 times FASTER once it is complete. Coverage is not
+a nice-to-have for this feature, it is the precondition, and the earlier
+decision not to add a routing gate holds — the fix was always to finish
+indexing.
+
+The first repetition costs 4,555 ms because the index blobs are fetched and
+unpacked on demand. That cold cost is real and unaddressed: the first viewer
+of a chart after a restart or an eviction pays it, and only the repeats are
+fast. It is the clearest remaining work item on the read path.
+
+Coverage at this reading: Sep 9 complete, Sep 8 at 63 of 73, Sep 1 through
+Sep 7 still zero, fleet entries 676.
