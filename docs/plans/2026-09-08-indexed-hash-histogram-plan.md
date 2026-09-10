@@ -2106,3 +2106,33 @@ fast. It is the clearest remaining work item on the read path.
 
 Coverage at this reading: Sep 9 complete, Sep 8 at 63 of 73, Sep 1 through
 Sep 7 still zero, fleet entries 676.
+
+### Weighting measured, and Sep 8 pays off tenfold — 2026-09-10 04:45 UTC
+
+The weighting and the builder change deployed together at 02:42 as
+sha256:792094edfa73e283792157f4c63e7c1dfdac7cd942a8f9897d1c7e. Over the mature
+window 03:38 to 04:45 the band gained 25 files, which is 22 an hour against
+the 4.6 an hour measured under newest-first alone. Sep 8 reached 73 of 73 and
+Sep 7 went from zero to 22 of 31. Fleet entries rose 690 to 747. Build
+throughput reached 286 an hour, up from 223.
+
+Attribution between the two changes is not separable, because the docs-merge
+supersede trap forced them into one deploy. Both were expected to raise the
+same number and both are still in place.
+
+Sep 8, complete and freshly indexed, answers a full twenty-four hour day in
+123 to 291 ms on count(*) against 1,449 to 2,079 ms on count(timestamp).
+That is roughly ten times faster, and better than Sep 9's 2.3x because these
+index blobs were built minutes earlier and are still in the local cache. The
+gap between the two is the cold-fetch cost, not a difference in the index.
+
+The transient penalty is visible in the same reading and behaves exactly as
+predicted. Sep 7, part-covered at 22 of 31, took 20,035 ms on count(*) against
+1,199 ms on count(timestamp). Sep 6, uncovered, took 13,048 and 11,581 ms,
+which is bytes rather than routing. So a date is slow while it transits and
+fast once it lands, and nothing about that needs a code change.
+
+Remaining band at this reading is 115 files across Sep 1 to Sep 7, about five
+hours at the measured rate. Memory is 26.8 GiB of the 120 GiB cap with no
+restarts since 02:42, so neither the raised concurrency nor the larger byte
+budget is pressuring the box.
