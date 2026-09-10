@@ -300,6 +300,40 @@ const MAINTENANCE_FLOOR_BYTES: usize = GIB;
 /// overrides it, so rollback is env-only and needs no rebuild.
 const QUERY_PARTITIONS_MAX: usize = 24;
 
+/// Concurrent sort-bearing queries the query pool must survive. Not a guess:
+/// prod's client (monoscope) holds an 8-connection pool to pgwire, so 8 is the
+/// real ceiling on in-flight reads, and a dashboard render fires enough widgets
+/// to fill it — every one of which may plan a sort.
+const CONCURRENT_SORT_QUERIES: usize = 8;
+
+/// DataFusion's own default is 2 MiB; this is the value the query session has
+/// carried since it was set explicitly, and it is what the clamp below defends.
+const DEFAULT_SORT_SPILL_RESERVATION_BYTES: usize = 64 * MIB;
+/// Floor, so a small box (or a large `target_partitions`) cannot clamp the
+/// reservation to nothing and push sorts back into dying mid-merge.
+const MIN_SORT_SPILL_RESERVATION_BYTES: usize = 8 * MIB;
+
+/// Effective `sort_spill_reservation_bytes`: the requested value, LOWERED so
+/// that `CONCURRENT_SORT_QUERIES` sorts of `partitions` partitions still fit
+/// `pool_bytes`.
+///
+/// `ExternalSorter` takes this reservation **per partition, up front**, and its
+/// merge half **cannot spill** — so it is a floor every sort pays whether or
+/// not it ends up sorting anything. Requesting more than the pool can hold does
+/// not buy a bigger merge; it lowers how many queries can run at once before an
+/// unrelated allocation fails. Measured 2026-09-10: prod ran 128 MiB x 24
+/// partitions, so ~5 concurrent sorts filled the 16 GiB query pool and a 28.8 MiB
+/// request from a one-hour `COUNT(DISTINCT …)` died with `Resources exhausted`.
+/// Every consumer in that error sat exactly at the floor (`peak == consumed`),
+/// i.e. the reservation was pure overhead, not merge data.
+///
+/// Clamped rather than honoured, on the same principle as `effective_limit`:
+/// reserving above the pool you must fit in is never valid.
+pub fn sort_spill_reservation_bytes(requested: Option<usize>, partitions: usize, pool_bytes: usize) -> usize {
+    let cap = pool_bytes / (partitions.max(1) * CONCURRENT_SORT_QUERIES);
+    requested.unwrap_or(DEFAULT_SORT_SPILL_RESERVATION_BYTES).min(cap).max(MIN_SORT_SPILL_RESERVATION_BYTES)
+}
+
 /// The number the whole tree derives from: the detected limit, LOWERED by an
 /// operator request — budgeting above the cgroup is never valid, so an
 /// over-large request is clamped rather than honoured.
@@ -360,6 +394,10 @@ impl DerivedBudget {
 
     pub fn query_pool_bytes(&self) -> usize {
         self.query_pool_bytes
+    }
+
+    pub fn cores(&self) -> usize {
+        self.cores
     }
 
     pub fn buffer_max_bytes(&self) -> usize {
@@ -3329,6 +3367,23 @@ mod tests {
         // re-tier is unsafe when the re-tiering cron is gated off.
         assert_eq!(p.timefusion_zstd_compression_level, 3);
         assert!(p.timefusion_zstd_compression_level < p.timefusion_zstd_level_warm);
+    }
+
+    /// The whole point of the clamp: whatever an operator asks for, the pool
+    /// must still hold `CONCURRENT_SORT_QUERIES` sorts of it. The prod row is
+    /// the 2026-09-10 failure — 128 MiB x 24 partitions let only ~5 queries in.
+    #[test_case::test_case(Some(128 * MIB), 24, 16 * GIB ; "prod: an over-large request is clamped")]
+    #[test_case::test_case(None, 24, 16 * GIB ; "prod: the default already fits")]
+    #[test_case::test_case(Some(usize::MAX), 48, 16 * GIB ; "an absurd request cannot escape the pool")]
+    #[test_case::test_case(None, 2, 8 * GIB ; "maintenance scan: few partitions, keeps the default")]
+    fn sort_reservation_always_fits_the_pool(requested: Option<usize>, partitions: usize, pool: usize) {
+        let got = sort_spill_reservation_bytes(requested, partitions, pool);
+        // Divided, not multiplied: an unclamped `usize::MAX` request would
+        // overflow the product and fail as a panic rather than as this claim.
+        assert!(got <= pool / (partitions * CONCURRENT_SORT_QUERIES), "{got} x {partitions} x {CONCURRENT_SORT_QUERIES} exceeds the {pool}-byte pool");
+        assert!(got >= MIN_SORT_SPILL_RESERVATION_BYTES, "clamped below the merge floor: {got}");
+        // Never RAISES a request — this is a ceiling, not a target.
+        assert!(got <= requested.unwrap_or(DEFAULT_SORT_SPILL_RESERVATION_BYTES));
     }
 
     // Prod-shaped box (120 GiB / 48 cores, 11 hot projects): K lands in the

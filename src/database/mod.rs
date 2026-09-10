@@ -5451,9 +5451,17 @@ impl Database {
         // two sequential S3 RTTs on different keys that can never be pre-warmed
         // (measured 1.6 s of metadata_load_time on a cold OVH partition).
         let _ = options.set("datafusion.execution.parquet.metadata_size_hint", &self.config.cache.timefusion_parquet_metadata_size_hint.to_string());
+        // The partition count this session will actually run at, and the pool it
+        // will borrow from — together they price the sort reservation, which is
+        // taken per partition and cannot spill. See `sort_spill_reservation_bytes`.
+        let (partitions, pool_bytes) = match (self.maintenance_scan, self.config.memory.timefusion_query_partitions) {
+            (true, _) => (MAINTENANCE_MAX_PARTITIONS, self.config.derived.maintenance_pool_bytes()),
+            (false, 0) => (self.config.derived.cores(), self.config.derived.query_pool_bytes()),
+            (false, n) => (n, self.config.derived.query_pool_bytes()),
+        };
         let _ = options.set(
             "datafusion.execution.sort_spill_reservation_bytes",
-            &self.config.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864).to_string(),
+            &crate::config::sort_spill_reservation_bytes(self.config.memory.timefusion_sort_spill_reservation_bytes, partitions, pool_bytes).to_string(),
         );
         // Cap query parallelism at the container's CPU quota (derived in
         // config::apply; 0 = leave DataFusion's default). See MemoryConfig.
