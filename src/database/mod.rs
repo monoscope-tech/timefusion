@@ -3220,13 +3220,35 @@ fn slice_share_of_file(file_min: Option<i64>, file_max: Option<i64>, slice: crat
 
 fn fair_tantivy_backfill_work(mut queues: Vec<(String, VecDeque<(String, String)>)>) -> Vec<TantivyBackfillWork> {
     // HashMap iteration is deliberately unstable. Pin project order so repair
-    // is reproducible, then take one newest file from every project per round —
-    // a stable sort by per-queue position keeps project order within a round.
+    // is reproducible, then order by VIRTUAL TIME — a stable sort keeps project
+    // order within a tie.
+    //
+    // A project's Nth file gets virtual time `N * total / its_backlog`, which is
+    // weighted fair queueing. Two properties follow, and both are load-bearing:
+    //
+    //  - Every project's NEWEST file has virtual time 0, so no project can be
+    //    starved out of a pass however small it is. That is the guarantee equal
+    //    round-robin used to provide, and the tests below still assert it.
+    //  - Past that first file, slots land where the uncovered backlog is,
+    //    instead of splitting evenly across projects that differ by two orders
+    //    of magnitude. Equal shares gave the unified table — which holds most of
+    //    the corpus and nearly all of the query traffic — the same slice as a
+    //    project with seventeen files, and prod 2026-09-09 measured the result:
+    //    the fleet gained 98 index entries in three and a half hours while the
+    //    unified project's dashboard window gained five.
+    //
+    // The trade is deliberate: a small project keeps its newest file every pass
+    // but drains its HISTORY more slowly while a large backlog is being worked
+    // off. Equal-length queues reduce exactly to the old round-robin.
     queues.sort_by(|a, b| a.0.cmp(&b.0));
+    let total = queues.iter().map(|(_, queue)| queue.len() as u64).sum::<u64>();
     queues
         .into_iter()
-        .flat_map(|(project, queue)| queue.into_iter().enumerate().map(move |(round, (rel, uri))| (round, (project.clone(), rel, uri))))
-        .sorted_by_key(|(round, _)| *round)
+        .flat_map(|(project, queue)| {
+            let backlog = (queue.len() as u64).max(1);
+            queue.into_iter().enumerate().map(move |(position, (rel, uri))| (position as u64 * total / backlog, (project.clone(), rel, uri)))
+        })
+        .sorted_by_key(|(virtual_time, _)| *virtual_time)
         .map(|(_, work)| work)
         .collect()
 }
@@ -15501,9 +15523,40 @@ mod tests {
         let scheduled: Vec<_> = work.iter().map(|(project, _, uri)| (project.as_str(), uri.as_str())).collect();
 
         assert_eq!(deferred, 2, "the cap must report what it left behind, not swallow it");
-        // Round 0 is both projects' newest; round 1 begins before anything older.
-        assert_eq!(scheduled, vec![("small", "uri/small-new"), ("whale", "uri/whale-new"), ("small", "uri/small-old")]);
+        // Virtual time 0 is every project's newest; the third slot goes to the
+        // larger backlog (whale 3 files against small's 2), which is the
+        // weighting. Under equal round-robin this was `small-old`.
+        assert_eq!(scheduled, vec![("small", "uri/small-new"), ("whale", "uri/whale-new"), ("whale", "uri/whale-mid")]);
         assert!(scheduled.iter().any(|(p, _)| *p == "small"), "the smaller project keeps its slot under a cap");
+        assert!(
+            !scheduled.iter().all(|(p, _)| *p == "whale"),
+            "weighting must never take a project's whole slice — every project's newest file is virtual time 0"
+        );
+    }
+
+    /// The shape prod actually has: one unified table holding most of the
+    /// corpus beside a dozen small projects. Equal round-robin gave the whale
+    /// 1/12 of every pass, so its dashboard window gained five files in three
+    /// and a half hours while the fleet gained 98 (prod 2026-09-09).
+    #[test]
+    fn tantivy_backfill_weights_each_project_by_its_backlog() {
+        let queue = |project: &str, n: usize| {
+            (project.to_string(), (0..n).map(|i| (format!("rel/{project}-{i:03}"), format!("uri/{project}-{i:03}"))).collect::<VecDeque<_>>())
+        };
+        let mut queues = vec![queue("unified", 200)];
+        queues.extend((0..11).map(|i| queue(&format!("small{i:02}"), 17)));
+
+        let pass: Vec<_> = super::fair_tantivy_backfill_work(queues).into_iter().take(48).collect();
+        let unified = pass.iter().filter(|(project, _, _)| project == "unified").count();
+
+        // 200 of 387 files is 52% of the backlog; an equal split would hand it 4.
+        assert!(unified >= 24, "the largest backlog must get a proportional slice, got {unified} of 48");
+        // Starvation is the failure this must not reintroduce: every project's
+        // newest file is virtual time 0, so all twelve appear in one pass.
+        for i in 0..11 {
+            let project = format!("small{i:02}");
+            assert!(pass.iter().any(|(p, _, uri)| *p == project && uri.ends_with("-000")), "{project} lost its newest file to the weighting");
+        }
     }
 
     /// The merge-on-read gate: `keep_greatest_ordering` yields the lead sort key
