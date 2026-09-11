@@ -750,6 +750,10 @@ pub struct TaskJournal {
     /// Keys removed since the last write, pending a `Removed` tombstone.
     removed_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
+    /// When the gauges were last recomputed, so `checkpoint` does not rescan the
+    /// whole task list on every claim and completion — see
+    /// [`TaskJournal::publish_statistics_throttled`].
+    stats_published_at: Option<std::time::Instant>,
     fair_cursors: HashMap<Operation, String>,
     /// `(source, project_id, date)` whose BASE tier is already built, as read
     /// from real rollup coverage by `plan_rollup_backfill` every 60s.
@@ -1031,6 +1035,7 @@ impl TaskJournal {
             dirty_tasks: HashSet::new(),
             removed_tasks: HashSet::new(),
             dirty_cursors: HashSet::new(),
+            stats_published_at: None,
             fair_cursors: HashMap::new(),
             base_tier_ready: HashSet::new(),
             tier_holes: HashSet::new(),
@@ -3323,8 +3328,44 @@ impl TaskJournal {
         if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
             self.compact()?;
         }
-        self.publish_statistics();
+        self.publish_statistics_throttled();
         Ok(())
+    }
+
+    /// How often `checkpoint` may recompute the maintenance gauges.
+    ///
+    /// These are observability, read by `timefusion_stats` and the dashboards;
+    /// nothing consults them transactionally, so a bound of one second is
+    /// invisible to every consumer while removing 97% of the scans.
+    const STATS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// `publish_statistics`, but at most once per [`Self::STATS_PUBLISH_INTERVAL`].
+    ///
+    /// `publish_statistics` is a FULL LINEAR SCAN of `snapshot.tasks`, and
+    /// `checkpoint` called it unconditionally — so it ran on every claim,
+    /// completion, retry and cursor update, while holding the one global
+    /// `Mutex<TaskJournal>` that all maintenance bookkeeping serializes on.
+    ///
+    /// Prod 2026-09-11 held 71,849 tasks (71,399 of them COMPLETE history that
+    /// moves no gauge but one counter) and took ~2,032 checkpoints per minute.
+    /// Measured locally at that exact size: **1.70 ms per call** — roughly a
+    /// third of the 5.45 ms average `journal_hold`, spent entirely on gauges.
+    /// The cost grows with journal HISTORY rather than with load, so it gets
+    /// worse while sitting still, and it is paid under a global lock whose duty
+    /// cycle (~19% of wall-clock) is the ceiling on maintenance throughput.
+    ///
+    /// Throttling is correct rather than merely cheap: the gauges describe the
+    /// journal's state, that state is republished on the next tick anyway, and
+    /// no reader can distinguish "published 900 ms ago" from "published now".
+    /// `publish_statistics` stays public and unthrottled for the callers that
+    /// do need an exact read immediately — chiefly tests.
+    fn publish_statistics_throttled(&mut self) {
+        let now = std::time::Instant::now();
+        if self.stats_published_at.is_some_and(|last| now.duration_since(last) < Self::STATS_PUBLISH_INTERVAL) {
+            return;
+        }
+        self.stats_published_at = Some(now);
+        self.publish_statistics();
     }
 
     /// Rewrite the authoritative snapshot even when the WAL is below its
@@ -3362,6 +3403,7 @@ impl TaskJournal {
     pub fn publish_statistics(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
+        stats.journal_stats_publishes.fetch_add(1, Relaxed);
         let mut counts = [0u64; 4];
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
@@ -4424,6 +4466,49 @@ mod tests {
             operation,
         };
         MaintenanceTask::pending(key, 0, 0, 0)
+    }
+
+    /// `checkpoint` must not rescan the whole journal every time it is called.
+    ///
+    /// `publish_statistics` is O(tasks) and `checkpoint` ran it unconditionally,
+    /// while holding the single global `Mutex<TaskJournal>` that every claim,
+    /// completion and retry serializes on. Prod 2026-09-11 held 71,849 tasks —
+    /// 71,399 of them Complete history — and took ~2,032 checkpoints per minute;
+    /// the scan measured 1.70 ms at exactly that size, roughly a third of the
+    /// 5.45 ms average `journal_hold`. The cost grows with journal HISTORY, not
+    /// with load, so it worsens while the system sits still.
+    ///
+    /// Asserted on the SCAN COUNT rather than on a duration, because a timing
+    /// assertion on a shared CI box is a flake generator. Can-fail proof, run red
+    /// then restored: pointing `checkpoint` back at `publish_statistics` makes
+    /// this report 40 publishes for 40 checkpoints.
+    #[test]
+    fn checkpoint_does_not_rescan_the_journal_on_every_call() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let publishes = || crate::observability::maintenance_stats().journal_stats_publishes.load(Relaxed);
+
+        // The first checkpoint must publish: a process that never checkpointed
+        // twice would otherwise export nothing at all.
+        journal.upsert(task("p", 0, 1, Operation::BaseRollup));
+        journal.checkpoint().expect("checkpoint");
+        let after_first = publishes();
+
+        for i in 1..40i64 {
+            journal.upsert(task("p", i, i + 1, Operation::BaseRollup));
+            journal.checkpoint().expect("checkpoint");
+        }
+        assert_eq!(publishes(), after_first, "39 further checkpoints inside one second must not rescan the journal 39 more times");
+
+        // Throttled, not disabled — the gauges still describe the journal.
+        journal.publish_statistics();
+        assert_eq!(publishes(), after_first + 1);
+        assert_eq!(
+            crate::observability::maintenance_stats().pending_base_rollup.load(Relaxed),
+            40,
+            "an explicit publish must still report the true pending count"
+        );
     }
 
     /// Only outstanding ROLLUP work may veto a rollup backfill.
