@@ -74,7 +74,7 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     let table = table();
     let batches = vec![batch()];
 
-    let (blob, stats): (_, IndexBuildStats) = timefusion::tantivy::build_and_pack(&table, &batches, 3, MergeMode::Deferred).expect("build_and_pack");
+    let (blob, stats): (_, IndexBuildStats) = timefusion::tantivy::build_and_pack(&table, &batches, 3, MergeMode::Deferred, &std::env::temp_dir()).expect("build_and_pack");
     assert_eq!(stats.rows, 3);
     assert!(!blob.is_empty());
 
@@ -143,7 +143,7 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     }
     object_store::ObjectStoreExt::put(store_obj.as_ref(), &object_store::path::Path::from(parquet_rel), buf.into()).await.expect("put parquet");
 
-    let svc = Arc::new(TantivyIndexService::new(store_obj.clone(), Arc::new(TantivyConfig::default())));
+    let svc = Arc::new(TantivyIndexService::new(store_obj.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir()));
     let parquet_uri = format!("s3://bucket/tf/{TABLE}/{parquet_rel}");
     svc.build_index_for_file(TABLE, "p1", parquet_rel, &parquet_uri, store_obj.clone()).await.expect("build_index_for_file");
 
@@ -174,12 +174,12 @@ fn verify_blob_accepts_built_index_and_rejects_corruption() {
     // fails every future read on its immutable path). The merge-thread race
     // that produced corrupt blobs is timing-dependent — the fix is the
     // `wait_merging_threads()` join in `index_to_writer`; this pins the guard.
-    let (blob, _) = timefusion::tantivy::build_and_pack(&table(), &[batch()], 3, MergeMode::Now).expect("build_and_pack");
-    verify_blob(&blob).expect("freshly built blob must verify");
+    let (blob, _) = timefusion::tantivy::build_and_pack(&table(), &[batch()], 3, MergeMode::Now, &std::env::temp_dir()).expect("build_and_pack");
+    verify_blob(&blob, &std::env::temp_dir()).expect("freshly built blob must verify");
 
     // Truncating the blob yields an invalid tar.zst; verify must error, not panic.
-    assert!(timefusion::tantivy::verify_blob(&blob[..blob.len() / 2]).is_err(), "corrupt blob must be rejected");
-    assert!(timefusion::tantivy::verify_blob(b"not a tantivy archive").is_err(), "garbage blob must be rejected");
+    assert!(timefusion::tantivy::verify_blob(&blob[..blob.len() / 2], &std::env::temp_dir()).is_err(), "corrupt blob must be rejected");
+    assert!(timefusion::tantivy::verify_blob(b"not a tantivy archive", &std::env::temp_dir()).is_err(), "garbage blob must be rejected");
 }
 
 #[tokio::test]

@@ -1667,7 +1667,7 @@ async fn tantivy_backfill_skips_todays_partition_but_the_census_still_counts_it(
     const TABLE: &str = "otel_logs_and_spans";
     let cfg = TestConfigBuilder::new("tantivy_skip_today").with_buffer_mode(BufferMode::Enabled).build();
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store, Arc::new(cfg.tantivy.clone())));
+    let svc = Arc::new(TantivyIndexService::new(store, Arc::new(cfg.tantivy.clone()), std::env::temp_dir()));
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     // Must land in TODAY's partition whatever the hour: `now - 2h` falls into
@@ -1711,7 +1711,7 @@ async fn tantivy_reconcile_backfills_new_files_and_gcs_orphans() -> Result<()> {
         Arc::new(cfg)
     };
     let tantivy_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(tantivy_store.clone(), Arc::new(cfg.tantivy.clone())));
+    let svc = Arc::new(TantivyIndexService::new(tantivy_store.clone(), Arc::new(cfg.tantivy.clone()), std::env::temp_dir()));
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?.with_tantivy_indexer(svc));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
