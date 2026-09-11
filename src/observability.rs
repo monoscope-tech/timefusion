@@ -1070,6 +1070,25 @@ atomic_stats! {
         /// however busy maintenance gets. Tracking the checkpoint rate instead
         /// means the throttle is not firing.
         journal_stats_publishes as "journal_stats_publishes_total",
+        /// Base files a DERIVED unit refused for an obsolete generation, split by
+        /// whether refusing them actually cost anything.
+        ///
+        /// `reproduced` — the CURRENT-generation files the unit selected already
+        /// cover the refused file's whole span, so excluding it loses no rows and
+        /// no rebuild is demanded. This is the livelock that was: prod 2026-09-11
+        /// had derived units at attempts=78 minting a base rebuild every 32
+        /// minutes over `skipped_generation=1`, and the rebuild could never clear
+        /// it because `slice_retires` only retires a file CONTAINED in the
+        /// publishing slice.
+        ///
+        /// `unreproduced` — a genuine hole in current-generation evidence. The
+        /// unit mints the base rebuild and retries, exactly as before.
+        ///
+        /// Chronically rising `reproduced` with a flat `rollup_tier_untagged_found`
+        /// means obsolete tier files are accumulating and nothing retires them —
+        /// real garbage, but no longer a livelock.
+        rollup_base_refusal_reproduced as "rollup_base_refusal_reproduced_total",
+        rollup_base_refusal_unreproduced as "rollup_base_refusal_unreproduced_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.

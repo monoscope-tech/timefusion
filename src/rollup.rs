@@ -978,6 +978,43 @@ pub(crate) fn slice_retires(file: &LiveFile<'_>, publish: &SlicePublish<'_>) -> 
     }
 }
 
+/// How many obsolete-generation refusals a derived unit must actually pay for.
+///
+/// A derived unit refuses a base file whose materialization generation is not
+/// current, and historically ANY refusal made it demand a base rebuild and
+/// retry. That is a livelock whenever the refused file's span is already
+/// reproduced by the current-generation files the unit selected: the rebuild
+/// republishes the same slices and cannot retire the offender, because
+/// `slice_retires` only retires a tagged file CONTAINED in the publishing slice
+/// and the offender is wider than the children a day is published as. Prod
+/// 2026-09-11 sat at `attempts=78`, re-minting every 32 minutes, over
+/// `skipped_generation=1` — one stale file.
+///
+/// `refused` spans are INCLUSIVE of both ends (matching [`ranges_cover`]), and
+/// `None` means the file would not say what it holds — which can never be shown
+/// reproduced, so it always counts.
+///
+/// ```
+/// # use timefusion::rollup::unreproduced_refusals as unpaid;
+/// const H: i64 = 3_600_000_000;
+/// // The prod shape: one stale DAY-wide file over a day published as two halves.
+/// // Both halves are selected, they tile the day, so refusing it costs nothing.
+/// assert_eq!(unpaid(&[Some((0, 24 * H - 1))], &[(0, 12 * H), (12 * H, 24 * H)]), 0);
+/// // A real hole: the selected files stop at noon, the refusal reaches past it.
+/// assert_eq!(unpaid(&[Some((0, 24 * H - 1))], &[(0, 12 * H)]), 1);
+/// // A gap anywhere in the middle is still a hole.
+/// assert_eq!(unpaid(&[Some((0, 24 * H - 1))], &[(0, 6 * H), (7 * H, 24 * H)]), 1);
+/// // A file that cannot say what it holds always counts — never assume empty.
+/// assert_eq!(unpaid(&[None], &[(0, 24 * H)]), 1);
+/// // Nothing selected reproduces nothing.
+/// assert_eq!(unpaid(&[Some((0, H))], &[]), 1);
+/// // Counts the refusals that are unpaid, not whether any refusal happened.
+/// assert_eq!(unpaid(&[Some((0, H)), Some((20 * H, 30 * H))], &[(0, 24 * H)]), 1);
+/// ```
+pub fn unreproduced_refusals(refused: &[Option<(i64, i64)>], selected: &[(i64, i64)]) -> u64 {
+    refused.iter().filter(|span| !span.is_some_and(|span| ranges_cover(selected, span))).count() as u64
+}
+
 /// Whether the union of `ranges` covers every instant in `[lo, hi]`.
 ///
 /// `hi` is INCLUSIVE — it is a row's timestamp, straight from file statistics —
