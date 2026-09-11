@@ -2890,7 +2890,7 @@ impl Database {
         //
         // The proof is the live SLICE coverage, which is the same map the read
         // path routes on, and it is exactly right for this test because of what
-        // clears it: `invalidate_rollup_hours` — the CONTENT-change path, taken
+        // clears it: `apply_rollup_hours` — the CONTENT-change path, taken
         // by ingest and DML — drops the covering entries, while the reconciler's
         // commit observation does not. So a real change cannot be skipped and a
         // bookkeeping re-mint cannot cost a scan.
@@ -4206,11 +4206,21 @@ impl Database {
     /// unaffected: the ticket is taken after this caller's mutations are
     /// applied, and a commit flushes everything outstanding, so a commit that
     /// covers the ticket has necessarily flushed them.
+    ///
+    /// Instrumented and worker-protected for the same reason `journal_lock_wait`
+    /// is: a follower blocks on a condvar for up to two commit durations, which
+    /// is a blocking wait on a runtime worker — the 2026-08-24 shape. Without
+    /// `block.journal_commit_wait` this change would replace a measured stall
+    /// with an unmeasured one.
     pub(crate) fn commit_journal(&self) -> std::io::Result<()> {
-        self.journal_group_commit.commit(|| {
-            self.journal().checkpoint().map_err(std::io::Error::other)?;
-            self.persist_rollup_journal()
+        let wait = crate::observability::BlockWatch::new("journal_commit_wait");
+        crate::support::without_blocking_the_worker(|| {
+            self.journal_group_commit.commit(|| {
+                self.journal().checkpoint().map_err(std::io::Error::other)?;
+                self.persist_rollup_journal()
+            })
         })?;
+        drop(wait);
         let (performed, coalesced) = self.journal_group_commit.counts();
         let stats = crate::observability::maintenance_stats();
         stats.journal_commits.store(performed, std::sync::atomic::Ordering::Relaxed);
@@ -10211,7 +10221,7 @@ mod rollup_noop_skip_tests {
     /// `skipped_generation` branch calls `journal.enqueue` on the BASE key it
     /// could not verify, which upserts an already-Complete unit back to Pending
     /// over the SAME slice. Coverage is untouched — unlike the CONTENT-change
-    /// path (`invalidate_rollup_hours`), which drops it — so the rebuild it asks
+    /// path (`apply_rollup_hours`), which drops it — so the rebuild it asks
     /// for is the one that must be proved needless rather than paid for. Prod
     /// repeats this every 32 minutes (`60 << 5`, the branch's backoff cap).
     fn remint_published_base_slices(db: &Database) -> Result<()> {
@@ -10290,7 +10300,7 @@ mod rollup_noop_skip_tests {
         // `skipped_generation` branch calls `journal.enqueue` on the BASE key it
         // could not verify, which upserts an already-Complete unit back to
         // Pending over the SAME slice. Coverage is untouched — unlike the
-        // CONTENT-change path (`invalidate_rollup_hours`), which drops it — so
+        // CONTENT-change path (`apply_rollup_hours`), which drops it — so
         // the rebuild it asks for is provably needless. Re-minting every
         // published slice is the same fact at 32-minute cadence.
         let before = skips();
@@ -10311,7 +10321,7 @@ mod rollup_noop_skip_tests {
     /// file PATH — the resurrection trap the DV-dedup design named. The rollup's
     /// coverage is not dropped by a dedup wave either (that wave reaches the
     /// journal through `reconcile_maintenance_task_cursors`, not through
-    /// `invalidate_rollup_hours`), so a paths-only fingerprint would report
+    /// `apply_rollup_hours`), so a paths-only fingerprint would report
     /// "nothing moved" over a partition that just lost rows and freeze a rollup
     /// that still counts the duplicates.
     ///

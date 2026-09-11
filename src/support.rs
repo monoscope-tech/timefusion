@@ -142,6 +142,27 @@ struct GroupCommitState {
     pub coalesced: u64,
 }
 
+/// The leader's hold on the commit, released in `Drop` so an unwind cannot
+/// strand it. `succeeded` stays false unless the commit returned `Ok`, so a
+/// panic advances the durable watermark exactly as little as a failure does.
+struct Leadership<'a> {
+    group: &'a GroupCommit,
+    covered: u64,
+    succeeded: bool,
+}
+
+impl Drop for Leadership<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.group.state);
+        state.in_flight = false;
+        state.performed += 1;
+        if self.succeeded {
+            state.committed = state.committed.max(self.covered);
+        }
+        self.group.settled.notify_all();
+    }
+}
+
 impl GroupCommit {
     /// Return once a commit covering this caller's already-applied mutations
     /// has completed, performing that commit if nobody else is.
@@ -150,7 +171,10 @@ impl GroupCommit {
     /// work — that is what lets one call satisfy many waiters. A failed commit
     /// is reported to its leader and leaves `committed` untouched, so the
     /// waiters behind it retry rather than inherit a success that never
-    /// happened.
+    /// happened. A PANICKING commit is treated the same way, and hands the
+    /// leadership back on unwind: this is the durability barrier every write
+    /// crosses, so a leader that dies holding it would park every subsequent
+    /// writer on the condvar forever — the whole process stops acknowledging.
     pub fn commit<E>(&self, do_commit: impl Fn() -> Result<(), E>) -> Result<(), E> {
         let ticket = self.applied.fetch_add(1, Ordering::AcqRel) + 1;
         let mut state = lock(&self.state);
@@ -169,15 +193,12 @@ impl GroupCommit {
             let covered = self.applied.load(Ordering::Acquire);
             drop(state);
 
+            // Settles in its `Drop`, so an unwind out of `do_commit` releases
+            // leadership and wakes the waiters instead of wedging them.
+            let mut leadership = Leadership { group: self, covered, succeeded: false };
             let result = do_commit();
-
-            state = lock(&self.state);
-            state.in_flight = false;
-            state.performed += 1;
-            if result.is_ok() {
-                state.committed = state.committed.max(covered);
-            }
-            self.settled.notify_all();
+            leadership.succeeded = result.is_ok();
+            drop(leadership);
             // The leader's own ticket is <= `covered` by construction, so a
             // successful commit always covers it — return rather than loop, or
             // it would count itself as having ridden someone else's commit.
@@ -315,6 +336,29 @@ mod tests {
         let (performed, coalesced) = group.counts();
         assert_eq!(commits.load(Ordering::Relaxed), 2, "{FOLLOWERS} callers queued during one commit must share the next, not fsync each");
         assert_eq!((performed, coalesced), (2, FOLLOWERS - 1), "all but the two leaders must be recorded as riding someone else's commit");
+    }
+
+    /// A panicking leader must hand leadership back, not strand every writer.
+    ///
+    /// This is the barrier every write crosses before it is acknowledged, so a
+    /// leader that dies still holding it parks all later callers on the condvar
+    /// permanently — the process stops acking writes altogether. The assertion
+    /// that matters is that the second call RETURNS at all; it hangs forever
+    /// without the `Drop`.
+    #[test]
+    fn a_panicking_leader_does_not_wedge_every_caller_behind_it() {
+        let group = GroupCommit::default();
+        let died = std::thread::scope(|scope| scope.spawn(|| group.commit(|| -> Result<(), &str> { panic!("disk on fire") })).join());
+        assert!(died.is_err(), "the panic must reach the leader's own caller");
+
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        group
+            .commit(|| {
+                committed.store(true, Ordering::Relaxed);
+                Ok::<_, &str>(())
+            })
+            .unwrap();
+        assert!(committed.load(Ordering::Relaxed), "the next caller must be able to lead; a panic must not advance the durable watermark either");
     }
 
     /// A failed commit must not be inherited: the waiters behind it retry.
