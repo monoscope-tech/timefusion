@@ -511,6 +511,29 @@ mod builder_tests {
         assert_eq!(error_hits(&index, &built), unmerged);
     }
 
+    /// A COST guard, not a correctness one: the build must put its scratch on
+    /// the volume it was handed and write NOTHING under the process temp dir.
+    ///
+    /// In prod `std::env::temp_dir()` is the container's overlay2 layer on the
+    /// same array as the WAL, and 5.4 builds/min of multi-GB indexes there ran
+    /// it to 100% util / 546 ms `w_await`, which is what made client INSERTs
+    /// take 48 s at p99 (2026-09-11). A build that still *works* while writing
+    /// to /tmp passes every correctness assertion and reintroduces the outage,
+    /// so the assertion has to be about where the bytes land.
+    #[test]
+    fn index_builds_keep_scratch_off_the_process_temp_dir() {
+        let scratch = tempfile::tempdir().expect("scratch root");
+        let (blob, stats) = build_and_pack(&table(), &[batch(0), batch(1)], 1, MergeMode::Now, scratch.path()).expect("build");
+        verify_blob(&blob, scratch.path()).expect("verify");
+
+        assert_eq!(stats.rows, 2, "build must actually have indexed the batches");
+        // Asserts the ROOT, not leftover files: every scratch dir is reclaimed
+        // on drop, so counting files under a redirected TMPDIR finds nothing
+        // whether the fix is present or not. Verified to go red by reverting
+        // `scratch_tempdir` to a bare `tempfile::tempdir()`.
+        assert!(scratch.path().join("tantivy_scratch").is_dir(), "build must root its scratch under the volume it was given");
+    }
+
     #[test]
     fn committed_file_build_consumes_a_bounded_batch_stream() {
         assert_eq!(crate::tantivy::PARQUET_INDEX_BATCH_WINDOW, 2);
@@ -1002,7 +1025,7 @@ pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
 /// memory-bounded counterpart to [`build_and_pack`], retained for flush-time
 /// in-memory batches.
 pub async fn build_parquet_and_pack(
-    store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, level: i32, merge: MergeMode,
+    store: Arc<dyn ObjectStore>, parquet_rel: &str, table: &'static TableSchema, level: i32, merge: MergeMode, scratch: &Path,
 ) -> Result<(Bytes, IndexBuildStats)> {
     use deltalake::datafusion::parquet::arrow::{
         ProjectionMask,
@@ -1027,7 +1050,7 @@ pub async fn build_parquet_and_pack(
     let columns = builder.schema().fields().iter().enumerate().filter_map(|(index, field)| fields.contains(field.name().as_str()).then_some(index));
     let projection = ProjectionMask::roots(builder.parquet_schema(), columns);
     let mut stream = builder.with_projection(projection).build().context("build parquet stream")?;
-    let tmp = tempfile::tempdir().context("build_parquet_and_pack: tempdir")?;
+    let tmp = scratch_tempdir(scratch).context("build_parquet_and_pack: tempdir")?;
     let dir = tmp.path().to_owned();
     let (tx, rx) = tokio::sync::mpsc::channel(PARQUET_INDEX_BATCH_WINDOW);
     let build = tokio::task::spawn_blocking(move || crate::tantivy::build_stream_to_dir(table, &dir, rx, merge));
@@ -1043,19 +1066,37 @@ pub async fn build_parquet_and_pack(
     let built = build.await.context("join streaming tantivy build")?;
     decode?;
     let (_built, stats) = built?;
+    let scratch = scratch.to_owned();
     tokio::task::spawn_blocking(move || {
         let blob = pack_dir(tmp.path(), level)?;
-        verify_blob(&blob).context("verify packed blob")?;
+        verify_blob(&blob, &scratch).context("verify packed blob")?;
         Ok::<_, anyhow::Error>((blob, stats))
     })
     .await
     .context("join tantivy pack")?
 }
 
+/// Scratch directory for an index build, rooted on the data volume.
+///
+/// NOT `std::env::temp_dir()`. In prod that resolves to `/tmp` inside the
+/// container, i.e. the overlay2 writable layer — and every TimeFusion disk
+/// tenant shares one physical array (`md3`). On 2026-09-11 index builds ran at
+/// 5.4/min against ~3.8 GB indexes, each written roughly twice (segments, then
+/// `verify_blob`'s full unpack), putting ~300-600 MB/s onto that array; it sat
+/// at 100% util with `w_await` 63-620 ms. Client INSERTs fsync pre-ack on the
+/// same array, so this surfaced as a p99 write latency of 48 s. Keeping the
+/// scratch on the data volume puts the bytes where the operator has already
+/// sized and can observe them, and off the container's copy-on-write layer.
+fn scratch_tempdir(root: &Path) -> Result<tempfile::TempDir> {
+    let base = root.join("tantivy_scratch");
+    std::fs::create_dir_all(&base).with_context(|| format!("create scratch root {}", base.display()))?;
+    tempfile::TempDir::new_in(&base).with_context(|| format!("tempdir under {}", base.display()))
+}
+
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot, then
 /// pack it into a `tar.zst` blob. Avoids any RAM→disk copy.
-pub fn build_and_pack(table: &TableSchema, batches: &[RecordBatch], level: i32, merge: MergeMode) -> Result<(Bytes, IndexBuildStats)> {
-    let tmp = tempfile::tempdir().context("build_and_pack: tempdir")?;
+pub fn build_and_pack(table: &TableSchema, batches: &[RecordBatch], level: i32, merge: MergeMode, scratch: &Path) -> Result<(Bytes, IndexBuildStats)> {
+    let tmp = scratch_tempdir(scratch).context("build_and_pack: tempdir")?;
     let (_built, stats) = build_to_dir(table, batches, tmp.path(), merge)?;
     Ok((pack_dir(tmp.path(), level)?, stats))
 }
@@ -1091,8 +1132,8 @@ pub fn unpack_to_dir(blob: &[u8], dest: &Path) -> Result<()> {
 /// structurally-corrupt archive is never uploaded. Blob paths are immutable and
 /// reader-cached, so a poison blob would otherwise fail every future read until
 /// a manual reindex.
-pub fn verify_blob(blob: &[u8]) -> Result<()> {
-    let tmp = tempfile::tempdir().context("verify: tempdir")?;
+pub fn verify_blob(blob: &[u8], scratch: &Path) -> Result<()> {
+    let tmp = scratch_tempdir(scratch).context("verify: tempdir")?;
     unpack_to_dir(blob, tmp.path())?;
     open_index(tmp.path()).map(drop)
 }

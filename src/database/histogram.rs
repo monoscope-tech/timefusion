@@ -1108,7 +1108,7 @@ mod tests {
         let config = minio_test_config(&project, &dir.path().to_string_lossy());
         let store = Arc::new(object_store::memory::InMemory::new());
         let search = Arc::new(TantivySearchService::new(store.clone(), dir.path().join("indexes"), Arc::new(config.tantivy.clone())));
-        let indexer = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(config.tantivy.clone())));
+        let indexer = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(config.tantivy.clone()), std::env::temp_dir()));
         indexer.with_reader(&search);
         let db = super::super::Database::with_config(config.clone()).await?.with_tantivy_search(search.clone()).with_tantivy_indexer(indexer.clone());
         let table = "mor_versioned";
