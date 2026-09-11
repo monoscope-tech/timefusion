@@ -1058,6 +1058,18 @@ atomic_stats! {
         /// claimed, so the ratio is the share of rollup work that was bookkeeping.
         /// Prod 2026-09-11 measured that share at 72.6% of BaseRollup bytes.
         rollup_noop_rebuild_skipped as "rollup_noop_rebuild_skipped_total",
+        /// How many times the maintenance gauges were actually recomputed.
+        ///
+        /// `publish_statistics` is a full linear scan of the journal, and
+        /// `checkpoint` used to call it unconditionally — every claim, completion
+        /// and retry, under the one global `Mutex<TaskJournal>`. Prod 2026-09-11:
+        /// 71,849 tasks, ~2,032 checkpoints/min, 1.70 ms per scan measured at
+        /// that size — about a third of the 5.45 ms average `journal_hold`.
+        ///
+        /// Read against the checkpoint rate: this should sit near one per second
+        /// however busy maintenance gets. Tracking the checkpoint rate instead
+        /// means the throttle is not firing.
+        journal_stats_publishes as "journal_stats_publishes_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.
