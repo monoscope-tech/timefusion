@@ -2912,6 +2912,10 @@ pub struct Database {
     /// Serializes dirty-map mutation with journal snapshots, else two writers
     /// can persist out of order and lose the newer invalidation on restart.
     rollup_journal_lock: Arc<std::sync::Mutex<()>>,
+    /// Coalesces the durable half of that path (see [`Self::commit_journal`]).
+    /// The lock above covers only the in-memory mutation; the `fsync` behind it
+    /// is shared, so the ingest rate no longer sets the `fsync` rate.
+    journal_group_commit: Arc<crate::support::GroupCommit>,
     /// Durable slice work from the same pre-ack invalidation path as
     /// `rollup_dirty`; the finer-grained source of truth coordinator workers consume.
     maintenance_tasks: Arc<std::sync::Mutex<crate::maintenance_coordinator::TaskJournal>>,
@@ -3747,6 +3751,7 @@ impl Database {
             rollup_dirty,
             rollup_invalidated_at,
             rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),
+            journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
             maintenance_admission,
             maintenance_debt_planned_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
@@ -15960,6 +15965,54 @@ mod tests {
         Ok(())
     }
 
+    /// One write, one durability barrier — no matter how many partitions it touches.
+    ///
+    /// The maintenance journal must be `fsync`ed before a write is acknowledged
+    /// (a crash after that can only leave redundant tasks; nothing re-seeds a
+    /// mutation with no maintenance record). What is NOT required is paying for
+    /// that barrier once per (project, date) in the batch. Prod 2026-09-11 did:
+    /// an INSERT spanning three partitions cost three `fsync`s of the task
+    /// journal, three `publish_statistics` full task scans and three rollup
+    /// journal writes, on an array already at 98.8 % utilisation — while
+    /// `insert into otel_logs_and_spans` averaged 18.1 s.
+    ///
+    /// Asserts the COST, not just the outcome: a version that commits per
+    /// partition still produces exactly the same journal and passes every
+    /// correctness assertion below.
+    #[tokio::test]
+    async fn a_multi_partition_invalidation_costs_one_journal_commit() -> Result<()> {
+        use datafusion::arrow::{
+            array::TimestampMicrosecondArray,
+            datatypes::{DataType, Field, Schema, TimeUnit},
+        };
+
+        let db = Database::with_config(create_test_config("journal-group-commit-batches")).await?;
+        const DAY: i64 = 86_400_000_000;
+        // One inbound batch straddling three dates — the ordinary shape of a
+        // client flushing a buffer across a midnight boundary.
+        let day0 = chrono::NaiveDate::from_ymd_opt(2026, 8, 16).unwrap().and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
+        let days = [day0, day0 + DAY, day0 + 2 * DAY];
+        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(TimestampMicrosecondArray::from(days.to_vec()).with_timezone("UTC"))])?;
+
+        let (before, _) = db.journal_group_commit.counts();
+        db.invalidate_rollup_batches("customer-a", "otel_logs_and_spans", std::slice::from_ref(&batch))?;
+        let (after, _) = db.journal_group_commit.counts();
+
+        assert_eq!(after - before, 1, "{} dates in one write must share ONE journal commit, not one each", days.len());
+        // ...and every date is actually in it: the cheap version must not be
+        // cheap by doing less work.
+        let journal = db.maintenance_tasks.lock().unwrap();
+        for day in days {
+            let day_start = day - day.rem_euclid(DAY);
+            assert!(
+                journal.tasks().any(|task| task.key.project_id == "customer-a" && task.key.slice.overlaps(day_start, day_start + DAY)),
+                "the shared commit dropped the partition at {day_start}"
+            );
+        }
+        Ok(())
+    }
+
     /// A tenant's first write must not manufacture a full day of empty and future maintenance debt.
     ///
     /// File hygiene is planned by debt in `plan_compaction_debt` (one day-wide unit per project, only
@@ -15970,7 +16023,8 @@ mod tests {
         use crate::maintenance_coordinator::Operation;
 
         let db = Database::with_config(create_test_config("first-rollup-invalidation-is-sparse")).await?;
-        db.invalidate_rollup_hours("customer-a", "otel_logs_and_spans", "2026-08-16", 1 << 7)?;
+        db.apply_rollup_hours("customer-a", "otel_logs_and_spans", "2026-08-16", 1 << 7)?;
+        db.commit_journal()?;
 
         let journal = db.maintenance_tasks.lock().unwrap();
         let counts = journal.tasks().fold(HashMap::<Operation, usize>::new(), |mut counts, task| {

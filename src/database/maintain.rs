@@ -925,6 +925,13 @@ impl Database {
     /// DV-dedup commits (see [`DV_DEDUP_COMMIT_KEY`]); everything else must
     /// pass true.
     pub(crate) fn enqueue_maintenance_hours(&self, project_id: &str, source: &str, date: &str, hours: u32, mint_dedup: bool) -> std::io::Result<()> {
+        self.mint_maintenance_hours(project_id, source, date, hours, mint_dedup)?;
+        self.commit_journal()
+    }
+
+    /// Mint the slice work without making it durable — see
+    /// [`Self::commit_journal`] for who pays for the `fsync` and when.
+    fn mint_maintenance_hours(&self, project_id: &str, source: &str, date: &str, hours: u32, mint_dedup: bool) -> std::io::Result<()> {
         let Some(schema) = get_schema(source) else { return Ok(()) };
         if schema.rollups.is_empty() || hours == 0 {
             return Ok(());
@@ -957,7 +964,7 @@ impl Database {
                     .map_err(std::io::Error::other)?;
             }
         }
-        journal.checkpoint().map_err(std::io::Error::other)
+        Ok(())
     }
 
     fn enqueue_maintenance_partition(&self, project_id: &str, source: &str, date: &str) -> Result<()> {
@@ -1145,9 +1152,12 @@ impl Database {
                     self.enqueue_maintenance_partition(&project, source, &date)?;
                     queued = queued.saturating_add(1 + schema.rollups.len());
                 } else {
+                    // The two halves of one partition's hours — mint both, then
+                    // commit once.
                     let with_dedup = dedup_hours.get(&(partition_project, date.clone())).copied().unwrap_or(0) & hours;
-                    self.enqueue_maintenance_hours(&project, source, &date, with_dedup, true)?;
-                    self.enqueue_maintenance_hours(&project, source, &date, hours & !with_dedup, false)?;
+                    self.mint_maintenance_hours(&project, source, &date, with_dedup, true)?;
+                    self.mint_maintenance_hours(&project, source, &date, hours & !with_dedup, false)?;
+                    self.commit_journal()?;
                     queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
                 }
                 tokio::task::yield_now().await;
@@ -2880,7 +2890,7 @@ impl Database {
         //
         // The proof is the live SLICE coverage, which is the same map the read
         // path routes on, and it is exactly right for this test because of what
-        // clears it: `invalidate_rollup_hours` — the CONTENT-change path, taken
+        // clears it: `apply_rollup_hours` — the CONTENT-change path, taken
         // by ingest and DML — drops the covering entries, while the reconciler's
         // commit observation does not. So a real change cannot be skipped and a
         // bookkeeping re-mint cannot cost a scan.
@@ -4179,7 +4189,51 @@ impl Database {
         Ok(completed)
     }
 
-    pub(crate) fn invalidate_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
+    /// Durable half of the invalidation path: flush the task journal and the
+    /// rollup journal, coalescing with any concurrent caller.
+    ///
+    /// It stays BEFORE the write is acknowledged — a crash at any later point
+    /// can only leave redundant tasks, never a mutation with no maintenance
+    /// record, and nothing re-seeds one (WAL replay does not run this path).
+    /// What changes is only who pays: `GroupCommit` lets overlapping writers
+    /// share one `fsync`, so the cost tracks the commit rate rather than the
+    /// ingest rate. Prod 2026-09-11 did this per INSERT, per (project, date),
+    /// on an array already at 98.8 % utilisation.
+    ///
+    /// Called with `rollup_journal_lock` RELEASED. That lock orders the
+    /// in-memory mutations; holding it across the commit would serialise every
+    /// writer behind the `fsync` and leave nothing to coalesce. Durability is
+    /// unaffected: the ticket is taken after this caller's mutations are
+    /// applied, and a commit flushes everything outstanding, so a commit that
+    /// covers the ticket has necessarily flushed them.
+    ///
+    /// Instrumented and worker-protected for the same reason `journal_lock_wait`
+    /// is: a follower blocks on a condvar for up to two commit durations, which
+    /// is a blocking wait on a runtime worker — the 2026-08-24 shape. Without
+    /// `block.journal_commit_wait` this change would replace a measured stall
+    /// with an unmeasured one.
+    pub(crate) fn commit_journal(&self) -> std::io::Result<()> {
+        let wait = crate::observability::BlockWatch::new("journal_commit_wait");
+        crate::support::without_blocking_the_worker(|| {
+            self.journal_group_commit.commit(|| {
+                self.journal().checkpoint().map_err(std::io::Error::other)?;
+                self.persist_rollup_journal()
+            })
+        })?;
+        drop(wait);
+        let (performed, coalesced) = self.journal_group_commit.counts();
+        let stats = crate::observability::maintenance_stats();
+        stats.journal_commits.store(performed, std::sync::atomic::Ordering::Relaxed);
+        stats.journal_commits_coalesced.store(coalesced, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// In-memory half: mark the partition dirty and mint its slice work. Not
+    /// durable on its own — the caller must reach [`Self::commit_journal`]
+    /// before acknowledging the write that caused it. Split out so a caller
+    /// touching several partitions (an INSERT batch spanning dates or projects,
+    /// a source-wide DML) pays for ONE commit rather than one per partition.
+    pub(crate) fn apply_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
         let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         // The mutation tells us exactly which hours became dirty. Expanding a
@@ -4210,12 +4264,11 @@ impl Database {
                 project != project_id || table != source || !ranges.iter().any(|(dirty_start, dirty_end)| *start < *dirty_end && *end > *dirty_start)
             });
         }
-        // Checkpoint slice work before the legacy journal and before the write
-        // is acknowledged. A crash at any later point can only leave redundant
-        // tasks; it cannot leave a mutation with no maintenance record.
-        self.enqueue_maintenance_hours(project_id, source, date, affected_hours, true)?;
-        self.persist_rollup_journal()?;
-        Ok(())
+        // Mint the slice work. It becomes durable in `commit_journal`, which the
+        // caller MUST reach before acknowledging the write — a crash after that
+        // can only leave redundant tasks, never a mutation with no maintenance
+        // record.
+        self.mint_maintenance_hours(project_id, source, date, affected_hours, true)
     }
 
     /// Invalidate only the partitions a non-MOR UPDATE/DELETE statement can have changed.
@@ -4235,9 +4288,9 @@ impl Database {
         match masks {
             Some(masks) => {
                 for (date, hours) in masks {
-                    self.invalidate_rollup_hours(project_id, source, &date, hours)?;
+                    self.apply_rollup_hours(project_id, source, &date, hours)?;
                 }
-                Ok(())
+                self.commit_journal()
             }
             None => self.invalidate_rollup_source(project_id, source),
         }
@@ -4254,13 +4307,13 @@ impl Database {
             self.rollup_source_epochs.entry(key.clone()).and_modify(|epoch| *epoch = epoch.saturating_add(1));
             self.rollup_dirty.insert(key.clone(), crate::rollup::ALL_HOURS);
             self.rollup_invalidated_at.entry(key.clone()).or_insert_with(crate::storage::now_unix_ms);
-            self.enqueue_maintenance_hours(&key.0, &key.1, &key.2, crate::rollup::ALL_HOURS, true)?;
+            self.mint_maintenance_hours(&key.0, &key.1, &key.2, crate::rollup::ALL_HOURS, true)?;
         }
         self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source);
         self.rollup_slice_coverage.retain(|(project, table, ..), _| project != project_id || table != source);
         self.rollup_backoff.retain(|(project, table, _, _), _| project != project_id || table != source);
-        self.persist_rollup_journal()?;
-        Ok(())
+        drop(_journal_guard);
+        self.commit_journal()
     }
 
     /// Walks the batches' dates, so it is gated on the master switch as well as
@@ -4294,10 +4347,14 @@ impl Database {
         }
         // The hours come from the rows themselves, so an enrichment touching one
         // hour marks one hour — and the repair rebuilds one hour instead of 24.
+        //
+        // ONE commit for the whole batch, not one per date: only the last needs
+        // to be durable before this write is acknowledged, and a batch spanning
+        // three dates used to cost three `fsync`s and three full task scans.
         for (date, hours) in dates {
-            self.invalidate_rollup_hours(project_id, source, &date, hours)?;
+            self.apply_rollup_hours(project_id, source, &date, hours)?;
         }
-        Ok(())
+        self.commit_journal()
     }
 
     /// Exclusive upper bound on row timestamps a file may contain to be folded into a slice.
@@ -10164,7 +10221,7 @@ mod rollup_noop_skip_tests {
     /// `skipped_generation` branch calls `journal.enqueue` on the BASE key it
     /// could not verify, which upserts an already-Complete unit back to Pending
     /// over the SAME slice. Coverage is untouched — unlike the CONTENT-change
-    /// path (`invalidate_rollup_hours`), which drops it — so the rebuild it asks
+    /// path (`apply_rollup_hours`), which drops it — so the rebuild it asks
     /// for is the one that must be proved needless rather than paid for. Prod
     /// repeats this every 32 minutes (`60 << 5`, the branch's backoff cap).
     fn remint_published_base_slices(db: &Database) -> Result<()> {
@@ -10243,7 +10300,7 @@ mod rollup_noop_skip_tests {
         // `skipped_generation` branch calls `journal.enqueue` on the BASE key it
         // could not verify, which upserts an already-Complete unit back to
         // Pending over the SAME slice. Coverage is untouched — unlike the
-        // CONTENT-change path (`invalidate_rollup_hours`), which drops it — so
+        // CONTENT-change path (`apply_rollup_hours`), which drops it — so
         // the rebuild it asks for is provably needless. Re-minting every
         // published slice is the same fact at 32-minute cadence.
         let before = skips();
@@ -10264,7 +10321,7 @@ mod rollup_noop_skip_tests {
     /// file PATH — the resurrection trap the DV-dedup design named. The rollup's
     /// coverage is not dropped by a dedup wave either (that wave reaches the
     /// journal through `reconcile_maintenance_task_cursors`, not through
-    /// `invalidate_rollup_hours`), so a paths-only fingerprint would report
+    /// `apply_rollup_hours`), so a paths-only fingerprint would report
     /// "nothing moved" over a partition that just lost rows and freeze a rollup
     /// that still counts the duplicates.
     ///

@@ -970,6 +970,14 @@ atomic_stats! {
     #[derive(Default)]
     MaintenanceStats => MAINTENANCE_STATS as "maintenance" {
         checkpoints_created,
+        /// Durable maintenance-journal commits actually performed, and the
+        /// callers that rode someone else's instead of paying for their own
+        /// `fsync` (see `support::GroupCommit`). Both are gauges republished
+        /// from the committer. `coalesced / (performed + coalesced)` is the
+        /// share of the ingest path's durability barrier that costs no IO;
+        /// near zero under load means the batching is not engaging.
+        journal_commits,
+        journal_commits_coalesced,
         checkpoint_failed,
         /// Checkpoints that wrote OK but failed post-write footer verification
         /// (the referenced object isn't a readable Parquet). Log cleanup is

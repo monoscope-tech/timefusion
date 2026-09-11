@@ -93,6 +93,132 @@ pub fn without_blocking_the_worker<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Coalesces concurrent durable commits into one, without weakening what a
+/// caller is promised when it returns.
+///
+/// The problem it solves: a durability barrier that every writer must cross
+/// before it may acknowledge its own work costs one `fsync` per writer, so its
+/// price scales with the write rate instead of with the data. Prod 2026-09-11:
+/// every pgwire INSERT checkpointed the maintenance journal — an `fsync` plus a
+/// full task scan — before acking the client, on a disk array already at 98.8 %
+/// utilisation with an 80 ms write wait.
+///
+/// The contract is unchanged, which is the point. Deferring the commit would
+/// be wrong: a crash between a mutation and its (never-taken) checkpoint leaves
+/// a mutation with no maintenance record, and WAL replay does not re-seed one.
+/// Here `commit` still returns only once a commit that **includes the caller's
+/// mutations** has completed — it just may be a commit someone else performed.
+///
+/// Usage: apply your mutations, THEN call `commit`. A ticket is taken on entry,
+/// so mutations applied after the call may or may not be included; mutations
+/// applied before it always are.
+///
+/// ```
+/// # use timefusion::support::GroupCommit;
+/// # use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+/// let group = GroupCommit::default();
+/// let commits = AtomicUsize::new(0);
+/// // Serial callers each get their own commit — nothing to coalesce.
+/// group.commit(|| { commits.fetch_add(1, Ordering::Relaxed); Ok::<_, std::io::Error>(()) }).unwrap();
+/// group.commit(|| { commits.fetch_add(1, Ordering::Relaxed); Ok::<_, std::io::Error>(()) }).unwrap();
+/// assert_eq!(commits.load(Ordering::Relaxed), 2);
+/// ```
+#[derive(Default, Debug)]
+pub struct GroupCommit {
+    /// Mutations offered so far. Incremented by each caller before it waits.
+    applied: std::sync::atomic::AtomicU64,
+    state: std::sync::Mutex<GroupCommitState>,
+    settled: std::sync::Condvar,
+}
+
+#[derive(Default, Debug)]
+struct GroupCommitState {
+    /// Highest `applied` value a completed commit is known to cover.
+    committed: u64,
+    /// Whether a leader is mid-commit; followers wait rather than pile on.
+    in_flight: bool,
+    /// Commits actually performed, and callers that rode someone else's.
+    pub performed: u64,
+    pub coalesced: u64,
+}
+
+/// The leader's hold on the commit, released in `Drop` so an unwind cannot
+/// strand it. `succeeded` stays false unless the commit returned `Ok`, so a
+/// panic advances the durable watermark exactly as little as a failure does.
+struct Leadership<'a> {
+    group: &'a GroupCommit,
+    covered: u64,
+    succeeded: bool,
+}
+
+impl Drop for Leadership<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.group.state);
+        state.in_flight = false;
+        state.performed += 1;
+        if self.succeeded {
+            state.committed = state.committed.max(self.covered);
+        }
+        self.group.settled.notify_all();
+    }
+}
+
+impl GroupCommit {
+    /// Return once a commit covering this caller's already-applied mutations
+    /// has completed, performing that commit if nobody else is.
+    ///
+    /// `do_commit` must flush *everything* outstanding, not just this caller's
+    /// work — that is what lets one call satisfy many waiters. A failed commit
+    /// is reported to its leader and leaves `committed` untouched, so the
+    /// waiters behind it retry rather than inherit a success that never
+    /// happened. A PANICKING commit is treated the same way, and hands the
+    /// leadership back on unwind: this is the durability barrier every write
+    /// crosses, so a leader that dies holding it would park every subsequent
+    /// writer on the condvar forever — the whole process stops acknowledging.
+    pub fn commit<E>(&self, do_commit: impl Fn() -> Result<(), E>) -> Result<(), E> {
+        let ticket = self.applied.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut state = lock(&self.state);
+        loop {
+            if state.committed >= ticket {
+                state.coalesced += 1;
+                return Ok(());
+            }
+            if state.in_flight {
+                state = self.settled.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            }
+            state.in_flight = true;
+            // Read BEFORE the commit runs: anything applied after this point may
+            // not be flushed, and must not be reported as durable.
+            let covered = self.applied.load(Ordering::Acquire);
+            drop(state);
+
+            // Settles in its `Drop`, so an unwind out of `do_commit` releases
+            // leadership and wakes the waiters instead of wedging them.
+            let mut leadership = Leadership { group: self, covered, succeeded: false };
+            let result = do_commit();
+            leadership.succeeded = result.is_ok();
+            drop(leadership);
+            // The leader's own ticket is <= `covered` by construction, so a
+            // successful commit always covers it — return rather than loop, or
+            // it would count itself as having ridden someone else's commit.
+            return result;
+        }
+    }
+
+    /// `(commits performed, callers that rode another caller's commit)`.
+    pub fn counts(&self) -> (u64, u64) {
+        let state = lock(&self.state);
+        (state.performed, state.coalesced)
+    }
+
+    /// Tickets taken so far. A caller takes its ticket before it waits, so this
+    /// is how many callers a commit starting now would be able to cover.
+    pub fn offered(&self) -> u64 {
+        self.applied.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -174,6 +300,86 @@ mod tests {
         assert_eq!(now_micros(), t1);
         unfreeze();
         assert!(!is_frozen());
+    }
+
+    /// Deterministic, not racy. One commit is pinned open while `FOLLOWERS`
+    /// callers queue behind it; it is released only once every one of them has
+    /// taken its ticket (`offered`). They must therefore all be covered by the
+    /// single commit that follows — 1 + FOLLOWERS callers for 2 commits, not
+    /// 1 + FOLLOWERS commits.
+    #[test]
+    fn callers_queued_during_a_commit_all_ride_the_next_one() {
+        const FOLLOWERS: u64 = 8;
+        let group = GroupCommit::default();
+        let commits = std::sync::atomic::AtomicU64::new(0);
+        let leading = std::sync::atomic::AtomicBool::new(false);
+        let commit = || {
+            commits.fetch_add(1, Ordering::Relaxed);
+            leading.store(true, Ordering::Release);
+            // Hold this commit open until every follower has queued behind it.
+            while group.offered() < FOLLOWERS + 1 {
+                std::thread::yield_now();
+            }
+            Ok::<_, std::convert::Infallible>(())
+        };
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| group.commit(commit).unwrap());
+            while !leading.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            for _ in 0..FOLLOWERS {
+                scope.spawn(|| group.commit(commit).unwrap());
+            }
+        });
+
+        let (performed, coalesced) = group.counts();
+        assert_eq!(commits.load(Ordering::Relaxed), 2, "{FOLLOWERS} callers queued during one commit must share the next, not fsync each");
+        assert_eq!((performed, coalesced), (2, FOLLOWERS - 1), "all but the two leaders must be recorded as riding someone else's commit");
+    }
+
+    /// A panicking leader must hand leadership back, not strand every writer.
+    ///
+    /// This is the barrier every write crosses before it is acknowledged, so a
+    /// leader that dies still holding it parks all later callers on the condvar
+    /// permanently — the process stops acking writes altogether. The assertion
+    /// that matters is that the second call RETURNS at all; it hangs forever
+    /// without the `Drop`.
+    #[test]
+    fn a_panicking_leader_does_not_wedge_every_caller_behind_it() {
+        let group = GroupCommit::default();
+        let died = std::thread::scope(|scope| scope.spawn(|| group.commit(|| -> Result<(), &str> { panic!("disk on fire") })).join());
+        assert!(died.is_err(), "the panic must reach the leader's own caller");
+
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        group
+            .commit(|| {
+                committed.store(true, Ordering::Relaxed);
+                Ok::<_, &str>(())
+            })
+            .unwrap();
+        assert!(committed.load(Ordering::Relaxed), "the next caller must be able to lead; a panic must not advance the durable watermark either");
+    }
+
+    /// A failed commit must not be inherited: the waiters behind it retry.
+    #[test]
+    fn a_failed_commit_is_not_reported_as_durable_to_the_waiters() {
+        let group = GroupCommit::default();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let first = group.commit(|| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err::<(), &str>("disk full")
+        });
+        assert_eq!(first, Err("disk full"));
+        // The next caller must actually commit rather than read a `committed`
+        // watermark the failed attempt had no right to advance.
+        group
+            .commit(|| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, &str>(())
+            })
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
     }
 }
 
