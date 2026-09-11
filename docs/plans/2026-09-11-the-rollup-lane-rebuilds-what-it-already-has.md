@@ -27,6 +27,22 @@ DV-dedup (shipped 09-06) did its job: dedup is no longer the top lane.
   (1,462 identical, 6 changed). 650 of 656 repeated slices never varied at all.
 - DerivedRollup: 682 publications over 259 slices, repeat factor 2.63.
 
+**The 72.6% is window- and age-dependent — do not quote it as universal.** Prod
+restarted on its own at ~22:30Z, and the same measurement over a 50-minute window
+of the ~1h-old process reads repeat factor **1.06** and **34.6%** of bytes on
+repeats. That is expected, not a contradiction: the loop has a 32-minute period,
+so a 50-minute window cannot contain two full cycles, and a young process is
+doing genuine first-builds while it re-enumerates. What is invariant across both
+readings is the thing the fix keys on — **every consecutive republication of a
+slice emitted an identical row count** (48/48 and 7/7 on the young process,
+1,462/1,468 on the mature one).
+
+Treat ~35% as the floor and ~73% as the mature-process figure. The number to
+compare after the deploy is a RATE, and it was stable across two independent
+processes: **BaseRollup ≈ 18,000-20,000 worker-seconds per hour** (193,539/11h =
+17,594/h; 19,585 in the first hour of the new process) — about 5.5 cores held
+continuously.
+
 Backfill is **not** the explanation, and the census says so directly:
 `cells_missing=0 cells_wanted=0 tier_holes=0`, `contiguous_days=30` on every
 tier. Coverage converged. This is churn on a converged system.
@@ -95,11 +111,21 @@ Counter: `rollup_noop_rebuild_skipped_total`, read against
 `rollup_staged_projects_total`. Kill switch:
 `TIMEFUSION_ROLLUP_NOOP_SKIP_ENABLED=false`.
 
-Expected: removes ~72.6% of BaseRollup decoded bytes ≈ ~43% of maintenance
-worker-seconds **at this process's mix**. It does not touch rebuilds triggered by
-compaction, which really does move the paths — that is a separate, later lever.
+Expected: removes the exact-slice republications, which the two readings above
+bound at 35-73% of BaseRollup decoded bytes. Both measurements group by the FULL
+slice `(table, project, start, end)`, so every byte counted is one the skip can
+actually claim — there is no width-mismatch residual hiding inside the figure.
+It does not touch rebuilds triggered by compaction, which really does move the
+paths; that is a separate, later lever.
 
-It also does **not** unwedge the derived tier. That is fix 2.
+It also does **not** unwedge the derived tier, and does not make the wedge worse
+either: `tier_still_holds_slice` counts only CURRENT-generation files, so the
+stale file neither blocks nor enables the skip. The loop simply becomes
+metadata-cheap while staying wedged. That is fix 2.
+
+One cosmetic residual: a skipped unit leaves `task.publication` as `None` (the
+re-mint nulled it), so `published_rows_overlapping` slightly under-feeds its
+"published empty over full base" warning. It is a warning input only.
 
 ## Fix 2 — stop minting a rebuild that cannot help (NEXT)
 
@@ -121,7 +147,11 @@ obsolete-generation files whose range is covered by current-generation live file
 
 ## Not yet investigated
 
-- `pack_value_refused_rows = 74,058,028,385` against 27,620 refusals. Unread.
+- `pack_value_refused_rows = 74,058,028,385` against 27,620 refusals: the packer
+  value floor is in SHADOW mode (floor 0 counts and admits), so prod is running
+  27.6k low-fan-in bins that ClickHouse's selector would refuse. Already sized on
+  09-04 though — turning the floor on cuts Pack writes 66%, and Pack is 7% of the
+  lane, so it is worth ~1.06x overall. Real, small, known.
 - `dedup_skipped_pct = 0.1%` still: `cert_slice_files_proved` 10,693 vs
   `files_unproven` 99,513, `cert_skip_blocked_overlap` 120,321. The read-side
   dedup skip remains blocked by overlap, as on 09-05.
