@@ -524,7 +524,7 @@ mod builder_tests {
     fn index_builds_keep_scratch_off_the_process_temp_dir() {
         let scratch = tempfile::tempdir().expect("scratch root");
         let (blob, stats) = build_and_pack(&table(), &[batch(0), batch(1)], 1, MergeMode::Now, scratch.path()).expect("build");
-        verify_blob(&blob, scratch.path()).expect("verify");
+        verify_blob(&blob).expect("verify");
 
         assert_eq!(stats.rows, 2, "build must actually have indexed the batches");
         // Asserts the ROOT, not leftover files: every scratch dir is reclaimed
@@ -537,6 +537,27 @@ mod builder_tests {
     /// The scratch dir now outlives a hard kill (it is on the data volume, not
     /// the container's `/tmp`), so startup must reclaim it or a volume that
     /// also holds the WAL fills up.
+    /// COST guard: verification must not materialise the index a second time.
+    ///
+    /// It used to unpack the whole archive to disk purely to prove it opens —
+    /// roughly half of every build's disk cost, on the array client INSERTs
+    /// fsync against. A version that writes to disk still verifies correctly
+    /// and still passes the corrupt-blob tests, so the assertion has to be that
+    /// nothing was written.
+    #[test]
+    fn verifying_a_blob_materializes_nothing_on_disk() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (blob, _) = build_and_pack(&table(), &[batch(0), batch(1)], 1, MergeMode::Now, scratch.path()).expect("build");
+
+        let before = std::fs::read_dir(scratch_root(scratch.path())).map(|e| e.count()).unwrap_or(0);
+        verify_blob(&blob).expect("fresh blob verifies");
+        let after = std::fs::read_dir(scratch_root(scratch.path())).map(|e| e.count()).unwrap_or(0);
+
+        assert_eq!(before, after, "verification must not create a scratch directory");
+        assert!(verify_blob(&blob[..blob.len() / 2]).is_err(), "a truncated archive must still be rejected");
+        assert!(verify_blob(b"not an archive").is_err(), "garbage must still be rejected");
+    }
+
     #[test]
     fn startup_reaps_orphaned_scratch_but_spares_foreign_entries() {
         let root = tempfile::tempdir().expect("root");
@@ -1090,10 +1111,9 @@ pub async fn build_parquet_and_pack(
     let built = build.await.context("join streaming tantivy build")?;
     decode?;
     let (_built, stats) = built?;
-    let scratch = scratch.to_owned();
     tokio::task::spawn_blocking(move || {
         let blob = pack_dir(tmp.path(), level)?;
-        verify_blob(&blob, &scratch).context("verify packed blob")?;
+        verify_blob(&blob).context("verify packed blob")?;
         Ok::<_, anyhow::Error>((blob, stats))
     })
     .await
@@ -1199,16 +1219,46 @@ pub fn unpack_to_dir(blob: &[u8], dest: &Path) -> Result<()> {
 /// structurally-corrupt archive is never uploaded. Blob paths are immutable and
 /// reader-cached, so a poison blob would otherwise fail every future read until
 /// a manual reindex.
-pub fn verify_blob(blob: &[u8], scratch: &Path) -> Result<()> {
-    let tmp = scratch_tempdir(scratch).context("verify: tempdir")?;
-    unpack_to_dir(blob, tmp.path())?;
-    open_index(tmp.path()).map(drop)
+///
+/// Stages into a `RamDirectory` rather than onto disk. The guarantee is
+/// unchanged — every entry is still decoded in full and the index still has to
+/// `open` — but the second full-size materialisation is gone. It was pure
+/// waste: `zstd::decode_all` already holds the whole uncompressed tar in
+/// memory, so writing it out again bought nothing and doubled a build's disk
+/// cost. At prod's 5.4 builds/min against ~3.8 GB indexes that was roughly half
+/// of ~680 MB/s onto the array every client `fsync` waits on (2026-09-11).
+pub fn verify_blob(blob: &[u8]) -> Result<()> {
+    let tar_bytes = zstd::decode_all(blob).context("zstd decode")?;
+    let staged = tantivy::directory::RamDirectory::create();
+    let mut files = 0usize;
+    for entry in tar::Archive::new(&tar_bytes[..]).entries().context("tar entries")? {
+        let mut entry = entry.context("tar entry")?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        // `pack_dir` tars with `append_dir_all(".", …)`, so paths arrive as
+        // `./meta.json`. A tantivy index directory is flat, so the file name is
+        // exactly the key tantivy will look the entry up by.
+        let entry_path = entry.path().context("tar entry path")?.into_owned();
+        let Some(name) = entry_path.file_name().map(PathBuf::from) else { continue };
+        let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
+        std::io::Read::read_to_end(&mut entry, &mut bytes).context("read tar entry")?;
+        tantivy::Directory::atomic_write(&staged, &name, &bytes).context("stage tar entry")?;
+        files += 1;
+    }
+    if files == 0 {
+        anyhow::bail!("packed blob contains no files");
+    }
+    open_index_in(staged).map(drop)
 }
 
 /// Open an unpacked tantivy index for querying.
 pub fn open_index(dir: &Path) -> Result<Index> {
-    let mm = MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
-    let index = Index::open(mm).map_err(|e| anyhow!("open index: {e}"))?;
+    open_index_in(MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?)
+}
+
+fn open_index_in(dir: impl tantivy::Directory) -> Result<Index> {
+    let index = Index::open(dir).map_err(|e| anyhow!("open index: {e}"))?;
     // Tokenizer registry is per-Index, not persisted, so the reader must
     // re-register exactly the same chains the writer used. Mismatch ⇒ silent
     // miss (tantivy looks up by name and falls back to default).

@@ -1383,7 +1383,7 @@ impl TantivyIndexService {
         let pack_result = tokio::task::spawn_blocking(move || {
             let (blob, stats) = super::build_and_pack(svc_table, &batches, level, merge, &scratch)?;
             // Guard against publishing a corrupt archive (see super::verify_blob).
-            super::verify_blob(&blob, &scratch).context("verify packed blob")?;
+            super::verify_blob(&blob).context("verify packed blob")?;
             Ok::<_, anyhow::Error>((blob, stats))
         })
         .await

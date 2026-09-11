@@ -175,11 +175,11 @@ fn verify_blob_accepts_built_index_and_rejects_corruption() {
     // that produced corrupt blobs is timing-dependent — the fix is the
     // `wait_merging_threads()` join in `index_to_writer`; this pins the guard.
     let (blob, _) = timefusion::tantivy::build_and_pack(&table(), &[batch()], 3, MergeMode::Now, &std::env::temp_dir()).expect("build_and_pack");
-    verify_blob(&blob, &std::env::temp_dir()).expect("freshly built blob must verify");
+    verify_blob(&blob).expect("freshly built blob must verify");
 
     // Truncating the blob yields an invalid tar.zst; verify must error, not panic.
-    assert!(timefusion::tantivy::verify_blob(&blob[..blob.len() / 2], &std::env::temp_dir()).is_err(), "corrupt blob must be rejected");
-    assert!(timefusion::tantivy::verify_blob(b"not a tantivy archive", &std::env::temp_dir()).is_err(), "garbage blob must be rejected");
+    assert!(timefusion::tantivy::verify_blob(&blob[..blob.len() / 2]).is_err(), "corrupt blob must be rejected");
+    assert!(timefusion::tantivy::verify_blob(b"not a tantivy archive").is_err(), "garbage blob must be rejected");
 }
 
 #[tokio::test]
