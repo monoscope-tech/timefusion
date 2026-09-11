@@ -231,7 +231,7 @@ async fn callback_builds_index_and_search_returns_hits() {
 
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.clone().batch_callback();
 
     // here are timestamp/id/level — the rest of the columns can be missing
@@ -267,7 +267,7 @@ async fn multi_pred_and_is_single_pass_and_conjunctive() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-multipred";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "ERROR")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
@@ -290,7 +290,7 @@ async fn single_file_flush_publishes_partition_mirrored_blob() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-mirrored";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
     let uri = format!("s3://bucket/timefusion/default/{table_name}/project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
     let rel = format!("project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
@@ -315,7 +315,7 @@ async fn reader_cache_avoids_reopen_across_queries() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-readercache";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "ERROR")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
@@ -345,7 +345,7 @@ async fn seeded_cache_serves_first_query_without_object_store_reads() {
     assert!(cfg.seed_cache_on_publish(), "seeding is the default this test covers");
 
     let cache = TempDir::new().unwrap();
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
 
@@ -373,7 +373,7 @@ async fn rebuilding_the_same_file_replaces_cached_terms_without_overwriting_old_
     let cfg = Arc::new(prod_defaults());
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().into(), cfg.clone()));
-    let indexer = Arc::new(TantivyIndexService::new(store.clone(), cfg, std::env::temp_dir()));
+    let indexer = Arc::new(TantivyIndexService::new(store.clone(), cfg, std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     indexer.with_reader(&search);
     let callback = indexer.clone().batch_callback();
     let uri = format!("s3://bucket/{table}/project_id={project}/date=2026-09-08/part-file.parquet");
@@ -418,7 +418,7 @@ async fn concurrent_install_of_same_index_is_idempotent() {
     let project_id = "p-race";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
@@ -447,7 +447,7 @@ async fn publishing_keeps_the_manifest_cache_warm_and_current() {
     let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = Arc::new(FailAfterArm::new(inner));
     let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
@@ -484,7 +484,7 @@ async fn a_batched_manifest_commit_lands_every_deferred_entry() {
     let project_id = "p-batch";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
@@ -529,7 +529,7 @@ async fn gc_after_compaction_drops_the_cached_manifest() {
     let project_id = "p-manifest-gc";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone(), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cache = TempDir::new().unwrap();
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
     svc.with_reader(&search);
@@ -624,7 +624,7 @@ async fn callback_skips_when_table_not_indexed() {
     // no schema and no override-list match — callback must be a no-op.
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig::default();
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "INFO")]);
     cb("p1".into(), "no_such_table".into(), vec![b], vec![]).await.expect("noop callback");
@@ -670,7 +670,7 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     let project_id = "p1";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.clone().batch_callback();
     cb(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "INFO")])], vec!["file_a".into()]).await.unwrap();
     cb(project_id.into(), table_name.into(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["file_b".into()]).await.unwrap();
@@ -705,7 +705,7 @@ async fn carry_forward_matches_relative_and_absolute_paths_alike() {
     let (table_name, project_id) = ("otel_logs_and_spans", "p-relpaths");
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     // Covered under an ABSOLUTE uri, exactly as the flush/optimize paths record it.
     let abs = "s3://bucket/timefusion/default/otel_logs_and_spans/project_id=p-relpaths/date=2026-08-01/in.parquet";
     svc.clone().batch_callback()(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec![abs.into()]).await.unwrap();
@@ -728,7 +728,7 @@ async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
     let (table_name, project_id) = ("otel_logs_and_spans", "p-carry");
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.clone().batch_callback();
     for (ts, id, uri) in [(1_000_000, "a", "in_a"), (2_000_000, "b", "in_b")] {
         cb(project_id.into(), table_name.into(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
@@ -768,7 +768,7 @@ async fn gc_keeps_a_multi_file_entry_for_its_surviving_files() {
     let (table_name, project_id) = ("otel_logs_and_spans", "p1");
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     // Two added files in ONE commit => one entry covering both.
     svc.clone().batch_callback()(
         project_id.into(),
@@ -803,7 +803,7 @@ async fn search_time_prunes_non_overlapping_indexes() {
     let project_id = "p1";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
 
     let old_ts = 1_000_000_000i64; // ~16:40 1970
@@ -837,7 +837,7 @@ async fn search_skips_indexes_that_dont_have_the_field() {
     let project_id = "p1";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "INFO")]);
     cb(project_id.into(), table_name.into(), vec![b], vec!["uri".into()]).await.unwrap();
@@ -861,7 +861,7 @@ async fn a_fat_needle_aborts_before_materializing_hits() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-fatneedle";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(prod_defaults()), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(prod_defaults()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
     let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
     let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();

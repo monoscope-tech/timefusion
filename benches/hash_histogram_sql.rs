@@ -207,7 +207,7 @@ async fn database(config: Arc<AppConfig>, cache: &Path) -> Result<(Arc<Database>
     let storage = format!("s3://timefusion-tests/{}/tantivy", config.core.timefusion_table_prefix);
     let store = db.create_object_store(&storage, &config.aws.build_storage_options(None)).await?;
     let search = Arc::new(TantivySearchService::new(store.clone(), cache.join("indexes"), Arc::new(config.tantivy.clone())));
-    let indexer = Arc::new(TantivyIndexService::new(store, Arc::new(config.tantivy.clone()), std::env::temp_dir()));
+    let indexer = Arc::new(TantivyIndexService::new(store, Arc::new(config.tantivy.clone()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     indexer.with_reader(&search);
     Ok((Arc::new(db.with_tantivy_search(search.clone()).with_tantivy_indexer(indexer)), search))
 }

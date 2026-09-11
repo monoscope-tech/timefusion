@@ -143,7 +143,7 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     }
     object_store::ObjectStoreExt::put(store_obj.as_ref(), &object_store::path::Path::from(parquet_rel), buf.into()).await.expect("put parquet");
 
-    let svc = Arc::new(TantivyIndexService::new(store_obj.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir()));
+    let svc = Arc::new(TantivyIndexService::new(store_obj.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let parquet_uri = format!("s3://bucket/tf/{TABLE}/{parquet_rel}");
     svc.build_index_for_file(TABLE, "p1", parquet_rel, &parquet_uri, store_obj.clone()).await.expect("build_index_for_file");
 

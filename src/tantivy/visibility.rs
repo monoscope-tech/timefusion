@@ -589,7 +589,7 @@ mod tests {
             assert!(!changed.matches(&root, &files, schema), "proof must reject visibility change {change}");
         }
         let store = Arc::new(object_store::memory::InMemory::new());
-        let indexer = crate::tantivy::search::TantivyIndexService::new(store.clone(), Arc::new(Default::default()), std::env::temp_dir());
+        let indexer = crate::tantivy::search::TantivyIndexService::new(store.clone(), Arc::new(Default::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())));
         let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
         for offset in 0..35 {
             indexer.publish_count_proof("mor_versioned", "project", start + chrono::Duration::days(offset), proof.clone()).await?;

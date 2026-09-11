@@ -1133,7 +1133,17 @@ pub(crate) fn scratch_root(root: &Path) -> std::path::PathBuf {
 /// Snapshot-then-delete off-thread, and only touch `TempDir`'s own `.tmp*`
 /// names, for the reason `reap_orphaned_spill_dirs` documents: enumerating
 /// lazily would race directories a live build is creating.
+///
+/// Runs at most ONCE per process. A second service constructed later shares the
+/// root with the first, and its "orphans" would be the first's live scratch —
+/// the suite caught exactly that (19 tantivy failures, green in isolation).
 pub fn reap_orphaned_scratch_dirs(root: &Path) {
+    static REAPED: std::sync::Once = std::sync::Once::new();
+    let mut ran = false;
+    REAPED.call_once(|| ran = true);
+    if !ran {
+        return;
+    }
     let base = scratch_root(root);
     let orphans: Vec<std::path::PathBuf> = std::fs::read_dir(&base)
         .map(|entries| entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".tmp")).map(|e| e.path()).collect())

@@ -211,7 +211,7 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
         let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg_arc.core.timefusion_table_prefix);
         let storage_opts = cfg_arc.aws.build_storage_options(None);
         let obj_store = db.create_object_store(&storage_uri, &storage_opts).await.ok()?;
-        let s = Arc::new(TantivyIndexService::new(obj_store.clone(), Arc::new(cfg_arc.tantivy.clone()), std::env::temp_dir()));
+        let s = Arc::new(TantivyIndexService::new(obj_store.clone(), Arc::new(cfg_arc.tantivy.clone()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
         layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&s)));
         let cache_root = cfg_arc.core.timefusion_data_dir.clone();
         let search = Arc::new(TantivySearchService::new(obj_store, cache_root, Arc::new(cfg_arc.tantivy.clone())));
