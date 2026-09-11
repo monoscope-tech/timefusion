@@ -1271,6 +1271,7 @@ pub struct TantivyIndexService {
 
 impl TantivyIndexService {
     pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>, scratch_root: PathBuf) -> Self {
+        crate::tantivy::reap_orphaned_scratch_dirs(&scratch_root);
         Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN), reader: Mutex::new(None), scratch_root }
     }
 

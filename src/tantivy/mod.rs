@@ -534,6 +534,30 @@ mod builder_tests {
         assert!(scratch.path().join("tantivy_scratch").is_dir(), "build must root its scratch under the volume it was given");
     }
 
+    /// The scratch dir now outlives a hard kill (it is on the data volume, not
+    /// the container's `/tmp`), so startup must reclaim it or a volume that
+    /// also holds the WAL fills up.
+    #[test]
+    fn startup_reaps_orphaned_scratch_but_spares_foreign_entries() {
+        let root = tempfile::tempdir().expect("root");
+        let base = scratch_root(root.path());
+        std::fs::create_dir_all(base.join(".tmpORPHAN")).expect("orphan");
+        std::fs::write(base.join(".tmpORPHAN/big.store"), b"x").expect("orphan file");
+        std::fs::create_dir_all(base.join("tantivy_cache_like")).expect("foreign");
+
+        reap_orphaned_scratch_dirs(root.path());
+        // The reaper runs off-thread; join by waiting for the observable effect.
+        for _ in 0..200 {
+            if !base.join(".tmpORPHAN").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(!base.join(".tmpORPHAN").exists(), "orphaned scratch dir must be reclaimed at startup");
+        assert!(base.join("tantivy_cache_like").exists(), "reaper must only touch TempDir's own .tmp* names");
+    }
+
     #[test]
     fn committed_file_build_consumes_a_bounded_batch_stream() {
         assert_eq!(crate::tantivy::PARQUET_INDEX_BATCH_WINDOW, 2);
@@ -1088,9 +1112,42 @@ pub async fn build_parquet_and_pack(
 /// scratch on the data volume puts the bytes where the operator has already
 /// sized and can observe them, and off the container's copy-on-write layer.
 fn scratch_tempdir(root: &Path) -> Result<tempfile::TempDir> {
-    let base = root.join("tantivy_scratch");
+    let base = scratch_root(root);
     std::fs::create_dir_all(&base).with_context(|| format!("create scratch root {}", base.display()))?;
     tempfile::TempDir::new_in(&base).with_context(|| format!("tempdir under {}", base.display()))
+}
+
+pub(crate) fn scratch_root(root: &Path) -> std::path::PathBuf {
+    root.join("tantivy_scratch")
+}
+
+/// Delete scratch directories left by a previous process, once at startup.
+///
+/// `TempDir` reclaims on drop, but this process does not always get to drop:
+/// prod dies by healthcheck kill and maintenance units die to process exit as a
+/// matter of course. While scratch lived in the container's `/tmp` that was
+/// harmless — the writable layer went away with the container. On the data
+/// volume it does not, and multi-GB indexes would accumulate on a volume that
+/// also carries the WAL, where running out of space fails WAL appends.
+///
+/// Snapshot-then-delete off-thread, and only touch `TempDir`'s own `.tmp*`
+/// names, for the reason `reap_orphaned_spill_dirs` documents: enumerating
+/// lazily would race directories a live build is creating.
+pub fn reap_orphaned_scratch_dirs(root: &Path) {
+    let base = scratch_root(root);
+    let orphans: Vec<std::path::PathBuf> = std::fs::read_dir(&base)
+        .map(|entries| entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".tmp")).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    if orphans.is_empty() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("tantivy-scratch-reap".into())
+        .spawn(move || {
+            let removed = orphans.iter().filter(|path| std::fs::remove_dir_all(path).is_ok()).count();
+            warn!("reaped {removed} orphaned tantivy scratch dir(s) of {} found", orphans.len());
+        })
+        .map_or_else(|e| warn!("tantivy scratch reap: cannot spawn reaper for {base:?}: {e}"), |_| ());
 }
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot, then
