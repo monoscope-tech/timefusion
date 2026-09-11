@@ -74,7 +74,8 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     let table = table();
     let batches = vec![batch()];
 
-    let (blob, stats): (_, IndexBuildStats) = timefusion::tantivy::build_and_pack(&table, &batches, 3, MergeMode::Deferred, &std::env::temp_dir()).expect("build_and_pack");
+    let (blob, stats): (_, IndexBuildStats) =
+        timefusion::tantivy::build_and_pack(&table, &batches, 3, MergeMode::Deferred, &std::env::temp_dir()).expect("build_and_pack");
     assert_eq!(stats.rows, 3);
     assert!(!blob.is_empty());
 
@@ -143,7 +144,11 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     }
     object_store::ObjectStoreExt::put(store_obj.as_ref(), &object_store::path::Path::from(parquet_rel), buf.into()).await.expect("put parquet");
 
-    let svc = Arc::new(TantivyIndexService::new(store_obj.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
+    let svc = Arc::new(TantivyIndexService::new(
+        store_obj.clone(),
+        Arc::new(TantivyConfig::default()),
+        std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
+    ));
     let parquet_uri = format!("s3://bucket/tf/{TABLE}/{parquet_rel}");
     svc.build_index_for_file(TABLE, "p1", parquet_rel, &parquet_uri, store_obj.clone()).await.expect("build_index_for_file");
 

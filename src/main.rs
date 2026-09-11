@@ -1063,7 +1063,11 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         (false, bucket) if !bucket.is_empty() => {
             let storage_uri = format!("s3://{bucket}/{}/tantivy", cfg.core.timefusion_table_prefix);
             let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
-            db.with_tantivy_indexer(Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store, Arc::new(cfg.tantivy.clone()), cfg.core.timefusion_data_dir.clone())))
+            db.with_tantivy_indexer(Arc::new(timefusion::tantivy::search::TantivyIndexService::new(
+                obj_store,
+                Arc::new(cfg.tantivy.clone()),
+                cfg.core.timefusion_data_dir.clone(),
+            )))
         }
         _ => db,
     };

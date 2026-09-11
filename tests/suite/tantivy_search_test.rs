@@ -267,7 +267,11 @@ async fn multi_pred_and_is_single_pass_and_conjunctive() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-multipred";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
+    let svc = Arc::new(TantivyIndexService::new(
+        store.clone(),
+        Arc::new(TantivyConfig::default()),
+        std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
+    ));
     let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "ERROR")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
@@ -290,7 +294,11 @@ async fn single_file_flush_publishes_partition_mirrored_blob() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-mirrored";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
+    let svc = Arc::new(TantivyIndexService::new(
+        store.clone(),
+        Arc::new(TantivyConfig::default()),
+        std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
+    ));
     let cb = svc.batch_callback();
     let uri = format!("s3://bucket/timefusion/default/{table_name}/project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
     let rel = format!("project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
@@ -315,7 +323,11 @@ async fn reader_cache_avoids_reopen_across_queries() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-readercache";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
+    let svc = Arc::new(TantivyIndexService::new(
+        store.clone(),
+        Arc::new(TantivyConfig::default()),
+        std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
+    ));
     let cb = svc.batch_callback();
     let b = batch(&[(1_000_000, "a", "ERROR")]);
     cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
@@ -861,7 +873,8 @@ async fn a_fat_needle_aborts_before_materializing_hits() {
     let table_name = "otel_logs_and_spans";
     let project_id = "p-fatneedle";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(prod_defaults()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
+    let svc =
+        Arc::new(TantivyIndexService::new(store.clone(), Arc::new(prod_defaults()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let cb = svc.batch_callback();
     let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
     let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();

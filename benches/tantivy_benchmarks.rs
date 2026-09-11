@@ -150,7 +150,8 @@ fn bench_size_ratio(c: &mut Criterion) {
     let table = table();
     let n = 100_000usize;
     let b = synthetic_batch(n);
-    let (blob, stats) = timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now, &std::env::temp_dir()).unwrap();
+    let (blob, stats) =
+        timefusion::tantivy::build_and_pack(&table, std::slice::from_ref(&b), 19, timefusion::tantivy::MergeMode::Now, &std::env::temp_dir()).unwrap();
     let bytes_per_row = blob.len() as f64 / stats.rows as f64;
     println!("tantivy index size: {} bytes for {} rows ({:.2} bytes/row)", blob.len(), stats.rows, bytes_per_row);
     c.bench_function("tantivy_pack_100k_zstd_19", |bench| {
@@ -211,7 +212,11 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
         let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg_arc.core.timefusion_table_prefix);
         let storage_opts = cfg_arc.aws.build_storage_options(None);
         let obj_store = db.create_object_store(&storage_uri, &storage_opts).await.ok()?;
-        let s = Arc::new(TantivyIndexService::new(obj_store.clone(), Arc::new(cfg_arc.tantivy.clone()), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
+        let s = Arc::new(TantivyIndexService::new(
+            obj_store.clone(),
+            Arc::new(cfg_arc.tantivy.clone()),
+            std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4())),
+        ));
         layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&s)));
         let cache_root = cfg_arc.core.timefusion_data_dir.clone();
         let search = Arc::new(TantivySearchService::new(obj_store, cache_root, Arc::new(cfg_arc.tantivy.clone())));
