@@ -109,7 +109,60 @@ binary and the blast radius is limited to the entries that cost disk bandwidth.
 Follows the existing kill-switch convention
 (`TIMEFUSION_REPAIR_RESUME_ENABLED`, `TIMEFUSION_LANDED_SKIP_ENABLED`).
 
-## Stage 2 — read the counters, then decide
+## STAGE 2 RESULT (2026-09-12): hypothesis REFUTED by its own instrument
+
+Shipped as `2e96eec7`, read on prod at ~1 h uptime.
+
+| counter | value |
+| --- | --- |
+| `admit_write_capture_bytes` | **0** |
+| `write_capture_admitted` | **0** |
+| `admit_read_miss_bytes` | 290 GB (≈ `inner_bytes_read`, so genuine R2 reads) |
+| read-miss admissions, 90 s delta | **1.4 MB/s** |
+| device writes, same window | **616 MB/s** |
+
+**Write-capture admits nothing at all**, and total foyer admissions are ~1.4 MB/s
+against 616 MB/s of device writes. Per this plan's own third branch: **do not
+flip the flag.** The arithmetic that motivated it — 4.2 evictions/s × ~120 MB —
+was a coincidence, the fifth such in this investigation.
+
+A 90 s delta with the device at 616 MB/s shows `processed_bytes_total` **0**,
+WAL `disk_bytes` **0**, flush 53 KB/s. **Nothing in TimeFusion's accounting
+explains the writes.**
+
+### Two measurement traps this stage paid for
+
+**A stats reading of exactly 0 may be a lock artifact, not data.**
+`runtime_stats` calls `try_get_stats()` — a non-blocking `try_read` that returns
+`CacheStats::default()` when contended. An intermediate reading showed
+`hits`/`misses`/`inner_bytes_read`/`bytes_served` all at exactly 0 while
+admissions stood at 290 GB, and that was read as "nothing was fetched from R2".
+It was four zeros from one failed lock. **Four counters reading exactly zero at
+once is the tell.** Re-read until a delta is non-trivial before concluding.
+
+**The first gate reached none of the traffic.** It covered `put_multipart` only,
+while the bulk of write-side warming goes through single-part `put_cached`
+(`storage.rs:1563`, "Warm the cache directly from the just-written bytes"). Real
+code, real test, zero effect — the ingest-dedup failure mode exactly. Fixed by
+tagging and gating that path too, with a guard that fails when reverted. It
+turned out not to be the flood either, but the accounting was actively
+misleading: a write was being counted as a read miss.
+
+### What is still unattributed, and the one candidate left
+
+616 MB/s with every application-level channel idle. The remaining hypothesis is
+**foyer's block-engine internal reclamation**: `l2_used_bytes` is pinned
+byte-identical at 638.66 GB against a 600 GB cap, evictions tick at ~8.5/s with
+essentially no admissions to drive them, and the engine uses **2 GB blocks**. A
+cache structurally over capacity may be in a permanent relocate-to-reclaim loop
+— which would be invisible to every counter added here, because it is below the
+admission layer.
+
+Testing that needs file-level attribution on the host (which region files are
+being rewritten), i.e. root access this investigation does not have. It is the
+next instrument, and it is an ops task rather than a code one.
+
+## Stage 2 — original decision table (kept for the record)
 
 Wait **≥2 h after deploy** before quoting anything: a restart re-inflates the
 maintenance queue for ~25 min and resets every counter, and a young process

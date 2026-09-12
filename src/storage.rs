@@ -1222,7 +1222,7 @@ impl FoyerObjectStoreCache {
             span.record("cache_entry_bytes", data.len() as i64);
             span.record("cache_admission", if data.len() > self.config.l1_max_entry_bytes { "disk" } else { "memory" });
             let data = Bytes::from(data);
-            self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
+            self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()), AdmitSource::ReadMiss);
             Ok(Self::make_get_result(data, result.meta))
         }
         .await;
@@ -1560,7 +1560,7 @@ impl FoyerObjectStoreCache {
         if payload_size > 0 {
             let data = payload_for_cache.as_ref().concat();
             let meta = put_result_meta(location.clone(), payload_size as u64, &result);
-            self.insert_main_value(location, CacheValue::new(data, meta));
+            self.insert_main_value(location, CacheValue::new(data, meta), AdmitSource::WriteCapture);
             debug!("Warmed cache from write payload: {} (size: {} bytes)", location, payload_size);
         }
 
@@ -1584,13 +1584,23 @@ impl FoyerObjectStoreCache {
     /// Admit a full-file entry to the main cache, honoring the recent-days
     /// window (cold/old partitions are skipped → served from S3) and steering
     /// large entries to disk-only so they don't evict the L1 hot set.
-    fn insert_main_value(&self, location: &Path, value: CacheValue) {
+    fn insert_main_value(&self, location: &Path, value: CacheValue, source: AdmitSource) {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
+            return;
+        }
+        // A write-side admission above the L1 cap is bound for the disk tier,
+        // and that write is what `timefusion_write_capture_l2` governs. The
+        // single-part PUT path warms from the written payload exactly as the
+        // multipart tee does, so it has to honour the same gate — it carries
+        // the larger share of the traffic in practice.
+        let disk_bound = value.data.len() > self.config.l1_max_entry_bytes;
+        if source == AdmitSource::WriteCapture && disk_bound && !self.config.write_capture_to_l2 {
+            self.admission.write_capture_declined.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let (key, bytes) = (Self::make_cache_key(location), value.data.len() as u64);
         if self.admit(&self.cache, key.clone(), value, self.config.l1_max_entry_bytes) {
-            self.admission.record(AdmitSource::ReadMiss, &key, bytes);
+            self.admission.record(source, &key, bytes);
         }
     }
 
@@ -2551,6 +2561,43 @@ mod tests {
             );
             // Declining admission must never affect the upload itself.
             assert_eq!(cache.get(&Path::from("t/date=2026-09-12/big.parquet")).await?.bytes().await?.len(), big.len());
+            cache.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    /// The SINGLE-PART put path warms the cache from the written payload just
+    /// as the multipart tee does, and must honour the same gate.
+    ///
+    /// This is the test that would have caught the first version of the fix.
+    /// It gated `put_multipart` only, and prod then reported
+    /// `write_capture_admitted = 0` alongside 290 GB of admissions in 13
+    /// minutes — all of it from `put_cached`, mislabelled as read-miss. The
+    /// gate was real, tested, and reached none of the traffic.
+    #[tokio::test]
+    async fn write_capture_l2_flag_also_governs_the_single_part_put_path() -> anyhow::Result<()> {
+        let big = PutPayload::from(Bytes::from(vec![b'p'; 2 * 1024 * 1024])); // > 1MB L1 cap
+        for (to_l2, admitted, declined) in [(true, 1, 0), (false, 0, 1)] {
+            let inner = Arc::new(InMemory::new());
+            let config = FoyerCacheConfig::test_config_with(&format!("wc_put_{to_l2}"), |c| {
+                c.write_capture_to_l2 = to_l2;
+            });
+            let _dir = CacheDirGuard(config.cache_dir.clone());
+            let cache = FoyerObjectStoreCache::new(inner, config).await?;
+            let path = Path::from("t/date=2026-09-12/put.parquet");
+
+            cache.put(&path, big.clone()).await?;
+
+            let admission = cache.admission();
+            assert_eq!(
+                admission.write_capture_admitted.load(Ordering::Relaxed),
+                admitted,
+                "write_capture_to_l2={to_l2}: a single-part PUT warm is write capture, and is counted as such"
+            );
+            assert_eq!(admission.write_capture_declined.load(Ordering::Relaxed), declined, "write_capture_to_l2={to_l2}: wrong decline count");
+            assert_eq!(admission.read_miss_bytes.load(Ordering::Relaxed), 0, "a write must never be accounted as a read miss");
+            // The object itself is unaffected either way.
+            assert_eq!(cache.get(&path).await?.bytes().await?.len(), 2 * 1024 * 1024);
             cache.shutdown().await?;
         }
         Ok(())
