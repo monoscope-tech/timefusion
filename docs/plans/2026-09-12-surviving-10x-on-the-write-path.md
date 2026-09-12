@@ -35,15 +35,45 @@ The previous round left ~300 MB/s unattributed and guessed at DataFusion spill.
 | `flush_sort_spill` | 2 (empty) |
 | **`tantivy_scratch`** | **109,797** |
 
-Every spill pool is empty. Combined with foyer population measured at
-**10.8 MB/s** (`inner_bytes_read` 312 GB / 8 h), essentially **all** of the
-~340-794 MB/s of local write traffic is Tantivy index construction.
+Spill was re-checked six times over 50 s *while the device sustained 507 MB/s*
+(cgroup `wbytes` delta) and was empty in every sample — so this is not a
+snapshot artefact of transient files. **Spill is exonerated.**
 
-This is the first attribution in this whole investigation that comes from a
-direct measurement of the thing itself rather than arithmetic. Three earlier
-candidates — `persist_rollup_journal`, foyer, DataFusion spill — were each
-plausible from a code read and each refuted by measurement. Do not re-propose
-them.
+**But Tantivy is exonerated too, and that killed this note's first conclusion.**
+`tantivy_index_built` logs `index_bytes`. Over 60 minutes: **203 builds,
+3,033 MB of index output total = 0.84 MB/s**, largest single index 324 MB. Even
+at a generous 3x build-time amplification that is ~2.5 MB/s. Tantivy cannot be
+500 MB/s, and `tantivy_scratch` holding 109,797 files turned out to be just
+**3 live build directories**, not a leak.
+
+### The leading candidate: write-capture churn in a permanently full foyer L2
+
+Read-side foyer counters are small (`inner_bytes_read` 10.8 MB/s), which is what
+made foyer look innocent twice. **The write side is not counted there at all.**
+`CachingMultipartUpload` tees every completed upload into the cache — so every
+parquet file maintenance writes to R2 is *also* written to local L2.
+
+The arithmetic is consistent for the first time:
+
+| observation | value |
+| --- | --- |
+| device write rate (cgroup `wbytes`, 50 s) | **507 MB/s** |
+| foyer evictions (45 s delta) | 191 → **4.2/s** |
+| `l2_used_bytes` | **638.66 GB, pinned** (cap is 600 GB) |
+| mean entry size (638 GB / 2,067 entries) | ~309 MB |
+| 4.2/s × ~120 MB | **~504 MB/s** |
+
+L2 is permanently over cap, so every admission forces an eviction: each
+maintenance output costs a full-size local write plus a full-size eviction,
+forever, for data that is mostly never read again. `cache_recent_days = 35`
+admits essentially everything maintenance produces.
+
+**Confidence: this is the leading hypothesis with consistent arithmetic, not an
+established fact.** Four candidates have now been killed by measurement
+(`persist_rollup_journal`, foyer *reads*, DataFusion spill, Tantivy) and two of
+those looked equally solid before they fell. The counters in Phase 0 are what
+settle it — specifically a `foyer_admit_bytes` split by admission source
+(write-capture vs read-miss).
 
 ## The multiplier nobody costed: `md3` is a 4-way MIRROR
 
@@ -94,24 +124,30 @@ What can be said without that split:
 - **Steady-state indexing scales linearly with ingest.** 10x ingest → ~10x flush
   files → ~10x index builds. Whatever fraction *f* of today's 500 MB/s is
   steady state becomes `10 × f × 500 MB/s`.
-- **Backfill does not shrink at 10x, it grows.** More ingest means more files
-  entering the uncovered set, so the catch-up term is not a fixed debt that
-  retires — at 10x it is a larger standing queue unless throughput per unit
-  improves.
+- **Backfill inflow is ongoing, not a retiring debt.** The census breaks down as
+  `today=207` — 207 of the 783 uncovered files were created *today*, so files
+  keep entering the uncovered set rather than the set simply draining. Whether
+  it converges depends on whether backfill throughput exceeds that inflow, which
+  is exactly what the counters must measure.
 - **The mirror multiplies whatever the answer is by 4.**
+
+Stated in **logical** terms throughout, since the ×4 applies only to device
+traffic:
 
 | | now (1x, measured) | 10x |
 | --- | --- | --- |
 | ingest reaching Delta | 5.45 MB/s | 55 MB/s |
-| logical local writes | ~500 MB/s (mixed steady + backfill) | `10 × f × 500` + backfill |
-| **device writes (×4 mirror)** | **~2 GB/s** | 4× the above |
-| array ceiling | **~1.6-2 GB/s, measured at 100% util** | unchanged |
+| logical local writes | **~507 MB/s** | ~10× whatever is ingest-proportional |
+| **logical ceiling** | **~0.8 GB/s** — one drive's worth, because RAID1 | unchanged |
+| device traffic at that ceiling | ~3.2 GB/s across 4 drives | unchanged |
 
-Even at a conservative *f* = 0.3, steady state alone reaches ~1.5 GB/s logical /
-6 GB/s device at 10x — still **~3x past the measured ceiling**, before backfill.
-The conclusion survives the uncertainty; the exact multiple does not. Scheduling
-cannot fix this, because scheduling changes who waits, not how many bytes must
-land. **The byte count and the mirror are the two terms that have to move.**
+We are already at **~63% of the logical ceiling**, and the peak sample (794 MB/s
+at 100% util, `w_await` in the hundreds of ms) is essentially *at* it. Any
+ingest-proportional term multiplied by 10 blows straight through.
+
+Scheduling cannot fix this, because scheduling changes who waits, not how many
+bytes must land. **The byte count and the mirror are the two terms that have to
+move.**
 
 ## Solutions, cheapest first, with what each is worth
 
@@ -131,6 +167,23 @@ note an extrapolation from a backfill-contaminated number. The counters are
 behaviour-neutral; they ship with whatever goes next.
 
 ### Tier A — do less work (worth ~2-4x, no infra change)
+
+**A0. Stop write-capturing maintenance output into L2.** If the attribution
+above holds, this is the whole problem and the cheapest fix in this document.
+Maintenance rewrites files constantly; teeing each rewrite into a cache that is
+already over capacity buys a cache entry that is evicted almost immediately,
+at the cost of a full-size local write *and* a full-size eviction.
+
+RocksDB is the precedent in both directions: compaction **reads** take
+`fill_cache=false`, and compaction **output** is not pushed into the block cache
+on the theory that freshly-written data is not necessarily hot. TimeFusion does
+the opposite by default.
+
+Three dials, cheapest first: exclude maintenance-authored uploads from the tee
+(the writer knows it is maintenance); tighten `cache_recent_days` from **35** so
+the window actually filters; and stop running L2 **38 GB over its 600 GB cap**,
+which guarantees an eviction per admission. Note the last one alone is not
+enough — a smaller cache still writes every admission.
 
 **A1. Coarsen index granularity above the flush file.** Indexes are built per
 flush commit, on small 10-minute-bucket files.
@@ -239,13 +292,27 @@ at 20x.
 
 ## Recommended order
 
-1. **Phase 0 counters** — blocking, behaviour-neutral, ship with anything.
-2. **A1** (don't index doomed flush files) — biggest volume lever in software.
-3. **B1** (latency-fed maintenance scheduling + preemption) — protects p99 while
-   A1 lands.
-4. **A2/A3** — small, cheap, mechanisms mostly exist.
-5. **C** — decide deliberately; large win, real operational risk.
-6. **D** — only if 10x is a commitment rather than a projection.
+1. **Phase 0 counters** — blocking, behaviour-neutral, ship with anything. The
+   one that matters most is `foyer_admit_bytes` split by source, because it
+   confirms or kills A0 in a single reading.
+2. **A0** (stop write-capturing maintenance output) — if the attribution holds,
+   this is most of the 507 MB/s, and it is a config-and-predicate change rather
+   than an architecture change.
+3. **B1** (latency-fed maintenance scheduling + preemption) — protects p99
+   regardless of which attribution wins, since it is agnostic to *which*
+   background work is flooding.
+4. **A1/A1b/A2/A3** — index granularity, backfill bounding, RAM builds, scan
+   bypass. Real but second-order next to A0.
+5. **C** (RAID split) — decide deliberately; large win, real operational risk.
+6. **D** (offload) — only if 10x is a commitment rather than a projection.
+
+**A caution this document earned.** Four attributions have now been killed by
+measurement in two days: `persist_rollup_journal` (file was 105 KB, not 15 MB),
+foyer *reads* (240x too small), DataFusion spill (empty across six samples under
+load), and Tantivy (0.84 MB/s of output). Each was plausible from a code read;
+two were asserted confidently in a committed document before being refuted. **Do
+not implement A0 on the strength of its arithmetic — ship the counter first and
+read it.** That ordering is the whole lesson.
 
 ## Sources
 
