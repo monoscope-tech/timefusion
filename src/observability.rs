@@ -1178,6 +1178,23 @@ atomic_stats! {
         /// gauge, not a fault: read it against
         /// `maintenance_coordinator_unit_timed_out`, which it is meant to replace.
         compaction_permits_unavailable,
+        /// Packing/consolidation turns that DID take a `light_rewrite_sem` permit.
+        ///
+        /// The denominator `compaction_permits_unavailable` never had. On its own
+        /// a refusal count cannot distinguish healthy contention from a lane that
+        /// is dead: prod 2026-09-12 read 1,812 refusals in 55 minutes and it took
+        /// forty minutes of code reading to establish that the acquisitions behind
+        /// it were 2 per hour, against 196 planned cells and 1.1 TB of sealed
+        /// debt. Read `acquired / (acquired + unavailable)`.
+        compaction_permits_acquired,
+        /// Units killed by the absolute lifetime cap rather than by going idle —
+        /// see `coordinator_operation_lifetime_cap`.
+        ///
+        /// These are units that were making progress and still not converging. A
+        /// single one cost prod 7,634 s (8.5x its deadline) holding one of ~3
+        /// permits. Nonzero is the cap doing its job; it should be small, and if
+        /// it tracks the claim rate the units are being bisected too slowly.
+        maintenance_unit_lifetime_capped,
         /// Dashboard aggregates served from a rollup, split by how much of the
         /// window the rollup owned. The OTel counters carry the same numbers but
         /// cannot be read back in-process, and these two are the only signal that
