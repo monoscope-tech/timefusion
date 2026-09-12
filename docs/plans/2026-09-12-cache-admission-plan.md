@@ -494,3 +494,68 @@ the runway on the busiest drives and all but eliminates wear on the WAL pair.
 **Never read `percentage_used` alone:** divide `Data Units Written` by
 `power_on_hours` for the historical average and compare it against the current
 measured rate. A benign-looking 27% concealed a ~7-month runway.
+
+## EXECUTED 2026-09-12: the split is live
+
+Appendices A and B were run on the host. Layout now:
+
+| array | level | members | carries |
+| --- | --- | --- | --- |
+| `md3` (`/`) | **raid1, 2 legs** | nvme0n1p3, nvme2n1p3 | WAL, journals, foyer cache, OS |
+| `md4` | **raid0, 2 legs** | nvme1n1p3, nvme3n1p3 | 3.84 TB → LVM `ephemeral` |
+
+`ephemeral` holds a 64 GiB `swap` LV and a 3.5 TB `scratch` LV mounted at
+`/mnt/ephemeral`, bind-mounted over the seven transient dirs
+(`*_spill` ×6, `tantivy_scratch`). `vm.swappiness=10` persisted in
+`/etc/sysctl.d/`. Every fstab entry carries **`nofail`** — md4 has no redundancy
+by design and must never block boot.
+
+**The design changed from the draft, on tonight's evidence.** The draft moved the
+foyer cache too. It does not: measurement showed only **1 of 300** region files
+touched in two minutes, so the 605 GB is static and cheap to leave on the mirror.
+Moving only the *transient* dirs meant **no data migration at all** — nothing to
+copy, and the cache stays warm. That removed the riskiest part of the plan.
+
+### Result, measured
+
+| device | before | after |
+| --- | --- | --- |
+| **md3** writes / util | ~300 MB/s @ 45-61% | **7-10 MB/s @ 2%** |
+| md4 writes / util | n/a | 84-115 MB/s @ 4-6% |
+
+Client `fsync`s now have a near-idle mirror to themselves — the WAL no longer
+queues behind spill churn, which is the mechanism this whole investigation kept
+running into.
+
+### Endurance, recomputed against the ~5.1 PB remaining per drive
+
+| layout | worst-drive rate | runway |
+| --- | --- | --- |
+| before (4-way mirror) | 257 MB/s | **7.6 months** |
+| md4 pair (striped) | ~50 MB/s | **3.3 years** |
+| md3 pair | ~8 MB/s | ~20 years |
+
+**~5x on the busiest drive**, and the pair holding the only non-reconstructible
+data is now effectively idle.
+
+### Steps, as executed
+
+1. verified `[4/4] [UUUU]`, 0 failed, no resync
+2. `--fail`/`--remove` nvme1n1p3 → `[4/3] [UU_U]`, then nvme3n1p3 → `[4/2] [UU__]`
+   — never fewer than two live copies at any instant
+3. `--grow --raid-devices=2` → `[2/2] [UU]`, reports **active, not degraded**, so
+   it generates no monitoring noise
+4. `--zero-superblock`, `--create /dev/md4 --level=0`
+5. LVM, `mkswap`, `mkfs.xfs`, mount, `swapon`, `sysctl`
+6. `mdadm --detail --scan >> mdadm.conf`; fstab backed up first, then validated
+   with `findmnt --verify` (**0 parse errors, 0 errors**) before `mount -a`
+7. `docker service update --force` — required because Docker bind mounts are
+   `rprivate`, so a running container cannot see new host submounts
+
+### What is still NOT done
+
+- `update-initramfs -u` has **not** been run. md4 is not needed at early boot and
+  every entry is `nofail`, but run it before any planned reboot.
+- Byte reduction. The split **moved** the spill; it did not shrink it. The lever
+  remains `coordinator_share_bytes` vs `FairSpillPool` slices — see above, and do
+  not raise it without its own measurement.
