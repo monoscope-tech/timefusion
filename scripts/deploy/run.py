@@ -29,6 +29,33 @@ def output(*args):
     return execute(*args, stdout=subprocess.PIPE, text=True).stdout.strip()
 
 
+# Paths deploy.yml refuses to deploy for, because they cannot change the image.
+# Kept in step with its `paths-ignore`; test_run.py asserts the two agree.
+UNDEPLOYABLE = ('docs/', 'bench/')
+
+
+def only_undeployable(lease, current, master):
+    """Whether `master` differs from `current` by nothing that could change the image.
+
+    A documentation merge landing seconds after a code merge used to cancel that
+    code deploy: the rollout saw a newer master and declined, while the docs push
+    started no rollout of its own because deploy.yml ignores those paths. The
+    result was a green deploy job and a production box still running the previous
+    image, with nothing reporting the gap (2026-09-10, PR #251).
+
+    Fails CLOSED. If the newer commits cannot be fetched or inspected, the answer
+    is False and the rollout defers exactly as it did before.
+    """
+    try:
+        lease.git('fetch', '--quiet', '--depth=50', 'origin', master)
+        changed = lease.git('diff', '--name-only', f'{current}..{master}').splitlines()
+    except subprocess.CalledProcessError:
+        return False
+    if not changed:
+        return False
+    return all(path.startswith(UNDEPLOYABLE) or path.endswith('.md') for path in changed)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('local', 'ci'))
@@ -67,7 +94,7 @@ def main():
     with lease.hold(image) as guard:
         current = lease.git('rev-parse', 'HEAD')
         master = lease.remote('refs/heads/master')
-        if current != master:
+        if current != master and not only_undeployable(lease, current, master):
             if local:
                 parser.error('The checkout must be the current merged master commit')
             print('A newer master commit superseded this rollout; production is unchanged.')
