@@ -14386,6 +14386,98 @@ mod tests {
 
     /// Every live path in one tier partition, which is what "did the commit
     /// land?" means here.
+    /// A stale-generation base file whose span the CURRENT-generation files
+    /// already reproduce must not hold the derived tier hostage.
+    ///
+    /// Prod 2026-09-11: derived units sat at `attempts=78`, minting a fresh
+    /// day-wide base rebuild every `60 << 5` = 1920s — an exact 32-minute cycle —
+    /// over `skipped_generation=1`. ONE stale file. The rebuild can never clear
+    /// it, because `slice_retires` only retires a tagged file CONTAINED in the
+    /// publishing slice and the offender is wider than the children a day is
+    /// published as, so the loop is permanent. It cost 59% of maintenance
+    /// worker-seconds between them.
+    ///
+    /// Refusing to READ the file stays correct — `rollup_routing_rejects_legacy_materialization_generations`
+    /// pins that, and the `uncovered(slice, base_covered)` gate still refuses a
+    /// derived cell over a genuinely holey base. What changes is only whether the
+    /// refusal also DEMANDS a rebuild that provably cannot change the outcome.
+    ///
+    /// Can-fail proof, run red then restored: making `unreproduced_refusals`
+    /// return `refused.len()` — the previous always-mint behaviour — turns the
+    /// Complete assertion red with `base_generation_unverified`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_base_file_the_current_generation_reproduces_does_not_wedge_the_derived_tier() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TAG_GENERATION, TaskState};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        use object_store::ObjectStoreExt as _;
+        let db = Arc::new(Database::with_config(create_test_config("rollup-stale-gen-reproduced")).await?);
+        db.cancel_maintenance();
+        let project = format!("stalegen_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        for hour in [1, 7, 13, 19] {
+            let at = day.and_hms_opt(hour, 0, 0).expect("hour").and_utc().timestamp_micros();
+            let batch = json_to_batch(vec![test_span_ts(&format!("row-{hour}"), "op", &project, at)])?;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await?;
+        }
+        let base_tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        // A second copy of every base file, same slice tags, GENERATION mangled —
+        // the shape a spec change leaves behind. The originals stay live, so the
+        // current generation still reproduces every span the copies claim.
+        {
+            let tier = db.get_or_create_table(&project, &base_tier).await?;
+            let mut table = tier.read().await.clone();
+            let store = table.log_store().object_store(None);
+            #[allow(deprecated)]
+            let adds: Vec<_> = table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect();
+            assert!(!adds.is_empty(), "the base unit must have published files for there to be a stale copy of one");
+            let mut actions = Vec::new();
+            for mut add in adds {
+                let path = format!("{}-stalegen.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                add.path = path;
+                add.data_change = false;
+                if let Some(tags) = add.tags.as_mut() {
+                    tags.insert(TAG_GENERATION.to_owned(), Some("stale-generation".to_owned()));
+                }
+                actions.push(Action::Add(add));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            *tier.write().await = table;
+        }
+
+        let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+        assert_eq!(
+            derived.state,
+            Some(TaskState::Complete),
+            "a stale file the live current-generation files already reproduce must not demand a base rebuild: {:?}",
+            derived.retry_reason
+        );
+        let stats = crate::observability::maintenance_stats();
+        assert!(
+            stats.rollup_base_refusal_reproduced.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the refusal must still HAPPEN and be counted — this is about the mint, not about reading the stale file"
+        );
+
+        // And the derived tier holds the truth, not a short cell: four source rows.
+        let derived_tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a derived tier");
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let batches = ctx.sql(&format!("SELECT SUM(request_count) FROM {derived_tier} WHERE project_id='{project}'")).await?.collect().await?;
+        assert_eq!(batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("int64").value(0), 4);
+        Ok(())
+    }
+
     async fn live_paths(db: &Database, project: &str, tier: &str) -> std::collections::HashSet<String> {
         let table_ref = db.get_or_create_table(project, tier).await.expect("table");
         let table = table_ref.read().await;

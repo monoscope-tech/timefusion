@@ -2612,7 +2612,7 @@ impl Database {
         } else {
             Vec::new()
         };
-        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes, content_fp) = {
+        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes, content_fp, refused_spans, selected_spans) = {
             let table = from_table.read().await;
             let witness_guard = match &witness_table {
                 Some(table) => Some(table.read().await),
@@ -2646,6 +2646,8 @@ impl Database {
             let partition_identity = partition_stats.map(|stats| (stats.fingerprint, stats.min_ts, stats.max_ts));
             let partition_paths = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string);
             let mut selected = Vec::new();
+            let mut refused_spans: Vec<Option<(i64, i64)>> = Vec::new();
+            let mut selected_spans: Vec<(i64, i64)> = Vec::new();
             let mut estimated = 0u64;
             let mut whole_file_bytes = 0u64;
             let mut content_fp = 0u64;
@@ -2728,7 +2730,24 @@ impl Database {
                         .is_some_and(|generation| base_generations.contains(generation))
                     {
                         skipped_generation += 1;
+                        // WHAT was refused, not just how many. A refusal only
+                        // costs something if no CURRENT-generation file
+                        // reproduces the same span — see the mint below. The
+                        // tagged range is the file's own claim; a file with no
+                        // tags falls back to its statistics, and one with
+                        // neither is unbounded and can never be shown
+                        // reproduced (`None`), which keeps the mint firing.
+                        refused_spans.push(slice_tag_range(&add).map(|(start, end)| (start, end.saturating_sub(1))).or_else(|| match add_ts_bounds(&add) {
+                            (Some(lo), Some(hi)) => Some((lo, hi)),
+                            _ => None,
+                        }));
                         continue;
+                    }
+                    // The span this ACCEPTED file vouches for, against which a
+                    // refusal is judged. Taken from the same tags the refusal
+                    // reads, so the two are the same kind of claim.
+                    if let Some(range) = slice_tag_range(&add) {
+                        selected_spans.push(range);
                     }
                 }
                 let decoded = estimated_decoded_bytes(add.size);
@@ -2745,7 +2764,7 @@ impl Database {
                 content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes, content_fp)
+            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes, content_fp, refused_spans, selected_spans)
         };
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(&selected, whole_file_bytes);
         // Same reason as the dedup preflight: record it on every claim, not only
@@ -2778,10 +2797,36 @@ impl Database {
                 "base files carry no slice tags; checked by timestamp range and materialization generation"
             );
         }
-        if skipped_generation > 0 {
-            // Excluding an unverified file is not evidence that its rows were
-            // empty. Rebuild this base range from its source and retry the
-            // derived unit, even if an in-memory coverage claim still spans it.
+        // Excluding an unverified file is not evidence that its rows were empty,
+        // so a refusal normally means: rebuild this base range from its source
+        // and retry the derived unit. #221 deliberately does that even when an
+        // in-memory coverage claim still spans the range, because that map is
+        // not trustworthy enough to authorize dropping rows.
+        //
+        // But a refusal whose span is ALREADY reproduced by the CURRENT-generation
+        // files this unit selected costs nothing to exclude, and demanding a
+        // rebuild for it is a livelock: the rebuild republishes the same slices
+        // and cannot retire the offending file, because `slice_retires` only
+        // retires a tagged file CONTAINED in the publishing slice and the
+        // offender is wider than the children the day is published as. Prod
+        // 2026-09-11 measured the result — derived units at attempts=78, minting
+        // a fresh base rebuild every `60 << 5` = 1920s forever, with
+        // `skipped_generation=1` doing it. ONE stale file.
+        //
+        // The test is made against `selected_spans` — the tags of the files this
+        // unit is actually reading out of the live tier snapshot — and NOT
+        // against `base_covered`, which comes from the coverage map #221 chose
+        // to distrust. `ranges_cover`'s `hi` is inclusive, which is why the
+        // refused spans were pushed with an inclusive end.
+        //
+        // A refusal with no readable span at all is `None` and is never counted
+        // as reproduced, so the unbounded case still mints. Excluding a file
+        // this way does not let the unit publish short either: the
+        // `uncovered(slice, base_covered)` gate below is the real safety net and
+        // still refuses a derived cell over a holey base.
+        let unreproduced = crate::rollup::unreproduced_refusals(&refused_spans, &selected_spans);
+        if unreproduced > 0 {
+            crate::observability::maintenance_stats().rollup_base_refusal_unreproduced.fetch_add(unreproduced, Relaxed);
             let base_spec = source_schema
                 .rollups
                 .iter()
@@ -2805,6 +2850,9 @@ impl Database {
             let attempts = self.journal().attempts(&key);
             retry("base_generation_unverified".to_owned(), std::time::Duration::from_secs(60u64 << attempts.min(5)))?;
             return Ok(true);
+        }
+        if skipped_generation > 0 {
+            crate::observability::maintenance_stats().rollup_base_refusal_reproduced.fetch_add(skipped_generation, Relaxed);
         }
         // A DERIVED unit's witness describes the RAW partition, but its INPUT is
         // the base tier — witness table != input table, which is the one
