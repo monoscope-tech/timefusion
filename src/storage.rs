@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -180,6 +180,8 @@ pub struct FoyerCacheConfig {
     /// Process-wide budget for in-flight write-capture buffers. 0 = unbudgeted.
     #[educe(Default = 268_435_456)] // 256MB process-wide (8 x the per-upload cap)
     pub write_capture_budget_bytes: usize,
+    /// See `crate::config::CacheConfig::timefusion_write_capture_l2`.
+    pub write_capture_to_l2: bool,
     /// Disk block size for the main data cache — foyer's eviction unit and the
     /// hard cap on the largest entry that can persist to disk. Must be >= the
     /// largest file we want cached (compaction target size).
@@ -233,6 +235,7 @@ impl FoyerCacheConfig {
             warm_inline_max_bytes: cfg.cache.warm_inline_max_bytes(),
             write_capture_max_bytes: cfg.cache.write_capture_max_bytes(),
             write_capture_budget_bytes: cfg.cache.write_capture_budget_bytes(),
+            write_capture_to_l2: cfg.cache.timefusion_write_capture_l2,
             block_size_bytes,
             l1_max_entry_bytes: cfg.cache.l1_max_entry_bytes(),
             cache_recent_days: cfg.cache.timefusion_cache_recent_days,
@@ -257,9 +260,10 @@ impl FoyerCacheConfig {
             metadata_memory_size_bytes: 10 * 1024 * 1024, // 10MB for tests
             metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB for tests
             metadata_shards: 2,
-            warm_inline_max_bytes: 0,          // bound by block size
-            write_capture_max_bytes: 0,        // bound by block size in tests
-            write_capture_budget_bytes: 0,     // unbudgeted in tests
+            warm_inline_max_bytes: 0,      // bound by block size
+            write_capture_max_bytes: 0,    // bound by block size in tests
+            write_capture_budget_bytes: 0, // unbudgeted in tests
+            write_capture_to_l2: true,
             block_size_bytes: 4 * 1024 * 1024, // 4MB — must be <= test disk size
             l1_max_entry_bytes: 1024 * 1024,   // 1MB
             cache_recent_days: 0,              // no age limit in tests (avoid date flakiness)
@@ -299,6 +303,16 @@ pub struct CombinedCacheStats {
 #[derive(Debug, Default, Clone)]
 pub struct FoyerRuntimeStats {
     pub stats: CombinedCacheStats,
+    /// Admission accounting: who populated the main cache, and whether
+    /// write-captured entries were ever read before they left it.
+    pub admit_write_capture_bytes: u64,
+    pub admit_read_miss_bytes: u64,
+    pub admit_refresh_bytes: u64,
+    pub write_capture_admitted: u64,
+    pub write_capture_declined: u64,
+    pub write_capture_evicted_unread: u64,
+    pub write_capture_evicted_after_hit: u64,
+    pub write_capture_pending: u64,
     pub memory_size_bytes: usize,
     pub disk_size_bytes: usize,
     pub ttl_seconds: u64,
@@ -447,18 +461,101 @@ pub struct SharedFoyerCache {
     metadata_stats: StatsRef,
     config: FoyerCacheConfig,
     evictions: Arc<AtomicU64>,
+    admission: Arc<AdmissionStats>,
 }
 
-struct EvictionCounter(Arc<AtomicU64>);
+/// Which path put an entry in the main cache.
+///
+/// `WriteCapture` is the one under scrutiny. It tees every completed upload
+/// into the cache, so every file maintenance rewrites is also written to the
+/// local disk tier — whether or not anything ever reads it. Read-side counters
+/// cannot see it, which is why foyer looked innocent twice while the device
+/// absorbed ~500 MB/s (2026-09-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitSource {
+    /// Teed from a completed multipart upload (`CachingMultipartUpload`).
+    WriteCapture,
+    /// Populated because a read missed and had to fetch from the inner store.
+    ReadMiss,
+    /// Sliding-TTL re-insert of an entry that was already resident.
+    Refresh,
+}
+
+/// Admission accounting for the main cache, process-wide.
+///
+/// Answers the question the whole investigation turns on: of the entries
+/// write-capture admits, how many are read even once before they are evicted?
+/// That is the "one-hit wonder" test from the S3-FIFO line of work, and it
+/// decides whether write-capture is warming anything or just burning the disk.
+#[derive(Debug, Default)]
+pub struct AdmissionStats {
+    pub write_capture_bytes: AtomicU64,
+    pub read_miss_bytes: AtomicU64,
+    pub refresh_bytes: AtomicU64,
+    pub write_capture_admitted: AtomicU64,
+    /// Admissions declined by `timefusion_write_capture_l2 = false`.
+    pub write_capture_declined: AtomicU64,
+    pub write_capture_evicted_unread: AtomicU64,
+    pub write_capture_evicted_after_hit: AtomicU64,
+    /// Resident write-captured keys → whether one has been read yet. Entries are
+    /// removed when foyer reports the key leaving, so this tracks the cache.
+    pending: DashMap<String, AtomicBool>,
+}
+
+/// Ceiling on `pending`, so a missed leave-notification cannot grow it without
+/// bound. The main cache holds ~2.3k entries in prod, so this is slack, not a
+/// budget; blowing through it means the eviction listener is not firing and the
+/// ratio below should be distrusted rather than silently truncated.
+const ADMIT_PENDING_MAX: usize = 200_000;
+
+impl AdmissionStats {
+    fn record(&self, source: AdmitSource, key: &str, bytes: u64) {
+        match source {
+            AdmitSource::WriteCapture => {
+                self.write_capture_bytes.fetch_add(bytes, Ordering::Relaxed);
+                self.write_capture_admitted.fetch_add(1, Ordering::Relaxed);
+                if self.pending.len() < ADMIT_PENDING_MAX {
+                    self.pending.insert(key.to_string(), AtomicBool::new(false));
+                }
+            }
+            AdmitSource::ReadMiss => drop(self.read_miss_bytes.fetch_add(bytes, Ordering::Relaxed)),
+            AdmitSource::Refresh => drop(self.refresh_bytes.fetch_add(bytes, Ordering::Relaxed)),
+        }
+    }
+
+    /// A read touched `key`. Only write-captured keys are tracked, so this is a
+    /// cheap miss for everything else.
+    fn mark_read(&self, key: &str) {
+        if let Some(seen) = self.pending.get(key) {
+            seen.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `key` left the cache: bank whether it was ever worth admitting.
+    fn on_leave(&self, key: &str) {
+        if let Some((_, seen)) = self.pending.remove(key) {
+            let counter = if seen.load(Ordering::Relaxed) { &self.write_capture_evicted_after_hit } else { &self.write_capture_evicted_unread };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct EvictionCounter {
+    evictions: Arc<AtomicU64>,
+    admission: Arc<AdmissionStats>,
+}
 
 impl foyer::EventListener for EvictionCounter {
     type Key = String;
     type Value = CacheValue;
 
-    fn on_leave(&self, event: foyer::Event, _: &Self::Key, _: &Self::Value) {
+    fn on_leave(&self, event: foyer::Event, key: &Self::Key, _: &Self::Value) {
         if event == foyer::Event::Evict {
-            self.0.fetch_add(1, Ordering::Relaxed);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
+        // Every leave, not just eviction — otherwise `pending` retains keys that
+        // left by any other route and the unread/hit ratio drifts high.
+        self.admission.on_leave(key);
     }
 }
 
@@ -498,6 +595,7 @@ impl SharedFoyerCache {
         // outputs (128MB) so they persist, capped to the device so it can't wedge.
         let data_block_size = capped_block_size(config.block_size_bytes, config.disk_size_bytes);
         let evictions = Arc::new(AtomicU64::new(0));
+        let admission = Arc::new(AdmissionStats::default());
 
         let cache = build_hybrid_cache(
             &config.cache_dir,
@@ -505,7 +603,7 @@ impl SharedFoyerCache {
             config.shards,
             config.disk_size_bytes,
             data_block_size,
-            Some(Arc::new(EvictionCounter(evictions.clone()))),
+            Some(Arc::new(EvictionCounter { evictions: evictions.clone(), admission: admission.clone() })),
         )
         .await?;
         let metadata_cache = build_hybrid_cache(
@@ -525,6 +623,7 @@ impl SharedFoyerCache {
             metadata_stats: Arc::new(RwLock::new(CacheStats::default())),
             config,
             evictions,
+            admission,
         })
     }
 
@@ -556,6 +655,14 @@ impl SharedFoyerCache {
             l2_used_bytes: crate::support::without_blocking_the_worker(|| allocated_bytes(&self.config.cache_dir)),
             entry_count: self.cache.memory().entries(),
             evictions: self.evictions.load(Ordering::Relaxed),
+            admit_write_capture_bytes: self.admission.write_capture_bytes.load(Ordering::Relaxed),
+            admit_read_miss_bytes: self.admission.read_miss_bytes.load(Ordering::Relaxed),
+            admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
+            write_capture_admitted: self.admission.write_capture_admitted.load(Ordering::Relaxed),
+            write_capture_declined: self.admission.write_capture_declined.load(Ordering::Relaxed),
+            write_capture_evicted_unread: self.admission.write_capture_evicted_unread.load(Ordering::Relaxed),
+            write_capture_evicted_after_hit: self.admission.write_capture_evicted_after_hit.load(Ordering::Relaxed),
+            write_capture_pending: self.admission.pending.len() as u64,
         }
     }
 
@@ -837,6 +944,8 @@ pub struct FoyerObjectStoreCache {
     /// Keys a bypassed (wide) scan has asked to admit once already. See
     /// [`Self::repeat_sighting`].
     bypass_seen: Arc<DashSet<String>>,
+    /// Shared, process-wide: who admitted what, and whether it was ever read.
+    admission: Arc<AdmissionStats>,
 }
 
 impl FoyerObjectStoreCache {
@@ -852,6 +961,7 @@ impl FoyerObjectStoreCache {
             main_fetch_locks: Arc::new(DashMap::new()),
             bypass_seen: Arc::new(DashSet::new()),
             background_tasks: Arc::new(Mutex::new(JoinSet::new())),
+            admission: shared_cache.admission.clone(),
         }
     }
 
@@ -879,6 +989,11 @@ impl FoyerObjectStoreCache {
     pub async fn new(inner: Arc<dyn ObjectStore>, config: FoyerCacheConfig) -> anyhow::Result<Self> {
         let shared_cache = SharedFoyerCache::new(config).await?;
         Ok(Self::new_with_shared_cache(inner, &shared_cache))
+    }
+
+    /// Admission accounting for this store's (shared) main cache.
+    pub fn admission(&self) -> &AdmissionStats {
+        &self.admission
     }
 
     /// Record a metadata-tier hit and stamp the span fields that always
@@ -1023,6 +1138,7 @@ impl FoyerObjectStoreCache {
 
         // Try cache first
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
+            self.admission.mark_read(&cache_key);
             let value = entry.value();
 
             // Special handling for _last_checkpoint: stale-while-revalidate
@@ -1076,6 +1192,7 @@ impl FoyerObjectStoreCache {
 
         // A concurrent leader may have populated the object while we waited.
         if waited_for_inflight && let Ok(Some(entry)) = self.cache.get(&cache_key).await {
+            self.admission.mark_read(&cache_key);
             let value = entry.value();
             if !value.is_expired(ttl) {
                 let result = self.serve_hit(&span, value).await;
@@ -1138,6 +1255,7 @@ impl FoyerObjectStoreCache {
 
         let full_cache_key = Self::make_cache_key(location);
         if let Ok(Some(entry)) = self.cache.get(&full_cache_key).await {
+            self.admission.mark_read(&full_cache_key);
             let value = entry.value();
             if !value.is_expired(self.config.ttl) && range.end <= value.data.len() as u64 {
                 record_range_hit(&self.stats, range.end - range.start).await;
@@ -1470,18 +1588,24 @@ impl FoyerObjectStoreCache {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        self.admit(&self.cache, Self::make_cache_key(location), value, self.config.l1_max_entry_bytes);
+        let (key, bytes) = (Self::make_cache_key(location), value.data.len() as u64);
+        if self.admit(&self.cache, key.clone(), value, self.config.l1_max_entry_bytes) {
+            self.admission.record(AdmitSource::ReadMiss, &key, bytes);
+        }
     }
 
     /// Single funnel for every cache population, so `scan_bypass_scope` can
     /// suppress all of them in one place. `l1_max_entry_bytes = 0` (metadata
     /// entries) keeps the default L1+disk placement.
-    fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
+    /// Returns whether the entry was actually admitted, so callers can account
+    /// for it without double-counting the bypass path.
+    fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) -> bool {
         if bypass_active() && !self.repeat_sighting(&key) {
             crate::observability::record_cache_insert_bypassed();
-            return;
+            return false;
         }
         insert_main(cache, key, value, l1_max_entry_bytes);
+        true
     }
 
     /// Has a bypassed scan already tried to admit `key` once?
@@ -1521,7 +1645,10 @@ impl FoyerObjectStoreCache {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        self.admit(&self.cache, key, range_value(location, data, file), self.config.l1_max_entry_bytes);
+        let bytes = data.len() as u64;
+        if self.admit(&self.cache, key.clone(), range_value(location, data, file), self.config.l1_max_entry_bytes) {
+            self.admission.record(AdmitSource::ReadMiss, &key, bytes);
+        }
     }
 
     /// Cache a path's `ObjectMeta` (body-less entry) so later reads skip the HEAD.
@@ -1547,9 +1674,12 @@ impl FoyerObjectStoreCache {
             return;
         }
         let (cache, refreshing, key) = (cache.clone(), self.refreshing.clone(), key.to_string());
+        let admission = self.admission.clone();
         self.spawn_tracked(async move {
             let v = entry.value();
+            let bytes = v.data.len() as u64;
             insert_main(&cache, key.clone(), CacheValue::new(v.data.clone(), v.meta.clone()), l1_max_entry_bytes);
+            admission.record(AdmitSource::Refresh, &key, bytes);
             refreshing.remove(&key);
         });
     }
@@ -1572,6 +1702,9 @@ struct CachingMultipartUpload {
     buffer: Option<Vec<u8>>,
     max_warm_bytes: usize,
     l1_max_entry_bytes: usize,
+    /// See `timefusion_write_capture_l2`. False declines DISK admission only.
+    capture_to_l2: bool,
+    admission: Arc<AdmissionStats>,
     /// Holds this upload's slice of the process-wide capture budget; dropping
     /// it (abandon, complete, abort, or panic) returns the bytes.
     reservation: Option<CaptureReservation>,
@@ -1636,8 +1769,18 @@ impl MultipartUpload for CachingMultipartUpload {
             // Use the same key derivation as the read path so a multipart-warmed
             // entry is found by a later GET even if `make_cache_key` ever does
             // more than `location.to_string()`.
-            insert_main(&self.cache, FoyerObjectStoreCache::make_cache_key(&self.location), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
-            debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
+            let key = FoyerObjectStoreCache::make_cache_key(&self.location);
+            // An entry over the L1 cap is bound for the disk tier (`insert_main`
+            // steers it `OnDisk`), and that write is what the flag governs.
+            // Under it, admission is memory-only and costs no disk bandwidth.
+            if self.capture_to_l2 || buf.len() <= self.l1_max_entry_bytes {
+                insert_main(&self.cache, key.clone(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
+                self.admission.record(AdmitSource::WriteCapture, &key, size);
+                debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
+            } else {
+                self.admission.write_capture_declined.fetch_add(1, Ordering::Relaxed);
+                debug!("Declined disk admission for multipart write: {} (size: {} bytes)", self.location, size);
+            }
         }
         Ok(result)
     }
@@ -1726,6 +1869,8 @@ impl ObjectStore for FoyerObjectStoreCache {
             buffer: reservation.is_some().then(Vec::new),
             max_warm_bytes: cap,
             l1_max_entry_bytes: self.config.l1_max_entry_bytes,
+            capture_to_l2: self.config.write_capture_to_l2,
+            admission: self.admission.clone(),
             reservation,
         }))
     }
@@ -2367,6 +2512,70 @@ mod tests {
 
         cache.shutdown().await?;
         Ok(())
+    }
+
+    /// A COST guard: with `write_capture_to_l2` off, an upload bound for the
+    /// DISK tier must not be admitted at all — and one small enough to live in
+    /// memory must still be.
+    ///
+    /// Asserting on the admission counters rather than on a later cache hit is
+    /// deliberate. A version that still writes to disk and then serves a hit
+    /// passes every correctness assertion; only the admission count
+    /// distinguishes them, and the disk write is the entire point.
+    #[tokio::test]
+    async fn write_capture_l2_flag_declines_only_disk_bound_entries() -> anyhow::Result<()> {
+        // l1_max_entry_bytes is 1MB in tests: 2MB is disk-bound, 256KB is not.
+        let big = Bytes::from(vec![b'b'; 2 * 1024 * 1024]);
+        let small = Bytes::from(vec![b's'; 256 * 1024]);
+
+        for (to_l2, expect_admitted, expect_declined) in [(true, 2, 0), (false, 1, 1)] {
+            let inner = Arc::new(InMemory::new());
+            let config = FoyerCacheConfig::test_config_with(&format!("wc_l2_{to_l2}"), |c| {
+                c.write_capture_to_l2 = to_l2;
+            });
+            let _dir = CacheDirGuard(config.cache_dir.clone());
+            let cache = FoyerObjectStoreCache::new(inner, config).await?;
+
+            for (name, body) in [("big.parquet", &big), ("small.parquet", &small)] {
+                let mut upload = cache.put_multipart(&Path::from(format!("t/date=2026-09-12/{name}"))).await?;
+                upload.put_part(body.clone().into()).await?;
+                upload.complete().await?;
+            }
+
+            let admission = cache.admission();
+            assert_eq!(admission.write_capture_admitted.load(Ordering::Relaxed), expect_admitted, "write_capture_to_l2={to_l2}: wrong number of admissions");
+            assert_eq!(
+                admission.write_capture_declined.load(Ordering::Relaxed),
+                expect_declined,
+                "write_capture_to_l2={to_l2}: a declined entry is the disk write we are avoiding"
+            );
+            // Declining admission must never affect the upload itself.
+            assert_eq!(cache.get(&Path::from("t/date=2026-09-12/big.parquet")).await?.bytes().await?.len(), big.len());
+            cache.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    /// The unread/hit ratio is the number the whole decision rests on, so its
+    /// bookkeeping is tested directly rather than through an eviction race.
+    #[test]
+    fn admission_stats_classify_entries_by_whether_a_read_ever_came() {
+        let stats = AdmissionStats::default();
+        stats.record(AdmitSource::WriteCapture, "read-me", 10);
+        stats.record(AdmitSource::WriteCapture, "never-read", 20);
+        stats.record(AdmitSource::ReadMiss, "other", 30);
+
+        stats.mark_read("read-me");
+        stats.mark_read("other"); // not tracked — must be a harmless no-op
+        stats.on_leave("read-me");
+        stats.on_leave("never-read");
+        stats.on_leave("other");
+
+        assert_eq!(stats.write_capture_bytes.load(Ordering::Relaxed), 30);
+        assert_eq!(stats.read_miss_bytes.load(Ordering::Relaxed), 30);
+        assert_eq!(stats.write_capture_evicted_after_hit.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.write_capture_evicted_unread.load(Ordering::Relaxed), 1, "an entry nothing read is the waste we are hunting");
+        assert_eq!(stats.pending.len(), 0, "every key that left must be released, or the map grows without bound");
     }
 
     /// The per-upload write-capture cap must bound the tee independently of the
