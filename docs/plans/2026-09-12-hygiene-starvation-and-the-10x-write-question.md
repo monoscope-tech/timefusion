@@ -72,66 +72,76 @@ rather than one: `compaction_permits_acquired` (the denominator
 
 ## Part 2 — can we take 10x the writes?
 
-**No. Not today, and CPU is the least of the reasons.**
+**No — not today. The wall is CPU and the hygiene lane, not the disk.**
 
 Current load, same 55-minute process: **1,448 rows/s** ingested, buffer pressure
 **9%**, `backpressure_engaged_total` and `backpressure_rejected_total` both
 **0**, zero flush failures. At 1x the write path is comfortable.
 
+### A correction I made on myself, first
+
+My first pass said the disk was the wall and was **wrong**, because I measured a
+process that had just restarted. Recorded because it is the standing trap in
+this codebase and I walked into it anyway:
+
+| measured on | read-miss admission | md3 writes | md3 util |
+|---|---:|---:|---:|
+| 3-minute process | 824 MB/s | — | — |
+| 10-minute process (average since boot) | 482 MB/s | ~300 MB/s | 43-54% |
+| **14-minute process, 120 s delta** | **1.9 MB/s** | **8-10 MB/s** | **3.7-4.9%** |
+
+The first two are **cold-start cache warming**, not steady state. A lifetime
+average on a young process is dominated by its boot. Taking a delta on a warm
+one gives 1.9 MB/s of admission and a device at ~4% utilisation.
+
+This also settles the open question in
+[`2026-09-12-cache-admission-plan.md`](2026-09-12-cache-admission-plan.md), and
+not in favour of its leading candidate. The admission-source counters shipped
+today read `admit_write_capture_bytes` at **0.002 MB/s** against
+`admit_read_miss_bytes` — so write-capture is exonerated by its own instrument,
+matching the 474 KB/s / 80%-hit-before-evict verdict already recorded. The
+~500 MB/s that hunt was chasing is **cache re-warming after a restart**, which is
+a restart-frequency cost, not a steady-state throughput ceiling.
+
 ### What scales, and what breaks first
 
 | resource | at 1x | at 10x | verdict |
 |---|---|---|---|
-| CPU | ~1,800-2,500% of 4,800% | BaseRollup ~25 cores of 48, plus dedup and hygiene | **tight, not fatal** |
-| MemBuffer | pressure 9% | ~90% of the hard limit | **no margin** |
-| Disk write bandwidth | 284-341 MB/s at 43-54% util | ~3 GB/s asked of an array that saturates near 600-700 MB/s | **~5x short — the wall** |
-| Hygiene lanes | 0 worker-seconds, 1.1 TB behind | 10x the file production | **diverges without bound** |
+| CPU | 1,432-2,149% of 4,800% | BaseRollup alone 25-39 of 48 cores | **the wall** |
+| Hygiene lanes | 0 worker-seconds, 1.1 TB behind | 10x the file production | **the other wall** |
+| MemBuffer | pressure 9-13% | ~90-100% of the hard limit | **no margin** |
+| Disk write bandwidth | 8-10 MB/s at ~4% util (warm) | ~100 MB/s, ~40% util | fine |
 
-### The disk is the wall, and amplification is why
+Steady state on a 14-minute process: 1,470 rows/s, CPU **1,432-2,149% of 4,800%
+(30-45% of the box)**, memory 15-16 GB of 120 GB, buffer pressure 13%.
+BaseRollup costs **2.5-3.9 cores** (the lower figure on a mature process, the
+higher on one still burning its restart backlog).
 
-The array is **much healthier than on 09-11** — md3 now runs 43-54% utilisation
-with `w_await` **1.6-1.8 ms** and queue depth 12-23, against 99-100%,
-63-620 ms and 212-620 then. The tantivy-scratch move and the journal `fsync`
-reductions bought that.
+At 10x ingest, BaseRollup alone wants **25-39 of 48 cores**, before dedup, before
+the hygiene lanes that today do nothing and must then do ten times nothing, and
+before query. That does not fit.
 
-But the ratio has not moved. Durable ingest contributes ~4.8 MB/s
-(`flush_freed_bytes_total` 15.7 GB / 55 min, and that is DECODED bytes, so the
-true on-disk figure is smaller and the ratio larger). The device writes ~300 MB/s
-sustained. **The box writes on the order of 60 bytes for every byte of ingest
-that lands.**
-
-Ten times the ingest at the same amplification asks for ~3 GB/s from a device
-that saturates around 600-700 MB/s. **Faster disks do not fix this; a smaller
-multiplier does.**
-
-The largest single channel is now measurable, and it is not maintenance rewrites:
-
-```
-foyer.admit_read_miss_bytes: 158.5 GB -> 232.6 GB over 90 s = 824 MB/s
-```
-
-Foyer admitting read-miss bytes into the L2 disk cache, at **824 MB/s** on a
-warming process — more than the whole device does in steady state. And
-`l2_used_bytes` reads **638 GB against a 600 GB configured cap**, which is the
-over-cap condition the 09-11 doc already flagged as a misconfiguration. An L2
-that is over its cap admits, evicts, misses and re-admits; that loop is
-self-sustaining and is paid entirely in disk writes.
+The disk, by contrast, would go from ~4% to ~40% utilisation — uncomfortable but
+not a wall. The 09-11 measurement of 484 MB/s sustained on a **19-hour** process
+was real at the time; the tantivy-scratch move, the journal `fsync` reductions
+and write-capture gating have since taken steady-state writes down by roughly
+two orders of magnitude.
 
 ### So the order of work for 10x
 
-1. **Hygiene throughput** — fixed here, needs verification. At 10x this is not
-   optional: file production is 10x and the lane is currently at zero.
-2. **Foyer L2 admission policy.** Measure `admit_read_miss_bytes` against
-   `evictions` on a mature process. If the cache is thrashing over its cap, this
-   is the single biggest write channel and the cheapest to cut — a cache that
-   cannot hold its working set should decline admission, not churn.
-3. **MemBuffer headroom.** 9% at 1x leaves nothing at 10x. Either the budget
+1. **Hygiene throughput** — fixed here, needs verification. Not optional at 10x:
+   file production is 10x and the lane is currently at zero.
+2. **BaseRollup CPU per unit.** It is the single largest consumer and the one
+   that scales with data volume. Today's no-op skip and `#262` roughly halved it;
+   the remaining cost is real aggregation over 1,490x more rows than are
+   ingested, and that ratio is the lever.
+3. **MemBuffer headroom.** 9-13% at 1x leaves nothing at 10x. Either the budget
    grows or the flush interval shortens — and shortening it produces more files,
    which lands back on (1).
-4. Only then, per-unit maintenance cost. The 09-11 fix order
-   (`verify_blob` double-unpack, unattributed DataFusion spill) still applies and
-   is not re-derived here.
+4. **Restart frequency**, which is now a first-class cost rather than an
+   annoyance: each restart re-warms the cache at ~500-800 MB/s for minutes, and
+   the no-op rollup skip cannot fire until slices republish. Prod restarted
+   three times in two and a half hours today.
 
-CPU headroom is real: the box runs at roughly half of 48 cores with BaseRollup
-down to ~2.5 cores after today's rollup work. The constraint is bytes to disk,
-not instructions.
+Disk is no longer on this list, and that is a change from 09-11 worth noticing
+rather than assuming.
