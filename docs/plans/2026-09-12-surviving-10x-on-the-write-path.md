@@ -70,51 +70,94 @@ temporary, the foyer cache re-fetches from R2, spill is temporary. Only the WAL
 and the maintenance journals genuinely need durability, and they are a rounding
 error by volume. **We are paying 4x write amplification to mirror garbage.**
 
-## What binds at 10x
+## The current 500 MB/s is NOT all steady state — a backfill is running
 
-Assumption, stated explicitly because the exponent matters: index and
-maintenance volume scale **~linearly with ingested bytes**. Tantivy is built once
-per flush commit (`batch_callback` → `build_and_publish`, keyed to the parquet
-file), so 10x ingest means ~10x flush files and ~10x index builds. Rollup and
-dedup scale with data volume rather than request rate, so they scale at least
-linearly too.
+Two distinct Tantivy workloads are running, and conflating them would badly
+misprice 10x:
 
-| | now (1x) | 10x (projected) |
+1. **Steady state** — one index per flush commit (`batch_callback` →
+   `build_and_publish`, keyed to the parquet file). Scales ~linearly with ingest.
+2. **Catch-up backfill** — `tantivy_coverage_census` reports
+   **`uncovered=783` (today=207, week=184, older=392)**, and
+   `tantivy_backfill_unit` fires steadily. Backfill runs
+   `build_parquet_and_pack` over *whole committed historical files*, which are
+   far larger than a 10-minute flush bucket.
+
+**The naive extrapolation "500 MB/s × 10" is therefore wrong**, and an earlier
+draft of this note made it. A large but currently unmeasured share of today's
+local write traffic is one-time catch-up over 783 files, not a per-ingested-byte
+cost. Splitting these two is the single most important number nobody has, and it
+is precisely what the Phase 0 counters below exist to produce.
+
+What can be said without that split:
+
+- **Steady-state indexing scales linearly with ingest.** 10x ingest → ~10x flush
+  files → ~10x index builds. Whatever fraction *f* of today's 500 MB/s is
+  steady state becomes `10 × f × 500 MB/s`.
+- **Backfill does not shrink at 10x, it grows.** More ingest means more files
+  entering the uncovered set, so the catch-up term is not a fixed debt that
+  retires — at 10x it is a larger standing queue unless throughput per unit
+  improves.
+- **The mirror multiplies whatever the answer is by 4.**
+
+| | now (1x, measured) | 10x |
 | --- | --- | --- |
 | ingest reaching Delta | 5.45 MB/s | 55 MB/s |
-| logical local writes | ~500 MB/s | ~5 GB/s |
-| **device writes (×4 mirror)** | **~2 GB/s** | **~20 GB/s** |
-| array ceiling | ~1.6-2 GB/s (measured, at 100% util) | unchanged |
+| logical local writes | ~500 MB/s (mixed steady + backfill) | `10 × f × 500` + backfill |
+| **device writes (×4 mirror)** | **~2 GB/s** | 4× the above |
+| array ceiling | **~1.6-2 GB/s, measured at 100% util** | unchanged |
 
-**10x is roughly an order of magnitude past the array's write ceiling.** No
-amount of scheduling fixes that; scheduling changes who waits, not how many
-bytes must land. The byte count and the mirror are the two terms that have to
-move.
+Even at a conservative *f* = 0.3, steady state alone reaches ~1.5 GB/s logical /
+6 GB/s device at 10x — still **~3x past the measured ceiling**, before backfill.
+The conclusion survives the uncertainty; the exact multiple does not. Scheduling
+cannot fix this, because scheduling changes who waits, not how many bytes must
+land. **The byte count and the mirror are the two terms that have to move.**
 
 ## Solutions, cheapest first, with what each is worth
 
 ### Phase 0 (BLOCKING): per-channel byte counters
 
-`tantivy_scratch_bytes_written`, `spill_bytes_written`,
-`journal_bytes_written`, `foyer_admit_bytes` in `timefusion_stats`.
+`tantivy_scratch_bytes_written` **split by build kind (flush vs backfill)**,
+plus `spill_bytes_written`, `journal_bytes_written`, `foyer_admit_bytes` in
+`timefusion_stats`.
 
-This has now been deferred three times, and each deferral cost a wrong
-attribution. The table above rests on a directory listing and arithmetic, not on
-a counter; nothing below can be validated post-deploy without them. They are
-behaviour-neutral, so they ship with whatever goes next.
+The flush/backfill split is the load-bearing one: it produces *f*, and without
+*f* the 10x model has an unbounded term in it. Everything else below is sized
+against a directory listing and arithmetic, not a counter.
+
+This has now been deferred three times and each deferral bought a wrong
+attribution — `persist_rollup_journal`, then foyer, then spill, and in this very
+note an extrapolation from a backfill-contaminated number. The counters are
+behaviour-neutral; they ship with whatever goes next.
 
 ### Tier A — do less work (worth ~2-4x, no infra change)
 
-**A1. Stop indexing files that are about to be compacted away.** This is the
-biggest single lever and it is pure waste. Indexes are built per flush commit,
-on small 10-minute-bucket files that hot-packing and sealed consolidation
-rewrite within minutes. Carry-forward already preserves indexes across a rewrite
-when every input was covered (`carried=3 rebuilding=0` in the logs — it works),
-but the *initial* index on a short-lived file is still built, written, packed,
-uploaded, and then superseded. Index at the **sealed/compacted** tier and serve
-the recent tail from the mem-buffer and raw scan, which is what the hot path
-already does for uncovered intervals. This is the standard "don't index L0"
-shape from LSM search engines.
+**A1. Coarsen index granularity above the flush file.** Indexes are built per
+flush commit, on small 10-minute-bucket files.
+
+*A correction worth recording, because the obvious version of this lever is
+wrong:* those indexes are **not** thrown away when compaction rewrites the file.
+`carry_forward_after_compaction` (`search.rs:1516`) extends `covered_files` on
+the existing entries to include the compacted outputs — no rebuild
+(`carried=3 rebuilding=0` in the logs). So "stop indexing doomed files" is not
+the lever; the flush index is retained and reused.
+
+The real cost of flush-file granularity is twofold. Each build pays fixed
+per-index overhead (schema, dictionaries, segment metadata, tar+zstd, upload)
+that multiplies with index *count* rather than data volume. And the indexes
+accumulate: `indexes_per_query` is **10**, and every carry-forward sets
+`ordinals_valid = false`, giving up the row-ordinal optimisation. At 10x there
+are 10x as many small indexes — both build volume and query fanout degrade.
+
+Building at a coarser unit (per project-day, or at the sealed tier) and serving
+the recent tail from the mem-buffer and raw scan — which the hot path already
+does for uncovered intervals — attacks count-proportional overhead and fanout
+together. This is the "don't index L0" shape from LSM search engines.
+
+**A1b. Size and bound the backfill.** 783 uncovered files are being indexed
+concurrently with ingest, against a disk that is the binding constraint. Whether
+this is a debt that retires or a permanent standing queue is unknown and
+decides whether it belongs in the 10x model at all.
 
 **A2. Build small indexes in RAM.** `verify_blob` was changed in the last round
 to stage into a `RamDirectory` instead of materialising to disk; the same
