@@ -3288,6 +3288,13 @@ impl Database {
                 (crate::maintenance_coordinator::TAG_SLICE_START, key.slice.start_micros.to_string()),
                 (crate::maintenance_coordinator::TAG_SLICE_END, key.slice.end_micros.to_string()),
                 (crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT, source_fp.to_string()),
+                // Persisted so the no-op skip survives a restart. Without it,
+                // coverage rebuilt from these tags carries `content_fp: None`
+                // and nothing can be skipped until the slice has published once
+                // more in the new process — and production restarts on every
+                // non-docs push (three times in two and a half hours on
+                // 2026-09-12), so uptime is the scarce resource.
+                (crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT, content_fp.to_string()),
                 (crate::maintenance_coordinator::TAG_GENERATION, generation.clone()),
                 // Absent (older generations) means the read path cannot verify
                 // this slice and must refuse it, so write the sentinel rather
@@ -5130,141 +5137,155 @@ impl Database {
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
-            let (tagged, paths_by_identity, measures_by_identity, witness_reasons, witnessed) = match self.resolve_table("default", &target).await {
-                Ok(table) => {
-                    let table = table.read().await;
-                    // `source_rows` is part of the KEY so a partition rebuilt against a
-                    // different source count cannot merge with the older evidence.
-                    // A SET, not a count: the per-identity `num_records` sum this
-                    // used to carry fed exactly one `debug!` line and a placeholder
-                    // zero on the ledger-seeded path, so it was a field that read
-                    // as measured on one route and unset on another while meaning
-                    // nothing on either.
-                    let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
-                    // Paths per tagged identity, keyed exactly like `groups` so the
-                    // FILTERED loop below can recover them. The ledger must not be
-                    // written from this raw loop: the filters that follow
-                    // (`rollup_slice_complete`, and the `generation_id` match) are
-                    // what decide whether a slice is READABLE, and a ledger written
-                    // before them claims coverage the read path refuses — the one
-                    // failure this design must never have.
-                    let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
-                    // Why each witness-less identity has no witness, and which
-                    // identities DO carry one — keyed WITHOUT `source_rows`, so a
-                    // slice whose files disagree (a rewrite that stripped the tag
-                    // off some of them) is distinguishable from one that never had
-                    // it. Different repair entirely, indistinguishable in a count.
-                    let mut witness_reasons: HashMap<SliceKey, UnverifiableReason> = HashMap::new();
-                    let mut witnessed: std::collections::HashSet<SliceKey> = std::collections::HashSet::new();
-                    // Not part of the identity: two files of one slice that
-                    // disagree about their measures are still the same slice,
-                    // and folding measures into the key would instead make them
-                    // two entries racing for one coverage slot.
-                    let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
-                    for add in table.snapshot()?.log_data().iter() {
-                        let action = add_action(&add);
-                        // An untagged file proves no coverage, so this loop has
-                        // always skipped it. Skipping SILENTLY is what let 352 of
-                        // them accumulate over a month: `slice_retires` can now
-                        // retire one, but only when something publishes that
-                        // partition, and a sealed day that already has coverage is
-                        // never republished — nothing would ever enqueue it.
-                        // Remember the partition so the rebuild can be requested
-                        // below, which is what makes the tail self-healing rather
-                        // than a manual list someone has to keep.
-                        // Both arms feed `uncovered_gaps`: the untagged file's
-                        // own statistics span is the work, and the tagged
-                        // ranges beside it are what is already done. `hi + 1`
-                        // because statistics bounds are inclusive while a slice
-                        // end is not.
-                        let file_partition = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default");
-                        if let Some(partition) = file_partition.clone() {
-                            let tags = action.tags.as_ref();
-                            let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
-                            match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
-                                (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
-                                _ => {
-                                    untagged_files = untagged_files.saturating_add(1);
-                                    untagged_spans
-                                        .entry(partition)
-                                        .or_default()
-                                        .extend(action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1))));
+            let (tagged, paths_by_identity, measures_by_identity, content_fp_by_identity, witness_reasons, witnessed) =
+                match self.resolve_table("default", &target).await {
+                    Ok(table) => {
+                        let table = table.read().await;
+                        // `source_rows` is part of the KEY so a partition rebuilt against a
+                        // different source count cannot merge with the older evidence.
+                        // A SET, not a count: the per-identity `num_records` sum this
+                        // used to carry fed exactly one `debug!` line and a placeholder
+                        // zero on the ledger-seeded path, so it was a field that read
+                        // as measured on one route and unset on another while meaning
+                        // nothing on either.
+                        let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
+                        // Paths per tagged identity, keyed exactly like `groups` so the
+                        // FILTERED loop below can recover them. The ledger must not be
+                        // written from this raw loop: the filters that follow
+                        // (`rollup_slice_complete`, and the `generation_id` match) are
+                        // what decide whether a slice is READABLE, and a ledger written
+                        // before them claims coverage the read path refuses — the one
+                        // failure this design must never have.
+                        let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
+                        // Why each witness-less identity has no witness, and which
+                        // identities DO carry one — keyed WITHOUT `source_rows`, so a
+                        // slice whose files disagree (a rewrite that stripped the tag
+                        // off some of them) is distinguishable from one that never had
+                        // it. Different repair entirely, indistinguishable in a count.
+                        let mut witness_reasons: HashMap<SliceKey, UnverifiableReason> = HashMap::new();
+                        let mut witnessed: std::collections::HashSet<SliceKey> = std::collections::HashSet::new();
+                        // Not part of the identity: two files of one slice that
+                        // disagree about their measures are still the same slice,
+                        // and folding measures into the key would instead make them
+                        // two entries racing for one coverage slot.
+                        let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
+                        // The input set each identity was aggregated from. Several
+                        // files serve one identity and all carry the SAME value —
+                        // it is a property of the unit, not of the file — so any
+                        // disagreement means the tags cannot be trusted for this
+                        // purpose and the entry collapses to `None`, which declines
+                        // the skip. Absent on cells written before the tag existed.
+                        let mut content_fp_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
+                        for add in table.snapshot()?.log_data().iter() {
+                            let action = add_action(&add);
+                            // An untagged file proves no coverage, so this loop has
+                            // always skipped it. Skipping SILENTLY is what let 352 of
+                            // them accumulate over a month: `slice_retires` can now
+                            // retire one, but only when something publishes that
+                            // partition, and a sealed day that already has coverage is
+                            // never republished — nothing would ever enqueue it.
+                            // Remember the partition so the rebuild can be requested
+                            // below, which is what makes the tail self-healing rather
+                            // than a manual list someone has to keep.
+                            // Both arms feed `uncovered_gaps`: the untagged file's
+                            // own statistics span is the work, and the tagged
+                            // ranges beside it are what is already done. `hi + 1`
+                            // because statistics bounds are inclusive while a slice
+                            // end is not.
+                            let file_partition = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default");
+                            if let Some(partition) = file_partition.clone() {
+                                let tags = action.tags.as_ref();
+                                let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
+                                match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
+                                    (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
+                                    _ => {
+                                        untagged_files = untagged_files.saturating_add(1);
+                                        untagged_spans.entry(partition).or_default().extend(
+                                            action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1))),
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        let Some(tags) = action.tags.as_ref() else { continue };
-                        let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
-                        if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
-                            continue;
-                        }
-                        let (Some(project), Some(generation), Some(source_fp), Some(slice_start), Some(slice_end)) = (
-                            tag(crate::maintenance_coordinator::TAG_PROJECT),
-                            tag(crate::maintenance_coordinator::TAG_GENERATION),
-                            tag(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse::<u64>().ok()),
-                            tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                            tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                        ) else {
-                            // Tagged for THIS source, yet not identifiable: the file
-                            // is dropped from the tagged set and counted nowhere
-                            // else, so without this it is an invisible population.
-                            crate::database::rollup_unverifiable::IDENTITY_TAG_INCOMPLETE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            continue;
-                        };
-                        // Absent on generations written before the tag; `-1` is the
-                        // sentinel a build writes when the source reported no count.
-                        // Both become `None`, which the read path refuses to verify —
-                        // and `classify_witness` says WHICH, from the one place that
-                        // decides, so the split cannot fail to sum to the total.
-                        let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
-                        let source_rows = witness.ok();
-                        let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
-                        match witness {
-                            Ok(_) => {
-                                witnessed.insert(slice_key);
+                            let Some(tags) = action.tags.as_ref() else { continue };
+                            let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
+                            if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
+                                continue;
                             }
-                            // Lowest variant wins, so a slice seen under two
-                            // reasons attributes deterministically whatever order
-                            // the log lists its files in.
-                            Err(reason) => {
-                                witness_reasons.entry(slice_key).and_modify(|held| *held = (*held).min(reason)).or_insert(reason);
+                            let (Some(project), Some(generation), Some(source_fp), Some(slice_start), Some(slice_end)) = (
+                                tag(crate::maintenance_coordinator::TAG_PROJECT),
+                                tag(crate::maintenance_coordinator::TAG_GENERATION),
+                                tag(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse::<u64>().ok()),
+                                tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                                tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                            ) else {
+                                // Tagged for THIS source, yet not identifiable: the file
+                                // is dropped from the tagged set and counted nowhere
+                                // else, so without this it is an invisible population.
+                                crate::database::rollup_unverifiable::IDENTITY_TAG_INCOMPLETE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                continue;
+                            };
+                            // Absent on generations written before the tag; `-1` is the
+                            // sentinel a build writes when the source reported no count.
+                            // Both become `None`, which the read path refuses to verify —
+                            // and `classify_witness` says WHICH, from the one place that
+                            // decides, so the split cannot fail to sum to the total.
+                            let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
+                            let source_rows = witness.ok();
+                            let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
+                            match witness {
+                                Ok(_) => {
+                                    witnessed.insert(slice_key);
+                                }
+                                // Lowest variant wins, so a slice seen under two
+                                // reasons attributes deterministically whatever order
+                                // the log lists its files in.
+                                Err(reason) => {
+                                    witness_reasons.entry(slice_key).and_modify(|held| *held = (*held).min(reason)).or_insert(reason);
+                                }
+                            }
+                            // Absent means "no evidence", NOT "no measures" — the two
+                            // permit different queries, so an empty tag value must
+                            // still parse as `Some(∅)`. Several files can serve one
+                            // slice identity, and the slice can only be read for a
+                            // measure they ALL carry, hence the intersection.
+                            let measures = tag(crate::maintenance_coordinator::TAG_MEASURES)
+                                .map(|value| value.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<BTreeSet<String>>());
+                            let identity = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows);
+                            let merged = match measures_by_identity.remove(&identity) {
+                                Some(seen) => seen.zip(measures).map(|(left, right)| &left & &right),
+                                None => measures,
+                            };
+                            measures_by_identity.insert(identity.clone(), merged);
+                            let content_fp = tag(crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT).and_then(|value| value.parse::<u64>().ok());
+                            let agreed = match content_fp_by_identity.remove(&identity) {
+                                Some(seen) if seen == content_fp => seen,
+                                Some(_) => None,
+                                None => content_fp,
+                            };
+                            content_fp_by_identity.insert(identity.clone(), agreed);
+                            groups.insert(identity);
+                            // Same facts, recorded explicitly. The date comes from the
+                            // file's own partition rather than from `slice_start`,
+                            // because a day-wide slice starts at midnight of the day it
+                            // covers while a file in `date=D` cannot hold rows outside
+                            // `D` — the partition is the stronger statement.
+                            if let Some((partition_project, _date)) = file_partition.as_ref() {
+                                // The date comes from the file's PARTITION, not from
+                                // `slice_start`: a file in `date=D` cannot hold rows
+                                // outside `D`, so the partition is the stronger
+                                // statement, and a day-wide slice beginning at midnight
+                                // would otherwise be indistinguishable from one that
+                                // merely starts there.
+                                let entry = paths_by_identity
+                                    .entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows))
+                                    .or_insert_with(|| ((*partition_project).to_owned(), Vec::new()));
+                                entry.1.push(action.path.clone());
                             }
                         }
-                        // Absent means "no evidence", NOT "no measures" — the two
-                        // permit different queries, so an empty tag value must
-                        // still parse as `Some(∅)`. Several files can serve one
-                        // slice identity, and the slice can only be read for a
-                        // measure they ALL carry, hence the intersection.
-                        let measures = tag(crate::maintenance_coordinator::TAG_MEASURES)
-                            .map(|value| value.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<BTreeSet<String>>());
-                        let identity = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows);
-                        let merged = match measures_by_identity.remove(&identity) {
-                            Some(seen) => seen.zip(measures).map(|(left, right)| &left & &right),
-                            None => measures,
-                        };
-                        measures_by_identity.insert(identity.clone(), merged);
-                        groups.insert(identity);
-                        // Same facts, recorded explicitly. The date comes from the
-                        // file's own partition rather than from `slice_start`,
-                        // because a day-wide slice starts at midnight of the day it
-                        // covers while a file in `date=D` cannot hold rows outside
-                        // `D` — the partition is the stronger statement.
-                        if let Some((partition_project, _date)) = file_partition.as_ref() {
-                            // The date comes from the file's PARTITION, not from
-                            // `slice_start`: a file in `date=D` cannot hold rows
-                            // outside `D`, so the partition is the stronger
-                            // statement, and a day-wide slice beginning at midnight
-                            // would otherwise be indistinguishable from one that
-                            // merely starts there.
-                            let entry = paths_by_identity
-                                .entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows))
-                                .or_insert_with(|| ((*partition_project).to_owned(), Vec::new()));
-                            entry.1.push(action.path.clone());
-                        }
+                        (groups, paths_by_identity, measures_by_identity, content_fp_by_identity, witness_reasons, witnessed)
                     }
-                    (groups, paths_by_identity, measures_by_identity, witness_reasons, witnessed)
-                }
-                Err(_) => Default::default(),
-            };
+                    Err(_) => Default::default(),
+                };
             // Filled by the FILTERED loop below, then verified and written once
             // per tier. Nothing is recorded for a slice the read path would
             // refuse, because the ledger is meant to become the authority and an
@@ -5462,6 +5483,15 @@ impl Database {
                             },
                         );
                     }
+                    // The no-op skip's two halves, both recovered from the SAME
+                    // tags the rest of this loop trusts: the input set the cell
+                    // was aggregated from, and how many files it published. An
+                    // absent tag yields `None`/`0`, and either alone declines
+                    // the skip — so a cell written before this tag existed costs
+                    // one rebuild rather than freezing.
+                    let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
+                    let content_fp = content_fp_by_identity.get(&identity).copied().flatten();
+                    let output_files = paths_by_identity.get(&identity).map_or(0, |(_, paths)| u32::try_from(paths.len()).unwrap_or(u32::MAX));
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
                         RollupCoverage {
@@ -5471,8 +5501,8 @@ impl Database {
                             source_rows,
                             covered_through: slice_end,
                             measures: measures.map(|names| names.into_iter().collect()),
-                            content_fp: None,
-                            output_files: 0,
+                            content_fp,
+                            output_files,
                         },
                     );
                     recovered += 1;
@@ -10389,6 +10419,51 @@ mod rollup_noop_skip_tests {
         db.plan_rollup_backfill().await?;
         crate::support::advance_micros(16 * 60 * 1_000_000);
         db.drain_coordinator_rollups(64).await
+    }
+
+    /// The skip must survive a restart, or it is nearly useless in production.
+    ///
+    /// Coverage rebuilt from tier tags at boot carried `content_fp: None` and
+    /// `output_files: 0`, and either alone declines the skip — so NOTHING could
+    /// be skipped until a slice had published once more in the new process.
+    /// Production restarts on every non-docs push: three times in two and a half
+    /// hours on 2026-09-12, and `rollup_noop_rebuild_skipped_total` read **0** on
+    /// a 31-minute process against 38 on a 44-minute one. Uptime, not coverage,
+    /// was the binding constraint.
+    ///
+    /// The restart is a second `Database` over the same data dir, the same shape
+    /// `a_certification_survives_a_restart_and_still_grants_the_skip` uses.
+    ///
+    /// Can-fail proof, run red then restored: dropping `TAG_CONTENT_FINGERPRINT`
+    /// from the publish tag block leaves this red — no skip after the restart —
+    /// which is exactly the production behaviour being fixed.
+    #[serial]
+    #[tokio::test]
+    async fn a_restart_recovers_the_proof_the_skip_needs() -> Result<()> {
+        let mut cfg = (*TestConfigBuilder::new("rollup_noop_restart").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 7;
+        let cfg = Arc::new(cfg);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+
+        {
+            let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about restarts");
+        }
+
+        // A brand-new Database over the same data dir — a deploy, in miniature.
+        // Its coverage comes only from what the tier's tags carry.
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let published_at = tier_version(&db).await.expect("the tier must exist after the first process published into it");
+
+        let before = skips();
+        remint_published_base_slices(&db)?;
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?;
+        assert!(skips() > before, "a slice re-minted after a restart must still be proved redundant from its tags");
+        assert_eq!(tier_version(&db).await, Some(published_at), "and must not write to the tier");
+        Ok(())
     }
 
     /// Prod 2026-09-11: BaseRollup held 59% of maintenance worker-seconds and

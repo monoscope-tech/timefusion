@@ -204,6 +204,15 @@ pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
 pub const TAG_SLICE_END: &str = "timefusion.slice_end_micros";
 pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
+/// The INPUT FILE SET this cell was aggregated from, deletion vectors included —
+/// the no-op-rebuild proof, persisted so it survives a restart.
+///
+/// Distinct from [`TAG_SOURCE_FINGERPRINT`], which hashes paths alone and is
+/// therefore blind to a deletion vector superseding an `Add` under the same
+/// path. Written by the publish site and read back by `recover_rollup_coverage`;
+/// absent on cells written before this tag existed, which yields `None` and
+/// declines the skip exactly as a missing proof should.
+pub const TAG_CONTENT_FINGERPRINT: &str = "timefusion.content_fingerprint";
 /// How many rows the SOURCE DATE PARTITION held when this slice was built —
 /// the `num_records` sum, exactly as `partition_stats_bounded` computes it.
 ///
