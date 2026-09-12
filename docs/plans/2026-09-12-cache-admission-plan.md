@@ -405,3 +405,92 @@ amplification barely matters; the space does.
 - under induced pressure, TF degrades instead of being OOM-killed
 - `/proc/pressure/memory` stays near zero in normal operation; if swap is being
   touched routinely, `swappiness` is still too high
+
+## RESOLVED 2026-09-12 (with root): the flood is DataFusion SPILL CHURN
+
+Sudo on the host ended a six-hypothesis hunt in one command.
+
+**`sudo pidstat -d 5 3`** → `timefusion 367 MB/s`; everything else negligible
+(postgres ~7, redpanda 0.13, ext4 journal 0.3). Then `/proc/<pid>/fd`:
+
+| destination | fds (before fix) | fds (after `d1491f48`) |
+| --- | --- | --- |
+| **`/tmp/.tmp*`** (container overlay) | **184** | **0** |
+| `coordinator_spill/` | — | **356** |
+| foyer `cache` + `cache/metadata` | — | 460 |
+| `tantivy_scratch/` | 97 | 90 |
+| `query_spill/` | n/a (did not exist) | 40 |
+
+`build_query_runtime_env` never called `with_disk_manager_builder`, so query
+spill defaulted to `std::env::temp_dir()` — overlay2 — capped only by
+DataFusion's own **100 GiB** default and invisible to every knob here. Fixed in
+`d1491f48`; `/tmp` fds went **184 → 0** and `query_spill` now holds the traffic.
+
+**Be honest about what that fix did NOT do.** Both locations are on md3, so the
+byte count did not move: 257 MB/s before, 259 MB/s after. It **attributes and
+bounds** the traffic; it does not **reduce** it. Reducing bytes needs spilling
+less, or a different device.
+
+### Per-directory growth, 45 s (and why it undercounts)
+
+| dir | net growth | size |
+| --- | --- | --- |
+| `query_spill` | +45 MB/s | 3.4 GB |
+| `tantivy_scratch` | +24 MB/s | 7.3 GB |
+| `wal` | +22 MB/s | 2.9 GB |
+| `coordinator_spill` | −8.7 MB/s | 0.2 GB |
+| `cache` | 0 | 605 GB |
+
+91 MB/s of net growth against 259 MB/s written: the rest is **churn**, files
+created and deleted inside the window. That is exactly what spill is, and it is
+why `du` sampling — the method that produced the earlier "spill is empty"
+retraction — systematically undercounts it.
+
+### foyer block-engine reclamation: REFUTED
+
+The last standing hypothesis. **1 of 300** region files had an mtime inside the
+previous 2 minutes. There is no relocate-to-reclaim loop; the 605 GB is static.
+
+### The remaining byte-reduction lever
+
+Spill is dominated by the **maintenance coordinator** (356 fds), yet
+`coordinator_pool_pct` is **14%** and `maintenance_pool_pct` is **0%** — memory
+is abundant. That points at `FairSpillPool` semantics: each in-flight job gets a
+*slice* (`coordinator_share_bytes`, "kept equal to the admission ceiling"), and a
+job exceeding its slice spills regardless of global headroom. A sort needs more
+than its decoded input — input plus sorted output plus merge buffers — so a slice
+sized *equal* to the admission ceiling will spill by construction.
+
+**Do not just raise it.** Pool sizing here has a documented incident history
+(non-spillable sort reservations exhausting the query pool, "Not enough memory to
+continue external sort", 2026-08-31). The change wants its own measurement and
+its own deploy.
+
+## Drive endurance: measured, and the wear percentage is misleading
+
+`nvme smart-log`, all four drives identical: **`percentage_used` 27%**,
+`power_on_hours` **12,998** (~1.48 y), **`Data Units Written` 1.90 PB**,
+`media_errors` 0, `available_spare` 100%.
+
+27% in 1.48 years reads as safe **and is a lagging indicator**. 1.90 PB over
+12,998 h is a lifetime average of **40.6 MB/s per drive**; the current rate is
+**~257 MB/s per drive** (4-way mirror ⇒ every drive takes every write), i.e.
+**~6x the historical average**.
+
+27% ≙ 1.90 PB implies **~7.0 PB total TBW** (≈2 DWPD over 5 y — a normal
+mixed-use enterprise rating), leaving **~5.1 PB**:
+
+| layout | worst-drive rate | runway |
+| --- | --- | --- |
+| **today** (4-way mirror) | 257 MB/s | **7.6 months** (3.2 at the earlier 616 MB/s peak) |
+| after split — md3 pair (WAL only) | 10 MB/s | ~16 years |
+| after split — md4 pair (ephemeral, striped) | 125 MB/s | **15.6 months** |
+
+**This refines Appendix A.** Step 1 alone (4-way → 2-way) buys nothing for
+endurance either — the surviving pair still takes every write. The gain is
+entirely from **striping** the ephemeral traffic in step 2, which roughly doubles
+the runway on the busiest drives and all but eliminates wear on the WAL pair.
+
+**Never read `percentage_used` alone:** divide `Data Units Written` by
+`power_on_hours` for the historical average and compare it against the current
+measured rate. A benign-looking 27% concealed a ~7-month runway.
