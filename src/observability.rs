@@ -1070,6 +1070,14 @@ atomic_stats! {
         /// however busy maintenance gets. Tracking the checkpoint rate instead
         /// means the throttle is not firing.
         journal_stats_publishes as "journal_stats_publishes_total",
+        /// Finished tasks dropped from the journal because their slice is past
+        /// the abandonment horizon. A prod census on 2026-09-12 found 15,202 of
+        /// 79,682 (19.1%) in that state, so the first compaction after a deploy
+        /// should move this sharply once and then only trickle.
+        ///
+        /// Read `tasks_complete` alongside it: if this climbs while that does
+        /// not fall, something is re-creating the keys being pruned.
+        journal_retired_tasks_pruned as "journal_retired_tasks_pruned_total",
         /// Base files a DERIVED unit refused for an obsolete generation, split by
         /// whether refusing them actually cost anything.
         ///
