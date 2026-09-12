@@ -102,32 +102,27 @@ pub(crate) type BackfillCell = (String, chrono::NaiveDate);
 /// the parse layer, and this field gets hand-edited under exactly the
 /// conditions where nobody re-reads it.
 pub(crate) fn damaged_cells_newest_first(configured: &[String]) -> Vec<BackfillCell> {
-    let listed: Vec<(String, String)> = if configured.is_empty() {
-        DAMAGED_CELLS.iter().map(|(project, date)| ((*project).to_owned(), (*date).to_owned())).collect()
+    let listed = if configured.is_empty() {
+        itertools::Either::Left(DAMAGED_CELLS.iter().map(|(project, date)| ((*project).to_owned(), (*date).to_owned())))
     } else {
-        configured
-            .iter()
-            .filter_map(|cell| match cell.trim().split_once(':') {
-                Some((project, date)) => Some((project.trim().to_owned(), date.trim().to_owned())),
-                None => {
-                    warn!(entry = %cell, event = "damage_repair_cell_unparsed", "damage repair cell is not `project:YYYY-MM-DD`; it will NOT be repaired");
-                    None
-                }
-            })
-            .collect()
+        itertools::Either::Right(configured.iter().filter_map(|cell| match cell.trim().split_once(':') {
+            Some((project, date)) => Some((project.trim().to_owned(), date.trim().to_owned())),
+            None => {
+                warn!(entry = %cell, event = "damage_repair_cell_unparsed", "damage repair cell is not `project:YYYY-MM-DD`; it will NOT be repaired");
+                None
+            }
+        }))
     };
-    let mut cells: Vec<BackfillCell> = listed
-        .iter()
+    listed
         .filter_map(|(project, date)| match date.parse::<chrono::NaiveDate>() {
-            Ok(date) => Some((project.clone(), date)),
+            Ok(parsed) => Some((project, parsed)),
             Err(_) => {
                 warn!(project = %project, date = %date, event = "damage_repair_cell_unparsed", "damage repair cell has an unparseable date; it will NOT be repaired");
                 None
             }
         })
-        .collect();
-    cells.sort_by(|(project_a, date_a), (project_b, date_b)| date_b.cmp(date_a).then_with(|| project_a.cmp(project_b)));
-    cells
+        .sorted_by(|(project_a, date_a), (project_b, date_b)| date_b.cmp(date_a).then_with(|| project_a.cmp(project_b)))
+        .collect()
 }
 
 /// Order one backfill pass, bound it, and report how much of its forced prefix
@@ -518,12 +513,7 @@ pub fn probe_groups_for_budget(permits: usize, budget: std::time::Duration, obse
 /// assert_eq!(observed("otel_logs_and_spans"), Some(Duration::from_millis(163_441)));
 /// ```
 pub fn note_probe_cost_into(costs: &dashmap::DashMap<String, u64>, table_name: &str, ms: u64) {
-    match costs.get_mut(table_name) {
-        Some(mut prior) => *prior = (*prior + ms) / 2,
-        None => {
-            costs.insert(table_name.to_string(), ms);
-        }
-    }
+    costs.entry(table_name.to_string()).and_modify(|prior| *prior = (*prior + ms) / 2).or_insert(ms);
 }
 
 /// Rows an `Add` declares in its Delta statistics, when it declares any.
@@ -591,6 +581,11 @@ pub fn file_content_hash(path: &str, deletion_vector: Option<&deltalake::kernel:
 /// `micros` truncated to unix milliseconds, as the u64 the journal stores.
 fn unix_ms(micros: i64) -> u64 {
     u64::try_from(micros.div_euclid(1_000)).unwrap_or_default()
+}
+
+/// UTC midnight of `date` in microseconds — the start of every day-sized slice.
+fn day_start_micros(date: chrono::NaiveDate) -> Option<i64> {
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros())
 }
 
 /// `LogicalFileView::add_action()`, centralizing its one `#[allow(deprecated)]` call site.
@@ -714,10 +709,14 @@ pub(crate) async fn collect_watched(ctx: &datafusion::prelude::SessionContext, s
     Ok(batches)
 }
 
+/// Sum `of` over every operator's metrics in a plan.
+fn plan_metric_fold(plan: &dyn datafusion::physical_plan::ExecutionPlan, of: impl Fn(&datafusion::physical_plan::metrics::MetricsSet) -> u64 + Copy) -> u64 {
+    plan.children().iter().fold(plan.metrics().as_ref().map_or(0, of), |sum, child| sum.saturating_add(plan_metric_fold(child.as_ref(), of)))
+}
+
 /// Sum one named metric over every operator in a plan.
 fn plan_metric_sum(plan: &dyn datafusion::physical_plan::ExecutionPlan, name: &str) -> u64 {
-    let own = plan.metrics().map_or(0, |metrics| metrics.sum_by_name(name).map_or(0, |value| value.as_usize() as u64));
-    plan.children().iter().fold(own, |sum, child| sum.saturating_add(plan_metric_sum(child.as_ref(), name)))
+    plan_metric_fold(plan, |metrics| metrics.sum_by_name(name).map_or(0, |value| value.as_usize() as u64))
 }
 
 /// How much of what a maintenance query COULD have read it actually read.
@@ -761,8 +760,7 @@ fn log_scan_pruning(plan: &dyn datafusion::physical_plan::ExecutionPlan, elapsed
 
 /// Rows every operator in `plan` has produced so far.
 fn plan_output_rows(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> u64 {
-    let own = plan.metrics().and_then(|metrics| metrics.output_rows()).unwrap_or_default() as u64;
-    plan.children().iter().fold(own, |rows, child| rows.saturating_add(plan_output_rows(child.as_ref())))
+    plan_metric_fold(plan, |metrics| metrics.output_rows().unwrap_or_default() as u64)
 }
 
 /// Run `work`, giving up only after `idle` passes with **no progress**.
@@ -829,13 +827,11 @@ type UntaggedPartitions = HashMap<(String, String), (Vec<(i64, i64)>, Vec<(i64, 
 /// is the one nobody is looking at.
 async fn staged_objects_complete(store: &dyn object_store::ObjectStore, adds: &[deltalake::kernel::Add]) -> bool {
     use object_store::{ObjectStoreExt, path::Path as OsPath};
-    for add in adds {
-        let meta = store.head(&OsPath::from(add.path.as_str())).await;
-        if !meta.is_ok_and(|meta| i64::try_from(meta.size).is_ok_and(|size| size == add.size)) {
-            return false;
-        }
-    }
-    true
+    futures::stream::iter(adds)
+        .all(|add| async move {
+            store.head(&OsPath::from(add.path.as_str())).await.is_ok_and(|meta| i64::try_from(meta.size).is_ok_and(|size| size == add.size))
+        })
+        .await
 }
 
 impl Database {
@@ -890,7 +886,7 @@ impl Database {
     }
 
     fn persist_rollup_journal(&self) -> std::io::Result<()> {
-        let mut entries: Vec<_> = self
+        let entries: Vec<_> = self
             .rollup_source_epochs
             .iter()
             .map(|entry| {
@@ -906,8 +902,8 @@ impl Database {
                     invalidated_unix_ms: self.rollup_invalidated_at.get(entry.key()).map_or(0, |value| *value.value()),
                 }
             })
+            .sorted_by(|a, b| (&a.source, &a.project_id, &a.date).cmp(&(&b.source, &b.project_id, &b.date)))
             .collect();
-        entries.sort_by(|a, b| (&a.source, &a.project_id, &a.date).cmp(&(&b.source, &b.project_id, &b.date)));
         let dirty_entries = entries.iter().filter(|entry| entry.unknown || entry.dirty_hours != 0).collect::<Vec<_>>();
         let stats = crate::observability::maintenance_stats();
         stats.rollup_dirty_partitions.store(dirty_entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -929,56 +925,48 @@ impl Database {
         if schema.rollups.is_empty() || hours == 0 {
             return Ok(());
         }
-        let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(std::io::Error::other)?;
-        let day_start = day.and_hms_opt(0, 0, 0).ok_or_else(|| std::io::Error::other("invalid maintenance date"))?.and_utc().timestamp_micros();
-        let observed_at = crate::support::now_micros();
-        let mut journal = self.journal();
-        for spec in &schema.rollups {
-            let target = spec.table_name(source);
-            for (start, end) in crate::rollup::dirty_ranges(day_start, hours) {
-                journal
-                    .invalidate(crate::maintenance_coordinator::Invalidation {
-                        source_table: source,
-                        rollup_table: &target,
-                        source,
-                        project_id,
-                        start_micros: start,
-                        end_micros: end,
-                        observed_at_micros: observed_at,
-                        derived: spec.derive_from.is_some(),
-                        mint_dedup,
-                        // The ONLY caller passing `mint_dedup=false` is the
-                        // reconciler's DV-dedup-only hours (`hours & !with_dedup`);
-                        // every other caller passes true. A DV-dedup-only hour needs
-                        // no rollup rebuild either (see `Invalidation::mint_rollup`),
-                        // so the two flags move together here.
-                        mint_rollup: mint_dedup,
-                    })
-                    .map_err(std::io::Error::other)?;
-            }
-        }
-        journal.checkpoint().map_err(std::io::Error::other)
+        self.enqueue_invalidations(project_id, source, date, Some(hours), mint_dedup).map_err(std::io::Error::other)
     }
 
     fn enqueue_maintenance_partition(&self, project_id: &str, source: &str, date: &str) -> Result<()> {
+        self.enqueue_invalidations(project_id, source, date, None, true)
+    }
+
+    /// Invalidate every rollup spec of `source` over `date`: `Some(hours)` mints
+    /// the dirty hour ranges precisely, `None` the whole day coarsely.
+    fn enqueue_invalidations(&self, project_id: &str, source: &str, date: &str, hours: Option<u32>, mint: bool) -> Result<()> {
         let Some(schema) = get_schema(source) else { return Ok(()) };
         let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
-        let start = day.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid maintenance date"))?.and_utc().timestamp_micros();
+        let day_start = day_start_micros(day).ok_or_else(|| anyhow::anyhow!("invalid maintenance date"))?;
         let observed_at_micros = crate::support::now_micros();
         let mut journal = self.journal();
         for spec in &schema.rollups {
-            journal.invalidate_coarse(crate::maintenance_coordinator::Invalidation {
-                source_table: source,
-                rollup_table: &spec.table_name(source),
-                source,
-                project_id,
-                start_micros: start,
-                end_micros: start.saturating_add(DAY_MICROS),
-                observed_at_micros,
-                derived: spec.derive_from.is_some(),
-                mint_dedup: true,
-                mint_rollup: true,
-            })?;
+            let target = spec.table_name(source);
+            let ranges = hours.map_or_else(|| vec![(day_start, day_start.saturating_add(DAY_MICROS))], |hours| crate::rollup::dirty_ranges(day_start, hours));
+            for (start_micros, end_micros) in ranges {
+                let invalidation = crate::maintenance_coordinator::Invalidation {
+                    source_table: source,
+                    rollup_table: &target,
+                    source,
+                    project_id,
+                    start_micros,
+                    end_micros,
+                    observed_at_micros,
+                    derived: spec.derive_from.is_some(),
+                    mint_dedup: mint,
+                    // The ONLY caller passing `mint_dedup=false` is the
+                    // reconciler's DV-dedup-only hours (`hours & !with_dedup`);
+                    // every other caller passes true. A DV-dedup-only hour needs
+                    // no rollup rebuild either (see `Invalidation::mint_rollup`),
+                    // so the two flags move together here.
+                    mint_rollup: mint,
+                };
+                if hours.is_some() {
+                    journal.invalidate(invalidation)?;
+                } else {
+                    journal.invalidate_coarse(invalidation)?;
+                }
+            }
         }
         journal.checkpoint()
     }
@@ -1002,23 +990,24 @@ impl Database {
                 (table.version().unwrap_or_default(), table.log_store())
             };
             let cursor_key = format!("{storage_project}:{source}");
-            let current_cursor = self.journal().source_cursor(&cursor_key);
             // The first coordinator start has no durable cursor. Establish a
             // baseline at the already-loaded snapshot instead of expanding the
             // complete table history into thousands of urgent tasks. Existing
             // journal invalidations remain intact, and normal fair backfill
             // discovers historical debt. Production showed the old bootstrap
             // path monopolizing CPU for 21.9s immediately after preload.
-            if current_cursor.is_none() {
+            // Bound to its own statement so the journal guard is DROPPED before
+            // the else block takes it again — see `admission_backoff_for`.
+            let current_cursor = self.journal().source_cursor(&cursor_key);
+            let Some(cursor) = current_cursor else {
                 let mut journal = self.journal();
                 journal.set_source_cursor(cursor_key, version);
                 journal.checkpoint()?;
                 continue;
-            }
-            if current_cursor.is_some_and(|cursor| cursor >= version) {
+            };
+            if cursor >= version {
                 continue;
             }
-            let cursor = current_cursor.expect("missing cursor handled above");
             // Per partition, the hours the missed commits can have touched —
             // derived from the Add actions' timestamp stats. The naive form
             // invalidated ALL_HOURS per changed partition: a unified-table
@@ -1056,10 +1045,8 @@ impl Database {
                             let Some(partition) = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default") else { continue };
                             let mask = chrono::NaiveDate::parse_from_str(&partition.1, "%Y-%m-%d")
                                 .ok()
-                                .and_then(|date| date.and_hms_opt(0, 0, 0))
-                                .and_then(|day| {
-                                    add.stats.as_deref().and_then(|stats| crate::rollup::hours_from_stats_json(stats, day.and_utc().timestamp_micros()))
-                                })
+                                .and_then(day_start_micros)
+                                .and_then(|day_start| add.stats.as_deref().and_then(|stats| crate::rollup::hours_from_stats_json(stats, day_start)))
                                 .unwrap_or(crate::rollup::ALL_HOURS);
                             partitions_with_adds.insert(partition.clone());
                             if !dv_dedup_commit {
@@ -1080,14 +1067,12 @@ impl Database {
                         _ => {}
                     }
                 }
-                for partition in remove_only {
-                    if !partitions_with_adds.contains(&partition) {
-                        // Conservative day regardless of the tag: a tagged
-                        // commit never removes without a paired Add, so if one
-                        // somehow does, mint EVERYTHING for it.
-                        dedup_hours.insert(partition.clone(), crate::rollup::ALL_HOURS);
-                        partition_hours.insert(partition, crate::rollup::ALL_HOURS);
-                    }
+                // Conservative day regardless of the tag: a tagged commit never
+                // removes without a paired Add, so if one somehow does, mint
+                // EVERYTHING for it.
+                for partition in remove_only.difference(&partitions_with_adds).cloned() {
+                    dedup_hours.insert(partition.clone(), crate::rollup::ALL_HOURS);
+                    partition_hours.insert(partition, crate::rollup::ALL_HOURS);
                 }
             }
             if let Some(missing) = missing_commit {
@@ -1314,7 +1299,7 @@ impl Database {
                 if date > today {
                     continue;
                 }
-                let day_start = date.and_hms_opt(0, 0, 0).ok_or_else(|| anyhow::anyhow!("invalid compaction date"))?.and_utc().timestamp_micros();
+                let day_start = day_start_micros(date).ok_or_else(|| anyhow::anyhow!("invalid compaction date"))?;
                 let slice = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS))?;
                 let small_target = if date == today { COORDINATOR_HOT_TARGET_BYTES } else { COORDINATOR_SEALED_TARGET_BYTES };
                 // SIZE only. Sortedness belongs to Repair, which owns it below.
@@ -1338,7 +1323,7 @@ impl Database {
                 // Object storage agrees with the size-only policy: of 1,033
                 // partitions, 877 are already compliant and 108 sealed ones are
                 // genuinely out of policy — against 2,130 pending tasks.
-                let mut small = files.iter().filter(|file| file.size < small_target).collect::<Vec<_>>();
+                let small = files.iter().filter(|file| file.size < small_target).sorted_by_key(|file| file.size).collect_vec();
                 // The policy must agree with what the PACKER can actually do.
                 // `select_coordinator_compaction_candidates` merges files whose
                 // SUM fits the target, so two files that are each under target
@@ -1367,7 +1352,6 @@ impl Database {
                 //
                 // Unknown row counts are NO OBJECTION, matching the packer: a
                 // missing `numRecords` must never be stricter than bytes alone.
-                small.sort_by_key(|file| file.size);
                 let mergeable = small.len() >= 2 && packer_admits_pair((small[0].size, small[1].size), (small[0].rows, small[1].rows), small_target);
                 if mergeable {
                     let operation = if date == today { Operation::HotPacking } else { Operation::SealedConsolidation };
@@ -1495,6 +1479,7 @@ impl Database {
     /// durable cursor, so a day written before rollups existed is never enqueued by anything else.
     /// Bounded newest-first and at most `BACKFILL_PARTITIONS_PER_PASS` per pass.
     pub async fn plan_rollup_backfill(&self) -> Result<usize> {
+        use crate::maintenance_coordinator::{MAX_DECODED_BYTES, Operation, TaskJournal, TaskKey, TaskState, TimeSlice, blocks_rollup_backfill};
         /// Newest-first per pass, repeating on the same 60s cadence as compaction-debt planning.
         ///
         /// Day-sized rollup units reduced the per-partition task explosion from hundreds to a
@@ -1546,7 +1531,7 @@ impl Database {
         // the coverage at all.
         let defer_enqueue = {
             let journal = self.journal();
-            let pending = journal.tasks().filter(|task| task.state != crate::maintenance_coordinator::TaskState::Complete).count();
+            let pending = journal.tasks().filter(|task| task.state != TaskState::Complete).count();
             let defer = pending >= BACKFILL_PENDING_CEILING && !coverage_is_short();
             if defer {
                 debug!(pending, ceiling = BACKFILL_PENDING_CEILING, event = "rollup_backfill_enqueue_deferred");
@@ -1800,7 +1785,7 @@ impl Database {
             // re-contain a cell that has tier output. Nothing is consumed until
             // it has survived truncation; see `admit_backfill_pass`.
             let damage_repair = damaged_cells_newest_first(&self.config.maintenance.timefusion_damage_repair_cells);
-            let damage_from = self.journal().repair_cursor(crate::maintenance_coordinator::TaskJournal::DAMAGE_REPAIR_MIGRATION, &source);
+            let damage_from = self.journal().repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, &source);
             // An empty candidate set is a source with no partitions at all, not
             // evidence that the list is unrepairable there. Burning the cursor
             // 24 at a time against it would drop the list exactly as v1 did.
@@ -1871,7 +1856,7 @@ impl Database {
                 let journal = self.journal();
                 journal
                     .tasks()
-                    .filter(|task| task.key.source == source && crate::maintenance_coordinator::blocks_rollup_backfill(task))
+                    .filter(|task| task.key.source == source && blocks_rollup_backfill(task))
                     .filter_map(|task| {
                         chrono::DateTime::from_timestamp_micros(task.key.slice.start_micros)
                             .map(|time| (task.key.project_id.clone(), time.date_naive(), task.key.physical_table.clone()))
@@ -1903,20 +1888,20 @@ impl Database {
                     if *date >= today || missing.iter().any(|index| schema.rollups[*index].derive_from.is_none()) {
                         continue;
                     }
-                    let Some(day_start) = date.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
-                    let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
+                    let Some(day_start) = day_start_micros(*date) else { continue };
+                    let Ok(slice) = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
                     for index in missing {
                         let spec = &schema.rollups[*index];
                         if spec.derive_from.is_none() {
                             continue;
                         }
                         proven += journal.prove_base_tier_for_day(
-                            &crate::maintenance_coordinator::TaskKey {
+                            &TaskKey {
                                 physical_table: spec.table_name(&source),
                                 source: source.clone(),
                                 project_id: project_id.clone(),
                                 slice,
-                                operation: crate::maintenance_coordinator::Operation::DerivedRollup,
+                                operation: Operation::DerivedRollup,
                             },
                             day_start,
                             day_start.saturating_add(DAY_MICROS),
@@ -1945,7 +1930,7 @@ impl Database {
             // the holes, this one says why the work it already queued never runs.
             let (derived_pending, derived_sealed, derived_unproven, derived_quarantined, derived_not_due) = {
                 let journal = self.journal();
-                journal.claimability_census(crate::maintenance_coordinator::Operation::DerivedRollup, crate::support::now_micros())
+                journal.claimability_census(Operation::DerivedRollup, crate::support::now_micros())
             };
             info!(
                 source,
@@ -1961,7 +1946,7 @@ impl Database {
                 derived_refusal = {
                     let journal = self.journal();
                     journal
-                        .first_refused_sealed(crate::maintenance_coordinator::Operation::DerivedRollup, crate::support::now_micros())
+                        .first_refused_sealed(Operation::DerivedRollup, crate::support::now_micros())
                         .map_or_else(|| "none_pending".to_owned(), |(project, date, reason)| format!("{reason}:{project:.8}:{date}"))
                 },
                 cells_admitted = want.len().min(BACKFILL_PARTITIONS_PER_PASS),
@@ -2017,20 +2002,14 @@ impl Database {
             {
                 let mut journal = self.journal();
                 for (project_id, date) in &want {
-                    let Some(day_start) = date.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
-                    let Ok(slice) = crate::maintenance_coordinator::TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
+                    let Some(day_start) = day_start_micros(*date) else { continue };
+                    let Ok(slice) = TimeSlice::new(day_start, day_start.saturating_add(DAY_MICROS)) else { continue };
                     let mut refused = false;
                     let mut enqueue = |physical_table: String, operation, base_tier_present| {
                         journal.enqueue_with_base_tier(
-                            crate::maintenance_coordinator::TaskKey {
-                                physical_table,
-                                source: source.clone(),
-                                project_id: project_id.clone(),
-                                slice,
-                                operation,
-                            },
+                            TaskKey { physical_table, source: source.clone(), project_id: project_id.clone(), slice, operation },
                             now,
-                            crate::maintenance_coordinator::MAX_DECODED_BYTES,
+                            MAX_DECODED_BYTES,
                             created_unix_ms,
                             base_tier_present,
                         )
@@ -2046,15 +2025,11 @@ impl Database {
                     // the common case here: 1m is 22-32 days deep while 1h is
                     // 2-6, so most queued days need the coarse tier alone.
                     if needs_source_scan && !queued_tables.contains(&(project_id.clone(), *date, source.clone())) {
-                        refused |= !enqueue(source.clone(), crate::maintenance_coordinator::Operation::Dedup, false);
+                        refused |= !enqueue(source.clone(), Operation::Dedup, false);
                     }
                     for index in missing {
                         let spec = &schema.rollups[index];
-                        let operation = if spec.derive_from.is_some() {
-                            crate::maintenance_coordinator::Operation::DerivedRollup
-                        } else {
-                            crate::maintenance_coordinator::Operation::BaseRollup
-                        };
+                        let operation = if spec.derive_from.is_some() { Operation::DerivedRollup } else { Operation::BaseRollup };
                         // `!needs_source_scan` means no BASE tier is missing for
                         // this day, i.e. the tier this derived unit aggregates is
                         // already built. That is read from actual coverage, so it
@@ -2075,7 +2050,7 @@ impl Database {
                         if queued_tables.contains(&(project_id.clone(), *date, physical_table.clone())) {
                             continue;
                         }
-                        let base_proven = operation == crate::maintenance_coordinator::Operation::DerivedRollup && !needs_source_scan && *date < today;
+                        let base_proven = operation == Operation::DerivedRollup && !needs_source_scan && *date < today;
                         refused |= !enqueue(physical_table, operation, base_proven);
                     }
                     if refused && damage_admitted.contains(&(project_id.clone(), *date)) {
@@ -2089,11 +2064,7 @@ impl Database {
             // truncation. A crash in between re-offers the prefix, which
             // `enqueue` upserts idempotently; the other order is v1.
             if damage_consumed != 0 {
-                self.journal().advance_repair_cursor(
-                    crate::maintenance_coordinator::TaskJournal::DAMAGE_REPAIR_MIGRATION,
-                    &source,
-                    damage_from.saturating_add(damage_consumed),
-                )?;
+                self.journal().advance_repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, &source, damage_from.saturating_add(damage_consumed))?;
             }
             if !damage_offered.is_empty() {
                 warn!(
@@ -2144,6 +2115,35 @@ impl Database {
                 Some((project, date.parse::<chrono::NaiveDate>().ok()?))
             })
             .collect())
+    }
+
+    /// One of the tags a maintenance unit stamps on the files it publishes.
+    fn add_tag<'a>(add: &'a deltalake::kernel::Add, name: &str) -> Option<&'a str> {
+        add.tags.as_ref()?.get(name)?.as_deref()
+    }
+
+    /// Reads back the slice an `Add` was tagged with — used to reconcile a
+    /// rebuilt slice's coverage against already-live files.
+    fn slice_tag_range(add: &deltalake::kernel::Add) -> Option<(i64, i64)> {
+        Some((
+            Self::add_tag(add, crate::maintenance_coordinator::TAG_SLICE_START)?.parse().ok()?,
+            Self::add_tag(add, crate::maintenance_coordinator::TAG_SLICE_END)?.parse().ok()?,
+        ))
+    }
+
+    fn tag_project(add: &deltalake::kernel::Add) -> Option<&str> {
+        Self::add_tag(add, crate::maintenance_coordinator::TAG_PROJECT)
+    }
+
+    /// Decoded bytes a unit reads from one file, narrowed to the columns it
+    /// projects: `(prorated to the slice, whole file)`. The unprorated figure is
+    /// what a SIBLING slice over the same file would re-read, and fusion needs
+    /// both to price a bucket without counting a row group once per child.
+    fn projected_slice_bytes(add: &deltalake::kernel::Add, numerator: u64, denominator: u64, slice: crate::maintenance_coordinator::TimeSlice) -> (u64, u64) {
+        let projected = estimated_decoded_bytes(add.size).saturating_mul(numerator).div_ceil(denominator);
+        let (min, max) = add_ts_bounds(add);
+        let (share, whole) = slice_share_of_file(min, max, slice, estimated_row_groups(add.size));
+        (projected.saturating_mul(share).div_ceil(whole.max(1)), projected)
     }
 
     /// Claim one unit, bounding occupancy by units that have proven they cannot
@@ -2231,21 +2231,12 @@ impl Database {
                 .filter(|file| partition_paths.contains(file.path().as_ref()))
                 .filter_map(|file| {
                     let add = add_action(&file);
-                    let (min, max) = add_ts_bounds(&add);
-                    if let (Some(min), Some(max)) = (min, max)
-                        && (min >= key.slice.end_micros || max < key.slice.start_micros)
-                    {
+                    if stats_disjoint_from(&add, key.slice) {
                         return None;
                     }
-                    let decoded = estimated_decoded_bytes(add.size);
-                    let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
-                    let (share, whole) = slice_share_of_file(min, max, key.slice, estimated_row_groups(add.size));
-                    Some((file.path().to_string(), projected.saturating_mul(share).div_ceil(whole.max(1)), projected, add_row_count(&add).unwrap_or_default()))
+                    let (share, whole) = Self::projected_slice_bytes(&add, projected_numerator, projected_denominator, key.slice);
+                    Some((file.path().to_string(), share, whole, add_row_count(&add).unwrap_or_default()))
                 })
-                // The prorated sum is this unit's own estimate; the unprorated
-                // one is what a SIBLING over the same files would re-read, and
-                // fusion needs both to price a bucket without counting a row
-                // group once per child.
                 .fold((0u64, 0u64, Vec::new(), 0u64), |(share, whole, mut paths, rows), (path, file_share, file_whole, file_rows)| {
                     paths.push(path);
                     (share.saturating_add(file_share), whole.saturating_add(file_whole), paths, rows.saturating_add(file_rows))
@@ -2424,16 +2415,10 @@ impl Database {
         let counters = snapshot();
         let started = std::time::Instant::now();
         match operation {
-            Operation::Dedup => {
-                self.run_coordinator_dedup_selected(TaskSelection::Exact(&key)).await?;
-            }
-            Operation::BaseRollup | Operation::DerivedRollup => {
-                self.run_coordinator_rollup_selected(TaskSelection::Exact(&key)).await?;
-            }
-            _ => {
-                self.run_coordinator_compaction_selected(TaskSelection::Exact(&key)).await?;
-            }
-        }
+            Operation::Dedup => self.run_coordinator_dedup_selected(TaskSelection::Exact(&key)).await?,
+            Operation::BaseRollup | Operation::DerivedRollup => self.run_coordinator_rollup_selected(TaskSelection::Exact(&key)).await?,
+            _ => self.run_coordinator_compaction_selected(TaskSelection::Exact(&key)).await?,
+        };
         let wall = started.elapsed();
         let after = snapshot();
         let (state, retry_reason) = {
@@ -2471,19 +2456,6 @@ impl Database {
             hash::{Hash, Hasher},
             sync::atomic::Ordering::Relaxed,
         };
-
-        // Reads back the slice an `Add` was tagged with — used repeatedly below
-        // to reconcile a rebuilt slice's coverage against already-live files.
-        fn slice_tag_range(add: &deltalake::kernel::Add) -> Option<(i64, i64)> {
-            let tag = |name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::as_deref);
-            Some((
-                tag(crate::maintenance_coordinator::TAG_SLICE_START)?.parse::<i64>().ok()?,
-                tag(crate::maintenance_coordinator::TAG_SLICE_END)?.parse::<i64>().ok()?,
-            ))
-        }
-        fn tag_project(add: &deltalake::kernel::Add) -> Option<&str> {
-            add.tags.as_ref().and_then(|tags| tags.get(crate::maintenance_coordinator::TAG_PROJECT)).and_then(Option::as_deref)
-        }
 
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
         let key = task.key.clone();
@@ -2674,7 +2646,7 @@ impl Database {
                     // distinguishable: #139 fixed day-tagged files being
                     // unselectable, and if any tier still comes back empty this
                     // is the number that says whether tags are the reason.
-                    match slice_tag_range(&add) {
+                    match Self::slice_tag_range(&add) {
                         Some((start, end)) => {
                             // A TAGGED file dropped here was silent: `untagged_inputs`
                             // counts only files with NO tags, so prod read
@@ -2687,7 +2659,7 @@ impl Database {
                             // hour-wide derived units publish empty 14.5% of the time
                             // while day-wide units never do (0 of 398): a day-wide slice
                             // overlaps every base file for the day and cannot miss one.
-                            if tag_project(&add) != Some(key.project_id.as_str()) {
+                            if Self::tag_project(&add) != Some(key.project_id.as_str()) {
                                 skipped_tag_project += 1;
                                 continue;
                             }
@@ -2710,25 +2682,15 @@ impl Database {
                     }
                     // A current coverage range cannot authorize files from an
                     // older materialization generation that overlap that range.
-                    if !add
-                        .tags
-                        .as_ref()
-                        .and_then(|tags| tags.get(crate::maintenance_coordinator::TAG_GENERATION))
-                        .and_then(Option::as_ref)
-                        .is_some_and(|generation| base_generations.contains(generation))
-                    {
+                    if !Self::add_tag(&add, crate::maintenance_coordinator::TAG_GENERATION).is_some_and(|generation| base_generations.contains(generation)) {
                         skipped_generation += 1;
                         continue;
                     }
                 }
-                let decoded = estimated_decoded_bytes(add.size);
-                let projected = decoded.saturating_mul(projected_numerator).div_ceil(projected_denominator);
-                let (file_min, file_max) = add_ts_bounds(&add);
-                let (share, whole) = slice_share_of_file(file_min, file_max, key.slice, estimated_row_groups(add.size));
-                estimated = estimated.saturating_add(projected.saturating_mul(share).div_ceil(whole.max(1)));
-                // Unprorated: what a SIBLING slice over these same files would
-                // re-read. `coarsen_to_width` charges that once per distinct
-                // file set instead of once per child.
+                // `coarsen_to_width` charges the unprorated half once per
+                // distinct file set instead of once per child.
+                let (share, projected) = Self::projected_slice_bytes(&add, projected_numerator, projected_denominator, key.slice);
+                estimated = estimated.saturating_add(share);
                 whole_file_bytes = whole_file_bytes.saturating_add(projected);
                 // XOR-folded, so file order — which a snapshot does not promise
                 // — cannot change the answer.
@@ -3136,29 +3098,27 @@ impl Database {
         for batch in batches {
             writer.write(deltalake::kernel::schema::cast_record_batch(&batch?, arrow_schema.clone(), true, true)?).await?;
         }
-        let mut adds = writer.flush().await?.into_iter().map(Action::Add).collect::<Vec<_>>();
+        let mut adds = writer.flush().await?;
         let stage_ms = stage_started.elapsed().as_millis() as u64;
         let commit_started = std::time::Instant::now();
-        for action in &mut adds {
-            let Action::Add(add) = action else { continue };
+        for add in &mut adds {
             add.data_change = true;
-            let mut tags = add.tags.take().unwrap_or_default();
-            for (name, value) in [
-                (crate::maintenance_coordinator::TAG_SOURCE, key.source.clone()),
-                (crate::maintenance_coordinator::TAG_PROJECT, key.project_id.clone()),
-                (crate::maintenance_coordinator::TAG_SLICE_START, key.slice.start_micros.to_string()),
-                (crate::maintenance_coordinator::TAG_SLICE_END, key.slice.end_micros.to_string()),
-                (crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT, source_fp.to_string()),
-                (crate::maintenance_coordinator::TAG_GENERATION, generation.clone()),
-                // Absent (older generations) means the read path cannot verify
-                // this slice and must refuse it, so write the sentinel rather
-                // than omitting the tag when the source reports no count.
-                (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
-                (crate::maintenance_coordinator::TAG_MEASURES, materialized.join(",")),
-            ] {
-                tags.insert(name.to_owned(), Some(value));
-            }
-            add.tags = Some(tags);
+            add.tags.get_or_insert_default().extend(
+                [
+                    (crate::maintenance_coordinator::TAG_SOURCE, key.source.clone()),
+                    (crate::maintenance_coordinator::TAG_PROJECT, key.project_id.clone()),
+                    (crate::maintenance_coordinator::TAG_SLICE_START, key.slice.start_micros.to_string()),
+                    (crate::maintenance_coordinator::TAG_SLICE_END, key.slice.end_micros.to_string()),
+                    (crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT, source_fp.to_string()),
+                    (crate::maintenance_coordinator::TAG_GENERATION, generation.clone()),
+                    // Absent (older generations) means the read path cannot verify
+                    // this slice and must refuse it, so write the sentinel rather
+                    // than omitting the tag when the source reports no count.
+                    (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
+                    (crate::maintenance_coordinator::TAG_MEASURES, materialized.join(",")),
+                ]
+                .map(|(name, value)| (name.to_owned(), Some(value))),
+            );
         }
 
         let live_adds = staging_table.snapshot()?.log_data().iter().map(|file| add_action(&file)).collect::<Vec<_>>();
@@ -3188,7 +3148,7 @@ impl Database {
         // their span. Their union is the only proof available for a tenant whose
         // day is too big to publish whole.
         let covered = std::iter::once((key.slice.start_micros, key.slice.end_micros))
-            .chain(live_adds.iter().filter(|add| in_partition(add)).filter_map(slice_tag_range))
+            .chain(live_adds.iter().filter(|add| in_partition(add)).filter_map(Self::slice_tag_range))
             .collect::<Vec<_>>();
         let publish = crate::rollup::SlicePublish {
             project_id: &key.project_id,
@@ -3202,8 +3162,8 @@ impl Database {
             .filter(|add| {
                 let partition = Self::maintenance_partition_from_action(&add.path, Some(&add.partition_values), "default");
                 let file = crate::rollup::LiveFile {
-                    slice: slice_tag_range(add),
-                    project: tag_project(add),
+                    slice: Self::slice_tag_range(add),
+                    project: Self::tag_project(add),
                     partition: partition.as_ref().map(|(project, date)| (project.as_str(), date.as_str())),
                     stats: add.stats.as_deref().and_then(crate::rollup::stats_time_range),
                 };
@@ -3216,7 +3176,7 @@ impl Database {
         // live set. `found` is the whole tier's untagged count, not just this
         // partition's, so it reads as a backlog draining rather than a per-unit
         // blip; `retired` proves this unit actually removed one.
-        let no_identity = |add: &deltalake::kernel::Add| slice_tag_range(add).is_none();
+        let no_identity = |add: &deltalake::kernel::Add| Self::slice_tag_range(add).is_none();
         self.publish_tier_untagged(&key.physical_table, live_adds.iter().filter(|add| no_identity(add)).count() as u64);
         // Deferred to AFTER the commit. Counted here, this read 21 retired
         // within an hour on prod 2026-08-22 while a fresh Delta-log replay said
@@ -3241,8 +3201,8 @@ impl Database {
         // Regression: `a_partly_covered_window_unions_the_rollup_with_raw_and_matches_the_raw_answer`
         // (reproduces on a 24h live-frontier clock boundary, not under load).
         let covered_by_wider = live_adds.iter().find_map(|add| {
-            let (start, end) = slice_tag_range(add)?;
-            (tag_project(add) == Some(key.project_id.as_str())
+            let (start, end) = Self::slice_tag_range(add)?;
+            (Self::tag_project(add) == Some(key.project_id.as_str())
                 && (start, end) != (key.slice.start_micros, key.slice.end_micros)
                 && start <= key.slice.start_micros
                 && end >= key.slice.end_micros)
@@ -3300,7 +3260,10 @@ impl Database {
             source_rows: source_rows.and_then(|rows| u64::try_from(rows).ok()),
         };
         let mut actions = replaced.iter().map(|add| Action::Remove(remove_for_add(add, true))).collect::<Vec<_>>();
-        actions.extend(adds.iter().cloned());
+        actions.extend(adds.iter().cloned().map(Action::Add));
+        // The staged parquet as commit actions — only the two abandon paths,
+        // which delete it, need this shape.
+        let staged_actions = || adds.iter().cloned().map(Action::Add).collect::<Vec<_>>();
 
         // Counted before the commit consumes `actions`, and published below only
         // if this unit actually lands. The rollup_* stats were wired ONLY to the
@@ -3312,9 +3275,8 @@ impl Database {
         // diagnosis pass chasing a rollup outage that was not happening.
         let (action_count, output_files) = (actions.len() as u64, adds.len() as u64);
 
-        let still_running = self.journal().state(&key) == Some(TaskState::Running);
-        if !still_running {
-            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+        if self.journal().state(&key) != Some(TaskState::Running) {
+            Self::cleanup_orphaned_parquet(&stage_store, &staged_actions()).await;
             return Ok(true);
         }
         self.record_staged_intent(StagedIntent {
@@ -3322,9 +3284,9 @@ impl Database {
             table_name: key.physical_table.clone(),
             project_id: key.project_id.clone(),
             recorded_at: crate::support::now_secs(),
-            paths: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.path.clone()) } else { None }).collect(),
+            paths: adds.iter().map(|add| add.path.clone()).collect(),
             target_paths: target_paths.clone(),
-            adds: adds.iter().filter_map(|action| if let Action::Add(add) = action { Some(add.clone()) } else { None }).collect(),
+            adds: adds.clone(),
             rollup: Some(crate::database::RollupResume {
                 key: key.clone(),
                 publication: publication.clone(),
@@ -3341,7 +3303,7 @@ impl Database {
             let live = table.snapshot()?.log_data().iter().map(|file| file.path().to_string()).collect::<HashSet<_>>();
             if !target_paths.iter().all(|path| live.contains(path)) {
                 drop(guard);
-                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                Self::cleanup_orphaned_parquet(&stage_store, &staged_actions()).await;
                 // The staged objects are gone, so the intent can no longer
                 // describe anything resumable — leaving it would have the next
                 // boot try to commit Adds whose parquet was deleted.
@@ -3582,20 +3544,17 @@ impl Database {
     /// rebuilding must unblock the derived tier". That test failed first and is
     /// why this check exists — an input-only proof shipped without it.
     async fn tier_still_holds_slice(&self, key: &crate::maintenance_coordinator::TaskKey, generation: &str, output_files: u32) -> bool {
-        use crate::maintenance_coordinator::{TAG_GENERATION, TAG_PROJECT, TAG_SLICE_END, TAG_SLICE_START};
         let Ok(target) = self.resolve_table(&key.project_id, &key.physical_table).await else { return false };
         let table = target.read().await;
         let Ok(snapshot) = table.snapshot() else { return false };
-        let tag = |add: &deltalake::kernel::Add, name: &str| add.tags.as_ref().and_then(|tags| tags.get(name)).and_then(Option::clone);
         let live = snapshot
             .log_data()
             .iter()
             .map(|file| add_action(&file))
             .filter(|add| {
-                tag(add, TAG_PROJECT).as_deref() == Some(key.project_id.as_str())
-                    && tag(add, TAG_GENERATION).as_deref() == Some(generation)
-                    && tag(add, TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()) == Some(key.slice.start_micros)
-                    && tag(add, TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()) == Some(key.slice.end_micros)
+                Self::tag_project(add) == Some(key.project_id.as_str())
+                    && Self::add_tag(add, crate::maintenance_coordinator::TAG_GENERATION) == Some(generation)
+                    && Self::slice_tag_range(add) == Some((key.slice.start_micros, key.slice.end_micros))
             })
             .count();
         u32::try_from(live).is_ok_and(|live| live == output_files)
@@ -3698,12 +3657,8 @@ impl Database {
         // which is that guarantee failing in the field 11 days after the
         // 2026-08-23 fix. This field decides between "sets differ" and "snapshot
         // moved between plan and claim" without another deploy.
-        let mut small: Vec<i64> = candidates.iter().map(|add| add.size).filter(|size| *size < target).collect();
-        small.sort_unstable();
-        let smallest_pair = match small.as_slice() {
-            [a, b, ..] => a.saturating_add(*b),
-            _ => -1,
-        };
+        let two_smallest = candidates.iter().map(|add| add.size).filter(|size| *size < target).k_smallest(2).collect_tuple();
+        let smallest_pair = two_smallest.map_or(-1, |(smaller, larger): (i64, i64)| smaller.saturating_add(larger));
         // Captured before the move: the packer takes `candidates` by value and
         // returns paths, so the ranges must be kept to report the output's span.
         let ranges_by_path: HashMap<String, (i64, i64)> = candidates.iter().filter_map(|add| add.event_range.map(|range| (add.path.clone(), range))).collect();
@@ -3723,7 +3678,7 @@ impl Database {
         // selection change and this is the measurement that should precede it.
         if selected.len() >= 2 {
             let ranges: Vec<(i64, i64)> = selected.iter().filter_map(|path| ranges_by_path.get(path).copied()).collect();
-            if let (Some(lo), Some(hi)) = (ranges.iter().map(|r| r.0).min(), ranges.iter().map(|r| r.1).max()) {
+            if let Some((lo, hi)) = ranges.iter().copied().reduce(|(lo, hi), (start, end)| (lo.min(start), hi.max(end))) {
                 let bins = (hi - lo) / (10 * 60 * 1_000_000) + 1;
                 info!(
                     operation = ?key.operation,
@@ -3766,6 +3721,22 @@ impl Database {
 
     pub(crate) async fn run_coordinator_compaction_once(&self, operation: crate::maintenance_coordinator::Operation) -> Result<bool> {
         self.run_coordinator_compaction_selected(TaskSelection::Next(operation)).await
+    }
+
+    /// Retire a compaction unit, or requeue it immediately when its partition
+    /// still holds debt. A bin is never by construction the whole cell —
+    /// `coordinator_compaction_files` hands Repair `take(1)` and hands packing
+    /// one budgeted bin-pack — so completing unconditionally retired units whose
+    /// partition still carried work.
+    async fn settle_compaction_unit(&self, table_ref: &Arc<RwLock<DeltaTable>>, key: &crate::maintenance_coordinator::TaskKey) -> Result<()> {
+        let remaining = !self.coordinator_compaction_files(table_ref, key).await?.is_empty();
+        let mut journal = self.journal();
+        if remaining {
+            journal.retry(key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
+        } else {
+            journal.complete(key);
+        }
+        journal.checkpoint()
     }
 
     async fn run_coordinator_compaction_selected(&self, selection: TaskSelection<'_>) -> Result<bool> {
@@ -3837,14 +3808,7 @@ impl Database {
                 .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size())))
         };
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
-            let remaining = !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty();
-            let mut journal = self.journal();
-            if remaining {
-                journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
-            } else {
-                journal.complete(&key);
-            }
-            journal.checkpoint()?;
+            self.settle_compaction_unit(&table_ref, &key).await?;
             return Ok(true);
         }
         let Some(schema) = get_schema(&key.source) else {
@@ -3870,20 +3834,7 @@ impl Database {
             let landed = result.failed.is_empty() && !result.landed.is_empty();
             info!(table_name = %key.source, project_id = %key.project_id, landed, event = "resumed_bin_committed_early");
             if landed {
-                // A resumed bin is one BIN, never by construction the whole
-                // cell: `coordinator_compaction_files` hands Repair `take(1)`
-                // and hands packing one budgeted bin-pack. Completing here
-                // unconditionally retired a unit whose partition still carried
-                // debt — the same test the staging arm below and the
-                // already-sorted arm above both make, and for the same reason.
-                let remaining = !self.coordinator_compaction_files(&table_ref, &key).await?.is_empty();
-                let mut journal = self.journal();
-                if remaining {
-                    journal.retry(&key, "compaction_debt_remaining".to_owned(), crate::support::now_micros());
-                } else {
-                    journal.complete(&key);
-                }
-                journal.checkpoint()?;
+                self.settle_compaction_unit(&table_ref, &key).await?;
                 return Ok(true);
             }
             // The resume lost its race (inputs no longer live). Fall through and
@@ -3979,9 +3930,7 @@ impl Database {
                     let Ok(table_ref) = self.resolve_table("default", &source).await else { continue };
                     let table = table_ref.read().await;
                     if let Ok(stats) = Self::partition_stats_bounded(&table, tiebreak_of(&source), &|_, _| i64::MAX) {
-                        for ((project, date), stat) in stats {
-                            ceilings.insert((project, date), stat.bytes);
-                        }
+                        ceilings.extend(stats.into_iter().map(|(partition, stat)| (partition, stat.bytes)));
                     }
                 }
                 ceilings
@@ -4043,6 +3992,11 @@ impl Database {
         // recent-slice, dependency, and project fairness.
         let cycle = crate::maintenance_coordinator::operation_cycle(coverage_is_short());
         let start = self.maintenance_schedule_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cycle.len();
+        // `Some(None)` is "exempt, or not gated at all"; `None` is "capped out",
+        // and the caller falls through to the next operation in the cycle.
+        let gate = |semaphore: &Arc<tokio::sync::Semaphore>, exempt: bool| {
+            (exempt || !coverage_is_short()).then_some(None).or_else(|| Arc::clone(semaphore).try_acquire_owned().ok().map(Some))
+        };
         let mut attempted = [false; <crate::maintenance_coordinator::Operation as strum::EnumCount>::COUNT];
         for offset in 0..cycle.len() {
             let operation = cycle[(start + offset) % cycle.len()];
@@ -4070,13 +4024,8 @@ impl Database {
             // (measured 2026-08-19), so they take the freed workers and derived
             // starves exactly as it did behind debt. Derived is the cheap half:
             // it aggregates the base TIER and reads no raw data at all.
-            let _debt_slot = match operation {
-                Operation::BaseRollup | Operation::DerivedRollup => None,
-                _ if !coverage_is_short() => None,
-                _ => match Arc::clone(&self.maintenance_debt_slots).try_acquire_owned() {
-                    Ok(permit) => Some(permit),
-                    Err(_) => continue,
-                },
+            let Some(_debt_slot) = gate(&self.maintenance_debt_slots, matches!(operation, Operation::BaseRollup | Operation::DerivedRollup)) else {
+                continue;
             };
             // Keep a couple of workers free for derived work while coverage is
             // short. Everything else must leave `maintenance_derived_reserve`
@@ -4090,14 +4039,7 @@ impl Database {
             // worker that picks HotPacking is gone for 578s and one that picks a
             // sealed BaseRollup for 801s, so attempt share and slot-time share
             // differ by two orders of magnitude. That is #176's finding exactly.
-            let _derived_reserve = match operation {
-                Operation::DerivedRollup => None,
-                _ if !coverage_is_short() => None,
-                _ => match Arc::clone(&self.maintenance_derived_reserve).try_acquire_owned() {
-                    Ok(permit) => Some(permit),
-                    Err(_) => continue,
-                },
-            };
+            let Some(_derived_reserve) = gate(&self.maintenance_derived_reserve, operation == Operation::DerivedRollup) else { continue };
             let timeout = coordinator_operation_timeout(operation);
             // What the unit has written so far. The deadline below fires only
             // when this stops moving — see `run_until_idle`.
@@ -4125,13 +4067,15 @@ impl Database {
             // answered from the timeout count alone, because a timeout says only
             // "longer than the deadline", never how much longer.
             let started = std::time::Instant::now();
-            let completed = match run_until_idle(timeout, Arc::clone(&progress), work).await {
+            let outcome = run_until_idle(timeout, Arc::clone(&progress), work).await;
+            let elapsed = started.elapsed();
+            // Before `result?`: a unit that errors after 800s spent that capacity
+            // just as surely as one that succeeded — and a unit killed by the
+            // deadline spent it too.
+            crate::observability::count_maintenance_work(label, "worker_secs", elapsed.as_secs());
+            crate::observability::count_maintenance_work(label, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
+            let completed = match outcome {
                 Ok(result) => {
-                    let elapsed = started.elapsed();
-                    // Before `result?`: a unit that errors after 800s spent that
-                    // capacity just as surely as one that succeeded.
-                    crate::observability::count_maintenance_work(label, "worker_secs", elapsed.as_secs());
-                    crate::observability::count_maintenance_work(label, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
                     // Only the slow tail: a unit finishing well inside its
                     // deadline says nothing, and this runs on every claim.
                     if elapsed.as_secs_f64() > timeout.as_secs_f64() / 4.0 {
@@ -4153,9 +4097,7 @@ impl Database {
                     warn!(?operation, timeout_seconds = timeout.as_secs(), event = "maintenance_coordinator_unit_timed_out");
                     // `killed_secs` is a strict subset of `worker_secs`: the
                     // share of the fleet's capacity that produced nothing.
-                    crate::observability::count_maintenance_work(label, "worker_secs", started.elapsed().as_secs());
-                    crate::observability::count_maintenance_work(label, "killed_secs", started.elapsed().as_secs());
-                    crate::observability::count_maintenance_work(label, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
+                    crate::observability::count_maintenance_work(label, "killed_secs", elapsed.as_secs());
                     return Ok(true);
                 }
             };
@@ -4232,15 +4174,10 @@ impl Database {
     ) -> std::io::Result<()> {
         let moves_rows = assignments.iter().any(|(column, _)| column == "timestamp");
         let masks = (!moves_rows).then(|| predicate.and_then(crate::rollup::timestamp_window)).flatten().and_then(|(lo, hi)| window_hour_masks(lo, hi));
-        match masks {
-            Some(masks) => {
-                for (date, hours) in masks {
-                    self.invalidate_rollup_hours(project_id, source, &date, hours)?;
-                }
-                Ok(())
-            }
-            None => self.invalidate_rollup_source(project_id, source),
-        }
+        masks.map_or_else(
+            || self.invalidate_rollup_source(project_id, source),
+            |masks| masks.into_iter().try_for_each(|(date, hours)| self.invalidate_rollup_hours(project_id, source, &date, hours)),
+        )
     }
 
     pub(crate) fn invalidate_rollup_source(&self, project_id: &str, source: &str) -> std::io::Result<()> {
@@ -4404,14 +4341,18 @@ impl Database {
         let Some(paths) = actions.column_by_name("path").cloned() else { return Ok(HashMap::new()) };
         let min_ts = crate::read::ts_micros_column(&actions, "min.timestamp");
         let max_ts = crate::read::ts_micros_column(&actions, "max.timestamp");
-        let at = |column: &Option<arrow::array::Int64Array>, row: usize| column.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row)));
         Ok((0..actions.num_rows())
             .filter_map(|row| {
                 let path = crate::support::test_helpers::array_get_str(paths.as_ref(), row);
                 let rel = crate::tantivy::search::parquet_rel_of_uri(&path)?.to_string();
-                rel.contains(date_marker).then(|| (rel, at(&min_ts, row).zip(at(&max_ts, row))))
+                rel.contains(date_marker).then(|| (rel, Self::valid_at(&min_ts, row).zip(Self::valid_at(&max_ts, row))))
             })
             .collect())
+    }
+
+    /// `column[row]`, when the column is present and the row is not null.
+    fn valid_at(column: &Option<arrow::array::Int64Array>, row: usize) -> Option<i64> {
+        column.as_ref().and_then(|column| column.is_valid(row).then(|| column.value(row)))
     }
 
     /// As [`Self::partition_fingerprints_bounded`], but also carrying the row
@@ -4475,22 +4416,15 @@ impl Database {
             let project = string_at(&projects, row).unwrap_or_else(|| "default".to_string());
             // A file whose rows all sit at or above this partition's bound is not
             // part of what was aggregated, so it must not perturb the fingerprint.
-            if max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))).is_some_and(|hi| hi >= bound_for(&project, &date)) {
+            if Self::valid_at(&max_ts, row).is_some_and(|hi| hi >= bound_for(&project, &date)) {
                 return acc;
             }
-            let key = (project, date);
-            let entry = acc.entry(key).or_insert((0, i64::MAX, i64::MIN, i64::MIN, 0));
+            let entry = acc.entry((project, date)).or_insert((0, i64::MAX, i64::MIN, i64::MIN, 0));
             entry.0 += if records.is_valid(row) { records.value(row) } else { 0 };
-            entry.4 += sizes.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))).unwrap_or(0);
-            if let Some(lo) = min_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
-                entry.1 = entry.1.min(lo);
-            }
-            if let Some(hi) = max_ts.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
-                entry.2 = entry.2.max(hi);
-            }
-            if let Some(written) = stamp.as_ref().and_then(|c| c.is_valid(row).then(|| c.value(row))) {
-                entry.3 = entry.3.max(written);
-            }
+            entry.4 += Self::valid_at(&sizes, row).unwrap_or(0);
+            entry.1 = entry.1.min(Self::valid_at(&min_ts, row).unwrap_or(i64::MAX));
+            entry.2 = entry.2.max(Self::valid_at(&max_ts, row).unwrap_or(i64::MIN));
+            entry.3 = entry.3.max(Self::valid_at(&stamp, row).unwrap_or(i64::MIN));
             acc
         });
         Ok(by_partition
@@ -4583,8 +4517,7 @@ impl Database {
         let mut journal = self.journal();
         let mut queued = 0usize;
         for ((project_id, date), (untagged, tagged)) in partitions {
-            let Ok(day) = date.parse::<chrono::NaiveDate>() else { continue };
-            let Some(day_start) = day.and_hms_opt(0, 0, 0).map(|time| time.and_utc().timestamp_micros()) else { continue };
+            let Some(day_start) = date.parse::<chrono::NaiveDate>().ok().and_then(day_start_micros) else { continue };
             let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
             // No gaps means the proofs already HOLD and the file is still live
             // only because a proof is evaluated at publish time and nothing has
@@ -4664,15 +4597,16 @@ impl Database {
                 Err(_) => return,
             }
         };
-        let mut by_date: HashMap<(String, String), Vec<(i64, RollupCoverage)>> = HashMap::new();
-        for entry in self.rollup_slice_coverage.iter() {
-            let ((project, entry_source, entry_target, start, _), coverage) = (entry.key(), entry.value());
-            if entry_source != source || entry_target != target {
-                continue;
-            }
-            let Some(date) = chrono::DateTime::from_timestamp_micros(*start).map(|time| time.date_naive().to_string()) else { continue };
-            by_date.entry((project.clone(), date)).or_default().push((*start, coverage.clone()));
-        }
+        let by_date: HashMap<(String, String), Vec<(i64, RollupCoverage)>> = self
+            .rollup_slice_coverage
+            .iter()
+            .filter(|entry| entry.key().1 == source && entry.key().2 == target)
+            .filter_map(|entry| {
+                let ((project, _, _, start, _), coverage) = (entry.key(), entry.value());
+                let date = chrono::DateTime::from_timestamp_micros(*start)?.date_naive().to_string();
+                Some(((project.clone(), date), (*start, coverage.clone())))
+            })
+            .into_group_map();
         let mut recovered = 0u64;
         for ((project, date), slices) in by_date {
             let Some(partition) = stats.get(&(project.clone(), date.clone())).or_else(|| stats.get(&("default".to_string(), date.clone()))) else {
@@ -4746,8 +4680,8 @@ impl Database {
         // more than any older one and the bound costs nothing it would have got.
         // Re-running hourly advances the frontier: a republished slice carries a
         // witness, leaves this list, and the next pass takes the next `BOUND`.
-        let mut ordered: Vec<_> = slices.iter().collect::<HashSet<_>>().into_iter().collect();
-        ordered.sort_unstable_by_key(|(_, slice)| std::cmp::Reverse(slice.start_micros));
+        let ordered =
+            slices.iter().collect::<HashSet<_>>().into_iter().sorted_unstable_by_key(|(_, slice)| std::cmp::Reverse(slice.start_micros)).collect_vec();
         const BOUND: usize = 512;
         let total = ordered.len();
         let queued = total.min(BOUND);
@@ -4838,38 +4772,35 @@ impl Database {
     fn record_readable_coverage(&self, source: &str, target: &str, readable: HashMap<crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>>) {
         use crate::storage::CoverageLedger as _;
         let mut disagreements = 0u64;
+        let seen: std::collections::HashSet<crate::storage::CoverageCell> = readable.keys().cloned().collect();
         // Accumulated and written ONCE. Per-cell writes would re-serialize the
         // whole ledger for every cell of every tier, every hour.
-        let mut batch: Vec<(crate::storage::CoverageCell, Vec<crate::storage::CoverageEntry>)> = Vec::new();
-        let seen: std::collections::HashSet<crate::storage::CoverageCell> = readable.keys().cloned().collect();
-        for (cell, entries) in readable {
-            let proved = crate::storage::merge_coverage(entries);
-            let held = self.coverage_ledger.coverage(&cell);
-            // An empty `held` is the FIRST replay for that cell, not a
-            // disagreement — counting it would make every cell report drift on a
-            // fresh boot, and an alarm that fires on every boot is ignored.
-            if !held.is_empty() && held != proved {
-                disagreements += 1;
-                warn!(
-                    table = %target, project_id = %cell.1, date = %cell.3,
-                    held = held.len(), proved = proved.len(),
-                    event = "coverage_ledger_disagreement",
-                    "the ledger and the Delta tags disagree about this partition's coverage"
-                );
-            }
-            batch.push((cell, proved));
-        }
+        let mut batch = readable
+            .into_iter()
+            .map(|(cell, entries)| {
+                let proved = crate::storage::merge_coverage(entries);
+                let held = self.coverage_ledger.coverage(&cell);
+                // An empty `held` is the FIRST replay for that cell, not a
+                // disagreement — counting it would make every cell report drift on a
+                // fresh boot, and an alarm that fires on every boot is ignored.
+                if !held.is_empty() && held != proved {
+                    disagreements += 1;
+                    warn!(
+                        table = %target, project_id = %cell.1, date = %cell.3,
+                        held = held.len(), proved = proved.len(),
+                        event = "coverage_ledger_disagreement",
+                        "the ledger and the Delta tags disagree about this partition's coverage"
+                    );
+                }
+                (cell, proved)
+            })
+            .collect_vec();
         // Cells this tier no longer covers at all. Scoped to (source, target)
         // because this replay proves nothing about a tier it did not read.
-        let orphans: Vec<_> = self
-            .coverage_ledger
-            .cells()
-            .into_iter()
-            .filter(|(cell_source, _, cell_table, _)| cell_source == source && cell_table == target)
-            .filter(|cell| !seen.contains(cell))
-            .collect();
         // Retired in the same batch — an empty entry list drops the cell.
-        batch.extend(orphans.into_iter().map(|cell| (cell, Vec::new())));
+        batch.extend(
+            self.coverage_ledger.cells().into_iter().filter(|cell| cell.0 == source && cell.2 == target && !seen.contains(cell)).map(|cell| (cell, Vec::new())),
+        );
         self.coverage_ledger.replace_many(batch);
         if disagreements > 0 {
             crate::observability::maintenance_stats().coverage_ledger_disagreements.fetch_add(disagreements, std::sync::atomic::Ordering::Relaxed);
@@ -5056,23 +4987,15 @@ impl Database {
                             None => measures,
                         };
                         measures_by_identity.insert(identity.clone(), merged);
-                        groups.insert(identity);
-                        // Same facts, recorded explicitly. The date comes from the
-                        // file's own partition rather than from `slice_start`,
-                        // because a day-wide slice starts at midnight of the day it
-                        // covers while a file in `date=D` cannot hold rows outside
-                        // `D` — the partition is the stronger statement.
+                        groups.insert(identity.clone());
+                        // The date comes from the file's PARTITION, not from
+                        // `slice_start`: a file in `date=D` cannot hold rows
+                        // outside `D`, so the partition is the stronger statement,
+                        // and a day-wide slice beginning at midnight would
+                        // otherwise be indistinguishable from one that merely
+                        // starts there.
                         if let Some((partition_project, _date)) = file_partition.as_ref() {
-                            // The date comes from the file's PARTITION, not from
-                            // `slice_start`: a file in `date=D` cannot hold rows
-                            // outside `D`, so the partition is the stronger
-                            // statement, and a day-wide slice beginning at midnight
-                            // would otherwise be indistinguishable from one that
-                            // merely starts there.
-                            let entry = paths_by_identity
-                                .entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows))
-                                .or_insert_with(|| ((*partition_project).to_owned(), Vec::new()));
-                            entry.1.push(action.path.clone());
+                            paths_by_identity.entry(identity).or_insert_with(|| ((*partition_project).to_owned(), Vec::new())).1.push(action.path.clone());
                         }
                     }
                     (groups, paths_by_identity, measures_by_identity, witness_reasons, witnessed)
@@ -5245,8 +5168,8 @@ impl Database {
                         fate(UnverifiableFate::JournalIncomplete);
                         continue;
                     }
-                    let measures =
-                        measures_by_identity.get(&(project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows)).cloned().flatten();
+                    let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
+                    let measures = measures_by_identity.get(&identity).cloned().flatten();
                     let restrict = measures.as_ref().map(|names| names.iter().cloned().collect::<Vec<_>>());
                     if crate::rollup::generation_id(spec, source, &project_id, &date, source_fp, restrict.as_deref()) != generation {
                         fate(UnverifiableFate::StaleGeneration);
@@ -5261,9 +5184,7 @@ impl Database {
                     // Past every readability filter, so this slice is exactly
                     // what the read path will serve — and therefore exactly what
                     // the ledger may claim.
-                    if let Some((partition_project, paths)) =
-                        paths_by_identity.get(&(project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows))
-                    {
+                    if let Some((partition_project, paths)) = paths_by_identity.get(&identity) {
                         readable.entry((source.to_owned(), partition_project.clone(), target.clone(), date.clone())).or_default().push(
                             crate::storage::CoverageEntry {
                                 start_micros: slice_start,
@@ -5347,7 +5268,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
         (slice, dropped, masked): (crate::maintenance_coordinator::TimeSlice, u64, Option<MaskedPass<'_>>), pre: &[String],
     ) -> Result<Option<u64>> {
-        let day_start = date.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc().timestamp_micros();
+        let day_start = day_start_micros(date).unwrap_or_default();
         let day_end = day_start.saturating_add(crate::maintenance_coordinator::DAY_MICROS);
         let (start, end) = (slice.start_micros.max(day_start), slice.end_micros.min(day_end));
         if start >= end {
@@ -5447,13 +5368,11 @@ impl Database {
         }
         let spans = {
             let table = table_ref.read().await;
-            match Self::partition_file_spans(&table, &format!("date={date}")) {
-                Ok(spans) => spans,
-                Err(_) => return,
-            }
+            Self::partition_file_spans(&table, &format!("date={date}"))
         };
-        let contained = |span: crate::read::FileSpan| span.is_some_and(|(min, max)| intervals.iter().any(|&(start, end)| min >= start && max < end));
-        let (proved, unproven): (Vec<_>, Vec<_>) = spans.into_iter().partition(|(_, span)| contained(*span));
+        let Ok(spans) = spans else { return };
+        let (proved, unproven): (Vec<_>, Vec<_>) =
+            spans.into_iter().partition(|&(_, span)| span.is_some_and(|(min, max)| intervals.iter().any(|&(start, end)| min >= start && max < end)));
         metrics::counter!(scan_metric_names::CERT_SLICE_FILES_UNPROVEN).increment(unproven.len() as u64);
         if proved.is_empty() {
             return;
@@ -5705,8 +5624,7 @@ impl Database {
 
     pub(crate) fn logical_count_partition_snapshot(table: &DeltaTable, project_id: &str, date: &str) -> Result<(u64, crate::read::CountFiles)> {
         let snapshot = table.snapshot()?.snapshot();
-        let files = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), project_id, date);
-        let paths: HashSet<_> = files.into_iter().collect();
+        let paths: HashSet<_> = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), project_id, date).into_iter().collect();
         let mut files = crate::read::CountFiles::new();
         for file in snapshot.log_data().iter().filter(|file| paths.contains(file.path().as_ref())) {
             anyhow::ensure!(
@@ -6026,12 +5944,10 @@ impl Database {
             // A partition abandoned here is simply re-swept next tick: the pass
             // is idempotent and `record_certification` only certifies a pass
             // that ran to completion, so a truncated one certifies nothing.
-            let partition_budget = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-            let swept = match partition_budget {
-                Some(budget) => match tokio::time::timeout(budget, self.dedup_partition(table_ref, table_name, pid, date)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!("dedup of {pid}/{date} exceeded the sweep's remaining {budget:?}")),
-                },
+            let swept = match deadline.map(|d| d.saturating_duration_since(std::time::Instant::now())) {
+                Some(budget) => tokio::time::timeout(budget, self.dedup_partition(table_ref, table_name, pid, date))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("dedup of {pid}/{date} exceeded the sweep's remaining {budget:?}"))),
                 None => self.dedup_partition(table_ref, table_name, pid, date).await,
             };
             match swept {
@@ -6574,10 +6490,7 @@ impl Database {
         let mut by_project: HashMap<String, (usize, Vec<String>)> = Default::default();
         for back in 1..=CERTIFY_WINDOW_DAYS {
             let date = (today - chrono::Duration::days(back)).to_string();
-            for (project, files) in Self::partition_files_by_pid(table, &format!("date={date}")).into_iter().flatten() {
-                if files.is_empty() {
-                    continue;
-                }
+            for (project, files) in Self::partition_files_by_pid(table, &format!("date={date}")).into_iter().flatten().filter(|(_, files)| !files.is_empty()) {
                 let key = (project.clone(), table_name.to_string(), date.clone());
                 // Stale entries ARE re-probed: staleness means per-file evidence
                 // outlived its fingerprint, not that the date is dirty.
@@ -6586,11 +6499,10 @@ impl Database {
                 // clean without a commit, and a commit moves the fingerprint.
                 // Re-probing it is pure waste, and at 64 probes a pass it would be
                 // most of the budget.
-                let (file_count, fp) = (files.len(), partition_file_fp(&files));
-                let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| *entry.value() == fp);
+                let known_dirty = self.dedup_probe_declined.get(&key).is_some_and(|entry| *entry.value() == partition_file_fp(&files));
                 if uncertified && !known_dirty {
-                    let entry = by_project.entry(project).or_insert_with(|| (0usize, Vec::new()));
-                    entry.0 += file_count;
+                    let entry = by_project.entry(project).or_default();
+                    entry.0 += files.len();
                     entry.1.push(date.clone());
                 }
             }
@@ -6667,10 +6579,8 @@ impl Database {
         if budget.is_zero() {
             return ready;
         }
-        let mut groups: HashMap<(String, String), Vec<i64>> = Default::default();
-        for (project, date, bin) in &ready {
-            groups.entry((project.clone(), date.clone())).or_default().push(*bin);
-        }
+        use itertools::Itertools;
+        let groups = ready.iter().map(|(project, date, bin)| ((project.clone(), date.clone()), *bin)).into_group_map();
         // Probes run CONCURRENTLY (they were sequential until 2026-08-06 —
         // ~140 groups × seconds-to-a-minute each serialized the whole
         // classification phase). Bounded by the rewrite permits like every
@@ -6876,10 +6786,9 @@ impl Database {
     /// that didn't land (stale target, failed/unconfirmed commit) puts its bin
     /// back on the queue, because its duplicates are still in the table.
     async fn commit_dedup_wave(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, units: Vec<StagedBin>) {
+        use itertools::Itertools;
         use std::sync::atomic::Ordering::Relaxed;
-        let mut markers: Vec<String> = units.iter().filter_map(|u| u.dedup.as_ref()).map(|d| format!("date={}/", d.date)).collect();
-        markers.sort();
-        markers.dedup();
+        let markers: Vec<String> = units.iter().filter_map(|u| u.dedup.as_ref()).map(|d| format!("date={}/", d.date)).sorted().dedup().collect();
         let result = self.commit_wave(table, table_name, &markers, true, units, 0).await;
         let stats = crate::observability::maintenance_stats();
         let mut landed_bins: HashSet<DirtyBinKey> = result
@@ -6895,10 +6804,10 @@ impl Database {
         for unit in &result.failed {
             let Some(key) = unit.dedup.as_ref().and_then(|d| d.key.clone()) else { continue };
             landed_bins.remove(&key);
-            let (project_id, _, date, bin) = key.clone();
-            self.dedup_dirty_bins.insert(key, ());
+            let (project_id, _, date, bin) = &key;
             stats.dirty_bin_requeued.fetch_add(1, Relaxed);
             warn!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
+            self.dedup_dirty_bins.insert(key, ());
         }
         stats.dirty_bin_processed.fetch_add(landed_bins.len() as u64, Relaxed);
         self.persist_dirty_bins();
@@ -6926,32 +6835,28 @@ impl Database {
         // dragged each pass by hours while the bins never finished. 3600s
         // still bounds the hung-read wedge this exists for (was 6.5h).
         const DEDUP_BIN_STAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
-        match self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE, drain_deadline).await {
-            Ok(()) if t0.elapsed() > DEDUP_WARN => {
-                warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
-                crate::observability::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let note = |what: &str, elapsed: std::time::Duration, result: Result<()>| {
+            let stats = crate::observability::maintenance_stats();
+            match result {
+                Ok(()) if elapsed > DEDUP_WARN => {
+                    warn!("{what} for {label} took {elapsed:?} (exceeds {DEDUP_WARN:?} warning threshold)");
+                    stats.dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    stats.dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    error!("{what} failed for {label}: {e}");
+                }
             }
-            Ok(()) => {}
-            Err(e) => {
-                crate::observability::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                error!("Dirty-bin dedup failed for {label}: {e}");
-            }
-        }
+        };
+        let drained = self.dedup_dirty_bins_for_table(table, table_name, &|| self.dedup_flush_healthy(), DEDUP_BIN_STAGE_DEADLINE, drain_deadline).await;
+        note("Dirty-bin dedup", t0.elapsed(), drained);
         if self.config.maintenance.timefusion_dedup_sweep_fallback {
             let t0 = std::time::Instant::now();
             // The sweep is the pass's unbounded half (see `dedup_sweep`); the
             // drain above is bounded per bin and is the work worth finishing.
-            match self.dedup_sweep(table, table_name, dedup_key, Some(sweep_deadline)).await {
-                Ok(()) if t0.elapsed() > DEDUP_WARN => {
-                    warn!("Dedup fallback sweep for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
-                    crate::observability::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(()) => {}
-                Err(e) => {
-                    crate::observability::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    error!("Dedup fallback sweep failed for {label}: {e}");
-                }
-            }
+            let swept = self.dedup_sweep(table, table_name, dedup_key, Some(sweep_deadline)).await;
+            note("Dedup fallback sweep", t0.elapsed(), swept);
         }
     }
 
@@ -7043,6 +6948,14 @@ impl Database {
         }
     }
 
+    /// One metadata walk under the read lock — the three planning sites' shared shape.
+    async fn select_hot_bins(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, schema: &crate::schema::TableSchema, today_str: &str, policy: &HotBinPolicy<'_>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let table = table_ref.read().await;
+        Self::select_all_hot_bins(&table, schema, today_str, policy)
+    }
+
     /// Plan one tail pass: which projects have work and which files each bin takes.
     ///
     /// Split out so tests can reproduce the exact bin the next real pass will select (resume is
@@ -7062,10 +6975,7 @@ impl Database {
             if policy.pass != TailPass::Repair || planned.len() == before {
                 break;
             }
-            let next = {
-                let table = table_ref.read().await;
-                Self::select_all_hot_bins(&table, schema, today_str, policy)?
-            };
+            let next = self.select_hot_bins(table_ref, schema, today_str, policy).await?;
             if next.is_empty() {
                 break;
             }
@@ -7082,10 +6992,7 @@ impl Database {
         // Plan ONCE for round 0; later rounds re-plan from the post-commit
         // snapshot so a wave never re-selects the run it just wrote. Bins are
         // ordered by compaction debt.
-        let mut planned = {
-            let table = table_ref.read().await;
-            Self::select_all_hot_bins(&table, schema, today_str, policy)?
-        };
+        let mut planned = self.select_hot_bins(table_ref, schema, today_str, policy).await?;
         // Rotation cursor: start where the last truncated tick stopped so the
         // same tail is never skipped twice in a row (a truncated tick otherwise
         // always serves the same debt-ordered prefix).
@@ -7145,13 +7052,10 @@ impl Database {
         let planned = self.plan_tail_pass(table_ref, table_name, &today.to_string(), &policy).await?;
         let Some((project_id, files)) = planned.into_iter().next() else { return Ok(None) };
         let schema = schema_or_default(table_name);
-        match self
+        let outcome = self
             .stage_hot_bin(table_ref, table_name, schema, &project_id, files.clone(), HotStageOptions { pass, runtime_env: None, light_permit: None })
-            .await?
-        {
-            BinOutcome::Staged(_) => Ok(Some((project_id, files))),
-            _ => Ok(None),
-        }
+            .await?;
+        Ok(matches!(outcome, BinOutcome::Staged(_)).then_some((project_id, files)))
     }
 
     /// Hot-tail compaction for one table: plan-once, rewrite-parallel, commit-once waves.
@@ -7186,14 +7090,14 @@ impl Database {
         // 144-minute budget. See `repair_pass_permit`.
         let _repair_permit = match pass {
             TailPass::Pack => None,
-            TailPass::Repair => match Arc::clone(&self.repair_pass_permit).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
+            TailPass::Repair => {
+                let Ok(permit) = Arc::clone(&self.repair_pass_permit).try_acquire_owned() else {
                     crate::observability::maintenance_stats().repair_ticks_yielded.fetch_add(1, Relaxed);
                     info!(table_name, event = "repair_pass_yielded_to_another_table");
                     return Ok(());
-                }
-            },
+                };
+                Some(permit)
+            }
         };
         let today = chrono::DateTime::from_timestamp_micros(crate::support::now_micros()).map(|d| d.date_naive()).unwrap_or_else(|| Utc::now().date_naive());
         let today_str = today.to_string();
@@ -7201,6 +7105,13 @@ impl Database {
         let budget = self.tail_pass_tick_budget(pass);
         let policy = self.tail_pass_policy(pass, budget, &repair_dates);
         let schema = schema_or_default(table_name);
+        // Scope the warm/evict diff to the dates this pass actually rewrote.
+        // Handing a repair wave today's marker would diff the wrong partition
+        // entirely. Fixed for the whole pass, so every commit site shares it.
+        let markers: Vec<String> = match pass {
+            TailPass::Pack => vec![format!("date={today_str}/")],
+            TailPass::Repair => repair_dates.iter().map(|d| format!("date={d}/")).collect(),
+        };
         let planned = self.plan_tail_pass(table_ref, table_name, &today_str, &policy).await?;
         if planned.is_empty() {
             return Ok(());
@@ -7234,9 +7145,7 @@ impl Database {
             let plan_guard = plan.lock().await;
             let mut found = Vec::new();
             for (project_id, files) in plan_guard.iter() {
-                if let Some(bin) = self.resumable_staged_bin(table_ref, table_name, project_id, files).await {
-                    found.push((project_id.clone(), bin));
-                }
+                found.extend(self.resumable_staged_bin(table_ref, table_name, project_id, files).await.map(|bin| (project_id.clone(), bin)));
             }
             found
         };
@@ -7244,10 +7153,6 @@ impl Database {
             // Drop it from the plan: its inputs are about to stop being live, so
             // re-staging them this tick would rewrite files the commit removed.
             plan.lock().await.remove(&project_id);
-            let markers: Vec<String> = match pass {
-                TailPass::Pack => vec![format!("date={today_str}/")],
-                TailPass::Repair => policy.repair_dates.iter().map(|d| format!("date={d}/")).collect(),
-            };
             let failed = self.commit_wave(table_ref, table_name, &markers, false, vec![bin], 0).await.failed.len();
             info!(table_name, project_id, failed, event = "resumed_bin_committed_early");
         }
@@ -7339,10 +7244,7 @@ impl Database {
                     // elsewhere — needs the path. Inferring it from counters and
                     // checkpoints cost most of a night on 2026-08-09 and every
                     // inference was one indirection too far from the answer.
-                    let selected = match pass {
-                        TailPass::Repair => files.first().map(String::as_str).unwrap_or(""),
-                        TailPass::Pack => "",
-                    };
+                    let selected = files.first().filter(|_| pass == TailPass::Repair).map(String::as_str).unwrap_or("");
                     info!(table_name, project_id, date = %today, selected_files = files.len(), selected, round, event = "light_optimize_tail_selected");
                     // Admission picked this file off the ABSENT sort tag, which
                     // is only a suspicion (see `repair_verified_sorted`). Read
@@ -7415,17 +7317,10 @@ impl Database {
                 }
             },
             |bins, round| {
-                let (plan, today_str, policy) = (&plan, today_str.as_str(), &policy);
+                let (plan, today_str, policy, markers) = (&plan, today_str.as_str(), &policy, markers.as_slice());
                 async move {
                     let staged = bins.len();
-                    // Scope the warm/evict diff to the dates this pass actually rewrote.
-                    // Handing a repair wave today's marker would diff the wrong
-                    // partition entirely.
-                    let markers: Vec<String> = match pass {
-                        TailPass::Pack => vec![format!("date={today_str}/")],
-                        TailPass::Repair => policy.repair_dates.iter().map(|d| format!("date={d}/")).collect(),
-                    };
-                    let failed = self.commit_wave(table_ref, table_name, &markers, false, bins, round).await.failed.len();
+                    let failed = self.commit_wave(table_ref, table_name, markers, false, bins, round).await.failed.len();
                     // Round 0 only: one bin per project, so this is directly
                     // comparable to `projects_planned` (the alert is
                     // completed < planned for N consecutive ticks).
@@ -7440,10 +7335,7 @@ impl Database {
                     // can run (round cap / deadline), which would walk the
                     // snapshot only to discard the result.
                     if round + 1 < max_waves && std::time::Instant::now() < deadline {
-                        let next = {
-                            let table = table_ref.read().await;
-                            Self::select_all_hot_bins(&table, schema, today_str, policy).unwrap_or_default()
-                        };
+                        let next = self.select_hot_bins(table_ref, schema, today_str, policy).await.unwrap_or_default();
                         // Filter the RE-PLAN too. Filtering only round 0 is what
                         // made the first attempt at this useless: every later
                         // round re-selected unverified suspects and fell back to
@@ -7574,18 +7466,12 @@ impl Database {
         // Bytes read into this rewrite — free here (the Adds are already mapped)
         // and the divisor that turns staging duration into observed R2 throughput.
         let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
+        let decoded_in = estimated_decoded_bytes(bytes_in);
+        let rows_in: u64 = targets.iter().filter_map(add_row_count).sum();
         // THIS bin's measured row width — feeds both the scan batch size and the
         // output's row-group cap.
-        let measured_bytes_per_row = {
-            let rows: u64 = targets.iter().filter_map(add_row_count).sum();
-            estimated_decoded_bytes(bytes_in).checked_div(rows).filter(|width| *width > 0)
-        };
-        let batch_size = batch_rows_for(
-            estimated_decoded_bytes(bytes_in),
-            targets.iter().filter_map(add_row_count).sum(),
-            self.config.maintenance.timefusion_maintenance_batch_target_bytes,
-        )
-        .to_string();
+        let measured_bytes_per_row = decoded_in.checked_div(rows_in).filter(|width| *width > 0);
+        let batch_size = batch_rows_for(decoded_in, rows_in, self.config.maintenance.timefusion_maintenance_batch_target_bytes).to_string();
         // Emitted BEFORE the rewrite, because the interesting bins are the ones
         // that never reach `wave_bin_staged`. A timed-out bin used to report
         // only "exceeded the Ns left in the tick budget" — no size, no file
@@ -8013,7 +7899,7 @@ impl Database {
     /// same file. Sharing the per-physical-table commit lock prevents optimize-vs-dedup
     /// delete-delete aborts. `data_change` is the one real difference between the engines.
     pub(crate) async fn commit_wave(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date_markers: &[String], data_change: bool, bins: Vec<StagedBin>, round: usize,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date_markers: &[String], data_change: bool, mut bins: Vec<StagedBin>, round: usize,
     ) -> WaveResult {
         use deltalake::kernel::{Action, transaction::TableReference};
         debug_assert!(bins.iter().all(|b| b.data_change() == data_change), "a wave must not mix data-preserving and row-dropping units");
@@ -8034,7 +7920,6 @@ impl Database {
             wave_ids = ?bins.iter().map(|b| b.wave_id.as_str()).collect::<Vec<_>>(),
             event = "wave_commit_enter"
         );
-        let mut bins = bins;
         let mut failed: Vec<StagedBin> = Vec::new();
         // Bins already CONFIRMED landed by an earlier attempt of this wave (see
         // the self-landed split below). Carried across OCC retries so their
@@ -8125,9 +8010,7 @@ impl Database {
             // The exact Adds settle it: a DV update reuses its parquet path,
             // so its deletion vector must also match before crediting a commit.
             let (self_landed, stale): (Vec<StagedBin>, Vec<StagedBin>) = stale.into_iter().partition(|b| bin_adds_live(b, &active));
-            for bin in &stale {
-                debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit");
-            }
+            stale.iter().for_each(|bin| debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit"));
             self.discard_bins(table_ref, &stale, Some(&live)).await;
             failed.extend(stale);
             if !self_landed.is_empty() {
@@ -8158,9 +8041,7 @@ impl Database {
                     true
                 }
             });
-            for bin in &overlapping {
-                debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_overlapping_target");
-            }
+            overlapping.iter().for_each(|bin| debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_overlapping_target"));
             self.discard_bins(table_ref, &overlapping, Some(&live)).await;
             failed.extend(overlapping);
             if fresh.is_empty() {
@@ -8463,11 +8344,16 @@ impl Database {
         if paths.is_empty() {
             return;
         }
-        for path in &paths {
+        crate::observability::maintenance_stats().repair_sorted_at_write.fetch_add(paths.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.remember_verified_sorted(&paths);
+    }
+
+    /// Remember footers known to be sorted, in memory and on disk.
+    fn remember_verified_sorted(&self, paths: &[String]) {
+        for path in paths {
             self.repair_verified_sorted.insert(path.clone());
         }
-        crate::observability::maintenance_stats().repair_sorted_at_write.fetch_add(paths.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.persist_verified_sorted(&paths);
+        self.persist_verified_sorted(paths);
     }
 
     /// Persist footers already probed as sorted, so a restart does not re-probe them.
@@ -8555,6 +8441,13 @@ impl Database {
         self.maintenance_state_path("staged_intent.jsonl")
     }
 
+    /// Every recorded staged intent. A missing/unreadable manifest is an empty
+    /// list: every caller treats "no entries" and "no manifest" identically.
+    fn staged_intents(&self) -> Vec<StagedIntent> {
+        let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
+        parse_staged_intents(&std::fs::read_to_string(self.staged_intent_path()).unwrap_or_default())
+    }
+
     /// Append one bin's staged paths. Best-effort: a manifest write failure
     /// must never fail the compaction, only widen the VACUUM backstop's job.
     pub(crate) fn record_staged_intent(&self, entry: StagedIntent) {
@@ -8629,18 +8522,11 @@ impl Database {
         use deltalake::protocol::{DeltaOperation, SaveMode};
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
-        let contents = {
-            let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
-            let Ok(contents) = std::fs::read_to_string(self.staged_intent_path()) else {
-                stats.rollup_resume_no_intent.fetch_add(1, Relaxed);
-                return Ok(false);
-            };
-            contents
-        };
         // Paired with its evidence, so the commit path below cannot re-ask
         // whether it is a rollup at all — a branch that could never fire, in the
         // middle of the one place correctness matters.
-        let candidates: Vec<(StagedIntent, crate::database::RollupResume)> = parse_staged_intents(&contents)
+        let candidates: Vec<(StagedIntent, crate::database::RollupResume)> = self
+            .staged_intents()
             .into_iter()
             .filter_map(|entry| entry.rollup.clone().filter(|rollup| &rollup.key == key).map(|rollup| (entry, rollup)))
             .collect();
@@ -8762,14 +8648,11 @@ impl Database {
         if !self.config.maintenance.timefusion_repair_resume_enabled {
             return None;
         }
-        let contents = {
-            let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
-            std::fs::read_to_string(self.staged_intent_path()).ok()?
-        };
         let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
         // Set equality, not order: the bin is a SET of inputs, and admission may
         // legitimately hand them over in a different order than last time.
-        let candidates: Vec<StagedIntent> = parse_staged_intents(&contents)
+        let candidates: Vec<StagedIntent> = self
+            .staged_intents()
             .into_iter()
             .filter(|e| e.project_id == project_id && e.target_paths.len() == files.len())
             .filter(|e| e.target_paths.iter().all(|p| wanted.contains(p.as_str())))
@@ -8783,21 +8666,21 @@ impl Database {
         let (live, target_adds, store) = {
             let table = table_ref.read().await;
             let snapshot = table.snapshot().ok()?;
-            let mut live: HashMap<String, Option<i64>> = HashMap::new();
-            let mut target_adds: HashMap<String, deltalake::kernel::Add> = HashMap::new();
-            for file in snapshot.log_data().iter() {
-                let file_path = file.path().into_owned();
-                if !interest.contains(file_path.as_str()) {
-                    continue;
-                }
-                // A deletion vector makes the file's LOGICAL row count smaller
-                // than its `numRecords`, and the rewrite read logical rows — so
-                // comparing against `numRecords` would flag every DV'd input as
-                // a mismatch and decline the very bins this exists to save.
-                let dropped = file.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality);
-                live.insert(file_path.clone(), file.num_records().and_then(|n| i64::try_from(n).ok()).map(|n| n - dropped));
-                target_adds.insert(file_path, add_action(&file));
-            }
+            let (live, target_adds): (HashMap<String, Option<i64>>, HashMap<String, deltalake::kernel::Add>) = snapshot
+                .log_data()
+                .iter()
+                .filter(|file| interest.contains(&*file.path()))
+                .map(|file| {
+                    let file_path = file.path().into_owned();
+                    // A deletion vector makes the file's LOGICAL row count smaller
+                    // than its `numRecords`, and the rewrite read logical rows — so
+                    // comparing against `numRecords` would flag every DV'd input as
+                    // a mismatch and decline the very bins this exists to save.
+                    let dropped = file.deletion_vector_descriptor().map_or(0, |dv| dv.cardinality);
+                    let rows = file.num_records().and_then(|n| i64::try_from(n).ok()).map(|n| n - dropped);
+                    ((file_path.clone(), rows), (file_path, add_action(&file)))
+                })
+                .unzip();
             (live, target_adds, table.log_store().object_store(None))
         };
         let live_view: HashMap<&str, Option<i64>> = live.iter().map(|(k, v)| (k.as_str(), *v)).collect();
@@ -8875,13 +8758,7 @@ impl Database {
     /// cleanup aid, correctness never depends on it.
     pub async fn reconcile_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
         use object_store::ObjectStoreExt;
-        let path = self.staged_intent_path();
-        let contents = {
-            let _manifest_guard = crate::support::lock(&self.staged_intent_manifest_lock);
-            let Ok(contents) = std::fs::read_to_string(&path) else { return };
-            contents
-        };
-        let entries = parse_staged_intents(&contents);
+        let entries = self.staged_intents();
         if entries.is_empty() {
             return;
         }
@@ -8891,16 +8768,18 @@ impl Database {
                 warn!("staged-intent reconcile skipped for '{table_name}': no snapshot loaded");
                 return;
             };
-            let mut referenced: HashSet<String> = snapshot.log_data().iter().map(|f| f.path().into_owned()).collect();
             // A committed deletion-vector `.bin` is NOT a log_data path, so without
             // this a crash-after-commit reconcile would delete a live DV sidecar
             // and resurrect the masked rows. Treat any `.bin` referenced by a live
             // Add's DV descriptor as live (the same rule VACUUM applies).
-            for f in snapshot.log_data().iter() {
-                if let Some(rel) = f.deletion_vector_descriptor().as_ref().and_then(deltalake::operations::deletion_vectors::dv_object_store_relative_path) {
-                    referenced.insert(rel);
-                }
-            }
+            let referenced: HashSet<String> = snapshot
+                .log_data()
+                .iter()
+                .flat_map(|f| {
+                    let dv = f.deletion_vector_descriptor().as_ref().and_then(deltalake::operations::deletion_vectors::dv_object_store_relative_path);
+                    std::iter::once(f.path().into_owned()).chain(dv)
+                })
+                .collect();
             (referenced, table.log_store().object_store(None))
         };
         let now_secs = crate::support::now_secs();
@@ -9029,15 +8908,12 @@ impl Database {
         }
         use futures::StreamExt;
         let before = planned.len();
-        let checked: Vec<(String, Vec<String>, bool)> = futures::stream::iter(planned)
-            .map(|(project_id, files)| async move {
-                let sorted = self.repair_bin_already_sorted(table_ref, &files).await;
-                (project_id, files, sorted)
-            })
+        let kept: Vec<(String, Vec<String>)> = futures::stream::iter(planned)
+            .map(|(project_id, files)| async move { (!self.repair_bin_already_sorted(table_ref, &files).await).then_some((project_id, files)) })
             .buffer_unordered(REPAIR_VERIFY_CONCURRENCY)
+            .filter_map(std::future::ready)
             .collect()
             .await;
-        let kept: Vec<(String, Vec<String>)> = checked.into_iter().filter(|(_, _, sorted)| !sorted).map(|(p, f, _)| (p, f)).collect();
         if before != kept.len() {
             info!(table_name, cleared = before - kept.len(), remaining = kept.len(), event = "footer_repair_suspects_bulk_cleared");
         }
@@ -9055,10 +8931,7 @@ impl Database {
                 return false;
             }
         }
-        for path in files {
-            self.repair_verified_sorted.insert(path.clone());
-        }
-        self.persist_verified_sorted(files);
+        self.remember_verified_sorted(files);
         info!(files = files.len(), event = "footer_repair_suspect_cleared");
         true
     }
@@ -9122,17 +8995,16 @@ impl Database {
                 let table = table_ref.read().await;
                 let Ok(snapshot) = table.snapshot() else { continue };
                 tables_read += 1;
-                let object_store = table.log_store().object_store(None);
-                let mut paths: Vec<String> = Vec::new();
-                for file in snapshot.log_data().iter() {
-                    let path = file.path().into_owned();
-                    if !self.repair_verified_sorted.contains(&path) && candidates + paths.len() < limit {
-                        paths.push(path);
-                    }
-                }
+                let paths: Vec<String> = snapshot
+                    .log_data()
+                    .iter()
+                    .map(|file| file.path().into_owned())
+                    .filter(|path| !self.repair_verified_sorted.contains(path))
+                    .take(limit - candidates)
+                    .collect();
                 candidates += paths.len();
                 if !paths.is_empty() {
-                    unknown.push((object_store, paths));
+                    unknown.push((table.log_store().object_store(None), paths));
                 }
             }
             if candidates >= limit {
@@ -9147,14 +9019,15 @@ impl Database {
             info!(tables_read, candidates = 0, verified = 0, event = "footer_repair_seed_swept");
             return (tables_read, 0);
         }
+        // Deliberately NOT flattened into one stream over `(store, paths)`. Any closure whose
+        // PARAMETER carries the store leaves the trait object's lifetime to inference, which then
+        // demands a higher-ranked `FnOnce` it cannot satisfy, and the error surfaces far away at
+        // the `tokio::spawn` that drives this.
         let mut verified: Vec<String> = Vec::new();
         for (object_store, paths) in unknown {
             let found: Vec<String> = futures::stream::iter(paths)
                 .map(|path| {
-                    // Cloned INSIDE the closure so its parameter is a plain `String`. With the
-                    // store in the closure's parameter instead, inference demands a higher-ranked
-                    // `FnOnce` over the trait object's lifetime that it cannot satisfy, and the
-                    // error surfaces far away at the `tokio::spawn` that drives this.
+                    // Cloned INSIDE the closure so its parameter is a plain `String`.
                     let object_store = Arc::clone(&object_store);
                     async move { Self::footer_declares_sorted(&object_store, &path).await.then_some(path) }
                 })
@@ -9164,10 +9037,7 @@ impl Database {
                 .await;
             verified.extend(found);
         }
-        for path in &verified {
-            self.repair_verified_sorted.insert(path.clone());
-        }
-        self.persist_verified_sorted(&verified);
+        self.remember_verified_sorted(&verified);
         // Both numbers, always. `verified` alone cannot distinguish "the fleet is
         // healthy" from "the sweep found nothing to look at", and the difference
         // between them is the entire size of the repair backlog.
@@ -9217,10 +9087,7 @@ impl Database {
         let scope = [pid_marker.as_str(), date_marker.as_str()];
         let pre_uris: Option<HashSet<String>> = if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
         for attempt in 0..MAX_RETRIES {
-            let table_clone = {
-                let table = table_ref.read().await;
-                table.clone()
-            };
+            let table_clone = { table_ref.read().await.clone() };
             if attempt == 0 {
                 info!(table_name, project_id, date = %today, target_size, max_concurrent_tasks = self.config.derived.optimize_merge_tasks(), event = "light_optimize_started");
             } else {
@@ -9325,7 +9192,6 @@ impl Database {
 
     /// Returns the number of files deleted (0 on failure — the error is logged).
     pub(crate) async fn vacuum_table(&self, project_id: &str, table_name: &str, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) -> usize {
-        // Log the start of the vacuum operation
         let start_time = std::time::Instant::now();
         info!("Starting vacuum operation with retention period of {} hours", retention_hours);
 
@@ -9344,12 +9210,7 @@ impl Database {
 
         // Get a clone so the table RwLock is not held across object-store IO.
         // The per-physical-table commit lock above keeps this snapshot stable.
-        let table_clone = {
-            let table = table_ref.read().await;
-            table.clone()
-        };
-
-        // Directly run vacuum without dry run to delete old files
+        let table_clone = { table_ref.read().await.clone() };
         match table_clone
             .vacuum()
             .with_retention_period(chrono::Duration::hours(retention_hours as i64))

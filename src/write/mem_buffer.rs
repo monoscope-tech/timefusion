@@ -956,10 +956,8 @@ fn apply_predicate(batch: &RecordBatch, pred: &Arc<dyn datafusion::physical_expr
 /// non-matching rows and any batch that ends up empty. `None` returns the
 /// snapshot unchanged.
 pub fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>) -> Vec<RecordBatch> {
-    match pred {
-        Some(p) => snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0).collect(),
-        None => snapshot,
-    }
+    let Some(p) = pred else { return snapshot };
+    snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0).collect()
 }
 
 /// MemBuffer's contribution to a scan: one partition per surviving time
@@ -1049,10 +1047,7 @@ const SORT_CHUNK_ROWS: usize = 8192;
 pub fn batch_bucket_ids(batch: &RecordBatch, time_col: &str) -> Vec<i64> {
     let Some(col) = batch.column_by_name(time_col) else { return Vec::new() };
     let Some(values) = crate::read::bound_slice(col) else { return Vec::new() };
-    let mut ids: Vec<i64> = values.iter().map(|&t| MemBuffer::compute_bucket_id(t)).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
+    values.iter().map(|&t| MemBuffer::compute_bucket_id(t)).sorted_unstable().dedup().collect()
 }
 
 /// Half-open `[start, end)` interval overlap — the ONE range convention shared
@@ -1066,15 +1061,8 @@ pub fn overlaps(a: (i64, i64), b: (i64, i64)) -> bool {
 /// excludes the UNION of the other tiers' ranges, and consecutive sealed
 /// buckets are contiguous, so this collapses what would be one
 /// `(ts < a OR ts >= b)` conjunct per bucket into (typically) one.
-pub fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
-    ranges.sort_unstable();
-    ranges.into_iter().fold(Vec::new(), |mut out, (start, end)| {
-        match out.last_mut() {
-            Some((_, prev_end)) if start <= *prev_end => *prev_end = (*prev_end).max(end),
-            _ => out.push((start, end)),
-        }
-        out
-    })
+pub fn merge_ranges(ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.into_iter().sorted_unstable().coalesce(|a, b| if b.0 <= a.1 { Ok((a.0, a.1.max(b.1))) } else { Err((a, b)) }).collect()
 }
 
 /// Check if a bucket's time range overlaps with the query range.
@@ -1305,20 +1293,15 @@ impl MemBuffer {
             return Ok(Arc::clone(&table));
         }
 
-        // Slow path: create table using entry API
-        match self.tables.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => {
-                if entry.get().declared.is_none() {
-                    ensure_compatible(entry.get().schema())?;
-                }
-                Ok(Arc::clone(entry.get()))
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let new_table = Arc::new(TableBuffer::new(schema.clone(), Arc::from(project_id), Arc::from(table_name)));
-                entry.insert(Arc::clone(&new_table));
-                Ok(new_table)
-            }
+        // Slow path: create table using entry API. The check below cannot fail
+        // for a freshly created buffer — an unregistered table (`declared ==
+        // None`, the only case checked) keeps `schema` verbatim.
+        let make = || Arc::new(TableBuffer::new(schema.clone(), Arc::from(project_id), Arc::from(table_name)));
+        let table = Arc::clone(&self.tables.entry(key).or_insert_with(make));
+        if table.declared.is_none() {
+            ensure_compatible(table.schema())?;
         }
+        Ok(table)
     }
 
     /// Get a TableBuffer if it exists (for read operations).
@@ -1443,13 +1426,10 @@ impl MemBuffer {
         let schema = batches[0].schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
 
-        let (total_delta, touched_buckets) = batches.into_iter().try_fold((0i64, std::collections::HashSet::new()), |(delta, mut touched), batch| {
-            let (sz, bucket_id) = table.insert_batch(batch, timestamp_micros, None)?;
-            touched.insert(bucket_id);
-            anyhow::Ok((delta + sz, touched))
-        })?;
-        apply_signed_delta(&self.estimated_bytes, total_delta);
-        for bucket_id in touched_buckets {
+        let inserted: Vec<(i64, i64)> = batches.into_iter().map(|batch| table.insert_batch(batch, timestamp_micros, None)).try_collect()?;
+        // One aggregate delta, not one per batch — mutation site #3 of `estimated_bytes`.
+        apply_signed_delta(&self.estimated_bytes, inserted.iter().map(|&(sz, _)| sz).sum());
+        for bucket_id in inserted.into_iter().map(|(_, id)| id).unique() {
             self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
         }
         Ok(())
@@ -1537,13 +1517,8 @@ impl MemBuffer {
             .buckets
             .iter()
             .filter(|b| b.value().row_count.load(Ordering::Relaxed) > 0 && bucket_overlaps_range(b.value(), &range))
-            .map(|b| {
-                let start = b.key().saturating_mul(bucket_duration_micros());
-                match b.value().min_timestamp.load(Ordering::Relaxed) {
-                    i64::MAX => start,
-                    min => start.min(min),
-                }
-            })
+            // The unset sentinel is i64::MAX, so `min` drops it by construction.
+            .map(|b| b.key().saturating_mul(bucket_duration_micros()).min(b.value().min_timestamp.load(Ordering::Relaxed)))
             .min()
     }
 
@@ -1589,8 +1564,7 @@ impl MemBuffer {
         let Some(table) = self.get_table(project_id, table_name) else { return Ok(MemSnapshot::default()) };
         let key = table_key(project_id, table_name);
         let current = Self::current_bucket_id();
-        let mut bucket_ids: Vec<_> = table.buckets.iter().map(|bucket| *bucket.key()).collect();
-        bucket_ids.sort_unstable();
+        let bucket_ids = table.buckets.iter().map(|bucket| *bucket.key()).sorted_unstable().collect_vec();
         let mut snapshot = MemSnapshot::default();
         for bucket_id in bucket_ids {
             let Some(bucket) = table.buckets.get(&bucket_id) else { continue };
@@ -1844,10 +1818,7 @@ impl MemBuffer {
             let mut g = bucket.batches.lock();
             if bucket.mutation_gen.load(Ordering::Relaxed) != b.snapshot_gen {
                 // Dirty: re-pin and re-flush next cycle.
-                for (shard, pos) in b.wal_first_positions.iter().enumerate() {
-                    bucket.record_wal_append(shard, *pos);
-                }
-                bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
+                bucket.restore_holds(&b.wal_first_positions);
                 // No further drain-progress escalation needed for sustained
                 // DML churn: backpressure relief force-flushes via take-based
                 // snapshots, which a racing DML cannot dirty.
@@ -1941,10 +1912,7 @@ impl MemBuffer {
         let Some(bucket) = table.buckets.get(&b.bucket_id) else {
             return false;
         };
-        for (shard, pos) in b.wal_first_positions.iter().enumerate() {
-            bucket.record_wal_append(shard, *pos);
-        }
-        bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
+        bucket.restore_holds(&b.wal_first_positions);
         true
     }
 
@@ -1967,21 +1935,26 @@ impl MemBuffer {
     /// skipped.
     pub fn reap_expired_empty_buckets(&self, arrival_cutoff_micros: i64) -> usize {
         let releasable = |b: &TimeBucket| b.batches.lock().is_empty() && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros;
-        let mut reaped = 0usize;
-        for table in self.tables.iter() {
-            let expired: Vec<i64> =
-                table.buckets.iter().filter(|b| releasable(b) && b.flush_pinned_prefix.load(Ordering::Relaxed) == 0).map(|b| *b.key()).collect();
-            for id in expired {
+        let reaped: usize = self
+            .tables
+            .iter()
+            .map(|table| {
+                let expired: Vec<i64> =
+                    table.buckets.iter().filter(|b| releasable(b) && b.flush_pinned_prefix.load(Ordering::Relaxed) == 0).map(|b| *b.key()).collect();
                 // Re-check emptiness under the shard lock — a concurrent
                 // insert that repopulated the shell keeps it.
-                if let Some((_, shell)) = table.buckets.remove_if(&id, |_, b| releasable(b)) {
-                    // Residual bytes on a dropped shell must leave the total too.
-                    sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
-                    self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, id));
-                    reaped += 1;
-                }
-            }
-        }
+                expired
+                    .into_iter()
+                    .filter_map(|id| {
+                        table.buckets.remove_if(&id, |_, b| releasable(b)).map(|(_, shell)| {
+                            // Residual bytes on a dropped shell must leave the total too.
+                            sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
+                            self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, id));
+                        })
+                    })
+                    .count()
+            })
+            .sum();
         if reaped > 0 {
             debug!("reap_expired_empty_buckets: released {} expired empty shell(s)", reaped);
         }
@@ -2151,14 +2124,12 @@ impl MemBuffer {
             let table = table_entry.value();
             let bucket_ids_to_remove: Vec<i64> = table.buckets.iter().filter(|b| *b.key() < cutoff_bucket_id).map(|b| *b.key()).collect();
 
-            for bucket_id in bucket_ids_to_remove {
-                if let Some((_, bucket)) = table.buckets.remove(&bucket_id) {
-                    freed_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
-                    evicted_count += 1;
-                    // Free the bucket's text-index cache entry alongside its
-                    // batches — same reasoning as in the flush drain.
-                    self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, bucket_id));
-                }
+            for (bucket_id, bucket) in bucket_ids_to_remove.into_iter().filter_map(|id| table.buckets.remove(&id)) {
+                freed_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
+                evicted_count += 1;
+                // Free the bucket's text-index cache entry alongside its
+                // batches — same reasoning as in the flush drain.
+                self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, bucket_id));
             }
             // The flushed watermarks outlive their buckets on purpose, but only
             // until the window itself falls out of retention — past the cutoff
@@ -2252,6 +2223,22 @@ impl MemBuffer {
         Ok(total_deleted)
     }
 
+    /// Compile assignment exprs to `(target column index, physical expr)`.
+    /// `rewrite` runs after qualifier stripping — identity (`Ok`) for a plain
+    /// UPDATE, the `source__` renamer for `UPDATE ... FROM`.
+    fn compile_assignments(
+        assignments: &[(String, Expr)], target: &SchemaRef, df_schema: &DFSchema, props: &ExecutionProps, rewrite: impl Fn(Expr) -> DFResult<Expr>,
+    ) -> DFResult<Vec<(usize, Arc<dyn datafusion::physical_expr::PhysicalExpr>)>> {
+        assignments
+            .iter()
+            .map(|(col, expr)| {
+                let phys_expr = create_physical_expr(&rewrite(strip_column_qualifiers(expr.clone())?)?, df_schema, props)?;
+                let col_idx = target.index_of(col).map_err(|_| datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col)))?;
+                Ok((col_idx, phys_expr))
+            })
+            .collect()
+    }
+
     /// Update rows matching the predicate with new values.
     /// Returns the number of rows updated.
     #[instrument(skip(self, predicate, assignments), fields(project_id, table_name, rows_updated))]
@@ -2273,15 +2260,7 @@ impl MemBuffer {
 
         let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props)).transpose()?;
 
-        // Pre-compile assignment expressions
-        let physical_assignments: Vec<_> = assignments
-            .iter()
-            .map(|(col, expr)| {
-                let phys_expr = create_physical_expr(&strip_column_qualifiers(expr.clone())?, &df_schema, &props)?;
-                let col_idx = schema.index_of(col).map_err(|_| datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col)))?;
-                Ok((col_idx, phys_expr))
-            })
-            .collect::<DFResult<Vec<_>>>()?;
+        let physical_assignments = Self::compile_assignments(assignments, &schema, &df_schema, &props, Ok)?;
 
         let mut total_updated = 0u64;
         let mut total_delta: i64 = 0;
@@ -2393,24 +2372,10 @@ impl MemBuffer {
             .map_err(|e| datafusion::error::DataFusionError::Execution(format!("update_with_source: rewrite failed: {e}")))
         };
 
-        let physical_predicate = predicate
-            .map(|p| -> DFResult<_> {
-                let stripped = strip_column_qualifiers(p.clone())?;
-                let rewritten = rewrite(stripped)?;
-                create_physical_expr(&rewritten, &widened_df_schema, &props)
-            })
-            .transpose()?;
+        let physical_predicate =
+            predicate.map(|p| create_physical_expr(&rewrite(strip_column_qualifiers(p.clone())?)?, &widened_df_schema, &props)).transpose()?;
 
-        let physical_assignments: Vec<(usize, _)> = assignments
-            .iter()
-            .map(|(col, expr)| -> DFResult<_> {
-                let stripped = strip_column_qualifiers(expr.clone())?;
-                let rewritten = rewrite(stripped)?;
-                let phys_expr = create_physical_expr(&rewritten, &widened_df_schema, &props)?;
-                let col_idx = target_schema.index_of(col).map_err(|_| datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col)))?;
-                Ok((col_idx, phys_expr))
-            })
-            .collect::<DFResult<Vec<_>>>()?;
+        let physical_assignments = Self::compile_assignments(assignments, &target_schema, &widened_df_schema, &props, &rewrite)?;
 
         // Hash the source side once via Arrow's RowConverter so target rows can
         // probe the lookup with byte-identical key encoding.
@@ -2693,44 +2658,31 @@ impl MemBuffer {
     }
 
     pub fn get_stats(&self) -> MemBufferStats {
-        let (mut total_buckets, mut total_rows, mut total_batches) = (0, 0, 0);
-        let mut estimated_bytes = 0usize;
-        let mut project_ids = std::collections::HashSet::new();
-        let mut oldest: Option<i64> = None;
         // Only buckets the flush path should already have drained count toward
         // the dwell signal — non-empty AND past the open window.
         let current = Self::current_bucket_id();
-
+        // `estimated_memory_bytes` is summed from the bucket atomics in this
+        // sweep (free — it already visits every bucket), so `timefusion_stats`
+        // and the `mem_buffer.estimated_bytes` gauge report the authoritative
+        // value even if the hot-path cache has drifted since the last reconcile.
+        let mut stats = MemBufferStats {
+            project_count: self.tables.iter().map(|t| t.key().0.clone()).unique().count(),
+            replay_dml_noops: self.replay_dml_noops.load(Ordering::Relaxed),
+            ..Default::default()
+        };
         for table_entry in self.tables.iter() {
-            let (project_id, _) = table_entry.key();
-            project_ids.insert(project_id.clone());
-
-            let table = table_entry.value();
-            total_buckets += table.buckets.len();
-            for bucket in table.buckets.iter() {
-                total_rows += bucket.row_count.load(Ordering::Relaxed);
-                estimated_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
+            stats.total_buckets += table_entry.value().buckets.len();
+            for bucket in table_entry.value().buckets.iter() {
+                stats.total_rows += bucket.row_count.load(Ordering::Relaxed);
+                stats.estimated_memory_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
                 let batch_count = bucket.batches.lock().len();
-                total_batches += batch_count;
+                stats.total_batches += batch_count;
                 if batch_count > 0 && *bucket.key() < current {
-                    let created = bucket.created_micros;
-                    oldest = Some(oldest.map_or(created, |o| o.min(created)));
+                    stats.oldest_bucket_micros = Some(stats.oldest_bucket_micros.map_or(bucket.created_micros, |o| o.min(bucket.created_micros)));
                 }
             }
         }
-        MemBufferStats {
-            project_count: project_ids.len(),
-            total_buckets,
-            total_rows,
-            total_batches,
-            replay_dml_noops: self.replay_dml_noops.load(Ordering::Relaxed),
-            // Summed from the bucket atomics in the sweep above (free — the
-            // loop already visits every bucket), so `timefusion_stats` and the
-            // `mem_buffer.estimated_bytes` gauge report the authoritative value
-            // even if the hot-path cache has drifted since the last reconcile.
-            estimated_memory_bytes: estimated_bytes,
-            oldest_bucket_micros: oldest,
-        }
+        stats
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2957,6 +2909,16 @@ impl TimeBucket {
         if let Some(pos) = pre_position {
             self.wal_shard_state.lock().merge(shard, pos);
         }
+    }
+
+    /// Re-pin a flush snapshot's WAL holds and lift the prefix fence — the
+    /// snapshotted rows are the bucket's own again (failed commit, or a DML
+    /// that dirtied the bucket mid-flight).
+    fn restore_holds(&self, positions: &[Option<walrus_rust::WalPosition>]) {
+        for (shard, pos) in positions.iter().enumerate() {
+            self.record_wal_append(shard, *pos);
+        }
+        self.flush_pinned_prefix.store(0, Ordering::Relaxed);
     }
 
     fn snapshot_wal_shard_state(&self, shards_per_topic: usize) -> Vec<Option<walrus_rust::WalPosition>> {

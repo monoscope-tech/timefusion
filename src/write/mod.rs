@@ -124,7 +124,7 @@ fn bound_event_time(project_id: &str, table_name: &str, batches: Vec<RecordBatch
                 return Some(batch);
             }
             let mask: arrow::array::BooleanArray = ts.iter().map(|v| Some(v.is_none_or(|v| (EVENT_TIME_MIN_MICROS..=hi).contains(&v)))).collect();
-            dropped += mask.iter().filter(|keep| *keep == Some(false)).count() as u64;
+            dropped += mask.false_count() as u64;
             match arrow::compute::filter_record_batch(&batch, &mask) {
                 Ok(kept) if kept.num_rows() == 0 => None,
                 Ok(kept) => Some(kept),
@@ -328,12 +328,10 @@ const FLUSH_FAILURE_BRAKE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
 /// Pure brake predicate, split out so the thresholds are unit-testable with
 /// injected numbers (constructing a live `BufferedWriteLayer` needs S3 + WAL).
 fn wal_backlog_over_threshold(backlog_bytes: u64, max_unflushed_bytes: u64, last_flush_failure_micros: i64, now_micros: i64) -> bool {
-    if max_unflushed_bytes > 0 && backlog_bytes > max_unflushed_bytes {
-        return true;
-    }
-    // Flush broken ⇒ the backlog is about to be real regardless of its current
-    // size: brake so compaction isn't competing with recovery.
-    last_flush_failure_micros > 0 && now_micros.saturating_sub(last_flush_failure_micros) < FLUSH_FAILURE_BRAKE_WINDOW_MICROS
+    (max_unflushed_bytes > 0 && backlog_bytes > max_unflushed_bytes)
+        // Flush broken ⇒ the backlog is about to be real regardless of its current
+        // size: brake so compaction isn't competing with recovery.
+        || (last_flush_failure_micros > 0 && now_micros.saturating_sub(last_flush_failure_micros) < FLUSH_FAILURE_BRAKE_WINDOW_MICROS)
 }
 
 /// Pure emergency-flush predicate (see `is_wal_over_threshold` for why the
@@ -462,8 +460,7 @@ pub fn row_hashes(batch: &RecordBatch, idxs: &[usize]) -> Option<Vec<u128>> {
     if batch.num_rows() == 0 {
         return Some(Vec::new());
     }
-    let fields: Vec<SortField> = idxs.iter().map(|&i| SortField::new(batch.column(i).data_type().clone())).collect();
-    let cols: Vec<_> = idxs.iter().map(|&i| batch.column(i).clone()).collect();
+    let (fields, cols): (Vec<SortField>, Vec<_>) = idxs.iter().map(|&i| (SortField::new(batch.column(i).data_type().clone()), batch.column(i).clone())).unzip();
     let rows = RowConverter::new(fields).ok()?.convert_columns(&cols).ok()?;
     Some((0..batch.num_rows()).map(|r| twox_hash::XxHash3_128::oneshot(rows.row(r).as_ref())).collect())
 }
@@ -967,20 +964,20 @@ impl Drop for WriteAdmission<'_> {
 
 impl BufferedWriteLayer {
     fn admit_write(&self) -> Result<WriteAdmission<'_>, &'static str> {
+        const DRAINING: &str = "TimeFusion is draining for deployment; retry on the replacement";
         if !self.accepting_writes.load(Ordering::Acquire) {
-            return Err("TimeFusion is draining for deployment; retry on the replacement");
+            return Err(DRAINING);
         }
         self.active_writes.fetch_add(1, Ordering::AcqRel);
+        let admission = WriteAdmission { layer: self };
         // Close-vs-increment race: the shutdown thread stores false before it
         // waits for this counter. Recheck after increment so every admitted
-        // writer is either visible to that wait or rejected here.
+        // writer is either visible to that wait or rejected here — dropping
+        // `admission` on the reject path releases the slot (and notifies).
         if !self.accepting_writes.load(Ordering::Acquire) {
-            if self.active_writes.fetch_sub(1, Ordering::AcqRel) == 1 {
-                self.writes_drained.notify_waiters();
-            }
-            return Err("TimeFusion is draining for deployment; retry on the replacement");
+            return Err(DRAINING);
         }
-        Ok(WriteAdmission { layer: self })
+        Ok(admission)
     }
 
     /// Close write admission before network-server drain. Idempotent. Reads on
@@ -1034,7 +1031,7 @@ impl BufferedWriteLayer {
         let deferred_path = deferred_tantivy_path(&cfg);
 
         Ok(Self {
-            config: cfg.clone(),
+            config: cfg,
             wal,
             mem_buffer,
             shutdown: CancellationToken::new(),
@@ -1404,10 +1401,9 @@ impl BufferedWriteLayer {
             let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
                 continue;
             };
-            if !attempted {
+            if !std::mem::replace(&mut attempted, true) {
                 crate::observability::record_backpressure_force_flush();
                 self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
-                attempted = true;
             }
             match self.flush_taken_bucket(&bucket).await {
                 Ok(()) => {
@@ -1679,12 +1675,11 @@ impl BufferedWriteLayer {
     /// leaves keys unindexed — a later duplicate, never a loss.
     fn populate_ingest_dedup(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) {
         let idx = self.ingest_dedup_index(project_id, table_name);
-        for batch in batches {
-            let Some((key_idxs, content_idxs)) = ingest_identity_idxs(table_name, &batch.schema()) else { continue };
-            for (k, c) in per_row_identities(batch, &key_idxs, &content_idxs).unwrap_or_default() {
-                idx.populate(k, c);
-            }
-        }
+        batches
+            .iter()
+            .filter_map(|batch| ingest_identity_idxs(table_name, &batch.schema()).map(|(k, c)| (batch, k, c)))
+            .flat_map(|(batch, key_idxs, content_idxs)| per_row_identities(batch, &key_idxs, &content_idxs).unwrap_or_default())
+            .for_each(|(k, c)| idx.populate(k, c));
         let stats = crate::observability::maintenance_stats();
         // Rotate here too: a table written only via DML re-appends never takes
         // the probe path, and the index must stay bounded either way.
@@ -2935,17 +2930,14 @@ impl BufferedWriteLayer {
         let results = if timeout.is_zero() {
             commit.await
         } else {
-            match tokio::time::timeout(timeout, commit).await {
-                Ok(r) => r,
-                Err(_) => {
-                    crate::observability::record_flush_stalled();
-                    error!(
-                        "coalesced Delta commit stalled >{:?} across {} group(s) — aborting so flush_lock releases and relief can retry; rows remain durable in MemBuffer + WAL",
-                        timeout, expected
-                    );
-                    Vec::new()
-                }
-            }
+            tokio::time::timeout(timeout, commit).await.unwrap_or_else(|_| {
+                crate::observability::record_flush_stalled();
+                error!(
+                    "coalesced Delta commit stalled >{:?} across {} group(s) — aborting so flush_lock releases and relief can retry; rows remain durable in MemBuffer + WAL",
+                    timeout, expected
+                );
+                Vec::new()
+            })
         };
         // Defensive: a short/over-long result vector would strand groups
         // (unsettled = leaked in-flight holds). Fail them all instead — a
@@ -3187,16 +3179,16 @@ impl BufferedWriteLayer {
     /// so concurrent uploads can't saturate S3 connections or grow tantivy
     /// writer heap unbounded.
     fn index_flushed_files(&self, bucket: &FlushableBucket, batches: Vec<RecordBatch>, added_files: Vec<String>) {
-        // This commit landed, so its identity joins the live set — an
-        // in-process re-flush of the identical set (the abandoned-commit
-        // window in `flush_bucket`, a requeued group) is then declined too,
-        // not only duplicates left behind by a previous boot.
-        if self.config.buffer.landed_skip_enabled() && landed_identity_applies(&bucket.table_name) {
-            self.note_landed_digests(&bucket.project_id, &bucket.table_name, landed_digest(&batches));
-        }
-        // Same post-commit placement for the per-row ingest-dedup identities:
-        // only rows Delta provably holds may ever drop a retry.
         if landed_identity_applies(&bucket.table_name) {
+            // This commit landed, so its identity joins the live set — an
+            // in-process re-flush of the identical set (the abandoned-commit
+            // window in `flush_bucket`, a requeued group) is then declined too,
+            // not only duplicates left behind by a previous boot.
+            if self.config.buffer.landed_skip_enabled() {
+                self.note_landed_digests(&bucket.project_id, &bucket.table_name, landed_digest(&batches));
+            }
+            // Same post-commit placement for the per-row ingest-dedup identities:
+            // only rows Delta provably holds may ever drop a retry.
             self.populate_ingest_dedup(&bucket.project_id, &bucket.table_name, &batches);
         }
         if self.recovery_active.load(Ordering::Relaxed) {
@@ -3387,16 +3379,22 @@ impl BufferedWriteLayer {
         self.release_inflight_holds(project_id, table_name, token);
     }
 
-    fn release_inflight_holds(&self, project_id: &str, table_name: &str, token: u64) {
-        let key = (project_id.to_string(), table_name.to_string());
-        if let Some(mut m) = self.inflight_flush_holds.get_mut(&key) {
+    /// Drop `token` from a per-topic hold map and prune the emptied outer
+    /// entry — per-topic entries otherwise accumulate forever under
+    /// project/table churn. remove_if re-checks under the shard lock, so a
+    /// racing register keeps its entry.
+    fn drop_hold_token<V>(map: &DashMap<(String, String), HashMap<u64, V>>, key: &(String, String), token: u64) {
+        if let Some(mut m) = map.get_mut(key) {
             m.remove(&token);
         }
+        map.remove_if(key, |_, m| m.is_empty());
+    }
+
+    fn release_inflight_holds(&self, project_id: &str, table_name: &str, token: u64) {
+        Self::drop_hold_token(&self.inflight_flush_holds, &(project_id.to_string(), table_name.to_string()), token);
+        // After the hold drop, never before: the transient where the pin
+        // outlives its entry over-pins the GC floor, never gaps it.
         self.inflight_wal_pins.remove(&token);
-        // Prune the emptied outer entry — per-topic entries otherwise
-        // accumulate forever under project/table churn. remove_if re-checks
-        // under the shard lock, so a racing register keeps its entry.
-        self.inflight_flush_holds.remove_if(&key, |_, m| m.is_empty());
     }
 
     /// Wait until no Delta commit is airborne for this table. The DML Delta
@@ -3415,10 +3413,8 @@ impl BufferedWriteLayer {
         // bookkeeping before the hold releases.
         const WATCHDOG_DISABLED_FALLBACK: Duration = Duration::from_secs(600);
         const POST_COMMIT_PAD: Duration = Duration::from_secs(30);
-        let budget = match self.config.buffer.flush_bucket_timeout() {
-            t if t.is_zero() => WATCHDOG_DISABLED_FALLBACK,
-            t => t + POST_COMMIT_PAD,
-        };
+        let watchdog = self.config.buffer.flush_bucket_timeout();
+        let budget = if watchdog.is_zero() { WATCHDOG_DISABLED_FALLBACK } else { watchdog + POST_COMMIT_PAD };
         let start = std::time::Instant::now();
         while self.inflight_flush_holds.get(&key).is_some_and(|m| !m.is_empty()) {
             if start.elapsed() > budget {
@@ -3614,6 +3610,18 @@ impl BufferedWriteLayer {
         self.flush_buckets_where(|_| true).await
     }
 
+    /// Undo the handoff fence, but only while `generation` still owns it —
+    /// shutdown or a newer handoff takes ownership and must not be undone.
+    /// Returns whether the fence was ours to reopen.
+    fn reopen_write_admission(&self, generation: u64) -> bool {
+        let owned = !self.shutdown.is_cancelled() && self.handoff_generation.load(Ordering::Acquire) == generation;
+        if owned {
+            self.deploy_handoff_ready.store(false, Ordering::Release);
+            self.accepting_writes.store(true, Ordering::Release);
+        }
+        owned
+    }
+
     /// Fence new writes and drain the now-finite WAL tail while this process
     /// remains available for reads. The deploy workflow calls this immediately
     /// before task replacement, making SIGTERM's local snapshot the only work
@@ -3636,9 +3644,7 @@ impl BufferedWriteLayer {
         tokio::spawn(async move {
             tokio::time::sleep(HANDOFF_LEASE).await;
             let Some(layer) = weak.upgrade() else { return };
-            if !layer.shutdown.is_cancelled() && layer.handoff_generation.load(Ordering::Acquire) == generation {
-                layer.deploy_handoff_ready.store(false, Ordering::Release);
-                layer.accepting_writes.store(true, Ordering::Release);
+            if layer.reopen_write_admission(generation) {
                 warn!("Deploy handoff lease expired before shutdown; write admission reopened");
             }
         });
@@ -3647,24 +3653,16 @@ impl BufferedWriteLayer {
         // Restore admission on both paths, unless shutdown or a newer handoff
         // has taken ownership of the fence.
         let reopen_admission = scopeguard::guard((), |_| {
-            if !self.shutdown.is_cancelled() && self.handoff_generation.load(Ordering::Acquire) == generation {
-                self.deploy_handoff_ready.store(false, Ordering::Release);
-                self.accepting_writes.store(true, Ordering::Release);
-            }
+            self.reopen_write_admission(generation);
         });
         let deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
         if !self.wait_for_active_writes_until(deadline).await {
             anyhow::bail!("HANDOFF timed out waiting for admitted writers; write admission reopened");
         }
-        let stats = match tokio::time::timeout_at(deadline, self.flush_buckets_where(|_| true)).await {
-            Ok(Ok(stats)) => stats,
-            Ok(Err(e)) => {
-                return Err(e.context("HANDOFF flush failed; write admission reopened"));
-            }
-            Err(_) => {
-                anyhow::bail!("HANDOFF flush exceeded four minutes; write admission reopened");
-            }
-        };
+        let stats = tokio::time::timeout_at(deadline, self.flush_buckets_where(|_| true))
+            .await
+            .map_err(|_| anyhow::anyhow!("HANDOFF flush exceeded four minutes; write admission reopened"))?
+            .map_err(|e| e.context("HANDOFF flush failed; write admission reopened"))?;
         if stats.buckets_failed > 0 || !self.is_drained() {
             anyhow::bail!("HANDOFF left {} failed bucket(s) or undrained WAL state; write admission reopened", stats.buckets_failed);
         }
@@ -3692,20 +3690,10 @@ impl BufferedWriteLayer {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let after = self.wal.reclaim_state_counts();
-        info!(
-            "WAL reclaim handoff: before(total={}, eligible={}, locked={}, uncheckpointed={}, open={}), after(total={}, eligible={}, locked={}, uncheckpointed={}, open={}), completed={}",
-            before.total,
-            before.eligible,
-            before.locked,
-            before.uncheckpointed,
-            before.open,
-            after.total,
-            after.eligible,
-            after.locked,
-            after.uncheckpointed,
-            after.open,
-            self.wal.reclaim_sweep_complete(epoch)
-        );
+        let counts = |c: &crate::write::wal::ReclaimStateCounts| {
+            format!("total={}, eligible={}, locked={}, uncheckpointed={}, open={}", c.total, c.eligible, c.locked, c.uncheckpointed, c.open)
+        };
+        info!("WAL reclaim handoff: before({}), after({}), completed={}", counts(&before), counts(&after), self.wal.reclaim_sweep_complete(epoch));
     }
 
     /// Flush one taken bucket: force-flushed marking + in-flight hold
@@ -3988,12 +3976,13 @@ impl BufferedWriteLayer {
             Ok(_) => apply(captured.get()),
             Err(e) => Err(E::from(wal_err(op)(e))),
         };
-        if let Some(mut m) = self.pending_wal_holds.get_mut(&hold_key) {
-            m.remove(&token);
-        }
-        // Prune the emptied outer entry (see release_inflight_holds).
-        self.pending_wal_holds.remove_if(&hold_key, |_, m| m.is_empty());
+        Self::drop_hold_token(&self.pending_wal_holds, &hold_key, token);
         out
+    }
+
+    /// [`Self::admit_write`] for the DML entry points, whose error type is DataFusion's.
+    fn admit_dml(&self) -> datafusion::error::Result<WriteAdmission<'_>> {
+        self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
     }
 
     /// Delete rows matching the predicate from the memory buffer.
@@ -4001,7 +3990,7 @@ impl BufferedWriteLayer {
     /// Returns the number of rows deleted.
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
-        let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        let _admission = self.admit_dml()?;
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
         // Log to WAL first for durability. Failure here means the delete is
         // not recoverable after a crash — propagate so the client knows the
@@ -4023,7 +4012,7 @@ impl BufferedWriteLayer {
     pub fn update(
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
     ) -> datafusion::error::Result<u64> {
-        let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        let _admission = self.admit_dml()?;
         let predicate_sql = predicate.map(Self::stripped_wal_sql);
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &HashSet::new());
         // See `delete()` — WAL failure must propagate so the client doesn't
@@ -4046,7 +4035,7 @@ impl BufferedWriteLayer {
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>,
         assignments: &[(String, datafusion::logical_expr::Expr)], source: &crate::dml::UpdateSource,
     ) -> datafusion::error::Result<u64> {
-        let _admission = self.admit_write().map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        let _admission = self.admit_dml()?;
         let source_cols: HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
         let predicate_sql = predicate.map(|p| Self::normalized_wal_sql(p, &source_cols));
         let assignments_sql = Self::assignments_to_wal_sql(assignments, &source_cols);

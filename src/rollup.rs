@@ -153,10 +153,7 @@ pub(crate) fn stats_time_range(stats: &str) -> Option<(i64, i64)> {
     let value: serde_json::Value = serde_json::from_str(stats).ok()?;
     let parse_ts = |side: &str| -> Option<i64> {
         let v = value.get(side)?.get("timestamp")?;
-        if let Some(micros) = v.as_i64() {
-            return Some(micros);
-        }
-        chrono::DateTime::parse_from_rfc3339(v.as_str()?).ok().map(|t| t.timestamp_micros())
+        v.as_i64().or_else(|| chrono::DateTime::parse_from_rfc3339(v.as_str()?).ok().map(|t| t.timestamp_micros()))
     };
     Some((parse_ts("minValues")?, parse_ts("maxValues")?))
 }
@@ -270,7 +267,8 @@ fn filtered(expression: String, filter: Option<&str>) -> String {
 /// ONE spelling of the bucket-floor formula: it was written out in both the
 /// per-project and the cohort builder, where the two had to stay in step by
 /// hand — the same way this file has already lost a caveat.
-fn bucketed_projection(spec: &RollupSpec, derived: bool, grain: i64) -> anyhow::Result<(String, String)> {
+fn bucketed_projection(spec: &RollupSpec, derived: bool) -> anyhow::Result<(String, String)> {
+    let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
     let dimensions = spec.dimensions.join(", ");
     let select_dimensions = if dimensions.is_empty() { String::new() } else { format!(", {dimensions}") };
     let measures = spec.measures.iter().map(|measure| measure_projection(spec, measure, derived)).collect::<anyhow::Result<Vec<_>>>()?.join(", ");
@@ -290,8 +288,7 @@ fn bucketed_projection(spec: &RollupSpec, derived: bool, grain: i64) -> anyhow::
 pub(crate) fn build_partition_sql_ranges(
     spec: &RollupSpec, source: &str, from: &str, target: &str, project_id: &str, date: &str, ranges: &[(i64, i64)],
 ) -> anyhow::Result<String> {
-    let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
-    let (select_dimensions, projection) = bucketed_projection(spec, from != source, grain)?;
+    let (select_dimensions, projection) = bucketed_projection(spec, from != source)?;
     let source = from;
     let group_by = (1..=1 + spec.dimensions.len()).join(", ");
 
@@ -318,8 +315,7 @@ pub(crate) fn build_cohort_sql_range_mode(
     if project_ids.is_empty() {
         anyhow::bail!("rollup cohort has no projects");
     }
-    let grain = spec.grain_micros().ok_or_else(|| anyhow::anyhow!("invalid rollup grain `{}`", spec.grain))?;
-    let (_, projection) = bucketed_projection(spec, derived, grain)?;
+    let (_, projection) = bucketed_projection(spec, derived)?;
     let group_by = (1..=2 + spec.dimensions.len()).join(", ");
     let projects = project_ids.iter().map(|project| sql_literal(project)).join(", ");
     Ok(format!(
@@ -339,9 +335,7 @@ fn generated_bucket_id(bucket: i64, grain: i64, generation: &str, dimensions: &[
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     (bucket, grain, generation).hash(&mut hasher);
     dimensions.len().hash(&mut hasher);
-    for dimension in dimensions {
-        format!("{dimension:?}").hash(&mut hasher);
-    }
+    dimensions.iter().for_each(|dimension| format!("{dimension:?}").hash(&mut hasher));
     format!("{bucket}-{:016x}", hasher.finish())
 }
 
@@ -381,9 +375,8 @@ pub fn to_rollup_batches(
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| anyhow::anyhow!("rollup aggregate timestamp cannot cast to microseconds"))?;
-            let timestamps = (0..rows)
-                .map(|row| (!timestamp.is_null(row)).then(|| timestamp.value(row)).ok_or_else(|| anyhow::anyhow!("rollup aggregate timestamp is null")))
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let timestamps =
+                timestamp.iter().map(|value| value.ok_or_else(|| anyhow::anyhow!("rollup aggregate timestamp is null"))).collect::<anyhow::Result<Vec<_>>>()?;
             let dimension_columns = spec
                 .dimensions
                 .iter()
@@ -803,18 +796,17 @@ pub(crate) fn verify_slice_witness(witness: Option<SliceWitness>, source: LiveSo
 /// so the two together partition `[lo, hi)`: no row is read twice, none is
 /// missed, and no aggregate downstream could detect it if one were.
 pub(crate) fn complement(lo: i64, hi: i64, ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
-    let mut gaps = Vec::new();
-    let mut cursor = lo;
-    for (start, end) in ranges {
-        if cursor < *start {
-            gaps.push((cursor, *start));
-        }
-        cursor = cursor.max(*end);
-    }
-    if cursor < hi {
-        gaps.push((cursor, hi));
-    }
-    gaps
+    // The `(hi, hi)` sentinel emits the trailing gap and can contribute nothing else.
+    ranges
+        .iter()
+        .chain(std::iter::once(&(hi, hi)))
+        .scan(lo, |cursor, &(start, end)| {
+            let gap = (*cursor < start).then_some((*cursor, start));
+            *cursor = (*cursor).max(end);
+            Some(gap)
+        })
+        .flatten()
+        .collect()
 }
 
 /// [`complement`] for a coverage set that is neither sorted nor disjoint.
@@ -1199,11 +1191,10 @@ pub(crate) fn slice_input_sql(
     let Some(dedup) = dedup.filter(|dedup| !dedup.keys.is_empty()) else {
         // `SELECT *` returns only what the provider has, so it cannot stand in
         // once anything is missing.
-        if schema.fields.iter().any(|field| missing(&field.name)) {
-            let columns = schema.fields.iter().map(&projected).join(", ");
-            return format!("SELECT {columns} FROM {raw} {window}");
-        }
-        return format!("SELECT * FROM {raw} {window}");
+        return match schema.fields.iter().any(|field| missing(&field.name)) {
+            true => format!("SELECT {} FROM {raw} {window}", schema.fields.iter().map(&projected).join(", ")),
+            false => format!("SELECT * FROM {raw} {window}"),
+        };
     };
     let inner = schema.fields.iter().map(&projected).join(", ");
     let columns = schema.fields.iter().map(|field| quoted(&field.name)).join(", ");
@@ -1468,14 +1459,26 @@ fn coalesced_column(expr: &datafusion::logical_expr::Expr) -> Option<(&str, &str
         Expr::ScalarFunction(function) if function.name().eq_ignore_ascii_case("coalesce") && function.args.len() == 2 => {
             Some((column_name(&function.args[0])?, string_literal(&function.args[1])?))
         }
-        Expr::Case(case) if case.expr.is_none() && case.when_then_expr.len() == 1 => {
-            let (when, then) = &case.when_then_expr[0];
-            let Expr::IsNotNull(probed) = when.as_ref() else { return None };
+        Expr::Case(case) => {
+            let (probed, then) = null_guard_case(case)?;
             let column = column_name(probed)?;
             (column_name(then)? == column).then_some((column, string_literal(case.else_expr.as_ref()?)?))
         }
         _ => None,
     }
+}
+
+/// The `CASE WHEN <probed> IS NOT NULL THEN <then> …` shape DataFusion's
+/// simplifier leaves behind where the query said `coalesce`, as
+/// `(<probed>, <then>)`. ONE spelling of the shape itself — a divergence between
+/// the matcher above and the simplifier below is invisible, the matcher would
+/// simply stop firing, which is how this shape went unrouted in the first place.
+/// How narrowly each caller accepts `probed` stays the caller's own decision.
+fn null_guard_case(case: &datafusion::logical_expr::Case) -> Option<(&datafusion::logical_expr::Expr, &datafusion::logical_expr::Expr)> {
+    let [(when, then)] = &case.when_then_expr[..] else { return None };
+    case.expr.is_none().then_some(())?;
+    let datafusion::logical_expr::Expr::IsNotNull(probed) = when.as_ref() else { return None };
+    Some((probed.as_ref(), then.as_ref()))
 }
 
 /// A retained dimension filter can prove a COALESCE fallback unreachable.
@@ -1513,15 +1516,9 @@ fn simplify_filtered_group(
                 Expr::ScalarFunction(function) if function.name() == "coalesce" => {
                     function.args.first().filter(|first| column_name(first).is_some_and(|column| non_null.contains(column))).cloned()
                 }
-                Expr::Case(case) if case.expr.is_none() && case.when_then_expr.len() == 1 => {
-                    let (when, then) = &case.when_then_expr[0];
-                    match when.as_ref() {
-                        Expr::IsNotNull(probed) if matches!(probed.as_ref(), Expr::Column(column) if non_null.contains(column.name.as_str())) => {
-                            Some(then.as_ref().clone())
-                        }
-                        _ => None,
-                    }
-                }
+                Expr::Case(case) => null_guard_case(case)
+                    .filter(|&(probed, _)| matches!(probed, Expr::Column(column) if non_null.contains(column.name.as_str())))
+                    .map(|(_, then)| then.clone()),
                 _ => None,
             };
             Ok(replacement.map_or_else(|| Transformed::no(node), Transformed::yes))
@@ -1708,19 +1705,12 @@ fn canonical(expr: &datafusion::logical_expr::Expr) -> String {
             // Idempotence, at EVERY level rather than only the outermost one:
             // the duplicated conjuncts observed in prod were nested inside an OR
             // branch, where a top-level dedupe cannot reach them.
-            let mut terms = operands.into_iter().map(canonical).sorted().dedup().collect_vec();
-            // Stripping or deduping can leave one operand, and a one-element
-            // conjunction IS that operand — `((X))` must not differ from `(X)`.
-            if terms.len() == 1 {
-                return terms.remove(0);
-            }
-            format!(
-                "({})",
-                terms.join(match binary.op {
-                    Operator::And => " AND ",
-                    _ => " OR ",
-                })
-            )
+            //
+            // `exactly_one` carries the other half: stripping or deduping can
+            // leave one operand, and a one-element conjunction IS that operand —
+            // `((X))` must not differ from `(X)`.
+            let separator = if binary.op == Operator::And { " AND " } else { " OR " };
+            operands.into_iter().map(canonical).sorted().dedup().exactly_one().unwrap_or_else(|mut terms| format!("({})", terms.join(separator)))
         }
         Expr::BinaryExpr(binary) => format!("({} {:?} {})", canonical(&binary.left), binary.op, canonical(&binary.right)),
         Expr::IsNotNull(expr) => format!("{} IS NOT NULL", canonical(expr)),
@@ -1789,8 +1779,7 @@ fn canonical_and<'a>(expressions: impl IntoIterator<Item = &'a datafusion::logic
 fn parse_bucket_micros(value: &str) -> Option<i64> {
     let mut parts = value.split_whitespace();
     let value = parts.next()?.parse::<i64>().ok()?;
-    let unit = parts.next()?.trim_end_matches('s');
-    let unit = match unit {
+    let unit = match parts.next()?.trim_end_matches('s') {
         "second" | "sec" => 1_000_000,
         "minute" | "min" => 60_000_000,
         "hour" | "hr" => 3_600_000_000,
@@ -1859,12 +1848,9 @@ pub(crate) fn source_and_filters(plan: &datafusion::logical_expr::LogicalPlan, f
             // the scan — and `canonical_and`'s idempotence dedup (see there)
             // could no longer cancel the pair. Lossless: one scan, so the name
             // is the identity.
-            use datafusion::{
-                common::{
-                    Column,
-                    tree_node::{Transformed, TreeNode},
-                },
-                logical_expr::Expr,
+            use datafusion::common::{
+                Column,
+                tree_node::{Transformed, TreeNode},
             };
             let unqualify = |node: Expr| {
                 Ok(match node {
@@ -1917,18 +1903,16 @@ pub(crate) fn inline_common_exprs(aggregate: &datafusion::logical_expr::Aggregat
     const CSE_PREFIX: &str = "__common_expr_";
 
     let LogicalPlan::Projection(projection) = aggregate.input.as_ref() else { return None };
-    let mut definitions = std::collections::HashMap::new();
-    for expr in &projection.expr {
-        match expr {
-            Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX) => {
-                definitions.insert(alias.name.clone(), alias.expr.as_ref().clone());
-            }
-            Expr::Column(_) => {}
-            // A rename, a computed projection — anything else is exactly what
-            // `source_and_filters` refuses to walk, and for the same reason.
-            _ => return None,
+    // A rename, a computed projection — anything else is exactly what
+    // `source_and_filters` refuses to walk, and for the same reason.
+    let definitions = projection.expr.iter().try_fold(std::collections::HashMap::new(), |mut definitions, expr| match expr {
+        Expr::Alias(alias) if alias.name.starts_with(CSE_PREFIX) => {
+            definitions.insert(alias.name.clone(), alias.expr.as_ref().clone());
+            Some(definitions)
         }
-    }
+        Expr::Column(_) => Some(definitions),
+        _ => None,
+    })?;
     if definitions.is_empty() {
         return None;
     }
@@ -1972,10 +1956,7 @@ fn scanned_table(plan: &datafusion::logical_expr::LogicalPlan) -> Option<String>
 /// rollup is already partitioned by project and bucketed by time. So dropping
 /// them recovers exactly the declared predicate.
 fn is_probe_scaffolding(expr: &datafusion::logical_expr::Expr) -> bool {
-    let mut columns = std::collections::HashSet::new();
-    if datafusion::logical_expr::utils::expr_to_columns(expr, &mut columns).is_err() {
-        return false;
-    }
+    let columns = expr.column_refs();
     !columns.is_empty() && columns.iter().all(|column| matches!(column.name.as_str(), "project_id" | "timestamp"))
 }
 
@@ -2033,11 +2014,7 @@ async fn measure_filters<'a>(
                 // stops routing at all — and from outside the process it looks
                 // identical to a query whose own filter simply did not match.
                 // Discarding the error is what made the two indistinguishable.
-                let planned = async {
-                    let plan = session.create_logical_plan(&probe).await?;
-                    session.optimize(&plan)
-                }
-                .await;
+                let planned = async { session.optimize(&session.create_logical_plan(&probe).await?) }.await;
                 let plan = planned.map_err(|error| {
                     tracing::warn!(event = "rollup_measure_probe_failed", source, measure = %measure.name, probe, %error, "a declared measure filter could not be planned");
                     MissReason::UnknownFilter
@@ -2142,8 +2119,7 @@ pub(crate) async fn match_aggregates(
     // dimension set, which is the smaller table. A spec that cannot serve this
     // query — wrong grain, missing dimension, missing measure — declines and the
     // next one is tried, so adding a spec can only ever widen what routes.
-    let mut candidates: Vec<&RollupSpec> = schema.rollups.iter().collect();
-    candidates.sort_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), spec.dimensions.len()));
+    let candidates = schema.rollups.iter().sorted_by_key(|spec| (std::cmp::Reverse(spec.grain_micros().unwrap_or(0)), spec.dimensions.len()));
     let (mut miss, mut grain_miss) = (None, None);
     let mut routes = Vec::new();
     for spec in candidates {
@@ -2209,28 +2185,27 @@ pub(crate) async fn match_aggregates(
 /// window and would serve rows the query excluded.
 fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>, hi: &mut Option<i64>) -> Result<bool, MissReason> {
     use datafusion::logical_expr::{Expr, Operator};
+    // Both bounds only ever TIGHTEN, so the merge is max on the inclusive start
+    // and min on the exclusive end; an absent bound takes the new value whole.
+    let narrow = |bound: &mut Option<i64>, value: i64, tighten: fn(i64, i64) -> i64| *bound = Some(bound.map_or(value, |current| tighten(current, value)));
+    // The exclusive end of an INCLUSIVE bound (`BETWEEN`, `<=`). Overflow here is
+    // a window nothing can be inside, which reads the same as unbounded.
+    let exclusive = |value: i64| value.checked_add(1).ok_or(MissReason::UnboundedTime);
     match term {
         Expr::Between(between) if !between.negated && column_name(&between.expr) == Some("timestamp") => {
             let (Some(lower), Some(upper)) = (timestamp_literal(&between.low), timestamp_literal(&between.high)) else {
                 return Err(MissReason::UnboundedTime);
             };
-            *lo = Some(lo.map_or(lower, |current: i64| current.max(lower)));
-            *hi = Some(
-                hi.map_or_else(|| upper.checked_add(1), |current: i64| upper.checked_add(1).map(|upper| current.min(upper)))
-                    .ok_or(MissReason::UnboundedTime)?,
-            );
+            narrow(lo, lower, i64::max);
+            narrow(hi, exclusive(upper)?, i64::min);
         }
         Expr::BinaryExpr(binary) if column_name(&binary.left) == Some("timestamp") => {
             let Some(value) = timestamp_literal(&binary.right) else { return Err(MissReason::UnboundedTime) };
             match binary.op {
-                Operator::GtEq => *lo = Some(lo.map_or(value, |current: i64| current.max(value))),
-                Operator::Gt => {
-                    *lo = Some(lo.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.max(value.saturating_add(1))))
-                }
-                Operator::Lt => *hi = Some(hi.map_or(value, |current: i64| current.min(value))),
-                Operator::LtEq => {
-                    *hi = Some(hi.map_or(value.checked_add(1).ok_or(MissReason::UnboundedTime)?, |current: i64| current.min(value.saturating_add(1))))
-                }
+                Operator::GtEq => narrow(lo, value, i64::max),
+                Operator::Gt => narrow(lo, exclusive(value)?, i64::max),
+                Operator::Lt => narrow(hi, value, i64::min),
+                Operator::LtEq => narrow(hi, exclusive(value)?, i64::min),
                 _ => return Err(MissReason::UnknownFilter),
             }
         }
@@ -2254,8 +2229,8 @@ fn narrow_timestamp(term: &datafusion::logical_expr::Expr, lo: &mut Option<i64>,
                 return Err(MissReason::UnknownFilter);
             }
             let end = start.checked_add(width).ok_or(MissReason::UnboundedTime)?;
-            *lo = Some(lo.map_or(start, |current: i64| current.max(start)));
-            *hi = Some(hi.map_or(end, |current: i64| current.min(end)));
+            narrow(lo, start, i64::max);
+            narrow(hi, end, i64::min);
         }
         _ => return Ok(false),
     }
@@ -2291,11 +2266,9 @@ fn date_trunc_width(expr: &datafusion::logical_expr::Expr) -> Option<i64> {
 /// safe direction for every caller.
 pub(crate) fn timestamp_window(predicate: &datafusion::logical_expr::Expr) -> Option<(i64, i64)> {
     let (mut lo, mut hi) = (None, None);
+    // An unreadable bound is not "no bound": treat it as unbounded.
     for term in datafusion::logical_expr::utils::split_conjunction(predicate) {
-        // An unreadable bound is not "no bound": treat it as unbounded.
-        if narrow_timestamp(term, &mut lo, &mut hi).is_err() {
-            return None;
-        }
+        narrow_timestamp(term, &mut lo, &mut hi).ok()?;
     }
     lo.zip(hi).filter(|(lo, hi)| lo < hi)
 }
@@ -2358,8 +2331,7 @@ async fn route_with_spec(
     // Two different columns cannot both be expressed by one count measure, and the
     // guard is a single measure by construction. Fail closed rather than guard on
     // one and silently ignore the other.
-    null_guards.dedup();
-    if null_guards.len() > 1 {
+    if !null_guards.iter().all_equal() {
         return Err(MissReason::FilterMultipleNullGuards);
     }
     let null_guard = null_guards.first().copied();
@@ -2403,6 +2375,15 @@ async fn route_with_spec(
     // give it, and any value satisfies the guard's SHAPE check.
     let probe_project = project_id.as_deref().unwrap_or("rollup-probe");
     let configured_filters = measure_filters(session, source, spec, probe_project, lo, hi).await?;
+    // ONE lookup for the whole matcher: a declared measure is identified by its
+    // aggregate, its column and the canonical text of its filter, and both the
+    // promotion guard and every routed aggregate below resolve on exactly that.
+    let declared_measure = |aggregate: &str, column: Option<&str>, filter: &str| {
+        configured_filters
+            .iter()
+            .find(|(measure, declared)| measure.agg == aggregate && measure.column.as_deref() == column && declared.as_str() == filter)
+            .map(|(measure, _)| *measure)
+    };
 
     // ROW-FILTER PROMOTION. A residual predicate is normally fatal: the rollup
     // aggregated over every row, so re-aggregating it resurrects the groups the
@@ -2432,69 +2413,62 @@ async fn route_with_spec(
     let promoted = (!promotable.is_empty()).then(|| canonical_and(promotable.iter().copied()));
     let guard = match (promoted.as_deref(), null_guard) {
         (None, None) => None,
-        (promoted, column) => Some(
-            configured_filters
-                .iter()
-                .find(|(measure, filter)| measure.agg == "count" && measure.column.as_deref() == column && filter.as_str() == promoted.unwrap_or_default())
-                .map(|(measure, _)| *measure)
-                .ok_or_else(|| {
-                    let declared = || {
-                        configured_filters
-                            .iter()
-                            .filter(|(measure, _)| measure.agg == "count" && measure.column.as_deref() == column)
-                            .map(|(measure, filter)| format!("{}={filter}", measure.name))
-                            .join(" | ")
-                    };
-                    // A residual constraining columns NO declared filter even
-                    // mentions was never a candidate — it is log-explorer and
-                    // facet traffic (`attributes___…___name IS NOT NULL`,
-                    // `jsonb_path_exists`, `LIKE`), not a promotion that failed.
-                    // Prod 2026-08-12: 84 declines in 3h, every one of them this
-                    // shape and not one a dashboard panel. Folding those into
-                    // `unknown_filter` made the counter unreadable — it could not
-                    // distinguish "should have matched and didn't" from "never
-                    // eligible" — and warning about them 84 times in 3h on a hot
-                    // path is how the real case gets buried.
-                    // A null guard is eligible on the same test read through the
-                    // measure's COLUMN rather than its filter text: `duration IS
-                    // NOT NULL` is a near-miss because `duration_count` exists,
-                    // while `attributes___…___name IS NOT NULL` is log-explorer
-                    // traffic no measure was ever going to answer.
-                    let guard_column_declared =
-                        column.is_some_and(|column| configured_filters.iter().any(|(measure, _)| measure.column.as_deref() == Some(column)));
-                    if !guard_column_declared
-                        && !promotable
-                            .iter()
-                            .flat_map(|expr| expr.column_refs())
-                            .any(|column| configured_filters.iter().any(|(_, filter)| filter.contains(column.name.as_str())))
-                    {
-                        tracing::debug!(
-                            event = "rollup_promotion_not_eligible",
-                            source,
-                            spec = spec.name.as_deref().unwrap_or_default(),
-                            promoted = promoted.unwrap_or_default(),
-                            null_guard = column.unwrap_or_default(),
-                            "a residual row filter constrains columns no declared measure uses"
-                        );
-                        return MissReason::FilterNotEligible;
-                    }
-                    // A genuine near-miss: the residual talks about the same
-                    // columns a declared measure filters on, yet did not match.
-                    // The two canonical strings are the whole content of this
-                    // decline and there is no way to see them from outside. This
-                    // has already cost two deploys to diagnose; print both.
-                    tracing::warn!(
-                        event = "rollup_promotion_unmatched",
-                        source,
-                        spec = spec.name.as_deref().unwrap_or_default(),
-                        promoted = promoted.unwrap_or_default(),
-                        null_guard = column.unwrap_or_default(),
-                        declared = %declared(),
-                        "a residual row filter matched no declared count measure"
-                    );
-                    MissReason::UnknownFilter
-                })?,
-        ),
+        (promoted, column) => Some(declared_measure("count", column, promoted.unwrap_or_default()).ok_or_else(|| {
+            let declared = || {
+                configured_filters
+                    .iter()
+                    .filter(|(measure, _)| measure.agg == "count" && measure.column.as_deref() == column)
+                    .map(|(measure, filter)| format!("{}={filter}", measure.name))
+                    .join(" | ")
+            };
+            // A residual constraining columns NO declared filter even
+            // mentions was never a candidate — it is log-explorer and
+            // facet traffic (`attributes___…___name IS NOT NULL`,
+            // `jsonb_path_exists`, `LIKE`), not a promotion that failed.
+            // Prod 2026-08-12: 84 declines in 3h, every one of them this
+            // shape and not one a dashboard panel. Folding those into
+            // `unknown_filter` made the counter unreadable — it could not
+            // distinguish "should have matched and didn't" from "never
+            // eligible" — and warning about them 84 times in 3h on a hot
+            // path is how the real case gets buried.
+            // A null guard is eligible on the same test read through the
+            // measure's COLUMN rather than its filter text: `duration IS
+            // NOT NULL` is a near-miss because `duration_count` exists,
+            // while `attributes___…___name IS NOT NULL` is log-explorer
+            // traffic no measure was ever going to answer.
+            let guard_column_declared = column.is_some_and(|column| configured_filters.iter().any(|(measure, _)| measure.column.as_deref() == Some(column)));
+            if !guard_column_declared
+                && !promotable
+                    .iter()
+                    .flat_map(|expr| expr.column_refs())
+                    .any(|column| configured_filters.iter().any(|(_, filter)| filter.contains(column.name.as_str())))
+            {
+                tracing::debug!(
+                    event = "rollup_promotion_not_eligible",
+                    source,
+                    spec = spec.name.as_deref().unwrap_or_default(),
+                    promoted = promoted.unwrap_or_default(),
+                    null_guard = column.unwrap_or_default(),
+                    "a residual row filter constrains columns no declared measure uses"
+                );
+                return MissReason::FilterNotEligible;
+            }
+            // A genuine near-miss: the residual talks about the same
+            // columns a declared measure filters on, yet did not match.
+            // The two canonical strings are the whole content of this
+            // decline and there is no way to see them from outside. This
+            // has already cost two deploys to diagnose; print both.
+            tracing::warn!(
+                event = "rollup_promotion_unmatched",
+                source,
+                spec = spec.name.as_deref().unwrap_or_default(),
+                promoted = promoted.unwrap_or_default(),
+                null_guard = column.unwrap_or_default(),
+                declared = %declared(),
+                "a residual row filter matched no declared count measure"
+            );
+            MissReason::UnknownFilter
+        })?),
     };
 
     if too_narrow {
@@ -2638,19 +2612,17 @@ async fn route_with_spec(
             if null_guard.is_some() && column.as_deref() != null_guard {
                 return Err(MissReason::FilterNullGuardMismatch);
             }
-            let measure = |aggregate: &str, column: Option<&str>| {
-                configured_filters
-                    .iter()
-                    .find(|(measure, measure_filter)| measure.agg == aggregate && measure.column.as_deref() == column && *measure_filter == filter)
-                    .map(|(measure, _)| *measure)
-            };
+            let measure = |aggregate: &str, column: Option<&str>| declared_measure(aggregate, column, &filter);
+            // The single-state merges all resolve the same way: one declared
+            // measure over this aggregate's own column.
+            let one = |aggregate: &str| measure(aggregate, column.as_deref()).map(|measure| vec![measure]);
             let (merge, resolved) = match name.as_str() {
-                "count" => (Merge::Count, measure("count", column.as_deref()).map(|m| vec![m])),
-                "sum" => (Merge::Sum, measure("sum", column.as_deref()).map(|m| vec![m])),
-                "min" => (Merge::Min, measure("min", column.as_deref()).map(|m| vec![m])),
-                "max" => (Merge::Max, measure("max", column.as_deref()).map(|m| vec![m])),
+                "count" => (Merge::Count, one("count")),
+                "sum" => (Merge::Sum, one("sum")),
+                "min" => (Merge::Min, one("min")),
+                "max" => (Merge::Max, one("max")),
                 "avg" => (Merge::Avg, measure("sum", column.as_deref()).zip(measure("count", column.as_deref())).map(|(sum, count)| vec![sum, count])),
-                "percentile_agg" => (Merge::TDigest, measure("tdigest", column.as_deref()).map(|m| vec![m])),
+                "percentile_agg" => (Merge::TDigest, one("tdigest")),
                 // `hll_agg`, a.k.a. Toolkit's `approx_count_distinct`. It behaves
                 // exactly like `percentile_agg` above: the aggregate yields the STATE
                 // and the scalar that reads a number out of it (`distinct_count`)
@@ -2659,7 +2631,7 @@ async fn route_with_spec(
                 // `COUNT(DISTINCT x)` stays non-decomposable and is still declined;
                 // approximating it without being asked is what the measure list
                 // refuses to do.
-                "hll_agg" => (Merge::Hll, measure("hll", column.as_deref()).map(|m| vec![m])),
+                "hll_agg" => (Merge::Hll, one("hll")),
                 // Resolves to a PAIR, exactly as `avg` resolves to sum/count: the
                 // stored value plus the companion `min(timestamp)` that says which
                 // row it came from. `RollupSpec::validate` guarantees a `first`
