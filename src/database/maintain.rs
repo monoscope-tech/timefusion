@@ -4134,6 +4134,12 @@ impl Database {
             };
             let report = {
                 let mut journal = self.journal();
+                // Same pass, same tombstone mechanism: shed finished work whose
+                // slice the scheduler has already abandoned. A prod census on
+                // 2026-09-12 found 15,202 of 79,682 tasks (19.1%) in that state,
+                // and every commit serializes the set while `compact` rewrites
+                // all 51 MB of it under the global mutex.
+                journal.prune_retired_history(crate::support::now_micros());
                 let report = journal.coarsen_sealed_slices_capped(crate::support::now_micros(), &|project, _source, date| {
                     ceilings.get(&(project.to_string(), date.to_string())).or_else(|| ceilings.get(&("default".to_string(), date.to_string()))).copied()
                 });
