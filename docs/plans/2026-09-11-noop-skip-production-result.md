@@ -121,3 +121,16 @@ cannot fire after a restart at all, which is the whole point.
   kept climbing. That is PR #262.
 - The journal lock is the next throughput ceiling. That is PR #263 and
   `2026-09-11-the-journal-lock-is-the-next-ceiling.md`.
+
+## Addendum, 2026-09-12
+
+The journal landscape this document ends on has moved. PR #263 merged, and
+`journal_stats_publishes_total` reads **2,102 over a 2,640 s process (0.80/s)**
+against the ~1/s design target — the throttle works. Group commit shipped
+(`1b391890`, `16e925af`), which moved the journal `fsync` out from under the
+global mutex.
+
+The no-op skip itself is unchanged and still limited exactly as described above:
+`rollup_noop_rebuild_skipped_total` read **38** at 44 minutes of uptime, because
+boot-recovered coverage still carries `content_fp: None`. The follow-up in "The
+limitation the data exposed" is still the highest-value one for this lane.
