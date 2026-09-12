@@ -1443,6 +1443,28 @@ fn buffered_source_retry_delay(slice: crate::maintenance_coordinator::TimeSlice,
     u64::try_from(earliest.saturating_sub(now_micros)).map_or(FLOOR, |micros| std::time::Duration::from_micros(micros).max(FLOOR))
 }
 
+/// Absolute wall-clock ceiling for a unit, for the lanes that hold a permit the
+/// rest of the fleet is waiting on.
+///
+/// `None` means the idle window alone governs, which is right wherever a unit
+/// costs only its worker. The rewrite lanes are different: `light_rewrite_sem`
+/// prices ~3 permits and `run_coordinator_compaction_selected` takes one BEFORE
+/// it claims, so one unit that never converges removes a third of the lane's
+/// capacity for as long as it runs — and the idle window places no bound on that.
+///
+/// Four times the idle deadline. Generous enough that a slow-but-converging unit
+/// finishes, short enough that a day-wide whale is bisected into children that
+/// fit rather than holding the lane for hours. `Repair` is included: it does not
+/// take the permit up front, but `stage_hot_bin` AWAITS one, which is the same
+/// hold by a different route.
+fn coordinator_operation_lifetime_cap(operation: crate::maintenance_coordinator::Operation) -> Option<std::time::Duration> {
+    use crate::maintenance_coordinator::Operation;
+    match operation {
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => Some(coordinator_operation_timeout(operation) * 4),
+        Operation::BaseRollup | Operation::DerivedRollup | Operation::Dedup => None,
+    }
+}
+
 fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Operation) -> std::time::Duration {
     use crate::maintenance_coordinator::Operation;
     match operation {

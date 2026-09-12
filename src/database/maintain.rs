@@ -217,7 +217,7 @@ mod liveness_clock_tests {
             }
             "committed"
         };
-        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, work).await;
+        let result = super::run_until_idle_capped(std::time::Duration::from_secs(30), None, progress, work).await;
         assert_eq!(result.ok(), Some("committed"), "100s of steady progress must survive a 30s idle window");
     }
 
@@ -235,7 +235,7 @@ mod liveness_clock_tests {
             }
             "committed"
         };
-        assert_eq!(super::run_until_idle(std::time::Duration::from_secs(30), Arc::clone(&progress), work).await.ok(), Some("committed"));
+        assert_eq!(super::run_until_idle_capped(std::time::Duration::from_secs(30), None, Arc::clone(&progress), work).await.ok(), Some("committed"));
         assert_eq!(progress.load(Relaxed), 5_000, "the task-local reached the counter the clock reads");
     }
 
@@ -252,7 +252,7 @@ mod liveness_clock_tests {
             }
             Ok::<_, anyhow::Error>("committed")
         };
-        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, work).await??;
+        let result = super::run_until_idle_capped(std::time::Duration::from_secs(30), None, progress, work).await??;
         assert_eq!(result, "committed", "completed short queries must prevent a false idle timeout");
         Ok(())
     }
@@ -383,7 +383,7 @@ mod liveness_clock_tests {
     async fn work_that_writes_nothing_is_given_up_on() {
         let progress = Arc::new(AtomicU64::new(0));
         let stalled = async { std::future::pending::<&str>().await };
-        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, stalled).await;
+        let result = super::run_until_idle_capped(std::time::Duration::from_secs(30), None, progress, stalled).await;
         assert!(result.is_err(), "an idle unit must not hold its worker forever");
     }
 
@@ -779,10 +779,33 @@ fn plan_output_rows(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> u64 
 /// `docs/plans/2026-08-31-how-other-systems-schedule-maintenance.md`). The
 /// counter is per-unit, never shared, so one worker's progress cannot excuse
 /// another's stall.
-async fn run_until_idle<T>(
-    idle: std::time::Duration, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>,
+/// Run `work` until it stops making progress for `idle`, or until `cap` of total
+/// wall clock has elapsed.
+///
+/// The idle window alone is the right shape for a unit that owns only a worker — a
+/// slow unit making progress should not be killed for being slow. It is the
+/// WRONG shape for a unit holding a scarce permit, because it places no upper
+/// bound on the hold at all.
+///
+/// Prod 2026-09-12 measured the consequence. A single day-wide
+/// `SealedConsolidation` over the shared project ran **7,634 s — 8.5x its 900 s
+/// deadline** — and returned `outcome=Some(Running)` having completed nothing,
+/// while `maintenance_coordinator_unit_timed_out` fired ZERO times. It holds one
+/// of only ~3 `light_rewrite_sem` permits for that entire time, and because that
+/// permit is taken BEFORE the claim, every other hygiene attempt is refused
+/// outright: `compaction_permits_unavailable` reached 1,812 in 55 minutes while
+/// HotPacking and SealedConsolidation together recorded **0 worker-seconds** and
+/// 2 claims in an hour, against 196 planned cells and 1.1 TB of sealed debt.
+///
+/// Killing such a unit is not lost work: the `TaskLease` requeues it on drop and
+/// `abandon_running` bisects it, which is exactly what a whale day-wide unit
+/// needs — smaller children that fit. The ceiling is generous on purpose, so it
+/// fires on units that are not converging rather than on merely slow ones.
+async fn run_until_idle_capped<T>(
+    idle: std::time::Duration, cap: Option<std::time::Duration>, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>,
 ) -> Result<T, tokio::time::error::Elapsed> {
     use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
     // BOXED, not `pin!`ed on the stack. `work` is the coordinator's whole
     // dispatch future and this frame sits inside an already-deep async stack:
     // holding it inline overflowed the worker stack in a debug build
@@ -793,7 +816,9 @@ async fn run_until_idle<T>(
         match tokio::time::timeout(idle, &mut work).await {
             Ok(value) => return Ok(value),
             Err(elapsed) => match progress.load(Relaxed) {
-                moved if moved != last => last = moved,
+                // Progress moved, so the unit is alive — but a permit-holding
+                // lane still owes the rest of the fleet an upper bound.
+                moved if moved != last && cap.is_none_or(|cap| started.elapsed() < cap) => last = moved,
                 _ => return Err(elapsed),
             },
         }
@@ -3937,7 +3962,10 @@ impl Database {
         // reaching `stage_hot_bin`, so gating it would invent a starvation.
         let light_permit = match operation {
             Operation::HotPacking | Operation::SealedConsolidation => match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
-                Ok(permit) => Some(permit),
+                Ok(permit) => {
+                    crate::observability::maintenance_stats().compaction_permits_acquired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(permit)
+                }
                 Err(_) => {
                     crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(false);
@@ -4277,7 +4305,7 @@ impl Database {
             // answered from the timeout count alone, because a timeout says only
             // "longer than the deadline", never how much longer.
             let started = std::time::Instant::now();
-            let completed = match run_until_idle(timeout, Arc::clone(&progress), work).await {
+            let completed = match run_until_idle_capped(timeout, coordinator_operation_lifetime_cap(operation), Arc::clone(&progress), work).await {
                 Ok(result) => {
                     let elapsed = started.elapsed();
                     // Before `result?`: a unit that errors after 800s spent that
@@ -4302,7 +4330,17 @@ impl Database {
                     // Dropping the operation future drops its TaskLease. The
                     // claimed unit is durably requeued and all resource tokens
                     // are released before another project gets a turn.
-                    warn!(?operation, timeout_seconds = timeout.as_secs(), event = "maintenance_coordinator_unit_timed_out");
+                    let capped = coordinator_operation_lifetime_cap(operation).is_some_and(|cap| started.elapsed() >= cap);
+                    if capped {
+                        crate::observability::maintenance_stats().maintenance_unit_lifetime_capped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    warn!(
+                        ?operation,
+                        timeout_seconds = timeout.as_secs(),
+                        ran_secs = started.elapsed().as_secs(),
+                        capped,
+                        event = "maintenance_coordinator_unit_timed_out"
+                    );
                     // `killed_secs` is a strict subset of `worker_secs`: the
                     // share of the fleet's capacity that produced nothing.
                     crate::observability::count_maintenance_work(label, "worker_secs", started.elapsed().as_secs());
@@ -10666,5 +10704,88 @@ mod rollup_journal_persist_tests {
         assert_eq!(counts().1 - before.1, 1, "an unchanged journal must be skipped on content, not merely deferred");
         assert_eq!(counts().0, before.0, "and must not write");
         Ok(())
+    }
+}
+
+/// The absolute lifetime cap on permit-holding maintenance units.
+#[cfg(test)]
+mod unit_lifetime_cap_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering::Relaxed},
+        },
+        time::Duration,
+    };
+
+    use super::{coordinator_operation_lifetime_cap, run_until_idle_capped};
+    use crate::maintenance_coordinator::Operation;
+
+    /// A unit that keeps reporting progress but never finishes must still be
+    /// stopped when it holds a permit the rest of the fleet is waiting on.
+    ///
+    /// `run_until_idle` is an IDLE window by design — a slow but converging unit
+    /// should not be killed for being slow. That is right when a unit costs only
+    /// its worker and wrong when it holds one of ~3 `light_rewrite_sem` permits,
+    /// because it bounds the hold at nothing at all.
+    ///
+    /// Prod 2026-09-12: one day-wide `SealedConsolidation` ran **7,634 s, 8.5x
+    /// its 900 s deadline**, returned `outcome=Some(Running)` having completed
+    /// nothing, and `maintenance_coordinator_unit_timed_out` fired ZERO times.
+    /// Meanwhile `compaction_permits_unavailable` hit 1,812 in 55 minutes,
+    /// HotPacking and SealedConsolidation recorded **0 worker-seconds** between
+    /// them, and 196 cells and 1.1 TB of sealed debt went unworked.
+    ///
+    /// Both directions, because a cap that fires on converging work is its own
+    /// outage.
+    ///
+    /// Can-fail proof, run red then restored: passing `None` for the cap — the
+    /// old `run_until_idle` behaviour — hangs the first case until the test
+    /// harness kills it, because that is precisely a unit that never stops.
+    #[tokio::test(start_paused = true)]
+    async fn a_progressing_unit_that_never_converges_is_still_stopped() {
+        let idle = Duration::from_millis(900);
+        let cap = Duration::from_millis(3_600);
+        let progress = Arc::new(AtomicU64::new(0));
+        let ticker = Arc::clone(&progress);
+        // Never returns, but reports progress inside every idle window — exactly
+        // the shape that ran for 7,634 s in production.
+        let forever = async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                ticker.fetch_add(1, Relaxed);
+            }
+        };
+        let started = tokio::time::Instant::now();
+        assert!(run_until_idle_capped(idle, Some(cap), progress, forever).await.is_err(), "a unit past its lifetime cap must be stopped");
+        assert!(started.elapsed() >= cap, "and not before the cap");
+
+        // The other direction: work that FINISHES inside the cap is untouched,
+        // including work slower than a single idle window.
+        let progress = Arc::new(AtomicU64::new(0));
+        let ticker = Arc::clone(&progress);
+        let converging = async move {
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                ticker.fetch_add(1, Relaxed);
+            }
+            7u32
+        };
+        assert_eq!(run_until_idle_capped(idle, Some(cap), progress, converging).await.ok(), Some(7), "converging work must not be killed");
+    }
+
+    /// Only the lanes that hold a permit get a cap. A rollup unit costs its
+    /// worker and nothing else, and rollup cost is set by input FILE COUNT —
+    /// bisecting it converges on nothing, which is why its deadline was
+    /// lengthened rather than shortened.
+    #[test]
+    fn only_the_permit_holding_lanes_are_capped() {
+        for operation in [Operation::HotPacking, Operation::SealedConsolidation, Operation::Repair] {
+            let cap = coordinator_operation_lifetime_cap(operation).expect("permit-holding lanes are capped");
+            assert_eq!(cap, crate::database::coordinator_operation_timeout(operation) * 4, "{operation:?}");
+        }
+        for operation in [Operation::BaseRollup, Operation::DerivedRollup, Operation::Dedup] {
+            assert!(coordinator_operation_lifetime_cap(operation).is_none(), "{operation:?} holds no permit and must keep idle-only semantics");
+        }
     }
 }
