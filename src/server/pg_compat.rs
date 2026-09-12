@@ -1203,11 +1203,6 @@ impl StatsTableProvider {
                     "admit_read_miss_bytes" => s.admit_read_miss_bytes,
                     "admit_refresh_bytes" => s.admit_refresh_bytes,
                     "write_capture_admitted" => s.write_capture_admitted,
-                    // THE decision: of what write-capture admitted, how much
-                    // left the cache having never been read.
-                    "write_capture_evicted_unread" => s.write_capture_evicted_unread,
-                    "write_capture_evicted_after_hit" => s.write_capture_evicted_after_hit,
-                    "write_capture_pending" => s.write_capture_pending,
                 ])
                 .collect()
         });

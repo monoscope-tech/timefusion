@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -305,9 +305,6 @@ pub struct FoyerRuntimeStats {
     pub admit_read_miss_bytes: u64,
     pub admit_refresh_bytes: u64,
     pub write_capture_admitted: u64,
-    pub write_capture_evicted_unread: u64,
-    pub write_capture_evicted_after_hit: u64,
-    pub write_capture_pending: u64,
     pub memory_size_bytes: usize,
     pub disk_size_bytes: usize,
     pub ttl_seconds: u64,
@@ -488,67 +485,31 @@ pub struct AdmissionStats {
     pub read_miss_bytes: AtomicU64,
     pub refresh_bytes: AtomicU64,
     pub write_capture_admitted: AtomicU64,
-    pub write_capture_evicted_unread: AtomicU64,
-    pub write_capture_evicted_after_hit: AtomicU64,
-    /// Resident write-captured keys → whether one has been read yet. Entries are
-    /// removed when foyer reports the key leaving, so this tracks the cache.
-    pending: DashMap<String, AtomicBool>,
 }
 
-/// Ceiling on `pending`, so a missed leave-notification cannot grow it without
-/// bound. The main cache holds ~2.3k entries in prod, so this is slack, not a
-/// budget; blowing through it means the eviction listener is not firing and the
-/// ratio below should be distrusted rather than silently truncated.
-const ADMIT_PENDING_MAX: usize = 200_000;
-
 impl AdmissionStats {
-    fn record(&self, source: AdmitSource, key: &str, bytes: u64) {
+    fn record(&self, source: AdmitSource, bytes: u64) {
         match source {
             AdmitSource::WriteCapture => {
                 self.write_capture_bytes.fetch_add(bytes, Ordering::Relaxed);
                 self.write_capture_admitted.fetch_add(1, Ordering::Relaxed);
-                if self.pending.len() < ADMIT_PENDING_MAX {
-                    self.pending.insert(key.to_string(), AtomicBool::new(false));
-                }
             }
             AdmitSource::ReadMiss => drop(self.read_miss_bytes.fetch_add(bytes, Ordering::Relaxed)),
             AdmitSource::Refresh => drop(self.refresh_bytes.fetch_add(bytes, Ordering::Relaxed)),
         }
     }
-
-    /// A read touched `key`. Only write-captured keys are tracked, so this is a
-    /// cheap miss for everything else.
-    fn mark_read(&self, key: &str) {
-        if let Some(seen) = self.pending.get(key) {
-            seen.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// `key` left the cache: bank whether it was ever worth admitting.
-    fn on_leave(&self, key: &str) {
-        if let Some((_, seen)) = self.pending.remove(key) {
-            let counter = if seen.load(Ordering::Relaxed) { &self.write_capture_evicted_after_hit } else { &self.write_capture_evicted_unread };
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-    }
 }
 
-struct EvictionCounter {
-    evictions: Arc<AtomicU64>,
-    admission: Arc<AdmissionStats>,
-}
+struct EvictionCounter(Arc<AtomicU64>);
 
 impl foyer::EventListener for EvictionCounter {
     type Key = String;
     type Value = CacheValue;
 
-    fn on_leave(&self, event: foyer::Event, key: &Self::Key, _: &Self::Value) {
+    fn on_leave(&self, event: foyer::Event, _: &Self::Key, _: &Self::Value) {
         if event == foyer::Event::Evict {
-            self.evictions.fetch_add(1, Ordering::Relaxed);
+            self.0.fetch_add(1, Ordering::Relaxed);
         }
-        // Every leave, not just eviction — otherwise `pending` retains keys that
-        // left by any other route and the unread/hit ratio drifts high.
-        self.admission.on_leave(key);
     }
 }
 
@@ -596,7 +557,7 @@ impl SharedFoyerCache {
             config.shards,
             config.disk_size_bytes,
             data_block_size,
-            Some(Arc::new(EvictionCounter { evictions: evictions.clone(), admission: admission.clone() })),
+            Some(Arc::new(EvictionCounter(evictions.clone()))),
         )
         .await?;
         let metadata_cache = build_hybrid_cache(
@@ -652,9 +613,6 @@ impl SharedFoyerCache {
             admit_read_miss_bytes: self.admission.read_miss_bytes.load(Ordering::Relaxed),
             admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
             write_capture_admitted: self.admission.write_capture_admitted.load(Ordering::Relaxed),
-            write_capture_evicted_unread: self.admission.write_capture_evicted_unread.load(Ordering::Relaxed),
-            write_capture_evicted_after_hit: self.admission.write_capture_evicted_after_hit.load(Ordering::Relaxed),
-            write_capture_pending: self.admission.pending.len() as u64,
         }
     }
 
@@ -1130,7 +1088,6 @@ impl FoyerObjectStoreCache {
 
         // Try cache first
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
-            self.admission.mark_read(&cache_key);
             let value = entry.value();
 
             // Special handling for _last_checkpoint: stale-while-revalidate
@@ -1184,7 +1141,6 @@ impl FoyerObjectStoreCache {
 
         // A concurrent leader may have populated the object while we waited.
         if waited_for_inflight && let Ok(Some(entry)) = self.cache.get(&cache_key).await {
-            self.admission.mark_read(&cache_key);
             let value = entry.value();
             if !value.is_expired(ttl) {
                 let result = self.serve_hit(&span, value).await;
@@ -1247,7 +1203,6 @@ impl FoyerObjectStoreCache {
 
         let full_cache_key = Self::make_cache_key(location);
         if let Ok(Some(entry)) = self.cache.get(&full_cache_key).await {
-            self.admission.mark_read(&full_cache_key);
             let value = entry.value();
             if !value.is_expired(self.config.ttl) && range.end <= value.data.len() as u64 {
                 record_range_hit(&self.stats, range.end - range.start).await;
@@ -1582,7 +1537,7 @@ impl FoyerObjectStoreCache {
         }
         let (key, bytes) = (Self::make_cache_key(location), value.data.len() as u64);
         if self.admit(&self.cache, key.clone(), value, self.config.l1_max_entry_bytes) {
-            self.admission.record(source, &key, bytes);
+            self.admission.record(source, bytes);
         }
     }
 
@@ -1639,7 +1594,7 @@ impl FoyerObjectStoreCache {
         }
         let bytes = data.len() as u64;
         if self.admit(&self.cache, key.clone(), range_value(location, data, file), self.config.l1_max_entry_bytes) {
-            self.admission.record(AdmitSource::ReadMiss, &key, bytes);
+            self.admission.record(AdmitSource::ReadMiss, bytes);
         }
     }
 
@@ -1671,7 +1626,7 @@ impl FoyerObjectStoreCache {
             let v = entry.value();
             let bytes = v.data.len() as u64;
             insert_main(&cache, key.clone(), CacheValue::new(v.data.clone(), v.meta.clone()), l1_max_entry_bytes);
-            admission.record(AdmitSource::Refresh, &key, bytes);
+            admission.record(AdmitSource::Refresh, bytes);
             refreshing.remove(&key);
         });
     }
@@ -1761,7 +1716,7 @@ impl MultipartUpload for CachingMultipartUpload {
             // more than `location.to_string()`.
             let key = FoyerObjectStoreCache::make_cache_key(&self.location);
             insert_main(&self.cache, key.clone(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
-            self.admission.record(AdmitSource::WriteCapture, &key, size);
+            self.admission.record(AdmitSource::WriteCapture, size);
             debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
         }
         Ok(result)
@@ -2532,26 +2487,21 @@ mod tests {
         Ok(())
     }
 
-    /// The unread/hit ratio is the number the whole decision rests on, so its
-    /// bookkeeping is tested directly rather than through an eviction race.
+    /// Bytes must land under the source that produced them — that split is the
+    /// whole point of this accounting, and getting it wrong once already sent an
+    /// investigation at the wrong code path.
     #[test]
-    fn admission_stats_classify_entries_by_whether_a_read_ever_came() {
+    fn admission_bytes_are_attributed_to_the_source_that_produced_them() {
         let stats = AdmissionStats::default();
-        stats.record(AdmitSource::WriteCapture, "read-me", 10);
-        stats.record(AdmitSource::WriteCapture, "never-read", 20);
-        stats.record(AdmitSource::ReadMiss, "other", 30);
-
-        stats.mark_read("read-me");
-        stats.mark_read("other"); // not tracked — must be a harmless no-op
-        stats.on_leave("read-me");
-        stats.on_leave("never-read");
-        stats.on_leave("other");
+        stats.record(AdmitSource::WriteCapture, 10);
+        stats.record(AdmitSource::WriteCapture, 20);
+        stats.record(AdmitSource::ReadMiss, 30);
+        stats.record(AdmitSource::Refresh, 40);
 
         assert_eq!(stats.write_capture_bytes.load(Ordering::Relaxed), 30);
+        assert_eq!(stats.write_capture_admitted.load(Ordering::Relaxed), 2);
         assert_eq!(stats.read_miss_bytes.load(Ordering::Relaxed), 30);
-        assert_eq!(stats.write_capture_evicted_after_hit.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.write_capture_evicted_unread.load(Ordering::Relaxed), 1, "an entry nothing read is the waste we are hunting");
-        assert_eq!(stats.pending.len(), 0, "every key that left must be released, or the map grows without bound");
+        assert_eq!(stats.refresh_bytes.load(Ordering::Relaxed), 40);
     }
 
     /// The per-upload write-capture cap must bound the tee independently of the
