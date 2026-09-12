@@ -68,12 +68,23 @@ pub fn load(data_dir: &Path) -> Vec<RollupInvalidation> {
 /// writes. Clearing after a target commit is best effort: failure only causes a
 /// redundant rebuild after restart.
 pub fn store(data_dir: &Path, entries: &[RollupInvalidation]) -> std::io::Result<()> {
+    store_encoded(data_dir, &encode(entries)?)
+}
+
+/// The exact bytes [`store_encoded`] would write. Split out so a caller can
+/// compare them against what it last persisted and skip the write entirely —
+/// see `Database::persist_rollup_journal`. Encoding is cheap next to the two
+/// `fsync`s `store_encoded` costs, which is what makes that trade worth making.
+pub fn encode(entries: &[RollupInvalidation]) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(&Snapshot { version: VERSION, entries }).map_err(std::io::Error::other)
+}
+
+pub fn store_encoded(data_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let path = path(data_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec(&Snapshot { version: VERSION, entries }).map_err(std::io::Error::other)?;
-    crate::write::wal::write_atomic_with(&path, true, |file| file.write_all(&bytes))
+    crate::write::wal::write_atomic_with(&path, true, |file| file.write_all(bytes))
 }
 
 #[cfg(test)]

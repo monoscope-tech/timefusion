@@ -842,6 +842,15 @@ type ZOrderFilesets = Arc<RwLock<HashMap<String, HashMap<chrono::NaiveDate, Hash
 /// Per-(project_id, table_name) DML serialization mutexes — see `Database::dml_lock`.
 type DmlLocks = Arc<dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
 
+/// The last durable state of the rollup journal: what was written and when.
+/// Both `None` until the first successful store, which is what makes a fresh
+/// process always write once rather than trusting an empty stamp.
+#[derive(Default, Debug)]
+struct PersistedRollupJournal {
+    digest: Option<u64>,
+    at: Option<std::time::Instant>,
+}
+
 type RollupSourceKey = (String, String, String);
 type RollupCoverageKey = (String, String, String, String);
 type RollupSliceCoverageKey = (String, String, String, i64, i64);
@@ -2912,6 +2921,10 @@ pub struct Database {
     /// Serializes dirty-map mutation with journal snapshots, else two writers
     /// can persist out of order and lose the newer invalidation on restart.
     rollup_journal_lock: Arc<std::sync::Mutex<()>>,
+    /// What was last persisted of the rollup journal, so a commit whose content
+    /// has not moved — or whose write is not yet due — can skip two `fsync`s.
+    /// See `persist_rollup_journal_bytes`.
+    rollup_journal_persisted: Arc<std::sync::Mutex<PersistedRollupJournal>>,
     /// Coalesces the durable half of that path (see [`Self::commit_journal`]).
     /// The lock above covers only the in-memory mutation; the `fsync` behind it
     /// is shared, so the ingest rate no longer sets the `fsync` rate.
@@ -3751,6 +3764,7 @@ impl Database {
             rollup_dirty,
             rollup_invalidated_at,
             rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),
+            rollup_journal_persisted: Arc::new(std::sync::Mutex::new(PersistedRollupJournal::default())),
             journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
             maintenance_admission,

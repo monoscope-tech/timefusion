@@ -1089,6 +1089,28 @@ atomic_stats! {
         /// real garbage, but no longer a livelock.
         rollup_base_refusal_reproduced as "rollup_base_refusal_reproduced_total",
         rollup_base_refusal_unreproduced as "rollup_base_refusal_unreproduced_total",
+        /// Rollup-journal writes performed, and the ones skipped because the
+        /// encoded content had not moved since the last successful store.
+        ///
+        /// `store` costs TWO `fsync`s (temp file, then the parent directory
+        /// after the rename) and runs inside every group commit beside the task
+        /// journal's own — three per commit. Prod 2026-09-12 performed 30,075
+        /// commits in 2,640 s (11.4/s), which is ~100% duty on the commit
+        /// pipeline: `block.journal_commit_wait` averaged 362 ms, max 10.7 s,
+        /// on the pre-ack path.
+        ///
+        /// Read `skipped / (skipped + persists)`: steady ingest re-invalidates
+        /// the same hours idempotently, so a healthy system skips most commits.
+        /// A ratio near zero means the journal really is changing every commit
+        /// and the remaining cost is genuine.
+        rollup_journal_persists as "rollup_journal_persists_total",
+        rollup_journal_persist_skipped as "rollup_journal_persist_skipped_total",
+        /// Writes DEFERRED because the journal had changed but was written less
+        /// than `ROLLUP_JOURNAL_MAX_STALENESS` ago. Deferred, never dropped: the
+        /// content is still different at the next commit, so the next one past
+        /// the window writes it, and shutdown forces one. This is the term that
+        /// scales with ingest — `skipped` is the idle case.
+        rollup_journal_persist_deferred as "rollup_journal_persist_deferred_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.
