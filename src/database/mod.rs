@@ -6736,11 +6736,12 @@ impl Database {
 /// DataFusion's 50MB default and every scan re-decodes the parquet footer + page
 /// index (measured ~900ms metadata_load_time per query on prod).
 fn build_query_runtime_env(
-    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>, metadata_cache_bytes: usize,
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>, metadata_cache_bytes: usize, disk: datafusion::execution::disk_manager::DiskManagerBuilder,
 ) -> datafusion::execution::runtime_env::RuntimeEnv {
     datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_metadata_cache_limit(metadata_cache_bytes)
+        .with_disk_manager_builder(disk)
         .build()
         .expect("Failed to create runtime environment")
 }
@@ -12414,8 +12415,29 @@ mod writer_properties_tests {
     fn runtime_env_applies_metadata_cache_limit() {
         let pool = std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(1024 * 1024));
         let bytes = 321 * 1024 * 1024;
-        let rt = build_query_runtime_env(pool, bytes);
+        let dir = tempfile::tempdir().expect("spill dir");
+        let rt = build_query_runtime_env(pool, bytes, crate::database::spill_disk_builder(dir.path().to_path_buf(), 7));
         assert_eq!(rt.cache_manager.get_metadata_cache_limit(), bytes);
+    }
+
+    /// A COST guard: query spill must be bounded and land on the volume we chose.
+    ///
+    /// Until 2026-09-12 this runtime was built with no DiskManager, so spill went
+    /// to `std::env::temp_dir()` — the container's overlay layer — with no cap
+    /// this config could see. Root `pidstat` found 184 open fds under `/tmp`
+    /// against 204 for the maintenance dirs that WERE configured. The assertion
+    /// is the CAP, because a runtime that spills to the wrong place still answers
+    /// every query correctly and passes any correctness test.
+    #[test]
+    fn query_runtime_spill_is_bounded_and_not_the_process_temp_dir() {
+        let pool = std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(1024 * 1024));
+        let dir = tempfile::tempdir().expect("spill dir");
+        let rt = build_query_runtime_env(pool, 1024, crate::database::spill_disk_builder(dir.path().to_path_buf(), 7));
+
+        assert_eq!(rt.disk_manager.max_temp_directory_size(), 7 * 1024 * 1024 * 1024, "query spill must honour the configured cap, not DataFusion's default");
+        // DataFusion's default cap is far larger; matching it means no builder was applied.
+        let unconfigured = datafusion::execution::disk_manager::DiskManagerBuilder::default().build().unwrap().max_temp_directory_size();
+        assert_ne!(rt.disk_manager.max_temp_directory_size(), unconfigured, "an unconfigured DiskManager spills to the process temp dir");
     }
 
     // Read-side dedup skip: fingerprint is order-insensitive but content-

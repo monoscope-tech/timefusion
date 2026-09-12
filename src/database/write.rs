@@ -41,7 +41,15 @@ impl Database {
                     crate::config::MemoryPoolKind::FairSpill => Arc::new(TrackConsumersPool::new(FairSpillPool::new(pool_size), TOP_POOL_CONSUMERS)),
                 };
                 let meta_cache_bytes = self.config.cache.timefusion_df_metadata_cache_mb * 1024 * 1024;
-                Arc::new(build_query_runtime_env(pool, meta_cache_bytes))
+                // Queries spill to the data volume like maintenance does. Without
+                // this the DiskManager defaults to `std::env::temp_dir()` — `/tmp`
+                // on the container's overlay2 layer — unbounded by our config and
+                // invisible to the spill knobs. See `timefusion_query_spill_max_gb`.
+                let spill_dir = self.config.core.timefusion_data_dir.join("query_spill");
+                let _ = std::fs::create_dir_all(&spill_dir);
+                reap_orphaned_spill_dirs(&spill_dir);
+                let disk = spill_disk_builder(spill_dir, self.config.maintenance.timefusion_query_spill_max_gb);
+                Arc::new(build_query_runtime_env(pool, meta_cache_bytes, disk))
             })
             .clone()
     }

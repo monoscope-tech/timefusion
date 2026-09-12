@@ -2184,6 +2184,21 @@ pub struct MaintenanceConfig {
     /// concurrently by construction (the clamp) — revisit if that changes.
     #[serde_inline_default(220)]
     pub timefusion_maintenance_spill_max_gb: u64,
+    /// Cap for QUERY spill, which lives under `<data_dir>/query_spill`.
+    ///
+    /// Until 2026-09-12 the query `RuntimeEnv` was built with no DiskManager at
+    /// all, so every spill went to `std::env::temp_dir()` — `/tmp` inside the
+    /// container, i.e. the overlay2 layer — bounded only by DataFusion's own
+    /// default and invisible to every knob here. Root-level `pidstat` put the
+    /// process at 367 MB/s with 184 open fds under `/tmp`, against 204 for the
+    /// maintenance spill dirs that WERE configured.
+    ///
+    /// 64 GiB: maintenance already reserves `timefusion_maintenance_spill_max_gb`
+    /// (220) on the same volume, and only one heavy maintenance spiller runs at a
+    /// time by construction. A query needing more than this should fail rather
+    /// than fill the volume the WAL also lives on.
+    #[serde_inline_default(64)]
+    pub timefusion_query_spill_max_gb: u64,
     /// Emergency kill switch for the Dedup contiguity rank term (prefer the
     /// slice that EXTENDS a completed run — see `TaskJournal::rank`). ON by
     /// default; set `=false` only to revert the ordering in prod without a
