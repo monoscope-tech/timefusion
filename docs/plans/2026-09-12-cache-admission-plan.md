@@ -566,3 +566,53 @@ load figure is the honest one — measure the busy state, not the first state.
 - Byte reduction. The split **moved** the spill; it did not shrink it. The lever
   remains `coordinator_share_bytes` vs `FairSpillPool` slices — see above, and do
   not raise it without its own measurement.
+
+## Final client latency, measured after the split
+
+Three samples ~90 s apart at 19 min uptime (variance <10%, trending down):
+
+| percentile | original (2026-09-11) | after tantivy + group-commit | **after the split** |
+| --- | --- | --- | --- |
+| p50 | 1,015 ms | 230 ms | **38 ms** |
+| p95 | 9.01 s | 3.18 s | **0.65 s** |
+| p99 | **47.9 s** | 6.88 s | **2.5 s** |
+| p999 | **184.8 s** | 13.8 s | **6.1 s** |
+
+The original report was "writes taking up to 90 seconds". p999 is now ~6 s.
+
+Caveat kept honest: 19 min is inside the ~25 min window in which a restart
+re-inflates the maintenance queue, so these should improve rather than regress —
+but re-read them at ≥2 h before quoting as settled.
+
+## Byte reduction: investigated, and deliberately NOT pursued
+
+The remaining lever was to make the coordinator spill less. It should not be
+taken, for three reasons:
+
+1. **Spilling here is the designed safe fallback.**
+   `coordinator_share_bytes` was *already* raised (quarter → three-fifths of the
+   maintenance pool) after 2026-08-31, when a smaller slice made 243 dedup units
+   fail outright with "Not enough memory to continue external sort". Each job's
+   slice is deliberately equal to its admission ceiling; a sort needs more than
+   its decoded input, so it spills instead of failing. Enlarging pools to avoid
+   spill walks back into that incident.
+2. **Nothing is failing.** `flush_failed_total`, `dedup_failed_total` and
+   `light_optimize_failed_total` are all **0**; pools sit at 17% / 0% / 4%.
+3. **The spill is no longer harmful.** After the split it lands on a dedicated
+   striped volume at **12% utilisation with sub-millisecond waits**. The damage
+   it did was never the bytes — it was competing with the WAL for the same
+   spindles. Separation fixed that; reduction was never the requirement.
+
+Genuinely reducing these bytes means doing less maintenance work — the 10x
+architecture question in
+[`2026-09-12-surviving-10x-on-the-write-path.md`](2026-09-12-surviving-10x-on-the-write-path.md),
+not a knob.
+
+## Boot path: a hazard found and closed
+
+`update-initramfs -u` reported it would **resume from
+`/dev/mapper/ephemeral-swap`** — a hibernate-resume target on the
+**non-redundant** md4, needing md4 + LVM assembly at early boot. That partly
+defeats the `nofail` protection on every other entry. Set `RESUME=none` in
+`/etc/initramfs-tools/conf.d/resume` and regenerated; the warning is gone.
+Servers do not hibernate, so nothing is lost.
