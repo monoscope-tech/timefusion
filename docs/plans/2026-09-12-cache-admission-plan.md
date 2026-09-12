@@ -109,7 +109,35 @@ binary and the blast radius is limited to the entries that cost disk bandwidth.
 Follows the existing kill-switch convention
 (`TIMEFUSION_REPAIR_RESUME_ENABLED`, `TIMEFUSION_LANDED_SKIP_ENABLED`).
 
-## STAGE 2 RESULT (2026-09-12): hypothesis REFUTED by its own instrument
+## FINAL VERDICT (2026-09-12): DO NOT FLIP — write-capture earns its keep
+
+With the accounting corrected (`7c8f0e4e`, both the multipart tee and the
+single-part PUT warm tagged as write capture), prod answers the question this
+plan was built to ask:
+
+| counter | value |
+| --- | --- |
+| `write_capture_admitted` | **137** (0 before the retag — the fix now reaches the traffic) |
+| `write_capture_evicted_after_hit` | **75** |
+| `write_capture_evicted_unread` | **30** |
+| `admit_write_capture_bytes` | 234 MB |
+
+**71% of write-captured entries are read before they are evicted.** They are not
+one-hit wonders; capture is doing exactly the job it was written for — a file we
+just uploaded is usually read again shortly after, and caching it saves an R2
+round trip. Per this plan's own decision table, that is the **"do not flip"**
+branch, and `TIMEFUSION_WRITE_CAPTURE_L2` stays `true`.
+
+The volume is also negligible: **234 MB** of write-capture admissions against
+616 MB/s of device writes. Flipping the flag would forfeit a 71%-effective cache
+to save nothing measurable.
+
+The flag and counters stay: the flag costs nothing defaulted on, and the counters
+are what turned a plausible story into a measured refusal. That is the whole
+return on the instrument-first ordering — the alternative was shipping a change
+that degraded reads to fix a problem it did not touch.
+
+## Stage 2 first reading: hypothesis refuted by its own instrument
 
 Shipped as `2e96eec7`, read on prod at ~1 h uptime.
 
