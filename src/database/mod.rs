@@ -3712,6 +3712,10 @@ impl Database {
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.derived.rewrite_permits().max(1);
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
+        // Exported, not re-derived. The value comes from a five-function
+        // arithmetic chain and has silently collapsed to 1 before (prod
+        // 2026-09-01), taking the whole hygiene lane with it.
+        crate::observability::maintenance_stats().light_rewrite_permits_total.store(light_rewrite_permits as u64, std::sync::atomic::Ordering::Relaxed);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         // In UNITS, not polls: one reader slot is `DECODE_UNITS_PER_READER`
         // units and a worst-case batch claims all of them, so the heap ceiling

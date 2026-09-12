@@ -1195,6 +1195,23 @@ atomic_stats! {
         /// permits. Nonzero is the cap doing its job; it should be small, and if
         /// it tracks the claim rate the units are being bisected too slowly.
         maintenance_unit_lifetime_capped,
+        /// `light_rewrite_sem` permits free, sampled whenever a hygiene turn asks
+        /// for one, and the TOTAL the semaphore was built with.
+        ///
+        /// `compaction_permits_unavailable` counts refusals and
+        /// `compaction_permits_acquired` counts successes, but neither can say
+        /// whether the permits are HELD or simply do not exist — and those need
+        /// opposite fixes. Prod 2026-09-12: 12 acquisitions against 6,948
+        /// refusals with zero units capped, which is consistent with both.
+        ///
+        /// `light_rewrite_permits_total` is derived at boot from
+        /// `coordinator_share / COORDINATOR_PER_SORT_BUDGET - repair_holdback`,
+        /// floored at 1 — an arithmetic chain across five functions that has
+        /// silently collapsed to 1 before (prod 2026-09-01, HotPacking stopped
+        /// being claimed at all). Exporting it means never deriving it by hand
+        /// again.
+        light_rewrite_permits_available,
+        light_rewrite_permits_total,
         /// Dashboard aggregates served from a rollup, split by how much of the
         /// window the rollup owned. The OTel counters carry the same numbers but
         /// cannot be read back in-process, and these two are the only signal that
