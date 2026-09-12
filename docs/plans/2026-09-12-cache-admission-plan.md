@@ -520,8 +520,11 @@ copy, and the cache stays warm. That removed the riskiest part of the plan.
 
 | device | before | after |
 | --- | --- | --- |
-| **md3** writes / util | ~300 MB/s @ 45-61% | **7-10 MB/s @ 2%** |
-| md4 writes / util | n/a | 84-115 MB/s @ 4-6% |
+| **md3** writes / util | ~300 MB/s @ 45-61% | **8-25 MB/s @ 1.4-4.1%** |
+| md4 writes / util | n/a | 218-231 MB/s @ **12%**, `w_await` 0.12-0.26 ms |
+
+(An earlier reading of md4 at 84-115 MB/s was taken before maintenance had ramped
+up. Under load it carries ~230 MB/s — and still at 12% util, i.e. ~88% headroom.)
 
 Client `fsync`s now have a near-idle mirror to themselves — the WAL no longer
 queues behind spill churn, which is the mechanism this whole investigation kept
@@ -532,11 +535,15 @@ running into.
 | layout | worst-drive rate | runway |
 | --- | --- | --- |
 | before (4-way mirror) | 257 MB/s | **7.6 months** |
-| md4 pair (striped) | ~50 MB/s | **3.3 years** |
-| md3 pair | ~8 MB/s | ~20 years |
+| md4 pair (230 MB/s striped ⇒ 115 each) | 115 MB/s | **1.4 years** |
+| md3 pair | ~15 MB/s | ~10.9 years |
 
-**~5x on the busiest drive**, and the pair holding the only non-reconstructible
+**2.2x on the busiest drive**, and the pair holding the only non-reconstructible
 data is now effectively idle.
+
+*A correction worth keeping:* a first reading gave ~50 MB/s/drive and "3.3
+years". That sample was taken in a quiet window before maintenance ramped. The
+load figure is the honest one — measure the busy state, not the first state.
 
 ### Steps, as executed
 
