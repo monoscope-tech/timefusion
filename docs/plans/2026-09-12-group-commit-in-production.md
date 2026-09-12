@@ -99,7 +99,19 @@ at 09:56Z and 10:01Z, which start no rollout of their own. `docker service
 inspect` reported `UpdatedAt=09:39:25Z` — merged code stranded for over an hour,
 with a green job and nothing reporting the gap. This is the second observed
 instance (the first was #251 on 09-10). **PR #258 fixes it and had been sitting
-open since 09-10; merged today.**
+open since 09-10; merged today** (`d8944835`), and merging it was also what
+finally rolled #262 — a docs merge deploys nothing, so stranded code needs a
+push to a non-ignored path to land.
+
+#262 was verified live at 10:36Z and behaves as designed: at 31 minutes it had
+refused 8 obsolete base files it could prove reproduced (no rebuild minted, no
+32-minute livelock) and 19 it could not (rebuild minted, exactly as before), with
+`retry.DerivedRollup.base_generation_unverified = 15` — one retry per unit over
+those 19 files. **`rollup_published_empty_over_full_base` stayed 0 and
+`rollup_median_contiguous_days` stayed 30**, which is the silent-short-publish
+failure mode this change risked. The `reproduced`/`unreproduced` ratio should
+improve as coverage matures; a young process has genuine holes, and prod has not
+stayed up long enough today to read the steady state.
 
 **2. Journal history grows without bound.** `tasks_complete` read 71,399 on
 09-11 and 78,907 today — nothing prunes Complete tasks. `compact()` rewrites the
