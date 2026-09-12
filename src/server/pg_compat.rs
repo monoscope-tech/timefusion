@@ -1203,7 +1203,6 @@ impl StatsTableProvider {
                     "admit_read_miss_bytes" => s.admit_read_miss_bytes,
                     "admit_refresh_bytes" => s.admit_refresh_bytes,
                     "write_capture_admitted" => s.write_capture_admitted,
-                    "write_capture_declined" => s.write_capture_declined,
                     // THE decision: of what write-capture admitted, how much
                     // left the cache having never been read.
                     "write_capture_evicted_unread" => s.write_capture_evicted_unread,

@@ -180,8 +180,6 @@ pub struct FoyerCacheConfig {
     /// Process-wide budget for in-flight write-capture buffers. 0 = unbudgeted.
     #[educe(Default = 268_435_456)] // 256MB process-wide (8 x the per-upload cap)
     pub write_capture_budget_bytes: usize,
-    /// See `crate::config::CacheConfig::timefusion_write_capture_l2`.
-    pub write_capture_to_l2: bool,
     /// Disk block size for the main data cache — foyer's eviction unit and the
     /// hard cap on the largest entry that can persist to disk. Must be >= the
     /// largest file we want cached (compaction target size).
@@ -235,7 +233,6 @@ impl FoyerCacheConfig {
             warm_inline_max_bytes: cfg.cache.warm_inline_max_bytes(),
             write_capture_max_bytes: cfg.cache.write_capture_max_bytes(),
             write_capture_budget_bytes: cfg.cache.write_capture_budget_bytes(),
-            write_capture_to_l2: cfg.cache.timefusion_write_capture_l2,
             block_size_bytes,
             l1_max_entry_bytes: cfg.cache.l1_max_entry_bytes(),
             cache_recent_days: cfg.cache.timefusion_cache_recent_days,
@@ -260,10 +257,9 @@ impl FoyerCacheConfig {
             metadata_memory_size_bytes: 10 * 1024 * 1024, // 10MB for tests
             metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB for tests
             metadata_shards: 2,
-            warm_inline_max_bytes: 0,      // bound by block size
-            write_capture_max_bytes: 0,    // bound by block size in tests
-            write_capture_budget_bytes: 0, // unbudgeted in tests
-            write_capture_to_l2: true,
+            warm_inline_max_bytes: 0,          // bound by block size
+            write_capture_max_bytes: 0,        // bound by block size in tests
+            write_capture_budget_bytes: 0,     // unbudgeted in tests
             block_size_bytes: 4 * 1024 * 1024, // 4MB — must be <= test disk size
             l1_max_entry_bytes: 1024 * 1024,   // 1MB
             cache_recent_days: 0,              // no age limit in tests (avoid date flakiness)
@@ -309,7 +305,6 @@ pub struct FoyerRuntimeStats {
     pub admit_read_miss_bytes: u64,
     pub admit_refresh_bytes: u64,
     pub write_capture_admitted: u64,
-    pub write_capture_declined: u64,
     pub write_capture_evicted_unread: u64,
     pub write_capture_evicted_after_hit: u64,
     pub write_capture_pending: u64,
@@ -493,8 +488,6 @@ pub struct AdmissionStats {
     pub read_miss_bytes: AtomicU64,
     pub refresh_bytes: AtomicU64,
     pub write_capture_admitted: AtomicU64,
-    /// Admissions declined by `timefusion_write_capture_l2 = false`.
-    pub write_capture_declined: AtomicU64,
     pub write_capture_evicted_unread: AtomicU64,
     pub write_capture_evicted_after_hit: AtomicU64,
     /// Resident write-captured keys → whether one has been read yet. Entries are
@@ -659,7 +652,6 @@ impl SharedFoyerCache {
             admit_read_miss_bytes: self.admission.read_miss_bytes.load(Ordering::Relaxed),
             admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
             write_capture_admitted: self.admission.write_capture_admitted.load(Ordering::Relaxed),
-            write_capture_declined: self.admission.write_capture_declined.load(Ordering::Relaxed),
             write_capture_evicted_unread: self.admission.write_capture_evicted_unread.load(Ordering::Relaxed),
             write_capture_evicted_after_hit: self.admission.write_capture_evicted_after_hit.load(Ordering::Relaxed),
             write_capture_pending: self.admission.pending.len() as u64,
@@ -1588,16 +1580,6 @@ impl FoyerObjectStoreCache {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        // A write-side admission above the L1 cap is bound for the disk tier,
-        // and that write is what `timefusion_write_capture_l2` governs. The
-        // single-part PUT path warms from the written payload exactly as the
-        // multipart tee does, so it has to honour the same gate — it carries
-        // the larger share of the traffic in practice.
-        let disk_bound = value.data.len() > self.config.l1_max_entry_bytes;
-        if source == AdmitSource::WriteCapture && disk_bound && !self.config.write_capture_to_l2 {
-            self.admission.write_capture_declined.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
         let (key, bytes) = (Self::make_cache_key(location), value.data.len() as u64);
         if self.admit(&self.cache, key.clone(), value, self.config.l1_max_entry_bytes) {
             self.admission.record(source, &key, bytes);
@@ -1712,8 +1694,6 @@ struct CachingMultipartUpload {
     buffer: Option<Vec<u8>>,
     max_warm_bytes: usize,
     l1_max_entry_bytes: usize,
-    /// See `timefusion_write_capture_l2`. False declines DISK admission only.
-    capture_to_l2: bool,
     admission: Arc<AdmissionStats>,
     /// Holds this upload's slice of the process-wide capture budget; dropping
     /// it (abandon, complete, abort, or panic) returns the bytes.
@@ -1780,17 +1760,9 @@ impl MultipartUpload for CachingMultipartUpload {
             // entry is found by a later GET even if `make_cache_key` ever does
             // more than `location.to_string()`.
             let key = FoyerObjectStoreCache::make_cache_key(&self.location);
-            // An entry over the L1 cap is bound for the disk tier (`insert_main`
-            // steers it `OnDisk`), and that write is what the flag governs.
-            // Under it, admission is memory-only and costs no disk bandwidth.
-            if self.capture_to_l2 || buf.len() <= self.l1_max_entry_bytes {
-                insert_main(&self.cache, key.clone(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
-                self.admission.record(AdmitSource::WriteCapture, &key, size);
-                debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
-            } else {
-                self.admission.write_capture_declined.fetch_add(1, Ordering::Relaxed);
-                debug!("Declined disk admission for multipart write: {} (size: {} bytes)", self.location, size);
-            }
+            insert_main(&self.cache, key.clone(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
+            self.admission.record(AdmitSource::WriteCapture, &key, size);
+            debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
         }
         Ok(result)
     }
@@ -1879,7 +1851,6 @@ impl ObjectStore for FoyerObjectStoreCache {
             buffer: reservation.is_some().then(Vec::new),
             max_warm_bytes: cap,
             l1_max_entry_bytes: self.config.l1_max_entry_bytes,
-            capture_to_l2: self.config.write_capture_to_l2,
             admission: self.admission.clone(),
             reservation,
         }))
@@ -2524,82 +2495,40 @@ mod tests {
         Ok(())
     }
 
-    /// A COST guard: with `write_capture_to_l2` off, an upload bound for the
-    /// DISK tier must not be admitted at all — and one small enough to live in
-    /// memory must still be.
+    /// Both write-side warm paths must be accounted as WRITE CAPTURE, never as a
+    /// read miss.
     ///
-    /// Asserting on the admission counters rather than on a later cache hit is
-    /// deliberate. A version that still writes to disk and then serves a hit
-    /// passes every correctness assertion; only the admission count
-    /// distinguishes them, and the disk write is the entire point.
+    /// This is the guard for a defect that cost real time: the single-part
+    /// `put_cached` warm was tagged `ReadMiss`, so prod showed
+    /// `write_capture_admitted = 0` beside 290 GB of "read" admissions with the
+    /// main cache reporting no inner reads at all. The mislabelling sent the
+    /// investigation at the wrong code path. Asserting the SOURCE split is what
+    /// makes the counters trustworthy enough to decide anything.
     #[tokio::test]
-    async fn write_capture_l2_flag_declines_only_disk_bound_entries() -> anyhow::Result<()> {
-        // l1_max_entry_bytes is 1MB in tests: 2MB is disk-bound, 256KB is not.
-        let big = Bytes::from(vec![b'b'; 2 * 1024 * 1024]);
-        let small = Bytes::from(vec![b's'; 256 * 1024]);
+    async fn both_write_paths_are_accounted_as_write_capture_not_read_miss() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let config = FoyerCacheConfig::test_config("wc_accounting");
+        let _dir = CacheDirGuard(config.cache_dir.clone());
+        let cache = FoyerObjectStoreCache::new(inner, config).await?;
 
-        for (to_l2, expect_admitted, expect_declined) in [(true, 2, 0), (false, 1, 1)] {
-            let inner = Arc::new(InMemory::new());
-            let config = FoyerCacheConfig::test_config_with(&format!("wc_l2_{to_l2}"), |c| {
-                c.write_capture_to_l2 = to_l2;
-            });
-            let _dir = CacheDirGuard(config.cache_dir.clone());
-            let cache = FoyerObjectStoreCache::new(inner, config).await?;
+        // Single-part PUT: carries the bulk of write-side warming in prod.
+        let body = Bytes::from(vec![b'p'; 2 * 1024 * 1024]);
+        cache.put(&Path::from("t/date=2026-09-12/put.parquet"), PutPayload::from(body.clone())).await?;
 
-            for (name, body) in [("big.parquet", &big), ("small.parquet", &small)] {
-                let mut upload = cache.put_multipart(&Path::from(format!("t/date=2026-09-12/{name}"))).await?;
-                upload.put_part(body.clone().into()).await?;
-                upload.complete().await?;
-            }
+        // Multipart: the same warm through the tee.
+        let mut upload = cache.put_multipart(&Path::from("t/date=2026-09-12/mpu.parquet")).await?;
+        upload.put_part(body.clone().into()).await?;
+        upload.complete().await?;
 
-            let admission = cache.admission();
-            assert_eq!(admission.write_capture_admitted.load(Ordering::Relaxed), expect_admitted, "write_capture_to_l2={to_l2}: wrong number of admissions");
-            assert_eq!(
-                admission.write_capture_declined.load(Ordering::Relaxed),
-                expect_declined,
-                "write_capture_to_l2={to_l2}: a declined entry is the disk write we are avoiding"
-            );
-            // Declining admission must never affect the upload itself.
-            assert_eq!(cache.get(&Path::from("t/date=2026-09-12/big.parquet")).await?.bytes().await?.len(), big.len());
-            cache.shutdown().await?;
-        }
-        Ok(())
-    }
-
-    /// The SINGLE-PART put path warms the cache from the written payload just
-    /// as the multipart tee does, and must honour the same gate.
-    ///
-    /// This is the test that would have caught the first version of the fix.
-    /// It gated `put_multipart` only, and prod then reported
-    /// `write_capture_admitted = 0` alongside 290 GB of admissions in 13
-    /// minutes — all of it from `put_cached`, mislabelled as read-miss. The
-    /// gate was real, tested, and reached none of the traffic.
-    #[tokio::test]
-    async fn write_capture_l2_flag_also_governs_the_single_part_put_path() -> anyhow::Result<()> {
-        let big = PutPayload::from(Bytes::from(vec![b'p'; 2 * 1024 * 1024])); // > 1MB L1 cap
-        for (to_l2, admitted, declined) in [(true, 1, 0), (false, 0, 1)] {
-            let inner = Arc::new(InMemory::new());
-            let config = FoyerCacheConfig::test_config_with(&format!("wc_put_{to_l2}"), |c| {
-                c.write_capture_to_l2 = to_l2;
-            });
-            let _dir = CacheDirGuard(config.cache_dir.clone());
-            let cache = FoyerObjectStoreCache::new(inner, config).await?;
-            let path = Path::from("t/date=2026-09-12/put.parquet");
-
-            cache.put(&path, big.clone()).await?;
-
-            let admission = cache.admission();
-            assert_eq!(
-                admission.write_capture_admitted.load(Ordering::Relaxed),
-                admitted,
-                "write_capture_to_l2={to_l2}: a single-part PUT warm is write capture, and is counted as such"
-            );
-            assert_eq!(admission.write_capture_declined.load(Ordering::Relaxed), declined, "write_capture_to_l2={to_l2}: wrong decline count");
-            assert_eq!(admission.read_miss_bytes.load(Ordering::Relaxed), 0, "a write must never be accounted as a read miss");
-            // The object itself is unaffected either way.
-            assert_eq!(cache.get(&path).await?.bytes().await?.len(), 2 * 1024 * 1024);
-            cache.shutdown().await?;
-        }
+        let admission = cache.admission();
+        assert_eq!(admission.write_capture_admitted.load(Ordering::Relaxed), 2, "both write paths must register as write capture");
+        assert_eq!(
+            admission.read_miss_bytes.load(Ordering::Relaxed),
+            0,
+            "a write must never be accounted as a read miss — that mislabelling hid the real traffic"
+        );
+        assert_eq!(admission.write_capture_bytes.load(Ordering::Relaxed), 2 * body.len() as u64);
+        cache.shutdown().await?;
         Ok(())
     }
 

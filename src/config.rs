@@ -1852,27 +1852,6 @@ pub struct CacheConfig {
     pub timefusion_write_capture_budget_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_disabled: bool,
-    /// Whether a teed write-capture may be admitted to the DISK tier.
-    ///
-    /// Write-capture exists so a file we just uploaded is not re-downloaded on
-    /// the next query. The cost is that every file maintenance rewrites is also
-    /// written to local disk — and read-side counters never see it, which is
-    /// why foyer twice looked innocent while the array absorbed ~500 MB/s with
-    /// `l2_used_bytes` pinned at its cap and zero read-driven admissions
-    /// (2026-09-12).
-    ///
-    /// `false` declines admission only for entries ABOVE
-    /// `timefusion_foyer_l1_max_entry_mb` — exactly the ones `insert_main`
-    /// steers to `Location::OnDisk`. Smaller entries keep their memory-only
-    /// admission, which costs no disk write. Compaction outputs are 128 MB-1.5
-    /// GB, so for them this is a clean skip.
-    ///
-    /// Default `true` = today's behaviour. Flip only once
-    /// `foyer.write_capture.evicted_unread` says the admissions are not earning
-    /// their keep; the counters ship with this flag precisely so the decision
-    /// is made on data rather than on the arithmetic that motivated it.
-    #[serde_inline_default(true)]
-    pub timefusion_write_capture_l2: bool,
     /// Scan-resistant admission: a scan reaching further back than this many
     /// hours runs with cache population BYPASSED, so a wide sweep can't
     /// flush the hot tail out of L1/disk. Reads still HIT what's already
