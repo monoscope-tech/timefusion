@@ -3961,16 +3961,28 @@ impl Database {
         // 0s, returning at `repair_bin_already_sorted`/`take(1)` without ever
         // reaching `stage_hot_bin`, so gating it would invent a starvation.
         let light_permit = match operation {
-            Operation::HotPacking | Operation::SealedConsolidation => match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
-                Ok(permit) => {
-                    crate::observability::maintenance_stats().compaction_permits_acquired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Some(permit)
+            Operation::HotPacking | Operation::SealedConsolidation => {
+                // Sampled on BOTH arms, because a refusal count cannot say
+                // whether the permits are held or simply absent. Prod
+                // 2026-09-12 read 12 acquisitions against 6,948 refusals with
+                // `maintenance_unit_lifetime_capped` at 0 — so no hygiene unit
+                // was holding them and no long unit was being capped, which
+                // leaves "held by something else" and "there are none" as the
+                // only candidates. Those need opposite fixes and nothing in the
+                // process could tell them apart.
+                let stats = crate::observability::maintenance_stats();
+                stats.light_rewrite_permits_available.store(self.light_rewrite_sem.available_permits() as u64, std::sync::atomic::Ordering::Relaxed);
+                match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
+                    Ok(permit) => {
+                        stats.compaction_permits_acquired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Some(permit)
+                    }
+                    Err(_) => {
+                        stats.compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(false);
+                    }
                 }
-                Err(_) => {
-                    crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(false);
-                }
-            },
+            }
             _ => None,
         };
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
