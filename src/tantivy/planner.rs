@@ -23,27 +23,28 @@ fn unalias(expr: &Expr) -> &Expr {
     }
 }
 
-fn string(expr: &Expr) -> Option<&str> {
-    match unalias(expr) {
-        Expr::Literal(ScalarValue::Utf8(Some(value)) | ScalarValue::Utf8View(Some(value)) | ScalarValue::LargeUtf8(Some(value)), _) => Some(value),
+fn utf8(value: &ScalarValue) -> Option<&str> {
+    match value {
+        ScalarValue::Utf8(Some(value)) | ScalarValue::Utf8View(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => Some(value),
         _ => None,
     }
+}
+
+fn string(expr: &Expr) -> Option<&str> {
+    let Expr::Literal(value, _) = unalias(expr) else { return None };
+    utf8(value)
 }
 
 fn strings(expr: &Expr) -> Option<Vec<String>> {
     use arrow::array::Array;
     let Expr::Literal(ScalarValue::List(list), _) = unalias(expr) else { return None };
-    if list.len() != 1 || list.is_null(0) {
-        return None;
-    }
+    (list.len() == 1 && !list.is_null(0)).then_some(())?;
     let values = list.value(0);
-    if values.is_empty() || values.null_count() != 0 {
-        return None;
-    }
+    (!values.is_empty() && values.null_count() == 0).then_some(())?;
     (0..values.len())
-        .map(|row| match ScalarValue::try_from_array(&values, row).ok()? {
-            ScalarValue::Utf8(Some(value)) | ScalarValue::Utf8View(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => Some(value),
-            _ => None,
+        .map(|row| {
+            let value = ScalarValue::try_from_array(&values, row).ok()?;
+            utf8(&value).map(str::to_owned)
         })
         .collect()
 }
@@ -56,37 +57,29 @@ fn jsonpath_member(path: &str) -> Option<String> {
     // Validate with the same parser as the UDF. Match only this small grammar;
     // parsing the final JSON string preserves quotes, escapes, and Unicode.
     sql_json_path::JsonPath::new(path).ok()?;
-    let mut path = path.trim();
-    if let Some(rest) = path.strip_prefix("lax") {
-        path = rest.trim_start();
-    }
-    for token in ["$", "[", "*", "]", "?", "(", "@", "=="] {
-        path = path.strip_prefix(token)?.trim_start();
-    }
+    let trimmed = path.trim();
+    let stripped = trimmed.strip_prefix("lax").map_or(trimmed, str::trim_start);
+    let path = ["$", "[", "*", "]", "?", "(", "@", "=="].into_iter().try_fold(stripped, |path, token| Some(path.strip_prefix(token)?.trim_start()))?;
     serde_json::from_str(path.strip_suffix(')')?.trim_end()).ok()
 }
 
 fn membership(expr: &Expr) -> Option<Membership> {
     match unalias(expr) {
-        Expr::ScalarFunction(function) if function.name() == "jsonb_path_exists" => {
-            let [Expr::ScalarFunction(json), path] = function.args.as_slice() else { return None };
-            if !matches!(json.name(), "to_jsonb" | "to_json") {
-                return None;
+        Expr::ScalarFunction(function) => match (function.name(), function.args.as_slice()) {
+            ("jsonb_path_exists", [Expr::ScalarFunction(json), path]) => {
+                let [Expr::Column(column)] = json.args.as_slice() else { return None };
+                matches!(json.name(), "to_jsonb" | "to_json").then_some(())?;
+                Some(Membership::Contains { column: column.name.clone(), value: jsonpath_member(string(path)?)? })
             }
-            let [Expr::Column(column)] = json.args.as_slice() else { return None };
-            Some(Membership::Contains { column: column.name.clone(), value: jsonpath_member(string(path)?)? })
-        }
-        Expr::ScalarFunction(function) if function.name() == "array_has" => {
-            let [Expr::Column(column), value] = function.args.as_slice() else { return None };
-            Some(Membership::Contains { column: column.name.clone(), value: string(value)?.into() })
-        }
-        Expr::ScalarFunction(function) if matches!(function.name(), "array_has_all" | "array_has_any") => {
-            let [Expr::Column(column), values] = function.args.as_slice() else { return None };
-            strings(values)?.into_iter().map(|value| Membership::Contains { column: column.name.clone(), value }).reduce(|left, right| {
-                let (left, right) = (Box::new(left), Box::new(right));
-                if function.name() == "array_has_all" { Membership::And(left, right) } else { Membership::Or(left, right) }
-            })
-        }
+            ("array_has", [Expr::Column(column), value]) => Some(Membership::Contains { column: column.name.clone(), value: string(value)?.into() }),
+            (name @ ("array_has_all" | "array_has_any"), [Expr::Column(column), values]) => {
+                strings(values)?.into_iter().map(|value| Membership::Contains { column: column.name.clone(), value }).reduce(|left, right| {
+                    let (left, right) = (Box::new(left), Box::new(right));
+                    if name == "array_has_all" { Membership::And(left, right) } else { Membership::Or(left, right) }
+                })
+            }
+            _ => None,
+        },
         Expr::BinaryExpr(binary) => {
             let left = Box::new(membership(&binary.left)?);
             let right = Box::new(membership(&binary.right)?);
@@ -101,35 +94,25 @@ fn membership(expr: &Expr) -> Option<Membership> {
 }
 
 pub(crate) fn match_query(plan: &LogicalPlan) -> Option<HistogramQuery<'_>> {
-    let matched = match plan {
-        LogicalPlan::Aggregate(_) => plan,
-        LogicalPlan::Projection(node) => return match_query(&node.input),
-        LogicalPlan::Sort(node) => return match_query(&node.input),
-        LogicalPlan::Limit(node) => return match_query(&node.input),
+    let original = match plan {
+        LogicalPlan::Aggregate(aggregate) => aggregate,
+        LogicalPlan::Projection(_) | LogicalPlan::Sort(_) | LogicalPlan::Limit(_) => return plan.inputs().first().copied().and_then(match_query),
         _ => return None,
     };
-    let LogicalPlan::Aggregate(original) = matched else { return None };
     let inlined = crate::rollup::inline_common_exprs(original);
     let aggregate = inlined.as_ref().unwrap_or(original);
     let [group] = aggregate.group_expr.as_slice() else { return None };
     let [count] = aggregate.aggr_expr.as_slice() else { return None };
     let Expr::AggregateFunction(count) = unalias(count) else { return None };
-    if count.func.name() != "count" || count.params.distinct || count.params.filter.is_some() || !count.params.order_by.is_empty() {
-        return None;
-    }
+    (count.func.name() == "count" && !count.params.distinct && count.params.filter.is_none() && count.params.order_by.is_empty()).then_some(())?;
     match count.params.args.as_slice() {
         [] => {}
         [Expr::Literal(value, _)] if !value.is_null() => {}
         _ => return None,
     }
     let Expr::ScalarFunction(bucket) = unalias(group) else { return None };
-    if bucket.name() != "time_bucket" {
-        return None;
-    }
     let [width, timestamp] = bucket.args.as_slice() else { return None };
-    if !column(timestamp, "timestamp") {
-        return None;
-    }
+    (bucket.name() == "time_bucket" && column(timestamp, "timestamp")).then_some(())?;
     let width = match unalias(width) {
         Expr::Literal(ScalarValue::IntervalMonthDayNano(Some(value)), _) => {
             crate::read::functions::interval_to_micros(value.months, value.days, value.nanoseconds).ok()?
@@ -140,14 +123,12 @@ pub(crate) fn match_query(plan: &LogicalPlan) -> Option<HistogramQuery<'_>> {
     while let LogicalPlan::SubqueryAlias(alias) = input {
         input = alias.input.as_ref();
     }
-    let LogicalPlan::Union(union) = input else { return match_source(matched, input, width) };
+    let LogicalPlan::Union(union) = input else { return match_source(plan, input, width) };
     // RangeParallelDedup splits wide windows below the aggregate. Only exact
     // adjacent ranges with the same source and predicate can be recombined.
     // UNION maps columns by position, so names must agree before walking them.
-    if !union.inputs.iter().all(|branch| union.schema.has_equivalent_names_and_types(branch.schema()).is_ok()) {
-        return None;
-    }
-    let mut sources = union.inputs.iter().map(|input| match_source(matched, input, width)).collect::<Option<Vec<_>>>()?;
+    union.inputs.iter().all(|branch| union.schema.has_equivalent_names_and_types(branch.schema()).is_ok()).then_some(())?;
+    let mut sources = union.inputs.iter().map(|input| match_source(plan, input, width)).collect::<Option<Vec<_>>>()?;
     sources.sort_unstable_by_key(|source| source.window.bounds().0);
     let mut sources = sources.into_iter();
     let first = sources.next()?;
@@ -186,19 +167,14 @@ fn match_source<'a>(matched: &'a LogicalPlan, input: &LogicalPlan, width: i64) -
             }
             if column(&binary.left, "timestamp") {
                 let Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), _), _) = unalias(&binary.right) else { return None };
-                match binary.op {
-                    Operator::GtEq => lo = Some(lo.map_or(*value, |old| old.max(*value))),
-                    Operator::Gt => {
-                        let value = value.checked_add(1)?;
-                        lo = Some(lo.map_or(value, |old| old.max(value)));
-                    }
-                    Operator::Lt => hi = Some(hi.map_or(*value, |old| old.min(*value))),
-                    Operator::LtEq => {
-                        let value = value.checked_add(1)?;
-                        hi = Some(hi.map_or(value, |old| old.min(value)));
-                    }
+                // lo is exclusive-shifted for `>`, hi for `<=`; both narrow toward the tighter bound.
+                let (bound, shift, tighter): (&mut Option<i64>, i64, fn(i64, i64) -> i64) = match binary.op {
+                    Operator::GtEq | Operator::Gt => (&mut lo, i64::from(binary.op == Operator::Gt), i64::max),
+                    Operator::Lt | Operator::LtEq => (&mut hi, i64::from(binary.op == Operator::LtEq), i64::min),
                     _ => return None,
-                }
+                };
+                let value = value.checked_add(shift)?;
+                *bound = Some(bound.map_or(value, |old| tighter(old, value)));
                 continue;
             }
         }

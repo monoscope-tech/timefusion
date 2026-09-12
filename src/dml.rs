@@ -26,6 +26,7 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
 use futures::{StreamExt, TryStreamExt};
+use itertools::Itertools;
 use tracing::{Instrument, debug, error, field::Empty, info, instrument, warn};
 
 use crate::{
@@ -286,11 +287,11 @@ impl QueryPlanner for DmlQueryPlanner {
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
                 let span = tracing::Span::current();
-                let operation = if matches!(dml.op, WriteOp::Update) { "UPDATE" } else { "DELETE" };
-                span.record("operation", operation);
+                let is_update = matches!(dml.op, WriteOp::Update);
+                let op_type = if is_update { DmlOperation::Update } else { DmlOperation::Delete };
+                span.record("operation", AsRef::<str>::as_ref(&op_type));
 
                 let input_exec = self.planner.create_physical_plan(&dml.input, session_state).await?;
-                let is_update = matches!(dml.op, WriteOp::Update);
                 let info = extract_dml_info(&dml.input, &dml.table_name.to_string(), is_update)?;
 
                 span.record("table.name", info.table_name.as_str());
@@ -303,14 +304,12 @@ impl QueryPlanner for DmlQueryPlanner {
                 let source = if let Some(sp) = info.source_plan { Some(materialize_source(&self.planner, session_state, sp).await?) } else { None };
 
                 let session = delta_session_from(session_state);
-                let exec = if is_update {
-                    DmlExec::update(info.table_name, info.project_id, input_exec, self.database.clone(), session)
-                        .predicate(info.predicate)
-                        .assignments(info.assignments.unwrap_or_default())
-                        .source(source)
-                } else {
-                    DmlExec::delete(info.table_name, info.project_id, input_exec, self.database.clone(), session).predicate(info.predicate)
-                };
+                // A DELETE carries neither assignments nor a source (both are gated
+                // on `extract_assignments`), so the UPDATE shape covers it exactly.
+                let exec = DmlExec::new(op_type, info.table_name, info.project_id, input_exec, self.database.clone(), session)
+                    .predicate(info.predicate)
+                    .assignments(info.assignments.unwrap_or_default())
+                    .source(source);
                 // Resolve the layer at PLAN time, not planner-construction time:
                 // sessions (and this planner) are created during boot before the
                 // buffered layer is attached to the Database.
@@ -362,11 +361,7 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 // matched span, tagged or not (unbounded write amplification;
                 // prod 2026-08-03).
                 project_id = extract_project_id_from_expr(&filter.predicate).unwrap_or(project_id);
-                let p = filter.predicate.clone();
-                predicate = Some(match predicate.take() {
-                    Some(existing) => existing.and(p),
-                    None => p,
-                });
+                predicate = Some(predicate.take().map_or_else(|| filter.predicate.clone(), |existing| existing.and(filter.predicate.clone())));
                 current_plan = filter.input.as_ref();
             }
             LogicalPlan::Join(join) if extract_assignments => {
@@ -578,6 +573,22 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
         .collect()
 }
 
+/// Rewrite every `Expr::Column` in `expr`; `None` from `rewrite` leaves the
+/// column untouched. `context` names the failure in the propagated error.
+fn map_columns(expr: Expr, context: &'static str, mut rewrite: impl FnMut(&Column) -> Option<Expr>) -> Result<Expr> {
+    expr.transform(|e| {
+        Ok(match &e {
+            Expr::Column(col) => match rewrite(col) {
+                Some(replacement) => Transformed::yes(replacement),
+                None => Transformed::no(e),
+            },
+            _ => Transformed::no(e),
+        })
+    })
+    .map(|t| t.data)
+    .map_err(exec_err(context))
+}
+
 /// Inline aliases from a nested (CSE) Projection into the existing UPDATE assignment
 /// exprs. Without this, refs like `__common_expr_1` survive into mem_buffer's physical
 /// expr evaluation against the bare table schema and fail with "Column not found".
@@ -595,17 +606,7 @@ fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assign
         return Ok(());
     }
     assignments.iter_mut().try_for_each(|(_, value_expr)| {
-        *value_expr = value_expr
-            .clone()
-            .transform(|e| match &e {
-                Expr::Column(col) => Ok(match subs.get(col.name.as_str()) {
-                    Some(replacement) => Transformed::yes((*replacement).clone()),
-                    None => Transformed::no(e),
-                }),
-                _ => Ok(Transformed::no(e)),
-            })
-            .map(|t| t.data)
-            .map_err(exec_err("Failed to inline CSE alias"))?;
+        *value_expr = map_columns(value_expr.clone(), "Failed to inline CSE alias", |col| subs.get(col.name.as_str()).map(|r| (*r).clone()))?;
         Ok(())
     })
 }
@@ -655,14 +656,6 @@ impl DmlExec {
         Self { op_type, table_name, project_id, predicate: None, assignments: vec![], source: None, input, database, buffered_layer: None, session, properties }
     }
 
-    pub fn update(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>) -> Self {
-        Self::new(DmlOperation::Update, table_name, project_id, input, database, session)
-    }
-
-    pub fn delete(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>) -> Self {
-        Self::new(DmlOperation::Delete, table_name, project_id, input, database, session)
-    }
-
     pub fn predicate(mut self, predicate: Option<Expr>) -> Self {
         self.predicate = predicate;
         self
@@ -687,7 +680,6 @@ impl DisplayAs for DmlExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "{}: table={}, project_id={}", self.name(), self.table_name, self.project_id)?;
                 if self.op_type == DmlOperation::Update && !self.assignments.is_empty() {
-                    use itertools::Itertools;
                     write!(f, ", assignments=[{}]", self.assignments.iter().map(|(col, expr)| format!("{col} = {expr}")).format(", "))?;
                 }
                 if let Some(pred) = &self.predicate {
@@ -929,10 +921,7 @@ fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_n
             //   days=0 (empty)  → shape gap, timestamp→date derivation missed it;
             //   days large      → legit wide time-window, nothing to prune.
             let bounds = crate::read::optimizers::time_range_partition_pruner::extract_date_bounds(&augmented);
-            let day_span = match (bounds.iter().map(|(_, d)| *d).min(), bounds.iter().map(|(_, d)| *d).max()) {
-                (Some(lo), Some(hi)) => hi - lo + 1,
-                _ => 0,
-            };
+            let day_span = bounds.iter().map(|(_, d)| *d).minmax().into_option().map_or(0, |(lo, hi)| hi - lo + 1);
             info!(project_id, table_name, date_bounds = bounds.len(), days = day_span, "DML delta-leg date-partition bounds");
             Some(augmented)
         }
@@ -1002,7 +991,7 @@ async fn perform_version_append(
     // that table. It also prunes, which is why the in-place Delta leg
     // re-augments its own predicate the same way.
     let tenant = Expr::Column(Column::from_name("project_id")).eq(lit(project_id));
-    let source_cols: std::collections::HashSet<String> = source.map(|s| s.schema.fields().iter().map(|f| f.name().clone()).collect()).unwrap_or_default();
+    let source_cols: HashSet<String> = source.map(|s| s.schema.fields().iter().map(|f| f.name().clone()).collect()).unwrap_or_default();
     // The predicate splits at the join: a conjunct referencing any source
     // column (the enrichment guard `NOT (hashes @> ARRAY[u.tag])`) can only be
     // evaluated on the joined row, while target-only conjuncts (tenant, time
@@ -1027,10 +1016,10 @@ async fn perform_version_append(
         if src.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS {
             builder = src.join_keys.iter().try_fold(builder, |builder, (t, s)| {
                 let arr = src.batch.column(src.schema.index_of(s)?);
-                let mut vals = (0..arr.len()).map(|i| datafusion::common::ScalarValue::try_from_array(arr, i)).collect::<Result<Vec<_>>>()?;
-                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                vals.dedup();
-                builder.filter(Expr::Column(Column::from_name(t)).in_list(vals.into_iter().map(lit).collect(), false))
+                let vals = (0..arr.len())
+                    .map(|i| datafusion::common::ScalarValue::try_from_array(arr, i))
+                    .process_results(|vals| vals.sorted_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).dedup().map(lit).collect())?;
+                builder.filter(Expr::Column(Column::from_name(t)).in_list(vals, false))
             })?;
         }
         let mem = MemTable::try_new(src.schema.clone(), vec![vec![src.batch.clone()]])?;
@@ -1375,13 +1364,7 @@ where
 /// (e.g., `table.column` becomes just `column`). All other expression types (literals,
 /// binary ops, functions, etc.) pass through unchanged, preserving types like Utf8View.
 fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
-    expr.clone()
-        .transform(|e| match &e {
-            Expr::Column(col) => Ok(Transformed::yes(Expr::Column(Column::from_name(&col.name)))),
-            _ => Ok(Transformed::no(e)),
-        })
-        .map(|t| t.data)
-        .map_err(exec_err("Failed to convert expression"))
+    map_columns(expr.clone(), "Failed to convert expression", |col| Some(Expr::Column(Column::from_name(&col.name))))
 }
 
 /// Rewrite column references in `expr` so they address `MergeBuilder`'s
@@ -1396,16 +1379,11 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
 ///   against the target (target columns are unambiguous since source columns
 ///   were already routed above).
 fn requalify_for_merge(expr: Expr, source_cols: &HashSet<String>, source_alias: &str, target_alias: &str) -> Result<Expr> {
-    expr.transform(|e| match &e {
-        Expr::Column(c) => Ok(match c.relation.as_ref() {
-            Some(r) if r.table() == source_alias || r.table() == target_alias => Transformed::no(e),
-            _ if source_cols.contains(&c.name) => Transformed::yes(Expr::Column(Column::new(Some(source_alias.to_string()), c.name.clone()))),
-            _ => Transformed::yes(Expr::Column(Column::from_name(c.name.clone()))),
-        }),
-        _ => Ok(Transformed::no(e)),
+    map_columns(expr, "Failed to requalify for merge", |c| match c.relation.as_ref() {
+        Some(r) if r.table() == source_alias || r.table() == target_alias => None,
+        _ if source_cols.contains(&c.name) => Some(Expr::Column(Column::new(Some(source_alias.to_string()), c.name.clone()))),
+        _ => Some(Expr::Column(Column::from_name(c.name.clone()))),
     })
-    .map(|t| t.data)
-    .map_err(exec_err("Failed to requalify for merge"))
 }
 
 /// Keep only the conjuncts of `predicate` that reference none of `strip_cols`,
@@ -1802,6 +1780,12 @@ fn chunk_rows(batch: &RecordBatch, max: usize) -> impl Iterator<Item = RecordBat
     (0..batch.num_rows()).step_by(max).map(move |off| batch.slice(off, max.min(batch.num_rows() - off)))
 }
 
+/// The merge sources for a round-split group: every round chunked to
+/// `MAX_MERGE_ROWS` and wrapped in the group's merge shape.
+fn merge_sources<'a>(rounds: &'a [RecordBatch], schema: &'a SchemaRef, join_keys: &'a [(String, String)]) -> impl Iterator<Item = UpdateSource> + 'a {
+    rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)).map(move |batch| UpdateSource { batch, schema: schema.clone(), join_keys: join_keys.to_vec() })
+}
+
 /// Persist a terminally-failed group's source rows as an Arrow IPC file plus a
 /// `.meta` sidecar, so the Delta leg can be re-driven instead of lost.
 ///
@@ -1821,8 +1805,7 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
     }
     // Schema drift is itself a quarantine reason (concat failure), so keep
     // only what this IPC file can actually hold and say so if any are left.
-    let writable: Vec<&RecordBatch> = batches.iter().filter(|b| b.schema() == group.schema).collect();
-    let skipped = batches.len() - writable.len();
+    let (writable, rejected): (Vec<&RecordBatch>, Vec<&RecordBatch>) = batches.iter().partition(|b| b.schema() == group.schema);
     if writable.is_empty() {
         error!(
             "dml quarantine: no batch matches the group schema for {}/{} — {} rows LOST: {reason}",
@@ -1874,11 +1857,11 @@ fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup,
     }
     error!("dml quarantine: parked {}/{} ({rows} rows) at {path:?}: {reason}", key.project_id, key.table_name);
     crate::observability::record_dml_coalesce_quarantined();
-    if skipped > 0 {
+    if !rejected.is_empty() {
         // Partially parked is partially LOST — the skipped batches have no
         // other copy. Page on it, or the recoverable-looking quarantine metric
         // would mask real loss.
-        let lost: usize = batches.iter().filter(|b| b.schema() != group.schema).map(RecordBatch::num_rows).sum();
+        let (skipped, lost) = (rejected.len(), rejected.iter().copied().map(RecordBatch::num_rows).sum::<usize>());
         crate::observability::record_dml_coalesce_dropped();
         error!("dml quarantine: {skipped} schema-mismatched batch(es) for {}/{} could NOT be parked — {lost} rows LOST", key.project_id, key.table_name);
     }
@@ -1978,14 +1961,8 @@ impl DecomposedPredicate {
     /// `widen` against bare bounds — a statement's own window, without
     /// fabricating a whole predicate to carry it.
     fn widen_bounds(&mut self, lower: &Option<TimeBound>, upper: &Option<TimeBound>) {
-        self.lower = match (self.lower.take(), lower) {
-            (Some(a), Some(b)) => Some(widen_bound(a, b, true)),
-            _ => None,
-        };
-        self.upper = match (self.upper.take(), upper) {
-            (Some(a), Some(b)) => Some(widen_bound(a, b, false)),
-            _ => None,
-        };
+        self.lower = self.lower.take().zip(lower.as_ref()).map(|(a, b)| widen_bound(a, b, true));
+        self.upper = self.upper.take().zip(upper.as_ref()).map(|(a, b)| widen_bound(a, b, false));
     }
 }
 
@@ -2033,10 +2010,10 @@ fn bounds_span(b: &StmtBounds) -> Option<(i64, i64)> {
 /// window to the union of only its own statements' bounds. Single-bucket
 /// groups pass through untouched — exactly today's one-merge-unit behavior.
 fn bucket_group(mut group: PendingGroup) -> Vec<PendingGroup> {
-    let buckets: BTreeMap<Option<(i64, i64)>, Vec<BoundBatch>> = std::mem::take(&mut group.batches).into_iter().fold(BTreeMap::new(), |mut m, bb| {
-        m.entry(bounds_span(&bb.1)).or_default().push(bb);
-        m
-    });
+    // BTreeMap, not `into_group_map`'s HashMap: bucket order decides merge and
+    // commit order, which must not vary run to run.
+    let buckets: BTreeMap<Option<(i64, i64)>, Vec<BoundBatch>> =
+        std::mem::take(&mut group.batches).into_iter().map(|bb| (bounds_span(&bb.1), bb)).into_group_map().into_iter().collect();
     if buckets.len() <= 1 {
         group.batches = buckets.into_values().next().unwrap_or_default();
         return vec![group];
@@ -2065,13 +2042,14 @@ fn classify_time_conjunct(e: &Expr, time_col: &str) -> Option<(TimeBound, bool)>
         (Expr::Literal(v, _), Expr::Column(c)) if c.name == time_col => (v.clone(), op.swap()?),
         _ => return None,
     };
-    match op {
-        Operator::Gt => Some((TimeBound { value, inclusive: false }, true)),
-        Operator::GtEq => Some((TimeBound { value, inclusive: true }, true)),
-        Operator::Lt => Some((TimeBound { value, inclusive: false }, false)),
-        Operator::LtEq => Some((TimeBound { value, inclusive: true }, false)),
-        _ => None,
-    }
+    let (inclusive, is_lower) = match op {
+        Operator::Gt => (false, true),
+        Operator::GtEq => (true, true),
+        Operator::Lt => (false, false),
+        Operator::LtEq => (true, false),
+        _ => return None,
+    };
+    Some((TimeBound { value, inclusive }, is_lower))
 }
 
 /// Express `watermark_micros` in the same scalar type as `template` so bounds
@@ -2261,14 +2239,15 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
             skipped += 1;
             continue;
         };
-        let batches: Result<Vec<RecordBatch>> = std::fs::File::open(&path)
+        let arrow_err = |e| DataFusionError::ArrowError(Box::new(e), None);
+        let merged = match std::fs::File::open(&path)
             .map_err(|e| DataFusionError::External(Box::new(e)))
-            .and_then(|f| datafusion::arrow::ipc::reader::FileReader::try_new(f, None).map_err(|e| DataFusionError::ArrowError(Box::new(e), None)))
-            .and_then(|r| r.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| DataFusionError::ArrowError(Box::new(e), None)));
-        let merged = match batches.and_then(|b| {
-            let schema = b.first().map(RecordBatch::schema).ok_or_else(|| DataFusionError::Execution("empty IPC file".into()))?;
-            concat_batches(&schema, &b).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-        }) {
+            .and_then(|f| datafusion::arrow::ipc::reader::FileReader::try_new(f, None).map_err(arrow_err))
+            .and_then(|r| r.collect::<std::result::Result<Vec<_>, _>>().map_err(arrow_err))
+            .and_then(|b| {
+                let schema = b.first().map(RecordBatch::schema).ok_or_else(|| DataFusionError::Execution("empty IPC file".into()))?;
+                concat_batches(&schema, &b).map_err(arrow_err)
+            }) {
             Ok(m) => m,
             Err(e) => {
                 warn!("dml redrive: cannot read {path:?}: {e}; leaving parked");
@@ -2349,14 +2328,14 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
         let _histogram_guards: Vec<_> =
             meta.projects.iter().map(|project| db.histogram_dml_guard(project, &meta.table_name, crate::database::HistogramDmlScope::All)).collect();
         // Sequential awaits with `?`: the first failed slice leaves the group parked.
+        let merged_schema = merged.schema();
         let outcome = async {
             for (si, &(lo, hi, hi_incl)) in slice_bounds.iter().enumerate() {
                 let predicate = base_conj(lo, hi, hi_incl);
                 if slice_bounds.len() > 1 {
                     info!("dml redrive: {path:?} slice {}/{} [{lo}..{hi}]", si + 1, slice_bounds.len());
                 }
-                for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
-                    let source = UpdateSource { batch: round, schema: merged.schema(), join_keys: meta.join_keys.clone() };
+                for source in merge_sources(&rounds, &merged_schema, &meta.join_keys) {
                     let assignments = vec![("hashes".into(), assignment.clone())];
                     merge_bisect(db, &meta.table_name, &meta.project_id, predicate.clone(), assignments, source, session.clone()).await.inspect_err(|e| {
                         error!(
@@ -2422,14 +2401,14 @@ pub(crate) fn parse_quarantine_meta(meta: &str) -> Option<QuarantineMeta> {
     let projects: Vec<String> =
         field("folded_projects").filter(|fp| !fp.is_empty()).map_or_else(|| vec![project_id.clone()], |fp| fp.split(',').map(str::to_string).collect());
     // Date32("YYYY-MM-DD") bounds → day numbers since epoch.
-    let dates: Vec<i32> = predicate
+    let (lo, hi) = predicate
         .match_indices("Date32(\"")
         .filter_map(|(i, m)| {
             let s = &predicate[i + m.len()..];
             s.split('"').next()?.parse::<chrono::NaiveDate>().ok().map(|d| (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32)
         })
-        .collect();
-    let (lo, hi) = (dates.iter().min()?, dates.iter().max()?);
+        .minmax()
+        .into_option()?;
     // `timestamp >= TimestampMicrosecond(N` / `timestamp <[=] TimestampMicrosecond(N`.
     let ts_after = |pat: &str| {
         predicate.find(pat).and_then(|i| {
@@ -2449,7 +2428,7 @@ pub(crate) fn parse_quarantine_meta(meta: &str) -> Option<QuarantineMeta> {
         project_id,
         projects,
         join_keys,
-        date_bounds: (*lo, *hi),
+        date_bounds: (lo, hi),
         ts_lower,
         ts_upper: (ts_upper, upper_incl),
         rows: field("rows").and_then(|r| r.parse().ok()).unwrap_or(0),
@@ -2508,9 +2487,7 @@ fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Exp
     for (c, e) in assignments {
         (c, e.to_string()).hash(&mut h);
     }
-    let mut res: Vec<String> = residual.iter().map(ToString::to_string).collect();
-    res.sort_unstable();
-    res.hash(&mut h);
+    residual.iter().map(ToString::to_string).sorted_unstable().collect_vec().hash(&mut h);
     for f in schema.fields() {
         (f.name(), format!("{:?}", f.data_type())).hash(&mut h);
     }
@@ -2563,15 +2540,12 @@ fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &HashSet<(
             (key, group, stripped)
         })
         .partition(is_eligible);
-    let buckets: HashMap<(String, u64), Vec<Member>> = candidates.into_iter().fold(HashMap::new(), |mut m, (key, group, stripped)| {
-        let fp = shape_fingerprint(&group.join_keys, &group.assignments, &stripped, &group.schema);
-        m.entry((key.table_name.clone(), fp)).or_default().push((key, group, stripped));
-        m
+    let buckets = candidates.into_iter().into_group_map_by(|(key, group, stripped): &Member| {
+        (key.table_name.clone(), shape_fingerprint(&group.join_keys, &group.assignments, stripped, &group.schema))
     });
     let unfolded = |members: Vec<Member>| members.into_iter().map(|(k, g, _)| (k, g)).collect::<Vec<_>>();
-    ineligible
+    unfolded(ineligible)
         .into_iter()
-        .map(|(k, g, _)| (k, g))
         .chain(buckets.into_iter().flat_map(|((table_name, shape_fp), mut members)| {
             if members.len() == 1 {
                 return unfolded(members);
@@ -2727,29 +2701,24 @@ impl DmlCoalescer {
         let histogram_guard = database.histogram_dml_guard(project_id, table_name, histogram_dml_scope(predicate, assignments, Some(source.schema.as_ref())));
         {
             let mut groups = self.groups.lock().expect("dml coalescer mutex poisoned");
-            match groups.entry(key) {
-                Entry::Occupied(mut g) => {
-                    let g = g.get_mut();
-                    g.predicate.widen(&decomposed);
-                    g.histogram_guards.push(histogram_guard);
-                    g.batches.push((source.batch.clone(), bounds));
-                    g.session = session;
-                }
-                Entry::Vacant(v) => {
-                    v.insert(PendingGroup {
-                        histogram_guards: vec![histogram_guard],
-                        join_keys: source.join_keys.clone(),
-                        assignments: assignments.to_vec(),
-                        predicate: decomposed,
-                        time_col,
-                        schema: source.schema.clone(),
-                        batches: vec![(source.batch.clone(), bounds)],
-                        session,
-                        attempts: 0,
-                        folded_projects: None,
-                    });
-                }
-            }
+            // Widening a fresh group against its own bounds is the identity, so
+            // both the new and the merging case are the same four updates.
+            let g = groups.entry(key).or_insert_with(|| PendingGroup {
+                histogram_guards: Vec::new(),
+                join_keys: source.join_keys.clone(),
+                assignments: assignments.to_vec(),
+                predicate: decomposed.clone(),
+                time_col,
+                schema: source.schema.clone(),
+                batches: Vec::new(),
+                session: session.clone(),
+                attempts: 0,
+                folded_projects: None,
+            });
+            g.predicate.widen(&decomposed);
+            g.histogram_guards.push(histogram_guard);
+            g.batches.push((source.batch.clone(), bounds));
+            g.session = session;
         }
         crate::observability::record_dml_coalesce_enqueued();
         if self.queued_rows.fetch_add(rows, Ordering::Relaxed) + rows > MAX_QUEUED_SOURCE_ROWS {
@@ -2818,8 +2787,7 @@ impl DmlCoalescer {
             // Chunk each round to bound per-MERGE memory (see MAX_MERGE_ROWS).
             // Sequential awaits with `?`: the first failure abandons the group.
             let outcome = async {
-                for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
-                    let source = UpdateSource { batch: round, schema: group.schema.clone(), join_keys: group.join_keys.clone() };
+                for source in merge_sources(&rounds, &group.schema, &group.join_keys) {
                     let rows =
                         merge_bisect(db, &key.table_name, &key.project_id, predicate.clone(), group.assignments.clone(), source, group.session.clone()).await?;
                     crate::observability::record_dml_coalesce_merge();

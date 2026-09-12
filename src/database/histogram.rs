@@ -290,6 +290,26 @@ impl Default for HistogramProofBuilds {
     }
 }
 
+/// Whether one index spans exactly `[lo, hi)` and indexes every membership column.
+fn entry_covers_day(entry: &crate::tantivy::ManifestEntry, lo: i64, hi: i64, columns: &std::collections::BTreeSet<&str>) -> bool {
+    entry.min_timestamp_micros.is_some_and(|min| min >= lo)
+        && entry.max_timestamp_micros.is_some_and(|max| max < hi)
+        && columns.iter().all(|column| entry.element_fields.contains(*column))
+}
+
+fn merge_result(total: &mut HistogramSnapshotResult, part: HistogramSnapshotResult) -> Result<()> {
+    crate::tantivy::histogram::merge_counts(&mut total.counts, part.counts)?;
+    total.indexed_sources += part.indexed_sources;
+    total.scanned_sources += part.scanned_sources;
+    total.index_errors.extend(part.index_errors);
+    Ok(())
+}
+
+fn day_bounds(day: i64) -> Result<(i64, i64)> {
+    let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
+    Ok((lo, lo.checked_add(DAY_MICROS).context("histogram date overflow")?))
+}
+
 fn histogram_timestamps(batch: &RecordBatch) -> Result<&[i64]> {
     let column = batch.column_by_name("timestamp").context("histogram source is missing timestamp")?;
     ensure!(column.null_count() == 0, "histogram timestamp contains nulls");
@@ -348,11 +368,7 @@ impl CapturedHistogram {
     pub async fn count(&self) -> Result<HistogramSnapshotResult> {
         let mut total = HistogramSnapshotResult::default();
         for (&day, files) in &self.partitions {
-            let part = self.count_partition(day, files).await?;
-            crate::tantivy::histogram::merge_counts(&mut total.counts, part.counts)?;
-            total.indexed_sources += part.indexed_sources;
-            total.scanned_sources += part.scanned_sources;
-            total.index_errors.extend(part.index_errors);
+            merge_result(&mut total, self.count_partition(day, files).await?)?;
         }
         Ok(total)
     }
@@ -401,24 +417,46 @@ impl CapturedHistogram {
                     self.count_streaming_partition(day, files).await?
                 }
             };
-            crate::tantivy::histogram::merge_counts(&mut total.counts, part.counts)?;
-            total.indexed_sources += part.indexed_sources;
-            total.scanned_sources += part.scanned_sources;
-            total.index_errors.extend(part.index_errors);
+            merge_result(&mut total, part)?;
         }
         Ok(total)
     }
 
+    /// Whether any captured memory row falls in `[lo, hi)`.
+    fn memory_touches(&self, lo: i64, hi: i64) -> Result<bool> {
+        use itertools::Itertools;
+        self.memory
+            .batches
+            .iter()
+            .map(histogram_timestamps)
+            .process_results(|mut batches| batches.any(|timestamps| timestamps.iter().any(|&timestamp| timestamp >= lo && timestamp < hi)))
+    }
+
+    /// Casts a memory batch onto `schema`, filling absent nullable columns with
+    /// nulls. `strict` is the captured-row path, which also rejects nulls in a
+    /// required column and names the missing one.
+    fn memory_projection(batch: &RecordBatch, schema: &arrow::datatypes::SchemaRef, strict: bool) -> Result<RecordBatch> {
+        let column = |field: &arrow::datatypes::Field| -> Result<_> {
+            let Some(array) = batch.column_by_name(field.name()) else {
+                if strict {
+                    ensure!(field.is_nullable(), "memory is missing required column {}", field.name());
+                } else {
+                    ensure!(field.is_nullable(), "missing required memory visibility column");
+                }
+                return Ok(arrow::array::new_null_array(field.data_type(), batch.num_rows()));
+            };
+            let array = arrow::compute::cast(array, field.data_type())?;
+            ensure!(!strict || field.is_nullable() || array.null_count() == 0, "memory required column contains nulls");
+            Ok(array)
+        };
+        let arrays = schema.fields().iter().map(|field| column(field)).collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+    }
+
     fn visibility_cache_key(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<VisibilityCacheKey>> {
-        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
-        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
-        if self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) {
+        let (lo, hi) = day_bounds(day)?;
+        if self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) || self.memory_touches(lo, hi)? {
             return Ok(None);
-        }
-        for batch in &self.memory.batches {
-            if histogram_timestamps(batch)?.iter().any(|&timestamp| timestamp >= lo && timestamp < hi) {
-                return Ok(None);
-            }
         }
         let (start, end) = self.window.bounds();
         Ok(Some(VisibilityCacheKey {
@@ -442,6 +480,13 @@ impl CapturedHistogram {
         let file = Arc::new(crate::tantivy::visibility::PreparedFileRows::open(self.log_store.clone(), file).await?);
         let owner = Arc::new(self.cache.reserve(file.retained_bytes()?, self.context.memory_pool())?);
         Ok((file, owner))
+    }
+
+    async fn count_indexed_file(
+        &self, entry: &crate::tantivy::HistogramEntry<'_>, source_file: &str, visible: arrow::buffer::BooleanBuffer,
+    ) -> Result<std::collections::BTreeMap<i64, u64>> {
+        let file = HistogramFile { table_root: &self.root, manifest_key: entry.key, entry: entry.entry, source_file, visible };
+        self.search.histogram_file(&self.table, &self.project, self.window, self.membership.as_ref(), file).await
     }
 
     async fn count_streaming_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<HistogramSnapshotResult> {
@@ -489,23 +534,7 @@ impl CapturedHistogram {
         let mut result = HistogramSnapshotResult::default();
         for (index, file) in files.iter().enumerate() {
             let indexed = match &entries[index] {
-                Some(entry) => {
-                    self.search
-                        .histogram_file(
-                            &self.table,
-                            &self.project,
-                            self.window,
-                            self.membership.as_ref(),
-                            HistogramFile {
-                                table_root: &self.root,
-                                manifest_key: entry.key,
-                                entry: entry.entry,
-                                source_file: &file.path,
-                                visible: delta.masks[index].clone(),
-                            },
-                        )
-                        .await
-                }
+                Some(entry) => self.count_indexed_file(entry, &file.path, delta.masks[index].clone()).await,
                 None => Err(anyhow::anyhow!("snapshot file has no histogram index")),
             };
             let counts = match indexed {
@@ -555,8 +584,7 @@ impl CapturedHistogram {
         use crate::tantivy::visibility::{FileVisibilitySource, VisibilityFiles, lineage_batch, lineage_schema, stream_winner_masks};
         use datafusion::physical_plan::{streaming::StreamingTableExec, union::UnionExec};
 
-        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
-        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
+        let (lo, hi) = day_bounds(day)?;
         let columns =
             self.keys.iter().map(String::as_str).chain(self.tiebreak.as_deref()).chain(self.tombstone.as_deref()).collect::<std::collections::BTreeSet<_>>();
         let projection = columns.into_iter().map(|name| self.projected.index_of(name)).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -581,20 +609,7 @@ impl CapturedHistogram {
         let mut memory = Vec::new();
         let mut offset = 0_usize;
         for batch in &self.memory.batches {
-            let arrays = narrow
-                .fields()
-                .iter()
-                .map(|field| -> Result<_> {
-                    match batch.column_by_name(field.name()) {
-                        Some(array) => Ok(arrow::compute::cast(array, field.data_type())?),
-                        None => {
-                            ensure!(field.is_nullable(), "missing required memory visibility column");
-                            Ok(arrow::array::new_null_array(field.data_type(), batch.num_rows()))
-                        }
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let batch = RecordBatch::try_new(narrow.clone(), arrays)?;
+            let batch = Self::memory_projection(batch, &narrow, false)?;
             let live = arrow::buffer::BooleanBuffer::from_iter(histogram_timestamps(&batch)?.iter().map(|&t| t >= lo && t < hi));
             memory.push(lineage_batch(&batch, &live, schema.clone(), u32::try_from(prepared.len())?, offset)?);
             offset = offset.checked_add(batch.num_rows()).context("memory visibility row overflow")?;
@@ -635,21 +650,15 @@ impl CapturedHistogram {
 
     async fn count_empty_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
         let Some(membership) = &self.membership else { return Ok(None) };
-        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
-        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
-        for batch in &self.memory.batches {
-            if histogram_timestamps(batch)?.iter().any(|&timestamp| timestamp >= lo && timestamp < hi) {
-                return Ok(None);
-            }
+        let (lo, hi) = day_bounds(day)?;
+        if self.memory_touches(lo, hi)? {
+            return Ok(None);
         }
         let entries = self.manifest.histogram_entries(&self.root, files)?;
         let columns = membership.columns();
         for (file, entry) in files.iter().zip(entries) {
             let Some(entry) = entry else { return Ok(None) };
-            if entry.entry.min_timestamp_micros.is_none_or(|min| min < lo)
-                || entry.entry.max_timestamp_micros.is_none_or(|max| max >= hi)
-                || columns.iter().any(|column| !entry.entry.element_fields.contains(*column))
-            {
+            if !entry_covers_day(entry.entry, lo, hi, &columns) {
                 return Ok(None);
             }
             let indexed_rows = entry.entry.rows;
@@ -677,24 +686,16 @@ impl CapturedHistogram {
     /// versions or tombstones: either would make the logical count smaller.
     async fn count_unique_partition(&self, day: i64, files: &[SnapshotFile]) -> Result<Option<HistogramSnapshotResult>> {
         let Some(&logical_count) = self.logical_counts.get(&day) else { return Ok(None) };
-        let lo = day.checked_mul(DAY_MICROS).context("histogram date overflow")?;
-        let hi = lo.checked_add(DAY_MICROS).context("histogram date overflow")?;
-        if self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) {
+        let (lo, hi) = day_bounds(day)?;
+        if self.memory.covered_ranges.iter().any(|&(start, end)| start < hi && end > lo) || self.memory_touches(lo, hi)? {
             return Ok(None);
         }
-        for batch in &self.memory.batches {
-            if histogram_timestamps(batch)?.iter().any(|&timestamp| timestamp >= lo && timestamp < hi) {
-                return Ok(None);
-            }
-        }
         let entries = self.manifest.histogram_entries(&self.root, files)?;
+        let columns = self.membership.as_ref().map(Membership::columns).unwrap_or_default();
         let mut physical_count = 0_u64;
         for (file, entry) in files.iter().zip(&entries) {
             let Some(entry) = entry else { return Ok(None) };
-            if self.membership.as_ref().is_some_and(|predicate| predicate.columns().iter().any(|column| !entry.entry.element_fields.contains(*column))) {
-                return Ok(None);
-            }
-            if entry.entry.min_timestamp_micros.is_none_or(|min| min < lo) || entry.entry.max_timestamp_micros.is_none_or(|max| max >= hi) {
+            if !entry_covers_day(entry.entry, lo, hi, &columns) {
                 return Ok(None);
             }
             let deleted = file.deletion_vector.as_ref().map_or(Ok(0), |dv| u64::try_from(dv.cardinality))?;
@@ -714,16 +715,7 @@ impl CapturedHistogram {
             let bytes = visible.inner().capacity();
             ensure!(bytes <= self.max_decoded_bytes, "histogram visibility allocation exceeds budget");
             let _reservation = self.cache.reserve(bytes, self.context.memory_pool())?;
-            let counts = self
-                .search
-                .histogram_file(
-                    &self.table,
-                    &self.project,
-                    self.window,
-                    self.membership.as_ref(),
-                    HistogramFile { table_root: &self.root, manifest_key: entry.key, entry: entry.entry, source_file: &file.path, visible },
-                )
-                .await?;
+            let counts = self.count_indexed_file(&entry, &file.path, visible).await?;
             crate::tantivy::histogram::merge_counts(&mut result.counts, counts)?;
             result.indexed_sources += 1;
         }
@@ -748,23 +740,7 @@ impl CapturedHistogram {
             if selected.true_count() == 0 {
                 continue;
             }
-            let arrays = self
-                .projected
-                .fields()
-                .iter()
-                .map(|field| -> Result<_> {
-                    let array = match batch.column_by_name(field.name()) {
-                        Some(array) => arrow::compute::cast(array, field.data_type())?,
-                        None => {
-                            ensure!(field.is_nullable(), "memory is missing required column {}", field.name());
-                            arrow::array::new_null_array(field.data_type(), batch.num_rows())
-                        }
-                    };
-                    ensure!(field.is_nullable() || array.null_count() == 0, "memory required column contains nulls");
-                    Ok(array)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let narrow = RecordBatch::try_new(self.projected.clone(), arrays)?;
+            let narrow = Self::memory_projection(batch, &self.projected, true)?;
             let batch = arrow::compute::filter_record_batch(&narrow, &selected)?;
             remaining = remaining.checked_sub(batch.get_array_memory_size()).context("histogram memory exceeds decoded budget")?;
             batches.push(batch);
@@ -1045,10 +1021,8 @@ impl super::Database {
             partitions.entry(day).or_default().push(file);
         }
         for batch in &memory.batches {
-            for &timestamp in histogram_timestamps(batch)? {
-                if timestamp >= lo && timestamp < hi {
-                    partitions.entry(timestamp.div_euclid(DAY_MICROS)).or_default();
-                }
+            for timestamp in histogram_timestamps(batch)?.iter().filter(|&&timestamp| timestamp >= lo && timestamp < hi) {
+                partitions.entry(timestamp.div_euclid(DAY_MICROS)).or_default();
             }
         }
         // Preserve an empty result through the same execution and diagnostics path.

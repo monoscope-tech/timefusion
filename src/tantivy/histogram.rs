@@ -16,12 +16,14 @@ use tantivy::{
 
 use super::{ROW_ORDINAL_FIELD, TS_FIELD};
 
+fn bump(target: &mut BTreeMap<i64, u64>, bucket: i64, count: u64) -> Result<()> {
+    let total = target.entry(bucket).or_default();
+    *total = total.checked_add(count).context("histogram count overflow")?;
+    Ok(())
+}
+
 pub(crate) fn merge_counts(target: &mut BTreeMap<i64, u64>, counts: BTreeMap<i64, u64>) -> Result<()> {
-    counts.into_iter().try_for_each(|(bucket, count)| {
-        let total = target.entry(bucket).or_default();
-        *total = total.checked_add(count).context("histogram count overflow")?;
-        Ok(())
-    })
+    counts.into_iter().try_for_each(|(bucket, count)| bump(target, bucket, count))
 }
 
 /// Exact list membership. Binary operators cannot accidentally express an empty
@@ -119,33 +121,33 @@ impl HistogramWindow {
         for batch in batches {
             let schema = batch.schema();
             let predicate = membership
-                .map(|predicate| -> Result<_> {
+                .map(|predicate| -> Result<BooleanArray> {
                     let expression = predicate.expression(&schema)?;
                     let physical = create_physical_expr(&expression, &DFSchema::try_from(schema.as_ref().clone())?, &ExecutionProps::new())?;
-                    Ok(physical.evaluate(batch)?.into_array(batch.num_rows())?)
+                    let array = physical.evaluate(batch)?.into_array(batch.num_rows())?;
+                    Ok(array.as_any().downcast_ref::<BooleanArray>().context("membership result is not Boolean")?.clone())
                 })
                 .transpose()?;
-            let predicate =
-                predicate.as_ref().map(|array| array.as_any().downcast_ref::<BooleanArray>().context("membership result is not Boolean")).transpose()?;
             let timestamps = batch.column_by_name("timestamp").context("histogram source is missing timestamp")?;
             ensure!(
                 matches!(timestamps.data_type(), DataType::Int64 | DataType::Timestamp(TimeUnit::Microsecond, _)),
                 "histogram timestamp must use microseconds"
             );
             let values = crate::read::bound_slice(timestamps).context("invalid histogram timestamp representation")?;
-            for (row, &timestamp) in values.iter().enumerate() {
-                if !visible.value(offset + row)
-                    || timestamps.is_null(row)
-                    || !(self.start..self.end).contains(&timestamp)
-                    || predicate.is_some_and(|predicate| predicate.is_null(row) || !predicate.value(row))
-                {
-                    continue;
-                }
-                let bucket =
-                    i128::from(self.first_bucket) + (i128::from(timestamp) - i128::from(self.first_bucket)) / i128::from(self.width) * i128::from(self.width);
-                let count = counts.entry(i64::try_from(bucket)?).or_default();
-                *count = count.checked_add(1).context("histogram count overflow")?;
-            }
+            values
+                .iter()
+                .enumerate()
+                .filter(|&(row, &timestamp)| {
+                    visible.value(offset + row)
+                        && !timestamps.is_null(row)
+                        && (self.start..self.end).contains(&timestamp)
+                        && !predicate.as_ref().is_some_and(|predicate| predicate.is_null(row) || !predicate.value(row))
+                })
+                .try_for_each(|(_, &timestamp)| {
+                    let bucket = i128::from(self.first_bucket)
+                        + (i128::from(timestamp) - i128::from(self.first_bucket)) / i128::from(self.width) * i128::from(self.width);
+                    bump(&mut counts, i64::try_from(bucket)?, 1)
+                })?;
             offset += batch.num_rows();
         }
         Ok(counts)
@@ -179,9 +181,7 @@ impl HistogramWindow {
     {
         // Fail on legacy indexes without physical ordinals, rather than silently
         // treating a missing mask column as an empty result.
-        for segment in searcher.segment_readers() {
-            segment.fast_fields().u64(ROW_ORDINAL_FIELD)?;
-        }
+        searcher.segment_readers().iter().try_for_each(|segment| segment.fast_fields().u64(ROW_ORDINAL_FIELD).map(drop))?;
         let collector = FilterCollector::new(ROW_ORDINAL_FIELD.into(), visible, HistogramCollector(*self));
         Ok(searcher.search(&self.query(predicate), &collector)?)
     }

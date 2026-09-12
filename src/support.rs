@@ -188,6 +188,7 @@ pub mod test_helpers {
 
     use arrow_json::ReaderBuilder;
     use datafusion::arrow::{
+        array::AsArray,
         compute::cast,
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
@@ -301,7 +302,6 @@ pub mod test_helpers {
     /// skipped, so a shorter-than-expected result means null cells — assert on
     /// `.len()` when that matters.
     pub fn query_col_strings(layer: &crate::write::BufferedWriteLayer, project: &str, table: &str, col: &str) -> Vec<String> {
-        use datafusion::arrow::array::AsArray;
         layer
             .query(project, table, &[])
             .unwrap()
@@ -322,25 +322,13 @@ pub mod test_helpers {
         let target_schema = crate::schema::get_schema(table).ok_or_else(|| anyhow::anyhow!("unknown table `{table}`"))?.schema_ref();
 
         // arrow-json only produces Utf8, so read into a Utf8-flavoured mirror of the target schema and cast back.
-        let json_read_schema = Arc::new(Schema::new(
-            target_schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    Field::new(
-                        f.name(),
-                        match f.data_type() {
-                            DataType::Utf8View => DataType::Utf8,
-                            DataType::List(inner) if inner.data_type() == &DataType::Utf8View => {
-                                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
-                            }
-                            other => other.clone(),
-                        },
-                        f.is_nullable(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        ));
+        let utf8_flavoured = |dt: &DataType| match dt {
+            DataType::Utf8View => DataType::Utf8,
+            DataType::List(inner) if inner.data_type() == &DataType::Utf8View => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            other => other.clone(),
+        };
+        let json_read_schema =
+            Arc::new(Schema::new(target_schema.fields().iter().map(|f| Field::new(f.name(), utf8_flavoured(f.data_type()), f.is_nullable())).collect_vec()));
 
         let json_data = records.iter().join("\n");
 
@@ -352,7 +340,6 @@ pub mod test_helpers {
 
         let columns =
             batch.columns().iter().zip(target_schema.fields()).map(|(col, field)| cast(col, field.data_type()).unwrap_or_else(|_| col.clone())).collect();
-
         Ok(RecordBatch::try_new(target_schema, columns)?)
     }
 
@@ -377,7 +364,6 @@ pub mod test_helpers {
 
     /// Read a string cell from any String/LargeString/StringView array; panics on other types.
     pub fn array_get_str(arr: &dyn datafusion::arrow::array::Array, idx: usize) -> String {
-        use datafusion::arrow::array::AsArray;
         match arr.data_type() {
             DataType::Utf8View => arr.as_string_view().value(idx),
             DataType::Utf8 => arr.as_string::<i32>().value(idx),

@@ -232,6 +232,32 @@ enum RoleField {
     Bool(bool),
 }
 
+impl RoleField {
+    fn pg_type(&self) -> Type {
+        match self {
+            Self::Oid(_) => Type::INT4,
+            Self::Text(_) => Type::VARCHAR,
+            Self::Bool(_) => Type::BOOL,
+        }
+    }
+
+    fn literal(&self) -> Expr {
+        match self {
+            Self::Oid(oid) => lit(*oid),
+            Self::Text(text) => lit(text.as_str()),
+            Self::Bool(flag) => lit(*flag),
+        }
+    }
+
+    fn encode(&self, encoder: &mut DataRowEncoder) -> PgWireResult<()> {
+        match self {
+            Self::Oid(oid) => encoder.encode_field(&Some(*oid)),
+            Self::Text(text) => encoder.encode_field(&Some(text.as_str())),
+            Self::Bool(flag) => encoder.encode_field(&Some(*flag)),
+        }
+    }
+}
+
 impl PgCompatibilityHook {
     pub fn new(role: impl Into<String>, max_statement_secs: u64) -> Self {
         Self { role: role.into(), max_statement_secs }
@@ -367,25 +393,11 @@ fn is_pg_roles(relation: &TableFactor) -> bool {
     matches!(relation, TableFactor::Table { name, .. } if name.to_string().to_ascii_lowercase().ends_with("pg_roles"))
 }
 
-fn role_probe_field_type(value: &RoleField) -> Type {
-    match value {
-        RoleField::Oid(_) => Type::INT4,
-        RoleField::Text(_) => Type::VARCHAR,
-        RoleField::Bool(_) => Type::BOOL,
-    }
-}
-
 fn role_probe_response(fields: &[(String, RoleField)]) -> PgWireResult<QueryResponse> {
-    let infos = Arc::new(
-        fields.iter().map(|(name, value)| FieldInfo::new(name.clone(), None, None, role_probe_field_type(value), FieldFormat::Text)).collect::<Vec<_>>(),
-    );
+    let infos = Arc::new(fields.iter().map(|(name, value)| FieldInfo::new(name.clone(), None, None, value.pg_type(), FieldFormat::Text)).collect::<Vec<_>>());
     let row = {
         let mut encoder = DataRowEncoder::new(Arc::clone(&infos));
-        fields.iter().try_for_each(|(_, value)| match value {
-            RoleField::Oid(oid) => encoder.encode_field(&Some(*oid)),
-            RoleField::Text(text) => encoder.encode_field(&Some(text.as_str())),
-            RoleField::Bool(flag) => encoder.encode_field(&Some(*flag)),
-        })?;
+        fields.iter().try_for_each(|(_, value)| value.encode(&mut encoder))?;
         encoder.take_row()
     };
     Ok(QueryResponse::new(infos, stream::once(async move { Ok(row) })))
@@ -412,17 +424,7 @@ fn bound_parameter_tautology(statement: &Statement) -> Option<Expr> {
 /// the extended protocol executes this plan, and only the real executor encodes
 /// columns in the result format the client requested.
 fn role_probe_plan(statement: &Statement, fields: &[(String, RoleField)]) -> PgWireResult<LogicalPlan> {
-    let projection = fields
-        .iter()
-        .map(|(name, value)| {
-            match value {
-                RoleField::Oid(oid) => lit(*oid),
-                RoleField::Text(text) => lit(text.as_str()),
-                RoleField::Bool(flag) => lit(*flag),
-            }
-            .alias(name)
-        })
-        .collect::<Vec<_>>();
+    let projection = fields.iter().map(|(name, value)| value.literal().alias(name)).collect::<Vec<_>>();
     let builder = LogicalPlanBuilder::empty(true);
     match bound_parameter_tautology(statement) {
         Some(predicate) => builder.filter(predicate).and_then(|builder| builder.project(projection)),
@@ -448,28 +450,25 @@ fn show_response(name: &str, value: &str) -> PgWireResult<QueryResponse> {
 }
 
 fn register_identity_udfs(ctx: &SessionContext, role: &str, max_statement_secs: u64) {
-    ctx.register_udf(constant_string_udf("current_database", PG_COMPAT_DATABASE.to_string(), Volatility::Stable));
-    ctx.register_udf(constant_string_udf("session_user", role.to_string(), Volatility::Stable));
-    ctx.register_udf(constant_string_udf(
-        "version",
-        format!("PostgreSQL {PG_COMPAT_VERSION} (TimeFusion {}) on {}-{}", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, std::env::consts::OS),
-        Volatility::Stable,
-    ));
-    ctx.register_udf(ScalarUDF::from(CurrentSettingUdf::new(max_statement_secs)));
-    // pgAdmin checks replica status on connect; TF is never a standby.
-    ctx.register_udf(create_udf(
-        "pg_is_in_recovery",
-        vec![],
-        DataType::Boolean,
-        Volatility::Stable,
-        Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false))))),
-    ));
+    let version = format!("PostgreSQL {PG_COMPAT_VERSION} (TimeFusion {}) on {}-{}", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, std::env::consts::OS);
+    for udf in [
+        constant_udf("current_database", PG_COMPAT_DATABASE.into()),
+        constant_udf("session_user", role.into()),
+        constant_udf("version", version.into()),
+        // pgAdmin checks replica status on connect; TF is never a standby.
+        constant_udf("pg_is_in_recovery", false.into()),
+        ScalarUDF::from(CurrentSettingUdf::new(max_statement_secs)),
+    ] {
+        ctx.register_udf(udf);
+    }
     ctx.register_udtf("pg_show_all_settings", Arc::new(PgShowAllSettingsFunction { max_statement_secs }));
 }
 
-fn constant_string_udf(name: &str, value: String, volatility: Volatility) -> ScalarUDF {
-    let function: ScalarFunctionImplementation = Arc::new(move |_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(value.clone())))));
-    create_udf(name, vec![], DataType::Utf8, volatility, function)
+/// Zero-argument UDF answering a fixed value; the return type is the value's own.
+fn constant_udf(name: &str, value: ScalarValue) -> ScalarUDF {
+    let data_type = value.data_type();
+    let function: ScalarFunctionImplementation = Arc::new(move |_| Ok(ColumnarValue::Scalar(value.clone())));
+    create_udf(name, vec![], data_type, Volatility::Stable, function)
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -818,6 +817,11 @@ fn avg(total: u64, samples: u64) -> u64 {
     total.checked_div(samples).unwrap_or(0)
 }
 
+/// Integer percent, 0 for an unwired pool — the `(0, 0)` snapshot convention.
+fn share_pct(used: usize, size: usize) -> usize {
+    (used * 100).checked_div(size).unwrap_or(0)
+}
+
 /// `atomic_stats!`-declared counters, rendered exactly as declared.
 fn atomic_rows(rows: Vec<(&'static str, &'static str, u64)>) -> Vec<Row> {
     rows.into_iter().map(|(component, key, value)| (component, key.to_string(), value.to_string())).collect()
@@ -850,11 +854,7 @@ pub struct StatsTableProvider {
 
 impl StatsTableProvider {
     pub fn new(layer: Option<Arc<BufferedWriteLayer>>) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("component", DataType::Utf8, false),
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(["component", "key", "value"].map(|name| Field::new(name, DataType::Utf8, false)).to_vec()));
         Self {
             layer,
             scan_metrics: None,
@@ -1080,15 +1080,9 @@ impl StatsTableProvider {
             use crate::database::scan_metric_names::*;
             let cv = crate::observability::counter_value;
             let q = |name: &str, p: f64| crate::observability::histogram_quantile(name, p).unwrap_or(0.0) as u64;
-            let (total, skipped) = (cv(SCANS_TOTAL), cv(SCANS_SKIPPED_DELTA));
             let (fr_hits, fr_misses) = (cv(FAST_RESOLVE_HITS), cv(FAST_RESOLVE_MISSES));
-            let (dedup_elig, dedup_skipped) = (cv(DEDUP_ELIGIBLE_SCANS), cv(DEDUP_SKIPPED));
             let (cert_never, cert_moved) = (cv(DEDUP_DENIED_NEVER_CERTIFIED), cv(DEDUP_DENIED_FP_MOVED));
-            let cert_dwells = cv(CERT_DWELL_TOTAL);
             let (pc_hits, pc_misses) = (cv(PROVIDER_CACHE_HITS), cv(PROVIDER_CACHE_MISSES));
-            let provider_builds = cv(PROVIDER_BUILD_TOTAL);
-            let provider_scans = cv(PROVIDER_SCAN_TOTAL);
-            let mem_plans = cv(MEM_PLAN_TOTAL);
             // Parquet decode heap — the largest consumer outside every budget.
             // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
             // concurrent decode heap, which is what a Transient budget must cover.
@@ -1097,8 +1091,7 @@ impl StatsTableProvider {
             let (dpeak, dinflight_peak) = (m.decode.decode_peak_batch_bytes.load(Relaxed), m.decode.decode_polls_inflight_peak.load(Relaxed));
             // The number the OOM killer acts on, live: without this the only
             // record of a memory climb is the kernel's post-mortem kill line.
-            let (used, limit) =
-                (crate::database::process_memory_bytes().unwrap_or(0) as u64, crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes as u64));
+            let (used, limit) = (crate::database::process_memory_bytes().unwrap_or(0), crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes));
             let (pool_used, pool_size) = self.query_pool.as_ref().map_or((0, 0), |f| f());
             // Reported as `usize::MAX` size when unwired would be misleading, so
             // keep the same (0, 0) convention as the query pool and guard the pct.
@@ -1108,19 +1101,19 @@ impl StatsTableProvider {
                 rows!["memory";
                     "charged_bytes" => used,
                     "limit_bytes" => limit,
-                    "charged_pct" => if limit > 0 { used * 100 / limit } else { 0 },
+                    "charged_pct" => share_pct(used, limit),
                     // Saturation here surfaces as "Resources exhausted" query
                     // errors (2026-08-03 07:06: enrichment UPDATEs failing at
                     // 30.0/30.0 GB), invisible before this row.
                     "query_pool_used_bytes" => pool_used,
-                    "query_pool_pct" => if pool_size > 0 { pool_used * 100 / pool_size } else { 0 },
+                    "query_pool_pct" => share_pct(pool_used, pool_size),
                     // The pools every maintenance memory decision is about. Their
                     // sizes were already visible; their USE was not, so a budget
                     // change could not be verified against the pool it moved.
                     "maintenance_pool_used_bytes" => mpool_used,
-                    "maintenance_pool_pct" => if mpool_size > 0 { mpool_used * 100 / mpool_size } else { 0 },
+                    "maintenance_pool_pct" => share_pct(mpool_used, mpool_size),
                     "coordinator_pool_used_bytes" => cpool_used,
-                    "coordinator_pool_pct" => if cpool_size > 0 { cpool_used * 100 / cpool_size } else { 0 },
+                    "coordinator_pool_pct" => share_pct(cpool_used, cpool_size),
                 ],
                 rows!["scan_decode";
                     "peak_batch_bytes" => dpeak,
@@ -1129,24 +1122,24 @@ impl StatsTableProvider {
                     "worst_case_heap_mb" => mb(dpeak.saturating_mul(dinflight_peak) as f64),
                 ],
                 rows!["scan";
-                    "skipped_delta_pct" => pct(skipped, total),
-                    "dedup_skipped_pct" => pct(dedup_skipped, dedup_elig),
+                    "skipped_delta_pct" => pct(cv(SCANS_SKIPPED_DELTA), cv(SCANS_TOTAL)),
+                    "dedup_skipped_pct" => pct(cv(DEDUP_SKIPPED), cv(DEDUP_ELIGIBLE_SCANS)),
                     "rollup_stale_moved" => cv(ROLLUP_STALE_SHRANK) + cv(ROLLUP_STALE_GREW),
                     "dedup_denied_never_certified_pct" => pct(cert_never, cert_never + cert_moved),
-                    "cert_dwell_secs_avg" => avg(cv(CERT_DWELL_SECS_TOTAL), cert_dwells),
+                    "cert_dwell_secs_avg" => avg(cv(CERT_DWELL_SECS_TOTAL), cv(CERT_DWELL_TOTAL)),
                     "cert_dwell_p50_secs" => m.cert_dwell_percentile_secs(0.50),
                     "cert_dwell_p90_secs" => m.cert_dwell_percentile_secs(0.90),
                     "fast_resolve_hit_pct" => pct(fr_hits, fr_hits + fr_misses),
                     "provider_cache_hit_pct" => pct(pc_hits, pc_hits + pc_misses),
-                    "provider_build_us_avg" => avg(cv(PROVIDER_BUILD_US_TOTAL), provider_builds),
-                    "provider_scan_us_avg" => avg(cv(PROVIDER_SCAN_US_TOTAL), provider_scans),
+                    "provider_build_us_avg" => avg(cv(PROVIDER_BUILD_US_TOTAL), cv(PROVIDER_BUILD_TOTAL)),
+                    "provider_scan_us_avg" => avg(cv(PROVIDER_SCAN_US_TOTAL), cv(PROVIDER_SCAN_TOTAL)),
                     "dedup_full_set_pct" => pct(cv(DEDUP_FULL_SET_TOTAL), cv(DEDUP_BOUNDED_TOTAL) + cv(DEDUP_FULL_SET_TOTAL)),
                     // Read these BEFORE setting TIMEFUSION_WIDE_SCAN_REFUSE_MB — the
                     // threshold has to sit above p99 or it rejects working dashboards.
                     "wide_scan_selected_mb_p50" => q(WIDE_SCAN_SELECTED_MB, 0.50),
                     "wide_scan_selected_mb_p90" => q(WIDE_SCAN_SELECTED_MB, 0.90),
                     "wide_scan_selected_mb_p99" => q(WIDE_SCAN_SELECTED_MB, 0.99),
-                    "mem_plan_us_avg" => avg(cv(MEM_PLAN_US_TOTAL), mem_plans),
+                    "mem_plan_us_avg" => avg(cv(MEM_PLAN_US_TOTAL), cv(MEM_PLAN_TOTAL)),
                     "lat_p50_us_approx" => m.latency_percentile_us(0.50),
                     "lat_p95_us_approx" => m.latency_percentile_us(0.95),
                     "lat_p99_us_approx" => m.latency_percentile_us(0.99),
@@ -1380,12 +1373,8 @@ impl StatsTableProvider {
         .into_iter()
         .flatten()
         .collect();
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(rows.iter().map(|r| Some(r.0)).collect::<StringArray>()),
-            Arc::new(rows.iter().map(|r| Some(r.1.as_str())).collect::<StringArray>()),
-            Arc::new(rows.iter().map(|r| Some(r.2.as_str())).collect::<StringArray>()),
-        ];
-        RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)
+        let col = |field: fn(&Row) -> &str| Arc::new(rows.iter().map(|row| Some(field(row))).collect::<StringArray>()) as ArrayRef;
+        RecordBatch::try_new(Arc::clone(&self.schema), vec![col(|r| r.0), col(|r| r.1.as_str()), col(|r| r.2.as_str())]).map_err(arrow_err)
     }
 }
 

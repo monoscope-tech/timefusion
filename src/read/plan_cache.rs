@@ -291,7 +291,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
     let num_rows = values.values.len();
 
     // One array per Values column, in Values' native order.
-    let columns_or_bail: Vec<Option<ArrayRef>> = values_schema
+    let Some(values_columns) = values_schema
         .fields()
         .iter()
         .enumerate()
@@ -310,8 +310,10 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
             // exactly what the table expects.
             Ok(Some(if arr.data_type() == target_ty { arr } else { cast(&arr, target_ty).map_err(arrow_err)? }))
         })
-        .collect::<DfResult<_>>()?;
-    let Some(values_columns) = columns_or_bail.into_iter().collect::<Option<Vec<ArrayRef>>>() else {
+        .collect::<DfResult<Vec<Option<ArrayRef>>>>()?
+        .into_iter()
+        .collect::<Option<Vec<ArrayRef>>>()
+    else {
         return Ok(None);
     };
 
@@ -347,7 +349,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
 }
 
 fn non_dml_err() -> PgWireError {
-    PgWireError::ApiError("internal error: DML plan returned non-DML completion".to_string().into())
+    PgWireError::ApiError("internal error: DML plan returned non-DML completion".into())
 }
 
 /// Mirror of `datafusion_postgres::handlers::dml_completion`,

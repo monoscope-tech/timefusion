@@ -122,10 +122,11 @@ impl ByteModel {
     /// partition overlap the same files, so they share an `fp` and fusion
     /// charges them once — the whole point of stamping it at claim time.
     fn footprint(&self, key: &TaskKey) -> Option<InputFootprint> {
-        let day = self.shape(&key.project_id, Self::day_of(key))?;
+        let day_start = Self::day_of(key);
+        let day = self.shape(&key.project_id, day_start)?;
         let files = day.files_overlapping(key.slice.width());
         let whole = (u128::from(day.decoded_bytes) * u128::from(files) / u128::from(day.files)) as u64;
-        Some(InputFootprint::new([format!("{}/{}/{files}", key.project_id, Self::day_of(key))], whole))
+        Some(InputFootprint::new([format!("{}/{day_start}/{files}", key.project_id)], whole))
     }
 
     /// `coarsen_sealed_slices_capped`'s ceiling: no unit over one partition can
@@ -738,7 +739,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     mint_stream(&mut journal, stream, next_mint - MINT_INTERVAL_MICROS, next_mint, next_mint);
                 }
             }
-            none_until = [0; 6];
+            none_until.fill(0);
             // The cadence advances whether or not minting is on — otherwise
             // `next_mint` pins `now` here forever.
             next_mint += MINT_INTERVAL_MICROS;
@@ -759,14 +760,14 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
             report.coarsen_blocked += coarsen.blocked;
             report.coarsen_over_budget += coarsen.over_budget;
             if coarsen.total() != 0 {
-                none_until = [0; 6];
+                none_until.fill(0);
             }
             next_coarsen += COARSEN_INTERVAL_MICROS;
         }
 
         if now >= next_restart {
             reconcile_restart(&mut journal, &streams, now);
-            none_until = [0; 6];
+            none_until.fill(0);
             next_restart = if cfg.restart_every_micros > 0 { next_restart + cfg.restart_every_micros } else { i64::MAX };
         }
 
@@ -782,7 +783,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                 let deadline_secs = operation_deadline_secs(key.operation);
                 if duration_secs <= deadline_secs {
                     journal.complete(&key);
-                    none_until = [0; 6];
+                    none_until.fill(0);
                     if matches!(key.operation, Operation::BaseRollup | Operation::DerivedRollup) {
                         coverage.record(&key);
                         let contiguous = coverage.min_contiguous_days(now);
@@ -798,7 +799,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     // lease drop abandons the unit — bisect on repeat, else
                     // deadline-floored backoff. Real code, not a re-imagination.
                     journal.abandon_running(&key, now, None);
-                    none_until = [0; 6];
+                    none_until.fill(0);
                     match journal.state(&key) {
                         Some(TaskState::Superseded) => report.splits += 1,
                         _ => *report.timeouts.entry(format!("{:?}", key.operation)).or_default() += 1,
@@ -856,7 +857,7 @@ pub fn run(mut journal: TaskJournal, cfg: &SimConfig, start_micros: i64) -> anyh
                     if is_debt_op(task.key.operation) {
                         debt_busy -= 1;
                     }
-                    none_until = [0; 6];
+                    none_until.fill(0);
                     worker.busy_until = now + PREFLIGHT_COST_MICROS;
                     continue;
                 };

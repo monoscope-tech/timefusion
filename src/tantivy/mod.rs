@@ -31,18 +31,42 @@ pub use search::{Hit, query_index};
 // writes "k1:v1 k2:v2 …" tokens (key+value flattened). Nested objects are
 // traversed recursively.
 
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::{
     array::{Array, ArrayRef, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use parquet_variant_compute::VariantArray;
 use parquet_variant_json::VariantToJson;
-use tantivy::{Index, IndexWriter, doc, merge_policy::NoMergePolicy};
+use serde::{Deserialize, Serialize};
+use tantivy::{
+    Index, IndexWriter,
+    directory::MmapDirectory,
+    doc,
+    merge_policy::NoMergePolicy,
+    schema::{FAST, Field, INDEXED, IndexRecordOption, NumericOptions, STORED, Schema, SchemaBuilder, TextFieldIndexing, TextOptions},
+    tokenizer::{AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Tokenizer},
+};
 use tracing::{debug, warn};
 
-use crate::schema::{TableSchema, TantivyListMode};
+use crate::{
+    schema::{FieldDef, TableSchema, TantivyFieldConfig, TantivyListMode},
+    tantivy::{
+        search::{PredsQuery, build_node_query},
+        udf::PredNode,
+    },
+    write::mem_buffer::TableKey,
+};
 
 /// Heap reserved per writer and charged against the MemBuffer budget.
 pub const WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
@@ -79,7 +103,7 @@ pub struct IndexBuildStats {
 pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(Index, BuiltSchema, IndexBuildStats)> {
     let built = build_for_table(table);
     let index = Index::create_in_ram(built.schema.clone());
-    crate::tantivy::register_tokenizers(&index);
+    register_tokenizers(&index);
     let stats = index_to_writer(&built, &index, batches, MergeMode::Deferred)?;
     Ok((index, built, stats))
 }
@@ -87,13 +111,32 @@ pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(
 /// Append `batches` to an existing tantivy `Index` (created in RAM or on disk).
 /// Used by `store::build_to_dir` to write directly to a `MmapDirectory`.
 pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatch], merge: MergeMode) -> Result<IndexBuildStats> {
+    write_index(built, index, batches, merge)
+}
+
+/// The one writer loop — single commit, explicit merge policy, stats
+/// accumulated per batch. Takes a slice or a stream so the flush and
+/// committed-file paths share it.
+fn write_index(
+    built: &BuiltSchema, index: &Index, batches: impl IntoIterator<Item = impl std::borrow::Borrow<RecordBatch>>, merge: MergeMode,
+) -> Result<IndexBuildStats> {
     let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
     // Explicit merges keep `TermMerger` off the ingest path.
     writer.set_merge_policy(Box::new(NoMergePolicy));
     let mut stats = IndexBuildStats { element_fields: built.element_fields(), ..Default::default() };
-    batches.iter().try_for_each(|batch| index_batch(built, &mut writer, batch, &mut stats))?;
-    stats.batches = batches.len() as u32;
+    for batch in batches {
+        index_batch(built, &mut writer, batch.borrow(), &mut stats)?;
+        stats.batches = stats.batches.saturating_add(1);
+    }
     finish_writer(index, writer, stats, merge)
+}
+
+/// Create an on-disk tantivy index with this crate's tokenizers registered.
+fn create_disk_index(built: &BuiltSchema, dir: &Path) -> Result<Index> {
+    let mmap_dir = MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
+    let index = Index::create(mmap_dir, built.schema.clone(), Default::default()).map_err(|e| anyhow!("create disk index: {e}"))?;
+    register_tokenizers(&index);
+    Ok(index)
 }
 
 /// Build a committed-file index from a bounded channel of decoded parquet
@@ -105,20 +148,11 @@ pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatc
 /// Must run on a blocking thread: `IndexWriter` is CPU/blocking work and
 /// `blocking_recv` intentionally keeps it off Tokio's async workers.
 pub fn build_stream_to_dir(
-    table: &TableSchema, dir: &std::path::Path, mut batches: tokio::sync::mpsc::Receiver<RecordBatch>, merge: MergeMode,
+    table: &TableSchema, dir: &Path, mut batches: tokio::sync::mpsc::Receiver<RecordBatch>, merge: MergeMode,
 ) -> Result<(BuiltSchema, IndexBuildStats)> {
     let built = build_for_table(table);
-    let mmap_dir = tantivy::directory::MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
-    let index = Index::create(mmap_dir, built.schema.clone(), Default::default()).map_err(|e| anyhow!("create disk index: {e}"))?;
-    crate::tantivy::register_tokenizers(&index);
-    let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
-    writer.set_merge_policy(Box::new(NoMergePolicy));
-    let mut stats = IndexBuildStats { element_fields: built.element_fields(), ..Default::default() };
-    while let Some(batch) = batches.blocking_recv() {
-        index_batch(&built, &mut writer, &batch, &mut stats)?;
-        stats.batches = stats.batches.saturating_add(1);
-    }
-    let stats = finish_writer(&index, writer, stats, merge)?;
+    let index = create_disk_index(&built, dir)?;
+    let stats = write_index(&built, &index, std::iter::from_fn(|| batches.blocking_recv()), merge)?;
     Ok((built, stats))
 }
 
@@ -177,39 +211,34 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
         .filter_map(|(name, uf)| schema.index_of(name).ok().map(|idx| (batch.column(idx), uf)))
         .map(|(column, uf)| {
             let cfg = uf.source.tantivy.as_ref().context("indexed field lacks configuration")?;
-            if cfg.list_mode == TantivyListMode::Elements {
-                anyhow::ensure!(
-                    matches!(column.data_type(), DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::Utf8View))
+            anyhow::ensure!(
+                cfg.list_mode != TantivyListMode::Elements
+                    || (matches!(column.data_type(), DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::Utf8View))
                         && canonical_tokenizer(cfg) == RAW_TOKENIZER
-                        && cfg.flatten.is_none(),
-                    "element index `{}` requires List(Utf8), raw tokenizer and no flattening",
-                    uf.source.name
-                );
-            }
+                        && cfg.flatten.is_none()),
+                "element index `{}` requires List(Utf8), raw tokenizer and no flattening",
+                uf.source.name
+            );
             Ok(UserCol { field: uf.field, column, kind: ColKind::detect(column, cfg.flatten.as_deref())?, list_mode: cfg.list_mode })
         })
         .collect::<Result<_>>()?;
 
+    // Nulls are ruled out above, so the column min/max is the row-wise fold.
+    stats.min_timestamp_micros = stats.min_timestamp_micros.into_iter().chain(arrow::compute::min(ts_col)).min();
+    stats.max_timestamp_micros = stats.max_timestamp_micros.into_iter().chain(arrow::compute::max(ts_col)).max();
+
     for row in 0..batch.num_rows() {
-        let ts = ts_col.value(row);
-        stats.min_timestamp_micros = Some(stats.min_timestamp_micros.map_or(ts, |m| m.min(ts)));
-        stats.max_timestamp_micros = Some(stats.max_timestamp_micros.map_or(ts, |m| m.max(ts)));
         let id = id_kind.extract(id_col, row)?.unwrap_or_default();
         // stats.rows counts docs already added → the global ordinal of this
         // one, valid as a parquet row index only for read-back builds.
-        let mut doc = doc!(built.timestamp => ts, built.id => id, built.row_ordinal => stats.rows);
+        let mut doc = doc!(built.timestamp => ts_col.value(row), built.id => id, built.row_ordinal => stats.rows);
         for uc in &user_cols {
             if uc.list_mode == TantivyListMode::Elements {
                 if !uc.column.is_null(row) {
                     let arr = uc.column.as_any().downcast_ref::<ListArray>().context("element index requires list")?;
-                    let inner = arr.value(row);
                     // Raw terms preserve punctuation, whitespace and empty strings.
                     // Repeated terms share a document posting, so they count once.
-                    if let Some(values) = inner.as_any().downcast_ref::<StringArray>() {
-                        values.iter().flatten().for_each(|value| doc.add_text(uc.field, value));
-                    } else if let Some(values) = inner.as_any().downcast_ref::<StringViewArray>() {
-                        values.iter().flatten().for_each(|value| doc.add_text(uc.field, value));
-                    }
+                    for_each_list_str(&arr.value(row), |value| doc.add_text(uc.field, value))?;
                 }
             } else if let Some(text) = uc.kind.extract(uc.column, row)?
                 && !text.is_empty()
@@ -264,16 +293,28 @@ impl ColKind {
     }
 }
 
-fn list_to_text(arr: &ListArray, row: usize) -> Result<String> {
-    let inner = arr.value(row);
-    let parts: Vec<&str> = if let Some(s) = inner.as_any().downcast_ref::<StringArray>() {
-        s.iter().flatten().collect()
-    } else if let Some(s) = inner.as_any().downcast_ref::<StringViewArray>() {
-        s.iter().flatten().collect()
+/// Apply `f` to every non-null string of one `List(Utf8|Utf8View)` row value.
+fn for_each_list_str(inner: &ArrayRef, f: impl FnMut(&str)) -> Result<()> {
+    if let Some(values) = inner.as_any().downcast_ref::<StringArray>() {
+        values.iter().flatten().for_each(f);
+    } else if let Some(values) = inner.as_any().downcast_ref::<StringViewArray>() {
+        values.iter().flatten().for_each(f);
     } else {
         bail!("list element type unsupported for tantivy: {:?}", inner.data_type())
-    };
-    Ok(parts.join(" "))
+    }
+    Ok(())
+}
+
+fn list_to_text(arr: &ListArray, row: usize) -> Result<String> {
+    let (mut out, mut first) = (String::new(), true);
+    for_each_list_str(&arr.value(row), |s| {
+        // Space-join, not "skip when empty": empty elements are real terms.
+        if !std::mem::take(&mut first) {
+            out.push(' ');
+        }
+        out.push_str(s);
+    })?;
+    Ok(out)
 }
 
 /// Render one Variant row to text. `kv=false` → canonical JSON (the same
@@ -306,17 +347,10 @@ fn prepared_variant_to_text(variant_arr: &VariantArray, row: usize, kv: bool) ->
 fn flatten_kv(v: &serde_json::Value, prefix: &str, out: &mut String) {
     use serde_json::Value::*;
     match v {
-        Object(map) => {
-            for (k, val) in map {
-                let next = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
-                flatten_kv(val, &next, out);
-            }
-        }
-        Array(items) => {
-            for item in items {
-                flatten_kv(item, prefix, out);
-            }
-        }
+        Object(map) => map.iter().for_each(|(k, val)| {
+            flatten_kv(val, &if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") }, out);
+        }),
+        Array(items) => items.iter().for_each(|item| flatten_kv(item, prefix, out)),
         Null => {}
         other => {
             if !out.is_empty() {
@@ -554,15 +588,6 @@ mod builder_tests {
 // dominant pattern for logs/traces. Opt-down to `raw`/`default` for
 // point-lookup-only columns (IDs, enums).
 
-use std::collections::HashMap;
-
-use tantivy::{
-    schema::{FAST, Field, INDEXED, IndexRecordOption, NumericOptions, STORED, Schema, SchemaBuilder, TextFieldIndexing, TextOptions},
-    tokenizer::{AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Tokenizer},
-};
-
-use crate::schema::{FieldDef, TantivyFieldConfig};
-
 /// Tokenizer name we use for n-gram indexing. Combined with `LowerCaser` so
 /// `ILIKE` semantics fall out automatically.
 pub const NGRAM3_TOKENIZER: &str = "tf_ngram3";
@@ -601,12 +626,18 @@ pub struct BuiltSchema {
 
 impl BuiltSchema {
     fn element_fields(&self) -> std::collections::BTreeSet<String> {
-        self.user_fields
-            .iter()
-            .filter(|(_, f)| f.source.tantivy.as_ref().is_some_and(|c| c.list_mode == TantivyListMode::Elements))
-            .map(|(name, _)| name.clone())
-            .collect()
+        element_field_names(self.user_fields.values().map(|f| &f.source))
     }
+}
+
+/// Columns declared as exact-element (`list_mode: elements`) indexes — the one
+/// definition shared by build stats and the manifest coverage check.
+fn element_field_names<'a>(fields: impl IntoIterator<Item = &'a FieldDef>) -> std::collections::BTreeSet<String> {
+    fields
+        .into_iter()
+        .filter(|field| field.tantivy.as_ref().is_some_and(|config| config.indexed && config.list_mode == TantivyListMode::Elements))
+        .map(|field| field.name.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -699,14 +730,6 @@ pub fn indexed_field_names(table: &TableSchema) -> Vec<String> {
 // check on read. Good enough for low-frequency manifest writes; if multiple
 // writers race, last-writer-wins (entries are idempotent upserts).
 
-use std::{collections::BTreeMap, sync::Arc};
-
-use chrono::{DateTime, Utc};
-use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
-use serde::{Deserialize, Serialize};
-
-use crate::write::mem_buffer::TableKey;
-
 pub const MANIFEST_PREFIX: &str = "index_manifests";
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -769,7 +792,8 @@ pub struct HistogramEntry<'a> {
     pub entry: &'a ManifestEntry,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, educe::Educe)]
+#[educe(Default)]
 pub struct ManifestEntry {
     /// Missing in legacy manifests: those indexes store joined list text and
     /// cannot answer exact element predicates, even if the field name exists.
@@ -778,7 +802,9 @@ pub struct ManifestEntry {
     /// Object-store path to the index tar.zst, or `None` if build failed.
     pub index: Option<String>,
     pub rows: u64,
+    #[educe(Default(expression = Utc::now()))]
     pub built_at: DateTime<Utc>,
+    #[educe(Default = SCHEMA_VERSION)]
     pub schema_version: u32,
     pub min_timestamp_micros: Option<i64>,
     pub max_timestamp_micros: Option<i64>,
@@ -853,7 +879,6 @@ pub async fn mutate<R, F: FnOnce(&mut Manifest) -> (R, bool)>(store: &dyn Object
     Ok(out)
 }
 
-/// Idempotent upsert: load, mutate, save.
 impl ManifestEntry {
     /// Whether this entry has the list representation requested by the table.
     /// Used by both the coverage census and maintenance backfill.
@@ -863,38 +888,18 @@ impl ManifestEntry {
             && self.error.is_none()
             && self.schema_version == SCHEMA_VERSION
             && (self.element_fields.is_empty() || (self.ordinals_valid && self.covered_files.len() == 1))
-            && self.element_fields
-                == table
-                    .fields
-                    .iter()
-                    .filter(|field| field.tantivy.as_ref().is_some_and(|config| config.indexed && config.list_mode == TantivyListMode::Elements))
-                    .map(|field| field.name.clone())
-                    .collect::<std::collections::BTreeSet<_>>()
+            && self.element_fields == element_field_names(&table.fields)
     }
     /// Entry recorded when the index build itself failed: no index, no rows,
     /// but the covered files are still tracked so GC can reap it later.
     pub fn failed(error: String, covered_files: Vec<String>) -> Self {
-        Self {
-            element_fields: Default::default(),
-            index: None,
-            rows: 0,
-            built_at: Utc::now(),
-            schema_version: SCHEMA_VERSION,
-            min_timestamp_micros: None,
-            max_timestamp_micros: None,
-            error: Some(error),
-            covered_files,
-            ordinals_valid: false,
-        }
+        Self { error: Some(error), covered_files, ..Default::default() }
     }
 }
 
+/// Idempotent upsert: load, mutate, save.
 pub async fn upsert_manifest(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_key: &str, entry: ManifestEntry) -> Result<()> {
-    mutate(store, table, project_id, |m| {
-        m.insert(parquet_key.to_string(), entry);
-        ((), true)
-    })
-    .await
+    upsert_manifest_many(store, table, project_id, vec![(parquet_key.to_string(), entry)]).await
 }
 
 /// Upsert many entries under ONE load+save of the manifest.
@@ -910,9 +915,7 @@ pub async fn upsert_manifest_many(store: &dyn ObjectStore, table: &str, project_
         return Ok(());
     }
     mutate(store, table, project_id, |m| {
-        for (key, entry) in entries {
-            m.insert(key, entry);
-        }
+        entries.into_iter().for_each(|(key, entry)| m.insert(key, entry));
         ((), true)
     })
     .await
@@ -941,11 +944,6 @@ pub async fn remove_manifest_entries(store: &dyn ObjectStore, table: &str, proje
 //
 // `pack_index` serializes the in-memory `Index` to bytes; `unpack_to_dir`
 // is the inverse. Upload/download are thin wrappers around `ObjectStore`.
-
-use std::path::{Path, PathBuf};
-
-use bytes::Bytes;
-use tantivy::directory::MmapDirectory;
 
 pub const INDEX_PREFIX: &str = "indexes";
 pub const INDEX_VERSION: &str = "v1";
@@ -1016,13 +1014,8 @@ pub async fn build_parquet_and_pack(
     // Decode exactly the columns the full index consumes. This preserves the
     // normal index schema and every physical row, without reading unrelated
     // Parquet column chunks on each rebuild.
-    let fields: std::collections::HashSet<&str> = table
-        .fields
-        .iter()
-        .filter(|field| field.tantivy.as_ref().is_some_and(|config| config.indexed))
-        .map(|field| field.name.as_str())
-        .chain(["timestamp", "id"])
-        .collect();
+    let fields: std::collections::HashSet<&str> =
+        table.fields.iter().filter_map(|f| f.tantivy.as_ref()?.indexed.then_some(f.name.as_str())).chain(["timestamp", "id"]).collect();
     let builder = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?;
     let columns = builder.schema().fields().iter().enumerate().filter_map(|(index, field)| fields.contains(field.name().as_str()).then_some(index));
     let projection = ProjectionMask::roots(builder.parquet_schema(), columns);
@@ -1063,9 +1056,7 @@ pub fn build_and_pack(table: &TableSchema, batches: &[RecordBatch], level: i32, 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot.
 pub fn build_to_dir(table: &TableSchema, batches: &[RecordBatch], dir: &Path, merge: MergeMode) -> Result<(BuiltSchema, IndexBuildStats)> {
     let built = build_for_table(table);
-    let mmap_dir = MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
-    let index = Index::create(mmap_dir, built.schema.clone(), Default::default()).map_err(|e| anyhow!("create disk index: {e}"))?;
-    register_tokenizers(&index);
+    let index = create_disk_index(&built, dir)?;
     let stats = index_to_writer(&built, &index, batches, merge)?;
     Ok((built, stats))
 }
@@ -1158,11 +1149,6 @@ mod store_tests {
 // while ≤ flush_interval buckets are active; past that window the post-flush
 // callback takes over and these in-memory copies are released.
 
-use crate::tantivy::{
-    search::{PredsQuery, build_node_query},
-    udf::PredNode,
-};
-
 /// A built tantivy index covering all rows currently in a bucket.
 pub struct BucketTextIndex {
     pub index: Index,
@@ -1186,8 +1172,8 @@ impl BucketTextIndex {
             return Ok(None);
         }
         let size_bytes = estimate_index_size(&indexed, batches);
+        // `build_in_memory` already registers the tokenizers on this index.
         let (index, built_schema, _stats) = build_in_memory(table, batches).with_context(|| format!("build mem-index for {}", table.table_name))?;
-        register_tokenizers(&index);
         Ok(Some(Self { index, built_schema: Arc::new(built_schema), indexed_rows: row_count, size_bytes }))
     }
 
@@ -1207,7 +1193,7 @@ impl BucketTextIndex {
 /// trigram tokenizers). Used by the `MemBuffer` LRU budget — accurate to
 /// within ~2× is sufficient since the budget is itself a soft cap.
 fn estimate_index_size(indexed_fields: &[String], batches: &[RecordBatch]) -> usize {
-    use arrow::array::{Array, AsArray};
+    use arrow::array::AsArray;
     batches
         .iter()
         .flat_map(|batch| indexed_fields.iter().filter_map(move |name| batch.column_by_name(name)))

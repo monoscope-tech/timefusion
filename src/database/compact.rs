@@ -60,11 +60,7 @@ impl Database {
             let prev = guard.get(&table_url);
             window_dates
                 .iter()
-                .filter(|d| match current.get(*d) {
-                    None => false,
-                    Some(cur) if cur.is_empty() => false,
-                    Some(cur) => **d == today || prev.and_then(|m| m.get(*d)).map(|p| p != cur).unwrap_or(true),
-                })
+                .filter(|d| current.get(*d).is_some_and(|cur| !cur.is_empty() && (**d == today || prev.and_then(|m| m.get(*d)).is_none_or(|p| p != cur))))
                 .copied()
                 .collect()
         };
@@ -494,7 +490,7 @@ impl Database {
     pub async fn compact_date(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>,
     ) -> Result<(u64, u64)> {
-        self.compact_date_with(table_ref, table_name, date, project_id, self.config.derived.optimize_merge_tasks()).await
+        self.compact_date_concurrent(table_ref, table_name, date, project_id, None).await
     }
 
     /// `compact_date` with an explicit bin concurrency (off-box CLI
@@ -763,28 +759,24 @@ impl Database {
         // metadata cache the scan would warm) and let sortedness veto the skip.
         let declares_order = get_schema(table_name).is_some_and(|s| !s.sorting_columns.is_empty());
         // A tier-qualified file without a sorted footer is not converged.
-        let any_unsorted = match declares_order {
-            false => false,
-            true => {
+        let any_unsorted = declares_order
+            && {
                 let object_store = log_store.object_store(None);
-                let mut found = false;
-                for uri in &uris {
-                    let Some(rel) = uri.strip_prefix(table_prefix).map(|s| s.trim_start_matches('/')) else { continue };
-                    let path = OsPath::from(rel);
-                    let Ok(meta) = object_store.head(&path).await else { continue };
-                    let mut reader = ParquetObjectReader::new(object_store.clone(), path).with_file_size(meta.size);
-                    // An unreadable footer is not evidence of sortedness; leave
-                    // `found` alone and let the tier probe decide.
-                    if let Ok(pq) = reader.get_metadata(None).await
-                        && pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty()))
-                    {
-                        found = true;
-                        break;
+                futures::stream::iter(&uris)
+                .any(|uri| {
+                    let object_store = object_store.clone();
+                    async move {
+                        let Some(rel) = uri.strip_prefix(table_prefix).map(|s| s.trim_start_matches('/')) else { return false };
+                        let path = OsPath::from(rel);
+                        let Ok(meta) = object_store.head(&path).await else { return false };
+                        let mut reader = ParquetObjectReader::new(object_store, path).with_file_size(meta.size);
+                        // An unreadable footer is not evidence of sortedness; say
+                        // no for this file and let the tier probe decide.
+                        matches!(reader.get_metadata(None).await, Ok(pq) if pq.row_groups().iter().any(|rg| rg.sorting_columns().is_none_or(|sc| sc.is_empty())))
                     }
-                }
-                found
-            }
-        };
+                })
+                .await
+            };
 
         // If probe failed or tier is unknown, fall through to rewrite — safer
         // than skipping a partition that may still be at hot tier.
@@ -1181,6 +1173,21 @@ impl Database {
             .map(|a| a.value(0)))
     }
 
+    /// Write one already-cast batch through a staging writer, flushing the
+    /// completed files into `adds` once the writer's buffer reaches
+    /// `max_file_bytes`. One definition so every dedup staging path keeps the
+    /// same file-size policy.
+    async fn write_staged(
+        writer: &mut deltalake::writer::RecordBatchWriter, adds: &mut Vec<deltalake::kernel::Action>, batch: RecordBatch, max_file_bytes: usize,
+    ) -> Result<()> {
+        use deltalake::{kernel::Action, writer::DeltaWriter};
+        writer.write(batch).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
+        if writer.buffer_len() >= max_file_bytes {
+            adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
+        }
+        Ok(())
+    }
+
     /// Batch probe: classify every 10-minute bin of one `(project, date)` with a single duplicate
     /// probe, returning the bin ids that contain duplicates.
     ///
@@ -1262,10 +1269,10 @@ impl Database {
                 let shard_filter = format!("{filter}{}", shard_bucket_pred(&bucket_expr, shard as u64, probe_shards as u64));
                 duplicate_starts.extend(Self::dup_bin_starts(&ctx, &shard_filter, &keys_csv).await?);
             }
-            duplicate_starts.sort_unstable();
-            duplicate_starts.dedup();
             let built: Vec<_> = duplicate_starts
                 .into_iter()
+                .sorted_unstable()
+                .dedup()
                 .filter_map(|start| {
                     let end = start + chrono::Duration::minutes(10);
                     if slice.is_none() && end > sealed_before {
@@ -1518,10 +1525,10 @@ impl Database {
             let logical_rows_sql = format!(
                 "SELECT count(*) FROM (SELECT 1 FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
             );
-            let expected_logical_rows =
-                Self::scalar_i64(&ctx, &logical_rows_sql).await?.ok_or_else(|| anyhow::anyhow!("dedup rewrite distinct-key validation returned no scalar"))?;
-            let expected_logical_rows =
-                u64::try_from(expected_logical_rows).map_err(|_| anyhow::anyhow!("dedup rewrite distinct-key validation returned a negative count"))?;
+            let expected_logical_rows = u64::try_from(
+                Self::scalar_i64(&ctx, &logical_rows_sql).await?.ok_or_else(|| anyhow::anyhow!("dedup rewrite distinct-key validation returned no scalar"))?,
+            )
+            .map_err(|_| anyhow::anyhow!("dedup rewrite distinct-key validation returned a negative count"))?;
 
             // Sharding can't split a single key group — all copies share one bucket.
             // If the largest group alone would blow the budget, no shard count helps,
@@ -1558,10 +1565,7 @@ impl Database {
             let stage_store = staging_table.log_store().object_store(None);
             // Shards have disjoint bucket ranges. The permit bounds concurrent
             // bins; `shard_k` bounds Arrow memory within each bin.
-            let shard_k = limits.map_or_else(
-                || dedup_shard_concurrency(decoded_budget, self.config.derived.cores),
-                |limits| dedup_shard_concurrency(decoded_budget, self.config.derived.cores).min(limits.max_concurrent_shards.max(1)),
-            );
+            let shard_k = dedup_shard_concurrency(decoded_budget, self.config.derived.cores).min(limits.map_or(usize::MAX, |l| l.max_concurrent_shards.max(1)));
             let staged_shards: Vec<StagedShard> = futures::stream::iter(0..shards)
                 .map(|shard| {
                     let (ctx, staging_table, scan_name) = (&ctx, &staging_table, &scan_name);
@@ -1602,6 +1606,20 @@ impl Database {
                                 .with_writer_properties(writer_properties);
                             let target_schema = writer.arrow_schema();
                             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
+                            // One shard, not all K, so a 256-way rewrite cannot flood the log.
+                            let log_decoded = |stage, rows, actual: usize| {
+                                if shard == 0 {
+                                    info!(
+                                        shards,
+                                        rows,
+                                        actual_decoded_mb = actual / (1 << 20),
+                                        predicted_decoded_mb = (est_decoded_bytes / shards.max(1)) / (1 << 20),
+                                        event = "dedup_shard_decoded",
+                                        stage,
+                                        "what one dedup shard decoded to, against what the estimate predicted"
+                                    );
+                                }
+                            };
                             let (shard_before, shard_after) = if limits.is_some() {
                                 let count_sql = format!("SELECT COUNT(*) FROM {scan_name} WHERE {rows_filter}");
                                 let shard_before = Self::scalar_i64(ctx, &count_sql).await?.map_or(0, |v| usize::try_from(v.max(0)).unwrap_or(usize::MAX));
@@ -1753,12 +1771,7 @@ impl Database {
                                         decoded_bytes = decoded_bytes.saturating_add(batch.get_array_memory_size());
                                         let casted = deltalake::kernel::schema::cast_record_batch(&batch, target_schema.clone(), true, true)?;
                                         let wrote_at = std::time::Instant::now();
-                                        writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
-                                        if writer.buffer_len() >= max_file_bytes {
-                                            adds.extend(
-                                                writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add),
-                                            );
-                                        }
+                                        Self::write_staged(&mut writer, &mut adds, casted, max_file_bytes).await?;
                                         t_write += wrote_at.elapsed();
                                     }
                                 }
@@ -1805,17 +1818,7 @@ impl Database {
                                 // production. Post-dedup rows, so this UNDER-states the input
                                 // volume — a ratio at or above the estimate is therefore
                                 // conclusive, one below it is not.
-                                if shard == 0 {
-                                    info!(
-                                        shards,
-                                        rows = shard_after,
-                                        actual_decoded_mb = decoded_bytes / (1 << 20),
-                                        predicted_decoded_mb = (est_decoded_bytes / shards.max(1)) / (1 << 20),
-                                        event = "dedup_shard_decoded",
-                                        stage = "streamed",
-                                        "what one dedup shard decoded to, against what the estimate predicted"
-                                    );
-                                }
+                                log_decoded("streamed", shard_after, decoded_bytes);
                                 (shard_before, shard_after)
                             } else {
                                 let batches: Vec<RecordBatch> = crate::database::maintain::collect_watched(ctx, &rows_sql)
@@ -1829,20 +1832,8 @@ impl Database {
                                 // `bytes_per_row = 4096` nor `inflation = 12` has ever been
                                 // checked against a real decoded-vs-compressed ratio, so log
                                 // what this shard ACTUALLY decoded to next to what was
-                                // predicted for it. One shard, not all K, so a 256-way rewrite
-                                // cannot flood the log.
-                                if shard == 0 {
-                                    let actual: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-                                    info!(
-                                        shards,
-                                        rows = shard_before,
-                                        actual_decoded_mb = actual / (1 << 20),
-                                        predicted_decoded_mb = (est_decoded_bytes / shards.max(1)) / (1 << 20),
-                                        event = "dedup_shard_decoded",
-                                        stage = "collected",
-                                        "what one dedup shard decoded to, against what the estimate predicted"
-                                    );
-                                }
+                                // predicted for it.
+                                log_decoded("collected", shard_before, batches.iter().map(RecordBatch::get_array_memory_size).sum());
                                 if shard_before == 0 {
                                     return Ok((0, 0));
                                 }
@@ -1852,12 +1843,7 @@ impl Database {
                                 let (deduped, _) = self.sort_flush_group(schema, deduped, UnsortedFallback::Forbid).await?;
                                 for batch in deduped {
                                     let casted = deltalake::kernel::schema::cast_record_batch(&batch?, target_schema.clone(), true, true)?;
-                                    writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
-                                    if writer.buffer_len() >= max_file_bytes {
-                                        adds.extend(
-                                            writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add),
-                                        );
-                                    }
+                                    Self::write_staged(&mut writer, &mut adds, casted, max_file_bytes).await?;
                                 }
                                 (shard_before, shard_after)
                             };
@@ -2104,19 +2090,15 @@ impl Database {
                 return Ok(BinOutcome::Converged);
             }
 
-            let (mut removes, mut adds, mut discardable_paths) = (Vec::new(), Vec::new(), Vec::new());
-            for action in actions {
-                match &action {
-                    Action::Remove(_) => removes.push(action),
-                    Action::Add(add) => {
-                        if let Some(rel) = add.deletion_vector.as_ref().and_then(dv_object_store_relative_path) {
-                            discardable_paths.push(rel);
-                        }
-                        adds.push(action);
-                    }
-                    _ => {}
-                }
-            }
+            let (removes, adds): (Vec<_>, Vec<_>) =
+                actions.into_iter().filter(|a| matches!(a, Action::Remove(_) | Action::Add(_))).partition(|a| matches!(a, Action::Remove(_)));
+            let discardable_paths: Vec<String> = adds
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Add(add) => add.deletion_vector.as_ref().and_then(dv_object_store_relative_path),
+                    _ => None,
+                })
+                .collect();
 
             let stage_store = chunk_log_store.object_store(None);
             let wave_id = uuid::Uuid::new_v4().to_string();
@@ -2285,15 +2267,12 @@ fn shard_bucket_pred(bucket_expr: &str, shard: u64, shards: u64) -> String {
 
 /// Non-null values of `column(0)` across `batches`, cast to Utf8.
 fn read_string_column(batches: Vec<RecordBatch>) -> Result<Vec<String>> {
-    Ok(batches
-        .into_iter()
-        .map(|batch| -> Result<Vec<String>> {
-            let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
-            let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
-            Ok(col.iter().flatten().map(str::to_string).collect())
-        })
-        .collect::<Result<Vec<Vec<String>>>>()?
-        .concat())
+    batches.into_iter().try_fold(Vec::new(), |mut out, batch| {
+        let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+        let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
+        out.extend(col.iter().flatten().map(str::to_string));
+        Ok(out)
+    })
 }
 
 /// Map scan file-id values back to Add actions in the SAME snapshot
@@ -2315,6 +2294,12 @@ fn adds_for_file_ids(snapshot: &deltalake::kernel::EagerSnapshot, file_ids: &[St
             }),
         table_name,
     )
+}
+
+/// Row encoder over `schema`'s columns at `idxs`, in that order.
+fn row_converter(schema: &arrow_schema::Schema, idxs: &[usize]) -> Result<datafusion::arrow::row::RowConverter> {
+    use datafusion::arrow::row::{RowConverter, SortField};
+    Ok(RowConverter::new(idxs.iter().map(|idx| SortField::new(schema.field(*idx).data_type().clone())).collect())?)
 }
 
 /// The run of equal keys currently in flight. `winner: None` means the carried
@@ -2349,16 +2334,14 @@ pub(crate) struct RunCollapse {
 
 impl RunCollapse {
     pub(crate) fn new(schema: &arrow_schema::Schema, keys: &[String], tiebreak: Option<&str>) -> Result<Self> {
-        use datafusion::arrow::row::{RowConverter, SortField};
         let index = |name: &str| schema.index_of(name).map_err(|_| anyhow::anyhow!("run collapse column `{name}` missing from rewrite output"));
         let key_idxs = keys.iter().map(|key| index(key)).collect::<Result<Vec<_>>>()?;
-        let field = |idx: usize| SortField::new(schema.field(idx).data_type().clone());
         Ok(Self {
-            keys: RowConverter::new(key_idxs.iter().map(|idx| field(*idx)).collect())?,
+            keys: row_converter(schema, &key_idxs)?,
             // Default `SortField` is ASC/nulls-first, so a byte compare of the
             // encoded tiebreak IS its value order and a NULL version ranks below
             // every stamped one.
-            tiebreak: tiebreak.map(|name| index(name).and_then(|idx| Ok((idx, RowConverter::new(vec![field(idx)])?)))).transpose()?,
+            tiebreak: tiebreak.map(|name| index(name).and_then(|idx| Ok((idx, row_converter(schema, &[idx])?)))).transpose()?,
             key_idxs,
             carry: None,
             audit: None,
@@ -2385,12 +2368,11 @@ impl RunCollapse {
     /// shape where a field is absent on first emit and filled on a retry — with
     /// no separate null-transition term.
     pub(crate) fn with_immutable_audit(mut self, schema: &arrow_schema::Schema, columns: &[String]) -> Result<Self> {
-        use datafusion::arrow::row::{RowConverter, SortField};
         let idxs = columns.iter().filter_map(|name| schema.index_of(name).ok()).collect::<Vec<_>>();
         if idxs.is_empty() {
             return Ok(self);
         }
-        let converter = RowConverter::new(idxs.iter().map(|idx| SortField::new(schema.field(*idx).data_type().clone())).collect())?;
+        let converter = row_converter(schema, &idxs)?;
         self.audit = Some((idxs, converter));
         Ok(self)
     }
@@ -2456,12 +2438,12 @@ impl RunCollapse {
                     }
                 }
                 _ => {
-                    match current.take() {
-                        // A closed run whose winner is the carry emits it first:
-                        // it sorts before every row of this batch.
-                        Some(OpenRun { winner: None, .. }) => out.extend(self.carry.take().map(|(row, _, _)| row)),
-                        Some(OpenRun { winner: Some(index), .. }) => winners.push(index),
-                        None => {}
+                    // A closed run whose winner is the carry emits it first: it
+                    // sorts before every row of this batch. (No open run at all
+                    // implies no carry, so the `None` arm is then a no-op.)
+                    match current.take().and_then(|open| open.winner) {
+                        Some(index) => winners.push(index),
+                        None => out.extend(self.carry.take().map(|(row, _, _)| row)),
                     }
                     current = Some(OpenRun { key, winner: Some(Self::idx(row)?), best: tiebreak });
                     self.run_immutable = immutable_at(row);

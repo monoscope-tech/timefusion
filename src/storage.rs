@@ -66,30 +66,25 @@ fn current_millis() -> u64 {
 }
 
 fn allocated_bytes(path: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|entry| {
             let path = entry.path();
             if path.file_name().is_some_and(|name| name == "metadata") {
                 return 0;
             }
-            let Ok(meta) = entry.metadata() else {
-                return 0;
-            };
-            if meta.is_dir() {
-                return allocated_bytes(&path);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                meta.blocks().saturating_mul(512)
-            }
-            #[cfg(not(unix))]
-            {
-                meta.len()
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => allocated_bytes(&path),
+                #[cfg(unix)]
+                Ok(meta) => {
+                    use std::os::unix::fs::MetadataExt;
+                    meta.blocks().saturating_mul(512)
+                }
+                #[cfg(not(unix))]
+                Ok(meta) => meta.len(),
+                Err(_) => 0,
             }
         })
         .sum()
@@ -1115,6 +1110,30 @@ impl FoyerObjectStoreCache {
         fetch_result
     }
 
+    /// Slice the part of `range` out of a live entry in `cache` under `key`,
+    /// where the entry's first byte sits at absolute offset `base`. Returns the
+    /// slice and the entry's age; `None` when the entry is absent, expired, or
+    /// too short. Refreshes the entry's sliding TTL on a hit.
+    ///
+    /// Zero-copy, second attempt. 2bb5e85 pinned the cache ENTRY
+    /// (`Bytes::from_owner(entry)`) and stalled foyer admission under scan load;
+    /// this slice shares only the `Bytes` buffer, so eviction and accounting
+    /// proceed regardless — a live slice at worst delays freeing one evicted
+    /// file body until its reader drops.
+    async fn live_slice(&self, cache: &FoyerCache, key: &str, base: u64, range: &Range<u64>, l1_max_entry_bytes: usize) -> Option<(Bytes, u64)> {
+        // Bounds first: an out-of-entry range must not cost a cache get (which
+        // promotes the entry in L1 and may read the disk tier).
+        let (start, end) = (range.start.checked_sub(base)? as usize, range.end.checked_sub(base)? as usize);
+        let entry = cache.get(key).await.ok().flatten()?;
+        let value = entry.value();
+        if value.is_expired(self.config.ttl) || end > value.data.len() {
+            return None;
+        }
+        let hit = (value.data.slice(start..end), value.age_millis());
+        self.maybe_touch(cache, key, entry, l1_max_entry_bytes);
+        Some(hit)
+    }
+
     #[instrument(
         name = "foyer_cache.get_range",
         skip_all,
@@ -1137,30 +1156,19 @@ impl FoyerObjectStoreCache {
         let mut range_meta = None;
 
         let full_cache_key = Self::make_cache_key(location);
-        if let Ok(Some(entry)) = self.cache.get(&full_cache_key).await {
-            let value = entry.value();
-            if !value.is_expired(self.config.ttl) && range.end <= value.data.len() as u64 {
-                record_range_hit(&self.stats, range.end - range.start).await;
-                span.record("cache_hit", true);
-                debug!(
-                    "Foyer cache HIT (full file) for range: {} (range: {}..{}, size: {} bytes, parquet={}, age={}ms)",
-                    location,
-                    range.start,
-                    range.end,
-                    range.end - range.start,
-                    is_parquet,
-                    value.age_millis()
-                );
-                // Zero-copy, second attempt. 2bb5e85 pinned the cache ENTRY
-                // (`Bytes::from_owner(entry)`) and stalled foyer admission
-                // under scan load; this slice shares only the `Bytes` buffer,
-                // so eviction and accounting proceed regardless — a live slice
-                // at worst delays freeing one evicted file body until its
-                // reader drops.
-                let sliced = value.data.slice(range.start as usize..range.end as usize);
-                self.maybe_touch(&self.cache, &full_cache_key, entry.clone(), self.config.l1_max_entry_bytes);
-                return Ok(sliced);
-            }
+        if let Some((sliced, age_millis)) = self.live_slice(&self.cache, &full_cache_key, 0, &range, self.config.l1_max_entry_bytes).await {
+            record_range_hit(&self.stats, range.end - range.start).await;
+            span.record("cache_hit", true);
+            debug!(
+                "Foyer cache HIT (full file) for range: {} (range: {}..{}, size: {} bytes, parquet={}, age={}ms)",
+                location,
+                range.start,
+                range.end,
+                range.end - range.start,
+                is_parquet,
+                age_millis
+            );
+            return Ok(sliced);
         }
 
         // Full-file coverage is preferred, but cache the exact coalesced data
@@ -1175,7 +1183,7 @@ impl FoyerObjectStoreCache {
                 record_range_hit(&self.stats, value.data.len() as u64).await;
                 span.record("cache_hit", true);
                 let data = value.data.clone();
-                self.maybe_touch(&self.cache, &range_cache_key, entry.clone(), self.config.l1_max_entry_bytes);
+                self.maybe_touch(&self.cache, &range_cache_key, entry, self.config.l1_max_entry_bytes);
                 return Ok(data);
             }
             bump(&self.stats, |s| s.ttl_expirations += 1).await;
@@ -1188,23 +1196,11 @@ impl FoyerObjectStoreCache {
             // (location, range), so a steady-state footer read served from cache
             // pays zero S3 round-trips. Data ranges aren't stored here and fall
             // through to the size-based classification below.
-            if let Ok(Some(entry)) = self.metadata_cache.get(&range_cache_key).await {
-                let value = entry.value();
-                if !value.is_expired(self.config.ttl) {
-                    self.record_meta_hit(&span, value.data.len() as u64).await;
-                    debug!(
-                        "Metadata cache HIT for: {} (range: {}..{}, size: {} bytes, age={}ms)",
-                        location,
-                        range.start,
-                        range.end,
-                        value.data.len(),
-                        value.age_millis()
-                    );
-                    let sliced = value.data.clone();
-                    // l1_max=0: metadata entries are tiny, always keep in L1.
-                    self.maybe_touch(&self.metadata_cache, &range_cache_key, entry.clone(), 0);
-                    return Ok(sliced);
-                }
+            // l1_max=0: metadata entries are tiny, always keep in L1.
+            if let Some((sliced, age_millis)) = self.live_slice(&self.metadata_cache, &range_cache_key, range.start, &range, 0).await {
+                self.record_meta_hit(&span, sliced.len() as u64).await;
+                debug!("Metadata cache HIT for: {} (range: {}..{}, size: {} bytes, age={}ms)", location, range.start, range.end, sliced.len(), age_millis);
+                return Ok(sliced);
             }
 
             // Range-cache miss: we need the file size to classify the request and
@@ -1232,22 +1228,14 @@ impl FoyerObjectStoreCache {
             // (warm_start..size) exists, so leading with it saves an always-miss
             // (0..size) lookup on the common footer-read path.
             let candidates: &[u64] = if warm_start == 0 { &[0] } else { &[warm_start, 0] };
-            for &candidate in candidates {
-                if candidate <= range.start && range.end <= file_size {
-                    let key = Self::make_range_cache_key(location, &(candidate..file_size));
-                    if let Ok(Some(entry)) = self.metadata_cache.get(&key).await {
-                        let value = entry.value();
-                        let (s, e) = ((range.start - candidate) as usize, (range.end - candidate) as usize);
-                        if !value.is_expired(self.config.ttl) && e <= value.data.len() {
-                            self.record_meta_hit(&span, range.end - range.start).await;
-                            // Distinct from the exact-key HIT log above so cache-key
-                            // alignment is diagnosable on a new deployment.
-                            debug!("Metadata cache HIT (containment {}..{}) for: {} (range: {}..{})", candidate, file_size, location, range.start, range.end);
-                            let sliced = value.data.slice(s..e);
-                            self.maybe_touch(&self.metadata_cache, &key, entry.clone(), 0);
-                            return Ok(sliced);
-                        }
-                    }
+            for &candidate in candidates.iter().filter(|&&c| c <= range.start && range.end <= file_size) {
+                let key = Self::make_range_cache_key(location, &(candidate..file_size));
+                if let Some((sliced, _)) = self.live_slice(&self.metadata_cache, &key, candidate, &range, 0).await {
+                    self.record_meta_hit(&span, range.end - range.start).await;
+                    // Distinct from the exact-key HIT log above so cache-key
+                    // alignment is diagnosable on a new deployment.
+                    debug!("Metadata cache HIT (containment {}..{}) for: {} (range: {}..{})", candidate, file_size, location, range.start, range.end);
+                    return Ok(sliced);
                 }
             }
 
@@ -1320,18 +1308,11 @@ impl FoyerObjectStoreCache {
                 let aligned = aligned_start..aligned_end;
                 let aligned_key = Self::make_range_cache_key(location, &aligned);
                 if aligned != range
-                    && let Ok(Some(entry)) = self.cache.get(&aligned_key).await
+                    && let Some((data, _)) = self.live_slice(&self.cache, &aligned_key, aligned.start, &range, self.config.l1_max_entry_bytes).await
                 {
-                    let value = entry.value();
-                    let start = (range.start - aligned.start) as usize;
-                    let end = start + (range.end - range.start) as usize;
-                    if !value.is_expired(self.config.ttl) && end <= value.data.len() {
-                        record_range_hit(&self.stats, range.end - range.start).await;
-                        span.record("cache_hit", true);
-                        let data = value.data.slice(start..end);
-                        self.maybe_touch(&self.cache, &aligned_key, entry.clone(), self.config.l1_max_entry_bytes);
-                        return Ok(data);
-                    }
+                    record_range_hit(&self.stats, range.end - range.start).await;
+                    span.record("cache_hit", true);
+                    return Ok(data);
                 }
                 response_slice = Some(((range.start - aligned.start) as usize, (range.end - aligned.start) as usize));
                 range_cache_key = aligned_key;
@@ -1731,49 +1712,48 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        // Handle range requests via the dedicated range cache path
-        if let Some(GetRange::Bounded(ref r)) = options.range
-            && is_unconditional(&options)
-        {
-            let range = r.clone();
-            let bytes = self.get_range_cached(location, range.clone()).await?;
-            let meta = self.head_cached(location).await.unwrap_or_else(|_| ObjectMeta {
-                location: location.clone(),
-                last_modified: Utc::now(),
-                size: range.end,
-                e_tag: None,
-                version: None,
-            });
-            return Ok(Self::make_get_result_at(bytes, meta, Attributes::new(), range.start));
-        }
-        // Suffix range (footer warm + any suffix reader): resolve to an absolute
-        // range so it shares cache keys with bounded footer reads. If we already
-        // know the size (cached meta), reuse the bounded path for free; otherwise
-        // a single suffix GET to the inner store learns the absolute range + size
-        // from the response — one round-trip, no separate HEAD.
-        if let Some(GetRange::Suffix(n)) = options.range
-            && is_unconditional(&options)
-        {
-            let n = n.max(1);
-            if let Some(meta) = self.cached_meta(location).await {
-                let range = meta.size.saturating_sub(n)..meta.size;
+        // Bounded and suffix ranges share the dedicated range-cache path: a suffix
+        // (footer warm + any suffix reader) is resolved to an ABSOLUTE range from
+        // cached meta, so it lands on the same cache keys as a bounded footer read.
+        if is_unconditional(&options) {
+            let resolved = match &options.range {
+                Some(GetRange::Bounded(r)) => Some((r.clone(), None)),
+                Some(GetRange::Suffix(n)) => self.cached_meta(location).await.map(|m| (m.size.saturating_sub((*n).max(1))..m.size, Some(m))),
+                _ => None,
+            };
+            if let Some((range, cached)) = resolved {
                 let bytes = self.get_range_cached(location, range.clone()).await?;
+                // Only the bounded arm can need a HEAD — the suffix arm resolves
+                // at all only when the meta was already cached.
+                let meta = match cached {
+                    Some(meta) => meta,
+                    None => self.head_cached(location).await.unwrap_or_else(|_| ObjectMeta {
+                        location: location.clone(),
+                        last_modified: Utc::now(),
+                        size: range.end,
+                        e_tag: None,
+                        version: None,
+                    }),
+                };
                 return Ok(Self::make_get_result_at(bytes, meta, Attributes::new(), range.start));
             }
-            let result = self.inner.get_opts(location, GetOptions { range: Some(GetRange::Suffix(n)), ..Default::default() }).await?;
-            let meta = result.meta.clone();
-            let abs_range = result.range.clone();
-            let attributes = result.attributes.clone();
-            let bytes = result.bytes().await?;
-            record_miss_with_fetch(&self.metadata_stats).await;
-            // Populate both the footer-range cache (under the absolute key bounded
-            // reads use) and the immutable-meta cache, so the next footer read is
-            // a pure cache hit.
-            if is_parquet_file(location) {
-                self.admit_range(location, Self::make_range_cache_key(location, &abs_range), bytes.clone(), &meta);
-                self.admit_meta(location, meta.clone());
+            // Suffix with unknown size: a single suffix GET to the inner store
+            // learns the absolute range + size from the response — one
+            // round-trip, no separate HEAD.
+            if let Some(GetRange::Suffix(n)) = options.range {
+                let result = self.inner.get_opts(location, GetOptions { range: Some(GetRange::Suffix(n.max(1))), ..Default::default() }).await?;
+                let (meta, abs_range, attributes) = (result.meta.clone(), result.range.clone(), result.attributes.clone());
+                let bytes = result.bytes().await?;
+                record_miss_with_fetch(&self.metadata_stats).await;
+                // Populate both the footer-range cache (under the absolute key bounded
+                // reads use) and the immutable-meta cache, so the next footer read is
+                // a pure cache hit.
+                if is_parquet_file(location) {
+                    self.admit_range(location, Self::make_range_cache_key(location, &abs_range), bytes.clone(), &meta);
+                    self.admit_meta(location, meta.clone());
+                }
+                return Ok(Self::make_get_result_at(bytes, meta, attributes, abs_range.start));
             }
-            return Ok(Self::make_get_result_at(bytes, meta, attributes, abs_range.start));
         }
         // Bypass cache for complex (conditional / non-bounded) requests
         if options.range.is_some() || options.head || !is_unconditional(&options) {
@@ -3653,9 +3633,9 @@ impl JsonCoverageLedger {
         let rows: Vec<StoredCoverage> = self
             .cells
             .iter()
-            .map(|entry| {
-                let ((source, project_id, table_name, date), entries) = (entry.key().clone(), entry.value().clone());
-                StoredCoverage { source, project_id, table_name, date, entries }
+            .map(|cell| {
+                let (source, project_id, table_name, date) = cell.key().clone();
+                StoredCoverage { source, project_id, table_name, date, entries: cell.value().clone() }
             })
             .collect();
         if !store_sidecar(&self.data_dir, ROLLUP_COVERAGE, &rows) {
@@ -3705,6 +3685,15 @@ impl JsonCoverageLedger {
         }
         stale.len()
     }
+
+    /// The single place `empty entries == retirement` is decided; true when a persist is owed.
+    fn apply(&self, cell: CoverageCell, entries: Vec<CoverageEntry>) -> bool {
+        if entries.is_empty() {
+            return self.cells.remove(&cell).is_some();
+        }
+        self.cells.insert(cell, merge_coverage(entries));
+        true
+    }
 }
 
 impl CoverageLedger for JsonCoverageLedger {
@@ -3723,12 +3712,9 @@ impl CoverageLedger for JsonCoverageLedger {
     }
 
     fn replace(&self, cell: &CoverageCell, entries: Vec<CoverageEntry>) {
-        if entries.is_empty() {
-            self.retire(cell);
-            return;
+        if self.apply(cell.clone(), entries) {
+            self.persist();
         }
-        self.cells.insert(cell.clone(), merge_coverage(entries));
-        self.persist();
     }
 
     /// One write for the whole batch. See the trait's note on why this exists.
@@ -3736,18 +3722,14 @@ impl CoverageLedger for JsonCoverageLedger {
         if cells.is_empty() {
             return;
         }
-        for (cell, entries) in cells {
-            if entries.is_empty() {
-                self.cells.remove(&cell);
-            } else {
-                self.cells.insert(cell, merge_coverage(entries));
-            }
-        }
+        cells.into_iter().for_each(|(cell, entries)| {
+            self.apply(cell, entries);
+        });
         self.persist();
     }
 
     fn retire(&self, cell: &CoverageCell) {
-        if self.cells.remove(cell).is_some() {
+        if self.apply(cell.clone(), Vec::new()) {
             self.persist();
         }
     }

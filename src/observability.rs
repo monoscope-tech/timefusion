@@ -628,10 +628,11 @@ struct SectionStat {
 static SECTION_STATS: LazyLock<dashmap::DashMap<(&'static str, &'static str), SectionStat>> = LazyLock::new(dashmap::DashMap::new);
 
 fn record_section(component: &'static str, name: &'static str, elapsed: Duration) {
+    let us = elapsed.as_micros() as u64;
     let entry = SECTION_STATS.entry((component, name)).or_default();
     entry.count.fetch_add(1, Relaxed);
-    entry.total_us.fetch_add(elapsed.as_micros() as u64, Relaxed);
-    entry.max_us.fetch_max(elapsed.as_micros() as u64, Relaxed);
+    entry.total_us.fetch_add(us, Relaxed);
+    entry.max_us.fetch_max(us, Relaxed);
 }
 
 /// Times a section that occupies a runtime worker without yielding — a
@@ -1648,9 +1649,7 @@ pub fn shutdown_telemetry() {
     info!("Shutting down OpenTelemetry");
     // Tracer/meter providers shut down when dropped; flush buffered logs
     // explicitly so the final shutdown lines reach the collector.
-    if let Some(p) = LOGGER_PROVIDER.get() {
-        let _ = p.shutdown();
-    }
+    let _ = LOGGER_PROVIDER.get().map(SdkLoggerProvider::shutdown);
 }
 
 /// Cell-capped preview formatter for datafusion-tracing spans, replacing the
@@ -1919,15 +1918,9 @@ mod imp {
         dumps.into_iter().skip(5).for_each(|(_, old)| {
             let _ = std::fs::remove_file(old);
         });
-        let mut archives: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("prekill-")))
-            .map(|e| e.path())
-            .collect();
-        archives.sort(); // `prekill-<unix secs>` sorts oldest-first by name
-        archives.into_iter().rev().skip(3).for_each(|old| {
+        // Newest-by-mtime, not by the `prekill-<unix secs>` name: same ordering in
+        // practice, and it reuses the pruner's clock-independent helper.
+        newest_first(dir, |n| n.starts_with("prekill-")).into_iter().skip(3).for_each(|(_, old)| {
             let _ = std::fs::remove_dir_all(&old);
         });
         info!("profiling: archived previous process's final heap dumps → {arch:?}");

@@ -81,6 +81,19 @@ pub struct RollupMeasure {
     pub filter: Option<String>,
 }
 
+/// `(name, data_type, nullable)` of the columns every rollup tier carries.
+/// One list: `synthesize` builds them and `validate` refuses a dimension that
+/// collides with one, so the two cannot drift.
+const IDENTITY_FIELDS: [(&str, &str, bool); 7] = [
+    ("project_id", "Utf8", true),
+    ("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", false),
+    ("date", "Date32", false),
+    ("id", "Utf8", false),
+    ("updated_at", "Timestamp(Microsecond, Some(\"UTC\"))", false),
+    ("deleted", "Boolean", true),
+    ("rollup_generation", "Utf8", false),
+];
+
 impl RollupSpec {
     /// `{source}_rollup_{name|grain}` — see `rollup_table_is_named_after_its_source`.
     pub fn table_name(&self, source: &str) -> String {
@@ -119,9 +132,7 @@ impl RollupSpec {
     }
 
     fn validate(&self, source: &TableSchema) -> anyhow::Result<()> {
-        const IDENTITY_FIELDS: [&str; 7] = ["project_id", "timestamp", "date", "id", "updated_at", "deleted", "rollup_generation"];
         let target = self.table_name(&source.table_name);
-        let field = |name: &str| source.fields.iter().find(|f| f.name == name);
         let is_ident = |name: &str| {
             let mut chars = name.chars();
             matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_')) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -131,9 +142,12 @@ impl RollupSpec {
         anyhow::ensure!(self.name.as_deref().is_none_or(is_ident), "rollup {target}: name must be an SQL identifier");
         let mut names = HashSet::new();
         for dimension in &self.dimensions {
-            anyhow::ensure!(field(dimension).is_some(), "rollup {target}: unknown dimension `{dimension}`");
+            anyhow::ensure!(source.field(dimension).is_some(), "rollup {target}: unknown dimension `{dimension}`");
             anyhow::ensure!(names.insert(dimension), "rollup {target}: duplicate dimension `{dimension}`");
-            anyhow::ensure!(!IDENTITY_FIELDS.contains(&dimension.as_str()), "rollup {target}: dimension `{dimension}` collides with an identity field");
+            anyhow::ensure!(
+                !IDENTITY_FIELDS.iter().any(|(name, ..)| *name == dimension.as_str()),
+                "rollup {target}: dimension `{dimension}` collides with an identity field"
+            );
         }
         anyhow::ensure!(!self.measures.is_empty(), "rollup {target}: needs at least one measure");
         if let Some(base) = &self.derive_from {
@@ -190,20 +204,19 @@ impl RollupSpec {
                 agg != "first" || self.first_companion(measure).is_some(),
                 "rollup {target}: `first` measure `{name}` needs a companion `{{agg: min, column: timestamp}}` measure carrying the same filter"
             );
-            match (agg.as_str(), measure.column.as_deref()) {
-                ("count", None) => {}
-                ("count" | "sum" | "min" | "max" | "hll" | "first", Some(column)) => {
-                    anyhow::ensure!(field(column).is_some(), "rollup {target}: unknown column `{column}`")
-                }
-                ("tdigest", Some(column)) => {
-                    let Some(data_type) = field(column).map(|f| f.data_type.as_str()) else { anyhow::bail!("rollup {target}: unknown column `{column}`") };
+            // `agg` is one of the seven above, so the only column rules left are
+            // "count may omit it" and "tdigest needs a numeric one".
+            match measure.column.as_deref() {
+                None => anyhow::ensure!(agg == "count", "rollup {target}: `{agg}` measure `{name}` needs a source column"),
+                Some(column) => {
+                    let Some(data_type) = source.field(column).map(|f| f.data_type.as_str()) else {
+                        anyhow::bail!("rollup {target}: unknown column `{column}`")
+                    };
                     anyhow::ensure!(
-                        matches!(data_type, "Int32" | "Int64" | "UInt32" | "UInt64" | "Float64"),
+                        agg != "tdigest" || matches!(data_type, "Int32" | "Int64" | "UInt32" | "UInt64" | "Float64"),
                         "rollup {target}: tdigest column `{column}` must be numeric"
                     );
                 }
-                (_, None) => anyhow::bail!("rollup {target}: `{agg}` measure `{name}` needs a source column"),
-                (aggregate, Some(_)) => anyhow::bail!("rollup {target}: unsupported aggregate `{aggregate}`"),
             }
             anyhow::ensure!(measure.filter.as_deref().is_none_or(|f| !f.trim().is_empty()), "rollup {target}: measure `{name}` has an empty filter");
         }
@@ -215,66 +228,49 @@ impl RollupSpec {
     /// dimensions keep the source's own type and nullability; measures are
     /// Int64 (count) or the source column's type (sum/min/max).
     pub fn synthesize(&self, source: &TableSchema) -> anyhow::Result<TableSchema> {
-        let src_field = |n: &str| {
-            source
-                .fields
-                .iter()
-                .find(|f| f.name == n)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("rollup {}: unknown column `{n}`", self.table_name(&source.table_name)))
-        };
+        let target = self.table_name(&source.table_name);
+        let src_field = |n: &str| source.field(n).cloned().ok_or_else(|| anyhow::anyhow!("rollup {target}: unknown column `{n}`"));
         let plain = |name: &str, data_type: &str, nullable: bool| FieldDef {
             name: name.to_string(),
             data_type: data_type.to_string(),
             nullable,
-            tantivy: None,
-            dictionary: None,
-            bloom_filter: false,
             // A tier is rebuilt wholesale, never UPDATEd.
-            mutable: false,
+            ..Default::default()
         };
-        let fields = [
-            ("project_id", "Utf8", true),
-            ("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", false),
-            ("date", "Date32", false),
-            ("id", "Utf8", false),
-            ("updated_at", "Timestamp(Microsecond, Some(\"UTC\"))", false),
-            ("deleted", "Boolean", true),
-            ("rollup_generation", "Utf8", false),
-        ]
-        .into_iter()
-        .map(|(name, data_type, nullable)| Ok(plain(name, data_type, nullable)))
-        // Dimensions are always nullable in the rollup: GROUP BY emits a NULL
-        // group for rows missing the dimension, even when the source column is
-        // not.
-        //
-        // `tantivy: None` explicitly, against the struct update: `kind` and
-        // `status_code` are tantivy-indexed on the source, so inheriting the
-        // config put every rollup tier into `indexed_set()` — 52% of the
-        // indexed file population — and turned a dimension equality into a
-        // `text_match` the prefilter then serves. Measured on prod 2026-08-24,
-        // same rows, 5 reps: `kind = 'server'` over a 2-day rollup window took
-        // 8.2-10.9s against 0.28-1.8s for an opaque control, and a routed 7d
-        // dashboard went 7.2s -> 14.5s when a dimension filter was added. The
-        // index is read, used, and a loss.
-        .chain(self.dimensions.iter().map(|d| Ok(FieldDef { nullable: true, tantivy: None, ..src_field(d)? })))
-        .chain(self.measures.iter().map(|m| {
-            let ty = match (m.agg.as_str(), &m.column) {
-                ("count", _) => "Int64".to_string(),
-                // `src_field` for its error, not its type: a sketch column is
-                // always Binary, but naming a column that does not exist must
-                // still fail HERE rather than synthesize a phantom field that
-                // only breaks when the build SQL runs.
-                ("tdigest" | "hll", Some(c)) => src_field(c).map(|_| "Binary".to_string())?,
-                (_, Some(c)) => src_field(c)?.data_type,
-                (a, None) => anyhow::bail!("rollup {}: `{a}` measure `{}` needs a source column", self.table_name(&source.table_name), m.name),
-            };
-            // A measure over an empty group is NULL, and count is never NULL.
-            Ok(plain(&m.name, &ty, m.agg != "count"))
-        }))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        let fields = IDENTITY_FIELDS
+            .into_iter()
+            .map(|(name, data_type, nullable)| Ok(plain(name, data_type, nullable)))
+            // Dimensions are always nullable in the rollup: GROUP BY emits a NULL
+            // group for rows missing the dimension, even when the source column is
+            // not.
+            //
+            // `tantivy: None` explicitly, against the struct update: `kind` and
+            // `status_code` are tantivy-indexed on the source, so inheriting the
+            // config put every rollup tier into `indexed_set()` — 52% of the
+            // indexed file population — and turned a dimension equality into a
+            // `text_match` the prefilter then serves. Measured on prod 2026-08-24,
+            // same rows, 5 reps: `kind = 'server'` over a 2-day rollup window took
+            // 8.2-10.9s against 0.28-1.8s for an opaque control, and a routed 7d
+            // dashboard went 7.2s -> 14.5s when a dimension filter was added. The
+            // index is read, used, and a loss.
+            .chain(self.dimensions.iter().map(|d| Ok(FieldDef { nullable: true, tantivy: None, ..src_field(d)? })))
+            .chain(self.measures.iter().map(|m| {
+                let ty = match (m.agg.as_str(), &m.column) {
+                    ("count", _) => "Int64".to_string(),
+                    // `src_field` for its error, not its type: a sketch column is
+                    // always Binary, but naming a column that does not exist must
+                    // still fail HERE rather than synthesize a phantom field that
+                    // only breaks when the build SQL runs.
+                    ("tdigest" | "hll", Some(c)) => src_field(c).map(|_| "Binary".to_string())?,
+                    (_, Some(c)) => src_field(c)?.data_type,
+                    (a, None) => anyhow::bail!("rollup {target}: `{a}` measure `{}` needs a source column", m.name),
+                };
+                // A measure over an empty group is NULL, and count is never NULL.
+                Ok(plain(&m.name, &ty, m.agg != "count"))
+            }))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(TableSchema {
-            table_name: self.table_name(&source.table_name),
+            table_name: target.clone(),
             // Same partitioning as the source, so ProjectRoutingTable gives
             // multi-tenant isolation and date pruning for free.
             partitions: source.partitions.clone(),
@@ -411,10 +407,14 @@ impl TableSchema {
         self.time_column.as_deref().unwrap_or("timestamp")
     }
 
+    pub fn field(&self, name: &str) -> Option<&FieldDef> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
     /// Arrow type + nullability of one declared field, without building the
     /// whole `schema_ref()` (which allocates ~100 fields per call).
     pub fn field_def(&self, name: &str) -> Option<(ArrowDataType, bool)> {
-        let f = self.fields.iter().find(|f| f.name == name)?;
+        let f = self.field(name)?;
         Some((parse_arrow_data_type(&f.data_type).ok()?, f.nullable))
     }
 
@@ -448,26 +448,20 @@ impl TableSchema {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        for field in &self.fields {
-            if let Some(config) = &field.tantivy
-                && config.list_mode == TantivyListMode::Elements
-            {
-                anyhow::ensure!(
-                    config.indexed
-                        && config.tokenizer.as_deref() == Some("raw")
-                        && config.flatten.is_none()
-                        && matches!(parse_arrow_data_type(&field.data_type)?, ArrowDataType::List(inner) if matches!(inner.data_type(), ArrowDataType::Utf8 | ArrowDataType::Utf8View)),
-                    "schema `{}`: element index `{}` requires an indexed string list, raw tokenizer and no flattening",
-                    self.table_name,
-                    field.name
-                );
-            }
+        let element_indexes = self.fields.iter().filter_map(|f| Some((f, f.tantivy.as_ref()?))).filter(|(_, c)| c.list_mode == TantivyListMode::Elements);
+        for (field, config) in element_indexes {
+            anyhow::ensure!(
+                config.indexed
+                    && config.tokenizer.as_deref() == Some("raw")
+                    && config.flatten.is_none()
+                    && matches!(parse_arrow_data_type(&field.data_type)?, ArrowDataType::List(inner) if matches!(inner.data_type(), ArrowDataType::Utf8 | ArrowDataType::Utf8View)),
+                "schema `{}`: element index `{}` requires an indexed string list, raw tokenizer and no flattening",
+                self.table_name,
+                field.name
+            );
         }
         let field = |role: &str, name: &str| {
-            self.fields
-                .iter()
-                .find(|f| f.name == name)
-                .ok_or_else(|| anyhow::anyhow!("schema `{}`: {role} references unknown field `{}`", self.table_name, name))
+            self.field(name).ok_or_else(|| anyhow::anyhow!("schema `{}`: {role} references unknown field `{}`", self.table_name, name))
         };
         // A `for` with `?`: each item both fails fast and needs the `?` on
         // `field(..)` inside the check itself.
@@ -580,7 +574,7 @@ pub struct SortingColumnDef {
     pub nulls_first: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct FieldDef {
     pub name: String,
     pub data_type: String,
@@ -739,10 +733,11 @@ impl SchemaRegistry {
         // Two rollups generating one name is a config error, and WHICH error it
         // is depends on whether they group the same way — so say so, rather
         // than making the operator infer it from a name collision.
-        for src in schemas.values() {
-            let Some((a, b)) = src.rollups.iter().tuple_combinations().find(|(a, b)| a.table_name(&src.table_name) == b.table_name(&src.table_name)) else {
-                continue;
-            };
+        if let Some((src, a, b)) = schemas
+            .values()
+            .flat_map(|src| src.rollups.iter().tuple_combinations().map(move |(a, b)| (src, a, b)))
+            .find(|(src, a, b)| a.table_name(&src.table_name) == b.table_name(&src.table_name))
+        {
             let name = a.table_name(&src.table_name);
             assert!(
                 a.dimensions != b.dimensions,
@@ -879,15 +874,12 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
         schema
             .fields()
             .iter()
-            .map(|f| {
-                if is_variant_type(f.data_type()) {
-                    Arc::new(
-                        Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable())
-                            .with_metadata(HashMap::from([("tf.pg_type".to_string(), "jsonb".to_string())])),
-                    )
-                } else {
-                    f.clone()
-                }
+            .map(|f| match is_variant_type(f.data_type()) {
+                true => Arc::new(
+                    Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable())
+                        .with_metadata(HashMap::from([("tf.pg_type".to_string(), "jsonb".to_string())])),
+                ),
+                false => f.clone(),
             })
             .collect::<Vec<FieldRef>>(),
     ))

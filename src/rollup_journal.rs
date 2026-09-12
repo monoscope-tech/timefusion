@@ -45,21 +45,13 @@ fn path(data_dir: &Path) -> PathBuf {
 pub fn load(data_dir: &Path) -> Vec<RollupInvalidation> {
     let path = path(data_dir);
     match fs::read(&path).map(|data| serde_json::from_slice::<Snapshot>(&data)) {
-        Ok(Ok(snapshot)) if snapshot.version == VERSION => snapshot.entries,
-        Ok(Ok(snapshot)) => {
-            warn!(?path, version = snapshot.version, "discarding unsupported rollup invalidation journal");
-            Vec::new()
-        }
-        Ok(Err(error)) => {
-            warn!(?path, %error, "discarding unreadable rollup invalidation journal");
-            Vec::new()
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            warn!(?path, %error, "failed to load rollup invalidation journal");
-            Vec::new()
-        }
+        Ok(Ok(snapshot)) if snapshot.version == VERSION => return snapshot.entries,
+        Ok(Ok(snapshot)) => warn!(?path, version = snapshot.version, "discarding unsupported rollup invalidation journal"),
+        Ok(Err(error)) => warn!(?path, %error, "discarding unreadable rollup invalidation journal"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => warn!(?path, %error, "failed to load rollup invalidation journal"),
     }
+    Vec::new()
 }
 
 /// Atomically and durably replace the journal.
@@ -69,9 +61,7 @@ pub fn load(data_dir: &Path) -> Vec<RollupInvalidation> {
 /// redundant rebuild after restart.
 pub fn store(data_dir: &Path, entries: &[RollupInvalidation]) -> std::io::Result<()> {
     let path = path(data_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    path.parent().map_or(Ok(()), fs::create_dir_all)?;
     let bytes = serde_json::to_vec(&Snapshot { version: VERSION, entries }).map_err(std::io::Error::other)?;
     crate::write::wal::write_atomic_with(&path, true, |file| file.write_all(&bytes))
 }

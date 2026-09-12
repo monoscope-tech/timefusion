@@ -16,12 +16,31 @@ use datafusion::{
     execution::context::TaskContext,
     physical_plan::{ExecutionPlan, execute_stream},
 };
+use itertools::Itertools;
+
+/// `None` on overflow, so each caller keeps its own context message.
+fn total_rows(batches: &[RecordBatch]) -> Option<usize> {
+    batches.iter().try_fold(0_usize, |sum, batch| sum.checked_add(batch.num_rows()))
+}
+
+fn filled_mask(rows: usize, value: bool) -> BooleanBufferBuilder {
+    let mut mask = BooleanBufferBuilder::new(rows);
+    mask.append_n(rows, value);
+    mask
+}
+
+/// Physical rows of a source whose visibility mask must cover exactly those rows.
+fn masked_rows(batches: &[RecordBatch], live: &BooleanBuffer) -> Result<usize> {
+    let rows = total_rows(batches).context("visibility row count overflow")?;
+    ensure!(rows == live.len(), "visibility mask length differs from physical row count");
+    Ok(rows)
+}
 
 /// Exact daily count derived from complete Delta winner resolution. File names
 /// alone are insufficient: a same-path deletion-vector update changes the proof.
 /// Keeping this small result in the manifest avoids retaining every event key.
 #[serde_with::serde_as]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PartitionCountProof {
     version: u32,
     #[serde_as(as = "serde_with::DisplayFromStr")]
@@ -56,14 +75,10 @@ impl PartitionCountProof {
         })
     }
 
+    /// Rebuilding the proof is the whole check: any field `new` derives from the
+    /// captured view — including `version` — must still match what was recorded.
     pub fn matches(&self, root: &url::Url, files: &crate::read::CountFiles, table: &crate::schema::TableSchema) -> bool {
-        self.version == 1
-            && self.root == *root
-            && self.files == *files
-            && self.keys == table.dedup_keys
-            && self.tiebreak == table.dedup_tiebreak
-            && self.tombstone == table.tombstone_column
-            && Self::visibility_schema(table).is_ok_and(|schema| schema == self.schema)
+        Self::new(root.clone(), files.clone(), table, self.logical_count).is_ok_and(|current| current == *self)
     }
 }
 
@@ -76,14 +91,12 @@ pub fn relative_source_path(root: &url::Url, source: &str) -> Result<Option<Stri
         return Ok(Some(Path::parse(source)?.to_string()));
     }
     let source = url::Url::parse(source)?;
-    if source.scheme() != root.scheme()
+    let differs = source.scheme() != root.scheme()
         || source.host_str() != root.host_str()
         || source.port() != root.port()
         || source.username() != root.username()
-        || source.password() != root.password()
-        || source.query().is_some()
-        || source.fragment().is_some()
-    {
+        || source.password() != root.password();
+    if differs || source.query().is_some() || source.fragment().is_some() {
         return Ok(None);
     }
     let path = Path::from_url_path(source.path())?;
@@ -139,10 +152,8 @@ impl SourceRows {
         }
         ensure!(ranges.iter().all(|(lo, hi)| lo < hi), "memory authority ranges must be nonempty");
         let ranges = crate::write::mem_buffer::merge_ranges(ranges.to_vec());
-        let rows = self.batches.iter().try_fold(0_usize, |sum, batch| sum.checked_add(batch.num_rows())).context("visibility row count overflow")?;
-        ensure!(rows == self.live.len(), "visibility mask length differs from physical row count");
+        let rows = masked_rows(&self.batches, &self.live)?;
         let mut live = BooleanBufferBuilder::new(rows);
-        let mut ordinal = 0;
         for batch in &self.batches {
             let column = batch.column_by_name(timestamp).context("visibility source is missing its timestamp")?;
             ensure!(
@@ -150,12 +161,11 @@ impl SourceRows {
                 "visibility timestamp must use microseconds"
             );
             let timestamps = crate::read::bound_slice(column).context("invalid visibility timestamp representation")?;
-            for (row, &value) in timestamps.iter().enumerate() {
-                ensure!(!column.is_null(row), "visibility timestamp contains nulls");
+            ensure!(column.null_count() == 0, "visibility timestamp contains nulls");
+            for &value in timestamps {
                 let next = ranges.partition_point(|&(lo, _)| lo <= value);
                 let covered = next > 0 && value < ranges[next - 1].1;
-                live.append(self.live.value(ordinal) && !covered);
-                ordinal += 1;
+                live.append(self.live.value(live.len()) && !covered);
             }
         }
         self.live = live.finish();
@@ -178,10 +188,8 @@ pub async fn resolve_with_memory(
     context: Arc<TaskContext>,
 ) -> Result<ResolvedSnapshot> {
     ensure!(keys.iter().any(|key| key == "timestamp"), "time-window visibility requires timestamp in the immutable key");
-    for source in &mut delta {
-        source.exclude_memory_ranges("timestamp", &memory.covered_ranges)?;
-    }
-    let rows = memory.batches.iter().try_fold(0_usize, |sum, batch| sum.checked_add(batch.num_rows())).context("memory snapshot row count overflow")?;
+    delta.iter_mut().try_for_each(|source| source.exclude_memory_ranges("timestamp", &memory.covered_ranges))?;
+    let rows = total_rows(&memory.batches).context("memory snapshot row count overflow")?;
     delta.push(SourceRows { batches: memory.batches, live: BooleanBuffer::new_set(rows) });
     let winners = winner_masks(&delta, keys, tiebreak, tombstone, context).await?;
     Ok(ResolvedSnapshot { sources: delta, winners })
@@ -331,8 +339,7 @@ pub async fn deletion_vector_mask(
     tokio::task::spawn_blocking(move || {
         let deleted = descriptor.read(log_store.engine(None).storage_handler(), log_store.root_url())?;
         ensure!(i64::try_from(deleted.len())? == descriptor.cardinality, "deletion vector cardinality differs from its snapshot descriptor");
-        let mut live = BooleanBufferBuilder::new(rows);
-        live.append_n(rows, true);
+        let mut live = filled_mask(rows, true);
         for row in deleted.iter() {
             let row = usize::try_from(row)?;
             ensure!(row < rows, "deletion vector ordinal exceeds its physical file");
@@ -362,21 +369,20 @@ pub async fn winner_masks(
     };
     ensure!(!keys.is_empty(), "winner masks require a complete deduplication key");
     let source_schema = first.schema();
-    let mut projection = Vec::new();
-    for name in keys.iter().map(String::as_str).chain(tiebreak).chain(tombstone) {
-        let index = source_schema.index_of(name).with_context(|| format!("missing visibility column: {name}"))?;
-        if !projection.contains(&index) {
-            projection.push(index);
-        }
-    }
+    let projection = keys
+        .iter()
+        .map(String::as_str)
+        .chain(tiebreak)
+        .chain(tombstone)
+        .unique()
+        .map(|name| source_schema.index_of(name).with_context(|| format!("missing visibility column: {name}")))
+        .collect::<Result<Vec<_>>>()?;
     let narrow_schema = source_schema.project(&projection)?;
     let schema = lineage_schema(&Arc::new(narrow_schema))?;
     let mut batches = Vec::new();
     for (source_id, source) in sources.iter().enumerate() {
         let source_id = u32::try_from(source_id)?;
-        let physical_rows =
-            source.batches.iter().try_fold(0_usize, |total, batch| total.checked_add(batch.num_rows())).context("visibility row count overflow")?;
-        ensure!(physical_rows == source.live.len(), "visibility mask length differs from physical row count");
+        masked_rows(&source.batches, &source.live)?;
         let mut offset = 0;
         for batch in &source.batches {
             ensure!(batch.schema() == source_schema, "visibility sources have incompatible schemas");
@@ -406,9 +412,9 @@ pub(crate) fn lineage_schema(schema: &arrow::datatypes::SchemaRef) -> Result<arr
 pub(crate) fn lineage_batch(batch: &RecordBatch, live: &BooleanBuffer, schema: arrow::datatypes::SchemaRef, source: u32, offset: usize) -> Result<RecordBatch> {
     ensure!(batch.num_rows() == live.len(), "lineage mask differs from batch rows");
     let end = offset.checked_add(batch.num_rows()).context("lineage ordinal overflow")?;
-    let mut columns = batch.columns().to_vec();
-    columns.push(Arc::new(UInt32Array::from_value(source, batch.num_rows())));
-    columns.push(Arc::new(UInt64Array::from_iter_values((u64::try_from(offset)?)..u64::try_from(end)?)));
+    let lineage: [ArrayRef; 2] =
+        [Arc::new(UInt32Array::from_value(source, batch.num_rows())), Arc::new(UInt64Array::from_iter_values((u64::try_from(offset)?)..u64::try_from(end)?))];
+    let columns = batch.columns().iter().cloned().chain(lineage).collect::<Vec<_>>();
     Ok(filter_record_batch(&RecordBatch::try_new(schema, columns)?, &BooleanArray::new(live.clone(), None))?)
 }
 
@@ -454,8 +460,7 @@ impl datafusion::physical_plan::streaming::PartitionStream for FileVisibilitySou
         let input = futures::stream::once(async move {
             ensure!(source.owner.size() >= source.file.retained_bytes()?, "prepared source lacks metadata reservation");
             let projection = (0..source.schema.fields().len().checked_sub(2).context("missing lineage schema")?).collect::<Vec<_>>();
-            let stream = source.file.stream(Arc::new(source.schema.project(&projection)?))?;
-            Ok::<_, anyhow::Error>(stream)
+            source.file.stream(Arc::new(source.schema.project(&projection)?))
         })
         .try_flatten();
         let source = self.clone();
@@ -505,8 +510,7 @@ pub(crate) async fn stream_winner_masks(
     let ordering = keys
         .iter()
         .map(String::as_str)
-        .filter(|key| *key == "timestamp")
-        .chain(keys.iter().map(String::as_str).filter(|key| *key != "timestamp"))
+        .sorted_by_key(|key| *key != "timestamp")
         .map(|name| (name, ascending))
         .chain(tiebreak.map(|name| (name, arrow::compute::SortOptions { descending: true, nulls_first: false })))
         .chain(VISIBILITY_LINEAGE.map(|name| (name, ascending)))
@@ -519,14 +523,7 @@ pub(crate) async fn stream_winner_masks(
     let reservation = datafusion::execution::memory_pool::MemoryConsumer::new("TantivyWinnerMasks").register(context.memory_pool());
     let bytes = source_rows.iter().map(|rows| rows.div_ceil(8)).try_fold(0_usize, usize::checked_add).context("winner mask size overflow")?;
     reservation.try_resize(bytes)?;
-    let mut masks = source_rows
-        .iter()
-        .map(|&rows| {
-            let mut mask = BooleanBufferBuilder::new(rows);
-            mask.append_n(rows, false);
-            mask
-        })
-        .collect::<Vec<_>>();
+    let mut masks = source_rows.iter().map(|&rows| filled_mask(rows, false)).collect_vec();
     let allocated = masks.iter().map(|mask| mask.capacity().div_ceil(8)).try_fold(0_usize, usize::checked_add).context("winner mask allocation overflow")?;
     reservation.try_resize(allocated)?;
     let mut stream = execute_stream(Arc::new(plan), context)?;

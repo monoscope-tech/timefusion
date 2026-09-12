@@ -437,8 +437,12 @@ async fn run_redrive_dml_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     db.shutdown().await
 }
 
+/// `s3://<bucket>/<table_prefix>/<kind>` — the tantivy and bloom sidecar roots.
+async fn sidecar_store(db: &Database, cfg: &AppConfig, bucket: &str, kind: &str) -> anyhow::Result<Arc<dyn object_store::ObjectStore>> {
+    db.create_object_store(&format!("s3://{bucket}/{}/{kind}", cfg.core.timefusion_table_prefix), &cfg.aws.build_storage_options(None)).await
+}
+
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
-    // Initialize OpenTelemetry with OTLP exporter
     observability::init_telemetry(&cfg.telemetry)?;
     // AFTER init_telemetry: config is built before the subscriber exists, so
     // logging the tree at derivation time is silently swallowed — which is why
@@ -453,7 +457,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Create Arc<AppConfig> for passing to components
     let cfg_arc = Arc::new(cfg.clone());
 
     // Bind :5432 immediately, before the slow startup work (Database open,
@@ -486,12 +489,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // which releases the lock); stop-first shortens the handoff but isn't required.
     let _wal_dir_lock = timefusion::write::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?;
 
-    // Initialize database with explicit config
     let t_db = std::time::Instant::now();
     let mut db = Database::with_config(Arc::clone(&cfg_arc)).await?;
     info!("bootstrap.phase=database_init elapsed_ms={}", t_db.elapsed().as_millis());
 
-    // Initialize BufferedWriteLayer with explicit config
     info!(
         "BufferedWriteLayer config: wal_dir={:?}, flush_interval={}s, retention={}min",
         cfg.core.wal_dir(),
@@ -499,7 +500,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         cfg.buffer.retention_mins()
     );
 
-    // Create buffered layer with delta write callback
     let db_for_callback = db.clone();
     let delta_write_callback: timefusion::write::DeltaWriteCallback =
         Arc::new(move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>, wal_watermark: timefusion::write::DeltaWatermark| {
@@ -550,8 +550,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         error!("Schema declares indexed columns but AWS_S3_BUCKET is unset — Tantivy disabled, queries will scan");
         None
     } else {
-        let storage_uri = format!("s3://{bucket}/{}/tantivy", cfg.core.timefusion_table_prefix);
-        let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+        let obj_store = sidecar_store(&db, cfg, bucket, "tantivy").await?;
         let tcfg = Arc::new(cfg.tantivy.clone());
         let svc = Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone()));
         layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&svc)));
@@ -564,8 +563,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         Some(svc)
     };
     if cfg.maintenance.timefusion_file_bloom_pruning && !bucket.is_empty() {
-        let storage_uri = format!("s3://{bucket}/{}/bloom_sidecars", cfg.core.timefusion_table_prefix);
-        let store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+        let store = sidecar_store(&db, cfg, bucket, "bloom_sidecars").await?;
         db = db.with_bloom_prune(Arc::new(timefusion::read::bloom_prune::BloomPruneRegistry::new(
             store,
             cfg.maintenance.timefusion_bloom_registry_cap_mb * 1024 * 1024,
@@ -661,20 +659,16 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         info!("bootstrap.phase=delta_cursor_reconcile elapsed_ms={}", t_delta.elapsed().as_millis());
     }
 
-    // Recover from WAL on startup
     let t_wal = std::time::Instant::now();
     let recovery_stats = buffered_layer.recover_from_wal().await?;
     info!("bootstrap.phase=wal_replay entries={} elapsed_ms={}", recovery_stats.entries_replayed, t_wal.elapsed().as_millis());
 
-    // Start background tasks (flush and eviction)
     buffered_layer.start_background_tasks().await;
     info!("BufferedWriteLayer background tasks started");
 
-    // Apply buffered layer to database
     db = db.with_buffered_layer(Arc::clone(&buffered_layer));
     db.start_dml_coalescer();
 
-    // Start maintenance schedulers for regular optimize and vacuum
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
@@ -1061,8 +1055,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // index entries and leaves its outputs unindexed until a server backfill.
     let db = match (cfg.tantivy.indexed_tables().is_empty(), cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default()) {
         (false, bucket) if !bucket.is_empty() => {
-            let storage_uri = format!("s3://{bucket}/{}/tantivy", cfg.core.timefusion_table_prefix);
-            let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
+            let obj_store = sidecar_store(&db, cfg, bucket, "tantivy").await?;
             db.with_tantivy_indexer(Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store, Arc::new(cfg.tantivy.clone()))))
         }
         _ => db,
@@ -1091,7 +1084,8 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         let total: usize = dates
             .iter()
             .map(|d| {
-                let n = uris.iter().filter(|u| u.contains(&pid_frag) && u.contains(&format!("date={d}"))).count();
+                let date_frag = format!("date={d}");
+                let n = uris.iter().filter(|u| u.contains(&pid_frag) && u.contains(&date_frag)).count();
                 println!("  date={d}: {n} files");
                 n
             })

@@ -7,6 +7,15 @@ static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 const MIB: usize = 1024 * 1024;
 const GIB: usize = 1024 * 1024 * 1024;
 
+/// Field-forwarding accessors. `name: Type = (field <tail>);` expands to
+/// `pub fn name(&self) -> Type { self.field <tail> }`; `<tail>` is any suffix
+/// expression (`.max(1)`, `* MIB`, `.join("wal")`).
+macro_rules! getters {
+    ($($(#[$m:meta])* $name:ident: $ty:ty = ($field:ident $($tail:tt)*);)*) => {
+        $($(#[$m])* pub fn $name(&self) -> $ty { self.$field $($tail)* })*
+    };
+}
+
 fn read_parsed<T>(path: &str, parse: impl FnOnce(&str) -> Option<T>) -> Option<T> {
     std::fs::read_to_string(path).ok().and_then(|s| parse(&s))
 }
@@ -147,11 +156,6 @@ pub enum BudgetProfile {
     #[default]
     Server,
     MaintenanceCli,
-}
-
-/// Anything unrecognised (including unset) is the server profile.
-fn profile_from_env() -> BudgetProfile {
-    env_parse("TIMEFUSION_BUDGET_PROFILE").unwrap_or_default()
 }
 
 // 0.20, down from 0.25: sampled pool usage sat at 0 while the 70% memory
@@ -389,43 +393,27 @@ impl DerivedBudget {
     /// is `TIMEFUSION_MEMORY_BUDGET_GB`, which can lower (never raise) the one
     /// number the whole tree derives from — see `env_memory_budget_bytes`.
     pub fn compute() -> Self {
-        Self::from_limits_with_profile(effective_limit(detect_memory_limit_clamped(), env_memory_budget_bytes()), detect_cores(), profile_from_env())
+        // Anything unrecognised (including unset) is the server profile.
+        let profile = env_parse("TIMEFUSION_BUDGET_PROFILE").unwrap_or_default();
+        Self::from_limits_with_profile(effective_limit(detect_memory_limit_clamped(), env_memory_budget_bytes()), detect_cores(), profile)
     }
 
-    pub fn query_pool_bytes(&self) -> usize {
-        self.query_pool_bytes
-    }
-
-    pub fn cores(&self) -> usize {
-        self.cores
-    }
-
-    pub fn buffer_max_bytes(&self) -> usize {
-        self.ingest_buffer_bytes
-    }
-
-    pub fn foyer_memory_bytes(&self) -> usize {
-        self.foyer_memory_bytes
-    }
-
-    /// The shared cache reservation is split between raw object bytes and
-    /// exact logical-count indexes. Keeping both inside the existing 10%
-    /// reservation prevents the derived cache from becoming untracked heap.
-    pub fn object_cache_memory_bytes(&self) -> usize {
-        self.foyer_memory_bytes / 2
+    getters! {
+        query_pool_bytes: usize = (query_pool_bytes);
+        cores: usize = (cores);
+        buffer_max_bytes: usize = (ingest_buffer_bytes);
+        foyer_memory_bytes: usize = (foyer_memory_bytes);
+        /// The shared cache reservation is split between raw object bytes and
+        /// exact logical-count indexes. Keeping both inside the existing 10%
+        /// reservation prevents the derived cache from becoming untracked heap.
+        object_cache_memory_bytes: usize = (foyer_memory_bytes / 2);
+        writer_reserve_bytes: usize = (writer_reserve_bytes);
+        /// Formerly `TIMEFUSION_MEMORY_LIMIT_GB * GIB`.
+        memory_limit_bytes: usize = (memory_limit_bytes);
     }
 
     pub fn logical_count_memory_bytes(&self) -> usize {
         self.foyer_memory_bytes - self.object_cache_memory_bytes()
-    }
-
-    pub fn writer_reserve_bytes(&self) -> usize {
-        self.writer_reserve_bytes
-    }
-
-    /// Formerly `TIMEFUSION_MEMORY_LIMIT_GB * GIB`.
-    pub fn memory_limit_bytes(&self) -> usize {
-        self.memory_limit_bytes
     }
 
     /// Formerly `MemoryConfig::maintenance_pool_bytes`. Hands `bytes` back
@@ -1140,36 +1128,24 @@ impl TantivyConfig {
     pub fn is_table_indexed(&self, table: &str) -> bool {
         Self::indexed_set().contains(table)
     }
-    pub fn compression_level(&self) -> i32 {
-        self.timefusion_tantivy_compression_level
-    }
-    pub fn prefilter_max_hits(&self) -> usize {
-        self.timefusion_tantivy_prefilter_max_hits.max(1)
-    }
-    pub fn prefilter_min_selectivity_pct(&self) -> u32 {
-        self.timefusion_tantivy_prefilter_min_selectivity_pct.min(100)
-    }
-    pub fn route_equality(&self) -> bool {
-        self.timefusion_tantivy_route_equality
-    }
-    /// Disk budget in bytes. Floored at 1 GB — zero would reap the cache to
-    /// nothing every 10 minutes, turning every query into a re-download.
-    pub fn cache_disk_bytes(&self) -> u64 {
-        self.timefusion_tantivy_cache_disk_gb.max(1) * 1024 * 1024 * 1024
+    getters! {
+        compression_level: i32 = (timefusion_tantivy_compression_level);
+        prefilter_max_hits: usize = (timefusion_tantivy_prefilter_max_hits.max(1));
+        prefilter_min_selectivity_pct: u32 = (timefusion_tantivy_prefilter_min_selectivity_pct.min(100));
+        route_equality: bool = (timefusion_tantivy_route_equality);
+        /// Disk budget in bytes. Floored at 1 GB — zero would reap the cache to
+        /// nothing every 10 minutes, turning every query into a re-download.
+        cache_disk_bytes: u64 = (timefusion_tantivy_cache_disk_gb.max(1) * GIB as u64);
+        /// Floored at 1: zero concurrency would deadlock the per-index fan-out.
+        search_concurrency: usize = (timefusion_tantivy_search_concurrency.max(1));
+        seed_cache_on_publish: bool = (timefusion_tantivy_seed_cache_on_publish);
     }
     /// Floored at 1: a zero-capacity LRU would make every open a cold open.
     pub fn reader_cache_entries(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.timefusion_tantivy_reader_cache_entries).unwrap_or(NonZeroUsize::MIN)
     }
-    /// Floored at 1: zero concurrency would deadlock the per-index fan-out.
-    pub fn search_concurrency(&self) -> usize {
-        self.timefusion_tantivy_search_concurrency.max(1)
-    }
-    pub fn manifest_ttl(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.timefusion_tantivy_manifest_ttl_secs)
-    }
-    pub fn seed_cache_on_publish(&self) -> bool {
-        self.timefusion_tantivy_seed_cache_on_publish
+    pub fn manifest_ttl(&self) -> Duration {
+        Duration::from_secs(self.timefusion_tantivy_manifest_ttl_secs)
     }
 }
 
@@ -1334,11 +1310,9 @@ pub struct CoreConfig {
 }
 
 impl CoreConfig {
-    pub fn wal_dir(&self) -> PathBuf {
-        self.timefusion_data_dir.join("wal")
-    }
-    pub fn cache_dir(&self) -> PathBuf {
-        self.timefusion_data_dir.join("cache")
+    getters! {
+        wal_dir: PathBuf = (timefusion_data_dir.join("wal"));
+        cache_dir: PathBuf = (timefusion_data_dir.join("cache"));
     }
 }
 
@@ -1629,12 +1603,29 @@ pub enum WalFsyncMode {
 }
 
 impl BufferConfig {
-    pub fn flush_interval_secs(&self) -> u64 {
-        self.timefusion_flush_interval_secs.max(1)
+    getters! {
+        flush_interval_secs: u64 = (timefusion_flush_interval_secs.max(1));
+        retention_mins: u64 = (timefusion_buffer_retention_mins.max(1));
+        eviction_interval_secs: u64 = (timefusion_eviction_interval_secs.max(1));
+        max_memory_mb: usize = (timefusion_buffer_max_memory_mb.max(64));
+        wal_shards_per_topic: usize = (timefusion_wal_shards_per_topic.max(1));
+        wal_corruption_threshold: usize = (timefusion_wal_corruption_threshold);
+        flush_parallelism: usize = (timefusion_flush_parallelism.max(1));
+        flush_coalesce_commits: bool = (timefusion_flush_coalesce_commits);
+        dml_coalesce_secs: u64 = (timefusion_dml_coalesce_secs);
+        dml_coalesce_fold: bool = (timefusion_dml_coalesce_fold);
+        delta_scan_concurrency: usize = (timefusion_delta_scan_concurrency.max(1));
+        landed_skip_enabled: bool = (timefusion_landed_skip_enabled);
+        delta_scan_depth: usize = (timefusion_delta_scan_depth.max(1));
+        flush_immediately: bool = (timefusion_flush_immediately);
+        wal_admit_decouple: bool = (timefusion_wal_admit_decouple);
+        wal_fsync_ms: u64 = (timefusion_wal_fsync_ms.max(1));
+        wal_ack_fsync: bool = (timefusion_wal_ack_fsync);
+        wal_max_file_count: usize = (timefusion_wal_max_file_count);
+        bucket_duration_secs: u64 = (timefusion_bucket_duration_secs.max(1));
+        pressure_flush_pct: u32 = (timefusion_pressure_flush_pct.min(100));
     }
-    pub fn retention_mins(&self) -> u64 {
-        self.timefusion_buffer_retention_mins.max(1)
-    }
+
     /// mtime age past which a WAL file is PRESUMED dead weight. Heuristic,
     /// not a soundness bound: replay is cursor-bounded (no age cutoff), so
     /// GC soundness comes from the un-flushed floor and the drained-gated
@@ -1648,60 +1639,12 @@ impl BufferConfig {
         // the disk-runaway breaker and flapped ingest for no durability benefit.
         Duration::from_secs(30 * 60)
     }
-    pub fn eviction_interval_secs(&self) -> u64 {
-        self.timefusion_eviction_interval_secs.max(1)
-    }
-    pub fn max_memory_mb(&self) -> usize {
-        self.timefusion_buffer_max_memory_mb.max(64)
-    }
-    pub fn wal_shards_per_topic(&self) -> usize {
-        self.timefusion_wal_shards_per_topic.max(1)
-    }
-    pub fn wal_corruption_threshold(&self) -> usize {
-        self.timefusion_wal_corruption_threshold
-    }
-    pub fn flush_parallelism(&self) -> usize {
-        self.timefusion_flush_parallelism.max(1)
-    }
-    pub fn flush_coalesce_commits(&self) -> bool {
-        self.timefusion_flush_coalesce_commits
-    }
-    pub fn dml_coalesce_secs(&self) -> u64 {
-        self.timefusion_dml_coalesce_secs
-    }
-    pub fn dml_coalesce_fold(&self) -> bool {
-        self.timefusion_dml_coalesce_fold
-    }
-    pub fn delta_scan_concurrency(&self) -> usize {
-        self.timefusion_delta_scan_concurrency.max(1)
-    }
-    pub fn landed_skip_enabled(&self) -> bool {
-        self.timefusion_landed_skip_enabled
-    }
-    pub fn delta_scan_depth(&self) -> usize {
-        self.timefusion_delta_scan_depth.max(1)
-    }
-    pub fn flush_immediately(&self) -> bool {
-        self.timefusion_flush_immediately
-    }
-    pub fn wal_admit_decouple(&self) -> bool {
-        self.timefusion_wal_admit_decouple
-    }
-    pub fn wal_fsync_ms(&self) -> u64 {
-        self.timefusion_wal_fsync_ms.max(1)
-    }
-    pub fn wal_ack_fsync(&self) -> bool {
-        self.timefusion_wal_ack_fsync
-    }
     pub fn wal_fsync_mode(&self) -> WalFsyncMode {
         match self.timefusion_wal_fsync_mode.to_ascii_lowercase().as_str() {
             "sync_each" | "synceach" | "each" => WalFsyncMode::SyncEach,
             "none" | "off" | "disabled" => WalFsyncMode::None,
             _ => WalFsyncMode::Milliseconds(self.wal_fsync_ms()),
         }
-    }
-    pub fn wal_max_file_count(&self) -> usize {
-        self.timefusion_wal_max_file_count
     }
     /// Byte ceiling for the unflushed-WAL force-flush backstop. An explicit
     /// value overrides the default quarter-buffer ceiling, bounding the
@@ -1713,19 +1656,10 @@ impl BufferConfig {
     pub fn wal_hard_limit_bytes(&self) -> Option<u64> {
         (self.timefusion_wal_hard_limit_gb > 0).then(|| self.timefusion_wal_hard_limit_gb.saturating_mul(GIB as u64))
     }
-    pub fn bucket_duration_secs(&self) -> u64 {
-        self.timefusion_bucket_duration_secs.max(1)
-    }
-
     /// The flush dwell in micros: -1 = one bucket_duration, 0 = gate off.
     pub fn flush_dwell_micros(&self) -> i64 {
-        match self.timefusion_flush_dwell_secs {
-            s if s < 0 => (self.bucket_duration_secs() as i64) * 1_000_000,
-            s => s * 1_000_000,
-        }
-    }
-    pub fn pressure_flush_pct(&self) -> u32 {
-        self.timefusion_pressure_flush_pct.min(100)
+        let secs = self.timefusion_flush_dwell_secs;
+        (if secs < 0 { self.bucket_duration_secs() as i64 } else { secs }) * 1_000_000
     }
     pub fn write_backpressure_timeout(&self) -> Duration {
         Duration::from_secs(self.timefusion_write_backpressure_secs)
@@ -1861,8 +1795,26 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    pub fn is_disabled(&self) -> bool {
-        self.timefusion_foyer_disabled
+    getters! {
+        is_disabled: bool = (timefusion_foyer_disabled);
+        provider_cache_capacity: usize = (timefusion_provider_cache_capacity.max(1));
+        stats_enabled: bool = (timefusion_foyer_stats.eq_ignore_ascii_case("true"));
+        memory_size_bytes: usize = (timefusion_foyer_memory_mb * MIB);
+        file_size_bytes: usize = (timefusion_foyer_file_size_mb * MIB);
+        metadata_memory_size_bytes: usize = (timefusion_foyer_metadata_memory_mb * MIB);
+        warm_inline_max_bytes: usize = (timefusion_warm_inline_max_mb * MIB);
+        write_capture_max_bytes: usize = (timefusion_write_capture_max_mb * MIB);
+        write_capture_budget_bytes: usize = (timefusion_write_capture_budget_mb * MIB);
+        block_size_bytes: usize = (timefusion_foyer_block_size_mb * MIB);
+        l1_max_entry_bytes: usize = (timefusion_foyer_l1_max_entry_mb * MIB);
+    }
+
+    // `self` in a macro tail is E0424 (hygiene), so the two GB-fallback getters stay hand-written.
+    pub fn disk_size_bytes(&self) -> usize {
+        self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * GIB, |mb| mb * MIB)
+    }
+    pub fn metadata_disk_size_bytes(&self) -> usize {
+        self.timefusion_foyer_metadata_disk_mb.map_or(self.timefusion_foyer_metadata_disk_gb * GIB, |mb| mb * MIB)
     }
     pub fn ttl(&self) -> Duration {
         Duration::from_secs(self.timefusion_foyer_ttl_seconds)
@@ -1870,46 +1822,10 @@ impl CacheConfig {
     pub fn provider_cache_ttl(&self) -> Duration {
         Duration::from_secs(self.timefusion_provider_cache_ttl_seconds.max(1))
     }
-    pub fn provider_cache_capacity(&self) -> usize {
-        self.timefusion_provider_cache_capacity.max(1)
-    }
-    pub fn stats_enabled(&self) -> bool {
-        self.timefusion_foyer_stats.eq_ignore_ascii_case("true")
-    }
-    pub fn memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_memory_mb * MIB
-    }
-    pub fn disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * GIB, |mb| mb * MIB)
-    }
-    pub fn file_size_bytes(&self) -> usize {
-        self.timefusion_foyer_file_size_mb * MIB
-    }
-    pub fn metadata_memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_memory_mb * MIB
-    }
-    pub fn warm_inline_max_bytes(&self) -> usize {
-        self.timefusion_warm_inline_max_mb * MIB
-    }
-    pub fn write_capture_max_bytes(&self) -> usize {
-        self.timefusion_write_capture_max_mb * MIB
-    }
-    pub fn write_capture_budget_bytes(&self) -> usize {
-        self.timefusion_write_capture_budget_mb * MIB
-    }
-    pub fn block_size_bytes(&self) -> usize {
-        self.timefusion_foyer_block_size_mb * MIB
-    }
-    pub fn l1_max_entry_bytes(&self) -> usize {
-        self.timefusion_foyer_l1_max_entry_mb * MIB
-    }
     /// Scan lookback depth past which cache population is bypassed, in the same
     /// unit the read path measures it. `None` = never bypass.
     pub fn cache_bypass_scan_micros(&self) -> Option<i64> {
         (self.timefusion_cache_bypass_scan_hours > 0).then(|| self.timefusion_cache_bypass_scan_hours as i64 * 3_600 * 1_000_000)
-    }
-    pub fn metadata_disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_disk_mb.map_or(self.timefusion_foyer_metadata_disk_gb * GIB, |mb| mb * MIB)
     }
 }
 
@@ -3142,8 +3058,8 @@ pub struct TelemetryConfig {
 }
 
 impl TelemetryConfig {
-    pub fn is_json_logging(&self) -> bool {
-        self.log_format.as_deref() == Some("json")
+    getters! {
+        is_json_logging: bool = (log_format.as_deref() == Some("json"));
     }
 }
 
@@ -3158,10 +3074,7 @@ impl AppConfig {
     /// (this is the wiring that fixes the 6 GB-vs-24 GB threshold drift — the
     /// derived numbers must actually reach the WAL layer, not just the startup log).
     pub fn effective_wal_max_files(&self) -> usize {
-        match self.buffer.wal_max_file_count() {
-            0 => self.derived.wal_flush_file_threshold(),
-            env => env,
-        }
+        NonZeroUsize::new(self.buffer.wal_max_file_count()).map_or_else(|| self.derived.wal_flush_file_threshold(), NonZeroUsize::get)
     }
 
     pub fn effective_wal_max_unflushed_bytes(&self) -> u64 {
@@ -3791,46 +3704,45 @@ pub fn apply(config: &mut AppConfig) {
 
     // Imperative by necessity: each knob is a `&mut` into a different config
     // field, so the env-unset-wins / changed / record triad can only be shared
-    // via a closure taking the slot by reference.
+    // via a closure taking the slot by reference. A `None` derived value (the
+    // disk probe found no mount) leaves the knob alone.
     let mut applied = Vec::new();
-    let mut tune = |name: &'static str, slot: &mut usize, derived: usize, unit: &str| {
-        if std::env::var(name).is_err() && *slot != derived {
-            *slot = derived;
-            applied.push(format!("{name}={derived}{unit}"));
+    let mut tune = |name: &'static str, slot: &mut usize, derived: Option<usize>, unit: &str| {
+        if let Some(d) = derived.filter(|d| *d != *slot && std::env::var(name).is_err()) {
+            *slot = d;
+            applied.push(format!("{name}={d}{unit}"));
         }
     };
+    let disk_share = |fraction: f64, max| available_disk_gb.map(|gb| ((gb as f64 * fraction) as usize).clamp(MIN_FOYER_DISK_GB, max));
 
     // MemBuffer and foyer memory come from DerivedBudget — ONE set of RAM
     // fractions (see the config.rs budget tree); autotune only applies them.
     tune(
         "TIMEFUSION_BUFFER_MAX_MEMORY_MB",
         &mut config.buffer.timefusion_buffer_max_memory_mb,
-        (config.derived.buffer_max_bytes() / MIB).max(MIN_BUFFER_MB),
+        Some((config.derived.buffer_max_bytes() / MIB).max(MIN_BUFFER_MB)),
         "MB",
     );
     tune(
         "TIMEFUSION_FOYER_MEMORY_MB",
         &mut config.cache.timefusion_foyer_memory_mb,
-        (config.derived.object_cache_memory_bytes() / MIB).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB),
+        Some((config.derived.object_cache_memory_bytes() / MIB).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB)),
         "MB",
     );
     tune(
         "TIMEFUSION_FOYER_METADATA_MEMORY_MB",
         &mut config.cache.timefusion_foyer_metadata_memory_mb,
-        ((total_ram_mb as f64 * RAM_FRACTION_FOYER_META) as usize).clamp(MIN_FOYER_META_MB, MAX_FOYER_META_MB),
+        Some(((total_ram_mb as f64 * RAM_FRACTION_FOYER_META) as usize).clamp(MIN_FOYER_META_MB, MAX_FOYER_META_MB)),
         "MB",
     );
-    if let Some(avail_gb) = available_disk_gb {
-        let disk_share = |fraction: f64, max| ((avail_gb as f64 * fraction) as usize).clamp(MIN_FOYER_DISK_GB, max);
-        tune("TIMEFUSION_FOYER_DISK_GB", &mut config.cache.timefusion_foyer_disk_gb, disk_share(DISK_FRACTION_FOYER, MAX_FOYER_DISK_GB), "GB");
-        tune(
-            "TIMEFUSION_FOYER_METADATA_DISK_GB",
-            &mut config.cache.timefusion_foyer_metadata_disk_gb,
-            disk_share(DISK_FRACTION_FOYER_META, MAX_FOYER_META_DISK_GB),
-            "GB",
-        );
-    }
-    tune("TIMEFUSION_FLUSH_PARALLELISM", &mut config.buffer.timefusion_flush_parallelism, (cpus / 2).max(2), "");
+    tune("TIMEFUSION_FOYER_DISK_GB", &mut config.cache.timefusion_foyer_disk_gb, disk_share(DISK_FRACTION_FOYER, MAX_FOYER_DISK_GB), "GB");
+    tune(
+        "TIMEFUSION_FOYER_METADATA_DISK_GB",
+        &mut config.cache.timefusion_foyer_metadata_disk_gb,
+        disk_share(DISK_FRACTION_FOYER_META, MAX_FOYER_META_DISK_GB),
+        "GB",
+    );
+    tune("TIMEFUSION_FLUSH_PARALLELISM", &mut config.buffer.timefusion_flush_parallelism, Some((cpus / 2).max(2)), "");
     // Query/maintenance target_partitions. DataFusion defaults to
     // `num_cpus::get()`, which reads `sched_getaffinity` — honors cpuset
     // pinning but not the CFS quota (`docker --cpus`), so a throttled container
@@ -3861,7 +3773,7 @@ pub fn apply(config: &mut AppConfig) {
     // cores to buy sort-memory headroom. 16 is a starting point, not a law —
     // `TIMEFUSION_QUERY_PARTITIONS` still overrides, so tuning and rollback are
     // env-only and need no redeploy.
-    tune("TIMEFUSION_QUERY_PARTITIONS", &mut config.memory.timefusion_query_partitions, cpus.min(QUERY_PARTITIONS_MAX), "");
+    tune("TIMEFUSION_QUERY_PARTITIONS", &mut config.memory.timefusion_query_partitions, Some(cpus.min(QUERY_PARTITIONS_MAX)), "");
 
     if applied.is_empty() {
         info!("Auto-tune: no overrides applied (user has set all knobs explicitly or host signals unavailable)");

@@ -50,6 +50,13 @@ fn as_array(v: &ColumnarValue) -> datafusion::error::Result<ArrayRef> {
     }
 }
 
+/// Downcasts an Arrow array to its concrete type, failing with `msg`.
+fn downcast<'a, T: 'static>(array: &'a dyn Array, msg: impl std::fmt::Display) -> datafusion::error::Result<&'a T> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| DataFusionError::Execution(msg.to_string()))
+}
+
+/// The `name`/`signature` pair every stateless UDF here repeats, plus — when
+/// given — the constant `return_type` and the `aliases()` accessor.
 macro_rules! udf_boilerplate {
     ($name:literal) => {
         fn name(&self) -> &str {
@@ -57,6 +64,18 @@ macro_rules! udf_boilerplate {
         }
         fn signature(&self) -> &Signature {
             &self.signature
+        }
+    };
+    ($name:literal, $ret:expr) => {
+        udf_boilerplate!($name);
+        fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+            Ok($ret)
+        }
+    };
+    ($name:literal, $ret:expr, aliases) => {
+        udf_boilerplate!($name, $ret);
+        fn aliases(&self) -> &[String] {
+            &self.aliases
         }
     };
 }
@@ -387,10 +406,7 @@ udf_struct!(
 );
 
 impl ScalarUDFImpl for JsonToPgTextUdf {
-    udf_boilerplate!("json_to_pg_text");
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Utf8)
-    }
+    udf_boilerplate!("json_to_pg_text", DataType::Utf8);
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let [arg] = args.args.as_slice() else {
             return Err(DataFusionError::Execution("json_to_pg_text requires exactly 1 argument".into()));
@@ -399,7 +415,7 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
         // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
         // concrete shape, single pass over rows.
         let utf8 = datafusion::arrow::compute::cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
-        let strs = utf8.as_any().downcast_ref::<StringArray>().ok_or_else(|| DataFusionError::Execution("json_to_pg_text: cast to Utf8 failed".into()))?;
+        let strs: &StringArray = downcast(&utf8, "json_to_pg_text: cast to Utf8 failed")?;
         // Builder (not a `collect()` into StringArray) so the common non-string
         // case appends the borrowed `&str` without a per-row String alloc.
         let mut b = datafusion::arrow::array::StringBuilder::with_capacity(strs.len(), strs.value_data().len());
@@ -626,7 +642,7 @@ pub fn function_registry() -> Result<Arc<FnRegistry>> {
 fn create_set_clock_udf() -> ScalarUDF {
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
         let arr = as_array(&args[0])?;
-        let s = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| DataFusionError::Execution("timefusion_set_clock expects Utf8".into()))?;
+        let s: &StringArray = downcast(&arr, "timefusion_set_clock expects Utf8")?;
         let out: Int64Array = s
             .iter()
             .map(|v| {
@@ -647,7 +663,7 @@ fn create_set_clock_udf() -> ScalarUDF {
 fn create_advance_clock_udf() -> ScalarUDF {
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
         let arr = as_array(&args[0])?;
-        let d = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| DataFusionError::Execution("timefusion_advance_clock expects Int64".into()))?;
+        let d: &Int64Array = downcast(&arr, "timefusion_advance_clock expects Int64")?;
         let out: Int64Array = d.iter().map(|v| v.map(crate::support::advance_micros)).collect();
         Ok(ColumnarValue::Array(Arc::new(out)))
     });
@@ -664,11 +680,7 @@ fn create_now_micros_udf() -> ScalarUDF {
 udf_struct!(ToCharUDF, Signature::any(2, Volatility::Immutable));
 
 impl ScalarUDFImpl for ToCharUDF {
-    udf_boilerplate!("to_char");
-
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Utf8View)
-    }
+    udf_boilerplate!("to_char", DataType::Utf8View);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let [ts, fmt] = args.args.as_slice() else {
@@ -938,22 +950,11 @@ fn create_jsonb_array_elements_udf() -> ScalarUDF {
 udf_struct!(JsonBuildArrayUDF, Signature::variadic_any(Volatility::Immutable));
 
 impl ScalarUDFImpl for JsonBuildArrayUDF {
-    udf_boilerplate!("json_build_array");
-
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Utf8View)
-    }
+    udf_boilerplate!("json_build_array", DataType::Utf8View);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let num_rows = args.number_rows;
         let args = args.args;
-        let num_rows = args
-            .iter()
-            .find_map(|a| match a {
-                ColumnarValue::Array(array) => Some(array.len()),
-                ColumnarValue::Scalar(_) => None,
-            })
-            .unwrap_or(1);
-
         // Convert each argument column ONCE up front. Converting inside the
         // row loop is O(rows² × args) — observed as ~0.6ms/row × millions of
         // rows, enough to OOM prod on a wide-window span-list query.
@@ -977,15 +978,7 @@ udf_struct!(
 );
 
 impl ScalarUDFImpl for ToJsonUDF {
-    udf_boilerplate!("to_json");
-
-    fn aliases(&self) -> &[String] {
-        &self.aliases
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Utf8View)
-    }
+    udf_boilerplate!("to_json", DataType::Utf8View, aliases);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let [arg] = args.args.as_slice() else {
@@ -1035,11 +1028,7 @@ jsonb_wrapper!(ToJsonbUDF, ToJsonUDF, "to_jsonb");
 udf_struct!(ExtractEpochUDF, Signature::any(1, Volatility::Immutable));
 
 impl ScalarUDFImpl for ExtractEpochUDF {
-    udf_boilerplate!("extract_epoch");
-
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Float64)
-    }
+    udf_boilerplate!("extract_epoch", DataType::Float64);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let [arg] = args.args.as_slice() else {
@@ -1060,7 +1049,7 @@ macro_rules! json_primitives {
         json_primitives!($array, $ty, |x| json!(x))
     };
     ($array:expr, $ty:ty, $convert:expr) => {{
-        let arr = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| DataFusionError::Execution(format!("Failed to downcast to {}", stringify!($ty))))?;
+        let arr: &$ty = downcast($array, concat!("Failed to downcast to ", stringify!($ty)))?;
         arr.iter().map(|v| v.map_or(JsonValue::Null, $convert)).collect()
     }};
 }
@@ -1093,10 +1082,7 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
 fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
     Ok(match array.data_type() {
         DataType::Utf8View => {
-            let strs = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to StringViewArray".to_string()))?;
+            let strs: &StringViewArray = downcast(array, "Failed to downcast to StringViewArray")?;
             let looks_json = |s: &str| (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'));
             strs.iter()
                 .map(|v| match v {
@@ -1118,10 +1104,7 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
         DataType::Float64 => json_floats!(array, Float64Array),
         DataType::Boolean => json_primitives!(array, BooleanArray),
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let ts = array
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to TimestampMicrosecondArray".to_string()))?;
+            let ts: &TimestampMicrosecondArray = downcast(array, "Failed to downcast to TimestampMicrosecondArray")?;
             ts.iter()
                 .map(|v| match v {
                     None => Ok(JsonValue::Null),
@@ -1135,10 +1118,7 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
         // `row_to_json(t)`. Without this the generic fallback below tries to cast
         // Struct to Utf8View and fails outright.
         DataType::Struct(fields) => {
-            let columns = array
-                .as_any()
-                .downcast_ref::<datafusion::arrow::array::StructArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to StructArray".to_string()))?;
+            let columns: &datafusion::arrow::array::StructArray = downcast(array, "Failed to downcast to StructArray")?;
             // Field values are converted column-wise, then transposed per row.
             let per_field = fields
                 .iter()
@@ -1163,10 +1143,7 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
 }
 
 fn list_to_json_values<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
-    let list_array = array
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::GenericListArray<O>>()
-        .ok_or_else(|| DataFusionError::Execution("Failed to downcast to list array".to_string()))?;
+    let list_array: &datafusion::arrow::array::GenericListArray<O> = downcast(array, "Failed to downcast to list array")?;
     // Always sniff_json=false: PG's to_jsonb(text[]) keeps elements as JSON strings.
     (0..list_array.len())
         .map(|i| if list_array.is_null(i) { Ok(JsonValue::Null) } else { array_to_json_values_inner(&list_array.value(i), false).map(JsonValue::Array) })
@@ -1191,7 +1168,7 @@ udf_struct!(
 );
 
 impl ScalarUDFImpl for TimeBucketUDF {
-    udf_boilerplate!("time_bucket");
+    udf_boilerplate!("time_bucket", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))));
 
     fn output_ordering(&self, inputs: &[ExprProperties]) -> datafusion::error::Result<SortProperties> {
         // Like date_bin, a constant positive width preserves timestamp ordering.
@@ -1200,10 +1177,6 @@ impl ScalarUDFImpl for TimeBucketUDF {
             [width, timestamp] if width.sort_properties == SortProperties::Singleton => timestamp.sort_properties,
             _ => SortProperties::Unordered,
         })
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
@@ -1317,10 +1290,6 @@ impl TDigestWrapper {
         self.digest = Some(merged);
     }
 
-    fn to_digest(&self) -> Option<TDigest> {
-        self.digest.clone()
-    }
-
     fn to_bytes(&self) -> datafusion::error::Result<Vec<u8>> {
         let centroids: Vec<(f64, f64)> = self.digest.iter().flat_map(|d| d.centroids().iter().map(|c| (c.mean, c.weight))).collect();
         // Never swallow the encode failure: an empty payload would silently become an
@@ -1352,7 +1321,7 @@ impl TDigestWrapper {
 
 fn merge_tdigest_batch(digest: &mut TDigestWrapper, arrays: &[ArrayRef]) -> datafusion::error::Result<()> {
     let Some(array) = arrays.first() else { return Ok(()) };
-    let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("tdigest_merge expects Binary values".to_string()))?;
+    let binary: &BinaryArray = downcast(array, "tdigest_merge expects Binary values")?;
     binary.iter().flatten().try_for_each(|bytes| {
         digest.merge(&TDigestWrapper::from_bytes(bytes)?);
         Ok(())
@@ -1372,10 +1341,7 @@ impl Accumulator for PercentileAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::error::Result<()> {
         match values.first() {
             Some(array) if !self.merging => {
-                let floats = array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| DataFusionError::Execution("percentile_agg expects Float64 values".to_string()))?;
+                let floats: &Float64Array = downcast(array, "percentile_agg expects Float64 values")?;
                 self.digest.insert_batch(floats.iter().flatten());
                 Ok(())
             }
@@ -1408,11 +1374,7 @@ udf_struct!(
 );
 
 impl ScalarUDFImpl for ApproxPercentileUDF {
-    udf_boilerplate!("approx_percentile");
-
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Float64)
-    }
+    udf_boilerplate!("approx_percentile", DataType::Float64);
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let [pct_arg, digest_arg] = args.args.as_slice() else {
@@ -1426,14 +1388,8 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
         let percentile_array = pct_arg.to_array(num_rows)?;
         let digest_array = digest_arg.to_array(num_rows)?;
 
-        let percentiles = percentile_array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| DataFusionError::Execution("First argument must be a percentile (Float64)".to_string()))?;
-        let digests = digest_array
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| DataFusionError::Execution("Second argument must be a t-digest (Binary)".to_string()))?;
+        let percentiles: &Float64Array = downcast(&percentile_array, "First argument must be a percentile (Float64)")?;
+        let digests: &BinaryArray = downcast(&digest_array, "Second argument must be a t-digest (Binary)")?;
 
         // None → SQL NULL (null input, or a digest that saw no values).
         let out: Float64Array = percentiles
@@ -1444,7 +1400,7 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
                     if !(0.0..=1.0).contains(&pct) {
                         return Err(DataFusionError::Execution(format!("Percentile must be between 0 and 1, got {pct}")));
                     }
-                    Ok(TDigestWrapper::from_bytes(bytes)?.to_digest().map(|d| d.estimate_quantile(pct)))
+                    Ok(TDigestWrapper::from_bytes(bytes)?.digest.map(|d| d.estimate_quantile(pct)))
                 }
                 _ => Ok(None),
             })
@@ -1475,10 +1431,7 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 fn hll_insert_array(sketch: &mut crate::read::Hll, array: &ArrayRef) -> datafusion::error::Result<()> {
     macro_rules! feed {
         ($ty:ty) => {{
-            let typed = array
-                .as_any()
-                .downcast_ref::<$ty>()
-                .ok_or_else(|| DataFusionError::Execution("hll_agg: array does not match its own data type".to_string()))?;
+            let typed: &$ty = downcast(array, "hll_agg: array does not match its own data type")?;
             typed.iter().flatten().for_each(|value| sketch.insert_hash(crate::read::hash_bytes(AsRef::<[u8]>::as_ref(&value))));
             return Ok(());
         }};
@@ -1497,7 +1450,7 @@ fn hll_insert_array(sketch: &mut crate::read::Hll, array: &ArrayRef) -> datafusi
 /// Decode and fold a column of serialized sketches.
 fn hll_merge_array(sketch: &mut crate::read::Hll, arrays: &[ArrayRef]) -> datafusion::error::Result<()> {
     let Some(array) = arrays.first() else { return Ok(()) };
-    let binary = array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("hll_merge expects Binary values".to_string()))?;
+    let binary: &BinaryArray = downcast(array, "hll_merge expects Binary values")?;
     binary.iter().flatten().try_for_each(|bytes| {
         sketch.merge(&crate::read::Hll::from_bytes(bytes).map_err(DataFusionError::Execution)?);
         Ok(())
@@ -1817,21 +1770,22 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let (json_array, path_str) = json_path_args(&args.args, "jsonb_path_exists")?;
-        // PG SQL/JSON-path dialect.
-        let json_path = sql_json_path::JsonPath::new(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {e}")))?;
-        let result = if is_variant_type(json_array.data_type()) {
-            evaluate_jsonpath_on_variant(&json_array, &json_path, &path_str)?
-        } else {
-            evaluate_jsonpath_on_json_string(&json_array, &json_path)?
-        };
-        Ok(ColumnarValue::Array(result))
+        let (json_array, path_str, json_path) = json_path_args(&args.args, "jsonb_path_exists")?;
+        if is_variant_type(json_array.data_type())
+            && let Some(fast) = variant_get_exists(&json_array, &path_str)?
+        {
+            return Ok(ColumnarValue::Array(fast));
+        }
+        // Lax mode (PG default): a data-dependent eval error, or JSON that does not
+        // parse at all, is an empty match — not a query failure.
+        json_path_eval::<bool, BooleanArray>(&json_array, "jsonb_path_exists", |json| Some(json.is_some_and(|json| json_path.exists(json).unwrap_or(false))))
     }
 }
 
-/// `(json_array, jsonpath_text)` for the two `jsonb_path_*` UDFs: the path is a
-/// scalar because it compiles once per invocation, not once per row.
-fn json_path_args(args: &[ColumnarValue], name: &str) -> datafusion::error::Result<(ArrayRef, String)> {
+/// `(json_array, raw_path, compiled_path)` for the two `jsonb_path_*` UDFs: the
+/// path is a scalar because it compiles once per invocation, not once per row.
+/// PG SQL/JSON-path dialect.
+fn json_path_args(args: &[ColumnarValue], name: &str) -> datafusion::error::Result<(ArrayRef, String, sql_json_path::JsonPath)> {
     let [json, path] = args else {
         return Err(DataFusionError::Execution(format!("{name} requires exactly 2 arguments: json/variant and jsonpath")));
     };
@@ -1839,7 +1793,22 @@ fn json_path_args(args: &[ColumnarValue], name: &str) -> datafusion::error::Resu
         return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string()));
     };
     let path_str = extract_utf8_string(scalar).ok_or_else(|| DataFusionError::Execution("JSONPath must be a string".to_string()))?;
-    Ok((as_array(json)?, path_str))
+    let json_path = sql_json_path::JsonPath::new(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {e}")))?;
+    Ok((as_array(json)?, path_str, json_path))
+}
+
+/// Run a compiled JSONPath over either a Variant-struct or a JSON-string column,
+/// keeping NULL rows NULL. `f` sees `None` for a JSON-string row that failed to
+/// parse — the two UDFs disagree on what that means (no match vs. false).
+fn json_path_eval<T, A: Array + FromIterator<Option<T>> + 'static>(
+    array: &ArrayRef, name: &str, f: impl Fn(Option<&JsonValue>) -> Option<T>,
+) -> datafusion::error::Result<ColumnarValue> {
+    let out: A = if is_variant_type(array.data_type()) {
+        map_variant_rows(array, |json| f(Some(json)))?
+    } else {
+        map_utf8_rows(array, name, |s| f(serde_json::from_str::<JsonValue>(s).ok().as_ref()))?
+    };
+    Ok(ColumnarValue::Array(Arc::new(out)))
 }
 
 const MAX_VARIANT_DEPTH: usize = 100;
@@ -1893,13 +1862,9 @@ enum BinaryAccessor<'a> {
 
 impl<'a> BinaryAccessor<'a> {
     fn try_new(col: &'a ArrayRef, field: &str) -> datafusion::error::Result<Self> {
-        if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
-            Ok(Self::Binary(a))
-        } else if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
-            Ok(Self::View(a))
-        } else {
-            Err(DataFusionError::Execution(format!("Variant {field} column is not Binary or BinaryView (got {:?})", col.data_type())))
-        }
+        (col.as_any().downcast_ref::<BinaryArray>().map(Self::Binary))
+            .or_else(|| col.as_any().downcast_ref::<BinaryViewArray>().map(Self::View))
+            .ok_or_else(|| DataFusionError::Execution(format!("Variant {field} column is not Binary or BinaryView (got {:?})", col.data_type())))
     }
 
     fn value(&self, i: usize) -> &[u8] {
@@ -1910,48 +1875,40 @@ impl<'a> BinaryAccessor<'a> {
     }
 }
 
-/// Evaluate JSONPath on a Variant (Struct) array
-fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &sql_json_path::JsonPath, raw_path: &str) -> datafusion::error::Result<ArrayRef> {
-    // Fast path: simple `$.a.b.c[N].d` style paths translate cleanly to a
-    // parquet_variant_compute::VariantPath and we can use the vectorized
-    // `variant_get` kernel, which walks the Variant binary directly without
-    // ever materializing the full JsonValue. Path existence = result is
-    // non-null per row.
-    //
-    // Parity caveat: variant_get resolves like PG *strict* mode — it does NOT
-    // perform PG lax auto-unwrapping (`.a` on an array, `[i]` on a scalar). So
-    // for a filter-free path over an array-shaped-where-object-expected value
-    // this can yield a false negative vs. the PG (lax) engine used by the
-    // fallback below. Monoscope's queries are unaffected — they always carry a
-    // `? (...)` filter, which is not a simple path and takes the fallback. A
-    // lax-correct variant-native evaluator is the deferred Phase 3 fix.
-    if let Some(variant_path) = simple_path_to_variant_path(raw_path) {
-        use parquet_variant_compute::{GetOptions, variant_get};
-        let opts = GetOptions::new_with_path(variant_path);
-        let extracted = variant_get(array, opts).map_err(|e| DataFusionError::Execution(format!("variant_get failed: {e}")))?;
-        // A NULL input row → NULL (SQL semantics, matches the fallback path and PG);
-        // a present row → path exists ↔ extracted is non-null. `extracted.is_null(i)`
-        // alone can't tell the two apart, so gate on the input's null buffer.
-        let out: BooleanArray = (0..extracted.len()).map(|i| (!array.is_null(i)).then(|| !extracted.is_null(i))).collect();
-        return Ok(Arc::new(out));
-    }
-
-    // Fallback: complex JSONPath (filters, recursive descent, etc.) — walk the
-    // Variant binary into a JsonValue and run the PG jsonpath engine. Avoided
-    // when the path is simple (filter-free) via the variant_get fast lane above.
-    //
-    // Deferred optimization: evaluate the filter against the Variant binary
-    // directly (no per-row JsonValue). The clean route — impl sql_json_path's
-    // JsonRef over parquet_variant::Variant so the SAME engine (hence identical
-    // PG semantics) walks the binary — is blocked because Variant/VariantList/
-    // VariantObject are Clone, not the Copy that JsonRef requires. It also buys
-    // little for the dominant `$[*] ? (@ == x)` shape: the `[*]` prefix needs
-    // the whole (small) column anyway, so only a JsonValue alloc is saved.
-    // Revisit if a profile shows this materialization is a real hot spot.
-    //
-    // Lax mode (PG default): a data-dependent eval error is an empty match, not a query failure.
-    let out: BooleanArray = map_variant_rows(array, |json| Some(json_path.exists(json).unwrap_or(false)))?;
-    Ok(Arc::new(out))
+/// Fast lane for `jsonb_path_exists` on a Variant (Struct) array: simple
+/// `$.a.b.c[N].d` style paths translate cleanly to a
+/// parquet_variant_compute::VariantPath and we can use the vectorized
+/// `variant_get` kernel, which walks the Variant binary directly without
+/// ever materializing the full JsonValue. Path existence = result is
+/// non-null per row. `None` = not a simple path, take the JsonValue fallback.
+///
+/// Parity caveat: variant_get resolves like PG *strict* mode — it does NOT
+/// perform PG lax auto-unwrapping (`.a` on an array, `[i]` on a scalar). So
+/// for a filter-free path over an array-shaped-where-object-expected value
+/// this can yield a false negative vs. the PG (lax) engine used by the
+/// fallback. Monoscope's queries are unaffected — they always carry a
+/// `? (...)` filter, which is not a simple path and takes the fallback. A
+/// lax-correct variant-native evaluator is the deferred Phase 3 fix.
+///
+/// The fallback — complex JSONPath (filters, recursive descent, etc.) — walks
+/// the Variant binary into a JsonValue and runs the PG jsonpath engine.
+/// Deferred optimization: evaluate the filter against the Variant binary
+/// directly (no per-row JsonValue). The clean route — impl sql_json_path's
+/// JsonRef over parquet_variant::Variant so the SAME engine (hence identical
+/// PG semantics) walks the binary — is blocked because Variant/VariantList/
+/// VariantObject are Clone, not the Copy that JsonRef requires. It also buys
+/// little for the dominant `$[*] ? (@ == x)` shape: the `[*]` prefix needs
+/// the whole (small) column anyway, so only a JsonValue alloc is saved.
+/// Revisit if a profile shows this materialization is a real hot spot.
+fn variant_get_exists(array: &ArrayRef, raw_path: &str) -> datafusion::error::Result<Option<ArrayRef>> {
+    use parquet_variant_compute::{GetOptions, variant_get};
+    let Some(variant_path) = simple_path_to_variant_path(raw_path) else { return Ok(None) };
+    let extracted = variant_get(array, GetOptions::new_with_path(variant_path)).map_err(|e| DataFusionError::Execution(format!("variant_get failed: {e}")))?;
+    // A NULL input row → NULL (SQL semantics, matches the fallback path and PG);
+    // a present row → path exists ↔ extracted is non-null. `extracted.is_null(i)`
+    // alone can't tell the two apart, so gate on the input's null buffer.
+    let out: BooleanArray = (0..extracted.len()).map(|i| (!array.is_null(i)).then(|| !extracted.is_null(i))).collect();
+    Ok(Some(Arc::new(out)))
 }
 
 /// Decode each row of a Variant struct array into a `JsonValue` and map it
@@ -1978,44 +1935,29 @@ fn map_variant_rows<T, A: FromIterator<Option<T>>>(array: &ArrayRef, f: impl Fn(
 /// those fall back to the slow JsonValue path.
 fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath<'_>> {
     use parquet_variant::{VariantPath, VariantPathElement};
-    let s = raw.strip_prefix('$').unwrap_or(raw);
+    let mut rest = raw.strip_prefix('$').unwrap_or(raw);
     let mut elements: Vec<VariantPathElement> = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    while !rest.is_empty() {
+        rest = match rest.as_bytes()[0] {
             b'.' => {
-                i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
-                    if !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                        return None;
-                    }
-                    i += 1;
-                }
-                if i == start {
+                let body = &rest[1..];
+                let (name, tail) = body.split_at(body.find(['.', '[']).unwrap_or(body.len()));
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                     return None;
                 }
-                elements.push(VariantPathElement::field(std::borrow::Cow::Borrowed(&s[start..i])));
+                elements.push(VariantPathElement::field(std::borrow::Cow::Borrowed(name)));
+                tail
             }
             b'[' => {
-                i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i] != b']' {
-                    if !bytes[i].is_ascii_digit() {
-                        return None;
-                    }
-                    i += 1;
-                }
-                if i >= bytes.len() || i == start {
+                let (digits, tail) = rest[1..].split_once(']')?;
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                     return None;
                 }
-                let idx: usize = s[start..i].parse().ok()?;
-                elements.push(VariantPathElement::index(idx));
-                i += 1; // skip ']'
+                elements.push(VariantPathElement::index(digits.parse().ok()?));
+                tail
             }
             _ => return None,
-        }
+        };
     }
     Some(VariantPath::new(elements))
 }
@@ -2046,42 +1988,18 @@ impl ScalarUDFImpl for JsonbPathQueryFirstUDF {
         Ok(jsonb_tagged_field())
     }
 
+    /// First match as JSON text, or NULL. Unlike `jsonb_path_exists` there is no
+    /// `variant_get` fast lane: monoscope's paths all carry a `? (...)` filter, which
+    /// is not a simple path, so that lane could never engage for the queries this
+    /// exists to serve — and writing one would duplicate the strict/lax hazard
+    /// documented on `variant_get_exists`.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        let (json_array, path_str) = json_path_args(&args.args, "jsonb_path_query_first")?;
-        let json_path = sql_json_path::JsonPath::new(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {e}")))?;
-        let result = if is_variant_type(json_array.data_type()) {
-            query_first_on_variant(&json_array, &json_path)?
-        } else {
-            query_first_on_json_string(&json_array, &json_path)?
-        };
-        Ok(ColumnarValue::Array(result))
+        let (json_array, _, json_path) = json_path_args(&args.args, "jsonb_path_query_first")?;
+        // Lax mode (PG default): a data-dependent eval error is no match, not a query failure.
+        json_path_eval::<String, StringViewArray>(&json_array, "jsonb_path_query_first", |json| {
+            json.and_then(|json| json_path.query_first(json).ok().flatten()).map(|found| found.to_string())
+        })
     }
-}
-
-/// First match as JSON text, or NULL. Unlike `jsonb_path_exists` there is no
-/// `variant_get` fast lane: monoscope's paths all carry a `? (...)` filter, which
-/// is not a simple path, so that lane could never engage for the queries this
-/// exists to serve — and writing one would duplicate the strict/lax hazard
-/// documented on `evaluate_jsonpath_on_variant`.
-fn query_first_on_variant(array: &ArrayRef, json_path: &sql_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
-    // Lax mode (PG default): a data-dependent eval error is no match, not a query failure.
-    let out: StringViewArray = map_variant_rows(array, |json| json_path.query_first(json).ok().flatten().map(|found| found.to_string()))?;
-    Ok(Arc::new(out))
-}
-
-fn query_first_on_json_string(array: &ArrayRef, json_path: &sql_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
-    let out: StringViewArray = map_utf8_rows(array, "jsonb_path_query_first", |s| {
-        serde_json::from_str::<JsonValue>(s).ok().and_then(|v| json_path.query_first(&v).ok().flatten().map(|found| found.to_string()))
-    })?;
-    Ok(Arc::new(out))
-}
-
-fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &sql_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
-    // Path exists per row; invalid JSON or a lax-mode eval error → false (PG parity).
-    let out: BooleanArray = map_utf8_rows(array, "jsonb_path_exists", |s| {
-        Some(serde_json::from_str::<JsonValue>(s).ok().and_then(|v| json_path.exists(&v).ok()).unwrap_or(false))
-    })?;
-    Ok(Arc::new(out))
 }
 
 /// Map each non-NULL row of a Utf8/Utf8View array through `f`, keeping NULLs.
@@ -2160,7 +2078,7 @@ mod tests {
         left.merge(&right);
 
         assert!(left.to_bytes().unwrap().len() < 10_000);
-        assert!((left.to_digest().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0);
+        assert!((left.digest.as_ref().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0);
     }
 
     #[tokio::test]
@@ -2341,10 +2259,10 @@ mod tests {
 
     #[test]
     fn test_empty_tdigest_wrapper() {
-        assert!(TDigestWrapper::default().to_digest().is_none());
+        assert!(TDigestWrapper::default().digest.is_none());
         let mut wrapper = TDigestWrapper::default();
         wrapper.insert_batch(vec![10.0, 20.0]);
-        assert!(wrapper.to_digest().is_some());
+        assert!(wrapper.digest.is_some());
     }
 
     #[test]

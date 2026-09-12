@@ -2,6 +2,7 @@ use datafusion::{
     logical_expr::{
         BinaryExpr, Expr, Operator,
         expr::{Cast, TryCast},
+        utils::split_conjunction,
     },
     prelude::col,
     scalar::ScalarValue,
@@ -25,20 +26,23 @@ pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
     utf8_scalar(v).cloned()
 }
 
+/// Strips coercion casts that otherwise hide columns and literals from pruning.
+fn peel_casts(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => peel_casts(expr),
+        other => other,
+    }
+}
+
 /// Matches a column through coercion casts.
 pub fn is_col_through_cast(expr: &Expr, name: &str) -> bool {
-    match expr {
-        Expr::Column(c) => c.name == name,
-        Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => is_col_through_cast(expr, name),
-        _ => false,
-    }
+    matches!(peel_casts(expr), Expr::Column(c) if c.name == name)
 }
 
 /// Removes coercion casts that otherwise hide literals from pruning.
 pub fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
-    match expr {
+    match peel_casts(expr) {
         Expr::Literal(scalar, _) => Some(scalar),
-        Expr::Cast(Cast { expr, .. }) | Expr::TryCast(TryCast { expr, .. }) => unwrap_literal(expr),
         _ => None,
     }
 }
@@ -103,26 +107,23 @@ pub mod time_range_partition_pruner {
 
     /// Adds necessary date-partition bounds without excluding matching rows.
     pub fn with_date_partition_filters(predicate: Expr, time_column: &str) -> Expr {
-        fn walk(expr: &Expr, time_column: &str) -> Vec<Expr> {
-            match expr {
-                Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => [left, right].into_iter().flat_map(|e| walk(e, time_column)).collect(),
-                other => timestamp_to_date_filters(other, time_column),
-            }
-        }
-        let date_filters = walk(&predicate, time_column); // bound separately: `predicate` is moved into the fold below
+        // bound separately: `predicate` is moved into the fold below
+        let date_filters: Vec<Expr> = split_conjunction(&predicate).into_iter().flat_map(|e| timestamp_to_date_filters(e, time_column)).collect();
         date_filters.into_iter().fold(predicate, Expr::and)
     }
 
     /// Collects date bounds from an AND tree for pruning diagnostics.
     pub fn extract_date_bounds(expr: &Expr) -> Vec<(Operator, i32)> {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => [left, right].into_iter().flat_map(|e| extract_date_bounds(e)).collect(),
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(c), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if c.name == "date" => vec![(*op, *day)],
-                _ => vec![],
-            },
-            _ => vec![],
-        }
+        split_conjunction(expr)
+            .into_iter()
+            .filter_map(|e| match e {
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if c.name == "date" => Some((*op, *day)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -368,6 +369,11 @@ fn rewrite_input_for_variant(input: &LogicalPlan, variant: &HashSet<usize>) -> R
     }
 }
 
+/// `func(args…)` as a logical expression — the single UDF-call construction site.
+fn call_udf(func: &Arc<ScalarUDF>, args: Vec<Expr>) -> Expr {
+    Expr::ScalarFunction(ScalarFunction { func: func.clone(), args })
+}
+
 /// Shared by the probe and the rewrite below — the two must never disagree.
 fn should_wrap(i: usize, e: &Expr, variant: &HashSet<usize>) -> bool {
     variant.contains(&i) && is_utf8_expr(e)
@@ -379,11 +385,7 @@ fn needs_wrap(exprs: &[Expr], variant: &HashSet<usize>) -> bool {
 }
 
 fn wrap_variant_exprs(exprs: &[Expr], variant: &HashSet<usize>, udf: &Arc<ScalarUDF>) -> Vec<Expr> {
-    exprs
-        .iter()
-        .enumerate()
-        .map(|(i, e)| if should_wrap(i, e, variant) { Expr::ScalarFunction(ScalarFunction { func: udf.clone(), args: vec![e.clone()] }) } else { e.clone() })
-        .collect()
+    exprs.iter().enumerate().map(|(i, e)| if should_wrap(i, e, variant) { call_udf(udf, vec![e.clone()]) } else { e.clone() }).collect()
 }
 
 /// Matches *literal* Utf8 only (and casts thereof). Column references — e.g.
@@ -628,7 +630,7 @@ fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// in a scalar-text position with `variant_to_json`. Idempotent — an
 /// already-wrapped operand types as `Utf8` and `is_variant_expr` returns false.
 fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<ScalarUDF>) -> Result<Transformed<Expr>> {
-    let wrap = |x: Expr| Expr::ScalarFunction(ScalarFunction { func: to_json.clone(), args: vec![x] });
+    let wrap = |x: Expr| call_udf(to_json, vec![x]);
     // Box::new(wrap(*l.expr)) can't be written as struct-update (`..l`) — that
     // would read a partially moved `l` — so rebind through a local mut.
     let wrap_like = |mut l: Like| {
@@ -668,29 +670,32 @@ fn is_text_type(dt: &DataType) -> bool {
     matches!(dt, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)
 }
 
+/// Deliberately enumerated (not `Operator::is_comparison_operator()`): this is
+/// exactly the set that puts a Variant operand in a scalar-text position.
 fn is_text_comparison_op(op: Operator) -> bool {
     use Operator::{
         Eq, Gt, GtEq, ILikeMatch, IsDistinctFrom, IsNotDistinctFrom, LikeMatch, Lt, LtEq, NotEq, NotILikeMatch, NotLikeMatch, RegexIMatch, RegexMatch,
         RegexNotIMatch, RegexNotMatch,
     };
-    matches!(
-        op,
-        Eq | NotEq
-            | Lt
-            | LtEq
-            | Gt
-            | GtEq
-            | IsDistinctFrom
-            | IsNotDistinctFrom
-            | RegexMatch
-            | RegexIMatch
-            | RegexNotMatch
-            | RegexNotIMatch
-            | LikeMatch
-            | ILikeMatch
-            | NotLikeMatch
-            | NotILikeMatch
-    )
+    [
+        Eq,
+        NotEq,
+        Lt,
+        LtEq,
+        Gt,
+        GtEq,
+        IsDistinctFrom,
+        IsNotDistinctFrom,
+        RegexMatch,
+        RegexIMatch,
+        RegexNotMatch,
+        RegexNotIMatch,
+        LikeMatch,
+        ILikeMatch,
+        NotLikeMatch,
+        NotILikeMatch,
+    ]
+    .contains(&op)
 }
 
 /// Peel Sort / Limit / Distinct / SubqueryAlias from the root and wrap
@@ -804,7 +809,7 @@ fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
 }
 
 fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<ScalarUDF>) -> Expr {
-    let wrap = |inner: Expr| Expr::ScalarFunction(ScalarFunction { func: udf.clone(), args: vec![inner] });
+    let wrap = |inner: Expr| call_udf(udf, vec![inner]);
     match expr {
         // Keep the alias outermost so the output column name is unchanged.
         Expr::Alias(a) => wrap(a.expr.as_ref().clone()).alias(a.name.clone()),
@@ -912,11 +917,10 @@ fn variant_native_extraction(expr: &Expr) -> Option<Expr> {
         return None;
     }
 
-    let scalar = |func: Arc<ScalarUDF>, args: Vec<Expr>| Expr::ScalarFunction(ScalarFunction { func, args });
-    let leaf = scalar(variant_get_udf(), vec![variant.clone(), Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path))), None)]);
+    let leaf = call_udf(&variant_get_udf(), vec![variant.clone(), Expr::Literal(ScalarValue::Utf8(Some(build_variant_path(&path))), None)]);
     // `variant_get` cannot stringify numeric/boolean leaves, so reuse the exact
     // composition `VariantAwareExprPlanner` already emits for `->>`.
-    Some(scalar(json_to_pg_text_udf(), vec![scalar(variant_to_json_udf(), vec![leaf])]))
+    Some(call_udf(&json_to_pg_text_udf(), vec![call_udf(&variant_to_json_udf(), vec![leaf])]))
 }
 
 #[cfg(test)]
@@ -1328,7 +1332,7 @@ impl Route {
             Route::Ready(query) => vec![col, lit(query)],
             Route::Deferred { rhs, kind } => vec![col, rhs, lit(kind)],
         };
-        Expr::ScalarFunction(ScalarFunction { func: CELL.get_or_init(|| Arc::new(ScalarUDF::from(TextMatchUdf::default()))).clone(), args })
+        call_udf(CELL.get_or_init(|| Arc::new(ScalarUDF::from(TextMatchUdf::default()))), args)
     }
 }
 
@@ -1468,9 +1472,9 @@ fn indexed_columns_for(table: &str) -> Option<&'static IndexedCols> {
                             if cfg.list_mode == crate::schema::TantivyListMode::Elements {
                                 return None; // exact membership has a separate route
                             }
-                            let tok = match cfg.tokenizer.as_deref().unwrap_or(NGRAM3_TOKENIZER) {
-                                RAW_TOKENIZER => RAW_TOKENIZER,
-                                DEFAULT_TOKENIZER => DEFAULT_TOKENIZER,
+                            let tok = match cfg.tokenizer.as_deref() {
+                                Some(RAW_TOKENIZER) => RAW_TOKENIZER,
+                                Some(DEFAULT_TOKENIZER) => DEFAULT_TOKENIZER,
                                 _ => NGRAM3_TOKENIZER,
                             };
                             Some((f.name.clone(), (tok, matches!(f.data_type.as_str(), "Utf8" | "LargeUtf8" | "Utf8View"))))
@@ -1729,6 +1733,14 @@ const _: () = {
     }
 };
 
+/// Element type of any list-shaped Arrow type; `None` for non-list types.
+fn list_elem_type(t: &DataType) -> Option<&DataType> {
+    match t {
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => Some(f.data_type()),
+        _ => None,
+    }
+}
+
 impl Default for PgCoalesceUdf {
     fn default() -> Self {
         Self { inner: datafusion::functions::core::coalesce() }
@@ -1780,7 +1792,7 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
             // (coalesce(utf8_list, int_list, '{}')) the retried coercion below
             // fails on the second list and the original error surfaces — no
             // silent mis-typing, just a planner-time error like today.
-            let list_t = arg_types.iter().find(|t| matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..))).ok_or(e)?.clone();
+            let list_t = arg_types.iter().find(|t| list_elem_type(t).is_some()).ok_or(e)?.clone();
             let patched: Vec<DataType> = arg_types.iter().map(|t| if is_text_type(t) { list_t.clone() } else { t.clone() }).collect();
             self.inner.coerce_types(&patched)
         })
@@ -1825,12 +1837,7 @@ fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transf
     }
 
     // Element type of the first arg that resolves to a list type.
-    let Some(elem_type) = args.iter().find_map(|a| {
-        input_schemas.iter().find_map(|s| match a.get_type(s.as_ref()).ok()? {
-            DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => Some(f.data_type().clone()),
-            _ => None,
-        })
-    }) else {
+    let Some(elem_type) = args.iter().find_map(|a| input_schemas.iter().find_map(|s| list_elem_type(&a.get_type(s.as_ref()).ok()?).cloned())) else {
         return no(args);
     };
 
@@ -2536,11 +2543,9 @@ impl RowToJsonRecord {
             return;
         }
         for item in &mut select.projection {
-            let expr = match item {
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-                _ => continue,
-            };
-            self.rewrite_expr(expr, &relations);
+            if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+                self.rewrite_expr(expr, &relations);
+            }
         }
     }
 
@@ -2568,10 +2573,7 @@ impl RowToJsonRecord {
 }
 
 fn is_row_to_json(name: &ObjectName) -> bool {
-    name.0.last().is_some_and(|part| match part {
-        ObjectNamePart::Identifier(ident) => ident.value.eq_ignore_ascii_case("row_to_json"),
-        _ => false,
-    })
+    name.0.last().is_some_and(|part| matches!(part, ObjectNamePart::Identifier(ident) if ident.value.eq_ignore_ascii_case("row_to_json")))
 }
 
 /// `named_struct('total', t."total", 'active', t."active", …)`, preserving the
@@ -2717,37 +2719,30 @@ impl AnalyzerRule for ExistsInProjection {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up(|plan| match plan {
-            LogicalPlan::Projection(projection) => {
-                let (expr, transformed) = rewrite_exprs(projection.expr.clone())?;
-                if !transformed {
-                    return Ok(Transformed::no(LogicalPlan::Projection(projection)));
-                }
-                LogicalPlanBuilder::from(Arc::unwrap_or_clone(projection.input)).project(expr)?.build().map(Transformed::yes)
+        plan.transform_up(|plan| {
+            let LogicalPlan::Projection(projection) = plan else { return Ok(Transformed::no(plan)) };
+            // `transform_up` so a nested EXISTS is rewritten before its parent is
+            // inspected; `Alias` nodes must survive untouched or the projection's
+            // output column names change. The collected `transformed` flag is the
+            // "did anything change" answer — no separate accumulator.
+            let Transformed { data, transformed, .. } = projection.expr.clone().into_iter().map_until_stop_and_collect(|expr| {
+                expr.transform_up(|expr| match expr {
+                    Expr::Exists(exists) => Ok(Transformed::yes(match count_subquery(exists.subquery)? {
+                        Some(count) if exists.negated => count.eq(lit(0_i64)),
+                        Some(count) => count.gt(lit(0_i64)),
+                        // Provably empty subquery: EXISTS is a constant.
+                        None => lit(exists.negated),
+                    })),
+                    other => Ok(Transformed::no(other)),
+                })
+            })?;
+            if !transformed {
+                return Ok(Transformed::no(LogicalPlan::Projection(projection)));
             }
-            other => Ok(Transformed::no(other)),
+            LogicalPlanBuilder::from(Arc::unwrap_or_clone(projection.input)).project(data)?.build().map(Transformed::yes)
         })
         .map(|transformed| transformed.data)
     }
-}
-
-fn rewrite_exprs(exprs: Vec<Expr>) -> Result<(Vec<Expr>, bool)> {
-    // `transform_up` so a nested EXISTS is rewritten before its parent is
-    // inspected; `Alias` nodes must survive untouched or the projection's
-    // output column names change. The collected `transformed` flag is the
-    // "did anything change" answer — no separate accumulator.
-    let Transformed { data, transformed, .. } = exprs.into_iter().map_until_stop_and_collect(|expr| {
-        expr.transform_up(|expr| match expr {
-            Expr::Exists(exists) => Ok(Transformed::yes(match count_subquery(exists.subquery)? {
-                Some(count) if exists.negated => count.eq(lit(0_i64)),
-                Some(count) => count.gt(lit(0_i64)),
-                // Provably empty subquery: EXISTS is a constant.
-                None => lit(exists.negated),
-            })),
-            other => Ok(Transformed::no(other)),
-        })
-    })?;
-    Ok((data, transformed))
 }
 
 /// `q` → scalar subquery `SELECT count(1) FROM q`, keeping the outer
@@ -2787,11 +2782,9 @@ fn peel_row_caps(plan: LogicalPlan) -> Option<LogicalPlan> {
 }
 
 fn literal_count(expr: &Expr) -> Option<i64> {
-    match expr {
-        Expr::Literal(value, ..) => value.cast_to(&DataType::Int64).ok().and_then(|value| match value {
-            ScalarValue::Int64(count) => count,
-            _ => None,
-        }),
+    let Expr::Literal(value, ..) = expr else { return None };
+    match value.cast_to(&DataType::Int64).ok()? {
+        ScalarValue::Int64(count) => count,
         _ => None,
     }
 }
@@ -3278,20 +3271,19 @@ impl PhysicalOptimizerRule for DedupNeedsOrderedInput {
 
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|node| {
-            let Some(dedup) = downcast::<DedupExec>(node.as_ref()) else {
-                return Ok(Transformed::no(node));
-            };
-            // No declared ordering means keep-greatest is dormant (the table has no
-            // `version_append`); the operator is ordering-agnostic and a coalesce is fine.
-            let Some(req) = dedup.required_ordering().cloned() else {
-                return Ok(Transformed::no(node));
-            };
-            let child = Arc::clone(node.children()[0]);
-            let Some(coalesce) = downcast::<CoalescePartitionsExec>(child.as_ref()) else {
-                return Ok(Transformed::no(node));
-            };
-            let merged = Arc::new(SortPreservingMergeExec::new(req, Arc::clone(coalesce.children()[0]))) as Arc<dyn ExecutionPlan>;
-            Ok(Transformed::yes(node.with_new_children(vec![merged])?))
+            let merged = downcast::<DedupExec>(node.as_ref())
+                // No declared ordering means keep-greatest is dormant (the table has no
+                // `version_append`); the operator is ordering-agnostic and a coalesce is fine.
+                .and_then(|dedup| dedup.required_ordering().cloned())
+                .and_then(|req| {
+                    let child = Arc::clone(node.children()[0]);
+                    let coalesce = downcast::<CoalescePartitionsExec>(child.as_ref())?;
+                    Some(Arc::new(SortPreservingMergeExec::new(req, Arc::clone(coalesce.children()[0]))) as Arc<dyn ExecutionPlan>)
+                });
+            match merged {
+                Some(merged) => Ok(Transformed::yes(node.with_new_children(vec![merged])?)),
+                None => Ok(Transformed::no(node)),
+            }
         })
         .data()
     }
@@ -3369,7 +3361,7 @@ mod dedup_needs_ordered_input_tests {
 
 // ===== range_parallel_dedup =====
 
-use datafusion::logical_expr::{Filter, SubqueryAlias, utils::split_conjunction};
+use datafusion::logical_expr::{Filter, SubqueryAlias};
 
 /// Branches a wide aggregate window is split into. `<2` disables the rule.
 static RANGE_SPLIT_BRANCHES: OnceLock<usize> = OnceLock::new();
@@ -3427,104 +3419,93 @@ impl OptimizerRule for RangeParallelDedup {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        let branches = range_split_branches();
-        let LogicalPlan::Aggregate(aggregate) = &plan else {
-            return Ok(Transformed::no(plan));
-        };
-        // A Union input is this rule's own output. The optimizer runs to a
-        // fixpoint, and re-splitting each branch would fan out geometrically.
-        if branches < 2 || matches!(aggregate.input.as_ref(), LogicalPlan::Union(_)) {
-            return Ok(Transformed::no(plan));
-        }
-        let Some((lo, hi)) = splittable_window(&aggregate.input) else {
-            return Ok(Transformed::no(plan));
-        };
-        if hi.saturating_sub(lo) < MIN_SPLIT_SPAN_MICROS {
-            return Ok(Transformed::no(plan));
-        }
-        let step = (hi - lo) / branches as i64;
-        let narrowed: Option<Vec<LogicalPlan>> = (0..branches)
-            .map(|i| {
-                // Half-open [lo, hi) per branch so a row on a boundary belongs to
-                // exactly one branch. The last branch takes `hi + 1` because the
-                // window `hi` is INCLUSIVE (`<=` folds into it upstream).
-                let branch_lo = lo + step * i as i64;
-                let branch_hi = if i + 1 == branches { hi.saturating_add(1) } else { lo + step * (i as i64 + 1) };
-                narrow_scan_window(&aggregate.input, branch_lo, branch_hi)
-            })
-            .collect();
-        let Some(narrowed) = narrowed else {
-            return Ok(Transformed::no(plan));
-        };
-        let union = narrowed[1..].iter().try_fold(LogicalPlanBuilder::new(narrowed[0].clone()), |builder, branch| builder.union(branch.clone()))?.build()?;
-        // A UNION's output fields are UNQUALIFIED, so a parent expression like
-        // `t.id` stops resolving and the whole rule fails the query. Re-attach
-        // the scan's qualifier, and if that still does not reproduce the input's
-        // schema exactly, DECLINE — the replacement must be indistinguishable to
-        // every parent, or this is a rewrite that breaks queries rather than one
-        // that speeds them up.
-        let union = if union.schema() == aggregate.input.schema() {
-            union
-        } else {
-            let Some(qualifier) = scan_qualifier(&aggregate.input) else {
-                return Ok(Transformed::no(plan));
-            };
-            let aliased = LogicalPlanBuilder::new(union).alias(qualifier)?.build()?;
-            if aliased.schema() != aggregate.input.schema() {
-                return Ok(Transformed::no(plan));
-            }
-            aliased
-        };
-        Ok(Transformed::yes(LogicalPlan::Aggregate(datafusion::logical_expr::Aggregate::try_new(
-            Arc::new(union),
-            aggregate.group_expr.clone(),
-            aggregate.aggr_expr.clone(),
-        )?)))
+        Ok(split_aggregate(&plan)?.map_or_else(|| Transformed::no(plan), Transformed::yes))
     }
 }
 
-/// The finite timestamp window of a subtree the split may pass through.
+/// `None` when the plan is not an aggregate over a window worth splitting.
+fn split_aggregate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    let branches = range_split_branches();
+    let LogicalPlan::Aggregate(aggregate) = plan else { return Ok(None) };
+    // A Union input is this rule's own output. The optimizer runs to a
+    // fixpoint, and re-splitting each branch would fan out geometrically.
+    if branches < 2 || matches!(aggregate.input.as_ref(), LogicalPlan::Union(_)) {
+        return Ok(None);
+    }
+    let Some((lo, hi)) = splittable_window(&aggregate.input).filter(|&(lo, hi)| hi.saturating_sub(lo) >= MIN_SPLIT_SPAN_MICROS) else {
+        return Ok(None);
+    };
+    let step = (hi - lo) / branches as i64;
+    let Some(narrowed) = (0..branches)
+        .map(|i| {
+            // Half-open [lo, hi) per branch so a row on a boundary belongs to
+            // exactly one branch. The last branch takes `hi + 1` because the
+            // window `hi` is INCLUSIVE (`<=` folds into it upstream).
+            let branch_lo = lo + step * i as i64;
+            let branch_hi = if i + 1 == branches { hi.saturating_add(1) } else { lo + step * (i as i64 + 1) };
+            narrow_scan_window(&aggregate.input, branch_lo, branch_hi)
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let union = narrowed[1..].iter().try_fold(LogicalPlanBuilder::new(narrowed[0].clone()), |builder, branch| builder.union(branch.clone()))?.build()?;
+    // A UNION's output fields are UNQUALIFIED, so a parent expression like
+    // `t.id` stops resolving and the whole rule fails the query. Re-attach
+    // the scan's qualifier, and if that still does not reproduce the input's
+    // schema exactly, DECLINE — the replacement must be indistinguishable to
+    // every parent, or this is a rewrite that breaks queries rather than one
+    // that speeds them up.
+    let union = if union.schema() == aggregate.input.schema() {
+        union
+    } else {
+        let Some(qualifier) = scan_qualifier(&aggregate.input) else { return Ok(None) };
+        let aliased = LogicalPlanBuilder::new(union).alias(qualifier)?.build()?;
+        if aliased.schema() != aggregate.input.schema() {
+            return Ok(None);
+        }
+        aliased
+    };
+    Ok(Some(LogicalPlan::Aggregate(datafusion::logical_expr::Aggregate::try_new(Arc::new(union), aggregate.group_expr.clone(), aggregate.aggr_expr.clone())?)))
+}
+
+/// The `TableScan` under a subtree the split may pass through, collecting the
+/// filter predicates crossed on the way down.
 ///
 /// A WHITELIST, deliberately: the rewrite assumes "the rows of sub-range A" equals
 /// "the rows of the whole window restricted to A". A LIMIT, DISTINCT, JOIN, WINDOW
 /// or nested aggregate breaks that equality — `count(*)` over `(SELECT … LIMIT
 /// 100)` would become N x 100 rows. Only nodes that commute with a row filter are
 /// listed, so an unrecognised node declines rather than silently miscounting.
-fn splittable_window(plan: &LogicalPlan) -> Option<(i64, i64)> {
-    let mut predicates: Vec<Expr> = Vec::new();
-    let mut node = plan;
-    loop {
-        match node {
-            LogicalPlan::Filter(filter) => {
-                predicates.push(filter.predicate.clone());
-                node = &filter.input;
-            }
-            LogicalPlan::Projection(projection) => node = &projection.input,
-            LogicalPlan::SubqueryAlias(alias) => node = &alias.input,
-            LogicalPlan::TableScan(scan) => {
-                predicates.extend(scan.filters.iter().cloned());
-                let conjuncts: Vec<&Expr> = predicates.iter().flat_map(split_conjunction).collect();
-                return bounded_window(&conjuncts);
-            }
-            _ => return None,
+fn scan_under<'a>(plan: &'a LogicalPlan, predicates: &mut Vec<&'a Expr>) -> Option<&'a TableScan> {
+    match plan {
+        LogicalPlan::Filter(filter) => {
+            predicates.push(&filter.predicate);
+            scan_under(&filter.input, predicates)
         }
+        LogicalPlan::Projection(projection) => scan_under(&projection.input, predicates),
+        LogicalPlan::SubqueryAlias(alias) => scan_under(&alias.input, predicates),
+        LogicalPlan::TableScan(scan) => Some(scan),
+        _ => None,
     }
+}
+
+/// The finite timestamp window of a subtree the split may pass through.
+fn splittable_window(plan: &LogicalPlan) -> Option<(i64, i64)> {
+    let mut predicates = Vec::new();
+    let scan = scan_under(plan, &mut predicates)?;
+    bounded_window(predicates.into_iter().chain(&scan.filters).flat_map(split_conjunction))
 }
 
 /// Both bounds of `timestamp` across `conjuncts`, or `None` if either is open.
 /// An unbounded side has no finite span to divide, and splitting on a guessed
 /// bound would drop every row outside it.
-fn bounded_window(conjuncts: &[&Expr]) -> Option<(i64, i64)> {
-    fn literal_micros(expr: &Expr) -> Option<i64> {
-        match expr {
-            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
-            Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
-            Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
-            Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
-            _ => None,
-        }
-    }
-    let (lo, hi) = conjuncts.iter().fold((None::<i64>, None::<i64>), |acc @ (lo, hi), conjunct| {
+fn bounded_window<'a>(conjuncts: impl IntoIterator<Item = &'a Expr>) -> Option<(i64, i64)> {
+    let literal_micros = |expr: &Expr| match expr {
+        Expr::Literal(scalar, _) => scalar_micros(scalar),
+        _ => None,
+    };
+    let (lo, hi) = conjuncts.into_iter().fold((None::<i64>, None::<i64>), |acc @ (lo, hi), conjunct| {
         let Expr::BinaryExpr(BinaryExpr { left, op, right }) = conjunct else { return acc };
         let (bound, op) = if is_col_through_cast(left, "timestamp") {
             (literal_micros(right), *op)
@@ -3546,13 +3527,7 @@ fn bounded_window(conjuncts: &[&Expr]) -> Option<(i64, i64)> {
 
 /// The scanned table's qualifier, used to restore the qualification a UNION drops.
 fn scan_qualifier(plan: &LogicalPlan) -> Option<datafusion::common::TableReference> {
-    match plan {
-        LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
-        LogicalPlan::Filter(filter) => scan_qualifier(&filter.input),
-        LogicalPlan::Projection(projection) => scan_qualifier(&projection.input),
-        LogicalPlan::SubqueryAlias(alias) => scan_qualifier(&alias.input),
-        _ => None,
-    }
+    scan_under(plan, &mut Vec::new()).map(|scan| scan.table_name.clone())
 }
 
 /// Rebuild `plan` with `[lo, hi)` pinned directly above its TableScan, so the
@@ -3770,14 +3745,13 @@ impl PhysicalOptimizerRule for AggregateInputOrdering {
             downcast::<DedupExec>(plan.as_ref()).is_some() || plan.children().into_iter().any(relies_on_storage_order)
         }
         plan.transform_up(|node| {
-            if downcast::<datafusion::physical_plan::aggregates::AggregateExec>(node.as_ref()).is_some() {
-                let input = node.children()[0];
-                if relies_on_storage_order(input) {
-                    let input = Arc::new(UnorderedAggregateInput::new(Arc::clone(input)));
-                    return Ok(Transformed::yes(node.with_new_children(vec![input])?));
-                }
+            let unordered = downcast::<datafusion::physical_plan::aggregates::AggregateExec>(node.as_ref())
+                .map(|_| Arc::clone(node.children()[0]))
+                .filter(relies_on_storage_order);
+            match unordered {
+                Some(input) => Ok(Transformed::yes(node.with_new_children(vec![Arc::new(UnorderedAggregateInput::new(input))])?)),
+                None => Ok(Transformed::no(node)),
             }
-            Ok(Transformed::no(node))
         })
         .data()
     }

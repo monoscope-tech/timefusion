@@ -18,6 +18,61 @@ async fn lock_with_flush_priority<'a>(lock: &'a tokio::sync::Mutex<()>, waiters:
     lock.lock().await
 }
 
+/// Spawn detached post-commit work that a maintenance shutdown cancels — it is
+/// all best-effort, so dropping it mid-flight on shutdown is correct.
+fn spawn_until_shutdown(shutdown: Arc<CancellationToken>, work: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = work => {}
+        }
+    });
+}
+
+/// Which path is driving [`Database::commit_staged_group`] — everything the
+/// per-project and coalesced staged commits do differently, in one value.
+#[derive(Clone, Copy)]
+enum StagedCommitKind {
+    /// One project's unit. `warm` is the caller's `watermark.is_some()`: only
+    /// the BufferedWriteLayer flush path warms the cache (see
+    /// [`Database::record_committed_write`]).
+    Flush { warm: bool },
+    /// One physical table's coalesced group — always a flush, always warms.
+    Coalesced,
+}
+
+impl StagedCommitKind {
+    /// `(refresh, commit)` labels for the commit-lock timeout metric — they are
+    /// documented per-value in `observability.rs`, so they are not cosmetic.
+    fn ops(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Flush { .. } => ("flush_refresh", "flush_commit"),
+            Self::Coalesced => ("coalesced_refresh", "coalesced_commit"),
+        }
+    }
+
+    /// Subject of the failure messages this path returns.
+    fn what(self) -> &'static str {
+        match self {
+            Self::Flush { .. } => "staged commit",
+            Self::Coalesced => "coalesced staged commit",
+        }
+    }
+
+    fn warm(self) -> bool {
+        matches!(self, Self::Flush { warm: true } | Self::Coalesced)
+    }
+}
+
+/// What a staged commit appends: the already-uploaded parquet's actions, the
+/// target's schema (which supplies the operation's `partition_by`), and the
+/// commit metadata.
+struct StagedCommit<'a> {
+    adds: &'a [deltalake::kernel::Action],
+    schema: &'a crate::schema::TableSchema,
+    properties: CommitProperties,
+}
+
 impl Database {
     /// Directory holding locally persisted Delta snapshots (see `snapshot_cache`).
     pub(crate) fn delta_snapshot_dir(cfg: &AppConfig) -> PathBuf {
@@ -28,6 +83,19 @@ impl Database {
     /// (see [`refresh_table_snapshot`]) — exposed for the DML path in dml.rs.
     pub(crate) fn incremental_snapshot(&self) -> bool {
         self.config.maintenance.timefusion_incremental_snapshot
+    }
+
+    /// Let the post-commit hook advance the snapshot incrementally — carry the
+    /// materialized file list forward, append the committed files, drop any
+    /// removed ones — instead of re-materializing the whole active set. Safe for
+    /// the staged (pure-append) and schema-evolution merge paths alike: the hook
+    /// rebuilds the kernel snapshot from the log, so a MetaData/schema change IS
+    /// applied; only the file-list re-materialize is skipped.
+    fn with_incremental_advance(&self, properties: CommitProperties) -> CommitProperties {
+        match self.incremental_snapshot() {
+            true => properties.with_incremental_advance(true),
+            false => properties,
+        }
     }
 
     /// Returns the process-wide query memory pool and Parquet metadata cache.
@@ -509,8 +577,7 @@ impl Database {
             use crate::database::compact::bin_micros;
             batches
                 .iter()
-                .filter_map(|batch| batch.column_by_name("timestamp"))
-                .filter_map(|column| column.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>())
+                .filter_map(|batch| batch.column_by_name("timestamp")?.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>())
                 .flat_map(|timestamps| {
                     timestamps.iter().flatten().filter_map(|timestamp| {
                         chrono::DateTime::from_timestamp_micros(timestamp).map(|time| (time.date_naive().to_string(), timestamp.div_euclid(bin_micros())))
@@ -655,24 +722,14 @@ impl Database {
             self.prepare_staged_write(&project_id, &table_name, batches).await?;
 
         // Hoist out of the retry loop — the watermark is the same on every attempt.
-        let commit_properties = watermark.map(|w| {
+        // Base properties (hooks off) when there is no watermark: leaving this
+        // unset would let WriteBuilder's own default re-enable the checkpoint hook.
+        let commit_properties = self.with_incremental_advance(watermark.map_or_else(base_commit_properties, |w| {
             build_watermark_commit_properties(
                 [(project_id.clone(), table_name.clone(), w.clone())],
                 landed.map(|d| (project_id.clone(), table_name.clone(), d)),
             )
-        });
-        // Let the post-commit hook advance the snapshot incrementally — carry
-        // the materialized file list forward, append the committed files, drop
-        // any removed ones — instead of re-materializing the whole active set.
-        // Safe for the staged (pure-append) and schema-evolution merge paths
-        // alike: the hook rebuilds the kernel snapshot from the log, so a
-        // MetaData/schema change IS applied; only the file-list re-materialize
-        // is skipped.
-        let commit_properties = if self.config.maintenance.timefusion_incremental_snapshot {
-            Some(commit_properties.unwrap_or_else(base_commit_properties).with_incremental_advance(true))
-        } else {
-            commit_properties
-        };
+        }));
         // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
         // per-table commit lock, then serialize only the tiny commit-log
         // append. The old path held the lock across the whole `.write()`
@@ -687,15 +744,10 @@ impl Database {
         // table schema `prepare_staged_write` returns no staged writer and we
         // fall back to the locked WriteBuilder merge path below.
         if let Some(mut writer) = staged_writer {
-            use deltalake::{
-                kernel::{Action, transaction::TableReference},
-                protocol::DeltaOperation,
-            };
-
             // Upload parquet (no commit) on the staging clone — outside the lock.
             let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
             let max_file_bytes = self.config.maintenance.timefusion_writer_max_file_bytes;
-            let adds: Vec<Action> = Self::stage_batches(&mut writer, batches, max_file_bytes)
+            let adds = Self::stage_batches(&mut writer, batches, max_file_bytes)
                 .instrument(stage_span)
                 .await
                 .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e))?;
@@ -703,136 +755,31 @@ impl Database {
                 return Ok(Vec::new());
             }
 
-            let partition_by = (!schema.partitions.is_empty()).then(|| schema.partitions.clone());
-            let op = DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by, predicate: None };
-            let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(&project_id, &table_name).await;
-            let mut retry_count = 0;
-            loop {
-                // Refresh UNDER the lock (the merge path refreshes before locking).
-                // The per-table commit lock serializes all in-process commits to
-                // THIS log, so refreshing here guarantees we build on the previous
-                // committer's version and never self-conflict; refresh is
-                // probe-cheap (a single GET that 404-short-circuits when already
-                // current), so the extra lock-hold is sub-millisecond on the common
-                // path.
-                let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
-                // DIAG (commit-throughput profiling): time the serial commit phases
-                // (refresh + Delta log append) under the lock — these bound the
-                // process-wide commit rate. Remove once the flush bottleneck is found.
-                let _t_refresh = std::time::Instant::now();
-                if let Err(e) = bounded_commit_await(
-                    COMMIT_LOCK_OP_TIMEOUT,
-                    "flush_refresh",
+            return match self
+                .commit_staged_group(
+                    StagedCommitKind::Flush { warm: watermark.is_some() },
+                    &table_ref,
+                    &[(project_id.as_str(), dirty_bins.as_slice())],
                     &table_name,
-                    refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot),
+                    StagedCommit { adds: &adds, schema, properties: commit_properties },
                 )
                 .await
-                {
-                    debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e.message);
+            {
+                // AFTER the commit lands, never before: an abandoned attempt's
+                // staged parquet is deleted, and marking a deleted path is
+                // harmless but a marked path that never committed is a lie we
+                // would keep forever.
+                Ok(committed) => {
+                    self.mark_written_sorted(schema, sorted, &adds);
+                    Ok(committed)
                 }
-                let _refresh_ms = _t_refresh.elapsed().as_millis();
-                let mut new_table = { table_ref.read().await.clone() };
-                let _t_build = std::time::Instant::now();
-                // Bounded for the same reason as the wave path: this await holds
-                // the per-table commit lock every other committer queues on.
-                let commit_res = bounded_commit_await(
-                    COMMIT_LOCK_OP_TIMEOUT,
-                    "flush_commit",
-                    &table_name,
-                    deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone().unwrap_or_else(base_commit_properties))
-                        .with_actions(adds.clone())
-                        .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op.clone()),
-                )
-                .await;
-                let _build_ms = _t_build.elapsed().as_millis();
-                match commit_res {
-                    Ok(finalized) => {
-                        // Diff pre- vs post-commit file URIs for `added`. Capture
-                        // pre-uris here (only on success) — before the state swap
-                        // below makes `new_table` post-commit — so failed attempts
-                        // don't pay the full-table file-URI walk.
-                        let pre_uris: HashSet<String> = file_uris(&new_table);
-                        new_table.state = Some(finalized.snapshot());
-                        drop(commit_guard);
-                        // AFTER the commit lands, never before: an abandoned
-                        // attempt's staged parquet is deleted, and marking a
-                        // deleted path is harmless but a marked path that never
-                        // committed is a lie we would keep forever.
-                        self.mark_written_sorted(schema, sorted, &adds);
-                        let _t_record = std::time::Instant::now();
-                        let _committed = self
-                            .record_committed_write(
-                                &table_ref,
-                                &[(project_id.as_str(), dirty_bins.as_slice())],
-                                &table_name,
-                                new_table,
-                                &pre_uris,
-                                watermark.is_some(),
-                            )
-                            .await;
-                        info!(
-                            "commit_timing project={} table={} refresh_ms={} build_ms={} record_ms={} files={}",
-                            project_id,
-                            table_name,
-                            _refresh_ms,
-                            _build_ms,
-                            _t_record.elapsed().as_millis(),
-                            adds.len()
-                        );
-                        return Ok(_committed);
+                Err(e) => {
+                    if !e.to_string().contains(INCONCLUSIVE_COMMIT_MARKER) {
+                        Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                     }
-                    Err(CommitFailure { message: e, timed_out }) => {
-                        drop(commit_guard);
-                        if !timed_out && is_occ_conflict_err(&e) {
-                            retry_count += 1;
-                            if retry_count >= MAX_COMMIT_RETRIES {
-                                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                                return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", MAX_COMMIT_RETRIES, e));
-                            }
-                            debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, MAX_COMMIT_RETRIES, e);
-                            tokio::time::sleep(occ_backoff(retry_count as usize)).await;
-                            continue;
-                        }
-                        // Non-OCC error: the commit MAY have landed (post-commit
-                        // hook / snapshot refresh failed AFTER N.json was written).
-                        // Capture the pre-commit file set from the still-pre-commit
-                        // clone (only on this rare branch — the OCC-retry path must
-                        // not pay the full-table URI walk), then probe.
-                        let pre_uris: HashSet<String> = file_uris(&new_table);
-                        match probe_after_timeout(self.probe_commit_landed_bounded(&table_ref, &adds).await, timed_out) {
-                            CommitProbe::Landed => {
-                                warn!(
-                                    "staged commit for {}/{} reported an error but LANDED (post-commit hook failed) — draining bucket: {}",
-                                    project_id, table_name, e
-                                );
-                                let post = { table_ref.read().await.clone() };
-                                let committed = self
-                                    .record_committed_write(
-                                        &table_ref,
-                                        &[(project_id.as_str(), dirty_bins.as_slice())],
-                                        &table_name,
-                                        post,
-                                        &pre_uris,
-                                        watermark.is_some(),
-                                    )
-                                    .await;
-                                return Ok(committed);
-                            }
-                            CommitProbe::NotLanded => {
-                                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                                return Err(anyhow::anyhow!("staged commit failed: {}", e));
-                            }
-                            CommitProbe::Inconclusive => {
-                                warn!(
-                                    "staged commit for {}/{} errored and landing is UNCONFIRMED (snapshot read failed) — leaving staged parquet in place to avoid a dangling Add: {}",
-                                    project_id, table_name, e
-                                );
-                                return Err(anyhow::anyhow!("staged commit failed (landing unconfirmed): {}", e));
-                            }
-                        }
-                    }
+                    Err(e)
                 }
-            }
+            };
         }
 
         // SCHEMA-EVOLUTION FALLBACK: locked WriteBuilder merge path. Holds the
@@ -864,9 +811,7 @@ impl Database {
                     .with_writer_properties(writer_properties.clone())
                     .with_save_mode(deltalake::protocol::SaveMode::Append)
                     .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
-                    // Always set base properties (hooks off) — a None here would
-                    // let WriteBuilder's own default re-enable the checkpoint hook.
-                    .with_commit_properties(commit_properties.clone().unwrap_or_else(base_commit_properties))
+                    .with_commit_properties(commit_properties.clone())
                     .await
             }
             .instrument(write_span)
@@ -923,7 +868,7 @@ impl Database {
     /// unit in the physical group; schema-evolving units are committed alone so they don't block
     /// co-tenants. Returns one result per input unit in input order.
     pub async fn insert_records_batches_coalesced(&self, units: Vec<CoalescedWriteUnit>) -> Vec<Result<Vec<String>>> {
-        use deltalake::{kernel::Action, protocol::DeltaOperation};
+        use deltalake::kernel::Action;
         use futures::stream::{self, StreamExt};
         let parallelism = self.config.buffer.flush_parallelism();
         let mut results: Vec<Result<Vec<String>>> = units.iter().map(|_| Ok(Vec::new())).collect();
@@ -996,7 +941,6 @@ impl Database {
                     let table_name = units[indices[0]].table_name.clone();
                     let projects: Vec<&str> = indices.iter().map(|i| units[*i].project_id.as_str()).collect();
                     let table_ref = group[0].1.table_ref.clone();
-                    let schema = group[0].1.schema;
                     let adds: Vec<Action> = group.iter().flat_map(|(_, u)| u.adds.iter().cloned()).collect();
                     let watermarks = indices.iter().map(|i| (units[*i].project_id.clone(), units[*i].table_name.clone(), units[*i].watermark.clone()));
                     // Per-unit landed identity, on the batches the flush handed
@@ -1013,19 +957,12 @@ impl Database {
                     } else {
                         Vec::new()
                     };
-                    let commit_properties = build_watermark_commit_properties(watermarks, digests);
-                    let commit_properties = if self.config.maintenance.timefusion_incremental_snapshot {
-                        commit_properties.with_incremental_advance(true)
-                    } else {
-                        commit_properties
-                    };
+                    let commit_properties = self.with_incremental_advance(build_watermark_commit_properties(watermarks, digests));
                     let per_project: Vec<(&str, &[(String, i64)])> =
                         group.iter().map(|(i, u)| (units[*i].project_id.as_str(), u.dirty_bins.as_slice())).collect();
-                    let partition_by = (!schema.partitions.is_empty()).then(|| schema.partitions.clone());
-                    let op = DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by, predicate: None };
-
+                    let commit = StagedCommit { adds: &adds, schema: group[0].1.schema, properties: commit_properties };
                     let outcome = self
-                        .commit_coalesced_group(&table_ref, &per_project, &table_name, adds.clone(), commit_properties, op)
+                        .commit_staged_group(StagedCommitKind::Coalesced, &table_ref, &per_project, &table_name, commit)
                         .await
                         .map(|added| attribute_added_files(added, &projects));
                     match outcome {
@@ -1056,10 +993,6 @@ impl Database {
             .buffer_unordered(parallelism)
             .collect()
             .await;
-        for (i, r) in committed.into_iter().flatten() {
-            results[i] = r;
-        }
-
         // ---- Phase 4: schema-evolution units, each on its own (locked merge path).
         let solo_results: Vec<(usize, Result<Vec<String>>)> = stream::iter(solo)
             .map(|i| {
@@ -1072,57 +1005,97 @@ impl Database {
             .buffer_unordered(parallelism)
             .collect()
             .await;
-        for (i, r) in solo_results {
+        // Phase-3 and phase-4 outcomes cover disjoint units, so order is irrelevant.
+        for (i, r) in committed.into_iter().flatten().chain(solo_results) {
             results[i] = r;
         }
         results
     }
 
-    /// The shared commit-log append for one physical table's coalesced group.
-    /// Mirrors the per-project staged-commit loop (same OCC retry budget +
-    /// backoff, same landed-despite-error probe); the only difference is that
-    /// the actions and the watermark metadata span several projects. Cleanup of
-    /// staged parquet is the caller's (it owns every unit's store).
-    async fn commit_coalesced_group(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, adds: Vec<deltalake::kernel::Action>,
-        commit_properties: CommitProperties, op: deltalake::protocol::DeltaOperation,
+    /// The shared commit-log append for a staged (parquet already uploaded)
+    /// write: one project's flush unit, or one physical table's coalesced group
+    /// whose actions and watermark metadata span several projects. One OCC retry
+    /// budget + backoff and one landed-despite-error probe for both; `kind`
+    /// carries everything that differs (see [`StagedCommitKind`]).
+    ///
+    /// Staged parquet is the CALLER's to clean up: on `Err`, delete it unless
+    /// the message carries [`INCONCLUSIVE_COMMIT_MARKER`] — landing could not be
+    /// confirmed there and deleting would risk a dangling Add.
+    async fn commit_staged_group(
+        &self, kind: StagedCommitKind, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, commit: StagedCommit<'_>,
     ) -> Result<Vec<String>> {
         use deltalake::kernel::transaction::TableReference;
-        // Any member resolves to the same physical lock (the group key IS
-        // `table_lock_key`), so serialization is identical to the per-project path.
+        let StagedCommit { adds, schema, properties } = commit;
+        let op = deltalake::protocol::DeltaOperation::Write {
+            mode: deltalake::protocol::SaveMode::Append,
+            partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
+            predicate: None,
+        };
+        // Any member resolves to the same physical lock (a coalesced group's key
+        // IS `table_lock_key`), so serialization is identical on both paths.
         let (commit_lock, flush_waiters) = self.commit_lock_and_waiters(projects[0].0, table_name).await;
+        let (refresh_op, commit_op) = kind.ops();
         let mut retry_count = 0u32;
         loop {
+            // Refresh UNDER the lock (the merge path refreshes before locking).
+            // The per-table commit lock serializes all in-process commits to
+            // THIS log, so refreshing here guarantees we build on the previous
+            // committer's version and never self-conflict; refresh is
+            // probe-cheap (a single GET that 404-short-circuits when already
+            // current), so the extra lock-hold is sub-millisecond on the common
+            // path.
             let commit_guard = lock_with_flush_priority(&commit_lock, &flush_waiters).await;
-            if let Err(e) = bounded_commit_await(
-                COMMIT_LOCK_OP_TIMEOUT,
-                "coalesced_refresh",
-                table_name,
-                refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot),
-            )
-            .await
+            // DIAG (commit-throughput profiling): time the serial commit phases
+            // (refresh + Delta log append) under the lock — these bound the
+            // process-wide commit rate. Remove once the flush bottleneck is found.
+            let t_refresh = std::time::Instant::now();
+            if let Err(e) =
+                bounded_commit_await(COMMIT_LOCK_OP_TIMEOUT, refresh_op, table_name, refresh_table_snapshot(table_ref, self.incremental_snapshot())).await
             {
                 debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e.message);
             }
+            let refresh_ms = t_refresh.elapsed().as_millis();
             let mut new_table = { table_ref.read().await.clone() };
+            let t_build = std::time::Instant::now();
+            // Bounded for the same reason as the wave path: this await holds the
+            // per-table commit lock every other committer queues on.
             let commit_res = bounded_commit_await(
                 COMMIT_LOCK_OP_TIMEOUT,
-                "coalesced_commit",
+                commit_op,
                 table_name,
-                deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone()).with_actions(adds.clone()).build(
+                deltalake::kernel::transaction::CommitBuilder::from(properties.clone()).with_actions(adds.to_vec()).build(
                     Some(new_table.snapshot()? as &dyn TableReference),
                     new_table.log_store(),
                     op.clone(),
                 ),
             )
             .await;
+            let build_ms = t_build.elapsed().as_millis();
             match commit_res {
                 Ok(finalized) => {
+                    // Diff pre- vs post-commit file URIs for `added`. Capture
+                    // pre-uris here (only on success) — before the state swap
+                    // below makes `new_table` post-commit — so failed attempts
+                    // don't pay the full-table file-URI walk.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
                     new_table.state = Some(finalized.snapshot());
                     drop(commit_guard);
-                    let added = self.record_committed_write(table_ref, projects, table_name, new_table, &pre_uris, true).await;
-                    debug!("coalesced commit landed: table={} projects={} files={}", table_name, projects.len(), adds.len());
+                    let t_record = std::time::Instant::now();
+                    let added = self.record_committed_write(table_ref, projects, table_name, new_table, &pre_uris, kind.warm()).await;
+                    match kind {
+                        StagedCommitKind::Flush { .. } => info!(
+                            "commit_timing project={} table={} refresh_ms={} build_ms={} record_ms={} files={}",
+                            projects[0].0,
+                            table_name,
+                            refresh_ms,
+                            build_ms,
+                            t_record.elapsed().as_millis(),
+                            adds.len()
+                        ),
+                        StagedCommitKind::Coalesced => {
+                            debug!("coalesced commit landed: table={} projects={} files={}", table_name, projects.len(), adds.len())
+                        }
+                    }
                     return Ok(added);
                 }
                 Err(CommitFailure { message: e, timed_out }) => {
@@ -1130,31 +1103,49 @@ impl Database {
                     if !timed_out && is_occ_conflict_err(&e) {
                         retry_count += 1;
                         if retry_count >= MAX_COMMIT_RETRIES {
-                            return Err(anyhow::anyhow!("coalesced staged commit failed after {} retries: {}", MAX_COMMIT_RETRIES, e));
+                            return Err(anyhow::anyhow!("{} failed after {} retries: {}", kind.what(), MAX_COMMIT_RETRIES, e));
                         }
-                        debug!("coalesced commit conflict, retrying ({}/{}): {}", retry_count, MAX_COMMIT_RETRIES, e);
+                        debug!("{} conflict, retrying ({}/{}): {}", kind.what(), retry_count, MAX_COMMIT_RETRIES, e);
                         tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                         continue;
                     }
-                    // Non-OCC: the commit MAY have landed (post-commit hook failed
-                    // after N.json was written). Same three-way probe as the
-                    // per-project path — never delete parquet a landed commit
-                    // references.
+                    // Non-OCC error: the commit MAY have landed (post-commit hook
+                    // / snapshot refresh failed AFTER N.json was written). Capture
+                    // the pre-commit file set from the still-pre-commit clone (only
+                    // on this rare branch — the OCC-retry path must not pay the
+                    // full-table URI walk), then probe. Never delete parquet a
+                    // landed commit references.
                     let pre_uris: HashSet<String> = file_uris(&new_table);
-                    match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, &adds).await, timed_out) {
+                    return match probe_after_timeout(self.probe_commit_landed_bounded(table_ref, adds).await, timed_out) {
                         CommitProbe::Landed => {
-                            warn!("coalesced commit for {} reported an error but LANDED (post-commit hook failed) — draining: {}", table_name, e);
+                            match kind {
+                                StagedCommitKind::Flush { .. } => warn!(
+                                    "staged commit for {}/{} reported an error but LANDED (post-commit hook failed) — draining bucket: {}",
+                                    projects[0].0, table_name, e
+                                ),
+                                StagedCommitKind::Coalesced => {
+                                    warn!("coalesced commit for {} reported an error but LANDED (post-commit hook failed) — draining: {}", table_name, e)
+                                }
+                            }
                             let post = { table_ref.read().await.clone() };
-                            return Ok(self.record_committed_write(table_ref, projects, table_name, post, &pre_uris, true).await);
+                            Ok(self.record_committed_write(table_ref, projects, table_name, post, &pre_uris, kind.warm()).await)
                         }
-                        CommitProbe::NotLanded => return Err(anyhow::anyhow!("coalesced staged commit failed: {}", e)),
+                        CommitProbe::NotLanded => Err(anyhow::anyhow!("{} failed: {}", kind.what(), e)),
                         CommitProbe::Inconclusive => {
-                            warn!("coalesced commit for {} errored and landing is UNCONFIRMED — leaving staged parquet in place: {}", table_name, e);
+                            match kind {
+                                StagedCommitKind::Flush { .. } => warn!(
+                                    "staged commit for {}/{} errored and landing is UNCONFIRMED (snapshot read failed) — leaving staged parquet in place to avoid a dangling Add: {}",
+                                    projects[0].0, table_name, e
+                                ),
+                                StagedCommitKind::Coalesced => {
+                                    warn!("coalesced commit for {} errored and landing is UNCONFIRMED — leaving staged parquet in place: {}", table_name, e)
+                                }
+                            }
                             // Signal "do not delete the parquet" by returning a
                             // distinct marker error the caller checks.
-                            return Err(anyhow::anyhow!("{}: coalesced staged commit failed (landing unconfirmed): {}", INCONCLUSIVE_COMMIT_MARKER, e));
+                            Err(anyhow::anyhow!("{}: {} failed (landing unconfirmed): {}", INCONCLUSIVE_COMMIT_MARKER, kind.what(), e))
                         }
-                    }
+                    };
                 }
             }
         }
@@ -1229,10 +1220,7 @@ impl Database {
         let project_id = projects.first().map(|(p, _)| *p).unwrap_or("");
         let committed_version = new_table.version();
         if let Some(version) = committed_version {
-            let mut versions = self.last_written_versions.write().await;
-            for (project, _) in projects {
-                versions.insert(table_key(project, table_name), version);
-            }
+            self.last_written_versions.write().await.extend(projects.iter().map(|(project, _)| (table_key(project, table_name), version)));
             debug!("Stored last written version for {}/{} (+{} coalesced): {}", project_id, table_name, projects.len().saturating_sub(1), version);
         } else {
             debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
@@ -1272,13 +1260,10 @@ impl Database {
                     .await;
             }
             let db = self.clone();
-            let shutdown = self.maintenance_shutdown.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {}
-                    _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None, true) => {}
-                }
-            });
+            spawn_until_shutdown(
+                self.maintenance_shutdown.clone(),
+                async move { db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added, None, true).await },
+            );
         }
         for (project, dirty_bins) in projects {
             self.statistics_extractor.invalidate(project, table_name).await;
@@ -1298,14 +1283,9 @@ impl Database {
             && reconcile_n > 0
             && committed_version.is_some_and(|v| (v + Self::reconcile_offset(project_id, table_name, reconcile_n)).is_multiple_of(reconcile_n))
         {
-            let (table_ref, shutdown) = (table_ref.clone(), self.maintenance_shutdown.clone());
+            let table_ref = table_ref.clone();
             let (project_id, table_name) = table_key(project_id, table_name);
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {}
-                    _ = Self::reconcile_snapshot(&table_ref, &project_id, &table_name) => {}
-                }
-            });
+            spawn_until_shutdown(self.maintenance_shutdown.clone(), async move { Self::reconcile_snapshot(&table_ref, &project_id, &table_name).await });
         }
         added
     }

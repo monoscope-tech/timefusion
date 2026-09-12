@@ -257,23 +257,12 @@ impl AuthConfig {
     }
 }
 
-/// AuthSource that validates against configured credentials
-#[derive(Debug, Clone)]
-pub struct ConfigAuthSource {
-    config: AuthConfig,
-}
-
-impl ConfigAuthSource {
-    pub fn new(config: AuthConfig) -> Self {
-        Self { config }
-    }
-}
-
+/// Validates a login against the configured credentials.
 #[async_trait]
-impl AuthSource for ConfigAuthSource {
+impl AuthSource for AuthConfig {
     async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
         let username = login.user().unwrap_or("");
-        (username == self.config.username).then(|| Password::new(None, self.config.password.clone().unwrap_or_default().into_bytes())).ok_or_else(|| {
+        (username == self.username).then(|| Password::new(None, self.password.clone().unwrap_or_default().into_bytes())).ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{username}\""))))
         })
     }
@@ -357,8 +346,8 @@ impl LoggingHandlerFactory {
 ///
 /// They are sync and allocate a `DfSessionService` each time, so they occupy a
 /// worker for their duration — `BlockWatch` (the `block` component), not
-/// `TimedSection`. Auth itself is a string compare (`ConfigAuthSource`), which
-/// is why it is not separately timed.
+/// `TimedSection`. Auth itself is a string compare (`AuthConfig`'s `AuthSource`
+/// impl), which is why it is not separately timed.
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn query_handlers(&self) -> (Arc<impl SimpleQueryHandler>, Arc<impl ExtendedQueryHandler>) {
         // SessionContext::clone shares its mutable state. Clone the SessionState
@@ -383,7 +372,7 @@ impl PgWireServerHandlers for LoggingHandlerFactory {
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         let _t = crate::observability::BlockWatch::new("pgwire_startup_handler_build");
         Arc::new(
-            CleartextPasswordAuthStartupHandler::new(ConfigAuthSource::new(self.auth_config.clone()), TimeFusionServerParameterProvider::default())
+            CleartextPasswordAuthStartupHandler::new(self.auth_config.clone(), TimeFusionServerParameterProvider::default())
                 .with_connection_manager(self.connections.clone()),
         )
     }
@@ -497,6 +486,32 @@ fn with_response_deadline(response: Response, deadline: Option<tokio::time::Inst
     }
 }
 
+/// The shared tail of both protocol handlers: the giant-statement gate, the
+/// `datafusion.execute` span, the statement deadline, and the latency/failure
+/// events. `finish` applies the deadline to whatever shape of response the
+/// protocol returns.
+///
+/// A failure is logged from INSIDE the query span, so the span's `query.text`
+/// lands on the same line as the error. `LoggingErrorHandler` runs outside the
+/// span and can only report the message — which is why a pgAdmin planning
+/// failure showed up in prod as a bare "Invalid function" with no way to tell
+/// which statement produced it.
+async fn run_statement<T, R>(
+    scan_metrics: Option<&crate::database::ScanMetrics>, max_statement_secs: u64, client_timeout: Option<std::time::Duration>, query: &str,
+    protocol: &'static str, execute: impl std::future::Future<Output = PgWireResult<T>>, finish: impl FnOnce(T, Option<tokio::time::Instant>) -> R,
+) -> PgWireResult<R> {
+    let _giant = giant_stmt_permit(query.len()).await;
+    let execute_span = tracing::trace_span!(parent: &tracing::Span::current(), "datafusion.execute");
+    let t0 = std::time::Instant::now();
+    let timeout = effective_statement_timeout(client_timeout, max_statement_secs, batch_statement_secs()).filter(|_| statement_timeout_applies(query));
+    let result = run_with_statement_timeout(timeout, execute.instrument(execute_span)).await.map(|(value, deadline)| finish(value, deadline));
+    record_statement_latency(scan_metrics, query, protocol, t0.elapsed().as_micros() as u64, result.is_ok());
+    if let Err(error) = &result {
+        warn!(protocol, error = %error, "statement failed");
+    }
+    result
+}
+
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
     inner: DfSessionService,
@@ -515,10 +530,17 @@ impl LoggingSimpleQueryHandler {
         Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics, db, max_statement_secs }
     }
 
+    /// Open the unified table an admin `command` names, with that command's
+    /// standard "not available on this server" and "open table" errors.
+    async fn admin_table(&self, command: &str, table: &str) -> PgWireResult<(Arc<Database>, Arc<tokio::sync::RwLock<deltalake::DeltaTable>>)> {
+        let db = require_available(self.db.clone(), command)?;
+        let table_ref = db.get_or_create_unified_table(table).await.map_err(|e| admin_err(format!("{command}: open table '{table}': {e}")))?;
+        Ok((db, table_ref))
+    }
+
     /// Execute an intercepted `OPTIMIZE <table> WHERE date = '...'`.
     async fn run_optimize(&self, cmd: OptimizeCmd) -> PgWireResult<Vec<Response>> {
-        let db = require_available(self.db.as_ref(), "OPTIMIZE")?;
-        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
+        let (db, table_ref) = self.admin_table("OPTIMIZE", &cmd.table).await?;
         let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date, cmd.project_id.as_deref()).await.map_err(|e| admin_err(e.to_string()))?;
         info!("pgwire OPTIMIZE {} date={} project={:?}: {removed} removed, {added} added", cmd.table, cmd.date, cmd.project_id);
         Ok(vec![Response::Execution(Tag::new(&format!("OPTIMIZE {removed} {added}")))])
@@ -588,12 +610,9 @@ impl LoggingSimpleQueryHandler {
     /// Read recent Delta commit metadata without requiring direct object-store
     /// credentials on the operator's machine.
     async fn run_delta_history(&self, cmd: DeltaHistoryCmd) -> PgWireResult<Vec<Response>> {
-        let db = require_available(self.db.as_ref(), "DELTA HISTORY")?;
-        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA HISTORY: open table '{}': {e}", cmd.table)))?;
-        let table = table_ref.read().await;
-        let commits: Vec<_> = table.history(Some(cmd.limit)).await.map_err(|e| admin_err(format!("DELTA HISTORY '{}': {e}", cmd.table)))?.collect();
-        drop(table);
-
+        let (_, table_ref) = self.admin_table("DELTA HISTORY", &cmd.table).await?;
+        let commits: Vec<_> =
+            table_ref.read().await.history(Some(cmd.limit)).await.map_err(|e| admin_err(format!("DELTA HISTORY '{}': {e}", cmd.table)))?.collect();
         let rows = commits.into_iter().map(|commit| {
             let timestamp = commit.timestamp.and_then(chrono::DateTime::from_timestamp_millis).map(|v| v.to_rfc3339()).unwrap_or_default();
             let read_version = commit.read_version.map(|v| v.to_string()).unwrap_or_default();
@@ -611,15 +630,9 @@ impl LoggingSimpleQueryHandler {
     /// Return every raw action in one Delta commit. This is an audit primitive:
     /// it reads the transaction log only and never constructs a transaction.
     async fn run_delta_actions(&self, cmd: DeltaVersionCmd) -> PgWireResult<Vec<Response>> {
-        let db = require_available(self.db.as_ref(), "DELTA ACTIONS")?;
-        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA ACTIONS: open table '{}': {e}", cmd.table)))?;
+        let (_, table_ref) = self.admin_table("DELTA ACTIONS", &cmd.table).await?;
         let log_store = table_ref.read().await.log_store();
-        let bytes = log_store
-            .read_commit_entry(cmd.version)
-            .await
-            .map_err(|e| admin_err(format!("DELTA ACTIONS '{}' VERSION {}: {e}", cmd.table, cmd.version)))?
-            .ok_or_else(|| admin_err(format!("DELTA ACTIONS '{}' VERSION {}: commit not found", cmd.table, cmd.version)))?;
-        let rows = decode_commit_actions(&bytes)?.into_iter().map(move |action| {
+        let rows = commit_actions(&log_store, "DELTA ACTIONS", &cmd).await?.into_iter().map(move |action| {
             let (kind, path, size) = match &action {
                 deltalake::kernel::Action::Add(add) => ("add", add.path.as_str(), add.size.to_string()),
                 deltalake::kernel::Action::Remove(remove) => ("remove", remove.path.as_str(), remove.size.map(|v| v.to_string()).unwrap_or_default()),
@@ -635,17 +648,10 @@ impl LoggingSimpleQueryHandler {
     /// Reconstruct the full pre-commit Add actions for files removed by
     /// `version`. This is read-only and fails unless every removal has a source.
     async fn run_delta_recovery_audit(&self, cmd: DeltaVersionCmd) -> PgWireResult<Vec<Response>> {
-        let db = require_available(self.db.as_ref(), "DELTA RECOVERY AUDIT")?;
-        let table_ref =
-            db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT: open table '{}': {e}", cmd.table)))?;
+        let (_, table_ref) = self.admin_table("DELTA RECOVERY AUDIT", &cmd.table).await?;
         let mut before = table_ref.read().await.clone();
-        let bytes = before
-            .log_store()
-            .read_commit_entry(cmd.version)
-            .await
-            .map_err(|e| admin_err(format!("DELTA RECOVERY AUDIT '{}' VERSION {}: {e}", cmd.table, cmd.version)))?
-            .ok_or_else(|| admin_err(format!("DELTA RECOVERY AUDIT '{}' VERSION {}: commit not found", cmd.table, cmd.version)))?;
-        let removed = decode_commit_actions(&bytes)?
+        let removed = commit_actions(&before.log_store(), "DELTA RECOVERY AUDIT", &cmd)
+            .await?
             .into_iter()
             .filter_map(|action| match action {
                 deltalake::kernel::Action::Remove(remove) => Some(remove.path),
@@ -766,8 +772,15 @@ pub(crate) struct OptimizeCmd {
     pub project_id: Option<String>,
 }
 
-/// Decode the newline-delimited action list of one Delta commit entry.
-fn decode_commit_actions(bytes: &[u8]) -> PgWireResult<Vec<deltalake::kernel::Action>> {
+/// Read and decode the newline-delimited action list of the commit entry `cmd`
+/// names, reporting failures as `command`.
+async fn commit_actions(log_store: &deltalake::logstore::LogStoreRef, command: &str, cmd: &DeltaVersionCmd) -> PgWireResult<Vec<deltalake::kernel::Action>> {
+    let (table, version) = (&cmd.table, cmd.version);
+    let bytes = log_store
+        .read_commit_entry(version)
+        .await
+        .map_err(|e| admin_err(format!("{command} '{table}' VERSION {version}: {e}")))?
+        .ok_or_else(|| admin_err(format!("{command} '{table}' VERSION {version}: commit not found")))?;
     bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
@@ -784,9 +797,7 @@ fn text_response<const N: usize>(names: [&str; N], rows: impl Iterator<Item = Pg
     let row_fields = fields.clone();
     let rows = rows.map(move |values| {
         let mut encoder = DataRowEncoder::new(row_fields.clone());
-        for value in values? {
-            encoder.encode_field(&value)?;
-        }
+        values?.iter().try_for_each(|value| encoder.encode_field(value))?;
         Ok(encoder.take_row())
     });
     vec![Response::Query(QueryResponse::new(fields, stream::iter(rows)))]
@@ -1028,32 +1039,27 @@ fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, quer
     let (_, operation) = classify_query(query);
     let (tables, project_id) = query_dimensions(query);
     let (fingerprint, template) = (query_fingerprint(query), query_template(query));
+    macro_rules! statement_event {
+        ($emit:ident, $event:literal, $message:literal $(, $field:ident = $value:expr)*) => {
+            $emit!(
+                event = $event,
+                query.class = operation,
+                query.fingerprint = %fingerprint,
+                query.template = %template,
+                query.tables = %tables,
+                project.id = %project_id,
+                protocol,
+                duration_us,
+                $($field = $value,)*
+                $message
+            )
+        };
+    }
     if !success {
-        warn!(
-            event = "pgwire.failed_statement",
-            query.class = operation,
-            query.fingerprint = %fingerprint,
-            query.template = %template,
-            query.tables = %tables,
-            project.id = %project_id,
-            protocol,
-            duration_us,
-            "PostgreSQL statement failed"
-        );
+        statement_event!(warn, "pgwire.failed_statement", "PostgreSQL statement failed");
     }
     if slow {
-        info!(
-            event = "pgwire.slow_statement",
-            query.class = operation,
-            query.fingerprint = %fingerprint,
-            query.template = %template,
-            query.tables = %tables,
-            project.id = %project_id,
-            protocol,
-            duration_us,
-            success,
-            "slow PostgreSQL statement"
-        );
+        statement_event!(info, "pgwire.slow_statement", "slow PostgreSQL statement", success = success);
     }
 }
 
@@ -1083,54 +1089,40 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
 
         // Admin commands, caught before DataFusion (whose parser rejects all
         // OPTIMIZE/VACUUM maintenance plus FLUSH and HANDOFF durability hooks.
-        if let Some(cmd) = parse_optimize(query).map_err(admin_err)? {
-            return self.run_optimize(cmd).await;
+        // Order is significant: `parse_delta_history` ERRORS on any other DELTA
+        // statement, so it stays last of the three DELTA parsers.
+        macro_rules! admin {
+            ($parse:ident => $run:ident) => {
+                if let Some(cmd) = $parse(query).map_err(admin_err)? {
+                    return self.$run(cmd).await;
+                }
+            };
+            ($parse:ident, $run:ident) => {
+                if $parse(query) {
+                    return self.$run().await;
+                }
+            };
         }
-        if let Some(cmd) = parse_vacuum(query).map_err(admin_err)? {
-            return self.run_vacuum(cmd).await;
-        }
-        if let Some(cmd) = parse_delta_recovery_audit(query).map_err(admin_err)? {
-            return self.run_delta_recovery_audit(cmd).await;
-        }
-        if let Some(cmd) = parse_delta_actions(query).map_err(admin_err)? {
-            return self.run_delta_actions(cmd).await;
-        }
-        if let Some(cmd) = parse_delta_history(query).map_err(admin_err)? {
-            return self.run_delta_history(cmd).await;
-        }
-        if parse_flush(query) {
-            return self.run_flush().await;
-        }
-        if parse_handoff(query) {
-            return self.run_handoff().await;
-        }
+        admin!(parse_optimize => run_optimize);
+        admin!(parse_vacuum => run_vacuum);
+        admin!(parse_delta_recovery_audit => run_delta_recovery_audit);
+        admin!(parse_delta_actions => run_delta_actions);
+        admin!(parse_delta_history => run_delta_history);
+        admin!(parse_flush, run_flush);
+        admin!(parse_handoff, run_handoff);
 
-        let span = tracing::Span::current();
-        record_query_span(&span, query);
-
-        let _giant = giant_stmt_permit(query.len()).await;
-        let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
-        let t0 = std::time::Instant::now();
-        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs, batch_statement_secs())
-            .filter(|_| statement_timeout_applies(query));
-        let result =
-            run_with_statement_timeout(timeout, <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span))
-                .await
-                .map(|(responses, deadline)| responses.into_iter().map(|response| with_response_deadline(response, deadline)).collect());
-        record_statement_latency(self.scan_metrics.as_deref(), query, "simple", t0.elapsed().as_micros() as u64, result.is_ok());
-        log_statement_failure("simple", &result);
-        result
-    }
-}
-
-/// Logs a failing statement from INSIDE its query span, so the span's
-/// `query.text` lands on the same line as the error. `LoggingErrorHandler` runs
-/// outside the span and can only report the message — which is why a pgAdmin
-/// planning failure showed up in prod as a bare "Invalid function" with no way
-/// to tell which statement produced it.
-fn log_statement_failure(protocol: &str, result: &PgWireResult<impl Sized>) {
-    if let Err(error) = result {
-        warn!(protocol, error = %error, "statement failed");
+        record_query_span(&tracing::Span::current(), query);
+        let client_timeout = client_statement_timeout(client);
+        run_statement(
+            self.scan_metrics.as_deref(),
+            self.max_statement_secs,
+            client_timeout,
+            query,
+            "simple",
+            <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query),
+            |responses: Vec<Response>, deadline| responses.into_iter().map(|response| with_response_deadline(response, deadline)).collect(),
+        )
+        .await
     }
 }
 
@@ -1228,24 +1220,19 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let span = tracing::Span::current();
         let query = &portal.statement.statement.0;
-        record_query_span(&span, query);
-
-        let _giant = giant_stmt_permit(query.len()).await;
-        let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
-        let t0 = std::time::Instant::now();
-        let timeout = effective_statement_timeout(client_statement_timeout(client), self.max_statement_secs, batch_statement_secs())
-            .filter(|_| statement_timeout_applies(query));
-        let result = run_with_statement_timeout(
-            timeout,
-            <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span),
+        record_query_span(&tracing::Span::current(), query);
+        let client_timeout = client_statement_timeout(client);
+        run_statement(
+            self.scan_metrics.as_deref(),
+            self.max_statement_secs,
+            client_timeout,
+            query,
+            "extended",
+            <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows),
+            with_response_deadline,
         )
         .await
-        .map(|(response, deadline)| with_response_deadline(response, deadline));
-        record_statement_latency(self.scan_metrics.as_deref(), query, "extended", t0.elapsed().as_micros() as u64, result.is_ok());
-        log_statement_failure("extended", &result);
-        result
     }
 }
 
@@ -1665,27 +1652,23 @@ async fn handle_one(mut sock: TcpStream, response: &[u8], drain_startup: bool) -
     // `real_len - 4`.
     if drain_startup {
         let len = sock.read_u32().await? as u64;
-        let remaining = match sock.read_u32().await? {
+        let n = match sock.read_u32().await? {
             SSL_REQUEST_CODE | GSS_REQUEST_CODE => {
                 sock.write_all(b"N").await?;
                 (sock.read_u32().await? as u64).checked_sub(4)
             }
             _ => len.checked_sub(8),
-        };
-        drain_body(&mut sock, remaining).await?;
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "startup length below 8-byte header"))?;
+        if n > MAX_STARTUP_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("startup body {n} exceeds {MAX_STARTUP_BYTES}-byte cap")));
+        }
+        tokio::io::copy(&mut (&mut sock).take(n), &mut tokio::io::sink()).await?;
     }
 
     sock.write_all(response).await?;
     let _ = sock.shutdown().await;
     Ok(())
-}
-
-async fn drain_body(sock: &mut TcpStream, remaining: Option<u64>) -> io::Result<()> {
-    let n = remaining.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "startup length below 8-byte header"))?;
-    if n > MAX_STARTUP_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("startup body {n} exceeds {MAX_STARTUP_BYTES}-byte cap")));
-    }
-    tokio::io::copy(&mut sock.take(n), &mut tokio::io::sink()).await.map(drop)
 }
 
 /// Wire format: `Byte1('E') Int32(length) [Byte1(tag) String(value)]* Byte1(0)`

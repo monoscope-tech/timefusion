@@ -472,10 +472,9 @@ impl DedupExec {
         // the projection). Without this the sorted Delta scan's declared order
         // (fork sort-order pushdown) dies here and `ORDER BY timestamp LIMIT n`
         // re-sorts the whole window instead of early-terminating.
-        let eq = match remap_ordering(&input, &output_projection, &schema) {
-            Some(ordering) => datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), [ordering]),
-            None => datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
-        };
+        // `Option` is an `IntoIterator`, so "no surviving ordering" is the empty
+        // ordering set — the same thing `EquivalenceProperties::new` builds.
+        let eq = datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), remap_ordering(&input, &output_projection, &schema));
         let properties =
             Arc::new(PlanProperties::new(eq, Partitioning::UnknownPartitioning(1), input.properties().emission_type, input.properties().boundedness));
         Ok(Self { input, keys, key_idxs, tiebreak, required_ordering: None, output_projection, schema, properties, metrics: ExecutionPlanMetricsSet::new() })
@@ -644,11 +643,9 @@ impl ExecutionPlan for DedupExec {
                     (produced, false)
                 }
             };
-            if let Ok(batches) = &produced {
-                for batch in batches {
-                    batch.record_output(&baseline);
-                }
-            }
+            produced.iter().flatten().for_each(|batch| {
+                batch.record_output(&baseline);
+            });
             Some((produced, (input, dedup, baseline, input_rows, done)))
         })
         .flat_map(|r| futures::stream::iter(r.map_or_else(|e| vec![Err(e)], |bs| bs.into_iter().map(Ok).collect::<Vec<_>>())));
@@ -732,9 +729,7 @@ impl Winners {
             WinnerUpdate::Insert => match self {
                 Self::Small(entries) if entries.len() < SMALL_WINNER_LIMIT => entries.push((key.into(), cand)),
                 Self::Small(entries) => {
-                    let mut promoted = HashMap::with_capacity_and_hasher(entries.len() + 1, ahash::RandomState::new());
-                    promoted.extend(entries.drain(..));
-                    promoted.insert(key.into(), cand);
+                    let promoted: HashMap<_, _, ahash::RandomState> = entries.drain(..).chain([(key.into(), cand)]).collect();
                     *self = Self::Large(promoted);
                 }
                 Self::Large(entries) => {
@@ -783,12 +778,16 @@ impl Winners {
     }
 }
 
-/// Owned winner tiebreak. Timestamp/int64 values stay primitive; other schema
-/// types retain Arrow's generic order-preserving encoding.
-enum TiebreakValue {
+/// A winner tiebreak. Timestamp/int64 values stay primitive; other schema types
+/// retain Arrow's generic order-preserving encoding. `B` is `Box<[u8]>` when the
+/// bytes are owned by a stored winner, `&[u8]` when borrowed from the batch.
+enum Tiebreak<B> {
     I64(Option<i64>),
-    Encoded(Box<[u8]>),
+    Encoded(B),
 }
+
+type TiebreakValue = Tiebreak<Box<[u8]>>;
+type TiebreakRef<'a> = Tiebreak<&'a [u8]>;
 
 enum TiebreakRows<'a> {
     I64 { values: &'a [i64], column: &'a ArrayRef },
@@ -804,24 +803,19 @@ impl TiebreakRows<'_> {
     }
 }
 
-enum TiebreakRef<'a> {
-    I64(Option<i64>),
-    Encoded(&'a [u8]),
-}
-
 impl TiebreakRef<'_> {
     fn beats(&self, old: &TiebreakValue) -> bool {
         match (self, old) {
-            (Self::I64(new), TiebreakValue::I64(old)) => new > old,
-            (Self::Encoded(new), TiebreakValue::Encoded(old)) => *new > &old[..],
+            (Self::I64(new), Tiebreak::I64(old)) => new > old,
+            (Self::Encoded(new), Tiebreak::Encoded(old)) => *new > &old[..],
             _ => unreachable!("one Greatest instance uses one tiebreak representation"),
         }
     }
 
     fn into_owned(self) -> TiebreakValue {
         match self {
-            Self::I64(value) => TiebreakValue::I64(value),
-            Self::Encoded(value) => TiebreakValue::Encoded(value.into()),
+            Self::I64(value) => Tiebreak::I64(value),
+            Self::Encoded(value) => Tiebreak::Encoded(value.into()),
         }
     }
 }
@@ -911,11 +905,9 @@ impl Greatest {
             }
             let bi = self.batches.len() as u32;
             let mut next = 0u32;
-            for (row, keep_row) in mask.iter().enumerate() {
-                if *keep_row {
-                    rows[row] = (bi, next);
-                    next += 1;
-                }
+            for (row, _) in mask.iter().enumerate().filter(|(_, k)| **k) {
+                rows[row] = (bi, next);
+                next += 1;
             }
             // `compact_batch` after the filter, not just the filter: Arrow's
             // filter over a view array produces new views over the ORIGINAL
@@ -1023,19 +1015,21 @@ impl KeyRows<'_> {
     }
 }
 
+/// Order-encode the key columns of `batch`. A free fn, not a method: the callers
+/// hold a `&mut` borrow of `Dedup::greatest` across it.
+fn encode_keys(conv: &RowConverter, key_idxs: &[usize], batch: &RecordBatch) -> DFResult<datafusion::arrow::row::Rows> {
+    conv.convert_columns(&key_idxs.iter().map(|&i| batch.column(i).clone()).collect::<Vec<ArrayRef>>()).map_err(arrow_err)
+}
+
 impl Dedup {
     fn push(&mut self, batch: &RecordBatch) -> DFResult<Vec<RecordBatch>> {
         let Some(g) = self.greatest.as_mut() else {
-            let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
-            let keys = self.conv.convert_columns(&key_arrays).map_err(arrow_err)?;
+            let keys = encode_keys(&self.conv, &self.key_idxs, batch)?;
             return Ok(dedup_first(batch, &keys, &mut self.seen, self.output_projection.as_deref(), self.bound.as_mut())?.into_iter().collect());
         };
         let keys = match self.direct_string_key.and_then(|idx| StringValues::from_column(batch.column(idx))) {
             Some(values) => KeyRows::Direct(values),
-            None => {
-                let key_arrays: Vec<ArrayRef> = self.key_idxs.iter().map(|&i| batch.column(i).clone()).collect();
-                KeyRows::Encoded(self.conv.convert_columns(&key_arrays).map_err(arrow_err)?)
-            }
+            None => KeyRows::Encoded(encode_keys(&self.conv, &self.key_idxs, batch)?),
         };
         let proj = self.output_projection.as_deref();
         let mut out = Vec::new();
@@ -1055,13 +1049,8 @@ impl Dedup {
             g.compact_floor = g.bytes.saturating_mul(2);
         }
         let tbs = g.tiebreak_rows(batch.column(g.idx))?;
-        let bvals = match self.bound.as_ref() {
-            Some(bound) => Some(
-                bound_slice(batch.column(bound.idx))
-                    .ok_or_else(|| DataFusionError::Internal(format!("DedupExec bound column {} is not i64-backed", bound.idx)))?,
-            ),
-            None => None,
-        };
+        let not_i64 = |idx| DataFusionError::Internal(format!("DedupExec bound column {idx} is not i64-backed"));
+        let bvals = self.bound.as_ref().map(|b| bound_slice(batch.column(b.idx)).ok_or_else(|| not_i64(b.idx))).transpose()?;
         // Index of `batch` within the open run's buffer; `None` until a row of
         // this batch wins something, and reset by every flush (the run changed).
         let mut cur: Option<u32> = None;
@@ -1122,13 +1111,9 @@ impl Dedup {
 
     /// End of stream: emit the still-open run.
     fn finish(&mut self) -> DFResult<Vec<RecordBatch>> {
-        match self.greatest.as_mut() {
-            Some(g) => {
-                g.close_run(&mut self.seen, false);
-                g.emit_prefix(g.batches.len(), self.output_projection.as_deref())
-            }
-            None => Ok(Vec::new()),
-        }
+        let Some(g) = self.greatest.as_mut() else { return Ok(Vec::new()) };
+        g.close_run(&mut self.seen, false);
+        g.emit_prefix(g.batches.len(), self.output_projection.as_deref())
     }
 }
 
@@ -2441,13 +2426,7 @@ pub(crate) fn ts_micros_column(b: &RecordBatch, name: &str) -> Option<Int64Array
 fn sum_from_actions(actions: &RecordBatch, q: &CountQuery) -> Option<u64> {
     // Deletion vectors make numRecords an over-count — bail if ANY file has
     // one (column families vary by writer; check every dv-prefixed column).
-    let any_dv = actions
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .any(|(i, f)| f.name().starts_with("deletionVector") && actions.column(i).null_count() < actions.num_rows());
-    if any_dv {
+    if actions.schema().fields().iter().zip(actions.columns()).any(|(f, c)| f.name().starts_with("deletionVector") && c.null_count() < actions.num_rows()) {
         return None;
     }
     let pid = actions.column_by_name("partition.project_id")?.as_any().downcast_ref::<StringArray>()?;
@@ -2639,22 +2618,25 @@ impl LogicalCountCache {
         self.access_clock.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Drop an entry and give its bytes back to the resident budget.
+    fn remove_entry(&self, key: &CountPartition) {
+        if let Some((_, removed)) = self.entries.remove(key) {
+            self.resident_bytes.fetch_sub(removed.estimated_bytes, Ordering::Relaxed);
+        }
+    }
+
     fn insert_memory(&self, key: CountPartition, fingerprint: u64, files: CountFiles, index: Arc<LogicalCountIndex>) -> bool {
         let estimated_bytes = index.estimated_heap_bytes();
         if estimated_bytes > self.max_resident_bytes {
             return false;
         }
         let _guard = self.admission_lock.lock();
-        if let Some((_, old)) = self.entries.remove(&key) {
-            self.resident_bytes.fetch_sub(old.estimated_bytes, Ordering::Relaxed);
-        }
+        self.remove_entry(&key);
         while self.resident_bytes.load(Ordering::Relaxed).saturating_add(estimated_bytes) > self.max_resident_bytes {
             let Some(victim) = self.entries.iter().min_by_key(|entry| entry.last_access.load(Ordering::Relaxed)).map(|entry| entry.key().clone()) else {
                 break;
             };
-            if let Some((_, evicted)) = self.entries.remove(&victim) {
-                self.resident_bytes.fetch_sub(evicted.estimated_bytes, Ordering::Relaxed);
-            }
+            self.remove_entry(&victim);
         }
         self.entries
             .insert(key, CachedPartition { fingerprint, files: Arc::new(files), index, estimated_bytes, last_access: AtomicU64::new(self.next_access()) });
@@ -2704,12 +2686,11 @@ impl LogicalCountCache {
     /// Return a complete exact index for this fingerprint, loading its Arrow
     /// file lazily after restart. Any validation failure is a cache miss.
     pub fn get(&self, key: &CountPartition, fingerprint: u64) -> Option<Arc<LogicalCountIndex>> {
-        if let Some(index) = self.get_memory(key, fingerprint) {
-            return Some(index);
-        }
-        let (loaded, files) = LogicalCountIndex::load(&self.path(key), fingerprint).ok()?;
-        let loaded = Arc::new(loaded);
-        self.insert_memory(key.clone(), fingerprint, files, Arc::clone(&loaded)).then_some(loaded)
+        self.get_memory(key, fingerprint).or_else(|| {
+            let (loaded, files) = LogicalCountIndex::load(&self.path(key), fingerprint).ok()?;
+            let loaded = Arc::new(loaded);
+            self.insert_memory(key.clone(), fingerprint, files, Arc::clone(&loaded)).then_some(loaded)
+        })
     }
 
     /// Background restart warm-up for an append-only successor snapshot.
@@ -2764,9 +2745,7 @@ impl LogicalCountCache {
     /// its embedded fingerprint prevents it from being reused after a write.
     pub fn invalidate(&self, key: &CountPartition) {
         let _guard = self.admission_lock.lock();
-        if let Some((_, removed)) = self.entries.remove(key) {
-            self.resident_bytes.fetch_sub(removed.estimated_bytes, Ordering::Relaxed);
-        }
+        self.remove_entry(key);
     }
 
     pub(crate) fn stats(&self) -> (usize, usize, usize) {
@@ -2924,13 +2903,8 @@ impl LogicalCountIndex {
             let id_offset = u32::try_from(packed.ids.len()).context("logical-count ID arena exceeds 4GiB")?;
             let id_len = u16::try_from(id.len()).context("logical-count ID exceeds 65535 bytes")?;
             packed.ids.extend_from_slice(id);
-            let mut flags = 0;
-            if winner.tiebreak.is_some() {
-                flags |= FLAG_TIEBREAK_PRESENT;
-            }
-            if winner.deleted {
-                flags |= FLAG_DELETED;
-            } else {
+            let flags = u8::from(winner.tiebreak.is_some()) * FLAG_TIEBREAK_PRESENT | u8::from(winner.deleted) * FLAG_DELETED;
+            if !winner.deleted {
                 packed.live_timestamps.push(timestamp);
             }
             packed.winners.push(PackedWinner { timestamp, tiebreak: winner.tiebreak.unwrap_or_default(), id_offset, id_len, flags, _padding: 0 });
@@ -3083,22 +3057,16 @@ impl LogicalCountIndex {
     /// embedded in schema metadata and must match the caller's current Delta
     /// snapshot before the file can be served.
     pub fn save(&self, path: &Path, fingerprint: u64, files: &CountFiles) -> Result<()> {
+        use itertools::Itertools;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create logical-count cache directory {}", parent.display()))?;
         }
-        let mut metadata = HashMap::new();
-        metadata.insert(META_VERSION.to_string(), FORMAT_VERSION.to_string());
-        metadata.insert(META_FINGERPRINT.to_string(), fingerprint.to_string());
-        metadata.insert(META_FILES.to_string(), serde_json::to_string(files).context("serialize logical-count file set")?);
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![
-                Field::new("timestamp", DataType::Int64, false),
-                Field::new("id", DataType::Utf8, false),
-                Field::new("tiebreak", DataType::Int64, true),
-                Field::new("deleted", DataType::Boolean, false),
-            ],
-            metadata,
-        ));
+        let metadata = HashMap::from([
+            (META_VERSION.to_string(), FORMAT_VERSION.to_string()),
+            (META_FINGERPRINT.to_string(), fingerprint.to_string()),
+            (META_FILES.to_string(), serde_json::to_string(files).context("serialize logical-count file set")?),
+        ]);
+        let schema = Arc::new(Schema::new_with_metadata(ipc_fields(), metadata));
         let tmp = path.with_extension(format!("arrow.tmp-{}", uuid::Uuid::new_v4()));
         let write = || -> Result<()> {
             let file = File::create(&tmp).with_context(|| format!("create logical-count cache {}", tmp.display()))?;
@@ -3108,31 +3076,21 @@ impl LogicalCountIndex {
             // index's peak memory during warm-up. IPC order is irrelevant to
             // correctness, so stream bounded batches directly from the map.
             const WRITE_ROWS: usize = 64 * 1024;
-            let mut rows = Vec::with_capacity(WRITE_ROWS);
-            let mut write_rows = |rows: &mut Vec<(i64, &str, Winner)>| -> Result<()> {
-                if rows.is_empty() {
-                    return Ok(());
-                }
+            for chunk in &self.entries().chunks(WRITE_ROWS) {
+                let rows = chunk
+                    .map(|(timestamp, id, winner)| Ok((timestamp, std::str::from_utf8(id).context("logical-count key contains non-UTF8 id")?, winner)))
+                    .collect::<Result<Vec<_>>>()?;
                 let batch = RecordBatch::try_new(
                     Arc::clone(&schema),
                     vec![
                         Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
                         Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.1))),
-                        Arc::new(Int64Array::from(rows.iter().map(|row| row.2.tiebreak).collect::<Vec<_>>())),
-                        Arc::new(BooleanArray::from(rows.iter().map(|row| row.2.deleted).collect::<Vec<_>>())),
+                        Arc::new(Int64Array::from_iter(rows.iter().map(|row| row.2.tiebreak))),
+                        Arc::new(BooleanArray::from_iter(rows.iter().map(|row| Some(row.2.deleted)))),
                     ],
                 )?;
                 writer.write(&batch)?;
-                rows.clear();
-                Ok(())
-            };
-            for (timestamp, id, winner) in self.entries() {
-                rows.push((timestamp, std::str::from_utf8(id).context("logical-count key contains non-UTF8 id")?, winner));
-                if rows.len() == WRITE_ROWS {
-                    write_rows(&mut rows)?;
-                }
             }
-            write_rows(&mut rows)?;
             writer.finish()?;
             std::fs::rename(&tmp, path).with_context(|| format!("publish logical-count cache {}", path.display()))?;
             Ok(())
@@ -3158,18 +3116,13 @@ impl LogicalCountIndex {
         if schema.metadata().get(META_VERSION).map(String::as_str) != Some(FORMAT_VERSION) {
             bail!("unsupported logical-count cache format");
         }
-        let expected_fields = [
-            ("timestamp", &DataType::Int64, false),
-            ("id", &DataType::Utf8, false),
-            ("tiebreak", &DataType::Int64, true),
-            ("deleted", &DataType::Boolean, false),
-        ];
-        if schema.fields().len() != expected_fields.len()
+        let expected = ipc_fields();
+        if schema.fields().len() != expected.len()
             || schema
                 .fields()
                 .iter()
-                .zip(expected_fields)
-                .any(|(field, (name, data_type, nullable))| field.name() != name || field.data_type() != data_type || field.is_nullable() != nullable)
+                .zip(&expected)
+                .any(|(field, want)| field.name() != want.name() || field.data_type() != want.data_type() || field.is_nullable() != want.is_nullable())
         {
             bail!("logical-count cache has an incompatible Arrow schema");
         }
@@ -3185,10 +3138,11 @@ impl LogicalCountIndex {
         let mut index = Self::new();
         for batch in reader {
             let batch = batch?;
-            let timestamps = batch.column(0).as_any().downcast_ref::<Int64Array>().context("logical-count timestamp column has wrong type")?;
-            let ids = batch.column(1).as_any().downcast_ref::<StringArray>().context("logical-count id column has wrong type")?;
-            let tiebreaks = batch.column(2).as_any().downcast_ref::<Int64Array>().context("logical-count tiebreak column has wrong type")?;
-            let deleted = batch.column(3).as_any().downcast_ref::<BooleanArray>().context("logical-count deleted column has wrong type")?;
+            // Safe to address by name: the schema check above proved the layout.
+            let timestamps = column_as::<Int64Array>(&batch, "timestamp")?;
+            let ids = column_as::<StringArray>(&batch, "id")?;
+            let tiebreaks = column_as::<Int64Array>(&batch, "tiebreak")?;
+            let deleted = column_as::<BooleanArray>(&batch, "deleted")?;
             if timestamps.null_count() != 0 || ids.null_count() != 0 || deleted.null_count() != 0 {
                 bail!("logical-count cache contains NULL in a required column");
             }
@@ -3200,6 +3154,17 @@ impl LogicalCountIndex {
         index.finalize()?;
         Ok((index, fingerprint, files))
     }
+}
+
+/// The one definition of the persisted winner table: `save` writes exactly
+/// these columns and `load_file` refuses a file that does not match them.
+fn ipc_fields() -> Vec<Field> {
+    vec![
+        Field::new("timestamp", DataType::Int64, false),
+        Field::new("id", DataType::Utf8, false),
+        Field::new("tiebreak", DataType::Int64, true),
+        Field::new("deleted", DataType::Boolean, false),
+    ]
 }
 
 /// One named column of a logical-count batch as its concrete Arrow array type.
@@ -3796,18 +3761,8 @@ impl Hll {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Sparse(hashes) => {
-                let mut out = Vec::with_capacity(1 + hashes.len() * 8);
-                out.push(TAG_SPARSE);
-                out.extend(hashes.iter().flat_map(|hash| hash.to_le_bytes()));
-                out
-            }
-            Self::Dense(registers) => {
-                let mut out = Vec::with_capacity(1 + M);
-                out.push(TAG_DENSE);
-                out.extend_from_slice(&**registers);
-                out
-            }
+            Self::Sparse(hashes) => [TAG_SPARSE].into_iter().chain(hashes.iter().flat_map(|hash| hash.to_le_bytes())).collect(),
+            Self::Dense(registers) => [TAG_DENSE].into_iter().chain(registers.iter().copied()).collect(),
         }
     }
 

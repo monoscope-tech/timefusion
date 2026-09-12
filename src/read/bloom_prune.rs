@@ -34,6 +34,7 @@ use deltalake::datafusion::parquet::{
     arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     bloom_filter::Sbbf,
 };
+use itertools::Itertools;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -111,8 +112,7 @@ pub fn extract_needles(filters: &[Expr], schema: &crate::schema::TableSchema, mu
         .filter_map(|conjunct| {
             let (col, values) = match conjunct {
                 Expr::BinaryExpr(b) if b.op == Operator::Eq => match (&*b.left, &*b.right) {
-                    (Expr::Column(c), rhs) => (c.name.clone(), lit_str(rhs).map(|v| vec![v])),
-                    (lhs, Expr::Column(c)) => (c.name.clone(), lit_str(lhs).map(|v| vec![v])),
+                    (Expr::Column(c), other) | (other, Expr::Column(c)) => (c.name.clone(), lit_str(other).map(|v| vec![v])),
                     _ => return None,
                 },
                 Expr::InList(l) if !l.negated && l.list.len() <= MAX_NEEDLE_VALUES => match &*l.expr {
@@ -123,11 +123,9 @@ pub fn extract_needles(filters: &[Expr], schema: &crate::schema::TableSchema, mu
             };
             values.filter(|_| eligible(&col)).map(|values| (col, values))
         })
-        .fold(HashMap::<String, Vec<String>>::new(), |mut by_col, (col, values)| {
-            by_col.entry(col).or_default().extend(values);
-            by_col
-        })
+        .into_group_map()
         .into_iter()
+        .map(|(col, groups)| (col, groups.concat()))
         .collect()
 }
 

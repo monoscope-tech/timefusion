@@ -204,25 +204,20 @@ impl TantivySearchService {
         let entries = snapshot.manifest.histogram_entries(snapshot.table_root, snapshot.files)?;
         let mut result = HistogramSnapshotResult::default();
         for (ordinal, (source, visible)) in snapshot.rows.sources.iter().zip(&snapshot.rows.winners).enumerate() {
-            let indexed = if let Some(Some(entry)) = entries.get(ordinal) {
-                self.histogram_file(
-                    table,
-                    project_id,
-                    window,
-                    membership,
-                    HistogramFile {
-                        table_root: snapshot.table_root,
-                        manifest_key: entry.key,
-                        entry: entry.entry,
-                        source_file: &snapshot.files[ordinal].path,
-                        visible: visible.clone(),
-                    },
-                )
-                .await
-                .map_err(|error| result.index_errors.push(error.context(format!("histogram source {}", snapshot.files[ordinal].path))))
-                .ok()
-            } else {
-                None
+            let file = entries.get(ordinal).and_then(Option::as_ref).map(|entry| HistogramFile {
+                table_root: snapshot.table_root,
+                manifest_key: entry.key,
+                entry: entry.entry,
+                source_file: &snapshot.files[ordinal].path,
+                visible: visible.clone(),
+            });
+            let indexed = match file {
+                Some(file) => self
+                    .histogram_file(table, project_id, window, membership, file)
+                    .await
+                    .map_err(|error| result.index_errors.push(error.context(format!("histogram source {}", snapshot.files[ordinal].path))))
+                    .ok(),
+                None => None,
             };
             let counts = match indexed {
                 Some(counts) => {
@@ -368,8 +363,7 @@ impl TantivySearchService {
         }
         // Coverage ignores the time-prune below: a pruned entry still covers its
         // file, its rows are merely out of window (see SearchResult docs).
-        let covered_files: HashSet<String> =
-            current().filter(|(_, e)| e.index.is_some() && e.error.is_none()).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
+        let covered_files: HashSet<String> = current().filter(|(_, e)| usable_entry(e)).flat_map(|(_, e)| e.covered_files.iter().cloned()).collect();
         // Time-prune: skip indexes whose timestamp span can't overlap the query
         // window (no blob download). Conservative on unknown bounds.
         // Work item: (file_uuid, blob_path, rows, entry covered_files, ordinals_valid).
@@ -743,6 +737,12 @@ fn prune_empty_parents(dir: &Path, root: &Path) {
     }
 }
 
+/// The reader's usability predicate: an entry it would consult for coverage.
+/// Anything this rejects cannot be evidence that a file is covered.
+fn usable_entry(e: &crate::tantivy::ManifestEntry) -> bool {
+    e.index.is_some() && e.error.is_none() && e.schema_version == SCHEMA_VERSION
+}
+
 /// Whether a manifest entry's `[min,max]` timestamp span could contain rows in
 /// the query's `[lo,hi]` window. Conservative by design: an entry with unknown
 /// bounds (`None`, e.g. legacy or a failed-stats build) always overlaps so it's
@@ -797,13 +797,7 @@ fn install_blob_into_cache(dir: &Path, blob: &bytes::Bytes) -> Result<()> {
 
 /// True if `dir` already holds an extracted index (a `seg*` file or `meta.json`).
 fn has_any_segment(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|rd| {
-        rd.flatten().any(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("seg") || name == "meta.json"
-        })
-    })
+    std::fs::read_dir(dir).is_ok_and(|rd| rd.flatten().any(|e| e.file_name() == "meta.json" || e.file_name().to_string_lossy().starts_with("seg")))
 }
 
 #[cfg(test)]
@@ -1094,17 +1088,14 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
             } else {
                 None
             };
-            match fast {
-                Some(hit) => Ok(hit),
-                None => {
-                    let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
-                    Ok(Hit {
-                        timestamp_micros: doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?,
-                        id: doc.get_first(id_field).and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| anyhow!("hit missing _id"))?,
-                        row_ordinal: None,
-                    })
-                }
-            }
+            fast.map(Ok).unwrap_or_else(|| {
+                let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
+                Ok(Hit {
+                    timestamp_micros: doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?,
+                    id: doc.get_first(id_field).and_then(|v| v.as_str()).map(str::to_string).ok_or_else(|| anyhow!("hit missing _id"))?,
+                    row_ordinal: None,
+                })
+            })
         })
         .collect()
 }
@@ -1281,6 +1272,13 @@ impl TantivyIndexService {
         self.reader.lock().as_ref().and_then(std::sync::Weak::upgrade)
     }
 
+    /// Drop the attached reader's cached manifest, if there is one.
+    fn invalidate_reader(&self, table: &str, project_id: &str) {
+        if let Some(reader) = self.reader() {
+            reader.invalidate_manifest(table, project_id);
+        }
+    }
+
     /// Newest indexed timestamp seen so far (microseconds). `None` until this
     /// process has published an index.
     pub fn newest_indexed_micros(&self) -> Option<i64> {
@@ -1452,18 +1450,13 @@ impl TantivyIndexService {
         }
         let Some(reader) = self.reader() else { return };
         let dir = super::local_cache_path(&reader.cache_root, table, project_id, &cache_generation_key(file_uuid(manifest_key), blob_path));
-        let installed = tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob)).await;
-        match installed {
-            Ok(Ok(())) => SearchStats::add(&reader.stats.cache_seeded, 1),
-            Ok(Err(e)) => {
-                SearchStats::add(&reader.stats.cache_seed_failures, 1);
-                debug!("tantivy cache seed failed for {project_id}/{table}: {e:#}");
-            }
-            Err(e) => {
-                SearchStats::add(&reader.stats.cache_seed_failures, 1);
-                debug!("tantivy cache seed join failed for {project_id}/{table}: {e}");
-            }
-        }
+        let failure = match tokio::task::spawn_blocking(move || install_blob_into_cache(&dir, &blob)).await {
+            Ok(Ok(())) => return SearchStats::add(&reader.stats.cache_seeded, 1),
+            Ok(Err(e)) => format!("tantivy cache seed failed for {project_id}/{table}: {e:#}"),
+            Err(e) => format!("tantivy cache seed join failed for {project_id}/{table}: {e}"),
+        };
+        SearchStats::add(&reader.stats.cache_seed_failures, 1);
+        debug!("{failure}");
     }
 
     pub(crate) async fn publish_count_proof(
@@ -1478,9 +1471,7 @@ impl TantivyIndexService {
             ((), true)
         })
         .await?;
-        if let Some(reader) = self.reader() {
-            reader.invalidate_manifest(table, project);
-        }
+        self.invalidate_reader(table, project);
         Ok(())
     }
 
@@ -1523,13 +1514,12 @@ impl TantivyIndexService {
             // An entry the reader filters out cannot be evidence that an input
             // is covered: it would vouch for a file at carry-forward time and be
             // invisible at query time, which is a false negative.
-            let usable = |e: &ManifestEntry| e.index.is_some() && e.error.is_none() && e.schema_version == SCHEMA_VERSION;
-            let covered: HashSet<String> = m.entries.values().filter(|e| usable(e)).flat_map(|e| e.covered_files.iter().map(|u| rel_of(u))).collect();
+            let covered: HashSet<String> = m.entries.values().filter(|e| usable_entry(e)).flat_map(|e| e.covered_files.iter().map(|u| rel_of(u))).collect();
             if !removed_rel.iter().all(|u| covered.contains(u)) {
                 return (false, false);
             }
             let mut touched = false;
-            for e in m.entries.values_mut().filter(|e| usable(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)))) {
+            for e in m.entries.values_mut().filter(|e| usable_entry(e) && e.covered_files.iter().any(|u| removed_rel.contains(&rel_of(u)))) {
                 let fresh: Vec<String> = added.iter().filter(|u| !e.covered_files.contains(u)).cloned().collect();
                 e.covered_files.extend(fresh);
                 e.ordinals_valid = false;
@@ -1540,9 +1530,7 @@ impl TantivyIndexService {
         .await?;
         if applied {
             metrics::counter!(crate::database::scan_metric_names::TANTIVY_CARRIED_FORWARD).increment(added.len() as u64);
-            if let Some(reader) = self.reader() {
-                reader.invalidate_manifest(table, project_id);
-            }
+            self.invalidate_reader(table, project_id);
         }
         Ok(applied)
     }
@@ -1622,7 +1610,7 @@ impl TantivyIndexService {
             .await;
         report.blobs_deleted = results.iter().filter(|(_, ok)| *ok).count();
         report.blob_delete_errors = results.len() - report.blobs_deleted;
-        if results.iter().any(|(_, ok)| *ok) {
+        if report.blobs_deleted > 0 {
             super::mutate(self.object_store.as_ref(), table, project_id, |m| {
                 let removed = results.iter().filter(|(_, ok)| *ok).filter(|(blob, _)| m.retired_blobs.remove(blob).is_some()).count();
                 ((), removed > 0)
@@ -1631,8 +1619,8 @@ impl TantivyIndexService {
         }
         // A pruned entry changes what the plan path may consult, so the cached
         // manifest must go whenever the stored one did.
-        if changed && let Some(reader) = self.reader() {
-            reader.invalidate_manifest(table, project_id);
+        if changed {
+            self.invalidate_reader(table, project_id);
         }
         Ok(report)
     }

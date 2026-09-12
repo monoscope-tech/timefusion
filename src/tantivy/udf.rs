@@ -252,15 +252,13 @@ fn like_match_ci(pattern: &str, text: &str) -> bool {
 }
 
 fn string_extractor(arr: &ArrayRef) -> Box<dyn Fn(usize) -> Option<String> + '_> {
+    fn strs<'a, A: Array + 'static>(arr: &'a ArrayRef, what: &str, val: impl Fn(&'a A, usize) -> &'a str + 'a) -> Box<dyn Fn(usize) -> Option<String> + 'a> {
+        let a = arr.as_any().downcast_ref::<A>().expect(what);
+        Box::new(move |i| (!a.is_null(i)).then(|| val(a, i).to_string()))
+    }
     match arr.data_type() {
-        DataType::Utf8 => {
-            let a = arr.as_any().downcast_ref::<StringArray>().expect("Utf8 array");
-            Box::new(move |i| (!a.is_null(i)).then(|| a.value(i).to_string()))
-        }
-        DataType::Utf8View => {
-            let a = arr.as_any().downcast_ref::<StringViewArray>().expect("Utf8View array");
-            Box::new(move |i| (!a.is_null(i)).then(|| a.value(i).to_string()))
-        }
+        DataType::Utf8 => strs(arr, "Utf8 array", |a: &StringArray, i| a.value(i)),
+        DataType::Utf8View => strs(arr, "Utf8View array", |a: &StringViewArray, i| a.value(i)),
         // Variant Struct{metadata,value}: render each row to canonical JSON text
         // via the SAME serializer the tantivy index and the LIKE-coercion path
         // use (`builder::variant_to_text`), so text_match's row-eval agrees
@@ -364,6 +362,7 @@ fn combine(and: bool, nodes: impl IntoIterator<Item = PredNode>) -> Option<PredN
 /// soundness: a branch without complete coverage would make the union a
 /// non-superset and silently drop that branch's rows (2026-06-16 dashboard
 /// bug: `(kind='server' OR name='...')` returned 0 from Delta).
+#[derive(Default)]
 struct NodeRes {
     node: Option<PredNode>,
     complete: bool,
@@ -400,10 +399,10 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
             let (a, b) = (expr_node(left), expr_node(right));
             match (a.node, b.node, a.complete && b.complete) {
                 (Some(an), Some(bn), true) => NodeRes { node: combine(false, [an, bn]), complete: true },
-                _ => NodeRes { node: None, complete: false },
+                _ => NodeRes::default(),
             }
         }
-        _ => NodeRes { node: None, complete: false },
+        _ => NodeRes::default(),
     }
 }
 
