@@ -117,19 +117,20 @@ plan was built to ask:
 
 | counter | value |
 | --- | --- |
-| `write_capture_admitted` | **137** (0 before the retag — the fix now reaches the traffic) |
-| `write_capture_evicted_after_hit` | **75** |
-| `write_capture_evicted_unread` | **30** |
-| `admit_write_capture_bytes` | 234 MB |
+| `write_capture_admitted` | **262** (0 before the retag — the fix now reaches the traffic) |
+| `write_capture_evicted_after_hit` | **191** |
+| `write_capture_evicted_unread` | **48** |
+| write-capture admission rate | **474 KB/s** |
 
-**71% of write-captured entries are read before they are evicted.** They are not
+**80% of write-captured entries are read before they are evicted** (191/239), and
+on a 120 s delta in isolation it is 20 hits against 1 unread — **95%**. They are not
 one-hit wonders; capture is doing exactly the job it was written for — a file we
 just uploaded is usually read again shortly after, and caching it saves an R2
 round trip. Per this plan's own decision table, that is the **"do not flip"**
 branch, and `TIMEFUSION_WRITE_CAPTURE_L2` stays `true`.
 
-The volume is also negligible: **234 MB** of write-capture admissions against
-616 MB/s of device writes. Flipping the flag would forfeit a 71%-effective cache
+The volume is also negligible: **474 KB/s** of write-capture admissions against
+616 MB/s of device writes — three orders of magnitude apart. Flipping the flag would forfeit a 71%-effective cache
 to save nothing measurable.
 
 The flag and counters stay: the flag costs nothing defaulted on, and the counters
@@ -167,6 +168,10 @@ explains the writes.**
 admissions stood at 290 GB, and that was read as "nothing was fetched from R2".
 It was four zeros from one failed lock. **Four counters reading exactly zero at
 once is the tell.** Re-read until a delta is non-trivial before concluding.
+
+This reproduces: in one later two-sample run the SAME `inner_bytes_read` counter
+read `0` and then `288,990,012,724`. Treat any zero from `runtime_stats` as
+suspect until a second reading agrees with it.
 
 **The first gate reached none of the traffic.** It covered `put_multipart` only,
 while the bulk of write-side warming goes through single-part `put_cached`
