@@ -890,6 +890,11 @@ impl Database {
     }
 
     fn persist_rollup_journal(&self) -> std::io::Result<()> {
+        self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, false)
+    }
+
+    /// The journal's current entry set, with the gauges it also feeds.
+    fn rollup_journal_entries(&self) -> Vec<crate::rollup_journal::RollupInvalidation> {
         let mut entries: Vec<_> = self
             .rollup_source_epochs
             .iter()
@@ -918,7 +923,83 @@ impl Database {
             .max()
             .unwrap_or(0);
         stats.rollup_oldest_invalidation_age_secs.store(oldest_age_secs, std::sync::atomic::Ordering::Relaxed);
-        crate::rollup_journal::store(&self.config.core.timefusion_data_dir, &entries)
+
+        entries
+    }
+
+    /// How stale the on-disk rollup journal may be.
+    ///
+    /// Commits run at ~11/s in production, so this is ~1 durable write per
+    /// second instead of ~11, and the journal is at most this far behind.
+    const ROLLUP_JOURNAL_MAX_STALENESS: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Persist the encoded rollup journal, unless it is unchanged or not yet due.
+    ///
+    /// **Why this may be deferred at all.** `rollup_journal` is scheduling
+    /// state, not a correctness boundary — its own module says so, and
+    /// `maintenance_tasks` is documented as "the finer-grained source of truth
+    /// coordinator workers consume". Both are written from the SAME pre-ack
+    /// invalidation, but only the task journal's `checkpoint` records the work
+    /// items; `rollup_dirty` is read in exactly one place, to requeue
+    /// partitions when bootstrap tasks were *discarded*. So a lost second of it
+    /// weakens a backup whose primary was fsynced in the same commit, and an
+    /// absent entry already means "full rebuild required" to the builder — the
+    /// conservative direction.
+    ///
+    /// **Why it is worth deferring.** `store` costs TWO `fsync`s — the temp
+    /// file, then the parent directory after the rename — and ran inside every
+    /// group commit beside the task journal's own. Three per commit, on an
+    /// array measured at 98.8% utilisation with a 63-620 ms write wait. Prod
+    /// 2026-09-12 performed 30,075 commits in 2,640 s (11.4/s), i.e. ~100% duty
+    /// on the commit pipeline, and `block.journal_commit_wait` averaged 362 ms
+    /// (max 10.7 s) on the PRE-ACK path because every arrival queues behind it.
+    ///
+    /// The content check is kept as well and is free: it compares the bytes
+    /// actually encoded, so any skew or hash collision can only produce an
+    /// EXTRA write, never a missed one. `None` until a store succeeds, so the
+    /// first write of a process always happens, and the stamp advances only
+    /// after `store_encoded` returns `Ok`.
+    ///
+    /// `force` bypasses the staleness window for shutdown, where there is no
+    /// next commit to carry the write.
+    fn persist_rollup_journal_bytes(&self, bytes: Vec<u8>, force: bool) -> std::io::Result<()> {
+        use std::{
+            hash::{Hash, Hasher},
+            sync::atomic::Ordering::Relaxed,
+        };
+        let stats = crate::observability::maintenance_stats();
+        let digest = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        };
+        let mut persisted = crate::support::lock(&self.rollup_journal_persisted);
+        if persisted.digest == Some(digest) {
+            stats.rollup_journal_persist_skipped.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        // Deferred, not dropped: the content is still different on the next
+        // commit, so the next one past the window writes it. `force` and the
+        // never-written case both bypass this.
+        if !force
+            && let Some(at) = persisted.at
+            && at.elapsed() < Self::ROLLUP_JOURNAL_MAX_STALENESS
+        {
+            stats.rollup_journal_persist_deferred.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        crate::rollup_journal::store_encoded(&self.config.core.timefusion_data_dir, &bytes)?;
+        persisted.digest = Some(digest);
+        persisted.at = Some(std::time::Instant::now());
+        stats.rollup_journal_persists.fetch_add(1, Relaxed);
+        Ok(())
+    }
+
+    /// Write the rollup journal unconditionally, for shutdown — the one point
+    /// where no later commit exists to carry a deferred write.
+    pub(crate) fn flush_rollup_journal(&self) -> std::io::Result<()> {
+        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, true)
     }
 
     /// `mint_dedup=false` only for hours touched EXCLUSIVELY by self-authored
@@ -9792,6 +9873,14 @@ impl Database {
             warn!("DML coalescer drain exceeded shutdown deadline — un-drained deferred Delta legs lost (crash-equivalent; mem-leg values survive in WAL)");
         }
 
+        // The rollup journal's durable write is throttled on the commit path, so
+        // shutdown is the one point with no later commit to carry a deferred
+        // one. Best-effort: it is scheduling state, and failing the shutdown
+        // over it would be worse than the conservative rebuild losing it costs.
+        if let Err(error) = self.flush_rollup_journal() {
+            warn!(%error, event = "rollup_journal_shutdown_flush_failed");
+        }
+
         // Cancel maintenance tasks
         self.maintenance_shutdown.cancel();
 
@@ -10413,6 +10502,88 @@ mod rollup_noop_skip_tests {
             tier_version(&db).await > Some(before_dedup),
             "a deletion vector masked a duplicate this rollup had already counted; a paths-only fingerprint would have called that unchanged"
         );
+        Ok(())
+    }
+}
+
+/// The rollup journal's two `fsync`s must not be paid on every commit.
+#[cfg(test)]
+mod rollup_journal_persist_tests {
+    use serial_test::serial;
+
+    use super::*;
+    use crate::support::test_helpers::TestConfigBuilder;
+
+    fn counts() -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = crate::observability::maintenance_stats();
+        (s.rollup_journal_persists.load(Relaxed), s.rollup_journal_persist_skipped.load(Relaxed), s.rollup_journal_persist_deferred.load(Relaxed))
+    }
+
+    /// `store` costs TWO `fsync`s — the temp file, then the parent directory
+    /// after the rename — and ran inside every group commit beside the task
+    /// journal's own `sync_all`. Three per commit, on an array measured at
+    /// 98.8% utilisation with a 63-620 ms write wait. Prod 2026-09-12 performed
+    /// 30,075 commits in 2,640 s (11.4/s), i.e. ~100% duty on the commit
+    /// pipeline, and `block.journal_commit_wait` averaged **362 ms** (max
+    /// 10.7 s) on the PRE-ACK path because every arrival queued behind it.
+    ///
+    /// Deferring is sound because `rollup_journal` is scheduling state, not a
+    /// correctness boundary: `maintenance_tasks` is "the finer-grained source
+    /// of truth coordinator workers consume", it is fsynced in the SAME commit,
+    /// and `rollup_dirty` is read in one place only — to requeue partitions
+    /// when bootstrap tasks were discarded.
+    ///
+    /// A content hash alone would NOT have helped: `apply_rollup_hours`
+    /// increments the source epoch on every call, so the encoded journal really
+    /// does change on every ingest invalidation. That is why this throttles by
+    /// TIME as well, and why the skip assertion below would pass vacuously
+    /// without the deferral.
+    ///
+    /// Can-fail proof, run red then restored: setting
+    /// `ROLLUP_JOURNAL_MAX_STALENESS` to zero makes the deferral assertion red
+    /// (13 writes for 13 commits, the pre-change behaviour).
+    #[serial]
+    #[tokio::test]
+    async fn repeated_commits_do_not_each_rewrite_the_rollup_journal() -> Result<()> {
+        let cfg = TestConfigBuilder::new("rollup_journal_persist").with_rollups().build();
+        let db = Database::with_config(cfg).await?;
+        let project = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = (chrono::Utc::now() - chrono::Duration::days(2)).date_naive().to_string();
+
+        // The first write of a process always happens: there is no stamp yet,
+        // so an empty one must not be mistaken for "already persisted".
+        db.apply_rollup_hours(&project, "otel_logs_and_spans", &date, 1 << 12)?;
+        db.commit_journal()?;
+        assert!(counts().0 > 0, "the first persist of a process must write");
+
+        // The steady-ingest shape. Every call bumps the source epoch, so the
+        // CONTENT differs every time — only the staleness window stops these.
+        let before = counts();
+        for hour in 0..13u32 {
+            db.apply_rollup_hours(&project, "otel_logs_and_spans", &date, 1 << hour)?;
+            db.commit_journal()?;
+        }
+        let after = counts();
+        assert_eq!(after.0, before.0, "13 commits inside the staleness window must not each pay two fsyncs");
+        assert_eq!(after.2 - before.2, 13, "and each must be counted as deferred, not silently dropped");
+
+        // Deferred is not dropped. Shutdown has no later commit to carry the
+        // write, so it forces one — and the journal on disk then holds the
+        // hours those deferred commits marked.
+        db.flush_rollup_journal()?;
+        assert_eq!(counts().0 - after.0, 1, "shutdown must flush what the window deferred");
+        let persisted = crate::rollup_journal::load(&db.config.core.timefusion_data_dir);
+        let entry =
+            persisted.iter().find(|entry| entry.project_id == project && entry.date == date).expect("the partition must be on disk after a forced flush");
+        assert_eq!(entry.dirty_hours & 0x1fff, 0x1fff, "every hour marked during the deferred window must have reached disk");
+
+        // Nothing changed since that flush, so the next commit writes nothing
+        // even though the window has no say — this is the idle case.
+        let before = counts();
+        db.commit_journal()?;
+        assert_eq!(counts().1 - before.1, 1, "an unchanged journal must be skipped on content, not merely deferred");
+        assert_eq!(counts().0, before.0, "and must not write");
         Ok(())
     }
 }
