@@ -183,15 +183,61 @@ update-initramfs -u
 # /etc/fstab:  /dev/md4  /mnt/ephemeral  xfs  defaults,nofail  0 0
 ```
 
+Use LVM on md4 rather than a bare filesystem, so swap and cache are independently
+resizable:
+
+```bash
+pvcreate /dev/md4 && vgcreate ephemeral /dev/md4
+lvcreate -L 64G     -n swap  ephemeral      # see Appendix B
+lvcreate -l 100%FREE -n cache ephemeral
+mkswap /dev/ephemeral/swap
+mkfs.xfs /dev/ephemeral/cache
+```
+
 Then move **only reconstructible** data — foyer cache, `tantivy_scratch`, the
 `*_spill` dirs — by adding a second bind mount to the CapRover service
 definition (`deploy/`). **WAL and journals stay on the mirror.** Zero code
 change; TF derives these paths from `timefusion_data_dir`, so the mount does the
 work.
 
-**What this buys:** ephemeral traffic stops being written 4x and moves off the
-contended mirror entirely; WAL fsyncs halve their device cost and stop competing
-with cache churn; foyer gets room to stop running 38 GB over its cap; +3.4 TB.
+**What this buys — and what it does NOT.** In a RAID1 *every leg receives every
+write*, so going 4-way → 2-way halves TOTAL device traffic but leaves each
+surviving drive at the same ~500 MB/s. **Step 1 alone buys no write headroom**;
+it is a prerequisite that frees two drives, not a fix. Do it only as part of
+committing to step 2.
+
+The win is entirely in step 2, and it is two things:
+
+- **~2x ephemeral bandwidth** — 490 MB/s striped over two drives is ~245 MB/s
+  each, against 500 MB/s hitting every drive today.
+- **WAL isolation, the bigger prize** — the mirror pair drops to ~10 MB/s and
+  carries only WAL and journals, so client `fsync`s stop queueing behind cache
+  churn. That is the mechanism behind the 13.4 s worst-case barrier wait, and
+  separation attacks it in a way no scheduler can.
+
+Per-drive write load, before and after:
+
+| | nvme0 | nvme1 | nvme2 | nvme3 |
+| --- | --- | --- | --- | --- |
+| now (all on md3 ×4) | 500 MB/s | 500 MB/s | 500 MB/s | 500 MB/s |
+| after step 1 | 500 MB/s | idle | 500 MB/s | idle |
+| after step 2 | **~10 MB/s** | ~245 MB/s | **~10 MB/s** | ~245 MB/s |
+
+Capacity: usable space from the `p3` region goes **1.918 TB → 5.754 TB (3.0x)**,
+redundancy overhead 75% → 25%.
+
+### Drive endurance — check this regardless of any RAID decision
+
+At ~500 MB/s per drive the array absorbs **43 TB/day/drive ≈ 22 DWPD** on 1.92 TB
+devices. Read-intensive NVMe is rated 0.3-1 DWPD, mixed-use 3, write-intensive
+5-10 — so this is **2-75x rated endurance** depending on drive class, and a
+3 DWPD drive's entire five-year budget is consumed in roughly eight months.
+
+**Run `nvme smart-log /dev/nvme0 | grep -i percentage_used` on all four** (needs
+root; the OVH panel also shows disk health). If those are climbing, wear-out is
+the dominant risk and the software fix stops being a performance optimisation
+and becomes hardware preservation. The RAID split halves total device writes;
+removing the 500 MB/s removes the problem.
 
 **What it costs, stated plainly:**
 - durable-data fault tolerance drops from surviving 3 drive failures to 1
@@ -204,3 +250,62 @@ with cache churn; foyer gets room to stop running 38 GB over its cap; +3.4 TB.
 **Do the software stages first.** If Stage 2 removes most of the 500 MB/s, the
 pressure that motivates this largely disappears, and it can be done calmly at a
 maintenance window instead of under duress.
+
+## Appendix B — swap on the ephemeral volume (TASK)
+
+**Current state, measured.** 188 GB RAM, 122 GB available,
+`/proc/pressure/memory` **0.00 across all windows** — there is no memory
+pressure today. Swap is **active but negligible**: ~1-2 GB total and **100%
+used**, from the four 537 MB `p4` partitions OVH created. TF's cgroup is capped
+at 120 GiB with `memory.swap.max` set to the same value, i.e. effectively
+unbounded.
+
+So this is **insurance, not a fix.** The case for it is TF-specific: this
+process has a history of OOM kills, and each restart costs ~25 min of
+maintenance-queue re-inflation plus every in-flight unit. Swap converts a hard
+kill into degraded performance, which for this workload is the better failure.
+
+### Task
+
+1. `lvcreate -L 64G -n swap ephemeral` on md4 (see Appendix A), `mkswap`,
+   `swapon`, add to `/etc/fstab` with **`nofail`**.
+2. **`vm.swappiness = 10`** (currently **60** — far too eager for a database).
+   Swap must be an emergency reserve, not a routine tier.
+3. Bound the container: set `memory.swap.max` to a deliberate figure
+   (e.g. 32 GiB) rather than leaving it equal to `memory.max`. This is the knob
+   that decides *degrade* vs *thrash*.
+4. Leave the four tiny `p4` partitions alone — 2 GB is not worth the write
+   traffic on the mirror pair.
+
+### Sizing rationale
+
+64 GB, not more. Enough to absorb a spike; **not** enough to thrash for hours.
+Swapping a 120 GiB working set through any device leaves the box unresponsive,
+which is worse than a fast restart — the goal is to survive a transient, not to
+run from disk.
+
+### THE TRADE-OFF THIS MAKES — read before agreeing
+
+Appendix A states that losing md4 costs a cold cache, not data loss. **Putting
+swap on md4 makes that false.** If a RAID0 member dies while pages are swapped
+out, every process holding those pages is killed — TF goes down, not just cold.
+
+Accepted here because TF is built to survive restarts (WAL replay, clean-shutdown
+path), and an md4 failure is already a severe event: 638 GB of cache gone and
+every read falling through to R2. A restart on top of that is small marginal
+harm.
+
+**The alternative, if that coupling is unacceptable:** a smaller swapfile on md3
+instead. It survives a single drive failure and keeps md4-loss benign, at the
+cost of 2x write amplification and scarce root space — `/` is at **83% with
+291 GB free** and shrinking. Emergency-only swap is rarely written, so the
+amplification barely matters; the space does.
+
+### Verification
+
+- `swapon --show` reports the new device (needs root — a non-root
+  `swapon --show` returns empty and reads as "no swap", which is how the earlier
+  reading in this investigation was wrong)
+- under induced pressure, TF degrades instead of being OOM-killed
+- `/proc/pressure/memory` stays near zero in normal operation; if swap is being
+  touched routinely, `swappiness` is still too high
