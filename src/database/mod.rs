@@ -2007,11 +2007,7 @@ pub fn file_uris<C: Default + FromIterator<String>>(table: &DeltaTable) -> C {
 /// "version" — that also matches the permanent Unsupported{Reader,Writer}Version
 /// errors, which must fail fast.
 pub(crate) fn is_occ_conflict_err(msg: &str) -> bool {
-    msg.contains("already exists")
-        || msg.contains("Commit failed")
-        || msg.contains("concurrent transaction")
-        || msg.contains("Metadata changed")
-        || msg.contains("Transaction failed")
+    ["already exists", "Commit failed", "concurrent transaction", "Metadata changed", "Transaction failed"].into_iter().any(|needle| msg.contains(needle))
 }
 
 /// Cheap structural check that catches real-world checkpoint-corruption classes.
@@ -2076,13 +2072,9 @@ pub(crate) fn occ_backoff(attempt: usize) -> tokio::time::Duration {
 /// fail fast. Phrases are anchored to genuinely transient states — notably not a bare
 /// "connection", which would match permanent "connection refused" and burn the retry budget.
 fn is_transient_s3_err(msg: &str) -> bool {
-    msg.contains("error sending request")
-        || msg.contains("connection reset")
-        || msg.contains("connection closed")
-        || msg.contains("broken pipe")
-        || msg.contains("reset by peer")
-        || msg.contains("timed out")
-        || msg.contains("timeout")
+    ["error sending request", "connection reset", "connection closed", "broken pipe", "reset by peer", "timed out", "timeout"]
+        .into_iter()
+        .any(|needle| msg.contains(needle))
 }
 
 /// Synthetic per-row source-file column exposed on the dedup sweep's table
@@ -4110,6 +4102,13 @@ impl Database {
         }
     }
 
+    /// Every physical table holding `table_name`'s files: `"default"` (the
+    /// unified table) plus each custom-storage project with its own copy.
+    async fn table_roots(&self, table_name: &str) -> Vec<String> {
+        let customs = self.custom_project_tables.read().await;
+        std::iter::once("default".to_string()).chain(customs.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone())).collect()
+    }
+
     /// Refresh global Tantivy coverage gauges without building indexes.
     ///
     /// Only this all-table census writes the coverage gauges. Per-table backfills
@@ -4130,9 +4129,7 @@ impl Database {
             if !svc.config.is_table_indexed(&table_name) {
                 continue;
             }
-            let mut roots: Vec<String> = vec!["default".into()];
-            roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| *t == table_name).map(|(p, _)| p.clone()));
-            for root in roots {
+            for root in self.table_roots(&table_name).await {
                 let Ok(table_ref) = self.resolve_table(&root, &table_name).await else { continue };
                 let (by_pid, ..) = self.group_uncovered_files_by_project(&svc, &table_ref, &table_name, &mut oversized, false).await?;
                 for uris in by_pid.into_values() {
@@ -4171,9 +4168,7 @@ impl Database {
             if cols.is_empty() {
                 continue;
             }
-            let mut roots: Vec<String> = vec!["default".into()];
-            roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| *t == table_name).map(|(p, _)| p.clone()));
-            for root in roots {
+            for root in self.table_roots(&table_name).await {
                 if budget == 0 {
                     return Ok((built, errors));
                 }
@@ -4247,10 +4242,7 @@ impl Database {
             info!(table_name, event = "tantivy_backfill_already_active");
             return Ok(0);
         };
-        // Unified table ("default") holds every default-routed project's
-        // files; custom project tables are resolved separately.
-        let mut roots: Vec<String> = vec!["default".into()];
-        roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()));
+        let roots = self.table_roots(table_name).await;
         let mut built = 0usize;
         // Per-table progress for this pass, reported in the completion log.
         let (mut uncovered_total, mut oversized_total) = (0u64, 0u64);
@@ -4839,7 +4831,7 @@ impl Database {
             if self.rollup_source_epochs.get(&(project_id.clone(), source.clone(), date.clone())).map_or(0, |epoch| *epoch.value()) != *source_epoch {
                 return false;
             }
-            if self.rollup_source_fingerprint(project_id, source, date).await.map_or(true, |fingerprint| fingerprint != *source_fp) {
+            if !self.rollup_source_fingerprint(project_id, source, date).await.is_ok_and(|fingerprint| fingerprint == *source_fp) {
                 return false;
             }
         }
@@ -6035,12 +6027,8 @@ impl Database {
             .clone();
         drop(configs);
 
-        let storage_uri = format!(
-            "s3://{}/{}/?endpoint={}",
-            config.s3_bucket,
-            config.s3_prefix,
-            config.s3_endpoint.as_ref().unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
-        );
+        let endpoint = config.s3_endpoint.as_deref().or(self.default_s3_endpoint.as_deref()).unwrap_or("https://s3.amazonaws.com");
+        let storage_uri = format!("s3://{}/{}/?endpoint={endpoint}", config.s3_bucket, config.s3_prefix);
 
         // Start from the shared base options so BYO buckets inherit AWS_ALLOW_HTTP +
         // connect_timeout like the unified table (delta-rs rejects http/on-prem
@@ -8439,7 +8427,7 @@ const DEDUP_SORT_PARTITION_LADDER: [usize; 2] = [MAINTENANCE_MAX_PARTITIONS, 1];
 /// reason is not plumbed to this call site, and a narrower sort costs only
 /// parallelism.
 fn dedup_sort_partitions(attempts: u32) -> usize {
-    let level = (attempts.saturating_sub(1)) as usize;
+    let level = attempts.saturating_sub(1) as usize;
     DEDUP_SORT_PARTITION_LADDER[level.min(DEDUP_SORT_PARTITION_LADDER.len() - 1)]
 }
 
@@ -8515,7 +8503,7 @@ impl HotBinPolicy<'_> {
 /// and the predicate then reports every bin so the refusal can be COUNTED
 /// without being applied — see `timefusion_pack_max_bytes_per_file_eliminated`.
 pub(crate) fn bin_exceeds_value_floor(rows: u64, files: usize, floor: u64) -> bool {
-    let eliminated = (files.saturating_sub(1)) as u64;
+    let eliminated = files.saturating_sub(1) as u64;
     rows / eliminated.max(1) > floor.max(1)
 }
 
@@ -9085,7 +9073,7 @@ pub(crate) enum Brake {
 
 #[allow(clippy::too_many_arguments)] // scheduling params are positional by design; a struct would just rename them
 async fn round_robin_bins<F, Fut, T, C, CFut>(
-    projects: Vec<String>, max_rounds: usize, concurrency: usize, deadline: std::time::Instant, on_truncate: impl Fn(usize, &[String]),
+    projects: Vec<String>, max_rounds: usize, mut concurrency: usize, deadline: std::time::Instant, on_truncate: impl Fn(usize, &[String]),
     should_pause: impl Fn() -> Option<Brake>, commit_each_bin: bool, op: F, commit_wave: C,
 ) -> usize
 where
@@ -9096,7 +9084,6 @@ where
 {
     let mut pending = projects;
     let mut failed = 0usize;
-    let mut concurrency = concurrency;
     for round in 0..max_rounds {
         if pending.is_empty() {
             break;
@@ -10849,15 +10836,8 @@ impl ExecutionPlan for GatedScanExec {
 
 // Needed by DataSink
 impl DisplayAs for ProjectRoutingTable {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ProjectRoutingTable ")
-            }
-            DisplayFormatType::TreeRender => {
-                write!(f, "ProjectRoutingTable ")
-            }
-        }
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProjectRoutingTable ")
     }
 }
 
@@ -11866,18 +11846,14 @@ impl TableProvider for ProjectRoutingTable {
             return wrap_result_split(plans.into_iter().map(|plan| (plan, crate::read::LegKind::Delta)).collect(), certified_plans);
         }
 
-        // Create MemorySourceConfig with multiple partitions for parallel execution
-        let mem_plan = match mem_partitions.is_empty() {
-            true => None,
-            false => {
-                scan_state.lock().has_mem = true;
-                Some(self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?)
-            }
-        };
+        // Create MemorySourceConfig with multiple partitions for parallel execution.
+        // `mem_partitions` is non-empty here — the empty case returned above.
+        scan_state.lock().has_mem = true;
+        let mem_plan = self.create_memory_exec(&mem_partitions, projection, mem_leg.sorted)?;
 
         // If we can skip Delta, return mem plan directly (the hot leg is empty
         // by construction on this path — see above).
-        if let Some(mem_plan) = mem_plan.clone().filter(|_| skip_delta) {
+        if skip_delta {
             span.record("scan.skipped_delta", true);
             debug!("Skipping Delta scan - query time range entirely within MemBuffer for {}/{}", project_id, self.table_name);
             return wrap_result(vec![(mem_plan, crate::read::LegKind::Mem)]);
@@ -11940,7 +11916,7 @@ impl TableProvider for ProjectRoutingTable {
         // Identity travels WITH the plan, so the flatten cannot desynchronise it
         // from the sortability it implies (see `wrap_result`).
         use crate::read::LegKind;
-        let mut legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> = mem_plan.map(|p| (p, LegKind::Mem)).into_iter().collect();
+        let mut legs: Vec<(Arc<dyn ExecutionPlan>, LegKind)> = vec![(mem_plan, LegKind::Mem)];
         legs.extend(delta_plans.into_iter().map(|p| (p, LegKind::Delta)));
         wrap_result(legs)
     }
