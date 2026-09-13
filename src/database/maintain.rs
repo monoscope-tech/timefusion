@@ -2748,7 +2748,82 @@ impl Database {
             }
             _ => None,
         };
+        // PHASE WATCHDOG over the window in which a light permit is held but no
+        // sort has begun. Prod 2026-09-13, on a 54-minute-old process carrying
+        // every one of tonight's permit and packer fixes:
+        //
+        //     light_optimize_bins_committed:   150 -> 150       FROZEN
+        //     compaction_permits_acquired:     370 -> 370       FROZEN
+        //     compaction_permits_unavailable:  4,026 -> 11,136  climbing
+        //     light_rewrite_permits_available: 0                both held
+        //     HotPacking + SealedConsolidation claims in 6 min: 0
+        //     wave_bin_staging_started in 20 min:               0
+        //
+        // Both permits were held by units that never released them, and because
+        // the permit is taken BEFORE the claim the hygiene lanes then stop
+        // claiming at all. The lane does not drain slowly — it WEDGES, and prod's
+        // constant redeploys keep clearing and re-forming it, which reads as
+        // slowness.
+        //
+        // The reporter must be a SEPARATE TASK, not a check on the way past each
+        // checkpoint. A unit that hangs never reaches the next checkpoint, so a
+        // completion-based clock stays silent on precisely the failure it is
+        // built to name — the same trap that kept #268's lifetime cap from ever
+        // firing, since `tokio::time::timeout` cannot preempt a future that never
+        // reaches an await point. Two permits bound this to two watchdogs.
+        // Every await between taking the permit and starting the sort gets its own
+        // name. The earlier five stopped at `compaction_files`, which labelled the
+        // whole of the snapshot fold, the repair sortedness probe and the resume
+        // scan as "staging" — the one answer the evidence has already ruled out.
+        const PERMIT_PHASES: [&str; 8] =
+            ["claim", "admission", "resolve_table", "compaction_files", "processed_bytes", "repair_sorted_probe", "resume_scan", "staging"];
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Repair flows through here too and takes NO light permit (`_ => None`
+        // above), yet its pre-stage window includes `repair_bin_already_sorted`,
+        // whose footer reads over S3 can legitimately stall for minutes. Without
+        // this label those units emit the same event under the same phase names
+        // while holding nothing, and the warn lines are the only evidence there
+        // will be when the wedge fires.
+        let watched_operation = format!("{operation:?}");
+        let holds_light_permit = light_permit.is_some();
+        let note = |next: usize| phase.store(next, std::sync::atomic::Ordering::Relaxed);
+        let _watchdog = AbortOnDrop(tokio::spawn({
+            let phase = Arc::clone(&phase);
+            let watched_operation = watched_operation.clone();
+            async move {
+                // Back off doubling. A bin at 1.0x the sort budget legitimately
+                // stages for ~1,710 s, so a flat 60 s interval would put ~28 lines
+                // per healthy unit into the log of a memory-tight box. Doubling
+                // keeps the first report early, where a wedge is still news, and
+                // costs a logarithmic number of lines for the long legitimate ones.
+                let (mut held_secs, mut wait) = (0u64, 60u64);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    held_secs += wait;
+                    wait = (wait * 2).min(900);
+                    // The gauge is the half that outlives the process: a log line
+                    // has to be grepped on a host, this gets history in monoscope.
+                    let stats = crate::observability::maintenance_stats();
+                    stats.permit_held_without_staging_secs.fetch_max(held_secs, std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        phase = PERMIT_PHASES[phase.load(std::sync::atomic::Ordering::Relaxed).min(PERMIT_PHASES.len() - 1)],
+                        operation = %watched_operation,
+                        held_permit = holds_light_permit,
+                        held_secs,
+                        event = "compaction_permit_held_without_staging",
+                        "a light permit has been held this long without starting a sort"
+                    );
+                }
+            }
+        }));
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
+        note(1);
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
@@ -2759,11 +2834,14 @@ impl Database {
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             return self.retried(&key, "admission_busy".to_owned(), admission_backoff(task.attempts));
         };
+        note(2);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
             Ok(table) => table,
             Err(error) => return retry(format!("resolve_compaction_source: {error:#}"), 30),
         };
+        note(3);
         let files = self.coordinator_compaction_files(&table_ref, &key).await?;
+        note(4);
         if files.is_empty() {
             return self.completed(&key);
         }
@@ -2777,6 +2855,7 @@ impl Database {
                 .filter(|file| selected.contains(file.path().as_ref()))
                 .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size())))
         };
+        note(5);
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
             return self.settle_compaction_unit(&table_ref, &key).await.map(|()| true);
         }
@@ -2787,6 +2866,7 @@ impl Database {
         // staged parquet and a whole rewrite is thrown away.
         let date_marker =
             chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| format!("date={}/", time.date_naive())).unwrap_or_default();
+        note(6);
         if let Some(bin) = self.resumable_staged_bin(&table_ref, &key.source, &key.project_id, &files).await {
             let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![bin], 0).await;
             let landed = result.failed.is_empty() && !result.landed.is_empty();
@@ -2796,6 +2876,7 @@ impl Database {
             }
             // The resume lost its race (inputs no longer live); stage normally.
         }
+        note(7);
         let runtime = self.coordinator_compaction_runtime_env(operation);
         let outcome = self
             .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
