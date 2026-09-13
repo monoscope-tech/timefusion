@@ -4650,8 +4650,14 @@ impl Database {
                 // WHOLE live file set — different hasher, different set, so they
                 // can never be equal. Built and measured 2026-08-22; it routed
                 // nothing, failing safe as a permanent miss.
-                let (fresh, stale): (Vec<_>, Vec<_>) =
-                    slices.into_iter().partition(|(_, coverage)| crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current));
+                let (fresh, stale): (Vec<_>, Vec<_>) = slices.into_iter().partition(|(_, coverage)| {
+                    // Dedup removes rows the rollup's deduplicated read never
+                    // counted, so a witness stamped before it is still true
+                    // of the data — only the physical count moved. Add the
+                    // carried amount back rather than refuse the slice.
+                    let carried = self.witness_carry.carried(&route.source, project, &date);
+                    crate::rollup::slice_coverage_agrees(&[coverage.source_rows], current.map(|rows| rows.saturating_add(carried)))
+                });
                 if !stale.is_empty() {
                     miss = miss.or(Some(crate::rollup::MissReason::StaleCoverage));
                     // WHY it is stale, because the two answers demand opposite

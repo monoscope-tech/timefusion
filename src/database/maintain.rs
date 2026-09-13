@@ -4913,17 +4913,19 @@ impl Database {
         }
         let Some(day_start) = date_start_micros(date) else { return };
         let day_end = day_start.saturating_add(DAY_MICROS);
-        let mut carried = 0u64;
-        self.rollup_slice_coverage.iter_mut().for_each(|mut entry| {
-            let (project, source, _, start, _) = entry.key();
-            if project != project_id || source != table_name || *start < day_start || *start >= day_end {
-                return;
-            }
-            if let Some(rows) = entry.value().source_rows {
-                entry.value_mut().source_rows = Some(rows.saturating_sub(dropped));
-                carried = carried.saturating_add(1);
-            }
-        });
+        // Deliberately NOT mutating `rollup_slice_coverage`. Coverage keeps the
+        // RAW tag value and the carry is applied once, at the two comparison
+        // sites — because coverage is stamped by THREE paths (ledger seed,
+        // journal publication, tag replay) and adjusting at stamping time means
+        // either missing one or double-applying when two chain.
+        let carried = self
+            .rollup_slice_coverage
+            .iter()
+            .filter(|entry| {
+                let (project, source, _, start, _) = entry.key();
+                project == project_id && source == table_name && *start >= day_start && *start < day_end
+            })
+            .count() as u64;
         // Durable first: if the process dies between here and the next
         // recovery, the sidecar is what makes the carry survive.
         let total = self.witness_carry.add(table_name, project_id, date, dropped);
@@ -4959,6 +4961,11 @@ impl Database {
                 continue;
             };
             let Ok(current_rows) = u64::try_from(partition.rows) else { continue };
+            // Add back what dedups removed, so a witness stamped BEFORE them
+            // still verifies. Applied at comparison rather than at stamping:
+            // coverage is written by three paths and adjusting each would either
+            // miss one or double-apply when two chain.
+            let current_rows = current_rows.saturating_add(self.witness_carry.carried(source, &project, &date));
             // Every slice must be verifiable AND agree. One unverifiable slice
             // means the date cannot be proven current, and an unproven date must
             // not be stamped — that is the difference between this and the
@@ -5601,18 +5608,6 @@ impl Database {
                     let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
                     let content_fp = content_fp_by_identity.get(&identity).copied().flatten();
                     let output_files = paths_by_identity.get(&identity).map_or(0, |(_, paths)| u32::try_from(paths.len()).unwrap_or(u32::MAX));
-                    // THE ONE PLACE the carry is applied. A tag records the
-                    // partition count at build time; dedups landed since removed
-                    // rows the rollup never counted, so the tag overstates the
-                    // live count by exactly what `WITNESS_CARRY` accumulated.
-                    // Applying it HERE — where a tag becomes in-memory coverage —
-                    // means every reader downstream (the read path's
-                    // `slice_coverage_agrees`, `recover_date_coverage`, the
-                    // ledger) sees one consistent carried value and none of them
-                    // needs to know the carry exists. Applying it at each
-                    // comparison instead would double-count against the
-                    // in-memory carry `carry_dedup_witness` already performs.
-                    let source_rows = source_rows.map(|rows| rows.saturating_sub(self.witness_carry.carried(source, &project_id, &date)));
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
                         RollupCoverage {
@@ -10562,33 +10557,69 @@ mod rollup_noop_skip_tests {
         let cfg = Arc::new((*TestConfigBuilder::new("witness_carry_restart").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone());
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
-        const DROPPED: u64 = 4;
+        const DROPPED: u64 = 2;
 
-        let stamped = {
+        // Pin ONE slice by KEY. `rollup_slice_coverage` is a DashMap, so
+        // iteration order is not stable and a bare `.find()` can return a
+        // different slice in each phase — which passed locally and failed in CI,
+        // comparing two unrelated witnesses.
+        let (slice_key, stamped) = {
             let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
-            assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so there is no witness to carry");
+            // SEVERAL rows, because `build_day` seeds exactly one and a witness
+            // of 1 makes the whole assertion vacuous — `saturating_sub` floors
+            // at zero and a carry that never applied looks identical to one that
+            // did. The non-vacuity guard below is what caught that.
+            let ts = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+            let spans: Vec<_> = (0..6).map(|i| test_span_ts(&format!("seed-{i}"), "op", &project_id, ts + i)).collect();
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(spans)?], true, None).await?;
+            let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+            db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+            db.plan_rollup_backfill().await?;
+            crate::support::advance_micros(16 * 60 * 1_000_000);
+            assert!(db.drain_coordinator_rollups(64).await? > 0, "no rollup unit ran, so there is no witness to carry");
             db.recover_rollup_coverage("otel_logs_and_spans").await?;
-            let stamped = db
+            let mut stamped: Vec<_> = db
                 .rollup_slice_coverage
                 .iter()
-                .find(|e| e.key().0 == project_id && e.key().1 == "otel_logs_and_spans")
-                .and_then(|e| e.value().source_rows)
-                .expect("recovery must stamp a row witness");
+                .filter(|e| e.key().0 == project_id && e.key().1 == "otel_logs_and_spans")
+                .filter_map(|e| e.value().source_rows.map(|rows| (e.key().clone(), rows)))
+                .collect();
+            stamped.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            // The widest witness, so `saturating_sub` cannot floor the
+            // assertion at zero and hide a carry that never applied.
+            let (key, rows) = stamped.into_iter().max_by_key(|(_, rows)| *rows).expect("recovery must stamp a row witness");
+            assert!(rows > DROPPED, "the fixture must stamp more rows ({rows}) than the drop ({DROPPED}), or the assertion is vacuous");
             db.carry_dedup_witness("otel_logs_and_spans", &project_id, &date.to_string(), DROPPED);
-            stamped
+            (key, rows)
         };
 
         // A brand-new Database over the same data dir — a deploy, in miniature.
         // Its coverage comes from the tags, which still hold the PRE-dedup count.
         let db = Arc::new(Database::with_config(cfg).await?);
+        // The witness itself is untouched by design: coverage holds the RAW tag
+        // value and the carry is applied at COMPARISON, so it survives however
+        // many paths stamp coverage. What the restart has to preserve is the
+        // carry, asserted above.
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
-        let recovered = db
-            .rollup_slice_coverage
-            .iter()
-            .find(|e| e.key().0 == project_id && e.key().1 == "otel_logs_and_spans")
-            .and_then(|e| e.value().source_rows)
-            .expect("the restarted process must recover slice coverage");
-        assert_eq!(recovered, stamped.saturating_sub(DROPPED), "the carry must survive the restart; a tag-only value would read {stamped}");
+        let stored = db.rollup_slice_coverage.get(&slice_key).and_then(|e| e.value().source_rows).expect("the restarted process must recover THIS slice");
+        assert_eq!(stored, stamped, "coverage must keep the raw tag value; the carry is applied at comparison, not baked into the witness");
+
+        // And the arithmetic that carry then enables: a partition that lost
+        // `DROPPED` rows to a dedup still reconciles with a witness stamped
+        // before it. This is the whole point — without the carry the two differ
+        // by exactly `DROPPED` and the slice is refused `shrank`.
+        let live_after_dedup = stamped - DROPPED;
+        assert!(
+            crate::rollup::slice_coverage_agrees(
+                &[Some(stamped)],
+                Some(live_after_dedup + db.witness_carry.carried("otel_logs_and_spans", &project_id, &date.to_string()))
+            ),
+            "witness {stamped} must reconcile with a post-dedup partition of {live_after_dedup} once the carry is added back"
+        );
+        assert!(
+            !crate::rollup::slice_coverage_agrees(&[Some(stamped)], Some(live_after_dedup)),
+            "precondition: without the carry those same numbers must DISAGREE, or this proves nothing"
+        );
         Ok(())
     }
 
