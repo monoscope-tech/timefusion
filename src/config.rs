@@ -181,14 +181,16 @@ pub fn coordinator_bin_compressed_cap_bytes() -> i64 {
 ///
 /// The margin exists because `DECODED_BYTES_PER_COMPRESSED` is an optimistic
 /// estimate, so a bin priced at exactly one sort budget still spills into an
-/// unspillable merge. The floor is mandatory: a cap below 2x the target file
-/// size admits no pair at all, so the cell re-enqueues forever and the lane
-/// retires nothing.
-pub fn coordinator_packing_cap_bytes(target_file_bytes: i64) -> i64 {
+/// unspillable merge. The floor is mandatory: a cap that cannot admit the two
+/// smallest files admits no pair at all, so the cell re-enqueues forever and the
+/// lane retires nothing.
+pub fn coordinator_packing_cap_bytes(smallest_pair_bytes: i64) -> i64 {
     let margin = coordinator_bin_compressed_cap_bytes() * 3 / 5;
-    // The floor wins over the margin: a stalled bin costs one permit, an
-    // unpackable cell costs the whole lane.
-    margin.max(target_file_bytes.saturating_mul(2))
+    // The floor is the PAIR itself, not a per-file size doubled: doubling loses a
+    // byte whenever the pair sums odd, and prod 2026-09-13 hit exactly that —
+    // `target=82703666 smallest_pair_bytes=82703667 smallest_pair_fits=false`.
+    // One byte short is as unpackable as a hundred megabytes short.
+    margin.max(smallest_pair_bytes)
 }
 /// Concurrent target-sized repair rewrites the repair budget must hold. A repair
 /// unit is exactly ONE file and cannot be split, so the budget is a multiple of
@@ -2719,12 +2721,16 @@ mod bin_decode_budget_tests {
     #[test]
     fn a_packing_cap_always_admits_two_target_sized_files() {
         let metrics_file = 36 * 1024 * 1024;
-        let cap = coordinator_packing_cap_bytes(metrics_file);
+        let cap = coordinator_packing_cap_bytes(metrics_file * 2);
         assert!(cap >= 72_140_172, "the two smallest prod otel_metrics files ({}) must pair under the cap ({cap})", 72_140_172_i64);
         assert!(cap >= metrics_file * 2, "a cap below 2x the target file size can never merge anything");
         // Where the floor does not bind, the margin still governs.
         let small = 4 * 1024 * 1024;
-        let margin_cap = coordinator_packing_cap_bytes(small);
+        let margin_cap = coordinator_packing_cap_bytes(small * 2);
+        // An ODD pair must still fit: halving then doubling loses a byte, which
+        // prod hit as `target=82703666` against `smallest_pair_bytes=82703667`.
+        let odd = 82_703_667;
+        assert!(coordinator_packing_cap_bytes(odd) >= odd, "an odd-summed pair must fit the cap it was measured against");
         let ratio = margin_cap as f64 * crate::database::DECODED_BYTES_PER_COMPRESSED as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
         assert!(ratio <= 0.65, "where the floor does not bind, a full bin is {ratio:.2} of a sort budget; 1.00x measured 28.5 minutes");
         assert!(margin_cap < coordinator_bin_compressed_cap_bytes(), "the margin must still bind below the raw decode cap");

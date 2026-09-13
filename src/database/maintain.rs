@@ -2639,13 +2639,21 @@ impl Database {
         }
         // Bounded by what ONE SORT CAN DECODE, not only by the desired output size:
         // packing targets are COMPRESSED while sort budgets are DECODED, and a bin that
-        // cannot fit its sort stalls indefinitely.
-        let target = match key.operation {
+        // cannot fit its sort stalls indefinitely. See `coordinator_bin_compressed_cap_bytes`.
+        let declared_target = match key.operation {
             Operation::HotPacking => COORDINATOR_HOT_TARGET_BYTES,
             Operation::SealedConsolidation => COORDINATOR_SEALED_TARGET_BYTES,
             _ => return Ok(Vec::new()),
-        }
-        .min(crate::config::coordinator_bin_compressed_cap_bytes());
+        };
+        // The pair floor is taken from THIS cell's own two smallest files, not
+        // from a constant, because that is exactly what `packer_admits_pair`
+        // (the planner/packer agreement test) measures when it decides to queue
+        // the cell. Deriving it any other way lets the planner enqueue work this
+        // packer must refuse — which is the wedge, not a hypothetical.
+        let mut two_smallest: Vec<i64> = candidates.iter().map(|add| add.size).collect();
+        two_smallest.sort_unstable();
+        let smallest_pair = two_smallest.iter().take(2).sum::<i64>();
+        let target = declared_target.min(crate::config::coordinator_packing_cap_bytes(smallest_pair));
         let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
         let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
         // A pair that does not fit means planner and packer see different candidate sets
