@@ -115,3 +115,31 @@ maintenance worker time. Reclaiming tantivy's ~10 cores is the largest single
 source of headroom on the box — but headroom is not the backlog fix: the sealed
 lane is permit- and stall-bound, not CPU-starved, so more cores alone will not
 drain it.
+
+## UPDATE, post-#271: the cap now BINDS, and `nr_throttled` proves it
+
+With the hygiene lanes unblocked, cgroup CPU moved from **25.0** to **25.9-27.7
+of 28**, and `cpu.stat`'s `nr_throttled` increments **~85-102 per 12 s (~8/s)**.
+
+That second number is the one that matters. A cores figure near the cap is
+suggestive — scheduling noise, a burst, a bad sample. **A rising `nr_throttled`
+is proof**: the kernel is stopping runnable threads because the CFS quota is
+exhausted. Maintenance work is now being held back by the container's CPU limit
+rather than by a lock, a permit, or a stalled sort.
+
+Measure `nr_throttled` alongside `usage_usec` whenever asking "is the CPU cap
+binding?" — it is the difference between "busy" and "capped", and this codebase
+has mistaken the former for a finding before.
+
+Two consequences:
+
+- **Raising NanoCpus 28 -> 32 is now a measured fix**, not a guess. The value is
+  in `deploy/caprover-service-override.yml`; the repo file alone does not apply
+  it, it needs a CapRover admin update. Note it does **not** change
+  `light_optimize_k`, which stays at 2 from 28 cores to ~48 — it buys throughput
+  for the lanes that already run, not more sealed concurrency.
+- **Tantivy's ~10 cores is now directly displacing maintenance.** While the box
+  had headroom, the 39% share was a cost without a victim. Under throttling it
+  is not: every core tantivy holds is a core the backlog does not get. That
+  promotes the attribution work from "headroom project" to "on the critical
+  path", which is what the `cause` span shipped in #273 exists to resolve.

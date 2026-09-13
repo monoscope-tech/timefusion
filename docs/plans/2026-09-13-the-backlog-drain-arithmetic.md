@@ -26,6 +26,15 @@ moved **0.5 GB** and `pending_sealed_consolidation` held flat at **196** — whi
 SealedConsolidation completed ~48 units/hour. Two mechanisms are visible and
 neither is the sort stall #271 fixed:
 
+- **The gauge is a STOCK OF ESTIMATES and cannot show drain at all.**
+  `estimated_decoded_bytes` is set once when the task is created
+  (`maintenance_coordinator.rs:457`) and is never decremented as bins commit —
+  the only write after creation zeroes it wholesale (`:1222`). So the sum only
+  falls when a task leaves the pending set entirely. This resolves the
+  contradiction outright: committed bins imply ~18 GB/h of decoded work against
+  an observed 0.3 GB/h of gauge movement, because **the gauge is not measuring
+  work done.** A drain rate has to be computed from committed-bin `bytes_in` in
+  the logs; do not quote one from this counter.
 - **Tasks retry rather than retire.** `retry.HotPacking.compaction_debt_remaining`
   = 54 and `retry.SealedConsolidation.compaction_debt_remaining` = 7: a unit
   does a few bins and re-queues, so the pending COUNT is not a work-remaining
@@ -128,3 +137,92 @@ drain this backlog, because the sealed lane is permit-bound, not CPU-starved.
 Raising the container cap 28 → 32 (already in
 `deploy/caprover-service-override.yml`, still needs applying in CapRover) adds
 ~14% CPU and, per the table above, **changes K not at all**.
+
+## Prior art: InfluxDB 3 bounds compaction by ROWS, not compressed bytes
+
+InfluxDB 3 (IOx) is the closest architectural relative TimeFusion has — Rust,
+DataFusion, Parquet, object storage — so its compactor is the most directly
+transferable prior art, and it differs from ours in exactly the place that hurt.
+
+- **Levels, not a single "sealed" pass.** L0 is newly ingested and uncompacted,
+  L1 is consolidated, L2 is compacted and non-overlapping. Promotion between
+  levels is gated on size boundaries (`--l1-consolidation-target-size`: a run set
+  is consumed at or below it, and promotion requires at least two run sets above
+  it). That is the same similar-size idea `bin_breaks_size_ratio` implements,
+  expressed as an explicit ladder.
+- **A separate, smaller target for the hot tail.** `--l1-hot-tail-target-size`
+  (default 250 MB) caps live tail rewrites during snapshot compaction, and the
+  larger tail is handed to L1 consolidation to seal. TimeFusion's split between
+  hot-tail packing and sealed consolidation is the same shape.
+- **The one that matters: `compactionRowLimit`, a soft limit of ~1,000,000 ROWS
+  per file the compactor writes.** The bound is on rows, not on compressed
+  bytes.
+
+**CORRECTION, found by reading before recommending: TimeFusion already does
+this.** `MAX_BIN_ROWS = 2_000_000` (`mod.rs:1487`) bounds a bin in rows, and its
+comment states the same principle in the same words — *"ROWS, not just bytes. A
+byte budget prices a bin by how much it will read; a rewrite costs what it must
+SORT AND WRITE, which is rows... price the work in the unit that costs."* That
+is within 2x of InfluxDB's ~1 M `compactionRowLimit`. The row bound is
+implemented, enforced in the packer loop, and mirrored in the planner/packer
+agreement test. **So this is convergent-evolution evidence that the design is
+right, not a gap to close.**
+
+TimeFusion still caps BYTES at
+`COORDINATOR_PER_SORT_BUDGET_BYTES / DECODED_BYTES_PER_COMPRESSED` — compressed
+bytes converted through a *fixed 12x estimate*. But the thing the sort actually
+costs is decoded rows, and the compression ratio is not 12x uniformly: it varies
+by column mix, by tenant, and by how well-sorted a file already is. A bin of
+identically-sized compressed input can decode to wildly different working sets.
+
+**Rows are exact, and TimeFusion already has them**: `TailAdd::rows` comes from
+Delta `numRecords` and `refuse_low_value_bin` already sums it to price a bin.
+Pricing the cap in rows rather than estimated-decoded-bytes removes the 12x
+estimate from the one decision that stalls the lane when it is wrong — which is
+the same class of error as the gauge correction above, and as #271 itself.
+
+This is a concrete follow-up, not a speculative one: the bound already exists,
+the input is already summed one function away, and the failure mode of the
+current estimate has now been measured twice.
+
+Sources: [InfluxDB 3 storage engine internals](https://docs.influxdata.com/influxdb3/clustered/reference/internals/storage-engine/),
+[InfluxDB 3 Enterprise configuration options](https://docs.influxdata.com/influxdb3/enterprise/reference/config-options/),
+[Timestream for InfluxDB v3 parameters](https://docs.aws.amazon.com/ts-influxdb/latest/ts-influxdb-api/API_InfluxDBv3EnterpriseParameters.html)
+
+## The measured cliff is at ~1.0x, not 2x — and one bin still crossed it
+
+Drain measured the only way that works (committed-bin `bytes_in` from the logs,
+not the gauge): **16 bins / 30 min = 382.7 MB compressed = ~765 MB/h**. Against
+~99 GB that is ~129 hours, but treat it as an order of magnitude, not an ETA —
+it is one 30-minute window on a 2-hour-old process.
+
+The same window contains the sharpest dose-response yet:
+
+| bin | compressed | decoded / 1.25 GiB | staging |
+|---|---:|---:|---:|
+| 11 files | 63.1 MB | **0.59x** | **15 s** |
+| 13 files | **111.3 MB** | **1.07x** | **28.5 min** |
+
+**7% over budget cost 114x.** The earlier reading — 0.59x fast, 1.37x slow,
+2.0x+ never — put the knee somewhere below 1.37x; this puts it essentially AT
+1.0x. That is what a sort falling out of memory looks like, and it means the cap
+has no useful margin: being just over is nearly as bad as being far over.
+
+**And 111.3 MB is above the 107 MB cap #271 installed**, so something admitted a
+bin the cap should have refused. Candidates, none yet confirmed:
+
+- The packer loop pushes its FIRST candidate unconditionally (the `<2`-file
+  livelock guard), so a bin can exceed by one file's size. 13 files averaging
+  8.6 MB does not obviously fit that shape.
+- There are several packing paths with DIFFERENT budgets:
+  `select_coordinator_compaction_candidates` uses
+  `if has_unsorted { unsorted_bin_budget_bytes() } else { target }`, where the
+  unsorted budget is 768 MB decoded = **64 MB compressed** — *stricter* than the
+  cap, so that path is not it. `select_tail_bin` carries its own `cap`, and the
+  cron hot-tail packer is a separate lane again.
+
+**Next step is to identify which lane emitted that bin before changing any
+budget** — the log line does not say. Adding the operation/lane to
+`wave_bin_staged` is the cheap instrument, and it is the same mistake this
+document keeps recording: do not tune a budget until you know which budget was
+applied.
