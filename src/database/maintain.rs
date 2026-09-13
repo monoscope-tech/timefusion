@@ -2784,9 +2784,18 @@ impl Database {
             }
         }
         let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Repair flows through here too and takes NO light permit (`_ => None`
+        // above), yet its pre-stage window includes `repair_bin_already_sorted`,
+        // whose footer reads over S3 can legitimately stall for minutes. Without
+        // this label those units emit the same event under the same phase names
+        // while holding nothing, and the warn lines are the only evidence there
+        // will be when the wedge fires.
+        let watched_operation = format!("{operation:?}");
+        let holds_light_permit = light_permit.is_some();
         let note = |next: usize| phase.store(next, std::sync::atomic::Ordering::Relaxed);
         let _watchdog = AbortOnDrop(tokio::spawn({
             let phase = Arc::clone(&phase);
+            let watched_operation = watched_operation.clone();
             async move {
                 // Back off doubling. A bin at 1.0x the sort budget legitimately
                 // stages for ~1,710 s, so a flat 60 s interval would put ~28 lines
@@ -2804,6 +2813,8 @@ impl Database {
                     stats.permit_held_without_staging_secs.fetch_max(held_secs, std::sync::atomic::Ordering::Relaxed);
                     warn!(
                         phase = PERMIT_PHASES[phase.load(std::sync::atomic::Ordering::Relaxed).min(PERMIT_PHASES.len() - 1)],
+                        operation = %watched_operation,
+                        held_permit = holds_light_permit,
                         held_secs,
                         event = "compaction_permit_held_without_staging",
                         "a light permit has been held this long without starting a sort"
