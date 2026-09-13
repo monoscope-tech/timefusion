@@ -2872,6 +2872,11 @@ pub struct Database {
     /// ledger adds — an authority that can drift, where self-describing files
     /// cannot — has a standing alarm against it.
     coverage_ledger: Arc<crate::storage::JsonCoverageLedger>,
+    /// Rows landed dedups removed from each `(source, project, date)` since its
+    /// rollup slices were last stamped. Durable, because prod redeploys several
+    /// times a day and a carry that dies on restart leaves every one of those
+    /// cells to be rebuilt again — the very work it exists to avoid.
+    witness_carry: Arc<crate::storage::WitnessCarry>,
     /// 24-bit changed-hours mask per `(project, source, date)`. PRESENCE claims
     /// every change since the last build was observed; absence means "unknown"
     /// and forces a full rebuild. Only a successful build inserts one.
@@ -3716,6 +3721,7 @@ impl Database {
             rollup_slice_coverage: Arc::new(dashmap::DashMap::new()),
             rollup_tier_untagged: Arc::new(dashmap::DashMap::new()),
             coverage_ledger: Arc::new(crate::storage::JsonCoverageLedger::load(&cfg.core.timefusion_data_dir)),
+            witness_carry: Arc::new(crate::storage::WitnessCarry::load(&cfg.core.timefusion_data_dir)),
             rollup_dirty,
             rollup_invalidated_at,
             rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),
