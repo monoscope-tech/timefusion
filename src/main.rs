@@ -1218,7 +1218,7 @@ mod healthcheck_tests {
 
     fn error_frame(code: &[u8]) -> Vec<u8> {
         let payload = [&b"C"[..], code, &[0, 0]].concat();
-        [&[b'E'][..], &((payload.len() + 4) as u32).to_be_bytes(), &payload[..]].concat()
+        [&b"E"[..], &((payload.len() + 4) as u32).to_be_bytes(), &payload[..]].concat()
     }
 
     #[test_case::test_case(vec![b'R'] => true ; "authentication request")]

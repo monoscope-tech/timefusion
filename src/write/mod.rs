@@ -2190,7 +2190,7 @@ impl BufferedWriteLayer {
             update_nanos / 1_000_000,
             avg_ms(update_nanos, updates_replayed),
             insert_bytes / (1024 * 1024),
-            if entries_replayed > 0 { insert_bytes / entries_replayed } else { 0 },
+            insert_bytes.checked_div(entries_replayed).unwrap_or(0),
         );
         // The two costs UPSTREAM of the Arrow decode, which together were 71%
         // of replay wall-clock when first measured (2026-08-15) and are invisible
@@ -3015,8 +3015,11 @@ impl BufferedWriteLayer {
                 // If any restore fails (bucket evicted meanwhile) the
                 // in-flight hold stays registered until restart, keeping
                 // the entries replayable.
-                // fold, not all(): every bucket must be restored even after one fails.
-                if source_buckets.iter().fold(true, |ok, bucket| self.mem_buffer.restore_snapshot_holds(bucket) && ok) {
+                // Collected first, deliberately: every bucket must be restored
+                // even after one fails, and `all` would short-circuit on the
+                // first failure and leave the rest unrestored.
+                let restored: Vec<_> = source_buckets.iter().map(|bucket| self.mem_buffer.restore_snapshot_holds(bucket)).collect();
+                if restored.into_iter().all(|ok| ok) {
                     self.release_inflight_holds(&combined.project_id, &combined.table_name, token);
                 } else {
                     // Carry the coalesced group's GC-floor pin: the

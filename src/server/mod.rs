@@ -1641,7 +1641,7 @@ fn build_starting_up_response() -> Vec<u8> {
         .flat_map(|(tag, value)| [tag].into_iter().chain(value.bytes()).chain([0]))
         .chain([0])
         .collect();
-    [b'E'].into_iter().chain(((body.len() + 4) as u32).to_be_bytes()).chain(body).collect()
+    (*b"E").into_iter().chain(((body.len() + 4) as u32).to_be_bytes()).chain(body).collect()
 }
 
 #[cfg(test)]

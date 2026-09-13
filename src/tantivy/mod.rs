@@ -509,7 +509,7 @@ mod builder_tests {
     fn error_hits(index: &Index, built: &BuiltSchema) -> Vec<Hit> {
         let q = TermQuery::new(Term::from_field_text(built.user_fields["level"].field, "ERROR"), IndexRecordOption::Basic);
         let mut hits = query_index(index, &q, None).expect("query");
-        hits.sort_by(|a, b| a.timestamp_micros.cmp(&b.timestamp_micros));
+        hits.sort_by_key(|hit| hit.timestamp_micros);
         hits
     }
 

@@ -10462,7 +10462,7 @@ fn scan_pressure_permits(total: u32) -> u32 {
         SAMPLED_AT_MS.store(now_ms, Relaxed);
         let limit = crate::config::try_config().map_or(0, |c| c.derived.memory_limit_bytes);
         let used = process_memory_bytes().unwrap_or(0);
-        let pct = if limit > 0 { (used * 100 / limit) as u64 } else { 0 };
+        let pct = (used * 100).checked_div(limit).unwrap_or(0) as u64;
         let prev_used = PREV_USED.swap(used as u64, Relaxed);
         let dt_ms = now_ms.saturating_sub(last);
         // First sample (no `last`) has no interval to differentiate over.
@@ -10477,7 +10477,7 @@ fn scan_pressure_permits(total: u32) -> u32 {
         }
         let rate = RATE_BPS.load(Relaxed);
         let headroom = (limit as u64).saturating_sub(used as u64);
-        ETA_SECS.store(if rate > 0 { headroom / rate } else { u64::MAX }, Relaxed);
+        ETA_SECS.store(headroom.checked_div(rate).unwrap_or(u64::MAX), Relaxed);
         let prev_pct = USAGE_PCT.swap(pct, Relaxed);
         // Tier transitions are rare and load-bearing for OOM post-mortems:
         // counters die with the process, the log survives it.
@@ -20126,7 +20126,7 @@ mod tests {
             let ttl = db.config.cache.provider_cache_ttl();
             let old = ring.get(v1, ttl).expect("previous version still retrievable — no rebuild for in-flight queries");
             assert!(old.initialized(), "the retained v{v1} cell must still hold its built provider");
-            assert!(ring.get({ v2 }, ttl).is_some(), "latest version cached");
+            assert!(ring.get(v2, ttl).is_some(), "latest version cached");
             assert!(ring.get(v2 + 99, ttl).is_none(), "lookup is exact-version: an unseen version must miss");
         }
         let stats2 = ctx.sql("SELECT value FROM timefusion_stats WHERE component = 'scan' AND key = 'provider_cache_entries'").await?.collect().await?;

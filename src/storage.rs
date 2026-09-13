@@ -3581,10 +3581,12 @@ pub trait CoverageLedger: Send + Sync {
 /// a range no single build ever produced.
 pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
     entries.sort_by(|a, b| (&a.generation, a.start_micros).cmp(&(&b.generation, b.start_micros)));
-    entries
-        .into_iter()
-        .coalesce(|mut last, entry| {
-            if last.generation == entry.generation && entry.start_micros <= last.end_micros {
+    // Folded into the accumulator rather than `Itertools::coalesce`: that hands
+    // the un-merged pair back through `Err((last, entry))`, and a pair of
+    // entries is a 224-byte Err variant on every non-merging step.
+    entries.into_iter().fold(Vec::new(), |mut merged: Vec<CoverageEntry>, entry| {
+        match merged.last_mut() {
+            Some(last) if last.generation == entry.generation && entry.start_micros <= last.end_micros => {
                 last.end_micros = last.end_micros.max(entry.end_micros);
                 // A merged range is only as trustworthy as its weakest part: one
                 // witness-less contributor makes the whole span unverifiable,
@@ -3600,12 +3602,11 @@ pub fn merge_coverage(mut entries: Vec<CoverageEntry>) -> Vec<CoverageEntry> {
                 last.files.extend(entry.files);
                 last.files.sort_unstable();
                 last.files.dedup();
-                Ok(last)
-            } else {
-                Err((last, entry))
             }
-        })
-        .collect()
+            _ => merged.push(entry),
+        }
+        merged
+    })
 }
 
 /// One `(cell -> entries)` row as it is persisted. Flat on purpose: a tuple key

@@ -3636,11 +3636,10 @@ const fn mix(mut x: u64) -> u64 {
 #[inline]
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut acc = SEED ^ (bytes.len() as u64);
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        acc = mix(acc ^ u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes")));
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        acc = mix(acc ^ u64::from_le_bytes(*chunk));
     }
-    let remainder = chunks.remainder();
     if !remainder.is_empty() {
         let mut tail = [0u8; 8];
         tail[..remainder.len()].copy_from_slice(remainder);
@@ -3751,9 +3750,7 @@ impl Hll {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
             [] => Ok(Self::default()),
-            [TAG_SPARSE, rest @ ..] if rest.len() % 8 == 0 => {
-                Ok(Self::Sparse(rest.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8)"))).collect()))
-            }
+            [TAG_SPARSE, rest @ ..] if rest.len() % 8 == 0 => Ok(Self::Sparse(rest.as_chunks::<8>().0.iter().copied().map(u64::from_le_bytes).collect())),
             [TAG_DENSE, rest @ ..] if rest.len() == M => {
                 Ok(Self::Dense(Box::new(rest.try_into().map_err(|_| "hll: dense payload is not M bytes".to_string())?)))
             }

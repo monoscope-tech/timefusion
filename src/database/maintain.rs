@@ -6394,7 +6394,7 @@ impl Database {
             .collect();
         // Newest first, so the cap drops the oldest — which is also the likeliest
         // to have been invalidated by a write already.
-        entries.sort_by(|a, b| b.granted_unix_ms.cmp(&a.granted_unix_ms));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.granted_unix_ms));
         entries.truncate(crate::storage::PERSIST_CAP);
         crate::storage::store_sidecar(&self.config.core.timefusion_data_dir, crate::storage::CERTIFICATIONS, &entries);
     }

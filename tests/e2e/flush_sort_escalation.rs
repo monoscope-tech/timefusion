@@ -83,7 +83,7 @@ async fn an_oversized_flush_group_is_sorted_by_the_spilling_path_not_skipped() -
         .map(|r| r.get::<_, String>(0))
         .collect();
     let mut expect: Vec<(i64, String)> = (0..N).map(|i| (((i * 17) % N), format!("e-{i:03}"))).collect();
-    expect.sort_by(|a, b| b.0.cmp(&a.0));
+    expect.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     assert_eq!(top, expect.iter().take(3).map(|(_, id)| id.clone()).collect::<Vec<_>>(), "declared order must match actual order");
 
     Ok(())
