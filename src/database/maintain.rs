@@ -4988,9 +4988,24 @@ impl Database {
                 // nothing else — and `enqueue_unverifiable_rebuilds` is already
                 // newest-first and bounded, so a recovery that finds thousands
                 // cannot flood the queue.
-                moved.extend(slices.iter().filter(|(_, coverage)| coverage.source_rows != Some(current_rows)).map(|(start, coverage)| {
-                    (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
-                }));
+                // SEALED DAYS ONLY — the qualifier this shipped without, and
+                // prod showed the cost within the hour: pending BaseRollup went
+                // 150 -> 1,112, drained to 107, then re-flooded to 995 while
+                // dedup stalled at 60 bins. A rebuild cannot make the witness
+                // agree on a day that is still ingesting, because the partition
+                // moves again before the next recovery pass looks — and
+                // `2026-08-25-rollup-witness-design.md` says so directly:
+                // "`moved` is the partition genuinely changing under a verifiable
+                // slice, which no amount of rebuilding fixes on a churning day."
+                // Its recommendation is "re-enqueue witness-MOVED slices ON
+                // SEALED DAYS ... a partition that is no longer live"; dropping
+                // that turned a one-time repair into a periodic work amplifier.
+                let sealed = date < chrono::Utc::now().date_naive().to_string();
+                if sealed {
+                    moved.extend(slices.iter().filter(|(_, coverage)| coverage.source_rows != Some(current_rows)).map(|(start, coverage)| {
+                        (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
+                    }));
+                }
                 continue;
             }
             let mut spans: Vec<(i64, i64)> = slices.iter().map(|(start, coverage)| (*start, coverage.covered_through)).collect();
@@ -10604,22 +10619,20 @@ mod rollup_noop_skip_tests {
         let stored = db.rollup_slice_coverage.get(&slice_key).and_then(|e| e.value().source_rows).expect("the restarted process must recover THIS slice");
         assert_eq!(stored, stamped, "coverage must keep the raw tag value; the carry is applied at comparison, not baked into the witness");
 
-        // And the arithmetic that carry then enables: a partition that lost
-        // `DROPPED` rows to a dedup still reconciles with a witness stamped
-        // before it. This is the whole point — without the carry the two differ
-        // by exactly `DROPPED` and the slice is refused `shrank`.
-        let live_after_dedup = stamped - DROPPED;
-        assert!(
-            crate::rollup::slice_coverage_agrees(
-                &[Some(stamped)],
-                Some(live_after_dedup + db.witness_carry.carried("otel_logs_and_spans", &project_id, &date.to_string()))
-            ),
-            "witness {stamped} must reconcile with a post-dedup partition of {live_after_dedup} once the carry is added back"
-        );
-        assert!(
-            !crate::rollup::slice_coverage_agrees(&[Some(stamped)], Some(live_after_dedup)),
-            "precondition: without the carry those same numbers must DISAGREE, or this proves nothing"
-        );
+        // WHAT THIS TEST DOES NOT COVER, stated rather than implied.
+        //
+        // It proves the carry is recorded, persisted, and reloaded by a new
+        // process, and that coverage keeps the raw tag value. It does NOT prove
+        // the production comparison consumes the carry: an earlier version
+        // asserted that by calling `slice_coverage_agrees` directly with
+        // `witness_carry.carried(...)`, which validated arithmetic written HERE
+        // rather than the comparison in `recover_date_coverage` — deleting the
+        // production carry left that assertion passing.
+        //
+        // Closing it needs a fixture where a REAL dedup drops rows, because the
+        // comparison only reconciles when the live count actually moved;
+        // calling `carry_dedup_witness` directly records a carry with no
+        // corresponding removal, which makes the numbers disagree by design.
         Ok(())
     }
 
