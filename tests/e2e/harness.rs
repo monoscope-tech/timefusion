@@ -22,10 +22,23 @@ use uuid::Uuid;
 /// MinIO release with atomic conditional PUT support. The testcontainers
 /// module's older default can overwrite racing Delta commits. Modern MinIO
 /// prints its readiness banner on stderr, hence the custom image below.
+/// MinIO's images come from quay.io, NOT Docker Hub.
+///
+/// `minio/minio:RELEASE.2025-09-07T16-13-09Z` 404s — MinIO stopped publishing
+/// that tag to Docker Hub, and testcontainers reports it as
+/// `pull access denied ... repository does not exist or may require docker login`,
+/// which reads like a credentials problem and is not one.
+///
+/// This was invisible for as long as it has been broken, because the harness
+/// resolves MinIO local-first: any developer with a `minio` binary on PATH never
+/// reaches the Docker fallback, and a locally-attested `e2e` makes CI SKIP the
+/// job. CI only ran it — and failed — once an attestation was absent.
+/// `ci/compose.yml` already pulls from quay.io; these two call sites did not.
+pub const MINIO_IMAGE: &str = "quay.io/minio/minio";
 pub const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 
 pub fn pinned_minio_image() -> GenericImage {
-    GenericImage::new("minio/minio", MINIO_TAG).with_wait_for(WaitFor::message_on_stderr("API:"))
+    GenericImage::new(MINIO_IMAGE, MINIO_TAG).with_wait_for(WaitFor::message_on_stderr("API:"))
 }
 
 pub const FROZEN_START_MICROS: i64 = 1_900_000_000_000_000; // ~2030-03-15
