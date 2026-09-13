@@ -1,8 +1,7 @@
 //! Durable, byte-bounded work units shared by background maintenance.
 //!
-//! Contains no scan implementation: work is journaled before it can be
-//! selected, and a worker only receives a unit whose decoded-byte reservation
-//! fits the configured ceiling.
+//! Work is journaled before it can be selected, and a worker only receives a
+//! unit whose decoded-byte reservation fits the configured ceiling.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -18,10 +17,9 @@ use crate::support::lock;
 
 pub const NORMAL_SLICE_MICROS: i64 = 10 * 60 * 1_000_000;
 pub const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
-/// Widths `coarsen_sealed_slices` fuses sealed units to, widest first. It takes
-/// the widest whose summed estimate fits `MAX_DECODED_BYTES`; below the finest,
-/// the mint width stands. Each divides the one above, so an aligned unit at any
-/// width sits inside exactly one bucket at every coarser width.
+/// Widths `coarsen_sealed_slices` fuses sealed units to, widest first. Each
+/// divides the one above, so an aligned unit at any width sits inside exactly
+/// one bucket at every coarser width.
 pub const COARSEN_WIDTHS: [i64; 3] = [DAY_MICROS, 6 * 60 * 60 * 1_000_000, 60 * 60 * 1_000_000];
 /// What one `coarsen_sealed_slices` pass actually did, per stage.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,8 +34,7 @@ pub struct CoarsenReport {
     pub blocked: usize,
     /// Candidates in a group whose priced estimate exceeded MAX_DECODED_BYTES.
     pub over_budget: usize,
-    /// Buckets that fit ONLY because members sharing a file set were charged
-    /// once.
+    /// Buckets that fit ONLY because members sharing a file set were charged once.
     pub priced_by_footprint: usize,
 }
 
@@ -48,27 +45,22 @@ impl CoarsenReport {
 }
 
 /// Is this operation fully re-derivable from a storage scan, and therefore not
-/// worth persisting? `plan_compaction_debt` re-mints these from the file list
-/// every 60s, so a durable record can only go stale and disagree.
-///
-/// Repair is deliberately NOT here: its units stage output before committing,
-/// so the durable record is what `TIMEFUSION_REPAIR_RESUME_ENABLED` resumes
-/// against.
+/// worth persisting? Repair is deliberately NOT here: its units stage output
+/// before committing, so the durable record is what a resume works against.
 pub const fn is_derived_operation(operation: Operation) -> bool {
     matches!(operation, Operation::HotPacking | Operation::SealedConsolidation)
 }
 
 /// Widths a unit can be SUBSUMED at, finest first — the mint width plus every
-/// fusion width. Each divides the next, so an aligned unit at any of them sits
-/// wholly inside one bucket of every coarser one.
+/// fusion width. Each divides the next.
 pub const SUBSUME_WIDTHS: [i64; 4] = [NORMAL_SLICE_MICROS, 60 * 60 * 1_000_000, 6 * 60 * 60 * 1_000_000, DAY_MICROS];
 pub const MIN_SLICE_MICROS: i64 = 60 * 1_000_000;
 pub const DERIVED_SLICE_MICROS: i64 = 60 * 60 * 1_000_000;
 pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Frontier lag above which `claim_next` stops reserving a share for sealed
-/// work. One `NORMAL_SLICE_MICROS`: a frontier a whole slice behind is not
-/// keeping up, and hybrid queries pay for it through `raw_tail_duration_secs`.
+/// work. One `NORMAL_SLICE_MICROS` — a frontier a whole slice behind is not
+/// keeping up.
 pub const FRONTIER_LAG_BUDGET_SECS: u64 = 600;
 
 /// The longest per-unit idle window any operation gets. `COORDINATOR_LOOP_TIMEOUT`
@@ -77,10 +69,8 @@ pub const MAX_OPERATION_DEADLINE_SECS: u64 = operation_deadline_secs(Operation::
 
 /// Per-operation IDLE window (fires only after this long with no rows written);
 /// also bounds retry backoff so oversized units cannot monopolize a worker.
-///
-/// Repair gets an hour because `ORDER BY` is blocking: a repair unit emits its
-/// first row only after the whole input is downloaded, decoded and spilled,
-/// which on the largest files exceeds 15 minutes on its own.
+/// Repair gets an hour because its blocking `ORDER BY` emits no row until the
+/// whole input is downloaded, decoded and spilled.
 pub const fn operation_deadline_secs(operation: Operation) -> u64 {
     match operation {
         Operation::Dedup => 15 * 60,
@@ -90,22 +80,16 @@ pub const fn operation_deadline_secs(operation: Operation) -> u64 {
 }
 
 /// Whether a failure means "this did not fit" rather than "this went wrong".
-///
-/// Matched on the message, not the type: these errors originate in DataFusion
-/// and arrive type-erased across the delta-rs and `anyhow` boundaries. The
-/// strings are pinned by `capacity_failures_are_recognised_from_prod_text`.
+/// Matched on the message, not the type: these errors arrive type-erased across
+/// the delta-rs and `anyhow` boundaries.
 pub fn is_capacity_failure(message: &str) -> bool {
-    // "resource_admission" counts: the unit's estimate exceeds what admission
-    // can ever grant, so it fails identically every pass.
     message.contains("Resources exhausted") || message.contains("Not enough memory to continue external sort") || message.contains("resource_admission")
 }
 
 /// Whether a failure is a DETERMINISTIC PLAN error — the SQL could not be built
 /// at all, so every retry and every CHILD of a bisection fails identically.
-/// Opposite verdict to [`is_capacity_failure`]: shrinking the slice cannot make
-/// a missing column appear, only multiply the units failing on it. Same
-/// string-matching contract, pinned by
-/// `schema_failures_are_recognised_from_prod_text`.
+/// Opposite verdict to [`is_capacity_failure`]: splitting cannot help, only
+/// multiply the units failing.
 pub fn is_schema_failure(message: &str) -> bool {
     message.contains("Schema error") || message.contains("SchemaError") || message.contains("No field named")
 }
@@ -113,14 +97,10 @@ pub const FINALIZATION_DELAY_MICROS: i64 = 15 * 60 * 1_000_000;
 pub const INVALIDATION_DEADLINE_BUCKET_MICROS: i64 = 30 * 1_000_000;
 pub const LIVE_FRONTIER_WINDOW_MICROS: i64 = DAY_MICROS;
 const PRIORITY_BUCKET_MICROS: i64 = 60 * 1_000_000;
-/// File-count band for hygiene benefit ranking — see `scheduling_class`.
-///
-/// Coarse ON PURPOSE: `claim_next` matches the winning rank tuple EXACTLY, so a
-/// continuous key would make one cell the sole winner of every claim and defeat
-/// the per-project rotation in `fair_cursors`. It must still be fine enough to
-/// separate the cells that exist; 32 keeps large cells tied (see
-/// `sealed_hygiene_ranks_by_files_removed_not_by_date`) while separating a
-/// median cell from a nearly-empty one.
+/// File-count band for hygiene benefit ranking. Coarse ON PURPOSE: `claim_next`
+/// matches the winning rank tuple EXACTLY, so a continuous key would make one
+/// cell the sole winner of every claim and defeat the per-project rotation in
+/// `fair_cursors`.
 const BENEFIT_BUCKET_FILES: u32 = 32;
 pub const TAG_SOURCE: &str = "timefusion.source";
 pub const TAG_PROJECT: &str = "timefusion.project";
@@ -132,20 +112,16 @@ pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
 /// paths alone, it sees a deletion vector superseding an `Add` under the same
 /// path. Absent on older cells, which declines the skip.
 pub const TAG_CONTENT_FINGERPRINT: &str = "timefusion.content_fingerprint";
-/// How many rows the SOURCE DATE PARTITION held when this slice was built —
-/// the `num_records` sum, as `partition_stats_bounded` computes it. Read
-/// coverage is refused unless every slice covering a date still agrees with the
-/// partition's present count (`rollup::slice_coverage_agrees`). A row count, not
-/// a fingerprint: fingerprints fold file identity and bin-packing would void
-/// them; row counts survive compaction.
+/// How many rows the SOURCE DATE PARTITION held when this slice was built.
+/// Read coverage is refused unless every slice covering a date still agrees
+/// with the partition's present count. A row count, not a fingerprint, because
+/// row counts survive compaction.
 pub const TAG_SOURCE_ROWS: &str = "timefusion.source_rows";
 pub const TAG_GENERATION: &str = "timefusion.generation";
 /// Which declared measures this slice's files actually MATERIALIZED, comma
-/// separated — NOT what the spec declares, and the generation does not imply
-/// it. A measure added after a slice was written null-fills on scan and merges
-/// silently skip the nulls, yielding a plausible wrong number rather than NULL,
-/// so the read path refuses a cell that cannot prove the measure a query needs
-/// (`RoutedRollup::measures_available`).
+/// separated — NOT what the spec declares. A measure added after a slice was
+/// written null-fills on scan and merges skip the nulls, so the read path
+/// refuses a cell that cannot prove the measure a query needs.
 pub const TAG_MEASURES: &str = "timefusion.measures";
 const JOURNAL_VERSION: u32 = 1;
 const JOURNAL_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -162,14 +138,11 @@ pub enum Operation {
     Repair,
 }
 
-/// The operation mix a maintenance worker rotates through. Shared by the server
-/// loop (`run_coordinator_maintenance_once`) and the journal-replay simulator
-/// (`maintenance_sim`) so the two cannot drift apart.
-///
+/// The operation mix a maintenance worker rotates through, shared by the server
+/// loop and the journal-replay simulator so the two cannot drift apart.
 /// BALANCED interleaves dependent publication with dedup; COVERAGE_SHORT gives
-/// the rollup chain the slots while `rollup_median_contiguous_days` is below
-/// goal. Every operation keeps at least one slot — file debt left at zero lets
-/// file counts run away and degrades every query.
+/// the rollup chain the slots while contiguity is below goal. Every operation
+/// must keep at least one slot.
 pub const CYCLE_BALANCED: [Operation; 10] = [
     Operation::Dedup,
     Operation::BaseRollup,
@@ -215,8 +188,7 @@ impl TimeSlice {
         self.end_micros - self.start_micros
     }
 
-    /// Half-open intersection. Shared by the two rollup call sites (which base
-    /// TASKS cover a derived slice, which base FILES it must read) so they agree.
+    /// Half-open intersection.
     pub const fn overlaps(self, start_micros: i64, end_micros: i64) -> bool {
         end_micros > self.start_micros && start_micros < self.end_micros
     }
@@ -268,38 +240,28 @@ pub struct MaintenanceTask {
     #[serde(default)]
     pub publication: Option<Publication>,
     /// The base tier this derived unit aggregates is ALREADY PRESENT, proven
-    /// from real rollup coverage by `plan_rollup_backfill`. `dependencies_complete`
-    /// otherwise requires COMPLETE `BaseRollup` TASKS covering the slice, which a
-    /// historical day built long ago no longer has — leaving the unit unclaimable
-    /// forever. Only ever set from positive coverage evidence, which is why it
-    /// overrides rather than supplements the journal.
+    /// from real rollup coverage. Only ever set from positive coverage evidence,
+    /// which is why it overrides rather than supplements the journal's
+    /// requirement of COMPLETE `BaseRollup` tasks (which a historical day no
+    /// longer has, leaving the unit unclaimable forever).
     #[serde(default)]
     pub base_tier_present: bool,
-    /// What this unit's slice actually READS, measured when its estimate was
-    /// taken. `default` so older journals deserialize as `None`.
+    /// What this unit's slice actually READS, measured when its estimate was taken.
     #[serde(default)]
     pub input: Option<InputFootprint>,
     /// What the parent MEASURED when it split into this unit, so the next
     /// preflight can tell whether halving the width actually bought anything.
-    ///
-    /// Children are priced by TIME SHARE — a model, so a split always "fits" on
-    /// paper — but true cost has a floor (a slice reads at least one row group of
-    /// every file it overlaps), and without this feedback a lineage bisects all
-    /// the way to `MIN_SLICE_MICROS`. The loop only closes because a split
-    /// descends ONE level per call, so every level gets measured.
+    /// Children are priced by TIME SHARE, so a split always "fits" on paper;
+    /// without this feedback a lineage bisects all the way to `MIN_SLICE_MICROS`.
     #[serde(default)]
     pub parent_measured_bytes: Option<u64>,
     /// Byte estimate from this claim's input preflight, before time-share modelling.
-    /// Older journals have no observation; a timeout itself supplies none.
     #[serde(default)]
     pub preflight_decoded_bytes: Option<u64>,
     /// Scheduling weight inherited from the backfill unit this task was split
-    /// out of. `None` means "weigh me by my own width".
-    ///
-    /// Sealed ordering ranks wide units first because width proxies BACKFILL
-    /// PROVENANCE — only backfill units advance the coverage horizon. Splitting
-    /// breaks that proxy, so children carry the parent's weight instead of their
-    /// own narrow width. `default` so older journals deserialize as `None`.
+    /// out of; `None` means "weigh me by my own width". Sealed ordering ranks
+    /// wide units first because width proxies backfill provenance, and splitting
+    /// would otherwise break that proxy.
     #[serde(default)]
     pub backfill_priority_micros: Option<i64>,
 }
@@ -310,8 +272,7 @@ impl MaintenanceTask {
         self.backfill_priority_micros.unwrap_or_else(|| self.key.slice.width())
     }
 
-    /// A freshly minted Pending unit with no history — the base every minting
-    /// site extends via struct update.
+    /// A freshly minted Pending unit with no history.
     fn pending(key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64) -> Self {
         Self {
             key,
@@ -334,13 +295,10 @@ impl MaintenanceTask {
 }
 
 /// The file set behind a unit's byte estimate, so a fusion group can be priced
-/// by DISTINCT file set instead of by summing prorated members.
-///
-/// Prorating is right for ONE unit and wrong the moment `coarsen_to_width` sums
-/// siblings: pruning is row-group granular, so every slice is floored at one row
-/// group of each file it overlaps and N children of a day each carry nearly the
-/// whole day. Children reading the same files are one scan; children reading
-/// different files still sum. Partial overlap counts twice — the safe direction.
+/// by DISTINCT file set instead of by summing prorated members. Prorating is
+/// right for ONE unit and wrong the moment `coarsen_to_width` sums siblings:
+/// pruning is row-group granular, so children reading the same files are one
+/// scan. Partial overlap counts twice — the safe direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct InputFootprint {
     /// Hash of the live file paths the slice overlaps.
@@ -348,15 +306,14 @@ pub struct InputFootprint {
     /// Decoded, projected bytes of that whole set — one scan, unprorated.
     pub whole_file_bytes: u64,
     /// How many files. For file hygiene this IS the benefit: a consolidation
-    /// removes them and leaves one. `default` so older journals deserialize,
-    /// reporting zero benefit — which orders them last rather than wrongly.
+    /// removes them and leaves one. Zero means "unknown", which orders last.
     #[serde(default)]
     pub files: u32,
 }
 
 impl InputFootprint {
-    /// Fingerprint a selected file set. Order-independent (a snapshot's file
-    /// order is not stable), so two units over the same files agree.
+    /// Fingerprint a selected file set. Order-independent, since a snapshot's
+    /// file order is not stable.
     ///
     /// FROZEN HASH: persisted in the task journal, so changing it makes every
     /// in-flight unit's footprint stop matching its own journal entry.
@@ -377,19 +334,15 @@ pub struct Publication {
     pub generation: String,
     pub rows: u64,
     /// The source DATE partition's `num_records` sum when this slice was built,
-    /// mirroring [`TAG_SOURCE_ROWS`]. `default` so older journals deserialize as
-    /// `None`; the read path cannot verify those, so they read raw until the
-    /// coordinator republishes.
+    /// mirroring [`TAG_SOURCE_ROWS`]. `None` cannot be verified by the read
+    /// path, so such slices read raw until the coordinator republishes.
     #[serde(default)]
     pub source_rows: Option<u64>,
 }
 
 /// What one fusion bucket would cost to scan, accumulated member by member.
-///
 /// Members naming the same [`InputFootprint`] are charged ONCE — they re-read
-/// the same row groups. Members with no footprint keep the summed price. The
-/// result is what the fused unit will actually READ, which may be HIGHER than
-/// the sum when prorated members understated a shared file set.
+/// the same row groups; members with no footprint keep the summed price.
 #[derive(Default)]
 struct GroupPrice {
     /// Distinct footprints, each charged its unprorated whole-file cost.
@@ -402,10 +355,10 @@ struct GroupPrice {
     summed_bytes: u64,
     /// How many units this bucket holds, which is what `over_budget` reports.
     members: usize,
-    /// The OLDEST member's creation time, because the fused unit inherits its
-    /// members' work and must inherit their age with it. `Option`, not a bare
-    /// `u64`: a `Default` of 0 would min-fold to the epoch and make every fused
-    /// unit permanently the oldest thing in the queue.
+    /// The OLDEST member's creation time; the fused unit inherits its members'
+    /// work and must inherit their age with it. `Option`, not a bare `u64`: a
+    /// `Default` of 0 would min-fold to the epoch and make every fused unit
+    /// permanently the oldest thing in the queue.
     oldest: Option<u64>,
 }
 
@@ -446,35 +399,28 @@ impl GroupPrice {
 
 /// A child must shed at least this much of what its parent measured for the
 /// next bisection to be worth minting units for. Bisection halves the WIDTH, so
-/// the model expects ~50%; anything above this is the row-group floor, not a
-/// slice that is genuinely too wide.
+/// the model expects ~50%; anything above this is the row-group floor.
 const SPLIT_MUST_SHED_NUMERATOR: u64 = 3;
 const SPLIT_MUST_SHED_DENOMINATOR: u64 = 4;
 
-/// Whether halving the width bought enough to justify halving it again.
-///
-/// `None` — no parent evidence — always splits: nothing to compare against yet.
-///
-/// Two-sided on purpose: a child preflight LARGER than its parent also splits,
-/// so a grown input or a synthetic parent estimate can establish a new baseline.
+/// Whether halving the width bought enough to justify halving it again. `None`
+/// (no parent evidence) always splits. Two-sided on purpose: a child preflight
+/// LARGER than its parent also splits, establishing a new baseline.
 fn split_sheds_enough(parent_measured_bytes: Option<u64>, observed_bytes: u64) -> bool {
     split_sheds_enough_at(parent_measured_bytes, observed_bytes, SPLIT_MUST_SHED_NUMERATOR, SPLIT_MUST_SHED_DENOMINATOR)
 }
 
 /// The shed test at an arbitrary ratio, so the simulator's threshold sweep runs
-/// THIS function rather than a drift-prone copy of it.
+/// this function rather than a copy of it.
 pub fn split_sheds_enough_at(parent_measured_bytes: Option<u64>, observed_bytes: u64, numerator: u64, denominator: u64) -> bool {
     let Some(parent) = parent_measured_bytes else { return true };
     observed_bytes > parent || observed_bytes.saturating_mul(denominator) < parent.saturating_mul(numerator)
 }
 
-/// Split a unit that does not fit, **one level per call**.  A one-minute whale
-/// is divided by a stable hash of the complete dedup key; callers must apply
-/// `hash(key) % hash_shards == hash_shard` before deduplication.
-///
-/// One level, not a subtree: levels below the first are priced by TIME SHARE,
-/// which is a model. Halving once and re-measuring is what lets
-/// `split_sheds_enough` — a between-call test — observe every width.
+/// Split a unit that does not fit, **one level per call**. A unit already at the
+/// bisection floor is divided by a stable hash of the complete dedup key;
+/// callers must apply `hash(key) % hash_shards == hash_shard` before
+/// deduplication. One level, not a subtree, so every width gets re-measured.
 pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u64) -> Vec<MaintenanceTask> {
     if observed_or_estimated_bytes <= MAX_DECODED_BYTES {
         return vec![MaintenanceTask { estimated_decoded_bytes: observed_or_estimated_bytes, ..task.clone() }];
@@ -492,10 +438,8 @@ pub fn byte_bounded_units(task: &MaintenanceTask, observed_or_estimated_bytes: u
 /// Bisect time independently of whether a byte estimate exceeds the budget.
 fn bisect_time_unit(task: &MaintenanceTask, observed_or_estimated_bytes: u64) -> Option<[MaintenanceTask; 2]> {
     // Bisection stops at the width where a slice stops shedding FILES. A dedup
-    // unit's cost is its whole PARTITION (`dedup_probe_ctx` scans every file of
-    // the (project, date) then filters by slice), so halving time below a slice
-    // sheds nothing; below the floor, shard by KEY instead. Repair declines to
-    // bisect at all for the same reason — its cost is a file.
+    // unit's cost is its whole PARTITION, so halving time below a slice sheds
+    // nothing; below the floor, shard by KEY instead.
     let bisect_floor = if task.key.operation == Operation::Dedup { NORMAL_SLICE_MICROS } else { MIN_SLICE_MICROS };
     let (start, end, width) = (task.key.slice.start_micros, task.key.slice.end_micros, task.key.slice.width());
     let midpoint = (start.saturating_add(width / 2) / MIN_SLICE_MICROS) * MIN_SLICE_MICROS;
@@ -532,15 +476,12 @@ enum JournalRecord {
         delta_version: u64,
     },
     /// This task no longer exists. Without a tombstone the WAL is upsert-only,
-    /// so a removal would persist only by rewriting the whole snapshot and would
-    /// otherwise be undone by the next restart. `retain_tasks` records these for
-    /// every caller.
+    /// so a removal would be undone by the next restart.
     Removed(TaskKey),
 }
 
-/// Crash-safe task journal. `checkpoint` uses the same fsync + atomic rename
-/// primitive as WAL metadata; a failed completion checkpoint therefore causes
-/// redundant work, never missing work.
+/// Crash-safe task journal. `checkpoint` uses fsync + atomic rename, so a failed
+/// completion checkpoint causes redundant work, never missing work.
 #[derive(Debug)]
 pub struct TaskJournal {
     path: PathBuf,
@@ -554,31 +495,27 @@ pub struct TaskJournal {
     removed_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
     /// When the gauges were last recomputed, so `checkpoint` does not rescan the
-    /// whole task list on every claim and completion — see
-    /// [`TaskJournal::publish_statistics_throttled`].
+    /// whole task list on every claim and completion.
     stats_published_at: Option<std::time::Instant>,
     fair_cursors: HashMap<Operation, String>,
     /// `(source, project_id, date)` whose BASE tier is already built, read from
-    /// real rollup coverage by `plan_rollup_backfill` every 60s.
-    /// `dependencies_complete` consults this instead of requiring COMPLETE
-    /// `BaseRollup` TASKS, which a historical day does not have. Keyed by DAY so
-    /// it cannot miss a task whatever slice that task covers. Runtime only,
-    /// never journalled — a restart costs one planner pass.
+    /// real rollup coverage. `dependencies_complete` consults this instead of
+    /// requiring COMPLETE `BaseRollup` TASKS, which a historical day does not
+    /// have. Keyed by DAY so it cannot miss a task whatever slice it covers.
+    /// Runtime only, never journalled — a restart costs one planner pass.
     base_tier_ready: HashSet<(String, String, String)>,
-    /// `(source, project_id, physical_table, date)` where the tier is MISSING,
-    /// from the same coverage read. `scheduling_class` ranks a hole ahead of a
-    /// re-derive; otherwise sealed rollup work is strictly newest-first and the
-    /// claim never walks back far enough to reach an old hole, which 30d
-    /// contiguity needs. Runtime only, same as `base_tier_ready`.
+    /// `(source, project_id, physical_table, date)` where the tier is MISSING.
+    /// `scheduling_class` ranks a hole ahead of a re-derive; otherwise sealed
+    /// rollup work is strictly newest-first and the claim never walks back far
+    /// enough to reach an old hole. Runtime only.
     tier_holes: HashSet<(String, String, String, String)>,
     /// `(source, project, tier table, date)` for partitions still holding tier
-    /// files with NO identity tags — ranked exactly like `tier_holes`, because
-    /// such a file cannot be certified or retired until something republishes
-    /// the partition. Kept separate because the two are published by different
+    /// files with NO identity tags — ranked like `tier_holes`, because such a
+    /// file cannot be certified or retired until something republishes the
+    /// partition. Kept separate because the two are published by different
     /// passes and a wholesale replace by either would erase the other's evidence.
     untagged_cells: HashSet<(String, String, String, String)>,
-    /// Rotates so a fixed share of claims is reserved for sealed work. Runtime
-    /// only — never journalled.
+    /// Rotates so a fixed share of claims is reserved for sealed work. Runtime only.
     claim_tick: u64,
     /// Last observed `eligible_watermark_lag_seconds`; read by `claim_next` to
     /// decide whether the sealed reservation can still be afforded. Atomic
@@ -586,8 +523,8 @@ pub struct TaskJournal {
     frontier_lag_secs: std::sync::atomic::AtomicU64,
     /// Boundary micros of COMPLETED Dedup slices, per project then source, so
     /// `rank` can prefer the pending slice that EXTENDS a completed run.
-    /// Runtime only — rebuilt at load, maintained by `note_dedup_edges`. Nested
-    /// maps (not a tuple key) so the lookup in `rank` borrows `&str`.
+    /// Runtime only. Nested maps (not a tuple key) so the lookup in `rank`
+    /// borrows `&str`.
     dedup_complete_edges: HashMap<String, HashMap<String, HashSet<i64>>>,
 }
 
@@ -601,8 +538,7 @@ pub struct TaskLease {
     /// Why the unit is about to fail, when the failing path knows. Errors leave
     /// a run function through `?` and reach [`Drop`] carrying nothing, so
     /// without this `abandon_running` would treat a deterministic plan error
-    /// like a timeout and bisect it. Mutex, not `RefCell`, so the lease stays
-    /// `Send` across the run functions' awaits.
+    /// like a timeout and bisect it. Mutex, not `RefCell`, to stay `Send`.
     failure: Mutex<Option<String>>,
 }
 
@@ -621,18 +557,16 @@ impl TaskLease {
 impl Drop for TaskLease {
     fn drop(&mut self) {
         let mut journal = lock(&self.journal);
-        // The ONLY place a unit's end is observable on every path — emitted from
-        // the RAII lease rather than `complete()` so no early return can skip
-        // it. The state read here IS the outcome: `Running` means the unit died
-        // without recording anything and is abandoned below.
+        // Emitted from the RAII lease rather than `complete()` so no early
+        // return can skip it. `Running` here means the unit died without
+        // recording anything and is abandoned below.
         let outcome = journal.state(&self.key);
         let ran_micros = crate::support::now_micros().saturating_sub(self.started_micros);
         tracing::info!(
             operation = ?self.key.operation, table = %self.key.physical_table, project_id = %self.key.project_id,
             slice_start = self.key.slice.start_micros, slice_end = self.key.slice.end_micros,
             outcome = ?outcome, ran_secs = ran_micros / 1_000_000,
-            // What the unit READ, not what it changed — "completed" here does
-            // not mean "did something".
+            // What the unit READ, not what it changed.
             input_files = journal.input_files(&self.key),
             event = "maintenance_task_finished"
         );
@@ -656,22 +590,18 @@ pub struct Invalidation<'a> {
     pub observed_at_micros: i64,
     pub derived: bool,
     /// False ONLY when every commit behind this invalidation is a self-authored
-    /// DV-dedup wave (tagged `DV_DEDUP_COMMIT_KEY`): such a commit adds no rows,
-    /// so re-minting Dedup from it would upsert already-Complete slices back to
-    /// Pending forever. Every other caller passes true — fail toward minting.
+    /// DV-dedup wave: such a commit adds no rows, so re-minting Dedup from it
+    /// would upsert already-Complete slices back to Pending forever. Every other
+    /// caller passes true — fail toward minting.
     pub mint_dedup: bool,
-    /// False on the SAME condition as `mint_dedup=false`. A DV-dedup wave masks
-    /// losers in place, so neither identity the read path gates rollup coverage
-    /// on can move, and a rebuild would produce byte-identical aggregates (the
-    /// base build already dedups on the same keys). Every other caller passes
-    /// true — fail toward minting.
+    /// False on the SAME condition as `mint_dedup=false`: a DV-dedup wave masks
+    /// losers in place, so a rebuild would produce byte-identical aggregates.
     pub mint_rollup: bool,
 }
 
 /// Insert or replace a task by key, keeping `indices` in step with `tasks`.
-///
-/// A free function so WAL replay in [`TaskJournal::load`] — which runs before
-/// there is a `Self` — shares the one definition with every other insert site.
+/// A free function so WAL replay in [`TaskJournal::load`], which runs before
+/// there is a `Self`, shares one definition with every other insert site.
 fn insert_task(tasks: &mut Vec<MaintenanceTask>, indices: &mut HashMap<TaskKey, usize>, task: MaintenanceTask) {
     match indices.get(&task.key).copied() {
         Some(index) => tasks[index] = task,
@@ -688,18 +618,15 @@ impl TaskJournal {
     const BOOTSTRAP_BACKLOG_LIMIT: usize = 100_000;
     const COARSE_BACKFILL_MIGRATION: &'static str = "__maintenance_coarse_backfill_v2";
     const STALE_ESTIMATE_MIGRATION: &'static str = "__maintenance_stale_estimate_v2";
-    /// Bump to re-run the orphaned-coverage repair after a FUTURE spec edit. The
+    /// Bump to re-run the orphaned-coverage repair after a future spec edit. The
     /// cursor is persisted BEFORE the caller does the work so a crash cannot
-    /// loop; a pass that claims and then fails to enqueue burns the one-shot,
-    /// and bumping is the intended recovery (re-enqueueing is idempotent).
+    /// loop; bumping is the intended recovery, since re-enqueueing is idempotent.
     const ORPHAN_REPAIR_MIGRATION: &'static str = "__maintenance_orphan_repair_v2";
 
-    /// Re-enqueue of a measured list of damaged (project, date) cells. Unlike
-    /// `ORPHAN_REPAIR_MIGRATION` it is a list, not a date window, and its cursor
-    /// counts a CONSUMED PREFIX — a one-shot cursor would force the whole list
-    /// into one planner pass, where `BACKFILL_PARTITIONS_PER_PASS` truncates it
-    /// and drops the tail permanently (a cell that HAS tier output can never
-    /// re-enter `missing_tiers`).
+    /// Re-enqueue of a measured list of damaged (project, date) cells. Its
+    /// cursor counts a CONSUMED PREFIX — a one-shot cursor would force the whole
+    /// list into one planner pass, which truncates it and drops the tail
+    /// permanently.
     pub const DAMAGE_REPAIR_MIGRATION: &'static str = "__maintenance_damage_repair_v2";
     /// See [`TaskJournal::reset_repair_attempts`].
     const REPAIR_SINGLE_PASS_MIGRATION: &'static str = "__maintenance_repair_single_pass_v1";
@@ -725,9 +652,8 @@ impl TaskJournal {
                     JournalRecord::SourceCursor { source, delta_version } => {
                         snapshot.source_cursors.entry(source).and_modify(|cursor| *cursor = (*cursor).max(delta_version)).or_insert(delta_version);
                     }
-                    // `swap_remove` keeps this O(1); the entry swapped into the
-                    // hole needs its index corrected. Snapshot ORDER carries no
-                    // meaning — every consumer sorts or filters.
+                    // `swap_remove` keeps this O(1); snapshot ORDER carries no
+                    // meaning, since every consumer sorts or filters.
                     JournalRecord::Removed(key) => {
                         if let Some(index) = task_indices.remove(&key) {
                             snapshot.tasks.swap_remove(index);
@@ -772,9 +698,7 @@ impl TaskJournal {
     }
 
     /// Run a one-shot migration whose cursor is unspent, consuming the cursor
-    /// only after `migrate` has run. `None` from `migrate` leaves it UNSPENT —
-    /// see [`Self::reset_repair_attempts`], which must not burn the one-shot on
-    /// a boot that merely preceded the queue it exists to forgive.
+    /// only after `migrate` has run. `None` from `migrate` leaves it UNSPENT.
     fn run_once(&mut self, marker: &str, migrate: impl FnOnce(&mut Self) -> Option<usize>) -> Option<usize> {
         if self.migration_done(marker) {
             return None;
@@ -796,7 +720,6 @@ impl TaskJournal {
     /// once at load; `note_dedup_edges` maintains it incrementally after that.
     fn rebuild_dedup_edges(&mut self) {
         self.dedup_complete_edges.clear();
-        // Disjoint field borrows, so no per-key clone of the whole snapshot.
         let edges = &mut self.dedup_complete_edges;
         self.snapshot
             .tasks
@@ -819,10 +742,8 @@ impl TaskJournal {
         edges.extend([key.slice.start_micros, key.slice.end_micros]);
     }
 
-    /// Early coordinator builds journaled the one-hour tier in ten-minute
-    /// units. Supersede those unpublished fragments and replace them with one
-    /// aligned hour task; completed tagged publications remain available for
-    /// metadata recovery and are not rewritten by this migration.
+    /// Supersede unpublished sub-hour `DerivedRollup` fragments and replace them
+    /// with one aligned hour task. Completed publications are not rewritten.
     pub fn migrate_derived_slices(&mut self) -> usize {
         let mut replacements: HashMap<TaskKey, (i64, u64, u64)> = HashMap::new();
         let dirty = &mut self.dirty_tasks;
@@ -831,13 +752,11 @@ impl TaskJournal {
             // hour erases the bisection ladder and re-enqueues the parent key,
             // which `enqueue_inner` resurrects to Pending — an endless loop.
             // `parent_measured_bytes` is set only by `split_time_task`, so it is
-            // the exact discriminator. Recombining children is
-            // `coarsen_to_width`'s job, since it prices the fusion.
+            // the exact discriminator.
             //
             // NARROWER than an hour, not merely "not an hour": the replacement
             // key below is the single hour containing the slice START, so `!=`
-            // would collapse a day-wide unit to hour 00 and silently drop the
-            // other 23.
+            // would collapse a day-wide unit to hour 00 and drop the other 23.
             task.key.operation == Operation::DerivedRollup
                 && task.key.slice.width() < DERIVED_SLICE_MICROS
                 && task.parent_measured_bytes.is_none()
@@ -866,9 +785,8 @@ impl TaskJournal {
     }
 
     /// Remove the one-time global backlog produced by the original cursor
-    /// bootstrap. Keeping completed publications preserves recoverable coverage;
-    /// dropping unfinished entries is correctness-safe because those slices stay
-    /// uncovered and reads fall back to raw data until a planner re-enqueues.
+    /// bootstrap. Dropping unfinished entries is correctness-safe: those slices
+    /// stay uncovered and reads fall back to raw data until a planner re-enqueues.
     pub fn migrate_bootstrap_backlog(&mut self) -> Option<usize> {
         self.migrate_bootstrap_backlog_with_limit(Self::BOOTSTRAP_BACKLOG_LIMIT)
     }
@@ -879,12 +797,9 @@ impl TaskJournal {
         })
     }
 
-    /// One-shot: forget every stored byte estimate, because estimates written by
-    /// older code counted whole files and can never fuse under `coarsen_to_width`.
-    ///
-    /// Zero is what a freshly minted unit carries: the claim-time preflight
-    /// computes the real estimate and splits if it must, so the worst case is one
-    /// over-sized claim that immediately right-sizes itself.
+    /// One-shot: forget every stored byte estimate. Zero is what a freshly
+    /// minted unit carries — the claim-time preflight computes the real estimate
+    /// and splits if it must.
     pub fn clear_stale_estimates(&mut self) -> Option<usize> {
         self.run_once(Self::STALE_ESTIMATE_MIGRATION, |journal| {
             let cleared =
@@ -894,12 +809,9 @@ impl TaskJournal {
         })
     }
 
-    /// One-shot: forget the attempt history of every Repair unit, which was
-    /// accumulated under a rewrite implementation that no longer exists.
-    /// `attempts >= 2` QUARANTINES a unit and floors its retry backoff at
-    /// `operation_deadline_secs` (an hour for Repair), so stale history alone
-    /// would stall the queue for a week. The deadline is cleared for the same
-    /// reason; zero is what a freshly minted unit carries.
+    /// One-shot: forget the attempt history of every Repair unit. `attempts >= 2`
+    /// QUARANTINES a unit and floors its retry backoff at an hour, so stale
+    /// history alone would stall the queue for a week.
     pub fn reset_repair_attempts(&mut self) -> Option<usize> {
         self.run_once(Self::REPAIR_SINGLE_PASS_MIGRATION, |journal| {
             let reset = journal.edit_tasks(
@@ -919,21 +831,12 @@ impl TaskJournal {
         })
     }
 
-    /// Drop queued work for a rollup tier that is no longer DECLARED.
+    /// Drop queued work for a rollup tier that is no longer DECLARED — otherwise
+    /// tasks queued against a removed or renamed spec stay claimable forever.
     ///
-    /// Removing a spec from the schema does not remove the tasks already queued
-    /// against it, and those stay claimable forever, doing nothing each claim.
-    /// Every tier rename (`_v2` -> `_v3`) leaves the same residue.
-    ///
-    /// Conservative on purpose, because the cost of a false positive is deleting
-    /// live work:
-    ///
-    ///   * only rollup-target names — a table that is not `{source}_rollup_*`
-    ///     is never a tier and is never considered;
-    ///   * only non-Complete tasks, so history is untouched;
-    ///   * and NOTHING happens when `declared` is empty, which is what an
-    ///     unloaded registry looks like. Without that guard a startup ordering
-    ///     change would silently retire the entire queue.
+    /// Conservative on purpose, since a false positive deletes live work: only
+    /// `_rollup_` table names, only non-Complete tasks, and NOTHING at all when
+    /// `declared` is empty (an unloaded registry must not retire the queue).
     pub fn retire_undeclared_tiers(&mut self, declared: &HashSet<String>) -> usize {
         if declared.is_empty() {
             return 0;
@@ -944,20 +847,15 @@ impl TaskJournal {
     }
 
     /// How much of `migration`'s ordered repair list `source` has CONSUMED.
-    ///
-    /// The durable form of a one-shot repair: a claim-once cursor gives the
-    /// caller exactly one bounded planner pass and silently loses the tail of a
-    /// longer list, while a prefix index survives restarts and lets every pass
-    /// force only what it can fit. See [`Self::DAMAGE_REPAIR_MIGRATION`].
+    /// A prefix index survives restarts and lets every pass force only what it
+    /// can fit. See [`Self::DAMAGE_REPAIR_MIGRATION`].
     pub fn repair_cursor(&self, migration: &str, source: &str) -> usize {
         usize::try_from(self.snapshot.source_cursors.get(&format!("{migration}:{source}")).copied().unwrap_or_default()).unwrap_or(usize::MAX)
     }
 
     /// Record that `source` has consumed `consumed` entries of `migration`'s list.
-    ///
-    /// Monotonic: callers must only ever move the cursor forward. Persist AFTER
-    /// the enqueue's own checkpoint — a crash in between merely re-offers, which
-    /// is idempotent, while the other order can lose work.
+    /// Monotonic: callers must only ever move the cursor forward, and must call
+    /// this AFTER the enqueue's own checkpoint or work can be lost.
     pub fn advance_repair_cursor(&mut self, migration: &str, source: &str, consumed: usize) -> anyhow::Result<()> {
         let key = format!("{migration}:{source}");
         let consumed = u64::try_from(consumed).unwrap_or(u64::MAX);
@@ -970,12 +868,9 @@ impl TaskJournal {
     }
 
     /// Claim the one-shot orphaned-coverage repair, or `None` if it already ran.
-    ///
     /// The caller does the work; this owns only the once-ness, and marks the
     /// migration done IMMEDIATELY so a restart mid-repair cannot re-force every
-    /// cell. The safe failure is running once and under-repairing, never looping.
-    /// The key is PER SOURCE — a global cursor would be consumed by whichever
-    /// source is processed first and silently skip the rest.
+    /// cell. Keyed PER SOURCE, or the first source processed consumes it for all.
     pub fn repair_orphaned_coverage_once(&mut self, source: &str) -> Option<u64> {
         let key = format!("{}:{source}", Self::ORPHAN_REPAIR_MIGRATION);
         if self.migration_done(&key) {
@@ -999,15 +894,13 @@ impl TaskJournal {
         })
     }
 
-    /// Collapse a sealed day's leftover ten-minute units into one day unit.
-    ///
-    /// Fusion is a cascade over `COARSEN_WIDTHS`: a span lands at the widest
-    /// width whose estimate fits the decode budget.
+    /// Collapse a sealed day's leftover ten-minute units into one day unit, as a
+    /// cascade over `COARSEN_WIDTHS`: a span lands at the widest width whose
+    /// estimate fits the decode budget.
     ///
     /// Anti-loop guard: a span already covered by a non-complete unit at least
     /// that wide is skipped, otherwise a split parent's children would fuse back
-    /// into a unit that splits again forever. The guard is per-width, so a
-    /// superseded day blocks only the day — its children still fuse at six hours.
+    /// into a unit that splits again forever. The guard is per-width.
     pub fn coarsen_sealed_slices(&mut self, now_micros: i64) -> usize {
         self.coarsen_sealed_slices_reporting(now_micros).total()
     }
@@ -1021,18 +914,15 @@ impl TaskJournal {
     /// `coarsen_sealed_slices_reporting`, with a ceiling on what a partition can
     /// possibly decode to.
     ///
-    /// The fit test sums the children's stored `estimated_decoded_bytes`, which
-    /// are WHOLE-FILE figures — children re-reading one file set double-count,
-    /// so the sum can vastly exceed what the partition holds.
-    ///
-    /// `partition_bytes(project, source, date)` returns what that partition
-    /// actually holds, and the fused estimate is capped by it: no unit over one
-    /// partition can decode more than the partition contains. Returning `None`
-    /// keeps the plain summed behaviour, for callers without storage access.
+    /// The fit test sums children's WHOLE-FILE `estimated_decoded_bytes`, which
+    /// double-count when children re-read one file set. `partition_bytes(project,
+    /// source, date)` caps the fused estimate at what the partition actually
+    /// holds; `None` keeps the plain summed behaviour, for callers without
+    /// storage access.
     pub fn coarsen_sealed_slices_capped(&mut self, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>) -> CoarsenReport {
-        // SUBSUME before fusing. Fusion cannot touch a bucket that a wider
-        // pending unit already covers — it would duplicate claimed work — so on
-        // its own it leaves exactly the redundancy it exists to remove.
+        // SUBSUME before fusing: fusion cannot touch a bucket a wider pending
+        // unit already covers, so on its own it leaves exactly the redundancy it
+        // exists to remove.
         let subsumed = self.subsume_covered_units(now_micros);
         let mut report = CoarsenReport { subsumed, ..Default::default() };
         for &width in COARSEN_WIDTHS.iter() {
@@ -1047,32 +937,22 @@ impl TaskJournal {
     }
 
     /// Drop sealed units wholly covered by a WIDER non-complete unit for the
-    /// same (table, source, project, operation).
+    /// same (table, source, project, operation) — a rollup or dedup unit rebuilds
+    /// its entire slice, so the narrow units are the same work listed twice.
     ///
-    /// A rollup or dedup unit rebuilds its entire slice, so a ten-minute unit
-    /// sitting inside a queued day-wide unit for the same cell is the same work
-    /// listed many times. This is the other half of `coarsen_to_width`: fusion
-    /// refuses a bucket already covered by a pending unit at least as wide, which
-    /// is precisely the condition under which the narrow units are redundant.
-    ///
-    /// Only NON-COMPLETE covering units subsume. A complete one is not evidence
-    /// the span is still queued — it was built once, and a narrower unit inside
-    /// it is a later invalidation that must run.
+    /// Only NON-COMPLETE covering units subsume: a narrower unit inside a
+    /// completed span is a later invalidation that must run.
     fn subsume_covered_units(&mut self, now_micros: i64) -> usize {
         type Group = (String, String, String, Operation);
         let group_of =
             |task: &MaintenanceTask| -> Group { (task.key.physical_table.clone(), task.key.source.clone(), task.key.project_id.clone(), task.key.operation) };
         // For each subsume width, the buckets wholly inside some non-complete
-        // unit STRICTLY wider than it. Membership therefore means "contained in
-        // a wider live unit", which is the whole predicate.
+        // unit STRICTLY wider than it.
         let mut covered: [HashSet<(Group, i64)>; SUBSUME_WIDTHS.len()] = Default::default();
-        // Pending/Retry/Running only. NOT Superseded, and that exclusion is
-        // load-bearing: `split_time_task` supersedes a unit too big to finish
-        // and replaces it with children that tile its range, so a superseded
-        // parent subsuming its own children would delete exactly the work the
-        // split just created and leave the cell with nothing. NOT Complete
-        // either — built once is not still queued, and a narrower unit inside a
-        // completed span is a later invalidation that must run.
+        // Pending/Retry/Running only. Excluding Superseded is load-bearing:
+        // `split_time_task` supersedes an oversized unit and replaces it with
+        // children tiling its range, so a superseded parent subsuming its own
+        // children would delete exactly the work the split just created.
         for task in self.snapshot.tasks.iter().filter(|task| matches!(task.state, TaskState::Pending | TaskState::Retry | TaskState::Running)) {
             let group = group_of(task);
             let (start, end) = (task.key.slice.start_micros, task.key.slice.end_micros);
@@ -1083,10 +963,8 @@ impl TaskJournal {
                 covered[index].extend(buckets.map(|bucket| (group.clone(), bucket)));
             }
         }
-        // Damage repairs are exempt here for the same reason they are exempt
-        // from fusion: the repair unit is sized to one file's uncovered span,
-        // and the wider unit that subsumes it does NOT replace it — the
-        // preflight measures that one over budget and shreds it back down.
+        // Damage repairs are exempt, as in fusion: the unit is sized to one
+        // file's uncovered span and a wider unit does NOT replace it.
         let damaged = self.untagged_cells.clone();
         let is_damage = |task: &MaintenanceTask| Self::cell_of(task).is_some_and(|cell| damaged.contains(&cell));
         self.retain_tasks(|task| {
@@ -1094,11 +972,10 @@ impl TaskJournal {
             if task.state != TaskState::Pending || is_live_frontier(task.key.slice, now_micros) || is_damage(task) {
                 return true;
             }
-            // The NARROWEST ladder width this unit fits inside, so that every
-            // unit recorded against it is strictly wider than this one. Taking
-            // the widest that fits instead lets an unaligned (e.g. bisected
-            // 12-hour) unit find the entry its OWN expansion wrote and subsume
-            // itself, leaving the cell with nothing queued.
+            // The NARROWEST ladder width this unit fits inside, so every unit
+            // recorded against it is strictly wider. Taking the widest that fits
+            // lets an unaligned unit find the entry its OWN expansion wrote and
+            // subsume itself, leaving the cell with nothing queued.
             let Some(index) = SUBSUME_WIDTHS.iter().position(|&width| width >= task.key.slice.width()) else { return true };
             let width = SUBSUME_WIDTHS[index];
             let bucket = task.key.slice.start_micros.div_euclid(width) * width;
@@ -1111,18 +988,15 @@ impl TaskJournal {
         })
     }
 
-    /// One pass of `coarsen_sealed_slices` at a single width.
-    ///
-    /// Fuses every strictly-narrower sealed unit in a bucket into one unit of
-    /// `width`, when the bucket's summed estimate fits `MAX_DECODED_BYTES` and
-    /// nothing at least that wide already covers it.
+    /// One pass of `coarsen_sealed_slices` at a single width: fuses every
+    /// strictly-narrower sealed unit in a bucket into one unit of `width`, when
+    /// the bucket's estimate fits `MAX_DECODED_BYTES` and nothing at least that
+    /// wide already covers it.
     fn coarsen_to_width_reporting(&mut self, width: i64, now_micros: i64, partition_bytes: &dyn Fn(&str, &str, &str) -> Option<u64>) -> CoarsenReport {
         let bucket_of = |start: i64| start.div_euclid(width) * width;
-        // DAMAGE REPAIR IS NEVER COARSENED. A repair unit is deliberately sized
-        // to one file's uncovered span, so fusing it destroys the only work that
-        // can close that hole — and the fused unit does not replace it, because
-        // the preflight measures it over budget and shreds it back down.
-        // Cloned, not borrowed: this pass mutates `self` further down.
+        // DAMAGE REPAIR IS NEVER COARSENED: a repair unit is sized to one file's
+        // uncovered span, so fusing it destroys the only work that can close
+        // that hole. Cloned, not borrowed: this pass mutates `self` further down.
         let untagged_cells = self.untagged_cells.clone();
         let coarsenable = |task: &MaintenanceTask| {
             matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup | Operation::HotPacking)
@@ -1131,12 +1005,9 @@ impl TaskJournal {
                 && task.key.slice.width() < width
                 && !Self::cell_of(task).is_some_and(|cell| untagged_cells.contains(&cell))
         };
-        // Running and Retry units block every overlapping bucket. A retry
-        // owns a deadline and failure history: fusing it would reset both on
-        // a fresh Pending parent, and fusing only its neighbours into that
-        // parent would bypass the same retry. Preserve it until the worker
-        // resolves it, even after its deadline passes.
-        // Pending units block buckets already covered at this width or wider.
+        // Running and Retry units block every overlapping bucket: a retry owns a
+        // deadline and failure history that fusing would reset. Pending units
+        // block buckets already covered at this width or wider.
         let group_of = |task: &MaintenanceTask, bucket: i64| {
             (task.key.physical_table.clone(), task.key.source.clone(), task.key.project_id.clone(), task.key.operation, bucket)
         };
@@ -1144,11 +1015,9 @@ impl TaskJournal {
         let blocks_bucket = |task: &MaintenanceTask| match task.state {
             TaskState::Running | TaskState::Retry => true,
             TaskState::Pending => task.key.slice.width() >= width,
-            // Superseded must NOT block: superseded ancestors at every ladder
-            // width would otherwise block every fusion width while none of them
-            // may subsume, stranding their descendants forever. The budget test
-            // below is the real anti-loop guard — a unit that fits does not
-            // split, so split/fuse cannot cycle.
+            // Superseded must NOT block, or superseded ancestors would block
+            // every fusion width while none may subsume, stranding their
+            // descendants forever. The budget test below is the anti-loop guard.
             TaskState::Superseded | TaskState::Complete => false,
         };
         let blocked: HashSet<_> = self
@@ -1176,37 +1045,24 @@ impl TaskJournal {
         }
         // Only fuse a span that will actually FIT: a unit that cannot finish
         // inside its deadline is strictly worse than the slices it replaced.
-        // The cascade is why this is not day-or-nothing — a day that does not
-        // fit is offered six hours, then one hour, and lands at the widest span
-        // it can finish.
-        //
-        // Then bound the price by what the partition can actually hold: no unit
-        // over one partition can decode more than the partition holds, so this
-        // only ever removes double-counting from members that carry no
-        // `InputFootprint` and are therefore priced by a plain sum.
+        // Then bound the price by what the partition can hold, which only ever
+        // removes double-counting from members priced by a plain sum.
         let priced_by_partition: HashSet<_> = groups
             .iter_mut()
             .filter_map(|(group, price)| {
                 let (_, source, project_id, op, bucket) = group;
                 let date = chrono::DateTime::from_timestamp_micros(*bucket)?.date_naive().to_string();
                 price.cap_at(partition_bytes(project_id, source, &date)?);
-                // Dedup ONLY. The argument below applies to any partition-scoped
-                // cost, but the escape hatch does not: a fused over-budget unit
-                // is only safe where the runner honours `hash_shard`, and dedup
-                // is the path where it demonstrably does (`dedup_shard_count`
-                // and the probe's `hash_bucket` filter). Widening this to the
-                // rollup lanes needs that check first.
+                // Dedup ONLY: a fused over-budget unit is safe only where the
+                // runner honours `hash_shard`, which the rollup lanes do not.
                 (*op == Operation::Dedup).then(|| group.clone())
             })
             .collect();
         groups.retain(|group, price| {
             // A group priced against its PARTITION may exceed the decode budget
-            // and still be worth fusing: its members do not avoid that cost by
-            // staying apart, they each pay it. The budget is then enforced where
-            // it can still be honoured — the claim's preflight measures the fused
-            // unit and `byte_bounded_units` shards it BY KEY. Without a partition
-            // ceiling the plain budget rule stands, because then the price really
-            // is a sum over possibly-disjoint files.
+            // and still be worth fusing: its members each pay that cost anyway.
+            // The budget is then enforced at claim time, where the preflight
+            // measures the fused unit and `byte_bounded_units` shards it BY KEY.
             let fits = price.bytes() <= MAX_DECODED_BYTES || priced_by_partition.contains(group);
             report.priced_by_footprint += usize::from(fits && price.summed_bytes > MAX_DECODED_BYTES);
             if !fits {
@@ -1222,14 +1078,12 @@ impl TaskJournal {
             let Ok(slice) = TimeSlice::new(bucket, bucket.saturating_add(width)) else { continue };
             let oldest_member = price.oldest.unwrap_or_else(|| u64::try_from(now_micros.div_euclid(1_000)).unwrap_or_default());
             self.upsert(MaintenanceTask {
-                // Only when every member agreed. A fused unit over several file
-                // sets reads their union, which no scalar here can state, and
-                // guessing one would let the next width up under-price itself.
+                // Only when every member agreed: a fused unit over several file
+                // sets reads their union, which no scalar here can state.
                 input: price.unanimous_input(),
-                // Inherit the OLDEST member's age, not `now`: `scheduling_class`
-                // escalates on wait time, so stamping the fused unit with the
-                // current time would make it permanently fresh and let the narrow
-                // leftovers outrank it forever.
+                // Inherit the OLDEST member's age, not `now` — `scheduling_class`
+                // escalates on wait time, so a fresh stamp would keep the fused
+                // unit permanently outranked.
                 ..MaintenanceTask::pending(TaskKey { physical_table, source, project_id, slice, operation }, now_micros, price.bytes(), oldest_member)
             });
         }
@@ -1242,15 +1096,10 @@ impl TaskJournal {
         self.snapshot.tasks.iter().filter(move |task| task.key.operation == operation && matches!(task.state, TaskState::Pending | TaskState::Retry))
     }
 
-    /// Why queued work for `operation` is not being claimed.
-    ///
-    /// Returns `(pending, sealed, unproven, quarantined, not_yet_due)`, which
-    /// between them cover every reason `claim_next` skips a pending task.
-    ///
-    /// `unproven` counts `!base_tier_present` rather than calling
-    /// `dependencies_complete`: that predicate is itself a scan of the whole task
-    /// set, so calling it per task would make this census O(n^2) under the
-    /// journal lock. The flag is O(1) and is the actionable half anyway.
+    /// Why queued work for `operation` is not being claimed: `(pending, sealed,
+    /// unproven, quarantined, not_yet_due)`. `unproven` counts
+    /// `!base_tier_present` rather than calling `dependencies_complete`, which
+    /// would make this census O(n^2) under the journal lock.
     pub fn claimability_census(&self, operation: Operation, now_micros: i64) -> (usize, usize, usize, usize, usize) {
         self.queued(operation).fold((0, 0, 0, 0, 0), |(pending, sealed, unproven, quarantined, not_due), task| {
             (
@@ -1267,32 +1116,17 @@ impl TaskJournal {
     /// width, benefit, recency)`. Smaller wins.
     ///
     /// `hole_rank` orders WITHIN a class: a cell whose tier output is missing
-    /// outranks one merely being re-derived. Newest-first is right for FRESHNESS
-    /// and wrong for CONTIGUITY, and old holes are the contiguity goal.
-    ///
-    /// DAMAGE leads its class, ahead of `starved`, because starvation is a
-    /// freshness heuristic and damage is not a freshness question. It cannot
-    /// starve the rest: the damaged set comes from files that exist and empties
-    /// as they are retired.
-    ///
-    /// Damage units order by NEITHER width nor recency — they all tie, so the
-    /// per-project cursor in `claim_next` rotates across damaged CELLS instead of
-    /// draining one to exhaustion. Both width orderings starve one end, since the
-    /// selection loop matches the winning tuple exactly.
-    ///
-    /// A method rather than a closure inside `claim_next` so that a read-only
-    /// caller can ask why a unit is losing. See `most_indebted_unclaimed`.
+    /// outranks one merely being re-derived, because newest-first is right for
+    /// freshness and wrong for contiguity. DAMAGE leads its class, ahead of
+    /// `starved`, and orders by NEITHER width nor recency — damage units all
+    /// tie, so the per-project cursor in `claim_next` rotates across damaged
+    /// cells instead of draining one to exhaustion.
     fn rank(&self, task: &MaintenanceTask, now_micros: i64) -> Rank {
         let (class, starved, width, benefit, order) = scheduling_class(task, now_micros);
         let hole = self.hole_rank(task);
         let (width, order) = if hole == 0 { (0, 0) } else { (width, order) };
-        // CONTIGUITY for the Dedup lane: certification grants a (project, date)
-        // only when the clean interval covers the WHOLE day, so a slice sharing
-        // a boundary with a COMPLETED dedup slice ranks ahead of one seeding a
-        // new island. With no adjacent candidate every task ties at 1 and the
-        // established order is untouched. Positioned AFTER `starved` so it
-        // cannot re-starve what the horizon machinery escalates, and NOT folded
-        // into `hole`, which outranks `starved`. Sealed class only.
+        // Dedup contiguity: a slice adjacent to a COMPLETED dedup slice ranks ahead of one
+        // seeding a new island. Must stay AFTER `starved` and out of `hole`, which outranks it.
         let adjacent = class != 0
             && task.key.operation == Operation::Dedup
             && crate::config::try_config().is_none_or(|cfg| cfg.maintenance.timefusion_dedup_contiguity_rank)
@@ -1304,16 +1138,8 @@ impl TaskJournal {
         (class, u8::from(hole > 0), starved, hole, u8::from(!adjacent), width, benefit, order)
     }
 
-    /// File-count spread of an operation's claimable cells, and how many of them
-    /// the `benefit` term cannot tell apart.
-    ///
-    /// `benefit = -(input.files / BENEFIT_BUCKET_FILES)`, so every cell under one
-    /// bucket scores ZERO — identical to a one-file cell — and ordering falls
-    /// through to recency. Hygiene cells are planned per tick and never persisted
-    /// to the journal, so this spread can only be measured from inside the process.
-    ///
-    /// Returns `None` when there is nothing claimable, so a quiet lane stays
-    /// silent.
+    /// File-count spread of an operation's claimable cells, and how many of them the
+    /// `benefit` term cannot tell apart. `None` when nothing is claimable.
     pub fn hygiene_debt_spread(&self, operation: Operation, now_micros: i64) -> Option<String> {
         use itertools::Itertools;
         let files = self
@@ -1333,24 +1159,19 @@ impl TaskJournal {
         Some(format!("cells={cells} files_p50={p50} files_p90={p90} files_max={max} tied_at_zero={tied} distinct_buckets={buckets}"))
     }
 
-    /// The queued unit holding the most DEBT (`input.files`) that is not being
-    /// claimed, and why — including which unit outranks it. `None` when that unit
-    /// already wins its own claims.
+    /// The queued unit holding the most DEBT (`input.files`) that is not being claimed, and
+    /// why — including which unit outranks it. `None` when it already wins its own claims.
     pub fn most_indebted_unclaimed(&self, operation: Operation, now_micros: i64) -> Option<String> {
         let eligible = || self.queued(operation);
         let date_of = |task: &MaintenanceTask| task_date(task).unwrap_or_else(|| "?".to_owned());
         let worst = eligible().max_by_key(|task| task.input.map_or(0, |input| input.files))?;
         let files = worst.input.map_or(0, |input| input.files);
-        // The reasons that live on the task itself, in the order `claim_next`
-        // applies them. Anything else means ordering, which is the case no
-        // existing instrument could name.
+        // The reasons that live on the task itself; anything else means ordering.
         let reason = match self.refusal_reason(worst, now_micros) {
             Some(reason) => reason.to_owned(),
             None => {
                 let winner = eligible().filter(|task| self.refusal_reason(task, now_micros).is_none()).min_by_key(|task| self.rank(task, now_micros))?;
                 if winner.key == worst.key {
-                    // It wins its own claims, so it is not being starved — whatever
-                    // is wrong is downstream of selection, not in it.
                     return None;
                 }
                 format!("outranked_by:{:.8}:{}", winner.key.project_id, date_of(winner))
@@ -1359,16 +1180,12 @@ impl TaskJournal {
         Some(format!("{reason}:{:.8}:{}:files={files}", worst.key.project_id, date_of(worst)))
     }
 
-    /// The first SEALED task of `operation` that `claim_next` would refuse, and
-    /// why — as `(project, date, reason)`.
-    ///
-    /// Bounded to `LIMIT` evaluations because `dependencies_complete` is a scan;
-    /// a sample is enough to name the reason, and naming it is the whole point.
+    /// The first SEALED task of `operation` that `claim_next` would refuse, and why — as
+    /// `(project, date, reason)`. Bounded to `LIMIT` because `dependencies_complete` is a scan.
     pub fn first_refused_sealed(&self, operation: Operation, now_micros: i64) -> Option<(String, String, &'static str)> {
         const LIMIT: usize = 64;
         use itertools::Itertools;
-        // A claimable one is the interesting answer: it means eligibility is fine
-        // and the refusal is in ordering. Otherwise report the first task's reason.
+        // A claimable one means eligibility is fine and the refusal is in ordering.
         self.queued(operation)
             .filter(|task| !is_frontier_task(task, now_micros))
             .take(LIMIT)
@@ -1379,10 +1196,8 @@ impl TaskJournal {
             })
     }
 
-    /// Publish which `(source, project, date)` have their BASE tier built, read
-    /// from real rollup coverage. Replaces the set wholesale: coverage can go
-    /// backwards (a rewrite, a vacuum), and a stale "ready" is the direction
-    /// that derives from a tier that is not there.
+    /// Publish which `(source, project, date)` have their BASE tier built. Replaces the set
+    /// wholesale: coverage can go backwards, and a stale "ready" derives from a missing tier.
     pub fn set_base_tier_ready(&mut self, ready: HashSet<(String, String, String)>) {
         self.base_tier_ready = ready;
     }
@@ -1391,15 +1206,13 @@ impl TaskJournal {
         self.base_tier_ready.len()
     }
 
-    /// Which sources contributed to the published coverage and holes. Exists so
-    /// a test can prove the sets are not merely the last source planned.
+    /// Which sources contributed to the published coverage and holes.
     pub fn tier_hole_sources(&self) -> HashSet<String> {
         self.tier_holes.iter().map(|(source, ..)| source.clone()).collect()
     }
 
-    /// Publish which `(source, project, tier table, date)` are MISSING, so
-    /// `claim_next` can rank holes ahead of re-derives. Replaced wholesale for
-    /// the same reason as `base_tier_ready`.
+    /// Publish which `(source, project, tier table, date)` are MISSING, so `claim_next` can
+    /// rank holes ahead of re-derives. Replaced wholesale, like `base_tier_ready`.
     pub fn set_tier_holes(&mut self, holes: HashSet<(String, String, String, String)>) {
         self.tier_holes = holes;
     }
@@ -1415,13 +1228,8 @@ impl TaskJournal {
         self.untagged_cells.len()
     }
 
-    /// Seed the set from the sidecar at boot, so the damage rank is live from
-    /// the first claim instead of from the first recovery pass ~40 minutes in.
-    ///
-    /// Additive, and safe if stale: `set_untagged_cells` replaces its own tier's
-    /// slice on the next recovery, and a publish that leaves a partition clean
-    /// clears its cell. A stale entry costs one mis-ranked claim, never
-    /// correctness.
+    /// Seed the set from the sidecar at boot so the damage rank is live from the first claim.
+    /// Additive, and safe if stale: a stale entry costs one mis-ranked claim, never correctness.
     pub fn restore_untagged_cells(&mut self, cells: impl IntoIterator<Item = (String, String, String, String)>) {
         self.untagged_cells.extend(cells);
     }
@@ -1431,23 +1239,16 @@ impl TaskJournal {
         self.untagged_cells.iter()
     }
 
-    /// Forget one cell, for a publish that has just left the partition clean.
-    ///
-    /// `recover_rollup_coverage` is the only producer and it runs ONCE at
-    /// startup, so without this a converged cell keeps out-ranking real work
-    /// until the next restart — the ranking would spend claims re-deriving the
-    /// day it already fixed.
+    /// Forget one cell, for a publish that has just left the partition clean. The only other
+    /// producer runs once at startup, so without this a converged cell out-ranks real work
+    /// until the next restart.
     pub fn clear_untagged_cell(&mut self, source: &str, table: &str, project: &str, date: &str) -> bool {
         self.untagged_cells.remove(&(source.to_owned(), project.to_owned(), table.to_owned(), date.to_owned()))
     }
 
-    /// How badly this cell needs the work: 0 repairs DAMAGE, 1 fills a missing
-    /// day, 2 re-derives a day that already has output. Smaller runs first.
-    ///
-    /// Damage leads because a repair unit is narrow by construction (the
-    /// uncovered span of one file), so the width tiebreak would otherwise rank it
-    /// below every day-wide backfill hole. It cannot starve the backfill: the set
-    /// comes from files that exist and shrinks as they are retired.
+    /// How badly this cell needs the work: 0 repairs DAMAGE, 1 fills a missing day, 2
+    /// re-derives a day that already has output. Smaller runs first — damage leads because a
+    /// repair unit is narrow by construction and the width tiebreak would otherwise bury it.
     fn hole_rank(&self, task: &MaintenanceTask) -> u8 {
         let cell = matches!(task.key.operation, Operation::BaseRollup | Operation::DerivedRollup).then(|| Self::cell_of(task)).flatten();
         cell.map_or(2, |cell| {
@@ -1471,12 +1272,8 @@ impl TaskJournal {
         task_date(task).map(|date| (task.key.source.clone(), task.key.project_id.clone(), task.key.physical_table.clone(), date))
     }
 
-    /// Why `claim_next` would refuse this task, in the order it applies the
-    /// reasons that live on the task itself. Lazy, because
-    /// `dependencies_complete` is itself a scan.
-    ///
-    /// `None` means nothing about the task refuses it, so the refusal is
-    /// upstream — in class ordering or the operation cycle, not in eligibility.
+    /// Why `claim_next` would refuse this task, in the order it applies the reasons that live
+    /// on the task itself. `None` means the refusal is upstream — ordering, not eligibility.
     fn refusal_reason(&self, task: &MaintenanceTask, now_micros: i64) -> Option<&'static str> {
         (task.deadline_micros > now_micros)
             .then_some("not_due")
@@ -1489,22 +1286,19 @@ impl TaskJournal {
         self.snapshot.tasks.get(*self.task_indices.get(key)?)
     }
 
-    /// Mutable form of [`Self::task`]. Callers own their own `dirty_tasks`
-    /// bookkeeping — `mark_running` deliberately journals nothing.
+    /// Mutable form of [`Self::task`]. Callers own their own `dirty_tasks` bookkeeping.
     fn task_mut(&mut self, key: &TaskKey) -> Option<&mut MaintenanceTask> {
         let index = *self.task_indices.get(key)?;
         self.snapshot.tasks.get_mut(index)
     }
 
     pub fn prove_base_tier_for_day(&mut self, key: &TaskKey, day_start: i64, day_end: i64) -> usize {
-        // Disjoint field borrows, so the pipeline can mark tasks dirty as it goes.
         let dirty = &mut self.dirty_tasks;
         self.snapshot
             .tasks
             .iter_mut()
-            // Only work that can still run. A completed task matches its own
-            // day and proving it is a no-op that would make the count read as
-            // progress when nothing became claimable.
+            // Only work that can still run: proving a completed task is a no-op that would
+            // make the returned count read as progress.
             .filter(|task| {
                 matches!(task.state, TaskState::Pending | TaskState::Retry)
                     && !task.base_tier_present
@@ -1519,12 +1313,9 @@ impl TaskJournal {
             })
     }
 
-    /// Remember what a unit reads, measured by the claim-time preflight.
-    ///
-    /// Recorded on EVERY claim, not only when the preflight splits: a unit that
-    /// fits its estimate and then times out is bisected by `abandon_running`,
-    /// which knows only a key, so without a footprint already on the parent the
-    /// children carry none and the bisect ladder becomes one-way.
+    /// Remember what a unit reads, measured by the claim-time preflight. Must be recorded on
+    /// EVERY claim, not only when the preflight splits: `abandon_running` bisects from a key
+    /// alone, so without a footprint on the parent the children carry none.
     pub fn record_input(&mut self, key: &TaskKey, input: InputFootprint) -> bool {
         let Some(task) = self.task_mut(key) else { return false };
         if task.input == Some(input) {
@@ -1549,8 +1340,7 @@ impl TaskJournal {
     }
 
     pub fn upsert(&mut self, task: MaintenanceTask) {
-        // A key removed earlier in this write window and re-created now must not
-        // still carry a tombstone; the upsert is the later truth.
+        // A key removed earlier in this write window and re-created now must drop its tombstone.
         self.removed_tasks.remove(&task.key);
         self.dirty_tasks.insert(task.key.clone());
         if task.state == TaskState::Complete {
@@ -1563,58 +1353,39 @@ impl TaskJournal {
         self.enqueue_with_base_tier(key, deadline_micros, estimated_decoded_bytes, created_unix_ms, false);
     }
 
-    /// `base_tier_present` records that the tier this unit aggregates already
-    /// exists — see the field on [`MaintenanceTask`]. Only `plan_rollup_backfill`
-    /// can prove it, because only it reads actual tier coverage.
-    ///
-    /// Returns whether the queue accepted the unit. `false` is one of the two
-    /// structural vetoes in `enqueue_inner` — a Superseded parent with a live
-    /// descendant, or a Retry parked on a worker/schema failure.
+    /// `base_tier_present` records that the tier this unit aggregates already exists; only
+    /// `plan_rollup_backfill` can prove it. Returns whether the queue accepted the unit —
+    /// `false` means one of the two structural vetoes in `enqueue_inner` fired.
     pub fn enqueue_with_base_tier(
         &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
     ) -> bool {
         self.enqueue_inner(key, deadline_micros, estimated_decoded_bytes, created_unix_ms, base_tier_present, None)
     }
 
-    /// Queue a unit the planner has already MEASURED, carrying its footprint.
+    /// Queue a unit the planner has already MEASURED, carrying its footprint so
+    /// `scheduling_class` can rank a never-claimed hygiene unit by `input.files`.
     ///
-    /// `scheduling_class` ranks file hygiene by `input.files`, so a unit that has
-    /// never been claimed (the only other writer is `record_input`, at claim
-    /// time) would otherwise score zero — precisely the population that needs
-    /// ordering.
-    ///
-    /// Deliberately NOT `upsert`: that replaces the whole task, resetting
-    /// `state`/`attempts` and bypassing the Superseded/live-descendant veto
-    /// below, which exists because resurrecting a parent beside its children
-    /// starves them.
+    /// Deliberately NOT `upsert`: that resets `state`/`attempts` and bypasses the
+    /// Superseded/live-descendant veto below, resurrecting a parent beside its children.
     pub fn enqueue_planned(&mut self, task: &MaintenanceTask) {
         self.enqueue_inner(task.key.clone(), task.deadline_micros, task.estimated_decoded_bytes, task.created_unix_ms, task.base_tier_present, task.input);
     }
 
-    /// Precedence between the two footprints, since both are honest:
+    /// Footprint precedence: `None` NEVER erases an existing one (that would break the bisect
+    /// ladder); the claim-time measurement wins while Running or quarantined; between claims
+    /// the PLANNER's is the fresher observation.
     ///
-    /// * `None` NEVER erases — stripping a claim-time footprint would break the
-    ///   bisect ladder `record_input` documents.
-    /// * The claim-time measurement wins while the unit is `Running` or parked in
-    ///   quarantine: those are the windows `abandon_running` reads it in.
-    /// * Between claims the PLANNER wins — it re-derives the live file set every
-    ///   tick, so it is the fresher observation, and every claim records its own
-    ///   footprint unconditionally.
-    ///
-    /// Returns `true` when the unit is queued afterwards — minted now, or already
-    /// present and deliberately left alone. Only the two structural vetoes below
-    /// return `false`.
+    /// Returns `true` when the unit is queued afterwards; only the two structural vetoes
+    /// below return `false`.
     fn enqueue_inner(
         &mut self, key: TaskKey, deadline_micros: i64, estimated_decoded_bytes: u64, created_unix_ms: u64, base_tier_present: bool,
         input: Option<InputFootprint>,
     ) -> bool {
-        // Same rule as `upsert`, which this path does not go through: a key
-        // removed earlier in this write window and enqueued again is CREATED,
-        // not removed. `coarsen_to_width` drops a bucket's members and writes a
-        // fused unit whose key can be one of them, in a single pass.
+        // Same rule as `upsert`: a key removed earlier in this write window and enqueued
+        // again is CREATED, not removed (`coarsen_to_width` does both in one pass).
         self.removed_tasks.remove(&key);
-        // Re-pend an existing entry. `attempts` restarts only for a superseded
-        // parent, which is fresh debt rather than a retry of the same unit.
+        // Re-pend an existing entry. `attempts` restarts only for a superseded parent, which
+        // is fresh debt rather than a retry of the same unit.
         let repend = |task: &mut MaintenanceTask, deadline: i64, reset_attempts: bool| {
             task.state = TaskState::Pending;
             task.deadline_micros = deadline;
@@ -1626,12 +1397,9 @@ impl TaskJournal {
             task.input = input.or(task.input);
         };
         if let Some(index) = self.task_indices.get(&key).copied() {
-            // A superseded parent's work lives on in its children; re-noticing
-            // the same debt is not new information and must not resurrect the
-            // parent beside them — its wider slice would outrank its own
-            // children and they would never run. Only when no live descendant
-            // remains is the enqueue fresh debt, and then it is a NEW unit:
-            // attempts start over.
+            // A superseded parent must not be resurrected beside its children — its wider
+            // slice would outrank them forever. Only with no live descendant is this fresh
+            // debt, and then it is a NEW unit: attempts start over.
             if self.snapshot.tasks[index].state == TaskState::Superseded {
                 let parent = &self.snapshot.tasks[index].key;
                 let live_descendant = self.snapshot.tasks.iter().any(|task| {
@@ -1648,11 +1416,8 @@ impl TaskJournal {
                 self.dirty_tasks.insert(key);
                 return true;
             }
-            // `abandon_running`'s verdict must outlive a planner tick: its
-            // deadline floor is the only bound on a doomed unit's duty cycle and
-            // its reason is what routes the unit through the small quarantine
-            // permit. Re-minting would clear both every tick; the debt is already
-            // queued, so nothing is lost by declining.
+            // `abandon_running`'s verdict must outlive a planner tick: re-minting would clear
+            // both the deadline floor and the quarantine-routing reason every tick.
             if self.snapshot.tasks[index].state == TaskState::Retry
                 && matches!(self.snapshot.tasks[index].retry_reason.as_deref(), Some(Self::WORKER_FAILURE_REASON | Self::SCHEMA_FAILURE_REASON))
             {
@@ -1666,12 +1431,9 @@ impl TaskJournal {
                     || task.estimated_decoded_bytes != estimated_decoded_bytes
                     || task.retry_reason.is_some()
                     || task.publication.is_some()
-                    // Latching, never clearing: the planner proves presence, and
-                    // a later enqueue that cannot prove it (the frontier's) is
+                    // Latching, never clearing: an enqueue that cannot prove presence is
                     // silence, not evidence of absence.
                     || (base_tier_present && !task.base_tier_present)
-                    // A cell whose debt grew must not have to be claimed once to
-                    // become rankable.
                     || (input.is_some() && input != task.input);
                 if changed {
                     repend(task, new_deadline, false);
@@ -1689,11 +1451,9 @@ impl TaskJournal {
         true
     }
 
-    /// Drop every task the predicate rejects, recording a tombstone for each.
-    ///
-    /// THE way to remove tasks — a bare `snapshot.tasks.retain` records no
-    /// tombstone, so the removal lives only in memory and comes back on the next
-    /// journal load.
+    /// Drop every task the predicate rejects, recording a tombstone for each. THE way to
+    /// remove tasks — a bare `snapshot.tasks.retain` records no tombstone, so the removal
+    /// lives only in memory and comes back on the next journal load.
     fn retain_tasks(&mut self, mut keep: impl FnMut(&MaintenanceTask) -> bool) -> usize {
         let before = self.snapshot.tasks.len();
         let removed = &mut self.removed_tasks;
@@ -1702,8 +1462,7 @@ impl TaskJournal {
             if keep(task) {
                 return true;
             }
-            // A key that was pending a write and is now gone must not also be
-            // upserted; the tombstone is the whole story.
+            // A key that was pending a write and is now gone must not also be upserted.
             dirty.remove(&task.key);
             removed.insert(task.key.clone());
             false
@@ -1740,24 +1499,19 @@ impl TaskJournal {
 
     fn invalidate_slices(&mut self, invalidation: Invalidation<'_>, normal_slices: &[TimeSlice], rollup_slices: &[TimeSlice]) -> anyhow::Result<()> {
         let Invalidation { source_table, rollup_table, source, project_id, observed_at_micros, derived, mint_dedup, mint_rollup, .. } = invalidation;
-        // Round up, never down: a bucket can delay eligibility slightly but
-        // can never publish before the full quiet period. High-rate ingest
-        // then journals one deadline extension per bucket rather than one full
-        // task record per event batch.
+        // Round up, never down: a bucket may delay eligibility but must never publish before
+        // the full quiet period.
         let deadline = observed_at_micros.saturating_add(FINALIZATION_DELAY_MICROS);
         let deadline_micros = deadline
             .saturating_add(INVALIDATION_DEADLINE_BUCKET_MICROS - 1)
             .div_euclid(INVALIDATION_DEADLINE_BUCKET_MICROS)
             .saturating_mul(INVALIDATION_DEADLINE_BUCKET_MICROS);
         let created_unix_ms = u64::try_from(observed_at_micros.div_euclid(1_000)).unwrap_or_default();
-        // HotPacking is deliberately NOT minted here. File hygiene is planned by
-        // DEBT, not by the calendar: `plan_compaction_debt` scans the real file
-        // list per (project, date) and mints ONE day-wide unit when the partition
-        // has small or unsorted files.
+        // HotPacking is deliberately NOT minted here: file hygiene is planned by DEBT, not by
+        // the calendar — see `plan_compaction_debt`.
         for (operation, slices) in [(Operation::Dedup, normal_slices), (if derived { Operation::DerivedRollup } else { Operation::BaseRollup }, rollup_slices)]
         {
-            // `mint_dedup`/`mint_rollup` are false only for a DV-dedup-only
-            // wave, which changed no logical content the operation would observe.
+            // False only for a DV-dedup-only wave, which changed no logical content.
             if operation == Operation::Dedup && !mint_dedup {
                 crate::observability::maintenance_stats().dedup_remint_skipped.fetch_add(slices.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 continue;
@@ -1811,28 +1565,22 @@ impl TaskJournal {
         true
     }
 
-    /// Attempts after which a unit has PROVEN it does not fit its deadline. One
-    /// timeout is a blip; two is the slice itself, the same threshold
-    /// `abandon_running` uses to call a unit oversized rather than unlucky.
+    /// Attempts after which a unit has PROVEN it does not fit its deadline: one timeout is a
+    /// blip, two is the slice itself.
     pub const QUARANTINE_ATTEMPTS: u32 = 2;
 
-    /// The `retry_reason` `abandon_running` writes when a WORKER gave a unit
-    /// back — a deadline it could not meet, or an error inside the unit.
+    /// The `retry_reason` `abandon_running` writes when a WORKER gave a unit back.
     pub const WORKER_FAILURE_REASON: &'static str = "worker_error";
 
-    /// The `retry_reason` a unit parked on a DETERMINISTIC plan error carries —
-    /// a state token, never the error text, because three places match it
-    /// exactly: [`Self::is_quarantined`], the planner re-mint guard in
-    /// `enqueue`, and the claim gate that reads the first. The text is logged
-    /// once at the park site instead.
+    /// The `retry_reason` a unit parked on a DETERMINISTIC plan error carries — a state
+    /// token, never the error text, because three places match it exactly.
     pub const SCHEMA_FAILURE_REASON: &'static str = "schema_error";
-    /// How long a schema-parked unit waits. Deliberately as long as the file's
-    /// other never-going-to-change-soon retries (`invalid_slice_timestamp`): the
-    /// thing that fixes it is a rebuild or a deploy, not another attempt.
+    /// How long a schema-parked unit waits: what fixes it is a rebuild or a deploy, not
+    /// another attempt.
     const SCHEMA_PARK_MICROS: i64 = 3_600 * 1_000_000;
 
-    /// Park a unit whose SQL cannot be planned. Never bisected: the children
-    /// would name the same missing column and fail identically.
+    /// Park a unit whose SQL cannot be planned. Never bisected: the children would name the
+    /// same missing column and fail identically.
     fn park_schema_failure(&mut self, key: &TaskKey, now_micros: i64, error: &str) {
         crate::observability::maintenance_stats().maintenance_schema_parked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(?key, %error, event = "maintenance_task_schema_parked", "parked a maintenance unit on a deterministic plan error instead of bisecting it");
@@ -1841,37 +1589,21 @@ impl TaskJournal {
 
     /// Has this unit PROVEN it cannot fit its deadline?
     ///
-    /// Attempts alone are NOT that proof: an attempt is counted before anything
-    /// about cost is known, so a unit handed back for an unrelated reason
-    /// (`source_not_flushed`, an unsatisfiable dependency) accumulates attempts
-    /// identically to one that burned its whole deadline. So require the
-    /// worker's own verdict — only a unit `abandon_running` gave back is
-    /// evidence about cost; anything else retries normally.
-    ///
-    /// A schema-parked unit qualifies immediately: one deterministic plan error
-    /// is already proof, and rationing its claims is the point of the tag.
+    /// Attempts alone are NOT proof — an attempt is counted before cost is known — so the
+    /// worker's own verdict is required too. A schema-parked unit qualifies immediately.
     pub fn is_quarantined(task: &MaintenanceTask) -> bool {
         task.retry_reason.as_deref() == Some(Self::SCHEMA_FAILURE_REASON)
             || (task.attempts >= Self::QUARANTINE_ATTEMPTS && task.retry_reason.as_deref() == Some(Self::WORKER_FAILURE_REASON))
     }
 
-    /// Claim one unit. `allow_quarantined` admits units that have already timed
-    /// out [`Self::QUARANTINE_ATTEMPTS`] times; the caller gates it on a small
-    /// occupancy permit so proven-unfittable work cannot hold the whole pool.
-    /// No operation is exempt: a rollup unit advances coverage only if it
-    /// COMPLETES, and bisecting cannot halve a per-file cost.
+    /// Claim one unit. `allow_quarantined` admits units that have already timed out
+    /// [`Self::QUARANTINE_ATTEMPTS`] times; the caller must gate it on a small occupancy
+    /// permit so proven-unfittable work cannot hold the whole pool.
     pub fn claim_next(&mut self, operation: Operation, now_micros: i64, allow_quarantined: bool) -> Option<MaintenanceTask> {
-        // The winning scheduling class, as a streaming minimum over the eligible
-        // tasks. `dependencies_complete` is itself a scan, so it is evaluated
-        // ONLY when a task would actually improve the current best — otherwise
-        // this would be quadratic for `DerivedRollup`.
         self.claim_tick = self.claim_tick.wrapping_add(1);
-        // Class is strict priority and ingest regenerates frontier work
-        // continuously, so one claim in two is RESERVED for sealed work — halved
-        // to one in four while the frontier is behind its lag budget, since a
-        // frontier that never finishes today holes every later coverage window.
-        // DerivedRollup always takes the sealed turn: it mints ~3% of frontier
-        // creation, so preferring sealed for it cannot starve the frontier.
+        // Class is strict priority and ingest regenerates frontier work continuously, so one
+        // claim in two is RESERVED for sealed work — one in four while the frontier is behind
+        // its lag budget. DerivedRollup always takes the sealed turn.
         let sealed_turn = operation == Operation::DerivedRollup
             || if self.frontier_lag_secs.load(std::sync::atomic::Ordering::Relaxed) > FRONTIER_LAG_BUDGET_SECS {
                 self.claim_tick.is_multiple_of(4)
@@ -1879,25 +1611,15 @@ impl TaskJournal {
                 self.claim_tick.is_multiple_of(2)
             };
         let claimable = |task: &MaintenanceTask| task.key.operation == operation && Self::task_can_be_claimed(task, now_micros, allow_quarantined);
-        // Claim order is [`Self::rank`]; this function only decides WHICH
-        // population each tick ranks over.
-        //
-        // One claim in four is RESERVED for work inside the window dashboards
-        // read, chosen WITHOUT reference to `starved` (any starved task outranks
-        // any non-starved one, so the window loses to older history otherwise).
-        //
-        // Residue 3 is load-bearing: it is ODD, so it can never collide with a
-        // sealed turn (multiples of 2 or 4), and `claim_tick` is incremented
-        // before use, so residue 1 would fire on a fresh journal's FIRST claim
-        // and change the documented hand-out order.
+        // One claim in four is RESERVED for work inside the window dashboards read, chosen
+        // WITHOUT reference to `starved` (any starved task outranks any non-starved one).
+        // Residue 3 is load-bearing: ODD, so it never collides with a sealed turn (multiples
+        // of 2 or 4), and it does not fire on a fresh journal's first claim.
         let window_turn = self.claim_tick % 4 == 3;
         let rank = |journal: &Self, task: &MaintenanceTask| -> Rank { journal.rank(task, now_micros) };
-        // One claim in eight for the band NOTHING else serves: older than the
-        // query window (so outside `window_turn`), younger than the starvation
-        // horizon (so it loses every sealed turn to the past-horizon cohort).
-        //
-        // Residue 5 is odd (never a sealed turn) and `5 % 4 == 1` (never a
-        // window turn), and it is not reached on a fresh journal's first claims.
+        // One claim in eight for the band NOTHING else serves: older than the query window,
+        // younger than the starvation horizon. Residue 5 is odd (never a sealed turn) and
+        // `5 % 4 == 1` (never a window turn).
         let horizon_turn = self.claim_tick % 8 == 5;
         let best_class = |journal: &Self, sealed_only: bool, window_only: bool, horizon_only: bool| -> Option<Rank> {
             let mut class: Option<Rank> = None;
@@ -1933,8 +1655,8 @@ impl TaskJournal {
         };
         let mut fallback: Option<&MaintenanceTask> = None;
         let mut next: Option<&MaintenanceTask> = None;
-        // One pass on purpose: `dependencies_complete` is itself a scan, so a
-        // two-pass `min_by_key` form would double the hot claim path's cost.
+        // One pass on purpose: `dependencies_complete` is itself a scan, so a two-pass
+        // `min_by_key` form would double the hot claim path's cost.
         for task in self.snapshot.tasks.iter().filter(|task| claimable(task) && rank(self, task) == class && self.dependencies_complete(task)) {
             if beats(task, fallback) {
                 fallback = Some(task);
@@ -1967,9 +1689,8 @@ impl TaskJournal {
     fn dependencies_complete(&self, task: &MaintenanceTask) -> bool {
         // Only a DERIVED unit has a dependency at all.
         let required = matches!(task.key.operation, Operation::DerivedRollup).then_some(Operation::BaseRollup);
-        // Either witness of a present base tier short-circuits. The day-keyed set
-        // is the reliable one: the per-task flag has to be set on exactly the
-        // right `TaskKey`, which re-keying silently misses.
+        // Either witness of a present base tier short-circuits; the day-keyed set is the
+        // reliable one, since the per-task flag must land on exactly the right `TaskKey`.
         if task.base_tier_present {
             return true;
         }
@@ -1978,9 +1699,8 @@ impl TaskJournal {
         {
             return true;
         }
-        // Contiguous coverage of the slice by COMPLETE units of the required
-        // operation: `scan` walks the sorted intervals and stops dead at the
-        // first gap, `any` stops at the first interval that reaches the end.
+        // Contiguous coverage of the slice by COMPLETE units of the required operation: the
+        // `scan` walks sorted intervals and stops dead at the first gap.
         required.is_none_or(|required| {
             use itertools::Itertools;
             self.snapshot
@@ -2029,8 +1749,7 @@ impl TaskJournal {
         self.finish(key, Some(publication))
     }
 
-    /// Mark a unit Complete. `None` leaves any existing publication untouched,
-    /// matching `complete`'s behaviour.
+    /// Mark a unit Complete. `None` leaves any existing publication untouched.
     fn finish(&mut self, key: &TaskKey, publication: Option<Publication>) -> bool {
         let Some(task) = self.task_mut(key) else { return false };
         task.state = TaskState::Complete;
@@ -2043,16 +1762,10 @@ impl TaskJournal {
         true
     }
 
-    /// A worker gave the task back without finishing it — an error, or a
-    /// deadline it could not meet.
-    ///
-    /// Once is a blip: back off and retry it whole. Twice says the slice does not
-    /// fit its deadline, so bisect instead of requeueing it unchanged forever.
-    /// Byte-based splitting does not cover this case: what overran is WALL TIME.
-    ///
-    /// `failure` is the worker's own account when it had one; a timeout carries
-    /// nothing, and that unnamed case is exactly what bisection exists for. Only
-    /// positive evidence of a DETERMINISTIC plan error suppresses it.
+    /// A worker gave the task back without finishing it — an error, or a deadline it could
+    /// not meet. Once is a blip: back off and retry whole. Twice means the slice does not fit
+    /// its deadline, so bisect TIME (byte splitting does not cover this). Only positive
+    /// evidence of a DETERMINISTIC plan error in `failure` suppresses the bisect.
     pub fn abandon_running(&mut self, key: &TaskKey, now_micros: i64, failure: Option<&str>) {
         if let Some(error) = failure.filter(|failure| is_schema_failure(failure)) {
             self.park_schema_failure(key, now_micros, error);
@@ -2062,14 +1775,11 @@ impl TaskJournal {
         if attempts >= 2 && self.split_task(key, SplitTrigger::RepeatedFailure, None) {
             return;
         }
-        // Floored at this operation's OWN deadline, otherwise a unit that cannot
-        // be split burns the full deadline, waits out a backoff capped at 256s,
-        // and burns it again — a permanent duty cycle on a worker for a unit that
-        // never produces anything.
+        // Floored at this operation's OWN deadline, otherwise an unsplittable unit burns the
+        // full deadline, waits out a backoff capped at 256s, and burns it again forever.
         let backoff_micros = exponential_backoff_micros(attempts);
-        // Only after a REPEAT: a FairSpillPool can squeeze out a correctly sized
-        // unit that would succeed untouched next pass, and the floor is a
-        // deadline-long penalty for someone else's memory spike.
+        // Only after a REPEAT: the FairSpillPool can squeeze out a correctly sized unit that
+        // would succeed untouched next pass.
         let delay_micros = if attempts >= 2 {
             let floor_micros = i64::try_from(operation_deadline_secs(key.operation).saturating_mul(1_000_000)).unwrap_or(i64::MAX);
             backoff_micros.max(floor_micros)
@@ -2079,12 +1789,9 @@ impl TaskJournal {
         self.retry(key, Self::WORKER_FAILURE_REASON.to_owned(), now_micros.saturating_add(delay_micros));
     }
 
-    /// Retry, or split when the input did not FIT — the same slice at the same
-    /// size fails identically forever, and here what overran is BYTES, which is
-    /// what `byte_bounded_units` divides.
-    ///
-    /// Still tolerate one failure: the maintenance pool is a FairSpillPool, so a
-    /// unit can be squeezed out by unrelated work. Only a repeat says it is too big.
+    /// Retry, or split when the input did not FIT — here what overran is BYTES, which is what
+    /// `byte_bounded_units` divides. One failure is tolerated (the pool is a FairSpillPool,
+    /// so unrelated work can squeeze a unit out); only a repeat says it is too big.
     pub fn retry_or_split(&mut self, key: &TaskKey, reason: String, when_micros: i64, attempts: u32) {
         // A missing field is the opposite verdict: unplannable at any width.
         if is_schema_failure(&reason) {
@@ -2095,9 +1802,8 @@ impl TaskJournal {
         if repeated_capacity && self.split_task(key, SplitTrigger::RepeatedFailure, None) {
             return;
         }
-        // Split refused (already minimum width, or would hash-shard) on a REPEATED
-        // capacity failure: the caller's delay is tuned for transient contention
-        // (1s for admission), so use the exponential backoff instead of hot-looping.
+        // Split refused on a REPEATED capacity failure: the caller's delay is tuned for
+        // transient contention, so use the exponential backoff instead of hot-looping.
         let escalated = crate::support::now_micros().saturating_add(exponential_backoff_micros(attempts));
         self.retry(key, reason, if repeated_capacity { when_micros.max(escalated) } else { when_micros });
     }
@@ -2107,22 +1813,21 @@ impl TaskJournal {
     }
 
     fn split_task(&mut self, key: &TaskKey, trigger: SplitTrigger, input: Option<InputFootprint>) -> bool {
-        // A Repair unit's cost is the FILE it rewrites, and time-bisection cannot
-        // shrink a file set — every child would fight over the same file.
+        // A Repair unit's cost is the FILE it rewrites; time-bisection cannot shrink a file
+        // set, so every child would fight over the same file.
         if key.operation == Operation::Repair {
             crate::observability::maintenance_stats().split_declined_at_floor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         let Some(index) = self.task_indices.get(key).copied() else { return false };
         let mut parent = self.snapshot.tasks[index].clone();
-        // Children of a split read ALL of the parent's files (a row group cannot
-        // be pruned below), and `coarsen_to_width` needs the stamp to refuse them later.
+        // Children of a split read ALL of the parent's files, and `coarsen_to_width` needs
+        // the stamp to refuse them later.
         parent.input = input.or(parent.input);
-        // Bisecting halves TIME, and only halves BYTES while the slice is wide
-        // enough to drop whole files; below that the cost stops falling while
-        // `byte_bounded_units` keeps modelling children by time share, so splits
-        // "fit" on paper forever. Decline once a child costs most of its parent and
-        // let it RUN — the runner hash-shards internally at any width.
+        // Bisecting halves BYTES only while the slice is wide enough to drop whole files;
+        // below that the modelled cost keeps falling while the real one does not, so splits
+        // "fit" on paper forever. Decline once a child costs most of its parent and let it
+        // RUN — the runner hash-shards internally at any width.
         let observed_bytes = match trigger {
             SplitTrigger::Preflight(bytes) => Some(bytes),
             SplitTrigger::RepeatedFailure => parent.preflight_decoded_bytes,
@@ -2137,7 +1842,6 @@ impl TaskJournal {
             SplitTrigger::RepeatedFailure => bisect_time_unit(&parent, cost).map(Vec::from).unwrap_or_default(),
         };
         if children.len() <= 1 || children.iter().any(|child| child.hash_shards > 1) {
-            // A unit that can neither finish nor shrink is invisible otherwise.
             crate::observability::maintenance_stats().split_declined_no_width.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
@@ -2146,15 +1850,15 @@ impl TaskJournal {
         task.retry_reason = Some("split_into_smaller_slices".to_owned());
         self.dirty_tasks.insert(key.clone());
         for mut child in children {
-            // What the PARENT measured; the child's modelled share is the untrustworthy number.
+            // What the PARENT measured; the child's modelled share is not trustworthy.
             child.parent_measured_bytes = observed_bytes;
             child.preflight_decoded_bytes = None;
             child.state = TaskState::Pending;
             child.attempts = 0;
             child.retry_reason = None;
             child.publication = None;
-            // A split narrows the WORK, not the priority: without this the children
-            // rank by their own narrow width and fall behind every day-wide unit.
+            // A split narrows the WORK, not the priority: without this the children rank by
+            // their own narrow width and fall behind every day-wide unit.
             child.backfill_priority_micros = Some(parent.scheduling_width());
             self.upsert(child);
         }
@@ -2164,7 +1868,6 @@ impl TaskJournal {
     /// A process may die after selecting work. Running is not a durable lease;
     /// requeue it at boot so recovery produces redundant work, never a hole.
     pub fn requeue_running(&mut self, now_micros: i64) -> usize {
-        // Disjoint field borrows, so the pipeline can mark tasks dirty as it goes.
         let dirty = &mut self.dirty_tasks;
         self.snapshot.tasks.iter_mut().filter(|task| task.state == TaskState::Running).fold(0, |count, task| {
             task.state = TaskState::Retry;
@@ -2183,10 +1886,8 @@ impl TaskJournal {
         self.task(key).map(|task| task.state)
     }
 
-    /// Files this unit's footprint says it reads, if it has one yet.
-    ///
-    /// `None` for a unit that has never been claimed — `record_input` writes the
-    /// footprint at claim time — which means the scheduler ordered it blind.
+    /// Files this unit's footprint says it reads. `None` for a unit that has never been
+    /// claimed, since `record_input` writes the footprint at claim time.
     pub fn input_files(&self, key: &TaskKey) -> Option<u32> {
         self.task(key).and_then(|task| task.input).map(|input| input.files)
     }
@@ -2211,12 +1912,9 @@ impl TaskJournal {
             .collect()
     }
 
-    /// Rows this project has PUBLISHED into `target` over slices overlapping
-    /// `[start, end)`.
-    ///
-    /// The comparator for an empty publication: day-level `source_rows` is keyed
-    /// on (project, date) while a unit is an hour, so a genuinely empty hour of a
-    /// busy day reads as non-empty.
+    /// Rows this project has PUBLISHED into `target` over slices overlapping `[start, end)`.
+    /// Use instead of day-level `source_rows`, which is keyed on (project, date) and so reads
+    /// a genuinely empty hour of a busy day as non-empty.
     pub fn published_rows_overlapping(&self, project_id: &str, target: &str, start: i64, end: i64) -> u64 {
         self.snapshot
             .tasks
@@ -2226,19 +1924,13 @@ impl TaskJournal {
             .sum()
     }
 
-    /// Reopen the COMPLETE derived cells built over a base range that has just
-    /// been republished. Returns how many were reopened.
+    /// Reopen the COMPLETE derived cells built over a base range that has just been
+    /// republished, returning how many. A derived cell's witness is the RAW partition, so a
+    /// rebuilt base otherwise leaves it serving an aggregate of a base that no longer exists.
     ///
-    /// A derived cell's input is the base tier, but its witness is the RAW
-    /// partition, so a rebuilt base leaves the cell serving an aggregate of a base
-    /// that no longer exists and never revisiting it.
-    ///
-    /// Deliberately NOT `invalidate`: that would mint `Dedup` work, and rebuilding
-    /// a rollup tier says nothing about whether the raw partition needs dedup.
-    ///
-    /// Only `Complete` cells are touched, and this mints no task, so it cannot loop.
+    /// Deliberately NOT `invalidate`: that would mint `Dedup` work, which a rollup rebuild
+    /// says nothing about. Mints no task, so it cannot loop.
     pub fn reopen_derived_over(&mut self, project_id: &str, rollup_table: &str, start_micros: i64, end_micros: i64) -> usize {
-        // Disjoint field borrows, so the pipeline can mark tasks dirty as it goes.
         let dirty = &mut self.dirty_tasks;
         self.snapshot
             .tasks
@@ -2253,8 +1945,8 @@ impl TaskJournal {
             .fold(0, |reopened, task| {
                 task.state = TaskState::Pending;
                 task.retry_reason = None;
-                // `Publication` is what coverage is recovered from at boot; leaving
-                // it would have the next process re-adopt the cell being replaced.
+                // `Publication` is what coverage is recovered from at boot; leaving it would
+                // have the next process re-adopt the cell being replaced.
                 task.publication = None;
                 dirty.insert(task.key.clone());
                 reopened + 1
@@ -2273,18 +1965,14 @@ impl TaskJournal {
         }
     }
 
-    /// Append the pending journal records and fsync them.
-    ///
-    /// Called synchronously on every claim, complete and retry, from tasks on the
-    /// shared runtime, so the blocking `fsync` goes through
-    /// `without_blocking_the_worker`. The mutex is still held across it, so
-    /// durability ordering is unchanged.
+    /// Append the pending journal records and fsync them. Called synchronously from tasks on
+    /// the shared runtime, so the blocking `fsync` must go through
+    /// `without_blocking_the_worker`; the mutex stays held across it for durability ordering.
     pub fn checkpoint(&mut self) -> anyhow::Result<()> {
         if let Some(parent) = self.wal_path.parent() {
             fs::create_dir_all(parent)?;
         }
         if !self.dirty_tasks.is_empty() || !self.dirty_cursors.is_empty() || !self.removed_tasks.is_empty() {
-            // Disjoint field borrows: the three drains are mutable, the two lookups shared.
             let Self { wal_path, dirty_tasks, dirty_cursors, removed_tasks, task_indices, snapshot, .. } = self;
             let (task_indices, snapshot) = (&*task_indices, &*snapshot);
             let mut wal = OpenOptions::new().create(true).append(true).open(&*wal_path)?;
@@ -2296,8 +1984,8 @@ impl TaskJournal {
                 .chain(dirty_cursors.drain().filter_map(|source| {
                     (snapshot.source_cursors.get(&source).copied()).map(|delta_version| JournalRecord::SourceCursor { source, delta_version })
                 }))
-                // AFTER the upserts, so a key removed and re-created in the same
-                // window keeps the re-creation.
+                // AFTER the upserts, so a key removed and re-created in the same window keeps
+                // the re-creation.
                 .chain(removed_tasks.drain().filter(durable).map(JournalRecord::Removed))
                 .try_fold(Vec::new(), |mut records, record| {
                     serde_json::to_writer(&mut records, &record)?;
@@ -2317,17 +2005,11 @@ impl TaskJournal {
     }
 
     /// How often `checkpoint` may recompute the maintenance gauges.
-    ///
-    /// Pure observability; nothing consults the gauges transactionally.
     const STATS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-    /// `publish_statistics`, but at most once per [`Self::STATS_PUBLISH_INTERVAL`].
-    ///
-    /// `publish_statistics` is a full linear scan of `snapshot.tasks` held under
-    /// the global journal mutex, and its cost grows with journal HISTORY rather
-    /// than with load. The gauges are republished on the next tick, so no reader
-    /// can tell. `publish_statistics` stays unthrottled for callers needing an
-    /// exact read now — chiefly tests.
+    /// `publish_statistics`, but at most once per [`Self::STATS_PUBLISH_INTERVAL`] — it is a
+    /// full scan of `snapshot.tasks` under the global journal mutex, costed by journal
+    /// HISTORY rather than load. Call `publish_statistics` directly for an exact read now.
     fn publish_statistics_throttled(&mut self) {
         let now = std::time::Instant::now();
         if self.stats_published_at.is_some_and(|last| now.duration_since(last) < Self::STATS_PUBLISH_INTERVAL) {
@@ -2337,20 +2019,11 @@ impl TaskJournal {
         self.publish_statistics();
     }
 
-    /// Drop FINISHED tasks whose slice is past the abandonment horizon, which
-    /// otherwise accumulate forever and are re-serialized by every `compact`.
+    /// Drop FINISHED tasks whose slice is past the abandonment horizon, which otherwise
+    /// accumulate forever and are re-serialized by every `compact`. Pending work past the
+    /// horizon stays — `beyond_horizon_tasks` is how the abandoned debt is sized.
     ///
-    /// Only FINISHED tasks go: pending work past the horizon stays, because
-    /// `beyond_horizon_tasks` is how the abandoned debt is sized.
-    ///
-    /// Losing a finished task makes `rollup_slice_complete` answer false, and
-    /// `recover_rollup_coverage` then skips the slice rather than enqueueing a
-    /// rebuild, so this cannot start a rework storm.
-    ///
-    /// Goes through `retain_tasks` so each drop leaves a `JournalRecord::Removed`
-    /// tombstone and survives a restart on the cheap append. It belongs on the
-    /// periodic hygiene pass, not inside `compact`, which several callers use
-    /// purely to persist a removal.
+    /// Goes through `retain_tasks` so each drop leaves a tombstone and survives a restart.
     pub fn prune_retired_history(&mut self, now_micros: i64) -> usize {
         let dropped = self.retain_tasks(|task| {
             !matches!(task.state, TaskState::Complete | TaskState::Superseded)
@@ -2367,15 +2040,15 @@ impl TaskJournal {
             fs::create_dir_all(parent)?;
         }
 
-        // Derived work is left out of the authoritative snapshot, so a reload
-        // starts with none of it and `plan_compaction_debt` re-derives it.
+        // Derived work is left out of the authoritative snapshot: a reload starts with none
+        // of it and `plan_compaction_debt` re-derives it.
         let durable = Snapshot {
             version: self.snapshot.version,
             tasks: self.snapshot.tasks.iter().filter(|task| !is_derived_operation(task.key.operation)).cloned().collect(),
             source_cursors: self.snapshot.source_cursors.clone(),
         };
-        // Serialize AND write off the worker: the `to_vec` over every live task is
-        // as costly as the fsync, and both hold the journal mutex.
+        // Serialize AND write off the worker: the `to_vec` over every live task is as costly
+        // as the fsync, and both hold the journal mutex.
         crate::support::without_blocking_the_worker(|| -> anyhow::Result<()> {
             let bytes = serde_json::to_vec(&durable)?;
             crate::write::wal::write_atomic_with(&self.path, true, |file| file.write_all(&bytes))?;
@@ -2406,11 +2079,8 @@ impl TaskJournal {
             counts[task.state as usize] = counts[task.state as usize].saturating_add(1);
             if task.state.is_active() {
                 backlog_bytes = backlog_bytes.saturating_add(task.estimated_decoded_bytes);
-                // The age gauge covers only work the scheduler still intends to
-                // do; past `STARVATION_HORIZON_MICROS` a task is abandoned and is
-                // counted separately so the debt is sized rather than hidden.
-                // Aged from `created_unix_ms`, which can precede the slice end, so
-                // the gauge is bounded by the horizon plus one slice width.
+                // The age gauge covers only work the scheduler still intends to do; past the
+                // horizon a task is abandoned and counted separately.
                 if now_micros.saturating_sub(task.key.slice.end_micros) > STARVATION_HORIZON_MICROS {
                     beyond_horizon = beyond_horizon.saturating_add(1);
                 } else {
@@ -2419,8 +2089,8 @@ impl TaskJournal {
                 if task.key.operation == Operation::SealedConsolidation {
                     sealed_debt_bytes = sealed_debt_bytes.saturating_add(task.estimated_decoded_bytes);
                 }
-                // Per-operation split, plus what is claimable now: when coverage
-                // stalls, is the work absent, ineligible, or out-competed?
+                // Per-operation split, plus what is claimable now: when coverage stalls, is
+                // the work absent, ineligible, or out-competed?
                 per_operation[task.key.operation as usize] = per_operation[task.key.operation as usize].saturating_add(1);
                 if matches!(task.state, TaskState::Pending | TaskState::Retry) && task.deadline_micros <= now_micros {
                     if task.key.operation == Operation::BaseRollup {
@@ -2479,90 +2149,66 @@ impl TaskState {
 /// The claim-order tuple `claim_next` minimises: see `TaskJournal::rank`.
 type Rank = (u8, u8, u8, u8, u8, i64, i64, i64);
 
-// How long past SEALING a partition may carry debt before it is overdue. Raising
-// this does NOT protect the query window: `starved` beats non-starved outright,
-// so a higher threshold evicts the window from the privileged lane. Bound the
-// claim share instead (see `claim_next`).
+// How long past SEALING a partition may carry debt before it is overdue. Raising this does
+// NOT protect the query window — `starved` beats non-starved outright, so a higher threshold
+// evicts the window from the privileged lane. Bound the claim share instead (see `claim_next`).
 const STARVATION_MICROS: i64 = 3 * DAY_MICROS;
-/// The window dashboards read, and therefore the window maintenance has to keep
-/// clean.
+/// The window dashboards read, and therefore the window maintenance has to keep clean.
 const QUERY_WINDOW_MICROS: i64 = 14 * DAY_MICROS;
-/// Upper bound on starvation escalation: without it every sealed partition older
-/// than a day qualifies, and a flag everything sets sorts nothing.
-///
-/// Beyond this bound a task stops gaining escalation from the window and gains
-/// one step per further day instead (the graded term in `scheduling_class`); a
-/// hard cut-off instead made the far tail permanently unreachable.
-///
-/// 31 days, because the flat part of the escalation must cover the GOAL window
-/// and no more. Outside it a partition is effectively ABANDONED — its class is
-/// replenished continuously, so it is only reachable when the 3-31 day band is
-/// empty — which is why `publish_statistics` counts beyond-horizon work
-/// separately instead of letting it pin the oldest-task age gauge.
+/// Upper bound on starvation escalation: without it every sealed partition older than a day
+/// qualifies, and a flag everything sets sorts nothing. Beyond it a task gains one step per
+/// further day (the graded term in `scheduling_class`) rather than hitting a hard cut-off,
+/// which would make the far tail unreachable.
 pub(crate) const STARVATION_HORIZON_MICROS: i64 = 31 * DAY_MICROS;
 
 fn scheduling_class(task: &MaintenanceTask, now_micros: i64) -> (u8, u8, i64, i64, i64) {
     if is_frontier_task(task, now_micros) {
-        // Smaller tuples run first. Negating makes the newest minute the most
-        // urgent while keeping all projects in that minute deadline-equivalent.
-        // Width is not a frontier concern — these are all one slice wide.
+        // Smaller tuples run first, so negating makes the newest minute the most urgent while
+        // keeping all projects in that minute deadline-equivalent.
         (0, 0, 0, 0, -task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS))
     } else {
-        // Newest slice first: recent days are what dashboards read. Eligibility is
-        // still deadline-gated in `claim_next`, so retry backoff is unaffected.
+        // Newest slice first, but WIDTH outranks recency: a day-sized unit is the only kind
+        // that advances the horizon, and a freshly sealed day carries ~144 ten-minute units
+        // per project per tier.
         //
-        // WIDTH outranks recency: a day-sized unit comes from the backfill planner
-        // and is the only kind that advances the horizon, while a freshly sealed
-        // day carries ~144 ten-minute units per project per tier — newest-first
-        // alone would never reach the day before yesterday.
-        //
-        // A SEALED task's age is how long its DATA has been sealed, NOT how long
-        // its record has existed: records are re-created constantly (planner
-        // re-derivation, restarts, `coarsen_to_width` fusion), so a record
-        // birthday makes the threshold unreachable and starves coarsened output.
+        // A SEALED task's age is how long its DATA has been sealed, NOT how long its record
+        // has existed — records are re-created constantly, so a record birthday makes the
+        // threshold unreachable and starves coarsened output.
         let waited = now_micros.saturating_sub(task.key.slice.end_micros);
         // The horizon is a SLOPE, not a cliff: below the floor is worst, the whole
-        // [floor, horizon] band ties so every later term still decides inside it,
-        // and each further DAY past the horizon is one step better, saturating at
-        // 0. Graded in DAYS, not raw age, because `claim_next` matches the winning
-        // tuple EXACTLY — a continuous key would make one unit the sole winner of
-        // every claim and defeat the per-project rotation in `fair_cursors`.
+        // [floor, horizon] band ties, and each further DAY past it is one step better.
+        // Graded in DAYS because `claim_next` matches the winning tuple EXACTLY — a
+        // continuous key would make one unit the sole winner and defeat `fair_cursors`.
         let starved = if waited < STARVATION_MICROS {
             u8::MAX
         } else {
             (u8::MAX - 1).saturating_sub(u8::try_from(waited.saturating_sub(STARVATION_HORIZON_MICROS).max(0) / DAY_MICROS).unwrap_or(u8::MAX))
         };
-        // Starved work drains OLDEST-first; fresh work stays newest-first. Both
-        // halves are needed: a starved task escalated but then ordered by recency
-        // just joins a larger set that still drains newest-first.
+        // Starved work drains OLDEST-first; fresh work stays newest-first. Both halves are
+        // needed: escalating a task but still ordering it by recency changes nothing.
         let recency = task.key.slice.end_micros.div_euclid(PRIORITY_BUCKET_MICROS);
-        // File hygiene ranks by BENEFIT, not date: every hygiene unit is day-wide,
-        // so `-width` is constant among them and recency says nothing about how
-        // much debt a claim retires. Zero files orders LAST — "benefit unknown".
+        // File hygiene ranks by BENEFIT, not date: every hygiene unit is day-wide, so
+        // `-width` is constant among them. Zero files orders LAST — "benefit unknown".
         let benefit = match task.key.operation {
-            // BUCKETED for the same reason recency is: `claim_next` matches the
-            // winning tuple EXACTLY, so a raw file count would make one cell the
-            // sole winner of every claim and defeat `fair_cursors` rotation.
+            // Bucketed for the same reason recency is: an exact tuple match plus a raw file
+            // count would make one cell the sole winner of every claim.
             Operation::SealedConsolidation | Operation::HotPacking | Operation::Repair => {
                 -i64::from(task.input.map_or(0, |input| input.files) / BENEFIT_BUCKET_FILES)
             }
             _ => 0,
         };
-        // Keyed on the AGE, not on `starved`: the graded term is 254 in-band, not 0,
-        // so testing the rank value here would flip the whole backlog to newest-first.
-        // Width goes through `scheduling_width` so SPLITTING a backfill unit does
-        // not demote its children out of reach.
+        // Keyed on the AGE, not on `starved`: the graded term is 254 in-band, not 0, so
+        // testing the rank value here would flip the whole backlog to newest-first. Width
+        // goes through `scheduling_width` so splitting does not demote a unit's children.
         (1, starved, -task.scheduling_width(), benefit, if waited >= STARVATION_MICROS { recency } else { -recency })
     }
 }
 
 /// Does this task make its (project, date, tier) cell ineligible for re-planning?
 ///
-/// Only work that will actually RUN may veto: `Superseded` is what a split leaves
-/// on a parent and is never claimable, so letting it block would mark every
-/// split day "already queued" permanently. The children are `Pending` and veto on
-/// their own, so dropping the parent's veto cannot cause duplicate work. Only the
-/// operations a backfill enqueues count — unrelated file debt must not veto.
+/// Only work that will actually RUN may veto: `Superseded` is never claimable, so letting it
+/// block would mark every split day "already queued" permanently. Only the operations a
+/// backfill enqueues count — unrelated file debt must not veto.
 pub fn blocks_rollup_backfill(task: &MaintenanceTask) -> bool {
     matches!(task.key.operation, Operation::Dedup | Operation::BaseRollup | Operation::DerivedRollup) && task.state.is_active()
 }
@@ -2576,14 +2222,9 @@ fn is_live_frontier(slice: TimeSlice, now_micros: i64) -> bool {
     slice.end_micros >= now_micros.saturating_sub(LIVE_FRONTIER_WINDOW_MICROS) && slice.start_micros <= now_micros
 }
 
-/// Whether a TASK is live-frontier work, which is not the same question as
-/// whether its slice is inside the frontier window.
-///
-/// `SealedConsolidation` never is, whatever its slice says: it is minted for dates
-/// older than today, while `is_live_frontier` stays true for a full
-/// `LIVE_FRONTIER_WINDOW_MICROS` (24 h) after a slice ENDS, and class is STRICT
-/// priority. HotPacking is deliberately NOT excluded — it is minted for today, so
-/// its slice and its operation agree.
+/// Whether a TASK is live-frontier work — not the same question as whether its slice is
+/// inside the frontier window. `SealedConsolidation` never is, whatever its slice says, since
+/// `is_live_frontier` stays true for 24 h after a slice ENDS and class is STRICT priority.
 fn is_frontier_task(task: &MaintenanceTask, now_micros: i64) -> bool {
     task.key.operation != Operation::SealedConsolidation && is_live_frontier(task.key.slice, now_micros)
 }
@@ -2680,45 +2321,15 @@ impl AdmissionState {
 #[derive(Clone, Debug)]
 pub struct AdmissionController(Arc<Mutex<AdmissionState>>);
 
-/// The largest single unit a pool at this occupancy will admit.
-///
-/// ClickHouse's rule, and the most transferable idea in the prior-art survey
-/// (`docs/plans/2026-08-31-how-other-systems-schedule-maintenance.md`, rule 2):
-/// scale the size cap by how much of the pool is free, so a busy pool admits
-/// only SMALL work. Its documented rationale is ours exactly — *"to allow small
-/// merges to process, not filling the pool with long running merges"* — and it
-/// subsumes a deadline, because an oversized unit is never admitted into a
-/// position where it would have to be killed.
-///
-/// Linear rather than ClickHouse's geometric interpolation: monotone, trivially
-/// explainable, and the floor is what actually matters (a busy pool must still
-/// admit the small hygiene bins that keep file counts down).
-///
-/// Always on, and deliberately not a knob: one admission rule is easier to
-/// reason about than two, and a flag that is never flipped is a second
-/// architecture nobody tests.
+/// The largest single unit a pool at this occupancy will admit: the size cap
+/// scales linearly with the free fraction, so a busy pool admits only small work.
 fn occupancy_scaled_ceiling(available: u64, capacity: u64) -> u64 {
     /// A busy pool must still admit work this small, or hygiene starves.
     const FLOOR: u64 = MAX_DECODED_BYTES / 16;
     /// Free fraction at which the FULL cap is granted, as a divisor: 2 = half
-    /// free. ClickHouse grants its whole 150 GB merge cap at **8 free pool
-    /// entries of 16** — half free, not idle — and that detail is the whole
-    /// rule. Ours reached `MAX_DECODED_BYTES` only at `available == capacity`
-    /// exactly, which no working pool ever is, so every unit priced at exactly
-    /// `MAX_DECODED_BYTES` was refused forever. That is precisely what the
-    /// splitter produces (`byte_bounded_units` halves until a unit FITS the
-    /// constant) and what both admission sites clamp their request to, so the
-    /// gate excluded the design's own intended shape: reserve the maximum, then
-    /// hash-shard internally. Prod 2026-09-02 carried 365 dedup units at a
-    /// median of exactly 512.0 MiB, median age 14.6 days.
-    ///
-    /// Honest about the practical effect: at prod's ratios — at most
-    /// `coordinator_jobs x MAX_DECODED_BYTES` = 8 GiB reserved against a 60 GiB
-    /// capacity — this ceiling is now INERT until the pool is half reserved. It
-    /// is a backstop for a genuinely full pool, not a live throttle, and that is
-    /// the right division of labour: the job count already bounds the
-    /// monopolization the ceiling was written to stop, and it bounds it by
-    /// construction rather than by a race.
+    /// free. It must not be 1: no working pool is ever fully free, so a unit
+    /// priced at exactly `MAX_DECODED_BYTES` — which is what the splitter
+    /// produces — would then be refused forever.
     const FULL_CAP_AT_FREE_FRACTION: u128 = 2;
     let scaled = (u128::from(MAX_DECODED_BYTES) * FULL_CAP_AT_FREE_FRACTION * u128::from(available) / u128::from(capacity.max(1))) as u64;
     scaled.clamp(FLOOR, MAX_DECODED_BYTES)
@@ -2783,9 +2394,7 @@ mod tests {
 
     use super::*;
 
-    /// Verbatim prod text, 2026-08-24: base files written before a rollup spec
-    /// change lacked `duration_digest`, and the DataFusion `SchemaError` that
-    /// raised arrives type-erased, so the strings are the contract.
+    /// The DataFusion `SchemaError` arrives type-erased, so its text is the contract.
     #[test]
     fn schema_failures_are_recognised_from_prod_text() {
         assert!(is_schema_failure("Schema error: No field named duration_digest. Valid fields are __maintenance_slice_input_0.project_id, ..."));
@@ -2796,12 +2405,8 @@ mod tests {
     }
 
     /// A missing column cannot be halved away: every CHILD of a bisection names
-    /// it too and fails identically, so splitting turns one bad spec into a
-    /// retry storm. Prod 2026-08-24: 477 of 658 claims failed in eight minutes,
-    /// the 1h rollup tier stopped ingesting entirely, and every other operation
-    /// starved behind the churn. Both entry points must park instead — and the
-    /// park has to survive the 60s planner re-mint, or it is a hot loop with a
-    /// fresh face.
+    /// it too and fails identically, so both entry points must park instead —
+    /// and the park has to survive the 60s planner re-mint.
     #[test_case::test_case(true ; "the worker hands back a plan error")]
     #[test_case::test_case(false ; "a fast-fail retry reason carries one")]
     fn a_deterministic_plan_error_parks_instead_of_shredding_the_slice(via_abandon: bool) {
@@ -2832,29 +2437,8 @@ mod tests {
 
     /// Abandoning an UNSPLITTABLE unit waits the greater of its exponential
     /// backoff and the operation's own deadline — but only once it has failed
-    /// more than once. Three incidents, one formula:
-    ///
-    /// `a_unit_that_burned_its_deadline_waits_at_least_that_long_again`: a unit
-    /// that cannot be split — repair is the standing case, since its cost is the
-    /// file it rewrites and time-bisection cannot shrink a file set — must not
-    /// come straight back. Burning a 900s deadline and returning 256s later is a
-    /// ~78% duty cycle on a worker, forever, for a unit that has never produced
-    /// anything. Prod 2026-08-18: 7 Repair units timed out at 900s inside a
-    /// 15-minute window — 6,300 of 14,400 available slot-seconds, 44% of all
-    /// maintenance capacity. Rollup coverage could not advance behind that
-    /// whatever the scheduling cycle did.
-    ///
-    /// `a_first_abandonment_is_not_floored`: a FIRST abandonment must still come
-    /// back fast. The pool is a FairSpillPool, so a correctly sized unit can be
-    /// squeezed out by someone else's memory spike and succeed untouched next
-    /// pass — making that wait a full deadline would penalise the innocent case.
-    /// Only a repeat says the unit is oversized, which is the same threshold the
-    /// split path already uses.
-    ///
-    /// `the_deadline_floor_does_not_cap_exponential_backoff`: the floor must not
-    /// REPLACE exponential backoff, only raise it. A unit that has failed many
-    /// times should keep backing off past the deadline, or a permanently broken
-    /// unit still returns every 15 minutes forever.
+    /// more than once, so a one-off squeeze-out is not penalised. The floor
+    /// raises the backoff, it never replaces it.
     #[test_case::test_case(Operation::Repair, 1 => 2 * 1_000_000i64 ; "a_first_abandonment_is_not_floored")]
     #[test_case::test_case(Operation::Repair, 5 => with |delay: i64| assert!(delay >= floor_micros(Operation::Repair), "a repair unit that burned {}s must wait at least that long again, waited {}s", floor_micros(Operation::Repair) / 1_000_000, delay / 1_000_000) ; "a_unit_that_burned_its_deadline_waits_at_least_that_long_again")]
     #[test_case::test_case(Operation::Dedup, 8 => (256 * 1_000_000i64).max(floor_micros(Operation::Dedup)) ; "the_deadline_floor_does_not_cap_exponential_backoff")]
@@ -2870,12 +2454,8 @@ mod tests {
     }
 
     /// A fast-fail retry (resource admission) repeats identically at the same
-    /// size: the estimate exceeds what admission can ever grant. This was the
-    /// ONE retry path with no split — prod 2026-08-21, a 1.1TB-estimate
-    /// day-wide Repair looped at its 1s admission delay for days (attempts
-    /// 140-211), never claiming a worker, so neither abandon_running's split
-    /// nor its floor ever fired. Routed through retry_or_split, a repeated
-    /// admission failure bisects like any other capacity failure.
+    /// size, never claiming a worker, so neither `abandon_running`'s split nor
+    /// its floor fires. A repeated admission failure must bisect instead.
     #[test]
     fn a_repeated_admission_failure_splits_instead_of_hot_looping() {
         let (_dir, mut journal) = new_journal();
@@ -2886,7 +2466,7 @@ mod tests {
             &mut journal,
             task("p", 0, DAY_MICROS, Operation::SealedConsolidation).tap_mut(|unit| {
                 unit.attempts = 3;
-                unit.estimated_decoded_bytes = 1_100_000_000_000; // the observed 1.1TB
+                unit.estimated_decoded_bytes = 1_100_000_000_000;
             }),
         );
 
@@ -2898,21 +2478,9 @@ mod tests {
         assert!(children.iter().all(|t| t.attempts == 0));
     }
 
-    /// REPRODUCES the 2026-09-03 split-floor leak: `retry_or_split` handed the
-    /// guard a SYNTHETIC `MAX_DECODED_BYTES + 1` instead of the unit's own
-    /// estimate, so `split_sheds_enough` compared a CONSTANT against the
-    /// parent's real measured bytes. Against any parent above ~683 MiB that
-    /// constant always satisfies `observed * 4 < parent * 3`, so the shed test
-    /// passed at every level and the lineage bisected to `MIN_SLICE_MICROS`.
-    ///
-    /// Prod 2026-09-03: **147 live units at or below the 60 s floor** — all
-    /// `base_rollup`, all one whale project — plus 8,595 completed there
-    /// historically, with `parent_measured_bytes` 512 MiB..17,020 MiB against
-    /// own estimates of 171 MiB..8,510 MiB. The guard was consulted at every
-    /// level and said yes at every level.
-    ///
-    /// The unit below shed NOTHING: its own estimate equals its parent's
-    /// measurement, so bisecting again cannot help and must be declined.
+    /// A unit whose own estimate equals its parent's MEASUREMENT shed nothing,
+    /// so bisecting again cannot help and must be declined — otherwise the
+    /// lineage bisects all the way to `MIN_SLICE_MICROS`.
     #[test_case::test_case(true ; "timeout")]
     #[test_case::test_case(false ; "capacity failure")]
     fn a_lineage_that_did_not_shed_is_not_split_again(via_timeout: bool) {
@@ -2973,11 +2541,7 @@ mod tests {
 
     /// The planner re-derives file debt every 60s and enqueues the same day-wide
     /// key while a partition stays out of policy. That re-mint must not resurrect
-    /// a parent `split_time_task` superseded: prod 2026-08-21, project 87576849,
-    /// held ~6 whole-day Repair units at attempts 140-204 for days — each timeout
-    /// split the parent, the next 60s tick flipped it back to Pending with its
-    /// attempts intact, and the day-wide width outranked its own 12h children in
-    /// `scheduling_class`, so across 24h of logs not one child ever started.
+    /// a parent `split_time_task` superseded, or its live children never start.
     #[test]
     fn a_replanned_day_does_not_resurrect_a_superseded_parent() {
         let (_dir, mut journal) = new_journal();
@@ -3006,9 +2570,7 @@ mod tests {
     /// The same 60s re-mint must not erase what `abandon_running` recorded: its
     /// deadline floor is the only bound on a doomed unit's duty cycle, and its
     /// `worker_error` reason is what routes the unit through the small quarantine
-    /// permit. Prod 2026-08-21: day-wide Repair units were re-claimed every 5-8
-    /// minutes against a >=900s floor, because every planner tick pulled the
-    /// deadline back to `now` and cleared the reason.
+    /// permit.
     #[test]
     fn a_replanned_debt_does_not_erase_worker_failure_backoff() {
         let (_dir, mut journal) = new_journal();
@@ -3030,24 +2592,10 @@ mod tests {
     /// Sealed ordering ranks wide units first because width PROXIES backfill
     /// provenance: a day-sized unit comes from the backfill planner and is the
     /// only kind that advances the horizon, while a ten-minute one is what the
-    /// live path mints by the hundred. `split_time_task` breaks that proxy — the
-    /// children are still the backfill work that moves coverage, but they now
-    /// measure 180s and rank below every day-wide unit anywhere in history.
-    ///
-    /// Prod 2026-08-19: `87576849`'s 2026-08-10 day unit was split into 928
-    /// fragments on 08-17, and over the following 40 minutes sealed BaseRollup
-    /// claims went to 2026-07-22 — a month older — while 08-10 got none. That
-    /// day stayed at zero rollup rows and capped `rollup_min_contiguous_days`
-    /// at 2. Ageing does not cover it: both are starved, and width decides
-    /// within the starved set.
-    ///
-    /// Asserted on the WIDTH TERM of `scheduling_class` rather than on     /// `fair_ready_tasks` returns. The original fixture compared a recent split
-    /// day against an older day-wide one and asserted the recent won; that has
-    /// since become the wrong expectation for a reason unrelated to this fix —
-    /// `starved` is now a per-day SLOPE past the 31-day horizon, so a 39-day
-    /// unit legitimately outranks a 9-day one before width is ever consulted.
-    /// Comparing the two units at the same seal time isolates the one term this
-    /// change actually moves.
+    /// live path mints by the hundred. `split_time_task` breaks that proxy, so a
+    /// child must keep its parent's width term or rank below every day-wide unit
+    /// in history. Asserted on the width term alone, at one seal time, so the
+    /// starvation slope does not confound it.
     #[test]
     fn a_split_backfill_child_keeps_its_parents_scheduling_width() {
         let now = 60 * DAY_MICROS;
@@ -3067,28 +2615,9 @@ mod tests {
         assert_eq!(scheduling_class(child, now).2, peer_width, "a split child must rank at its PARENT's width, not its own {}", child.key.slice.width());
     }
 
-    /// THE DASHBOARD-WINDOW ORDERING DEFECT, pinned as a measurement.
-    ///
-    /// `STARVATION_MICROS` is 3 days and starved work drains OLDEST-first, so of
-    /// the 14 days a dashboard reads, only days 1-3 stay newest-first. Days 4-14
-    /// are all "starved" and join the oldest-first backlog lane, where they
-    /// compete with MONTHS of history that is starved by a wider margin and
-    /// therefore outranks them.
-    ///
-    /// Prod 2026-09-01 is why this matters: certification cannot grant on
-    /// `otel_logs_and_spans` until duplicates are physically removed (0.0004% of
-    /// rows but spread over ~50 of 144 bins per date), so dedup order decides
-    /// when a queried window becomes certifiable. `pending_dedup` sat at ~2,250
-    /// while a 1.7M-row/day project measured 0 of 8 sampled dates certified.
-    ///
-    /// The query-window reservation must not preempt the sealed one, and must
-    /// not change what the first claims hand out.
-    ///
-    /// Both were caught by the suite while building it. `% 4 == 0` is also a
-    /// multiple of 2, so it STOLE sealed turns — and the sealed reservation
-    /// exists because without it sealed work never runs at all (prod 2026-08-17:
-    /// 278 consecutive starts, every one today or yesterday). `% 4 == 1` fired on
-    /// the very first claim, changing what a freshly-built journal returns.
+    /// The query-window reservation must not preempt the sealed one (any phase
+    /// that is a multiple of 2 or 4 steals sealed turns) and must not change what
+    /// the first claims hand out.
     #[test]
     fn the_window_reservation_composes_with_the_sealed_one() {
         // Sealed fires on multiples of 2, or of 4 while the frontier is behind.
@@ -3106,19 +2635,10 @@ mod tests {
         assert_eq!((1u64..=64).filter(|tick| tick % 4 == 3).count(), 16, "one claim in four, no more");
     }
 
-    /// Months-old history OUTRANKS the dates dashboards read, and the threshold
-    /// is not the lever.
-    ///
-    /// `STARVATION_MICROS` is 3 days and starved work drains oldest-first, so of
-    /// the 14 days a dashboard reads only days 1-3 escape the starved lane — and
-    /// `starved` is `u8::MAX` when NOT starved, so those three lose to everything
-    /// in it. Prod 2026-09-01: `pending_dedup` ~2,250 while a 1.7M-row/day project
-    /// had 0 of 8 sampled dates certified.
-    ///
-    /// Raising the threshold is REFUTED (see `STARVATION_MICROS`): it evicts the
-    /// window from the privileged lane and it loses by more. This pins the real
-    /// shape so a future fix — bounding the starved lane's share of claims, as
-    /// `claim_next` already does for sealed work — has a baseline to move.
+    /// Months-old history OUTRANKS the dates dashboards read: `starved` is
+    /// `u8::MAX` when NOT starved, so unstarved recent days lose to everything in
+    /// the starved lane. Raising `STARVATION_MICROS` makes it worse, not better;
+    /// this pins the shape a future fix has to move.
     #[test]
     fn months_old_history_outranks_the_dates_dashboards_read() {
         let now = 400 * DAY_MICROS;
@@ -3143,24 +2663,20 @@ mod tests {
     }
 
     /// The contiguity term: a pending Dedup slice that EXTENDS a completed run
-    /// outranks the one that would seed a new island — certification grants a
-    /// (project, date) only when the merged intervals cover the WHOLE day, and
-    /// prod 2026-09-05 measured day-cells holding a mode of 20-24 disjoint
-    /// islands each (worst 32), so 25% coverage certified nothing. Named after
-    /// the mechanism, guarded against the regression where the pre-term
-    /// oldest-first order picked the island seed.
+    /// outranks one that would seed a new island — certification grants a
+    /// (project, date) only when the merged intervals cover the WHOLE day.
     #[test]
     fn a_dedup_slice_extending_a_completed_run_outranks_an_island_seed() {
         const TEN_MIN: i64 = 10 * 60 * 1_000_000;
         let (_dir, mut journal) = new_journal();
         let now = 400 * DAY_MICROS;
         // Sealed and inside the [3d, 31d] starved band, where the whole band
-        // TIES on `starved` and the order used to fall through to oldest-first.
+        // TIES on `starved`.
         let day = now - 10 * DAY_MICROS;
         journal.upsert(task("p", day + 2 * TEN_MIN, day + 3 * TEN_MIN, Operation::Dedup).tap_mut(|done| done.state = TaskState::Complete));
 
-        // The island seed carries the OLDER end, so the pre-term order picked
-        // it; the extender shares a boundary with the completed run.
+        // The island seed carries the OLDER end; the extender shares a boundary
+        // with the completed run.
         let seed = task("p", day, day + TEN_MIN, Operation::Dedup);
         let extend = task("p", day + 3 * TEN_MIN, day + 4 * TEN_MIN, Operation::Dedup);
         assert!(journal.rank(&extend, now) < journal.rank(&seed, now), "the run-extending slice must outrank the island seed");
@@ -3238,20 +2754,9 @@ mod tests {
     /// (project, slice start, slice end, deadline, completed) — offsets from `ORDER_NOW`.
     type Stream = (&'static str, i64, i64, i64, bool);
 
-    /// `checkpoint` must not rescan the whole journal every time it is called.
-    ///
-    /// `publish_statistics` is O(tasks) and `checkpoint` ran it unconditionally,
-    /// while holding the single global `Mutex<TaskJournal>` that every claim,
-    /// completion and retry serializes on. Prod 2026-09-11 held 71,849 tasks —
-    /// 71,399 of them Complete history — and took ~2,032 checkpoints per minute;
-    /// the scan measured 1.70 ms at exactly that size, roughly a third of the
-    /// 5.45 ms average `journal_hold`. The cost grows with journal HISTORY, not
-    /// with load, so it worsens while the system sits still.
-    ///
-    /// Asserted on the SCAN COUNT rather than on a duration, because a timing
-    /// assertion on a shared CI box is a flake generator. Can-fail proof, run red
-    /// then restored: pointing `checkpoint` back at `publish_statistics` makes
-    /// this report 40 publishes for 40 checkpoints.
+    /// `checkpoint` must not rescan the whole journal every time it is called:
+    /// `publish_statistics` is O(tasks) and runs under the global journal mutex.
+    /// Asserted on the scan COUNT, not a duration, to avoid a timing flake.
     #[test]
     fn checkpoint_does_not_rescan_the_journal_on_every_call() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3281,22 +2786,9 @@ mod tests {
     }
 
     /// The hygiene pass must shed FINISHED work past the abandonment horizon,
-    /// keep everything else, and make the drop survive a restart.
-    ///
-    /// Nothing pruned it, so retired keys accumulated forever. A `docker cp`
-    /// census of the production journal on 2026-09-12: 79,682 tasks, **99.2%
-    /// Complete or Superseded**, **15,202 (19.1%) finished and older than the
-    /// horizon** — one of them 1,344 days old. `compact` rewrites all 51 MB
-    /// under the global mutex, which is where `journal_hold.max_ms` spikes of
-    /// 3.5 s come from.
-    ///
-    /// Three things must NOT be pruned, and each is asserted: pending work past
-    /// the horizon (that is the abandoned-debt gauge, and hiding it is not
-    /// paying it), retrying work past the horizon, and finished work inside it.
-    ///
-    /// Can-fail proof, run red then restored: dropping the state test prunes the
-    /// pending task and the `beyond_horizon` assertion goes red; dropping the
-    /// age test prunes the recent one and the survivor count goes red.
+    /// keep everything else, and make the drop survive a restart. Three things
+    /// must NOT be pruned: pending and retrying work past the horizon (that is
+    /// the abandoned-debt gauge), and finished work inside it.
     #[test]
     fn hygiene_sheds_finished_work_past_the_horizon_and_nothing_else() {
         let (dir, mut journal) = new_journal();
@@ -3317,8 +2809,7 @@ mod tests {
         add("fresh-pending", 2, TaskState::Pending);
         // Persist FIRST, or the durability assertion at the end is vacuous: an
         // unpersisted task cannot resurrect, so the tombstones would never be
-        // what kept it gone. (Measured — the assertion passed with
-        // `retain_tasks` bypassed until this checkpoint was added.)
+        // what kept it gone.
         journal.checkpoint().expect("persist the whole set before pruning any of it");
 
         assert_eq!(journal.prune_retired_history(now), 2, "exactly the two finished-and-past-the-horizon tasks");
@@ -3338,11 +2829,9 @@ mod tests {
         }
         assert_eq!(journal.prune_retired_history(now), 0, "a second pass has nothing left to drop");
 
-        // The drop must be DURABLE on the cheap append. `coarsen_sealed_slices`
-        // had exactly this bug: a pass removed tasks, persisted nothing, and the
-        // next restart undid it — prod took `pending_base_rollup` 88,618 -> 2,294
-        // with the on-disk journal byte-identical. Going through `retain_tasks`
-        // is what leaves the `Removed` tombstone that prevents it here.
+        // The drop must be DURABLE on the cheap append: going through
+        // `retain_tasks` is what leaves the `Removed` tombstone, without which
+        // the next restart undoes the prune.
         journal.checkpoint().expect("checkpoint the tombstones");
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         let names: Vec<&str> = reloaded.tasks().map(|t| t.key.project_id.as_str()).collect();
@@ -3350,16 +2839,8 @@ mod tests {
         assert_eq!(names.len(), 4, "and nothing else may vanish with them: {names:?}");
     }
 
-    /// Only outstanding ROLLUP work may veto a rollup backfill.
-    ///
-    /// This predicate used to be "any non-complete task on the source", so a
-    /// day carrying unrelated file debt was disqualified forever. Prod
-    /// 2026-08-17: the whale's Aug 15 `SealedConsolidation` sat on attempt 370,
-    /// and once the coarse-backfill migration retired the fine-grained
-    /// historical tasks there was nothing left to claim and nothing allowed to
-    /// replace it — every task start for 30 minutes was today's, rollup
-    /// coverage froze at three days, and 7d/14d queries fell back to a full raw
-    /// scan (`rollup_miss_not_built`).
+    /// Only outstanding ROLLUP work may veto a rollup backfill — unrelated file
+    /// debt on the same day must not disqualify it.
     #[test]
     fn only_outstanding_rollup_work_blocks_a_backfill() {
         for operation in [Operation::SealedConsolidation, Operation::HotPacking, Operation::Repair] {
@@ -3371,36 +2852,20 @@ mod tests {
             assert!(blocks_rollup_backfill(&outstanding), "{operation:?} is the work a backfill would queue; re-queueing it pushes its deadline out");
             let done = outstanding.clone().tap_mut(|t| t.state = TaskState::Complete);
             assert!(!blocks_rollup_backfill(&done), "a completed {operation:?} leaves the day open to backfill again");
-            // A SUPERSEDED parent is what `split_time_task` leaves behind, and it
-            // is never claimable. Letting it veto meant every day that was ever
-            // split had its cell marked "already queued" forever, so the planner
-            // could not re-admit it and the tier stayed holed permanently.
-            //
-            // Prod 2026-08-20 01:35, otel_logs_and_spans: `cells_missing=210`
-            // with `cells_wanted=0` and `derived_pending=22` — the census counts
-            // only Pending/Retry, so the superseded parents doing the blocking
-            // were invisible in every gauge. The 1h tier (what 30d dashboards
-            // read) sat at 22 days with its oldest date frozen at 2026-07-25
-            // across 32 minutes while the 1m tier held 31 days.
-            //
-            // Safe because a split parent's CHILDREN are Pending and still veto
-            // on their own; this only stops an unclaimable record from standing
-            // in for work nobody is going to do. Same reversal `can_fuse` already
-            // makes for coarsening.
+            // A SUPERSEDED parent is what `split_time_task` leaves behind and is
+            // never claimable, so it must not veto — its CHILDREN are Pending and
+            // still veto on their own.
             let split = outstanding.tap_mut(|t| t.state = TaskState::Superseded);
             assert!(!blocks_rollup_backfill(&split), "a superseded {operation:?} is unclaimable, so it must not veto the backfill that would replace it");
         }
     }
 
-    /// One call halves ONCE. Descending further would price the extra levels by
-    /// time share and stamp them all with this one measurement, which is what
-    /// made `split_sheds_enough` unreachable; the next level is minted only
-    /// after its own preflight has measured it.
+    /// One call halves ONCE: the next level is minted only after its own
+    /// preflight has measured it, never priced by time share from this one.
     #[test]
     fn halves_a_whale_once_and_hash_shards_at_the_floor() {
-        // A 10-minute slice is Dedup's floor now (see `byte_bounded_units`), so
-        // the halving property is asserted on an operation that still bisects
-        // there. The property under test is "one level per call", not the floor.
+        // A 10-minute slice is Dedup's floor, so the halving property is
+        // asserted on an operation that still bisects there.
         let input = task("whale", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup);
         let units = byte_bounded_units(&input, 10 * MAX_DECODED_BYTES);
         assert_eq!(units.len(), 2, "one level per measurement, not a subtree");
@@ -3414,26 +2879,11 @@ mod tests {
         assert!(shards.iter().all(|unit| unit.hash_shards == 3));
     }
 
-    /// Bisection prices children by TIME SHARE (`byte_bounded_units:444`), so it
-    /// always "fits" on paper. The real cost floors out — a slice reads at least
-    /// one row group of every file it overlaps — and the disagreement surfaces
-    /// only at the next preflight, which re-measures, finds itself over budget
-    /// and splits again. Prod 2026-08-22 held 3,455 units for a single
-    /// (project, tier, day), 1,423 of them pending.
-    ///
-    /// A child that measured essentially what its parent measured IS that floor,
-    /// observed. Splitting again cannot help, so the split must decline —
-    /// declining is safe because the runner already hash-shards INTERNALLY at
-    /// any width (`database/maintain.rs:1623`), which bounds memory without
-    /// minting a single journal unit.
-    ///
-    /// Declining a split must also leave the unit RUNNABLE, not merely
-    /// un-superseded. That is the failure mode that would be worse than the
-    /// shred it replaces: a unit declined at the floor and then never claimed
-    /// does no work at all, where the shred at least made progress expensively.
-    /// `split_declined_at_floor` rising alongside `pending_base_rollup` is what
-    /// that would look like in prod; this pins it at the source instead of
-    /// waiting to read it there.
+    /// Bisection prices children by TIME SHARE, so it always "fits" on paper,
+    /// but real cost floors out — a slice reads at least one row group of every
+    /// file it overlaps. A child that measured what its parent measured IS that
+    /// floor, so the split must decline (the runner hash-shards internally at any
+    /// width) AND leave the unit runnable, or it does no work at all.
     #[test]
     fn a_child_no_cheaper_than_its_parent_stops_bisecting_and_stays_claimable() {
         let (_dir, mut journal) = new_journal();
@@ -3449,23 +2899,18 @@ mod tests {
         assert_eq!(claimed.map(|task| task.key), Some(key), "the declined unit is the one a worker picks up, so the work still happens");
     }
 
-    /// Section 4 of the 08-24 plan proposed BATCHING escalations: when several
-    /// holes inside one covering slice each escalate, rebuild the covering slice
-    /// once rather than N times. That needs no code, and this pins why —
-    /// `enqueue` is keyed by `TaskKey`, so N escalations naming the same
-    /// covering slice collapse into a single pending unit by construction.
-    ///
-    /// Worth a test rather than a comment because the claim is what justifies
-    /// NOT building the batching layer, and a future change to enqueue's
-    /// identity rules would silently reintroduce the N-rebuild cost.
+    /// `enqueue` is keyed by `TaskKey`, so N holes escalating to the same
+    /// covering slice collapse into ONE pending unit — which is why no batching
+    /// layer exists. A change to enqueue's identity rules would reintroduce the
+    /// N-rebuild cost silently.
     #[test]
     fn escalations_to_one_covering_slice_collapse_into_a_single_unit() {
         let (_dir, mut journal) = new_journal();
         let day = 3 * DAY_MICROS;
         let covering = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
 
-        // Five separate narrow units discover holes and each escalates to the
-        // same covering slice, exactly as `covered_by_wider` does.
+        // Five narrow units each escalate to the same covering slice, exactly as
+        // `covered_by_wider` does.
         for _ in 0..5 {
             journal.enqueue(covering.clone(), 0, MAX_DECODED_BYTES, 0);
         }
@@ -3475,15 +2920,7 @@ mod tests {
     }
 
     /// BOTH ways a split can be refused must be counted, or a pinned unit is
-    /// invisible.
-    ///
-    /// Prod 2026-08-28: day-wide sealed units carrying 22-25 GB estimates were
-    /// abandoned 9/9 at the 900 s deadline and re-claimed forever. That was only
-    /// attributable because `split_declined_at_floor` happened to be counted —
-    /// the sibling branch (`children.len() <= 1 || hash_shards > 1`) returned
-    /// `false` silently, so had the decline gone that way instead, nothing in the
-    /// process would have named it. Counters are per-process under nextest, so
-    /// these assertions are exact.
+    /// invisible. Counters are per-process under nextest, so these are exact.
     #[test]
     fn both_split_declines_are_counted() {
         let stats = crate::observability::maintenance_stats();
@@ -3528,10 +2965,9 @@ mod tests {
     }
 
     /// `retry_or_split` forces a bisection with a synthetic
-    /// `MAX_DECODED_BYTES + 1` — it is a "does not fit" signal, not a
-    /// measurement. Stamping it and then comparing the next REAL measurement
-    /// against it would decline every split in that lineage forever, which is
-    /// the immortal-unit shape this file already carries three incidents of.
+    /// `MAX_DECODED_BYTES + 1` — a "does not fit" signal, not a measurement.
+    /// Comparing the next REAL measurement against it must not decline every
+    /// split in the lineage forever.
     #[test]
     fn a_synthetic_stamp_does_not_freeze_a_lineage() {
         let (_dir, mut journal) = new_journal();
@@ -3542,8 +2978,8 @@ mod tests {
         let child = journal.tasks().find(|t| t.state == TaskState::Pending).expect("a child").clone();
         assert_eq!(child.parent_measured_bytes, Some(MAX_DECODED_BYTES + 1));
 
-        // A real preflight now measures far more than the synthetic seed. That
-        // is not the row-group floor, so the child must still be splittable.
+        // A real preflight measuring far more than the synthetic seed is not the
+        // row-group floor, so the child must still be splittable.
         assert!(
             journal.split_time_task(&child.key, 8 * MAX_DECODED_BYTES, None),
             "a measurement ABOVE the parent's stamp is evidence the stamp was never a measurement"
@@ -3565,8 +3001,7 @@ mod tests {
     #[test]
     fn bootstrap_backlog_migration_keeps_publications_and_runs_once() {
         let (dir, mut journal) = new_journal();
-        // Production already carries the v1 marker. It must not suppress the
-        // corrective cleanup after commit-range reconciliation ships.
+        // An existing v1 marker must not suppress the v2 cleanup.
         journal.set_source_cursor("__maintenance_bootstrap_backlog_v1".to_owned(), 1);
         journal.set_source_cursor("__maintenance_bootstrap_backlog_v2".to_owned(), 1);
         journal.upsert(task("pending-a", 0, 1, Operation::Dedup));
@@ -3600,24 +3035,11 @@ mod tests {
         assert!(fs::metadata(&journal.wal_path).expect("wal").len() > first_size);
     }
 
-    /// `historical_debt_runs_newest_slice_first` (the last case): historical debt
-    /// runs newest SLICE first, not oldest deadline first.
-    ///
-    /// That asserted the opposite until 2026-08-17, with no stated reason.
-    /// Oldest-first is FIFO-fair, but it spends the whole non-frontier budget on
-    /// the oldest data in the store — which is the data nobody queries. Prod,
-    /// over 84 task starts: 74 went to the live frontier (correct) and every one
-    /// of the other 10 landed on 2026-08-01, 07-22, 07-16, 07-15, 06-29, 06-15,
-    /// 06-02, 06-01, 05-28. Meanwhile rollup coverage for a live tenant sat at
-    /// two days and every 7d/14d/30d query fell back to a raw scan.
-    ///
-    /// Newest-first does not starve old debt: frontier work is rate-limited by
-    /// ingest and recent slices are finite, so once the recent window drains the
-    /// ordering walks backward on its own. What it guarantees is that the window
-    /// a dashboard actually reads is reached FIRST. Both slices in that case
-    /// sealed RECENTLY, so neither is overdue — age comes from the slice, and
-    /// overdue work drains oldest-first by design, a different question from
-    /// which slice a dashboard needs.
+    /// Scheduling order, case by case. Historical debt runs newest SLICE first,
+    /// not oldest deadline first: oldest-first spends the whole non-frontier
+    /// budget on the data nobody queries, and newest-first does not starve old
+    /// debt because the recent window is finite and then the order walks back.
+    /// (Overdue work still drains oldest-first — a different question.)
     #[test_case::test_case((-MIN_SLICE_MICROS, 0, Operation::BaseRollup, None), (-ORDER_NOW, -ORDER_NOW + MIN_SLICE_MICROS, Operation::Dedup, None) ; "recent_slices_precede_overdue_historical_work")]
     #[test_case::test_case((-2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, Operation::BaseRollup, None), (-12 * 60 * 60 * 1_000_000, -12 * 60 * 60 * 1_000_000 + MIN_SLICE_MICROS, Operation::BaseRollup, None) ; "newest_eligible_frontier_slice_precedes_older_frontier_debt")]
     #[test_case::test_case((-2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, Operation::BaseRollup, Some(-60 * 1_000_000)), (-ORDER_NOW, -ORDER_NOW + MIN_SLICE_MICROS, Operation::BaseRollup, Some(-1)) ; "recently_mutated_historical_hole_does_not_displace_frontier")]
@@ -3636,14 +3058,9 @@ mod tests {
         assert!(scheduling_class(&winner, now) < scheduling_class(&loser, now), "the winning slice is the one the scheduler must reach first");
     }
 
-    /// Pending work must be reportable per operation, and split by whether it
-    /// is claimable right now.
-    ///
-    /// `tasks_pending` alone cannot distinguish "no rollup work queued" from
-    /// "queued but not eligible" from "eligible but out-competed" — three states
-    /// with three different fixes. Prod 2026-08-17 sat at ~128k pending with
-    /// rollup coverage frozen for hours, and every attempt to tune it was a
-    /// guess because these three were indistinguishable from outside.
+    /// Pending work must be reportable per operation AND split by whether it is
+    /// claimable right now — `tasks_pending` alone cannot distinguish "none
+    /// queued" from "queued but not eligible" from "eligible but out-competed".
     #[test]
     fn pending_work_is_reported_per_operation_and_by_eligibility() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3668,17 +3085,10 @@ mod tests {
         assert_eq!(stats.eligible_sealed_total.load(Relaxed), 2, "both due sealed tasks (rollup + repair) are claimable");
     }
 
-    /// `oldest_task_age` reports work the scheduler intends to do; abandoned
-    /// work is COUNTED, not aged.
-    ///
-    /// Prod read 85.6 days for months. That was the seal time of one 2026-05-31
-    /// hygiene partition — `plan_compaction_debt` stamps sealed units with their
-    /// slice end — and past `STARVATION_HORIZON_MICROS` such a unit is
-    /// deliberately never scheduled. An age gauge dominated by abandoned work is
-    /// pinned red and reports nothing about the goal window.
-    ///
-    /// Both halves are asserted together on purpose: narrowing the age alone
-    /// would look identical to hiding the debt.
+    /// `oldest_task_age` reports work the scheduler intends to do; work past
+    /// `STARVATION_HORIZON_MICROS` is never scheduled, so it is COUNTED, not
+    /// aged. Both halves are asserted together: narrowing the age alone would
+    /// look identical to hiding the debt.
     #[test]
     fn the_age_gauge_skips_abandoned_work_and_counts_it_instead() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3686,7 +3096,7 @@ mod tests {
         let (_dir, mut journal) = new_journal();
         let key = |start: i64| task("p", start, start + DAY_MICROS, Operation::SealedConsolidation).key;
         let stamp = |micros: i64| u64::try_from(micros.div_euclid(1_000)).unwrap_or_default();
-        // The prod shape: a hygiene unit aged from a seal time 85 days back...
+        // A hygiene unit aged from a seal time 85 days back...
         journal.enqueue(key(now - 86 * DAY_MICROS), now, 1, stamp(now - 85 * DAY_MICROS));
         // ...beside one inside the window, five days old.
         journal.enqueue(key(now - 6 * DAY_MICROS), now, 1, stamp(now - 5 * DAY_MICROS));
@@ -3699,13 +3109,9 @@ mod tests {
     }
 
     /// The coarse-backfill migration must be narrow: fine sealed backfill goes,
-    /// everything else stays.
-    ///
-    /// It exists because ~450 tasks per (project, date) drained at ~19/min on
-    /// prod — 111 hours for ~600 GB of real work. Dropping tasks is safe only
-    /// because `plan_rollup_backfill` re-derives from rollup COVERAGE, but a
-    /// migration that over-reaches would silently cancel live frontier work or
-    /// the separately-planned compaction debt.
+    /// everything else stays. Dropping tasks is safe only because
+    /// `plan_rollup_backfill` re-derives from rollup COVERAGE; over-reaching
+    /// would silently cancel frontier work or separately-planned compaction debt.
     #[test]
     fn coarse_backfill_migration_only_drops_fine_sealed_backfill() {
         let now = crate::support::now_micros();
@@ -3734,13 +3140,9 @@ mod tests {
     }
 
     /// The comparator for an empty publication must be the base tier's rows in
-    /// THIS slice, not the day.
-    ///
-    /// `source_rows` is keyed on (project, date) while a unit is an hour, so a
-    /// genuinely empty hour of a busy day reads as non-empty and a guard built
-    /// on it would fire on correct work. Joined offline against the 2026-08-28
-    /// prod journal, the per-slice comparator split 285 empty derived
-    /// completions into 276 real violations and 9 legitimately empty hours.
+    /// THIS slice, not the day: `source_rows` is keyed on (project, date) while a
+    /// unit is an hour, so a genuinely empty hour of a busy day reads as
+    /// non-empty and a guard built on it fires on correct work.
     #[test]
     fn published_rows_are_summed_per_slice_and_per_project() {
         let (_dir, mut journal) = new_journal();
@@ -3765,30 +3167,23 @@ mod tests {
         assert_eq!(rows(0, 24), 17, "the day never picks up another tenant or another tier");
     }
 
-    /// Sealed work must get a share of claims even while the frontier is busy.
-    ///
-    /// Class is strict priority and ingest never stops, so before the
-    /// reservation class 1 simply never ran: prod 2026-08-17 went 278
-    /// consecutive task starts without a single sealed day, while rollup
-    /// coverage for a live tenant sat at two days and every 7d/14d/30d query
-    /// fell back to a raw scan. A frontier that is healthy on its own metric
-    /// (`eligible_watermark_lag_seconds` 0) tells you nothing about this.
+    /// Sealed work must get a share of claims even while the frontier is busy:
+    /// class is strict priority and ingest never stops, so without the
+    /// reservation class 1 never runs at all.
     #[test]
     fn sealed_work_gets_claims_while_the_frontier_is_busy() {
         let now = ORDER_NOW;
         let (_dir, mut journal) = new_journal();
 
-        // Plenty of frontier work — the production condition, where ingest
-        // keeps class 0 permanently non-empty — plus one sealed day.
+        // Plenty of frontier work — class 0 permanently non-empty — plus one
+        // sealed day.
         let key = |start: i64, end: i64| task("p", start, end, Operation::BaseRollup).key;
         for k in 1..20 {
             journal.enqueue(key(now - (k + 1) * MIN_SLICE_MICROS, now - k * MIN_SLICE_MICROS), now - 1, 1, 1);
         }
         journal.enqueue(key(0, MIN_SLICE_MICROS), now - 1, 1, 1);
 
-        // Enough sealed slices that the share, not the supply, is what limits
-        // sealed claims — mirroring prod, where 118,794 of 127,798 pending tasks
-        // were sealed and eligible while the frontier took ~90% of claims.
+        // Enough sealed slices that the share, not the supply, limits sealed claims.
         for k in 1..20 {
             journal.enqueue(key(k * MIN_SLICE_MICROS, (k + 1) * MIN_SLICE_MICROS), now - 1, 1, 1);
         }
@@ -3799,15 +3194,8 @@ mod tests {
                 !is_live_frontier(claimed.key.slice, now)
             })
             .count();
-        // "> 0" would pass at any share, including one too small to ever drain a
-        // backlog — which is exactly what shipped first and left coverage frozen
-        // for hours. Assert sealed work is the MAJORITY when it is the majority
-        // of the queue.
-        // Was `>= 7` (three in four). Lowered to the one-in-two floor after the
-        // 2026-08-17 OOM: sealed work must still get a real share — "> 0" is the
-        // bug that let an ineffective share ship — but the higher share cost
-        // 124.9 GB of anon RSS and a kill, so the invariant is "a third or
-        // better", not "the majority".
+        // "> 0" would pass at a share too small to ever drain a backlog, so the
+        // invariant is "a third or better" — a higher share was tried and OOMed.
         assert!(
             sealed_claims >= 4,
             "sealed work got only {sealed_claims}/12 claims; below a third, a 118k-task sealed backlog never drains and long windows stay unroutable"
@@ -3860,21 +3248,9 @@ mod tests {
         assert!(journal.tasks().filter(|task| task.key.operation == Operation::Dedup).all(|task| task.key.slice.width() == NORMAL_SLICE_MICROS));
     }
 
-    /// The hour migration must not touch a slice WIDER than an hour.
-    ///
-    /// Its guard was `width() != DERIVED_SLICE_MICROS`, which matches wider
-    /// slices as well as the ten-minute fragments it was written for — and the
+    /// The hour migration must not touch a slice WIDER than an hour: its
     /// replacement key is the single hour containing the slice START, so a
-    /// day-wide unit was superseded and re-enqueued as hour 00 with the other 23
-    /// hours silently dropped. The 2026-08-28 prod journal held 265 such
-    /// collapses (248 of them day-wide), losing roughly 5,799 hours of derived
-    /// work, and is why cell 28f62f01/08-25 has no derived unit at all for hours
-    /// 21 and 22.
-    ///
-    /// Left ALONE rather than expanded into 24 hour units: expanding mints 24x
-    /// the journal entries this migration's own comment warns about, and day-wide
-    /// derived units are empirically the healthy ones — 0 of 398 published empty
-    /// over a non-empty base, against 14.5% for hour-wide units.
+    /// day-wide unit would be re-enqueued as hour 00 and lose the other 23.
     #[test]
     fn the_hour_migration_leaves_a_slice_wider_than_an_hour_alone() {
         let (dir, mut journal) = new_journal();
@@ -3888,8 +3264,7 @@ mod tests {
         assert_eq!(journal.migrate_derived_slices(), 1, "only the sub-hour fragment may migrate");
         journal.checkpoint().expect("migration checkpoint");
 
-        // The migration must also SURVIVE the next restart, so every assertion
-        // below reads the reloaded journal rather than the in-memory one.
+        // The migration must SURVIVE a restart, so assertions read the reloaded journal.
         let journal = TaskJournal::load(dir.path()).expect("migrated journal");
         assert!(
             journal.tasks().any(|task| task.key.operation == Operation::DerivedRollup
@@ -3914,19 +3289,8 @@ mod tests {
         );
     }
 
-    /// Rebuilding a BASE slice must reopen the DERIVED cell built over it.
-    ///
-    /// Without this edge a derived cell is a faithful aggregate of a base that no
-    /// longer exists, and it never self-corrects because its unit is `Complete`.
-    /// Prod 2026-08-28: `87576849`/08-01's 1h cell was written 09:44:32 and its
-    /// 1m base was rebuilt 09:49:13-14:46:12 — the cell reads +70.6% over the
-    /// base to this day.
-    ///
-    /// Three properties, because the reopen is the easy one:
-    ///   1. a COMPLETE derived unit over the republished range goes back to Pending
-    ///   2. its stale publication is dropped, so nothing recovers coverage from it
-    ///   3. it TERMINATES — reopening does not itself mint more work. The
-    ///      4,632-superseded-record incident came from resurrect logic that did.
+    /// Rebuilding a BASE slice must reopen the DERIVED cell built over it:
+    /// back to Pending, stale publication dropped, and without minting new tasks.
     #[test]
     fn republishing_a_base_slice_reopens_the_derived_cell_over_it() {
         let (_dir, mut journal) = new_journal();
@@ -3956,7 +3320,6 @@ mod tests {
         assert_eq!(state_of(&journal, HOUR), Some((TaskState::Pending, false)), "reopened, and its stale publication dropped");
         assert_eq!(state_of(&journal, 5 * HOUR), Some((TaskState::Complete, true)), "a cell outside the republished range must be untouched");
 
-        // Terminates: a second call over the same range has nothing left to do.
         assert_eq!(journal.reopen_derived_over("p", "derived", 0, 2 * HOUR), 0, "reopening is idempotent");
     }
 
@@ -4025,14 +3388,8 @@ mod tests {
         assert_eq!(loaded.state(&key), Some(TaskState::Retry));
     }
 
-    /// A completed unit must NOT be requeued by its lease, and the lease must
-    /// read the outcome the run function recorded.
-    ///
-    /// This is the invariant behind `maintenance_task_finished`: the event is
-    /// emitted from `Drop`, so it reports whatever `state` says at that moment.
-    /// If the lease could not distinguish Complete from Running, the new event
-    /// would report every successful unit as a death — which is worse than the
-    /// silence it replaces, because it looks like data.
+    /// A completed unit must NOT be requeued by its lease: `maintenance_task_finished`
+    /// is emitted from `Drop` and reports whatever `state` says at that moment.
     #[test]
     fn a_completed_lease_reports_complete_and_is_not_requeued() {
         let (_dir, mut journal) = new_journal();
@@ -4044,27 +3401,22 @@ mod tests {
 
         let guard = journal.lock().expect("lock");
         assert_eq!(guard.state(&key), Some(TaskState::Complete), "a completed unit must survive its own lease drop");
-        // And the debt field the event carries is absent on a unit that was
-        // never preflighted — which is the state every unclaimed hygiene cell
-        // is in, and the reason `benefit` ordering cannot see their debt.
+        // The debt field is absent on a unit that was never preflighted.
         assert_eq!(guard.input_files(&key), None);
     }
 
     #[test]
     fn every_crash_boundary_recovers_to_redundant_work_or_published_coverage() {
         let (dir, mut journal) = new_journal();
-        // WAL/source invalidation checkpoint: a crash leaves pending work and
-        // therefore no coverage claim.
+        // A crash leaves pending work and therefore no coverage claim.
         let key = upserted(&mut journal, task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
         journal.checkpoint().expect("invalidation checkpoint");
         let mut recovered = TaskJournal::load(dir.path()).expect("recover after invalidation");
         assert_eq!(recovered.state(&key), Some(TaskState::Pending));
         assert!(recovered.published_rollups("source", "table").is_empty());
 
-        // Rollup staging / target-commit-before-coverage checkpoint: claims are
-        // deliberately transient, so restart sees the last durable Pending
-        // state directly. An already-landed target commit is safely replaced
-        // by that redundant retry without a full-journal claim checkpoint.
+        // Claims are deliberately transient, so restart sees the last durable
+        // Pending state directly; a landed target commit is replaced by the retry.
         assert!(recovered.mark_running(&key));
         recovered.checkpoint().expect("running checkpoint");
         let mut recovered = TaskJournal::load(dir.path()).expect("recover after staging");
@@ -4102,11 +3454,8 @@ mod tests {
         journal.checkpoint().expect("same-bucket checkpoint");
         assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_wal_size, "same deadline bucket must not rewrite tasks");
         journal.invalidate(observed_at(INVALIDATION_DEADLINE_BUCKET_MICROS + 1)).expect("invalidate in next bucket");
-        // Two, not three: Dedup and the rollup. HotPacking is planned by DEBT
-        // in `plan_compaction_debt` (one day-wide unit per project, only when
-        // the partition really has small or unsorted files), never per slice —
-        // minting it here made file hygiene 22% of the journal with a count
-        // that tracked ingest rather than fragmentation.
+        // Two, not three: Dedup and the rollup. HotPacking is planned by debt in
+        // `plan_compaction_debt`, never minted per slice.
         assert_eq!(journal.tasks().count(), 2);
         assert!(
             journal.tasks().all(|task| task.key.operation != Operation::HotPacking),
@@ -4141,10 +3490,8 @@ mod tests {
         task_in("rollup_1h", project, start, start + width, Operation::DerivedRollup).key
     }
 
-    /// A tier unit as the planner just minted it: named tier, due now, and
-    /// freshly created so `starved` cannot decide the order — these cases are
-    /// about hole/damage rank, and leaving `created_unix_ms` at 0 would make
-    /// every unit maximally starved and settle the order on age instead.
+    /// A tier unit as the planner just minted it: named tier, due now, and freshly
+    /// created so `starved` cannot decide the order (age would otherwise dominate).
     fn tier_unit(project: &str, table: &str, start: i64, width: i64, now: i64, operation: Operation) -> MaintenanceTask {
         task_in(table, project, start, start + width, operation).tap_mut(|unit| unit.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default())
     }
@@ -4171,20 +3518,14 @@ mod tests {
     }
 
     /// Seeds a FRESH journal — rank state (`tier_holes`, untagged cells) is
-    /// per-journal, so a control and its counterpart cannot share one — and
-    /// returns the project whose unit wins the first claim.
+    /// per-journal — and returns the project whose unit wins the first claim.
     fn claim_winner(now: i64, operation: Operation, seed: impl FnOnce(&mut TaskJournal)) -> String {
         let (_dir, mut journal) = new_journal();
         seed(&mut journal);
         journal.claim_next(operation, now, true).expect("claim").key.project_id
     }
 
-    /// Historical derived work must not lose every claim to the frontier.
-    ///
-    /// Prod 2026-08-19 00:10 UTC: 387 historical day-wide derived units had just
-    /// been unblocked (#186/#188), the 1h tier they build was 9-17 days deep
-    /// against a 33-day base tier — and EVERY derived unit claimed in the next
-    /// 12 minutes was a one-hour frontier slice for today or yesterday. Class is
+    /// Historical derived work must not lose every claim to the frontier: class is
     /// strict priority and the frontier regenerates continuously, so without a
     /// reservation the historical units never run at all.
     #[test]
@@ -4199,8 +3540,7 @@ mod tests {
         let sealed_start = now - 10 * 24 * 3_600_000_000;
         journal.upsert(derived("sealed", sealed_start, 24 * 3_600_000_000));
 
-        // The frontier is behind, which is exactly when the general reservation
-        // shrinks — and exactly when coverage needs the sealed unit most.
+        // The frontier is behind, which is when the general reservation shrinks.
         journal.frontier_lag_secs.store(FRONTIER_LAG_BUDGET_SECS + 1, std::sync::atomic::Ordering::Relaxed);
         let claimed = journal.claim_next(Operation::DerivedRollup, now, true).expect("a derived unit is claimable");
         assert_eq!(claimed.key.project_id, "sealed", "historical derived work must win the claim, not today's");
@@ -4208,39 +3548,23 @@ mod tests {
 
     /// A derived unit whose base TIER already exists must be claimable, even
     /// when no `BaseRollup` journal task records that it was built.
-    ///
-    /// Prod 2026-08-18 22:30 UTC: the 1m base tier was 33 days deep on most
-    /// projects while the 1h derived tier it feeds sat at 9-17,
-    /// `pending_derived_rollup` did not move by ONE task across two 240s windows
-    /// with workers free, and every derived unit claimed in 20 minutes was a
-    /// frontier slice whose base had completed minutes earlier. Historical days
-    /// were unclaimable — `claim_next` skips a dependency-blocked task silently,
-    /// with no counter and no log, which is the sixth silent refusal in this
-    /// family.
     #[test]
     fn a_derived_unit_runs_when_its_base_tier_exists_without_a_journal_record() {
         let (_dir, mut journal) = new_journal();
         let derived = |project: &str| derived_key(project, 0, 3_600_000_000);
 
-        // The status quo, and correct on its own terms: no completed base task
-        // covers this slice, so the unit is refused.
+        // No completed base task covers this slice, so the unit is refused.
         journal.enqueue(derived("historical"), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "without evidence the dependency gate still holds");
 
-        // The backfill planner reads real tier coverage, so it can prove the
-        // base tier is there. That must be enough.
+        // The backfill planner reads real tier coverage; that proof must be enough.
         journal.enqueue_with_base_tier(derived("historical"), 0, 1, 0, true);
         assert_eq!(journal.claim_next(Operation::DerivedRollup, 0, true).expect("proven base tier makes the unit claimable").key.project_id, "historical");
     }
 
-    /// The planner must be able to prove the base tier for a task it can no
-    /// longer reach through `enqueue`.
-    ///
-    /// A blocked derived unit stays queued, which makes its day permanently
-    /// ineligible for backfill admission (`want.retain(|key| !queued...)`),
-    /// which is the only path that could have carried the proof. Prod
-    /// 2026-08-18 22:50 UTC: `pending_derived_rollup` did not move after #184
-    /// shipped, because all 759 tasks predated it.
+    /// The planner must be able to prove the base tier for a task it can no longer
+    /// reach through `enqueue`: a blocked derived unit stays queued, which makes its
+    /// day ineligible for backfill admission, the only path that carries the proof.
     #[test]
     fn an_already_queued_derived_unit_can_still_be_told_its_base_tier_exists() {
         let (_dir, mut journal) = new_journal();
@@ -4254,29 +3578,10 @@ mod tests {
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "the unit becomes claimable without being re-enqueued");
     }
 
-    /// The claimability census must name each reason `claim_next` skips a task.
-    ///
-    /// Every counter in this system reports how much work EXISTS; none reported
-    /// why an existing task is passed over, and `claim_next` decides that inside
-    /// filter predicates that leave no trace. Five correct fixes shipped against
-    /// The hygiene benefit band must separate cells at the sizes that EXIST.
-    ///
-    /// Prod 2026-09-03, over the 104 cells meeting `timefusion_compact_min_files`:
-    /// p50 = 35 files, p75 = 56, p90 = 107. At the old 64-wide band **84.6% tied
-    /// at zero** — the ranker could not separate five sixths of the queue, so
-    /// ordering fell through to recency and the project cursor, and the most
-    /// indebted HotPacking cell (`files=37`) was reported `outranked_by` a
-    /// same-day rival 50 times in 100 minutes.
-    ///
-    /// These three sizes are p50-ish, p75-ish and a small cell; at 64 all three
-    /// collapse to band 0.
-    ///
-    /// The ties are as load-bearing as the separations: `fair_cursors` rotates
-    /// projects only among cells that TIE, so a band fine enough to separate
-    /// every count makes one cell win every claim (200 vs 210 is pinned
-    /// independently by `sealed_hygiene_ranks_by_files_removed_not_by_date`).
-    /// The p50/p75 tie is the honest limit of a LINEAR band at this width; a
-    /// ratio band would separate them.
+    /// The hygiene benefit band must separate cells at the sizes that exist, while
+    /// still TYING comparable ones — `fair_cursors` rotates projects only among
+    /// cells that tie, so a band fine enough to separate every count makes one cell
+    /// win every claim. A linear band cannot separate p50 from p75; a ratio band would.
     #[test_case::test_case(35, 9 => false ; "a p50 cell must outrank a nearly-empty one")]
     #[test_case::test_case(107, 35 => false ; "p90 must be separable from p50")]
     #[test_case::test_case(200, 210 => true ; "comparable large cells must tie, or rotation dies")]
@@ -4286,19 +3591,13 @@ mod tests {
         files / BENEFIT_BUCKET_FILES == rival_files / BENEFIT_BUCKET_FILES
     }
 
-    /// `outranked_by` says the ranker could not separate the WORST cell from a
-    /// rival. This says whether it can separate ANY of them — the number that
-    /// decides whether `BENEFIT_BUCKET_FILES` is too coarse, and one that cannot
-    /// be recovered offline because hygiene cells never reach the persisted
-    /// journal (a pulled prod journal holds only base_rollup / dedup /
-    /// derived_rollup / repair).
+    /// Reports how many hygiene cells the ranker cannot separate — the number that
+    /// decides whether `BENEFIT_BUCKET_FILES` is too coarse.
     #[test]
     fn the_hygiene_spread_reports_how_many_cells_the_ranker_cannot_separate() {
         let now = 40 * DAY_MICROS;
         let (_dir, mut journal) = new_journal();
-        // Three cells under the 64-file bucket and one far above it: the shape
-        // that makes `benefit` inert for the small ones while still ranking the
-        // large one.
+        // Three cells under the bucket width and one far above it.
         for (project, files) in [("a", 5usize), ("b", 9), ("c", 60), ("d", 400)] {
             let key = task(project, now - 2 * DAY_MICROS, now - DAY_MICROS, Operation::HotPacking).key;
             journal.enqueue(key.clone(), 0, 0, 0);
@@ -4307,15 +3606,14 @@ mod tests {
         let spread = journal.hygiene_debt_spread(Operation::HotPacking, now).expect("cells are claimable");
         assert!(spread.contains("cells=4"), "all four cells are claimable: {spread}");
         assert!(spread.contains("files_max=400"), "the large cell is reported: {spread}");
-        // THE point: three of four collapse to bucket 0, so the ranker sees one
-        // value for a 5-file cell and a 60-file cell alike.
-        // 5 and 9 land in band 0; 60 -> 1; 400 -> 12. The point of the metric is
-        // the tie count, whatever the band width happens to be.
+        // 5 and 9 land in band 0; 60 -> 1; 400 -> 12. The metric is the tie count,
+        // whatever the band width happens to be.
         assert!(spread.contains("tied_at_zero=2"), "must report how many cells benefit cannot separate: {spread}");
         assert!(spread.contains("distinct_buckets=3"), "4 cells occupy 3 benefit bands: {spread}");
     }
 
-    /// wrong models of the queue before this existed.
+    /// The claimability census must name each reason `claim_next` skips a task —
+    /// the skips happen inside filter predicates that otherwise leave no trace.
     #[test]
     fn the_claimability_census_separates_the_reasons_a_task_is_skipped() {
         let (_dir, mut journal) = new_journal();
@@ -4346,25 +3644,8 @@ mod tests {
         assert_eq!(not_due, 1, "only the one with a future deadline is not yet due");
     }
 
-    /// Sealed work that has waited too long must overtake newer sealed work —
-    /// and only then.
-    ///
-    /// Prod 2026-08-19, from the compaction dashboard: 2026-08-13 sat at 167
-    /// files for FOUR DAYS, the same count and the same four tenants, while six
-    /// younger sealed days converged past it. Six successors overtaking a
-    /// partition is not a queue draining slowly; it is one the order never
-    /// reaches.
-    ///
-    /// Both halves matter. Oldest-first was tried and is recorded in
-    /// `scheduling_class`'s own comment as sending 10 of 10 historical starts to
-    /// data months old while the last 30 days went untouched — so fresh work
-    /// must STILL be newest-first, and only genuinely starved tasks escalate.
-    /// Sealed hygiene ranks by how much debt a claim RETIRES, not by date.
-    ///
-    /// Every hygiene unit is day-wide, so `-width` ties among them and the
-    /// tie-break was pure recency — which says nothing about benefit. Prod
-    /// 2026-08-23: four sealed cells held ~850 removable files in 4.9 GB while
-    /// capacity went to whichever sealed most recently.
+    /// Sealed hygiene ranks by how much debt a claim RETIRES, not by date: every
+    /// hygiene unit is day-wide, so `-width` ties and recency would otherwise decide.
     #[test]
     fn sealed_hygiene_ranks_by_files_removed_not_by_date() {
         const HOUR: i64 = 3_600_000_000;
@@ -4372,46 +3653,28 @@ mod tests {
         let cell = |project: &str, hours_ago: i64, files: u32, operation| hygiene_cell(project, now - hours_ago * HOUR, files, operation);
         let class = |unit: &MaintenanceTask| super::scheduling_class(unit, now);
 
-        // A big older cell beats a small newer one — the reversal.
         let big_old = cell("a", 60, 200, Operation::SealedConsolidation);
         let small_new = cell("b", 30, 3, Operation::SealedConsolidation);
         assert!(class(&big_old) < class(&small_new), "200 files outrank 3, whichever sealed first");
-        // Within a band they TIE, so `fair_cursors` can still rotate projects
-        // instead of one cell winning every claim.
+        // Within a band they TIE, so `fair_cursors` can still rotate projects.
         assert_eq!(
             class(&cell("a", 60, 200, Operation::SealedConsolidation)).3,
             class(&cell("b", 30, 210, Operation::SealedConsolidation)).3,
             "comparable cells must tie"
         );
-        // Unknown benefit orders LAST, never first: a journal written before the
-        // field must not jump the queue.
+        // Unknown benefit orders LAST, never first.
         let unknown = cell("c", 60, 0, Operation::SealedConsolidation).tap_mut(|unit| unit.input = None);
         assert!(class(&big_old) < class(&unknown));
-        // And benefit is hygiene-only — it must not perturb rollup ordering,
-        // which damage repair relies on tying.
+        // Benefit is hygiene-only: rollup ordering must still tie, as damage repair relies on.
         assert_eq!(class(&cell("d", 60, 200, Operation::BaseRollup)).3, class(&cell("e", 60, 3, Operation::BaseRollup)).3);
     }
 
-    /// A `SealedConsolidation` unit is never the live frontier, by construction.
-    ///
-    /// `plan_compaction_debt` picks the operation from the calendar — `date ==
-    /// today` mints HotPacking, anything older mints SealedConsolidation — but
-    /// `scheduling_class` asked `is_live_frontier`, which stays true for a full
-    /// `LIVE_FRONTIER_WINDOW_MICROS` (24 h) after the slice ENDS. So yesterday's
-    /// consolidation unit held class 0 — strict priority over every genuinely
-    /// sealed cell — until it was 48 h old, and the two halves of the system
-    /// disagreed about the same date for a whole day.
-    ///
-    /// Measured on prod 2026-08-24, a mature container over 68 minutes: **26 of
-    /// 27** SealedConsolidation claims went to 2026-08-23, while 48 out-of-policy
-    /// cells — one of them holding 238 small files — took none. Class is strict
-    /// priority, so benefit ordering never got a say: `scheduling_class`'s own
-    /// comment promises "a cell worth 200 files outranks one worth 3", and class
-    /// was silently overriding it.
+    /// A `SealedConsolidation` unit is never the live frontier: the planner mints it
+    /// only for a date it already treats as sealed, so class must not re-promote it
+    /// via `is_live_frontier`, which stays true for 24 h after the slice ends.
     #[test]
     fn a_sealed_consolidation_unit_is_never_the_live_frontier() {
-        // Late morning, so yesterday's slice ended 11 h ago — inside the 24 h
-        // frontier window, which is the window the defect lives in.
+        // Late morning, so yesterday's slice ended 11 h ago — inside the 24 h window.
         let now = 400 * DAY_MICROS + 11 * 3_600_000_000;
         let cell = |project: &str, start: i64, files: u32, operation| hygiene_cell(project, start + DAY_MICROS, files, operation);
         let yesterday = cell("small", 399 * DAY_MICROS, 3, Operation::SealedConsolidation);
@@ -4423,39 +3686,15 @@ mod tests {
             "238 files of debt must outrank 3 — which class 0 was silently preventing"
         );
 
-        // The blast radius. Today's packing IS frontier work and must stay class
-        // 0, or this trades one starvation for another.
+        // Today's packing IS frontier work and must stay class 0.
         let today = cell("today", 400 * DAY_MICROS, 9, Operation::HotPacking);
         assert_eq!(super::scheduling_class(&today, now).0, 0, "today's packing is genuinely live-frontier work");
     }
 
-    /// "Planned and never claimed" must name what beat it.
-    ///
-    /// Prod 2026-08-24: `87576849 / 2026-08-19` held 238 small files — the
-    /// largest file-debt cell in the fleet — read exactly 238 at four
-    /// object-storage censuses spanning a day, and appeared in NO log line of any
-    /// kind across 73 minutes and three containers. `680acac` instrumented "a
-    /// unit was claimed and selected nothing"; this is the other branch, and it
-    /// was invisible rather than explained.
-    ///
-    /// The `outranked_by` arm is the one no existing instrument could reach:
-    /// `claimability_census` counts per-task reasons and `first_refused_sealed`
-    /// returns a bare `CLAIMABLE` — true, and useless, because the refusal is in
-    /// `benefit` is per UNIT, so any future SPLITTING of a cell divides its debt.
-    ///
-    /// A LATENT hazard, not the cause of the 2026-08-28 starvation — that was
-    /// misdiagnosed twice before the numbers settled it, so both the property and
-    /// its limits are pinned here.
-    ///
-    /// The property is real: `benefit = -(input.files / BENEFIT_BUCKET_FILES)` is
-    /// computed per unit, so if one cell is ever cut into slices, each slice
-    /// reports a fraction of the debt and the cell sinks in the ordering — and
-    /// heavy debt is exactly what makes a cell a split candidate. Any change that
-    /// makes hygiene units narrower than one (project, date) must fix this first.
-    ///
-    /// It is NOT what starved `otel_logs_and_spans` on 2026-08-28. Hygiene units
-    /// there are per (project, date): prod's worst cell reported `files=433`,
-    /// which is that cell's *entire* file count. Nothing was split.
+    /// LATENT HAZARD: `benefit = -(input.files / BENEFIT_BUCKET_FILES)` is computed
+    /// per UNIT, so cutting a cell into slices makes each slice report a fraction of
+    /// the debt and the cell sinks in the ordering. Any change that makes hygiene
+    /// units narrower than one (project, date) must fix this first.
     #[test]
     fn splitting_a_cell_would_divide_its_benefit_and_invert_the_ordering() {
         let now = 400 * DAY_MICROS;
@@ -4466,15 +3705,14 @@ mod tests {
                 .tap_mut(|t| t.input = Some(InputFootprint::new((0..files).map(|n| format!("{project}/{days_ago}/{slice}/{n}.parquet")), 1)))
         };
 
-        // One cell per day — how hygiene actually runs. Benefit tracks real debt.
+        // One cell per day — how hygiene actually runs.
         let first = claim_winner(now, Operation::SealedConsolidation, |whole| {
             whole.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
             whole.enqueue_planned(&unit("logs", 3, 0, 1, 964));
         });
         assert_eq!(first.as_str(), "logs", "unsplit, the 964-file cell correctly outranks 261");
 
-        // The same debt, split four ways, now loses to a cell holding a quarter
-        // as much — the debt did not change, only its packaging.
+        // The same debt, split four ways, now loses to a cell holding a quarter as much.
         let (_dir, mut split) = new_journal();
         split.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
         for slice in 0..4 {
@@ -4486,28 +3724,15 @@ mod tests {
             "split four ways, a 964-file day is outranked by a 261-file one"
         );
 
-        // And `most_indebted_unclaimed` is blinded the same way: it ranks by
-        // per-unit files, so the largest is now the metrics cell, which wins its
-        // own claim — so nothing is reported starved at all.
+        // `most_indebted_unclaimed` is blinded the same way: it ranks by per-unit files.
         assert!(
             split.most_indebted_unclaimed(Operation::SealedConsolidation, now).is_none(),
             "the instrument cannot see a starved cell whose debt has been divided below its rivals"
         );
     }
 
-    /// The age window demotes the fleet's BIGGEST debts, at prod's real numbers.
-    ///
     /// `starved` is `0` only for work aged 3-31 days and is compared BEFORE
-    /// `benefit`, so a cell that is merely young loses regardless of how much it
-    /// holds. Measured 2026-08-28, the three largest cells in the fleet were all
-    /// 1-2 days old and therefore all demoted:
-    ///
-    ///     433 files  otel_logs_and_spans 28f62f01 08-27   1 day   starved=1
-    ///     294 files  otel_logs_and_spans 28f62f01 08-26   2 days  starved=1
-    ///     283 files  otel_metrics        8100121c 08-27   1 day   starved=1
-    ///
-    /// while a 238-file cell three days old was eligible. Prod's instrument said
-    /// exactly this: `outranked_by:8100121c:2026-08-24:28f62f01:2026-08-27:files=433`.
+    /// `benefit`, so a merely young cell loses however much debt it holds.
     #[test]
     fn the_starvation_window_demotes_the_biggest_debt_when_it_is_young() {
         let now = 400 * DAY_MICROS;
@@ -4519,28 +3744,20 @@ mod tests {
         assert_eq!(first, "smaller-but-aged", "a 238-file cell wins over a 433-file one solely because the bigger one is 1 day old");
     }
 
-    /// the ORDERING and neither reports the winner.
+    /// The most indebted unclaimed hygiene cell must name what outranks it —
+    /// no other instrument reports the winner of the ordering.
     #[test]
     fn the_most_indebted_hygiene_cell_names_what_outranks_it() {
         const HOUR: i64 = 3_600_000_000;
         let now = 400 * DAY_MICROS;
         let (dir, mut journal) = new_journal();
         // Shaped exactly like `plan_compaction_debt`: build the unit with the
-        // footprint it selected on, then hand it to `enqueue_planned`. The old
-        // fixture set `input` on a task it `upsert`ed — the one path production
-        // does not take — so it passed while prod read `files=0` on every sample.
+        // footprint it selected on, then hand it to `enqueue_planned`.
         let cell = |project: &str, hours_ago: i64, files: u32| hygiene_cell(project, now - hours_ago * HOUR, files, Operation::SealedConsolidation);
-        // The biggest debt sealed only a day ago, so it is NOT in the starvation
-        // band; a much smaller cell has been waiting five days and is. `starved`
-        // is compared before `benefit`, so the older one legitimately wins and
-        // the 238-file cell waits — which is the ordering this instrument exists
-        // to make legible.
-        //
-        // The smaller cell is enqueued FIRST, deliberately: with `files` unset
-        // the selection is `max_by_key` over zeroes, which returns whichever the
-        // iterator reached first. Naming the right cell then proves nothing —
-        // prod named a genuinely indebted cell while reporting `files=0`, purely
-        // by journal order. Insertion order must contradict the answer.
+        // The biggest debt sealed a day ago, so it is NOT in the starvation band;
+        // a much smaller cell has waited five days and is, so it legitimately wins.
+        // The smaller cell is enqueued FIRST so insertion order contradicts the
+        // answer — otherwise `max_by_key` over zeroes would name it by accident.
         let indebted = cell("bigdebt", 24, 238);
         journal.enqueue_planned(&cell("starved", 120, 10));
         journal.enqueue_planned(&indebted);
@@ -4549,9 +3766,8 @@ mod tests {
         assert!(refusal.starts_with("outranked_by:starved"), "it must name the winner, not merely say CLAIMABLE — got {refusal}");
         assert!(refusal.contains("files=238"), "and it must carry the debt that makes it worth reporting — got {refusal}");
 
-        // Eligibility reasons still win over the ordering answer, because they
-        // are actionable on the task itself. (A fresh journal, because `enqueue`
-        // only ever pulls a deadline EARLIER.)
+        // Eligibility reasons win over the ordering answer. (A fresh journal,
+        // because `enqueue` only ever pulls a deadline EARLIER.)
         let mut later = TaskJournal::load(dir.path()).expect("journal");
         later.enqueue_planned(&indebted.clone().tap_mut(|not_due| not_due.deadline_micros = now + DAY_MICROS));
         assert!(
@@ -4559,33 +3775,28 @@ mod tests {
             "a future deadline explains it without appealing to ordering"
         );
 
-        // And silence when there is nothing to explain: the biggest debt winning
-        // its own claims is the healthy state, not a finding.
+        // Silence when there is nothing to explain.
         let mut alone = TaskJournal::load(dir.path()).expect("journal");
         alone.enqueue_planned(&indebted);
         assert_eq!(alone.most_indebted_unclaimed(Operation::SealedConsolidation, now), None);
     }
 
-    /// Which footprint wins, and when. Both are honest measurements.
-    ///
-    /// The planner re-derives the live file set every 60 s; the claim-time
-    /// preflight measures what a running unit actually read. `None` must never
-    /// erase either — every other `enqueue` caller passes it, and stripping a
-    /// claim-time footprint breaks the bisect ladder `record_input` documents.
+    /// Which footprint wins, and when: the planner re-derives the live file set
+    /// periodically, the claim-time preflight measures what a running unit read.
+    /// `None` is silence and must never erase either.
     #[test]
     fn a_planned_footprint_heals_a_pending_cell_and_never_erases_a_measured_one() {
         let (_dir, mut journal) = new_journal();
         let mut unit = task("p", 0, DAY_MICROS, Operation::SealedConsolidation);
 
-        // The backlog heal: a cell queued before the planner carried a footprint
-        // must not need a first claim to become rankable.
+        // A cell queued before the planner carried a footprint must not need a
+        // first claim to become rankable.
         journal.enqueue(unit.key.clone(), 0, 1, 0);
         assert_eq!(journal.input_files(&unit.key), None);
         unit.input = Some(InputFootprint::new(["a", "b", "c"], 1));
         journal.enqueue_planned(&unit);
         assert_eq!(journal.input_files(&unit.key), Some(3), "the next planner tick must supply the count");
 
-        // And a plain re-enqueue leaves it alone rather than zeroing it.
         journal.enqueue(unit.key.clone(), 0, 1, 0);
         assert_eq!(journal.input_files(&unit.key), Some(3), "`None` is silence, not evidence of no files");
 
@@ -4600,13 +3811,11 @@ mod tests {
     #[test]
     fn sealed_work_ages_out_of_starvation_without_becoming_oldest_first() {
         let now = 400 * DAY_MICROS;
-        // Age comes from the SLICE, so a case is described by how long ago its
-        // day sealed. Anything sealing within 24 h is the live frontier and is
-        // class 0 regardless — these are all older than that.
+        // Age comes from the SLICE. Anything sealing within 24 h is the live
+        // frontier and is class 0 regardless — these are all older than that.
         let sealed = |project: &str, hours: i64| sealed_class(project, hours, now);
 
-        // Inside the overdue threshold: recent sealed days stay newest-first,
-        // which is what a dashboard reads.
+        // Inside the overdue threshold recent sealed days stay newest-first.
         let recent_new = sealed("a", 30);
         let recent_old = sealed("b", 60);
         assert!(recent_new < recent_old, "among days not yet overdue the newest still leads");
@@ -4615,8 +3824,7 @@ mod tests {
         let overdue = sealed("c", 10 * 24);
         assert!(overdue < recent_new, "a day overdue past the threshold overtakes newer sealed work");
 
-        // The backlog drains from its OLD end — the half that was missing, and
-        // why 2026-08-13 sat at 167 files while seven younger days passed it.
+        // The backlog drains from its OLD end.
         let overdue_older = sealed("d", 30 * 24);
         assert!(overdue_older < overdue, "a backlog drains oldest-first: the older overdue day leads");
 
@@ -4626,42 +3834,27 @@ mod tests {
         let narrow = super::scheduling_class(&task("e", end - NORMAL_SLICE_MICROS, end, Operation::SealedConsolidation), now);
         assert!(overdue_older < narrow, "width breaks the tie: the day-wide unit leads its own day's slices");
 
-        // Past the horizon a day keeps escalating rather than falling off it.
-        // This pair asserted the opposite until 2026-08-25 — it codified the
-        // defect: the cut-off left 1,237 units permanently unclaimable and
-        // `oldest_task_age_seconds` pinned at 85 days. What the horizon still
-        // buys is the FLAT band beneath it: every day inside the goal window
-        // ties on age, so `hole`, `-width` and `benefit` decide there, and only
-        // the tail the cut-off had abandoned gains rank over them.
+        // Past the horizon a day keeps escalating rather than falling off it. The
+        // horizon buys the FLAT band beneath it: every day inside the goal window
+        // ties on age, so `hole`, `-width` and `benefit` decide there.
         let ancient = sealed("f", 60 * 24);
         assert!(ancient < recent_new, "past STARVATION_HORIZON_MICROS a day still escalates, it does not fall off");
 
         let outside_goal_window = sealed("h", 40 * 24);
         let inside_goal_window = sealed("i", 25 * 24);
         assert!(outside_goal_window < inside_goal_window, "a day outside the window is behind in the drain, not beneath it");
-        // ...and inside the window age is FLAT, so the terms the band has learned
-        // still order it: 25 days and 10 days tie on `starved`.
+        // ...and inside the window age is FLAT: 25 days and 10 days tie on `starved`.
         let (_, inside_starved, ..) = inside_goal_window;
         let (_, ten_days_starved, ..) = sealed("j", 10 * 24);
         assert_eq!(inside_starved, ten_days_starved, "the goal window is one band: `hole`/`width`/`benefit` order inside it");
 
-        // And starvation never lets sealed work outrank the live frontier.
         let frontier = super::scheduling_class(&task("g", now - 600_000_000, now, Operation::BaseRollup), now);
         assert!(frontier < overdue_older, "class still leads: the frontier outranks even overdue sealed work");
     }
 
-    /// Age must keep accruing rank past the horizon instead of falling off it.
-    ///
-    /// The horizon used to be a CLIFF: `starved` was 0 only inside [3d, 31d],
-    /// and it sits ahead of `hole`/`width`/`benefit` in a strict-priority tuple,
-    /// so a slice one day past the horizon lost to everything inside it and was
-    /// never compared on any other term. Prod 2026-08-25: 1,237 units older than
-    /// 31 days were permanently unclaimable, `oldest_task_age_seconds` was 85
-    /// days and could not decrease — 40 minutes of `maintenance_task_started`
-    /// showed ZERO claims anywhere in 05-30..07-20. It cannot self-heal either:
-    /// the 3-31d band is refilled every midnight and its timed-out residue
-    /// crosses the cliff (1,019 of the tail at attempts=0, but 207 at
-    /// attempts=1 — tried inside the window, then aged out).
+    /// Age must keep accruing rank past the horizon instead of falling off a cliff:
+    /// `starved` sits ahead of `hole`/`width`/`benefit` in a strict-priority tuple,
+    /// so anything it ranks last is never compared on any other term.
     #[test]
     fn age_past_the_starvation_horizon_keeps_accruing_rank() {
         let now = 800 * DAY_MICROS;
@@ -4675,31 +3868,21 @@ mod tests {
         // grade saturates so ancient work ties rather than fanning out forever.
         let ladder: Vec<_> = [4, 10, 31, 32, 71, 300, 400].into_iter().map(|days| aged("p", days)).collect();
         assert!(ladder.windows(2).all(|pair| pair[1] <= pair[0]), "rank must be non-increasing in age: {ladder:?}");
-        // Saturation ties the GRADED term — the tuple below it still drains them
-        // oldest-first, which is what keeps the far tail converging rather than
-        // fanning into one sole winner of every claim.
+        // Saturation ties the GRADED term; the tuple below it still drains oldest-first.
         let (_, at_300, ..) = aged("p", 300);
         let (_, at_400, ..) = aged("p", 400);
         assert_eq!((at_300, at_400), (0, 0), "the grade saturates instead of running out of `u8`");
     }
 
-    /// A hole must be claimed before a day that already has tier output.
-    ///
-    /// Sealed rollup work is otherwise strictly newest-first, and recent days
-    /// are re-invalidated continuously by ongoing publication, so the claim
-    /// never walks back far enough to reach an old hole. Prod 2026-08-19 09:00:
-    /// `94c5dc1f`'s 1h tier jumped 2026-07-31 -> 08-14 for a second day running
-    /// while day-wide derived units for 08-17 were claimed over and over.
-    /// Newest-first is right for FRESHNESS and wrong for CONTIGUITY, and 30
-    /// contiguous days is a contiguity goal.
+    /// A hole must be claimed before a day that already has tier output: sealed
+    /// rollup work is otherwise newest-first, which is right for FRESHNESS and
+    /// wrong for the contiguity goal.
     #[test]
     fn a_hole_outranks_a_day_that_already_has_tier_output() {
         let now = 40 * DAY_MICROS;
         let at = |project: &str, day: i64| tier_unit(project, "rollup_1h", day * DAY_MICROS, DAY_MICROS, now, Operation::DerivedRollup);
-        // Both are SEALED and both are overdue, so backlog order applies and the
-        // OLDER day leads on age alone. The hole is deliberately put on the
-        // NEWER day, so `fills_a_hole` has to beat that ordering rather than
-        // merely agree with it — a control that agreed would prove nothing.
+        // Both SEALED and overdue, so the OLDER day leads on age alone. The hole is
+        // deliberately on the NEWER day, so `fills_a_hole` must beat that ordering.
         let seed = |journal: &mut TaskJournal| {
             journal.upsert(at("recent", 35));
             journal.upsert(at("oldhole", 20));
@@ -4712,7 +3895,6 @@ mod tests {
         // With no hole information, the older overdue day leads on age.
         assert_eq!(claim_winner(now, Operation::DerivedRollup, seed), "oldhole");
 
-        // Told which cell is a hole, the hole goes first instead.
         let winner = claim_winner(now, Operation::DerivedRollup, |journal| {
             seed(journal);
             journal.set_tier_holes(HashSet::from([("source".to_owned(), "recent".to_owned(), "rollup_1h".to_owned(), "1970-02-05".to_owned())]));
@@ -4720,24 +3902,15 @@ mod tests {
         assert_eq!(winner, "recent", "a missing day must outrank an OLDER day that already has output — holes rank above backlog age");
     }
 
-    /// A partition still holding UNTAGGED tier files is a hole, whatever else
-    /// is live in it.
-    ///
-    /// Measured on prod 2026-08-22. Every one of the 08-19 damaged partitions
-    /// had its day-wide rebuild already queued, already past its deadline, at
-    /// `attempts=0`, and cheap enough to run unsplit (268-537 MB) — and none had
-    /// been claimed in three days. The reason is this rank: those cells DO have
-    /// tier output, so `fills_a_hole` was false and they sat behind ~12,000
-    /// hole-filling units that the backfill mints faster than it drains. The
-    /// untagged files themselves cannot be certified, so the partition is
-    /// missing coverage no matter how much output sits beside them.
+    /// A partition still holding UNTAGGED tier files is a hole, whatever else is
+    /// live in it: untagged files cannot be certified, so the partition is missing
+    /// coverage no matter how much output sits beside them.
     #[test]
     fn a_partition_holding_untagged_files_outranks_a_re_derive() {
         let now = 40 * DAY_MICROS;
         let at = |project: &str, day: i64| tier_unit(project, "rollup_1m", day * DAY_MICROS, DAY_MICROS, now, Operation::BaseRollup);
-        // The damaged cell is deliberately the one that loses every other tie:
-        // it is the NEWER day and its project sorts last, so only the untagged
-        // rank can put it first.
+        // The damaged cell deliberately loses every other tie — newer day, project
+        // sorts last — so only the untagged rank can put it first.
         let seed = |journal: &mut TaskJournal| {
             journal.upsert(at("aaa-clean", 20));
             journal.upsert(at("zzz-damaged", 35));
@@ -4751,24 +3924,21 @@ mod tests {
         assert_eq!(winner, "zzz-damaged", "a partition holding unretirable untagged files must outrank a day that is merely being re-derived");
     }
 
-    /// Damage repair leads a missing day, which leads a re-derive.
-    ///
-    /// The middle rank is not enough on its own: a repair unit targets one
-    /// file's uncovered span — 39 to 308 minutes on prod 2026-08-22 — so the
-    /// `-width` tiebreak ranks it below every day-wide backfill hole it shares a
-    /// rank with. That is why the damaged cells drained at ~2.4 files/hour.
+    /// Damage repair leads a missing day, which leads a re-derive. Rank alone is not
+    /// enough: a repair unit targets one file's uncovered span, so `-width` would
+    /// otherwise put it below every day-wide backfill hole sharing its rank.
     #[test]
     fn damage_outranks_a_missing_day_which_outranks_a_re_derive() {
         let now = 40 * DAY_MICROS;
-        // The damaged unit is deliberately the NARROWEST and the newest, so it
-        // loses every other tiebreak and only the rank can put it first.
+        // The damaged unit is deliberately the NARROWEST and newest, so only the
+        // rank can put it first.
         let seed = |journal: &mut TaskJournal| {
             journal.upsert(tier_unit("damaged", "rollup_1m", 35 * DAY_MICROS, 600_000_000, now, Operation::BaseRollup));
             journal.upsert(tier_unit("missing", "rollup_1m", 20 * DAY_MICROS, DAY_MICROS, now, Operation::BaseRollup));
             journal.set_tier_holes(HashSet::from([("source".to_owned(), "missing".to_owned(), "rollup_1m".to_owned(), "1970-01-21".to_owned())]));
         };
 
-        // Sharing one rank, the day-wide hole wins on width — the old behaviour.
+        // Sharing one rank, the day-wide hole wins on width.
         assert_eq!(claim_winner(now, Operation::BaseRollup, seed), "missing");
 
         let winner = claim_winner(now, Operation::BaseRollup, |journal| {
@@ -4778,23 +3948,10 @@ mod tests {
         assert_eq!(winner, "damaged", "a ten-minute damage repair must outrank a day-wide backfill hole");
     }
 
-    /// Coarsening must not eat a damage repair.
-    ///
-    /// A repair unit is sized to one file's uncovered span, so fusing it
-    /// destroys the only work that closes that hole — and the fused unit does
-    /// not replace it, because the preflight measures it over budget and shreds
-    /// it back down. Prod 2026-08-23: the three units covering `dcad860a`
-    /// 08-15's eleven-minute hole (5m, 6m, 8m, Pending, eligible, attempts=0)
-    /// had VANISHED from the journal hours later, leaving only completed units
-    /// on either side of the hole. Five such cells sat at 3-11 minutes all day.
-    ///
-    /// Nor may SUBSUMPTION eat one, which is the other half of the same pass.
-    ///
-    /// A wider pending unit does not replace the repair it swallows: the
-    /// preflight measures that one over budget and shreds it back down. Prod
-    /// 2026-08-23, after exempting only fusion: five cells still had NO unit
-    /// covering their hole — `dcad860a` 08-15's units began at 18:11 against a
-    /// hole of 18:00-18:11.
+    /// Neither fusion nor subsumption may eat a damage repair: a repair unit is
+    /// sized to one file's uncovered span, and the wider unit that swallows it is
+    /// measured over budget by the preflight and shredded back down, so the hole
+    /// ends up with no unit covering it at all.
     ///
     /// `leading_width` picks which half of the pass is exercised: a second narrow
     /// sibling makes the bucket fusible, a day-wide neighbour makes it subsumable.
@@ -4816,40 +3973,29 @@ mod tests {
         assert_eq!(narrow("ordinary"), 0, "control: an ordinary narrow sealed unit is still fused or subsumed");
     }
 
-    /// Damage ROTATES across cells; one cell's ladder cannot monopolise it.
-    ///
-    /// Both width orderings starve, because the selection loop matches the
-    /// winning rank tuple EXACTLY, so any width ordering makes a single unit win
-    /// every claim. Widest-first buried the narrow repair units (three 5-8
-    /// minute units Pending at attempts=0, deadlines nine hours past);
-    /// narrowest-first buried everyone behind one whale cell whose shredded
-    /// ladder always held a narrower child — five cells with 3-11 minute holes
-    /// sat untouched for eight hours. Tying every damage unit puts them in one
-    /// rank group so `fair_cursors` rotates across projects.
+    /// Damage ROTATES across cells; one cell's ladder cannot monopolise it. The
+    /// selection loop matches the winning rank tuple EXACTLY, so ANY width ordering
+    /// makes a single unit win every claim — damage units must all TIE so
+    /// `fair_cursors` can rotate across projects.
     #[test]
     fn damage_rotates_across_cells_instead_of_draining_one() {
         let now = 40 * DAY_MICROS;
         let unit = |project: &str, start: i64, width: i64| tier_unit(project, "rollup_1m", start, width, now, Operation::BaseRollup);
         let (_dir, mut journal) = new_journal();
         // A whale ladder of very narrow children, and ONE other cell holding a
-        // slightly wider hole — the prod shape exactly.
+        // slightly wider hole.
         for minute in 0..6 {
             journal.upsert(unit("whale", 35 * DAY_MICROS + minute * 60_000_000, 60_000_000));
         }
         journal.upsert(unit("small", 35 * DAY_MICROS, 180_000_000));
         journal.set_untagged_cells("source", "rollup_1m", [("whale".to_owned(), "1970-02-05".to_owned()), ("small".to_owned(), "1970-02-05".to_owned())]);
 
-        // Six claims: the other cell must get a turn, not wait for the ladder.
         let claimed: Vec<String> = (0..6).filter_map(|_| journal.claim_next(Operation::BaseRollup, now, true).map(|task| task.key.project_id)).collect();
         assert!(claimed.iter().any(|project| project == "small"), "one cell's ladder must not monopolise damage repair; claimed {claimed:?}");
     }
 
-    /// A restored cell ranks exactly like a freshly discovered one.
-    ///
-    /// The repair units are durable in this journal; their PRIORITY was not,
-    /// and prod restarted four times an hour on 2026-08-23, so the rank was
-    /// never active. `restore_untagged_cells` is what closes that, and it is
-    /// only worth anything if the restored entries rank identically.
+    /// A cell restored via `restore_untagged_cells` must rank exactly like a freshly
+    /// discovered one — the repair units are durable, their damage rank is not.
     #[test]
     fn a_restored_untagged_cell_ranks_like_a_discovered_one() {
         let now = 40 * DAY_MICROS;
@@ -4866,20 +4012,10 @@ mod tests {
         );
     }
 
-    /// Damage outranks starvation, because the starvation window is a
-    /// FRESHNESS heuristic and damage is not a freshness question.
-    ///
-    /// `starved` grades age and is compared BEFORE `hole_rank`, so a damaged
-    /// cell whose age loses is unreachable however damaged it is. Every untagged
-    /// file left on prod 2026-08-23 was 32 to 37 days old and sorted below the
-    /// whole ~12,000-unit backfill queue.
-    ///
-    /// The age that loses used to be "past the 31-day horizon"; since the
-    /// horizon became a slope (2026-08-25) old work no longer loses on age at
-    /// all, so the damaged cell here is a SETTLING one — two days sealed, under
-    /// `STARVATION_MICROS` — which is now the only way age can rank a cell last.
-    /// Its previous shape made the control vacuous: the 36-day cell won on age
-    /// alone and the damage flag proved nothing.
+    /// Damage outranks starvation: `starved` grades age and is compared BEFORE
+    /// `hole_rank`, so a damaged cell whose age loses is otherwise unreachable.
+    /// The damaged cell here is a SETTLING one (two days sealed, under
+    /// `STARVATION_MICROS`) — the only way age can now rank a cell last.
     #[test]
     fn damage_outranks_work_inside_the_starvation_window() {
         let now = 40 * DAY_MICROS;
@@ -4902,12 +4038,9 @@ mod tests {
         assert_eq!(winner, "damaged", "a damaged cell the age ordering ranks last must still lead, or it is unreachable");
     }
 
-    /// Each (source, tier) owns its own slice of the untagged set.
-    ///
+    /// Each (source, tier) owns its own slice of the untagged set:
     /// `recover_rollup_coverage` runs per source AND per tier, so a wholesale
-    /// replace would leave the journal holding only whichever tier ran last —
-    /// the exact bug that made `base_tier_ready` and `tier_holes` inert on prod
-    /// (`base_tier_ready=374` then `272`, each wiping the other).
+    /// replace would leave the journal holding only whichever tier ran last.
     #[test]
     fn setting_untagged_cells_replaces_only_that_sources_tier() {
         let (_dir, mut journal) = new_journal();
@@ -4918,20 +4051,14 @@ mod tests {
         assert_eq!(journal.untagged_cells_len(), 1, "an emptied tier clears its own cells and only those");
     }
 
-    /// The day-keyed ready set must unblock a derived task of ANY width.
-    ///
-    /// Three attempts to carry this fact as a per-task flag were inert (#184,
-    /// #186, #195) because the flag had to land on exactly the right `TaskKey`
-    /// and the queued work is not the width the planner assumes. Prod
-    /// 2026-08-19 06:30: `derived_unproven=674` of `derived_pending=674` — the
-    /// flag had never been set on ONE pending task. A day is what the fact is
-    /// about, so keying on it cannot miss a task.
+    /// The day-keyed ready set must unblock a derived task of ANY width — a
+    /// per-task flag misses, because queued work is not the width the planner
+    /// assumes; a day is what the fact is actually about.
     #[test]
     fn the_base_tier_ready_set_unblocks_derived_work_of_any_width() {
         let (_dir, mut journal) = new_journal();
         const HOUR: i64 = 3_600_000_000;
         let at = |start: i64, width: i64| derived_key("p", start, width);
-        // An hour-wide task and a day-wide one, both inside 1970-01-01.
         journal.enqueue(at(0, HOUR), 0, 1, 0);
         journal.enqueue(at(5 * HOUR, HOUR), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: dependency-blocked");
@@ -4948,38 +4075,26 @@ mod tests {
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "clearing the set re-blocks the work");
     }
 
-    /// The proof must reach the tasks that actually exist, at their own width.
-    ///
-    /// Prod's shape, not a hypothetical: `invalidate` mints derived units one
-    /// HOUR wide, and `coarsen_sealed_slices` will not fuse a day whose day-wide
-    /// unit already exists in any state — including `Complete`, which is what a
-    /// legacy rows=0 publication leaves behind. So the day carries hour-wide
-    /// pending tasks *and* a completed day-wide one, and a proof aimed at the
-    /// day-wide key lands on the completed task, which is never claimed.
-    ///
-    /// Measured 2026-08-19 03:00 UTC by #194's census:
-    /// `cells_missing=264 cells_wanted=0 defer_enqueue=false` — every hole seen,
-    /// every one vetoed as already-queued, and the proof had never fired once.
+    /// The proof must reach the tasks that actually exist, at their own width: a day
+    /// can carry hour-wide pending tasks *and* a completed day-wide one, and a proof
+    /// aimed at the day-wide key would land on the completed task, which is never claimed.
     #[test]
     fn the_proof_reaches_hour_wide_tasks_under_a_completed_day_unit() {
         let (_dir, mut journal) = new_journal();
         const HOUR: i64 = 3_600_000_000;
         let at = |start: i64, width: i64| derived_key("p", start, width);
 
-        // The legacy rows=0 publication: a COMPLETE day-wide unit.
+        // A COMPLETE day-wide unit, with hour-wide work still pending underneath it.
         let day_unit = at(0, DAY_MICROS);
         journal.enqueue(day_unit.clone(), 0, 1, 0);
         journal.complete(&day_unit);
-        // And the hour-wide work that is actually pending underneath it.
         journal.enqueue(at(0, HOUR), 0, 1, 0);
         journal.enqueue(at(HOUR, HOUR), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: the hour units are dependency-blocked");
 
-        // Proving the DAY must reach the hour units, not just the completed key.
         assert_eq!(journal.prove_base_tier_for_day(&day_unit, 0, DAY_MICROS), 2, "both pending hour units are proven");
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "an hour unit becomes claimable");
 
-        // Scoped to the day: a task in the NEXT day must not be swept up.
         journal.enqueue(at(DAY_MICROS, HOUR), 0, 1, 0);
         assert_eq!(journal.prove_base_tier_for_day(&day_unit, 0, DAY_MICROS), 0, "the following day is a different fact and stays unproven");
     }
@@ -4995,18 +4110,9 @@ mod tests {
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "a later uninformed enqueue must not clear the proof");
     }
 
-    /// Attempts alone must not quarantine. Only the worker's own verdict does.
-    ///
-    /// A task is claimed and its attempt counted before anything about its cost
-    /// is known, so a unit handed back for a reason unrelated to cost —
-    /// `source_not_flushed`, `resolve_input`, an unsatisfiable dependency —
-    /// accumulates attempts identically to one that burned a 900s deadline.
-    ///
-    /// Prod 2026-08-19: of 162 SEALED derived units, the historical backfill the
-    /// 30d goal needs, **109 were quarantined** and held to 2 of 16 workers.
-    /// They had failed while their base-tier dependency was unprovable, which
-    /// #197/#202 then fixed — stale evidence about a condition that no longer
-    /// existed.
+    /// Attempts alone must not quarantine; only the worker's own verdict does. An
+    /// attempt is counted before anything about cost is known, so a unit handed back
+    /// for a cost-unrelated reason accumulates attempts like one that burned its deadline.
     #[test_case::test_case(TaskJournal::QUARANTINE_ATTEMPTS + 3, Some("source_not_flushed") => false ; "a dependency-shaped failure is not evidence about cost")]
     #[test_case::test_case(TaskJournal::QUARANTINE_ATTEMPTS + 3, None => false ; "no recorded reason is not evidence either")]
     #[test_case::test_case(TaskJournal::QUARANTINE_ATTEMPTS + 3, Some(TaskJournal::WORKER_FAILURE_REASON) => true ; "a unit the worker gave back, repeatedly, is quarantined")]
@@ -5018,78 +4124,46 @@ mod tests {
         TaskJournal::is_quarantined(&unit)
     }
 
-    /// A unit that has proven it cannot fit its deadline must not be able to
-    /// crowd out work that can.
-    ///
-    /// Prod 2026-08-18 21:00 UTC, 60 minutes of logs: 47 units timed out at
-    /// 900s each — 42,300 of 57,600 available worker-seconds, 73% of ALL
-    /// maintenance capacity, committing nothing — while ~40,000 pending
-    /// BaseRollup units could not get a slot and `tasks_complete` advanced by 2
-    /// per 180s with `tasks_running` pinned at 16. The one rollup that did
-    /// complete took 812ms.
-    ///
-    /// Neither the backoff nor the bisection in `abandon_running` bounds this:
-    /// the backoff sets how OFTEN a doomed unit runs, not what it costs, and
-    /// halving a slice cannot halve a per-file cost (~3.2s per parquet file,
-    /// measured the same day) — it doubles the number of units paying it.
+    /// A unit that has proven it cannot fit its deadline must not crowd out work that
+    /// can. Neither the backoff nor `abandon_running`'s bisection bounds this: the
+    /// backoff sets how OFTEN a doomed unit runs, not what it costs, and halving a
+    /// slice cannot halve a per-file cost — it doubles the number of units paying it.
     #[test]
     fn a_unit_that_cannot_fit_its_deadline_does_not_crowd_out_one_that_can() {
         let (_dir, mut journal) = new_journal();
-        // Two units, identical but for their history. The doomed one sorts
-        // FIRST on every tiebreak in `claim_next` (project id, then key), so a
+        // The doomed unit sorts FIRST on every tiebreak in `claim_next`, so a
         // scheduler blind to attempts is guaranteed to pick it.
         let key = upserted(&mut journal, task("a_doomed", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
         journal.upsert(task("b_fresh", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
-        // Two runs that ended in a timeout. `mark_running` is the same call
-        // `claim_next` uses to count an attempt, driven directly here so the
-        // setup does not also rotate the project-fairness cursor.
+        // `mark_running` counts an attempt like `claim_next` does, without also
+        // rotating the project-fairness cursor.
         for _ in 0..TaskJournal::QUARANTINE_ATTEMPTS {
             assert!(journal.mark_running(&key));
             journal.retry(&key, TaskJournal::WORKER_FAILURE_REASON.to_owned(), 0);
         }
 
-        // Without a quarantine slot the worker must skip it and run the unit
-        // that can still finish.
         assert_eq!(
             journal.claim_next(Operation::BaseRollup, 0, false).expect("fresh work is claimable").key.project_id,
             "b_fresh",
             "a proven-unfittable unit must not be claimed while ordinary work waits"
         );
 
-        // Deprioritised, never abandoned: with a slot it still takes its turn,
-        // or a partition whose rollup is genuinely expensive — the one the 30d
-        // goal needs most — would never gain coverage at all.
+        // Deprioritised, never abandoned: with a slot it still takes its turn, or a
+        // partition whose rollup is genuinely expensive never gains coverage at all.
         assert_eq!(journal.claim_next(Operation::BaseRollup, 0, true).expect("quarantined work still runs").key, key);
     }
 
-    /// The stale-estimate migration must run once, and must free fusion.
-    ///
-    /// Every stored estimate predating `slice_share_of_file` measured whole
-    /// files, so a ten-minute child of a split day carried the whole day's
-    /// number. `coarsen_to_width` sums its members, so 144 of them summed 144
-    /// whole days and could never fit. Prod 2026-08-19, right after the estimate
-    /// fix landed: `blocked=24 over_budget=266506` — the superseded trap gone
-    /// The debris left by the old preflight shred is footprint-less one-minute
-    /// units whose stored estimates are WHOLE-FILE figures, so their sum grows
-    /// with the shredding and the fit test refuses hardest exactly where fusing
-    /// is worth most. Prod 2026-08-23: `base_rollup / 00000000 / 2026-08-13`
-    /// held 1,440 such units claiming 391 GB between them over a partition
-    /// holding 0.36 GB.
-    ///
-    /// This pins that the PARTITION CEILING alone rescues them — no migration,
-    /// no deletion of queued work. It is why the "one-shot destructive
-    /// migration" this codebase's plan called for should not be written: the
-    /// debris fuses back, and fusing preserves the work where deleting it would
-    /// not.
+    /// Footprint-less shred debris carries WHOLE-FILE estimates, so its sum grows
+    /// with the shredding and the fit test refuses hardest where fusing is worth
+    /// most. The PARTITION CEILING alone rescues it — no migration and no deletion
+    /// of queued work, since fusing preserves the work where deleting would not.
     #[test]
     fn a_footprintless_shred_fuses_once_the_partition_ceiling_is_known() {
         let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
-        // One-minute units, each carrying a whole-file estimate and NO
-        // footprint — the shape `split_time_task` produced before it recorded
-        // one, which is the entire stuck population.
+        // One-minute units, each carrying a whole-file estimate and NO footprint.
         let minutes = 600;
         for slot in 0..minutes {
             let start = day + slot * MIN_SLICE_MICROS;
@@ -5098,11 +4172,9 @@ mod tests {
         let pending = |journal: &TaskJournal| live_widths(journal, Operation::BaseRollup).len();
         assert_eq!(pending(&journal), minutes as usize, "the shred is queued");
 
-        // Without a ceiling the summed price is ~2.7 TB and every width refuses.
         assert_eq!(journal.coarsen_sealed_slices(now), 0, "summed whole-file estimates refuse to fuse — this is the stuck state");
 
-        // The partition actually holds 0.36 GB. No unit over one partition can
-        // decode more than the partition contains.
+        // No unit over one partition can decode more than the partition contains.
         let report = journal.coarsen_sealed_slices_capped(now, &|_project, _source, _date| Some(360 * 1024 * 1024));
 
         assert!(report.fused > 0, "the ceiling makes the fused unit's real cost knowable, so the day collapses: {report:?}");
@@ -5117,15 +4189,16 @@ mod tests {
         );
     }
 
-    /// and every candidate refused on a number written before the fix existed.
+    /// The stale-estimate migration must run exactly once and free fusion: estimates
+    /// predating `slice_share_of_file` measured WHOLE files, so summing a split day's
+    /// children prices it at many whole days and no width can ever fit.
     #[test]
     fn clearing_stale_estimates_runs_once_and_lets_a_split_day_fuse_again() {
         let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
-        // 144 children each carrying the WHOLE day's estimate, as a split under
-        // the old ruler produced.
+        // 144 children each carrying the WHOLE day's estimate.
         enqueue_run(&mut journal, "p", day, NORMAL_SLICE_MICROS, DAY_MICROS / NORMAL_SLICE_MICROS, MAX_DECODED_BYTES, Operation::BaseRollup);
         assert_eq!(journal.coarsen_sealed_slices(now), 0, "summed stale estimates must refuse to fuse — that is the bug");
 
@@ -5138,18 +4211,9 @@ mod tests {
         assert_eq!(widths, vec![DAY_MICROS], "one day-wide unit should remain, got {widths:?}");
     }
 
-    /// A collapse must SURVIVE a reload.
-    ///
-    /// `checkpoint` appends dirty tasks to a WAL, and `JournalRecord::Task` can
-    /// only upsert — there is no record meaning "this task is gone". So a pass
-    /// that removes tasks and then checkpoints persists nothing, and every
-    /// removed task returns when the journal is next loaded.
-    ///
-    /// Prod 2026-08-19 ran the whole loop invisibly: coarsening took
-    /// `pending_base_rollup` from 88,618 to 2,294, the next deploy restored 81k,
-    /// and the on-disk journal was still byte-identical at 84,734,124 bytes with
-    /// all 173,901 tasks. On a process that restarts several times a day, an
-    /// in-memory-only collapse never happened at all.
+    /// A collapse must SURVIVE a reload: `checkpoint` appends dirty tasks to a WAL
+    /// and `JournalRecord::Task` can only upsert — there is no record meaning "this
+    /// task is gone" — so a pass that REMOVES tasks must `compact()`, not checkpoint.
     #[test]
     fn a_collapsed_queue_stays_collapsed_across_a_reload() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5167,8 +4231,7 @@ mod tests {
         assert_eq!(live, 1, "the collapse must survive the reload; got {live} units back");
     }
 
-    /// Enqueues `count` contiguous `width`-wide units from `start`, each priced
-    /// at `bytes` — the shape the live path mints for a sealed day.
+    /// Enqueues `count` contiguous `width`-wide units from `start`, each priced at `bytes`.
     fn enqueue_run(journal: &mut TaskJournal, project: &str, start: i64, width: i64, count: i64, bytes: u64, operation: Operation) {
         for slot in 0..count {
             let at = start + slot * width;
@@ -5199,25 +4262,16 @@ mod tests {
             .collect()
     }
 
-    /// Enqueues a unit and stamps it with the file set it reads, which is what
-    /// lets fusion price a group of children as one scan.
+    /// Enqueues a unit stamped with the file set it reads, so fusion can price a
+    /// group of children as one scan.
     fn enqueue_with_input(journal: &mut TaskJournal, key: &TaskKey, bytes: u64, input: InputFootprint) {
         journal.enqueue(key.clone(), 0, bytes, 0);
         let index = journal.task_indices[key];
         journal.snapshot.tasks[index].input = Some(input);
     }
 
-    /// Derived hygiene work is never persisted; durable work always is.
-    ///
-    /// `plan_compaction_debt` scans the real file list every 60 s and mints
-    /// HotPacking / SealedConsolidation from the files themselves, so the scan
-    /// is authoritative and a durable copy can only go stale. It did: prod
-    /// 2026-08-19 carried `pending_sealed_consolidation = 2,218` while an audit
-    /// of object storage found 877 of 1,033 partitions already compliant and
-    /// only 108 sealed ones out of policy — 20x inflated with work already done.
-    ///
-    /// Repair must still persist: its units are day-wide rewrites that stage
-    /// output before committing, and losing one means redoing 12-15 minutes.
+    /// Derived hygiene work is re-derived from the file scan and never persisted;
+    /// durable work (Repair, BaseRollup) always is.
     #[test]
     fn derived_hygiene_is_not_persisted_but_durable_work_is() {
         let (dir, mut journal) = new_journal();
@@ -5238,18 +4292,8 @@ mod tests {
         assert_eq!(survived.len(), 2, "exactly the durable operations, got {survived:?}");
     }
 
-    /// A removal must survive a reload through `checkpoint` ALONE.
-    ///
-    /// The WAL used to be upsert-only: `JournalRecord` had `Task` and
-    /// `SourceCursor` and nothing meaning "this task is gone", so a pass that
-    /// removed tasks could persist its work only by rewriting the entire 84 MB
-    /// snapshot. Every caller that forgot silently lost the removal. Prod
-    /// 2026-08-19: `pending_base_rollup` 88,618 -> 2,294 while the on-disk
-    /// journal stayed byte-identical at 84,734,124 bytes with all 173,901
-    /// tasks, and the next restart undid the lot.
-    ///
-    /// `compact` still exists and is still right for a large migration. This
-    /// pins the cheap path, because the cheap path is the one callers reach for.
+    /// A removal must survive a reload through `checkpoint` ALONE — without a
+    /// tombstone in the WAL, replay resurrects every removed task.
     #[test]
     fn a_removal_survives_a_reload_without_compacting() {
         let (dir, mut journal) = new_journal();
@@ -5265,12 +4309,8 @@ mod tests {
         assert!(!reloaded.tasks().any(|t| t.key.slice.start_micros == day), "the removed unit specifically must be gone, not merely some unit");
     }
 
-    /// Remove-then-recreate replays as CREATED, not as removed.
-    ///
-    /// `coarsen_to_width` does exactly this in one pass: it drops a bucket's
-    /// members and writes a fused unit over the same span, and a fused unit at
-    /// day width can collide with a key that was just dropped. If the tombstone
-    /// won, the pass would delete the very unit it exists to create.
+    /// Remove-then-recreate replays as CREATED, not as removed: `coarsen_to_width`
+    /// drops a bucket's members then writes a fused unit that can reuse a dropped key.
     #[test]
     fn a_task_recreated_after_removal_survives_the_reload() {
         let (dir, mut journal) = new_journal();
@@ -5287,18 +4327,8 @@ mod tests {
         assert_eq!(reloaded.state(&key), Some(TaskState::Pending));
     }
 
-    /// A fused unit inherits its members' AGE, not the moment of fusion.
-    ///
-    /// `scheduling_class` escalates work that has waited past
-    /// `STARVATION_MICROS`. Stamping the fused unit with `now` makes it
-    /// permanently fresh, so the narrow leftovers that were not fused keep their
-    /// real, older creation time and outrank it forever — coarsening starves its
-    /// own output.
-    ///
-    /// Prod 2026-08-19, 316 claims in 35 minutes: Dedup and BaseRollup claimed
-    /// ZERO day-wide units, while Repair (34/34), HotPacking (29/41) and
-    /// SealedConsolidation (19/20) claimed almost nothing else. Those three are
-    /// planned day-wide and never fused; the two that fuse were the two starving.
+    /// A fused unit inherits its members' AGE, not the moment of fusion: stamped
+    /// with `now` it could never escalate past `STARVATION_MICROS`.
     #[test]
     fn a_fused_unit_inherits_the_age_of_the_work_it_replaces() {
         let (_dir, mut journal) = new_journal();
@@ -5322,17 +4352,8 @@ mod tests {
         );
     }
 
-    /// A day-wide unit must SUBSUME the ten-minute units inside it.
-    ///
-    /// This is the shape prod was actually in on 2026-08-19, and the reason the
-    /// fuse pass alone converged to nothing. `coarsen_to_width` refuses any
-    /// bucket already covered by a pending unit at least as wide — correctly,
-    /// because fusing there would duplicate claimed work — but a pending
-    /// day-wide unit is exactly the condition under which the narrow units are
-    /// redundant. So fusion collapsed the cells that had no day unit, logged
-    /// 12, 6, 3, and went quiet, while `pending_base_rollup` sat at 88,100
-    /// against a backfill census of `cells_missing=260 cells_wanted=0` — 260
-    /// real (project, date) cells, ~339 queued units each.
+    /// A day-wide unit must SUBSUME the ten-minute units inside it; `coarsen_to_width`
+    /// alone refuses a bucket already covered and so converges to nothing.
     #[test]
     fn a_pending_day_unit_subsumes_the_ten_minute_units_inside_it() {
         let (_dir, mut journal) = new_journal();
@@ -5349,13 +4370,8 @@ mod tests {
         assert_eq!(live, vec![DAY_MICROS], "the day unit must absorb all 144 slices, leaving one unit for the cell; got {live:?}");
     }
 
-    /// ...and a SUPERSEDED day unit subsumes nothing either.
-    ///
-    /// `split_time_task` supersedes a unit too big to finish and replaces it
-    /// with children tiling its range. If a superseded parent could subsume,
-    /// it would delete the children the split just created and leave the cell
-    /// with no queued work at all — strictly worse than the redundancy this
-    /// pass exists to remove.
+    /// A SUPERSEDED day unit subsumes nothing: it would delete the children the
+    /// split just created, leaving the cell with no queued work at all.
     #[test]
     fn a_superseded_day_unit_does_not_subsume_the_children_that_replaced_it() {
         let (_dir, mut journal) = new_journal();
@@ -5377,11 +4393,8 @@ mod tests {
         );
     }
 
-    /// ...but a COMPLETE day unit subsumes nothing.
-    ///
-    /// Built once is not the same as queued. A narrower unit inside a completed
-    /// day is a later invalidation — the day is dirty again, which is why the
-    /// slice exists — and dropping it would lose that rebuild silently.
+    /// A COMPLETE day unit subsumes nothing either: a narrower unit inside it is a
+    /// later invalidation, and dropping it would lose that rebuild silently.
     #[test]
     fn a_complete_day_unit_does_not_subsume_a_later_invalidation() {
         let (_dir, mut journal) = new_journal();
@@ -5402,21 +4415,9 @@ mod tests {
         );
     }
 
-    /// A sealed day too big to scan as one unit lands at a narrower width,
-    /// not back at ten minutes.
-    ///
-    /// This is the state prod was in on 2026-08-19: `pending_base_rollup =
-    /// 84,834`, with `maintenance_sealed_slices_coarsened` logging 12, 6, 3 and
-    /// then nothing for the rest of the process's life. Everything that fit a
-    /// day had already been fused; every remaining day was over
-    /// `MAX_DECODED_BYTES` and so kept all 144 of its ten-minute slices.
-    ///
-    /// That fallback is not merely slower, it is inverted. On an uncompacted
-    /// sealed partition every file spans the whole day, so timestamp-stat
-    /// pruning skips nothing and a ten-minute slice reads exactly the files a
-    /// day unit would — measured at `scan_ms=481682` to publish 142 rows. The
-    /// day-or-nothing rule therefore answered "too expensive to scan once" with
-    /// "scan it 144 times".
+    /// A sealed day too big to scan as one unit lands at a narrower width, not back
+    /// at ten minutes: on an uncompacted partition every file spans the whole day,
+    /// so a ten-minute slice reads exactly the files a day unit would.
     #[test]
     fn a_day_over_the_decode_budget_lands_at_a_narrower_width_not_at_ten_minutes() {
         let (_dir, mut journal) = new_journal();
@@ -5436,18 +4437,8 @@ mod tests {
         assert!(widths.iter().all(|width| *width == 6 * 60 * 60 * 1_000_000), "expected six-hour units, got {widths:?}");
     }
 
-    /// A sealed day's ten-minute leftovers collapse into one day unit — but
-    /// never one that would undo a split.
-    ///
-    /// The live path mints a unit per ten-minute slice, which is right while
-    /// the day is the frontier and pure overhead once it seals: ~144 units
-    /// where one would do, each paying the same fixed object-store cost. Prod
-    /// 2026-08-17 sat at 18,040 pending, refilled every midnight at about the
-    /// rate it drained. At ten times the projects that diverges.
-    ///
-    /// The guard matters as much as the collapse: `split_time_task` leaves a
-    /// too-big parent `Superseded`, so coarsening its children back into a day
-    /// would split, coarsen, split, forever.
+    /// A sealed day's ten-minute leftovers collapse into one day unit — but never
+    /// one that would undo a split, which would loop split/coarsen forever.
     #[test]
     fn a_sealed_days_fine_slices_collapse_but_never_undo_a_split() {
         let (_dir, mut journal) = new_journal();
@@ -5470,9 +4461,8 @@ mod tests {
         assert!(day_five.iter().all(|w| *w < DAY_MICROS), "day 5 already had a day unit that was SPLIT; recreating it would loop forever, got {day_five:?}");
     }
 
-    /// `attempts >= 2` quarantines a unit and floors its backoff at the
-    /// operation deadline, so prod's 432 `worker_error` repair units would
-    /// otherwise have drained through ~2 slots at an hour each.
+    /// `attempts >= 2` quarantines a unit and floors its backoff at the operation
+    /// deadline; the one-shot migration clears that for the repair queue only.
     #[test]
     fn the_repair_migration_unquarantines_the_queue_it_is_for() {
         let (_dir, mut journal) = new_journal();
@@ -5501,23 +4491,16 @@ mod tests {
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
     }
 
-    /// A busy pool is not an oversized unit. `resource_admission` is classed as
-    /// a capacity failure, so `retry_or_split` SPLITS on it — right when
-    /// admission's ceiling was a static `MAX_DECODED_BYTES`, wrong once it
-    /// scales with occupancy. Prod 2026-09-01: 230,015 such retries in 33
-    /// minutes with `pending_dedup` climbing 2,857 -> 3,533, because every
-    /// refusal split a unit into shards that were each refused in turn.
+    /// A busy pool is not an oversized unit: splitting on a transient refusal
+    /// multiplies the queue into shards that are each refused in turn.
     #[test]
     fn a_busy_pool_refusal_must_not_be_classed_as_a_capacity_failure() {
         assert!(is_capacity_failure("resource_admission"), "a static over-budget estimate still splits");
         assert!(!is_capacity_failure("admission_busy"), "but a transient busy pool must back off, not multiply the queue");
     }
 
-    /// The ceiling is only meaningful if the REQUEST is honest. Prod
-    /// 2026-09-01, five minutes after the ceiling shipped: 1,339
-    /// `resource_admission` retries in one window, because every caller asked
-    /// for `MAX_DECODED_BYTES` regardless of its unit's real size, so a busy
-    /// pool refused all of them and every lane hot-looped on a 1-second requeue.
+    /// The occupancy ceiling is only meaningful if the request reflects the unit's
+    /// real size; a uniform max-size request makes every lane hot-loop on refusal.
     #[test]
     fn a_small_unit_is_admitted_by_a_pool_that_refuses_a_large_one() {
         const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
@@ -5530,26 +4513,9 @@ mod tests {
         );
     }
 
-    /// REPRODUCES the 2026-09-02 lockout: a unit priced at exactly
-    /// `MAX_DECODED_BYTES` must be admissible into a pool that is merely BUSY,
-    /// not idle.
-    ///
-    /// `byte_bounded_units` splits until a unit fits `MAX_DECODED_BYTES`, so its
-    /// output piles up AT that constant, and both admission sites clamp their
-    /// request to it — deliberately, because an oversized unit is meant to
-    /// reserve the maximum and then hash-shard ITSELF internally
-    /// (`split_time_task` declines to shard in the journal for exactly that
-    /// reason). But `MAX * available / capacity` is strictly less than `MAX`
-    /// whenever one byte is reserved, so the request the design intends as
-    /// "reserve the maximum and self-shard" was the one request the gate could
-    /// never grant.
-    ///
-    /// Prod 2026-09-02: 365 dedup units at a median of exactly 512.0 MiB, a
-    /// median age of 14.6 days, all `hash_shards = 1`; plus 94 base_rollup units
-    /// pinned at the 1-minute minimum slice width estimating 7.5 GiB each, hot
-    /// looping to 715 attempts on `admission_busy`.
-    ///
-    /// FAILS before the ceiling reaches `MAX` at a healthy free fraction.
+    /// A unit priced at exactly `MAX_DECODED_BYTES` must be admissible into a pool
+    /// that is merely BUSY. `byte_bounded_units` piles its output up at that
+    /// constant, so a ceiling strictly below `MAX` would lock those units out.
     #[test]
     fn a_max_sized_unit_is_admitted_by_a_busy_pool_not_only_an_idle_one() {
         const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
@@ -5562,9 +4528,8 @@ mod tests {
         );
     }
 
-    /// ClickHouse's rule: a busy pool admits only small work, so an oversized
-    /// unit is never admitted into a position where it would have to be killed.
-    /// Off by default — a shape for 10x load, not a throughput win today.
+    /// A busy pool admits only small work, so an oversized unit is never admitted
+    /// into a position where it would have to be killed.
     #[test]
     fn the_admission_ceiling_shrinks_as_the_pool_fills() {
         const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
@@ -5577,8 +4542,7 @@ mod tests {
 
     /// Fusion must not refuse a group priced against its PARTITION just because
     /// the partition is bigger than one unit's decode budget: the members do not
-    /// avoid that cost by staying apart, they each pay it. Prod 2026-09-01, every
-    /// coarsening pass: `candidates=7452 fused=0 over_budget=6967`.
+    /// avoid that cost by staying apart, they each pay it.
     #[test]
     fn a_partition_priced_group_fuses_even_when_the_partition_is_large() {
         // A day shredded into ten-minute slices, each modelled at a fraction of
@@ -5591,8 +4555,7 @@ mod tests {
         let (_dir, mut journal) = shredded_day(Operation::Dedup);
         let big_partition = MAX_DECODED_BYTES * 20;
 
-        // The exemption is dedup's alone until the rollup runner is shown to
-        // honour `hash_shard` — see `the_partition_ceiling_does_not_fuse_a_genuinely_oversized_day`.
+        // The exemption is dedup's alone until the rollup runner honours `hash_shard`.
         let (_rollup_dir, mut rollup) = shredded_day(Operation::BaseRollup);
         assert_eq!(rollup.coarsen_sealed_slices_capped(10 * DAY_MICROS, &|_, _, _| Some(big_partition)).fused, 0, "rollup keeps the old rule");
 
@@ -5607,9 +4570,7 @@ mod tests {
     }
 
     /// Bisecting a dedup unit below the width where it stops shedding FILES
-    /// manufactures slivers that each pay the same whole-partition scan. Prod
-    /// 2026-09-01: 4,000 of 5,028 active dedup units were sub-15-minute slices
-    /// with a p90 of 76 input files, all of them made by `split_into_smaller_slices`.
+    /// manufactures slivers that each pay the same whole-partition scan.
     #[test]
     fn a_dedup_unit_shards_by_key_instead_of_slivering_time() {
         let over_budget = MAX_DECODED_BYTES * 4;
@@ -5629,11 +4590,8 @@ mod tests {
         assert_eq!(byte_bounded_units(&rollup, over_budget).len(), 2, "only dedup's cost is partition-scoped");
     }
 
-    /// Dedup's window was 300s from when the clock was a budget on TOTAL time.
-    /// Under idle semantics that killed working units: prod 2026-09-01, 33 of
-    /// 288 dedup units in 25 minutes burned the full 300s and were killed —
-    /// 9,900 worker-seconds — while units granted a second window finished at
-    /// 599s, 600s and 887s.
+    /// Every operation shares the fleet deadline except Repair, whose ORDER BY
+    /// blocks on a whole file.
     #[test]
     fn only_repair_gets_a_window_longer_than_the_fleet_default() {
         for operation in [Operation::Dedup, Operation::HotPacking, Operation::SealedConsolidation, Operation::BaseRollup, Operation::DerivedRollup] {
@@ -5643,10 +4601,8 @@ mod tests {
         assert!(operation_deadline_secs(Operation::Repair) <= MAX_OPERATION_DEADLINE_SECS);
     }
 
-    /// A Repair unit rewrites ONE whole file, so halving its slice halves
-    /// nothing: `coordinator_compaction_files` still hands every child the same
-    /// `take(1)`. Prod 2026-08-31 had 432 repair units bisected to 12h/0.75h/
-    /// 0.38h widths across four dates, every one of them `worker_error`.
+    /// A Repair unit rewrites ONE whole file, so halving its slice halves nothing:
+    /// `coordinator_compaction_files` still hands every child the same `take(1)`.
     #[test]
     fn a_repair_unit_is_never_bisected_because_its_cost_is_a_whole_file() {
         let (_dir, mut journal) = new_journal();
@@ -5700,14 +4656,9 @@ mod tests {
         }
     }
 
-    /// Coarsening must not build a day unit that cannot finish. One day unit doing
-    /// one full-day scan beats 144 slices each doing the same scan — but only if
-    /// it completes. A day over the decode budget publishes nothing and times out
-    /// repeatedly, which is strictly worse than the slices it replaced.
-    ///
-    /// Measured after #178: BaseRollup timed out at 900s for the first time (4 in
-    /// a 10-minute window) and rollup output collapsed from ~9,000 rows/min to 10.
-    /// The fix is only reachable if it can claim the units it is for.
+    /// Coarsening must not build a day unit that cannot finish: a day over the
+    /// decode budget publishes nothing and times out repeatedly, which is strictly
+    /// worse than the slices it replaced.
     #[test]
     fn coarsening_skips_a_day_that_would_not_fit_the_decode_budget() {
         let (_dir, mut journal) = new_journal();
@@ -5726,54 +4677,24 @@ mod tests {
         assert!(over_budget.iter().all(|w| *w < DAY_MICROS));
     }
 
-    /// The prod shape: a whole day shredded to the one-minute floor, with the
-    /// ESTIMATES prod actually stored. Currently fails — this is a live defect.
-    ///
-    /// Copied out of the real journal 2026-08-23 (94,223 tasks; 21,598 pending
-    /// resolving to 1,452 cells, a 14.9x inflation). Worst cell: `base_rollup /
-    /// 00000000 / 2026-08-13`, **1,440 pending units of exactly 60 seconds each,
-    /// perfectly contiguous, covering exactly 24 hours**, nothing wider on that
-    /// table. Nothing wider means `subsume_covered_units` cannot fire, so fusion
-    /// is the only way out.
-    ///
-    /// Fusion cannot fire either, and the stored estimates say why:
-    ///
-    ///     estimated_decoded_bytes:  282 MB x1220,  188 MB x203,  537 MB x17
-    ///     summed per HOUR:          15.3 - 20.1 GB
-    ///     MAX_DECODED_BYTES:        512 MB
-    ///
-    /// An hour is 30-40x over budget, so every width is refused and the cell is
-    /// stuck forever. That partition holds **35 files totalling 0.36 GB** while
-    /// these 1,440 units claim **391 GB** between them — but each individual
-    /// estimate is HONEST, not stale (`__maintenance_stale_estimate_v2` had
-    /// already run). A row group cannot be pruned below, and on ~10 MB files one
-    /// row group IS the file, so a sixty-second slice really does decode ~282 MB.
-    ///
-    /// The defect is the SUM. 1,440 children reading the same 35 files are one
-    /// scan, and charging them 1,440 times is what blocks the one mechanism that
-    /// would collapse the 14.9x inflation.
-    ///
-    /// The fix is [`InputFootprint`]: children of a split read the parent's
-    /// files, so fusion charges that set ONCE instead of once per child.
+    /// A day shredded to the one-minute floor must collapse. Each child's estimate
+    /// is honest (one row group IS the file), but summing 1,440 children that read
+    /// the SAME files charges one scan 1,440 times and refuses every width.
+    /// [`InputFootprint`] is what lets fusion charge that file set once.
     #[test]
     fn a_day_shredded_to_the_minute_floor_collapses() {
         let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
-        // The 391 GB prod's 1,440 units claimed between them, against a
-        // partition holding 35 files that decode to well under the budget.
         let footprint = InputFootprint::new((0..35).map(|n| format!("part-{n}.parquet")), MAX_DECODED_BYTES / 2);
-        // A split stamps its children with what the PARENT read — that is what
-        // lets fusion price them as one scan later. Exercised on a different
-        // day so the halves it leaves cannot subsume the shred below, which
-        // would collapse it by covering rather than by fusion.
+        // A split stamps its children with what the PARENT read. Exercised on a
+        // different day so the halves it leaves cannot subsume the shred below,
+        // which would collapse it by covering rather than by fusion.
         let parent = task("p", 3 * DAY_MICROS, 4 * DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
         assert!(journal.split_time_task(&parent, 391 * 1024 * 1024 * 1024, Some(footprint)));
         assert!(journal.tasks().filter(|t| t.state == TaskState::Pending).all(|t| t.input == Some(footprint)), "children inherit what they read");
 
-        // The shred as prod held it, and as only REPEATED preflights can now
-        // produce it: 1,440 contiguous one-minute units over the same file
-        // set, nothing wider on the table.
+        // 1,440 contiguous one-minute units over the same file set, nothing wider.
         for minute in 0..1_440 {
             let start = DAY_MICROS + minute * MIN_SLICE_MICROS;
             let key = task("p", start, start + MIN_SLICE_MICROS, Operation::BaseRollup).key;
@@ -5782,8 +4703,7 @@ mod tests {
         let shredded = |journal: &TaskJournal| pending_widths(journal, "p", 1).len();
         assert!(shredded(&journal) > 1_000, "precondition: the day is shredded to the floor");
 
-        // The cascade lands them at a width they can actually finish. One pass
-        // is enough because every child names the same file set.
+        // One pass is enough because every child names the same file set.
         journal.coarsen_sealed_slices(now);
         assert!(shredded(&journal) <= 24, "a contiguous shredded day must collapse; {} units remain", shredded(&journal));
     }
@@ -5814,17 +4734,8 @@ mod tests {
         assert_eq!((disjoint.fused, disjoint.over_budget > 0), (0, true), "different files must still sum");
     }
 
-    /// The prod shape, WITH the partition ceiling that makes it collapsible.
-    ///
-    /// Same fixture as `a_day_shredded_to_the_minute_floor_collapses` (which is
-    /// `#[ignore]`d because it calls the uncapped entry point and therefore still
-    /// documents the defect): 1,440 contiguous one-minute units for one day, each
-    /// carrying the whole-file estimate prod actually stored.
-    ///
-    /// Summed they claim 391 GB. The partition holds **35 files totalling
-    /// 0.36 GB** — the sum is not pessimistic, it is impossible, because it
-    /// counts the same files once per child. Given the real ceiling the day fuses
-    /// in one pass.
+    /// A shredded day fuses in one pass once its summed estimate is capped by the
+    /// real partition size — the sum counts the same files once per child.
     #[test]
     fn a_shredded_day_collapses_once_the_estimate_is_capped_by_its_partition() {
         let (_dir, mut journal) = new_journal();
@@ -5843,10 +4754,8 @@ mod tests {
         assert_eq!(remaining, 1, "and it should land as ONE day-wide unit, got {remaining}");
     }
 
-    /// The ceiling must not become a licence to fuse anything. A partition whose
-    /// REAL size is over budget still cannot be scanned in one unit, so the day
-    /// keeps its slices exactly as before — the cap only ever removes
-    /// double-counting, it never argues a big partition is small.
+    /// The partition cap only removes double-counting: a partition whose REAL size is
+    /// over budget still cannot be scanned in one unit, so the day keeps its slices.
     #[test]
     fn the_partition_ceiling_does_not_fuse_a_genuinely_oversized_day() {
         let (_dir, mut journal) = new_journal();
@@ -5859,12 +4768,8 @@ mod tests {
         assert!(widths.iter().all(|w| *w < DAY_MICROS));
     }
 
-    /// Removing a spec must retire its queued work, and must never touch
-    /// anything else.
-    ///
-    /// Prod 2026-08-24 was still spending ~80 claims per ten minutes on
-    /// `dashboard_level_1h_v1` after the spec was deleted, doing nothing each
-    /// time. Every `_v2` -> `_v3` rename leaves the same residue.
+    /// Removing a rollup spec must retire its queued work and touch nothing else;
+    /// every `_v2` -> `_v3` rename otherwise leaves claimable no-op residue.
     #[test]
     fn removing_a_spec_retires_its_queued_work_and_nothing_else() {
         let (_dir, mut journal) = new_journal();
@@ -5892,29 +4797,23 @@ mod tests {
         assert_eq!(journal.state(&live), Some(TaskState::Pending));
     }
 
-    /// The orphan repair must run exactly once, and must persist that BEFORE
-    /// the caller does the work — a half-run repair that died to a restart would
-    /// re-force every cell on the next boot, and prod restarts every few minutes.
+    /// The orphan repair must run exactly once per source and persist that claim
+    /// BEFORE the caller does the work, so a restart cannot re-force every cell.
     #[test]
     fn the_orphan_repair_claims_itself_once_and_survives_a_reload() {
         let (dir, mut journal) = new_journal();
         assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "first call claims it");
         assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "second call in the same process must not");
-        // PER SOURCE: the caller loops over sources, so one global cursor
-        // would let whichever source is processed first consume the repair —
-        // and if that is otel_metrics, the source that actually needs it
-        // never runs. A silent no-op that looks like success.
+        // PER SOURCE: the caller loops over sources, so one global cursor would let
+        // whichever source runs first consume the repair the others still need.
         assert_eq!(journal.repair_orphaned_coverage_once("otel_metrics"), Some(0), "a different source claims independently");
         drop(journal);
         let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
         assert_eq!(reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
     }
 
-    /// The damage repair's cursor is a consumed-PREFIX index, per source, and it
-    /// survives a restart. Sharing it with the orphan repair would let claiming
-    /// one silently consume the other — and the damage list is what fixes ~211M
-    /// rows the derived-witness bug left short, so consuming it as a no-op would
-    /// look exactly like success.
+    /// The damage repair's cursor is a consumed-PREFIX index, per source, monotonic,
+    /// and it survives a restart; it must not share state with the orphan repair.
     #[test]
     fn the_damage_repair_cursor_is_a_per_source_prefix_that_survives_a_reload() {
         const DAMAGE: &str = TaskJournal::DAMAGE_REPAIR_MIGRATION;
@@ -5933,20 +4832,8 @@ mod tests {
     }
 
     /// A COMPLETE day unit must not block coarsening, or the queue fills with
-    /// sub-day slices that can never collapse.
-    ///
-    /// Once a day was rolled up once, its day task stayed in the journal as
-    /// Complete forever, so every later invalidation minted a ten-minute slice
-    /// that was skipped here and processed alone. A slice is not cheaper than the
-    /// day: an uncompacted sealed partition's files each span the WHOLE day, so a
-    /// ten-minute slice reads the same files a day unit would. Prod 2026-08-18,
-    /// via the phase timing from #174:
-    ///
-    ///     scan_ms=481682  stage_ms=30  commit_ms=961  rows=142
-    ///
-    /// Eight minutes of scanning for 142 rows, 144 times a day where once would
-    /// do, while `maintenance_sealed_slices_coarsened` logged ZERO against 37,065
-    /// pending base rollups.
+    /// sub-day slices that can never collapse — while a SUPERSEDED one must block
+    /// it, or the split is undone and the two fight forever.
     #[test]
     fn a_completed_day_unit_does_not_block_coarsening_but_a_superseded_one_does() {
         let (_dir, mut journal) = new_journal();
@@ -5973,14 +4860,8 @@ mod tests {
         assert!(pending_widths(&journal, "p", 6).iter().all(|w| *w < DAY_MICROS), "a SPLIT day's children must stay split — recoarsening them loops forever");
     }
 
-    /// The sealed reservation is affordable only while the frontier keeps up.
-    ///
-    /// It exists because strict class-0 priority let the frontier take ~90% of
-    /// claims and froze rollup coverage. But frontier lag is a per-query cost —
-    /// `raw_tail_duration_secs` is `FINALIZATION_DELAY + lag` and every hybrid
-    /// query scans that tail — and prod 2026-08-17 reached 62 minutes of it.
-    /// So the reservation yields while the frontier is behind, and returns on
-    /// its own once it is not.
+    /// The sealed reservation yields while the frontier is behind (frontier lag is a
+    /// per-query cost), and returns on its own once it is not — but never to zero.
     #[test]
     fn the_sealed_reservation_yields_while_the_frontier_is_behind() {
         let now = 10 * DAY_MICROS;
@@ -6017,28 +4898,18 @@ mod tests {
         );
     }
 
-    /// Work INSIDE the horizon must keep a share against work past it.
-    ///
-    /// `starved` improves for every day past `STARVATION_HORIZON_MICROS`, so a
-    /// past-horizon unit outranks every inside-horizon unit — and nothing made
-    /// that rescue relinquish the lane. Prod 2026-09-03: 148 of 761 claimable
-    /// dedup units were past the horizon (55 of them re-failing), and the
-    /// 3-31 day band — holding **96% of the queue's 5,334 GiB**, untouched for
-    /// 18 days — took **0 of 29** claims.
-    ///
-    /// The unit here is 20 days sealed on purpose: `window_turn` already covers
-    /// the last 14 days, so a 10-day unit passes this test WITHOUT the fix and
-    /// proves nothing. The band between the window and the horizon is the one
-    /// nothing served.
+    /// Work INSIDE the horizon must keep a share against work past it: `starved`
+    /// improves every day past `STARVATION_HORIZON_MICROS`, so an ancient unit
+    /// otherwise wins every tick. The unit here is 20 days sealed on purpose —
+    /// `window_turn` already covers the last 14, so a younger one proves nothing.
     #[test]
     fn work_inside_the_horizon_keeps_a_share_against_work_past_it() {
         let now = 100 * DAY_MICROS;
         let (_dir, mut journal) = new_journal();
         // Ancient: 60 days sealed, so `starved` has gained ~29 steps.
         let ancient = task("p", now - 61 * DAY_MICROS, now - 60 * DAY_MICROS, Operation::Dedup).key.clone();
-        // 20 days sealed: PAST the 14-day query window, so `window_turn` does
-        // not cover it, and inside the horizon, so it ties at the band floor.
-        // This band is the one with no reservation of its own.
+        // 20 days sealed: past the 14-day query window and inside the horizon —
+        // the band with no reservation of its own.
         let inside = task("p", now - 21 * DAY_MICROS, now - 20 * DAY_MICROS, Operation::Dedup).key.clone();
         journal.enqueue(ancient.clone(), 0, 0, 0);
         journal.enqueue(inside.clone(), 0, 0, 0);
@@ -6050,8 +4921,7 @@ mod tests {
                 inside_claims += 1;
             }
             journal.complete(&claimed.key);
-            // Re-open both, so the ancient unit is always available to win again
-            // — the shape of a past-horizon cohort that fails and requeues.
+            // Re-open both, so the ancient unit is always available to win again.
             journal.enqueue(claimed.key.clone(), 0, 0, 0);
         }
         assert!(
@@ -6061,19 +4931,9 @@ mod tests {
         );
     }
 
-    /// Among sealed work, a day-sized unit outranks yesterday's ten-minute
-    /// leftovers even though those are newer.
-    ///
-    /// Day-sized units come from the backfill planner and are the only kind
-    /// that advances the rollup horizon. Ten-minute units are what the live
-    /// path mints, and a day that has just sealed carries ~144 of them per
-    /// project per tier. Ordering sealed work newest-first alone therefore
-    /// grinds all of yesterday before reaching the day before — and midnight
-    /// mints a fresh day's worth, so the horizon can never move.
-    ///
-    /// Prod 2026-08-17, 65 rollup starts in 25 minutes: 46 on today, 18 on
-    /// yesterday, ZERO on any older day, while 7d/14d queries were refused for
-    /// want of exactly those older days.
+    /// Among sealed work, a day-sized unit outranks yesterday's ten-minute leftovers
+    /// even though those are newer: day units come from the backfill planner and are
+    /// the only kind that advances the rollup horizon.
     #[test]
     fn sealed_backfill_units_outrank_yesterdays_fine_slices() {
         let (_dir, mut journal) = new_journal();
@@ -6096,9 +4956,8 @@ mod tests {
         );
     }
 
-    /// Verbatim prod text, 2026-08-17. Classification is string-based because
-    /// the DataFusion error arrives type-erased through delta-rs/anyhow, so the
-    /// strings are the contract and this test is what pins them.
+    /// Classification is string-based because the DataFusion error arrives
+    /// type-erased through delta-rs/anyhow; these strings are the contract.
     #[test]
     fn capacity_failures_are_recognised_from_prod_text() {
         assert!(is_capacity_failure(
@@ -6111,17 +4970,9 @@ mod tests {
         }
     }
 
-    /// THE defect this classifier keeps re-acquiring: a SECOND, divergent copy.
-    ///
-    /// The hot-tail staging site classified with its own
-    /// `contains("Resources exhausted")`, which misses the wording a spilling
-    /// sort actually dies with — the one the test above pins FIRST. So every
-    /// light-optimize pool failure on prod 2026-09-03 scored transient, and the
-    /// `REPAIR_SORT_PARTITION_LADDER` built to retry it cheaper never engaged.
-    ///
-    /// A partial local copy is undetectable by behaviour tests (each classifier
-    /// is self-consistent), so pin it at the source: one definition, no
-    /// second-guessers.
+    /// There must be exactly ONE capacity classifier. A local copy that misses the
+    /// sort-OOM wording is undetectable by behaviour tests (each classifier is
+    /// self-consistent), so it is pinned at the source instead.
     #[test]
     fn no_second_capacity_classifier_exists() {
         for (name, source) in [("database/maintain.rs", include_str!("database/maintain.rs")), ("database/compact.rs", include_str!("database/compact.rs"))] {
@@ -6133,19 +4984,10 @@ mod tests {
         }
     }
 
-    /// A slice too big for the pool fails identically every pass. Back off once
-    /// (a FairSpillPool squeeze is transient), then shrink it.
-    ///
-    /// A unit that cannot finish inside its DEADLINE must get SMALLER the same
-    /// way, not be requeued unchanged. The lease requeues whatever the worker
-    /// abandoned, so a slice too big for its deadline times out, requeues
-    /// identical, times out again — forever, holding a worker for the full
-    /// deadline each time and never producing anything. Prod 2026-08-17: five
-    /// Dedup timeouts in twelve minutes at 300s apiece, permanently occupying
-    /// ~2 of 16 coordinator workers, while total task starts fell to 2.2/min
-    /// and the rollup horizon it was starving sat days behind. Byte-based
-    /// splitting cannot catch this — a day-sized slice with modest bytes still
-    /// pays one object-store round trip per file.
+    /// A slice too big for the pool — or for its deadline — fails identically every
+    /// pass, so back off once (a squeeze may be transient) then shrink it. Byte-based
+    /// splitting cannot catch the deadline case: a day-sized slice with modest bytes
+    /// still pays one object-store round trip per file.
     #[test_case::test_case(false ; "a_unit_that_cannot_fit_bisects_instead_of_retrying_at_the_same_size")]
     #[test_case::test_case(true ; "a_unit_that_keeps_timing_out_bisects_instead_of_retrying_forever")]
     fn a_repeated_capacity_failure_bisects_instead_of_retrying_at_the_same_size(via_timeout: bool) {
@@ -6154,8 +4996,7 @@ mod tests {
         journal.enqueue(key.clone(), 0, 0, 0);
         let oom = "dedup: Not enough memory to continue external sort.".to_owned();
 
-        // The first failure is an ordinary blip and must simply retry; the
-        // second says the slice itself does not fit.
+        // The first failure retries whole; the second says the slice does not fit.
         for attempt in 1..=2u32 {
             if via_timeout {
                 assert!(journal.mark_running(&key));
@@ -6222,16 +5063,9 @@ mod tests {
         }
     }
 
-    /// A derived unit must read the base files that hold its rows, whatever
-    /// width the unit that WROTE them happened to use.
-    ///
-    /// Prod 2026-08-17, exact numbers: derived units are one hour wide, while
-    /// the backfill writes base units a whole day wide and tags each file with
-    /// its own slice. The old test was CONTAINMENT — `file_end <= slice_end` —
-    /// which a day-tagged file can never satisfy against an hour, so every
-    /// backfilled day published rows=0 and was marked complete. Project
-    /// 87576849 had 17,705 rows in the 1m tier for 08-03 while its 1h unit for
-    /// 08-03 produced nothing, and 14d/30d queries never routed as a result.
+    /// A derived unit must read the base files that hold its rows by OVERLAP, not
+    /// containment: derived units are an hour wide and backfill writes day-wide base
+    /// files, which no hour can contain.
     #[test]
     fn a_day_wide_base_file_feeds_every_hour_wide_derived_slice_inside_it() {
         const DAY: i64 = 1_785_628_800_000_000; // 2026-08-02T00:00Z
@@ -6241,7 +5075,6 @@ mod tests {
         for hour in 0..24 {
             let slice = TimeSlice::new(DAY + hour * HOUR, DAY + (hour + 1) * HOUR).expect("slice");
             assert!(slice.overlaps(day_file.0, day_file.1), "hour {hour} must read the day-wide base file that holds its rows");
-            // The rule this replaced, stated so the regression is unmistakable.
             let contained = day_file.0 >= slice.start_micros && day_file.1 <= slice.end_micros;
             assert!(!contained, "containment is what broke: hour {hour} could never select a day-tagged file");
         }
@@ -6250,7 +5083,6 @@ mod tests {
         let slice = TimeSlice::new(DAY, DAY + HOUR).expect("slice");
         assert!(!slice.overlaps(DAY - 86_400_000_000, DAY), "the previous day ends exactly at the boundary and must not be read");
         assert!(!slice.overlaps(DAY + 86_400_000_000, DAY + 2 * 86_400_000_000), "a later day must not be read");
-        // Ten-minute frontier files — the only shape that ever worked — still do.
         assert!(slice.overlaps(DAY, DAY + 600_000_000));
     }
 
