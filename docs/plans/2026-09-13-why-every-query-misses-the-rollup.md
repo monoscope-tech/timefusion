@@ -60,7 +60,33 @@ not by the mechanism it sounds like — it is not file fragmentation making scan
 heavy, it is maintenance and ingest continuously invalidating the freshness
 proof so the rollup is never trusted.
 
-## The window that misses is TODAY, and that is what names the fix
+## It is NOT only the open day — a closed 8-day-old partition misses too
+
+A sampled miss carries `lo/hi` = 06:00-12:00 of the current day, which invites
+"this is just the open partition, and that is unavoidable". **Tested directly
+against a CLOSED day** — 2026-09-05, eight days old, one pinned project, so no
+cross-project intersection and no open-tail effect:
+
+```
+before  hits=2690  miss=13315
+query   SELECT count(*) ... project_id=<pinned> AND ts IN [2026-09-05, 09-06)
+after   hits=2690  miss=13329        -- +14 misses, ZERO hits
+```
+
+**A partition eight days old still fails the freshness proof.** Nothing is
+ingesting into 09-05; the only thing still changing it is **maintenance** —
+dedup dropping rows and consolidation rewriting file sets. That is the coupling
+demonstrated rather than inferred: **the backlog work is what keeps the rollup
+untrusted, and therefore what keeps queries slow.**
+
+It also means "prove a closed day once and stop re-proving it" is not sufficient
+on its own — a day is not settled while maintenance still has work queued
+against it. The proof has to be stable across the rewrites maintenance performs,
+which is what makes the dedup-certification predicate (`cert_slice_files_proved`)
+the right anchor: it already means "this partition is provably clean", which is
+a stronger and more durable statement than "its row count has not moved".
+
+## The open day is still the common case, and TimescaleDB names that half
 
 A sampled miss carries `lo = 1789272000000000`, `hi = 1789293600000000` —
 **06:00 to 12:00 of the current day**. The dashboards ask about the open
