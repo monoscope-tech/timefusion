@@ -2880,7 +2880,7 @@ impl Database {
         // Bounded by what ONE SORT CAN DECODE, not only by the desired output size:
         // packing targets are COMPRESSED while sort budgets are DECODED, and a bin that
         // cannot fit its sort stalls indefinitely. See `coordinator_bin_compressed_cap_bytes`.
-        let target = match key.operation {
+        let declared_target = match key.operation {
             Operation::HotPacking => COORDINATOR_HOT_TARGET_BYTES,
             Operation::SealedConsolidation => COORDINATOR_SEALED_TARGET_BYTES,
             _ => return Ok(Vec::new()),
