@@ -148,3 +148,26 @@ size**. Candidates, cheapest first, none yet implemented:
 **And keep the drain in proportion.** The measured user-facing pain is rollup
 routing misses, not fragmentation. The drain moves a gauge; the witness and the
 append model move what customers feel.
+
+## Postscript: the box is demand-saturated, which is the argument for all of this
+
+The container CPU cap was raised 28 -> 32 while this was being written. Measured
+on a mature (~30 min) process, both sides:
+
+| | 28-core cap | 32-core cap |
+|---|---:|---:|
+| cores used | 25.0-27.7 | **28.4-31.4** |
+| utilisation | ~92% | **~92%** |
+| `nr_throttled` per 12 s | 111-116 | 49-97 |
+
+**All four extra cores were absorbed and utilisation did not move.** Throttling
+fell ~40% but did not stop. The change is worth roughly 14% real throughput and
+should be kept — but **no core count available on this box makes CPU stop being
+the constraint.**
+
+That is the case for this proposal in one line: the system will consume whatever
+CPU it is given, so the only durable lever is to stop generating the work.
+BaseRollup's ~460 partition overwrites an hour, the backfill re-indexing they
+cause (83% of tantivy's indexed rows), and a large share of the 36x write
+amplification are **one root, not three**. At 10x traffic they scale together
+into a wall that more cores cannot clear.
