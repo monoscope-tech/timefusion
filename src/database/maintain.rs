@@ -23,6 +23,12 @@ impl TaskSelection<'_> {
 enum RollupRebuildReason {
     MissingRowWitness,
     ObsoleteGeneration,
+    /// The slice HAS a witness and the partition moved under it. Distinct from
+    /// `MissingRowWitness`: that one cannot be verified at all and only a
+    /// republish clears it, this one was verifiable and simply lost the race
+    /// with ingest or dedup. Prod 2026-09-13: 2,618,297 `moved` against ZERO
+    /// `no_witness`, so this is the whole population in practice.
+    WitnessMoved,
 }
 
 /// One tier's contribution to a fleet contiguity gauge, or `None` to abstain.
@@ -3849,20 +3855,12 @@ impl Database {
         // compressed target decodes to ~3 GiB against a 1.25 GiB per-sort
         // budget, and prod 2026-09-13 had every bin at that size stall
         // indefinitely while every small one completed.
-        let declared_target = match key.operation {
+        let target = match key.operation {
             Operation::HotPacking => COORDINATOR_HOT_TARGET_BYTES,
             Operation::SealedConsolidation => COORDINATOR_SEALED_TARGET_BYTES,
             _ => return Ok(Vec::new()),
-        };
-        // The pair floor is taken from THIS cell's own two smallest files, not
-        // from a constant, because that is exactly what `packer_admits_pair`
-        // (the planner/packer agreement test) measures when it decides to queue
-        // the cell. Deriving it any other way lets the planner enqueue work this
-        // packer must refuse — which is the wedge, not a hypothetical.
-        let mut two_smallest: Vec<i64> = candidates.iter().map(|add| add.size).collect();
-        two_smallest.sort_unstable();
-        let smallest_pair = two_smallest.iter().take(2).sum::<i64>();
-        let target = declared_target.min(crate::config::coordinator_packing_cap_bytes(smallest_pair / 2));
+        }
+        .min(crate::config::coordinator_bin_compressed_cap_bytes());
         let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
         let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
         // The PACKER's own two smallest under-target files. `plan_compaction_debt`
@@ -4885,6 +4883,46 @@ impl Database {
     /// still equals the partition's live `num_records`. That pays the witness
     /// check once at boot instead of on every query, and a date with even one
     /// unverifiable slice is skipped rather than guessed at.
+    /// Subtract a landed dedup's dropped rows from every rollup slice witness
+    /// over that partition, instead of letting the rewrite invalidate them.
+    ///
+    /// SOUNDNESS, and it is conditional. The rollup builds from a deduplicated
+    /// read and this sweep drops the same losers, so the logical row set is
+    /// unchanged — but only when the winner is DETERMINISTIC. Without a declared
+    /// `dedup_tiebreak` both sides fall back to keep-FIRST, and "first" depends
+    /// on scan order, so the two could keep different versions of a row and a
+    /// `min`/`max`/`sum` over the survivors could genuinely differ. So this is
+    /// gated on the declaration rather than applied blanket.
+    ///
+    /// IN-MEMORY ONLY, deliberately, and it is therefore INCOMPLETE: the
+    /// recovery authority is the tier files' `TAG_SOURCE_ROWS`, and a restart
+    /// re-reads those. Until the tags are updated too this repair survives only
+    /// until the next deploy — which prod does constantly. The remaining holders
+    /// are the journal publication, the coverage ledger and those tags; see
+    /// `2026-09-13-stop-re-rolling-deduped-partitions.md` Part 1.
+    pub(crate) fn carry_dedup_witness(&self, table_name: &str, project_id: &str, date: &str, dropped: u64) {
+        if get_schema(table_name).is_none_or(|schema| schema.dedup_tiebreak.is_none()) {
+            return;
+        }
+        let Some(day_start) = date_start_micros(date) else { return };
+        let day_end = day_start.saturating_add(DAY_MICROS);
+        let mut carried = 0u64;
+        self.rollup_slice_coverage.iter_mut().for_each(|mut entry| {
+            let (project, source, _, start, _) = entry.key();
+            if project != project_id || source != table_name || *start < day_start || *start >= day_end {
+                return;
+            }
+            if let Some(rows) = entry.value().source_rows {
+                entry.value_mut().source_rows = Some(rows.saturating_sub(dropped));
+                carried = carried.saturating_add(1);
+            }
+        });
+        if carried > 0 {
+            crate::observability::maintenance_stats().rollup_witness_carried.fetch_add(carried, std::sync::atomic::Ordering::Relaxed);
+            debug!(table_name, project_id, date, dropped, carried, event = "rollup_witness_carried_across_dedup");
+        }
+    }
+
     async fn recover_date_coverage(&self, source: &str, target: &str) {
         let Ok(table_ref) = self.resolve_table("default", source).await else { return };
         let stats = {
@@ -4905,6 +4943,7 @@ impl Database {
             })
             .into_group_map();
         let mut recovered = 0u64;
+        let mut moved: Vec<(String, crate::maintenance_coordinator::TimeSlice)> = Vec::new();
         for ((project, date), slices) in by_date {
             let Some(partition) = stats.get(&(project.clone(), date.clone())).or_else(|| stats.get(&("default".to_string(), date.clone()))) else {
                 continue;
@@ -4915,6 +4954,26 @@ impl Database {
             // not be stamped — that is the difference between this and the
             // `source_fp` fallback that had to be removed (7e5bb5a).
             if !slices.iter().all(|(_, coverage)| coverage.source_rows == Some(current_rows)) {
+                // STALE UNTIL REBUILT, not stale forever. Bare `continue` left a
+                // moved slice unreadable with nothing queued to re-prove it: the
+                // read path refuses it (`rollup_stale_moved`), and only an
+                // unrelated invalidation of the same cell would ever fix it.
+                // Prod 2026-09-13 measured 2,618,297 `moved` refusals against
+                // ZERO `no_witness` — every refusal was a slice that HAD a
+                // witness and had been overtaken, i.e. exactly this set.
+                //
+                // Queue the disagreeing ones. This is the prerequisite
+                // `2026-08-25-rollup-witness-design.md` §3 puts before both the
+                // dedup carry-forward and the logical witness, because it is
+                // what makes either converge: without a path back to `proven`,
+                // suppressing an invalidation only makes the cell unreadable for
+                // longer. Zero correctness surface — it creates work and
+                // nothing else — and `enqueue_unverifiable_rebuilds` is already
+                // newest-first and bounded, so a recovery that finds thousands
+                // cannot flood the queue.
+                moved.extend(slices.iter().filter(|(_, coverage)| coverage.source_rows != Some(current_rows)).map(|(start, coverage)| {
+                    (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
+                }));
                 continue;
             }
             let mut spans: Vec<(i64, i64)> = slices.iter().map(|(start, coverage)| (*start, coverage.covered_through)).collect();
@@ -4942,6 +5001,13 @@ impl Database {
                 },
             );
             recovered += 1;
+        }
+        if !moved.is_empty()
+            && let Some(spec) = get_schema(source).and_then(|schema| schema.rollups.iter().find(|spec| spec.table_name(source) == target).cloned())
+        {
+            let queued = moved.len();
+            self.enqueue_unverifiable_rebuilds(source, &spec, target, RollupRebuildReason::WitnessMoved, &moved);
+            info!(source, target, queued, event = "rollup_moved_slices_requeued", "slices whose witness was overtaken are queued to be re-proven");
         }
         if recovered != 0 {
             info!(source, target, recovered, event = "rollup_date_coverage_recovered", "date-level coverage rebuilt from witnessed slices");
@@ -10451,6 +10517,113 @@ mod rollup_noop_skip_tests {
         assert!(skips() > before, "a slice re-minted after a restart must still be proved redundant from its tags");
         assert_eq!(tier_version(&db).await, Some(published_at), "and must not write to the tier");
         Ok(())
+    }
+
+    /// A landed dedup must CARRY the rollup witness, not invalidate it.
+    ///
+    /// The rollup builds from a deduplicated read and the sweep drops the same
+    /// losers, so the numbers are unchanged and only the physical witness moved
+    /// — by exactly `dropped`. Subtracting it keeps the slice provable instead
+    /// of forcing a rebuild of a cell whose answer did not change.
+    ///
+    /// Asserts the witness ACTUALLY MOVED by the dropped amount. A weaker test
+    /// (no panic, or coverage still present) would pass against a no-op, which
+    /// is the failure mode this whole change risks — see the 2026-09-07
+    /// ingest-dedup change that passed every gate and did nothing.
+    ///
+    /// Can-fail: delete the `carry_dedup_witness` call in `compact.rs` and the
+    /// witness stays at its pre-dedup value.
+    #[serial]
+    #[tokio::test]
+    async fn a_landed_dedup_carries_the_rollup_witness() -> Result<()> {
+        let cfg = Arc::new((*TestConfigBuilder::new("rollup_witness_carry").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone());
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so there is no witness to carry");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+
+        let witness = |db: &Database| -> Option<u64> {
+            db.rollup_slice_coverage.iter().find(|e| e.key().0 == project_id && e.key().1 == "otel_logs_and_spans").and_then(|e| e.value().source_rows)
+        };
+        let before = witness(&db).expect("recovery must stamp a row witness to carry");
+
+        // Carry a plausible drop through the same entry point the commit site
+        // uses. Calling it directly keeps this about the CARRY, not about
+        // whether a synthetic fixture can be made to produce duplicates.
+        db.carry_dedup_witness("otel_logs_and_spans", &project_id, &date.to_string(), 3);
+        assert_eq!(witness(&db), Some(before.saturating_sub(3)), "the witness must fall by exactly the rows the dedup dropped");
+
+        // And the soundness gate: a table with no declared tiebreak has a
+        // non-deterministic winner, so its witness must NOT be carried.
+        let untouched = witness(&db);
+        db.carry_dedup_witness("no_such_table_without_tiebreak", &project_id, &date.to_string(), 5);
+        assert_eq!(witness(&db), untouched, "a table without a declared dedup_tiebreak must never have its witness carried");
+        Ok(())
+    }
+
+    /// A slice whose witness was OVERTAKEN must be queued to be re-proven.
+    ///
+    /// `recover_date_coverage` compares each slice's witness against the
+    /// partition's live row count and, on disagreement, used to `continue` and
+    /// nothing else. The read path independently refuses such a slice
+    /// (`rollup_stale_moved`), so the cell became unreadable with NOTHING queued
+    /// to fix it — stale forever, until some unrelated invalidation of the same
+    /// cell happened along.
+    ///
+    /// Prod 2026-09-13 measured **2,618,297 `moved` refusals against ZERO
+    /// `no_witness`**: every refusal was a slice that HAD a witness and lost the
+    /// race with ingest or dedup, i.e. exactly this population.
+    ///
+    /// `2026-08-25-rollup-witness-design.md` §3 makes this the prerequisite for
+    /// both the dedup carry-forward and the logical witness, because without a
+    /// path back to `proven`, suppressing an invalidation only makes a cell
+    /// unreadable for longer.
+    ///
+    /// Can-fail: restore the bare `continue` (drop the `moved.extend`) and the
+    /// re-mint assertion goes red — nothing is queued for the overtaken slice.
+    #[serial]
+    #[tokio::test]
+    async fn an_overtaken_slice_is_queued_to_be_re_proven() -> Result<()> {
+        let mut cfg = (*TestConfigBuilder::new("rollup_moved_requeue").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 7;
+        let cfg = Arc::new(cfg);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so there is no witnessed slice to overtake");
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert!(db.rollup_slice_coverage.iter().next().is_some(), "precondition: recovery must have stamped slice coverage to overtake");
+
+        // OVERTAKE it WITHOUT rebuilding: a second row moves the partition's
+        // live `num_records` past every stamped witness. Deliberately not
+        // `build_day`, which ends in `drain_coordinator_rollups` and would
+        // re-publish the slice — restamping the witness to the new count and
+        // leaving it in agreement, which is how the first version of this test
+        // read `before=0 after=0`.
+        let ts = date.and_hms_opt(13, 0, 0).expect("1pm").and_utc().timestamp_micros();
+        let batch = json_to_batch(vec![test_span_ts("overtakes-the-witness", "op", &project_id, ts)])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+
+        let before = pending_base_rollups(&db);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        assert!(pending_base_rollups(&db) > before, "an overtaken slice must be queued to be re-proven; before={before} after={}", pending_base_rollups(&db));
+        Ok(())
+    }
+
+    /// BaseRollup tasks in a state that will run — the observable for
+    /// "something is queued to re-prove this".
+    fn pending_base_rollups(db: &Database) -> usize {
+        let journal = db.journal();
+        journal
+            .tasks()
+            .filter(|task| {
+                task.key.operation == crate::maintenance_coordinator::Operation::BaseRollup && matches!(task.state, TaskState::Pending | TaskState::Retry)
+            })
+            .count()
     }
 
     /// Prod 2026-09-11: BaseRollup held 59% of maintenance worker-seconds and

@@ -1059,6 +1059,17 @@ atomic_stats! {
         /// claimed, so the ratio is the share of rollup work that was bookkeeping.
         /// Prod 2026-09-11 measured that share at 72.6% of BaseRollup bytes.
         rollup_noop_rebuild_skipped as "rollup_noop_rebuild_skipped_total",
+        /// Rollup slice witnesses repaired in place across a landed dedup,
+        /// rather than invalidated.
+        ///
+        /// A dedup drops exactly the rows the rollup's deduplicated read never
+        /// counted, so its numbers are unchanged and only the physical
+        /// `num_records` witness moved — by `dropped`, which the commit site
+        /// knows exactly. Read against `rollup_stale_shrank`: this is the class
+        /// that no longer has to be rebuilt. Prod 2026-09-13 sized it at 18,418
+        /// shrank against 229,361 grew, so a large `grew` with this counter
+        /// climbing is the EXPECTED shape, not a failure of the carry.
+        rollup_witness_carried as "rollup_witness_carried_total",
         /// How many times the maintenance gauges were actually recomputed.
         ///
         /// `publish_statistics` is a full linear scan of the journal, and
