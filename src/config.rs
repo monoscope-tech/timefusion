@@ -249,34 +249,53 @@ const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
 /// `MAX_DECODED_BYTES` and the dedup lane with its own preflight; the packer was
 /// the one that bounded compressed input against a decoded budget and never
 /// converted between them.
-/// The margin, and why a bin sized to exactly ONE sort budget is still too big.
-///
-/// #271 stopped bins from being 2.4x the budget. It did not make them fast: prod
-/// 2026-09-13 measured the staging cost of every bin against this cap and found
-/// the cliff sits AT 1.0, not past it:
-///
-/// | ratio of cap | staging  |
-/// |--------------|----------|
-/// | 0.15         | 3.9 s    |
-/// | 0.56-0.60    | 15-180 s |
-/// | **1.00**     | **1,710 s** |
-/// | 1.37         | 1,753 s  |
-///
-/// A bin at 100% of the cap took **28.5 minutes** while one at 60% took 15
-/// seconds — and at two light permits, one such bin is a quarter of an hour's
-/// whole lane capacity. `DECODED_BYTES_PER_COMPRESSED` = 12 is an ESTIMATE, and
-/// it is optimistic for this data: a bin priced at exactly one sort budget still
-/// exceeds it once decoded, spills, and grows an unspillable merge.
-///
-/// 3/5 puts the ceiling at the top of the measured fast regime rather than at
-/// the estimate's edge. It costs nothing in practice — the MEDIAN bin is 1.4 MB
-/// against a 111.8 MB cap, so this binds only on the large bins, which are
-/// exactly the ones that stall.
-const COORDINATOR_BIN_CAP_MARGIN: (i64, i64) = (3, 5);
-
 pub fn coordinator_bin_compressed_cap_bytes() -> i64 {
-    let one_sort = (COORDINATOR_PER_SORT_BUDGET_BYTES / crate::database::DECODED_BYTES_PER_COMPRESSED as usize) as i64;
-    one_sort * COORDINATOR_BIN_CAP_MARGIN.0 / COORDINATOR_BIN_CAP_MARGIN.1
+    (COORDINATOR_PER_SORT_BUDGET_BYTES / crate::database::DECODED_BYTES_PER_COMPRESSED as usize) as i64
+}
+
+/// The cap a PACKER may use, which is the decode cap with a margin — but never
+/// so small that two ordinary files cannot pair.
+///
+/// ## Why a margin at all
+///
+/// #271 stopped bins from being 2.4x what one sort can decode. It did not make
+/// them fast. Prod 2026-09-13 measured staging against the resulting cap and the
+/// cliff sits AT 1.0, not past it:
+///
+/// | ratio of one sort budget | staging     |
+/// |--------------------------|-------------|
+/// | 0.15                     | 3.9 s       |
+/// | 0.56-0.60                | 15-180 s    |
+/// | **1.00**                 | **1,710 s** |
+/// | 1.37                     | 1,753 s     |
+///
+/// `DECODED_BYTES_PER_COMPRESSED` is an ESTIMATE and optimistic for this data, so
+/// a bin priced at exactly one budget still spills and grows an unspillable
+/// merge. With two light permits, one such bin is a quarter-hour of the lane.
+///
+/// ## Why the floor, which cost an outage the first time
+///
+/// Shipping the margin ALONE wedged `otel_metrics` within the hour: its files are
+/// ~36 MB, so the two smallest summed to 72.1 MB against a 67.1 MB cap, no pair
+/// fit, `select_coordinator_compaction_candidates` returned empty, and the cell
+/// re-enqueued forever — **491 of 515 sealed units (95%) ran ZERO seconds**, each
+/// re-scanning a 4,170-file snapshot to select nothing.
+///
+/// That also broke `packer_admits_pair`, "THE planner/packer agreement test":
+/// the planner enqueues a cell whose two smallest fit the target, so shrinking
+/// the packer's target alone makes the planner queue work the packer must refuse.
+///
+/// The prior art states the rule this violated — a compaction size cap is a
+/// MULTIPLE of the target file size (RocksDB `max_compaction_bytes` = 25x,
+/// IOx `max_compact_size` = 3x, Iceberg `max-file-group-size-bytes`). A cap
+/// BELOW 2x the target file size cannot merge anything, whatever it does for
+/// decode safety. **A bin that cannot hold two files retires nothing, and a
+/// lane that retires nothing is worse than a slow one.**
+pub fn coordinator_packing_cap_bytes(target_file_bytes: i64) -> i64 {
+    let margin = coordinator_bin_compressed_cap_bytes() * 3 / 5;
+    // Two target-sized files, always — the floor wins over the margin, because a
+    // stalled bin costs one permit while an unpackable cell costs the lane.
+    margin.max(target_file_bytes.saturating_mul(2))
 }
 /// Concurrent target-sized repair rewrites the repair budget must hold.
 ///
@@ -4270,26 +4289,29 @@ mod bin_decode_budget_tests {
         assert!(ratio(cap / (1024 * 1024)) <= 1.0, "a bin at the new cap is not");
     }
 
-    /// A bin at ONE full sort budget is still too slow — the cliff is AT 1.0.
+    /// A packing cap must ALWAYS admit two target-sized files, margin or not.
     ///
-    /// #271 stopped 2.4x bins. Prod 2026-09-13 then measured staging against the
-    /// resulting cap and found a bin at **1.00x took 28.5 MINUTES** while 0.56x
-    /// took 15 s and 0.15x took 3.9 s. `DECODED_BYTES_PER_COMPRESSED` is an
-    /// estimate; pricing a bin at exactly one budget still spills.
+    /// Shipping the decode margin alone wedged `otel_metrics` in production
+    /// within the hour (2026-09-13): ~36 MB files, two smallest summing to
+    /// 72,140,172 B against a 67,108,863 B cap, so no pair fit, the packer
+    /// returned empty, and the cell re-enqueued forever — **491 of 515 sealed
+    /// units (95%) ran ZERO seconds**, each re-scanning a 4,170-file snapshot.
     ///
-    /// Can-fail: drop `COORDINATOR_BIN_CAP_MARGIN` (make the cap one full sort
-    /// budget) and the fast-regime assertion goes red at 1.00x.
+    /// The prior art is explicit that a compaction cap is a MULTIPLE of the
+    /// target file size (RocksDB 25x, IOx 3x); below 2x nothing can merge.
     #[test]
-    fn the_bin_cap_keeps_a_full_bin_inside_the_measured_fast_regime() {
-        let cap = coordinator_bin_compressed_cap_bytes();
-        let ratio = cap as f64 * crate::database::DECODED_BYTES_PER_COMPRESSED as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
-        // 0.56-0.60 staged in 15-180 s; 1.00 took 1,710 s. Stay at or under the
-        // top of the fast band, with the slow point excluded by a real margin.
-        assert!(ratio <= 0.65, "a full bin is {ratio:.2} of a sort budget; prod measured 1.00x at 28.5 minutes");
-        assert!(ratio >= 0.40, "too much margin wastes the lane: bins shrink while fixed per-unit cost stays");
-        // The 111.3 MB prod bin that staged for 28.5 minutes must now be refused.
-        assert!(cap < 111_340_092, "the bin measured at 28.5 minutes ({}) must not fit the cap ({cap})", 111_340_092_i64);
-        // ...while the 63.1 MB bin that staged in 15 s must still fit.
-        assert!(cap >= 63_094_710, "the 15-second prod bin must still be admissible");
+    fn a_packing_cap_always_admits_two_target_sized_files() {
+        // The exact prod shape that wedged.
+        let metrics_file = 36 * 1024 * 1024;
+        let cap = coordinator_packing_cap_bytes(metrics_file);
+        assert!(cap >= 72_140_172, "the two smallest prod otel_metrics files ({}) must pair under the cap ({cap})", 72_140_172_i64);
+        assert!(cap >= metrics_file * 2, "a cap below 2x the target file size can never merge anything");
+        // The margin still governs where it can: a small-file table keeps the
+        // measured fast regime rather than being widened to the floor.
+        let small = 4 * 1024 * 1024;
+        let margin_cap = coordinator_packing_cap_bytes(small);
+        let ratio = margin_cap as f64 * crate::database::DECODED_BYTES_PER_COMPRESSED as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
+        assert!(ratio <= 0.65, "where the floor does not bind, a full bin is {ratio:.2} of a sort budget; 1.00x measured 28.5 minutes");
+        assert!(margin_cap < coordinator_bin_compressed_cap_bytes(), "the margin must still bind below the raw decode cap");
     }
 }
