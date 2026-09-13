@@ -3837,9 +3837,29 @@ impl Database {
                 // nothing else — and `enqueue_unverifiable_rebuilds` is already
                 // newest-first and bounded, so a recovery that finds thousands
                 // cannot flood the queue.
-                moved.extend(slices.iter().filter(|(_, coverage)| coverage.source_rows != Some(current_rows)).map(|(start, coverage)| {
-                    (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
-                }));
+                // SEALED DAYS ONLY. Prod 2026-09-13 showed within the hour what
+                // shipping this without the qualifier costs: pending BaseRollup
+                // went 150 -> 1,112, drained to 107, then RE-FLOODED to 995
+                // while dedup stalled and the carry counter froze. A cycle, not
+                // a catch-up.
+                //
+                // A rebuild cannot make the witness agree on a day that is still
+                // ingesting, because the partition moves again before the next
+                // recovery pass looks. `2026-08-25-rollup-witness-design.md`
+                // says exactly this -- "no amount of rebuilding fixes on a
+                // churning day" -- and recommends the requeue "on sealed days
+                // ... a partition that is no longer live".
+                //
+                // `date < today` is the cheap form of "no longer live" and is a
+                // strict improvement on cycling. The precise predicate is the
+                // dedup certification (`cert_slice_files_proved`): a partition
+                // still taking late arrivals for yesterday reads as sealed here
+                // and can be requeued more than once.
+                if date < chrono::Utc::now().date_naive().to_string() {
+                    moved.extend(slices.iter().filter(|(_, coverage)| coverage.source_rows != Some(current_rows)).map(|(start, coverage)| {
+                        (project.clone(), crate::maintenance_coordinator::TimeSlice { start_micros: *start, end_micros: coverage.covered_through })
+                    }));
+                }
                 continue;
             }
             let mut spans: Vec<(i64, i64)> = slices.iter().map(|(start, coverage)| (*start, coverage.covered_through)).collect();
