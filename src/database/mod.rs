@@ -20124,10 +20124,10 @@ mod tests {
             let ring = db.delta_provider_cache.get(&(project_id.clone(), t.to_string())).expect("ring for the queried key");
             assert_eq!(ring.len(), 2, "both v{v1} and v{v2} providers must be retained");
             let ttl = db.config.cache.provider_cache_ttl();
-            let old = ring.get(v1 as u64, ttl).expect("previous version still retrievable — no rebuild for in-flight queries");
+            let old = ring.get(v1, ttl).expect("previous version still retrievable — no rebuild for in-flight queries");
             assert!(old.initialized(), "the retained v{v1} cell must still hold its built provider");
-            assert!(ring.get(v2 as u64, ttl).is_some(), "latest version cached");
-            assert!(ring.get(v2 as u64 + 99, ttl).is_none(), "lookup is exact-version: an unseen version must miss");
+            assert!(ring.get({ v2 }, ttl).is_some(), "latest version cached");
+            assert!(ring.get(v2 + 99, ttl).is_none(), "lookup is exact-version: an unseen version must miss");
         }
         let stats2 = ctx.sql("SELECT value FROM timefusion_stats WHERE component = 'scan' AND key = 'provider_cache_entries'").await?.collect().await?;
         let entries2 = stats2[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().expect("stats value").value(0);
