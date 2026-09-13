@@ -2316,6 +2316,9 @@ pub struct Database {
     /// Caps hot-tail wave staging. Separate from `maintenance_rewrite_sem` so a long dedup drain
     /// can't starve hot compaction. Sized to the light pool's own K.
     light_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// Light permits currently lent out of the repair lane's reservation. Only
+    /// ever 0 or `repair_holdback_permits()`; see `rebalance_repair_holdback`.
+    repair_holdback_lent: Arc<std::sync::atomic::AtomicU64>,
     /// Repair's decoded-BYTE budget, one permit per MiB — not a count of rewrites. Requests are
     /// clamped, so a bin larger than the budget takes all of it and runs alone.
     repair_rewrite_sem: Arc<tokio::sync::Semaphore>,
@@ -2955,6 +2958,7 @@ impl Database {
             repair_degradation: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.rewrite_permits().max(1))),
             light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
+            repair_holdback_lent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             repair_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(cfg.derived.repair_rewrite_budget_mib())),
             // Three quarters to debt, leaving a quarter always free for the rollup chain.
             maintenance_debt_slots: Arc::new(tokio::sync::Semaphore::new((coordinator_jobs * 3 / 4).max(1))),

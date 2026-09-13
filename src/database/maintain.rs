@@ -2725,6 +2725,7 @@ impl Database {
         let light_permit = match operation {
             Operation::HotPacking | Operation::SealedConsolidation => {
                 let stats = crate::observability::maintenance_stats();
+                self.rebalance_repair_holdback(stats);
                 stats.light_rewrite_permits_available.store(self.light_rewrite_sem.available_permits() as u64, std::sync::atomic::Ordering::Relaxed);
                 match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
                     Ok(permit) => {
@@ -2827,6 +2828,48 @@ impl Database {
             journal.checkpoint()?;
         }
         Ok(true)
+    }
+
+    /// Lend the repair lane's reserved light permits out while repair is idle,
+    /// and take them back the moment it has work.
+    ///
+    /// `light_optimize_k` subtracts `repair_pool_holdback_slices` so a repair
+    /// rewrite always has budget. Prod 2026-09-13: `pending_repair` was ZERO for
+    /// the whole day while that reservation pinned the hygiene lane at K=2 — and
+    /// the sealed backlog is precisely what the box is behind on. At 32 cores the
+    /// coordinator share holds 4 slices and the holdback was taking 2.
+    ///
+    /// SAFE because the holdback is a RESERVATION, not a memory ceiling: `slices`
+    /// is already `coordinator_share / COORDINATOR_PER_SORT_BUDGET`, so lending
+    /// these uses exactly the share the budget tree computed and no more. The
+    /// three "Resources exhausted" incidents this pool has seen came from raising
+    /// the per-sort budget or over-committing it; this does neither.
+    ///
+    /// The RETURN is the load-bearing half. `forget_permits` cannot revoke one
+    /// already held, so a repair unit arriving mid-flight waits for the current
+    /// hygiene sort rather than running beside it — bounded, and the direction
+    /// that cannot over-commit.
+    fn rebalance_repair_holdback(&self, stats: &crate::observability::MaintenanceStats) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let lendable = self.config.derived.repair_holdback_permits();
+        if lendable == 0 {
+            return;
+        }
+        let repair_idle = stats.pending_repair.load(Relaxed) == 0;
+        let lent = self.repair_holdback_lent.load(Relaxed);
+        if repair_idle && lent == 0 {
+            self.light_rewrite_sem.add_permits(lendable);
+            self.repair_holdback_lent.store(lendable as u64, Relaxed);
+            stats.light_rewrite_permits_total.fetch_add(lendable as u64, Relaxed);
+            stats.repair_holdback_lends.fetch_add(1, Relaxed);
+            info!(lendable, event = "repair_holdback_lent", "repair has no pending work; lending its reserved light permits to the hygiene lane");
+        } else if !repair_idle && lent > 0 {
+            let taken = self.light_rewrite_sem.forget_permits(lent as usize);
+            self.repair_holdback_lent.store((lent as usize).saturating_sub(taken) as u64, Relaxed);
+            stats.light_rewrite_permits_total.store(stats.light_rewrite_permits_total.load(Relaxed).saturating_sub(taken as u64), Relaxed);
+            stats.repair_holdback_returns.fetch_add(1, Relaxed);
+            info!(taken, still_lent = lent as usize - taken, event = "repair_holdback_returned", "repair has work; reclaiming its reserved light permits");
+        }
     }
 
     pub(crate) async fn run_maintenance_coordinator_once(&self) -> Result<bool> {

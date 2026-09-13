@@ -435,6 +435,31 @@ impl DerivedBudget {
         self.light_optimize_k(usize::MAX)
     }
 
+    /// The light permits the repair holdback is reserving, which repair can only
+    /// use if it HAS work.
+    ///
+    /// `light_optimize_k` subtracts `repair_pool_holdback_slices` so a repair
+    /// rewrite always has budget. Prod 2026-09-13: `pending_repair` was ZERO all
+    /// day while that reservation pinned the hygiene lane at K=2, and the sealed
+    /// backlog is what the box is behind on. At 32 cores the share holds 4
+    /// slices and the holdback takes 2 of them.
+    ///
+    /// This is a RESERVATION, not a memory ceiling: `slices` is already
+    /// `coordinator_share / COORDINATOR_PER_SORT_BUDGET`, so lending these out
+    /// uses exactly the share the budget tree computed and no more. That is why
+    /// it is safe to lend, and why it must be RETURNED the moment repair has
+    /// work — the pool cannot hold both at once.
+    pub fn repair_holdback_permits(&self) -> usize {
+        self.max_light_optimize_k_ignoring_holdback().saturating_sub(self.max_light_optimize_k())
+    }
+
+    /// `max_light_optimize_k` as if repair reserved nothing. Same floors — the
+    /// CPU term and the pool's slice count still bind.
+    fn max_light_optimize_k_ignoring_holdback(&self) -> usize {
+        let slices = self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
+        slices.min(self.cores / 4).max(1)
+    }
+
     pub fn tick_budget(&self, cron_period: Duration) -> Duration {
         cron_period.mul_f64(0.8)
     }
@@ -2654,6 +2679,37 @@ mod bin_decode_budget_tests {
         let ratio = |mb: i64| (mb * 1024 * 1024 * crate::database::DECODED_BYTES_PER_COMPRESSED) as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
         assert!(ratio(255) > 2.0, "the stalled prod bins were well past one sort budget");
         assert!(ratio(cap / (1024 * 1024)) <= 1.0, "a bin at the new cap is not");
+    }
+
+    /// The repair holdback must be LENDABLE, or the hygiene lane stays at K=2
+    /// while repair sits idle.
+    ///
+    /// Prod 2026-09-13: `pending_repair` was ZERO all day while the reservation
+    /// pinned the sealed lane — the lane holding a backlog the box was behind
+    /// on — at two concurrent sorts. At 32 cores the share holds 4 slices and
+    /// the holdback took 2 of them.
+    ///
+    /// Also pins the safety property: lending never exceeds what the budget tree
+    /// computed, because `slices` IS `coordinator_share / per_sort_budget`. The
+    /// holdback is a reservation, not a memory ceiling.
+    #[test]
+    fn the_repair_holdback_is_lendable_and_bounded_by_the_share() {
+        // Both shapes: the 48-core box this tree was calibrated for, and the
+        // 32 cores the container is actually capped at.
+        for (limit_gib, cores) in [(80usize, 48usize), (120, 32)] {
+            let prod = DerivedBudget::from_limits(limit_gib * GIB, cores);
+            let lendable = prod.repair_holdback_permits();
+            assert!(lendable > 0, "with a holdback in force there must be something to lend, or the hygiene lane can never reach its share");
+            // Lending must land exactly on the share's slice count -- never past it.
+            let share_slices = prod.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
+            let lent_total = prod.max_light_optimize_k() + lendable;
+            assert!(
+                lent_total <= share_slices.max(1),
+                "lending {lendable} on top of K={} would exceed the {share_slices} slices the coordinator share holds",
+                prod.max_light_optimize_k()
+            );
+            assert!(lent_total <= prod.cores / 4, "and must still respect the CPU term");
+        }
     }
 
     /// A packing cap must ALWAYS admit two target-sized files, margin or not:
