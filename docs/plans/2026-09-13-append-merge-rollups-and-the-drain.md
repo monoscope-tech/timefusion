@@ -171,3 +171,35 @@ BaseRollup's ~460 partition overwrites an hour, the backfill re-indexing they
 cause (83% of tantivy's indexed rows), and a large share of the 36x write
 amplification are **one root, not three**. At 10x traffic they scale together
 into a wall that more cores cannot clear.
+
+## GATE 1 CLEARED: the cardinality measurement
+
+The design above was gated on "partial rows must be far fewer than raw rows —
+do not build before this number is in hand." It is now in hand. One closed hour,
+`dashboard_1m_v3`'s grain and dimensions (`minute x service x kind x
+status_code`), measured directly against prod:
+
+| project | raw rows | partial rows | ratio |
+|---|---:|---:|---:|
+| 87576849 (whale) | 96,535 | 596 | **162 : 1** |
+| dcad860a | 423,721 | 304 | **1,394 : 1** |
+| 28f62f01 | 141,487 | 258 | **548 : 1** |
+| 00000000 (shared, worst) | 275,182 | 3,736 | **74 : 1** |
+| **total** | **936,925** | **4,894** | **191 : 1** |
+
+**The worst tenant is 74:1 and the aggregate is 191:1.** A 10-minute flush
+bucket holding ~16 k raw rows produces on the order of **100 partial rows** —
+appending that is trivial next to re-aggregating a whole day.
+
+Two things worth noting from the spread:
+
+- **The shared `00000000` partition is the outlier at 74:1**, which is expected:
+  it is many small tenants multiplexed into one partition, so its distinct
+  dimension set is the union of theirs. It is still an order of magnitude of
+  compression, and it is the partition most in need of cheap rollups.
+- **Higher-volume tenants compress BETTER, not worse** (dcad860a at 1,394:1).
+  Cardinality is bounded by the dimension domain, not by row count — which is
+  exactly the property that makes this design scale to 10x traffic, where a
+  rebuild-based design scales linearly with rows.
+
+So the remaining gate is the shadow phase, not the arithmetic.
