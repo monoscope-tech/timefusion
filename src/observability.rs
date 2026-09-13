@@ -409,6 +409,26 @@ pub fn init_metrics(
     observe!(gauge "timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
     observe!(gauge "timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
+    // QUERY LATENCY, the headline symptom, which had no usable history at all.
+    // Both latency histograms go through the `metrics` -> OTel bridge and arrive
+    // with a NULL scalar value, so "are queries slow?" — the question this whole
+    // effort exists to answer — could only be answered by running a query by hand
+    // and timing it. The quantiles are already computed in-process to back
+    // `timefusion_stats`; these publish the same numbers so they get a history.
+    // Milliseconds, not seconds: an integer gauge truncates every sub-second
+    // query to 0.
+    macro_rules! latency_gauge {
+        ($id:literal, $desc:literal, $hist:literal, $p:expr) => {
+            observe!(gauge $id, $desc, (histogram_quantile($hist, $p).unwrap_or(0.0) * 1_000.0) as u64);
+        };
+    }
+    latency_gauge!("timefusion.pgwire.query_latency_p50_ms", "Median pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.5);
+    latency_gauge!("timefusion.pgwire.query_latency_p95_ms", "p95 pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.95);
+    latency_gauge!("timefusion.pgwire.query_latency_p99_ms", "p99 pgwire end-to-end query latency", "timefusion.pgwire.query_latency_seconds", 0.99);
+    latency_gauge!("timefusion.scan.latency_p50_ms", "Median ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.5);
+    latency_gauge!("timefusion.scan.latency_p95_ms", "p95 ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.95);
+    latency_gauge!("timefusion.scan.latency_p99_ms", "p99 ProjectRoutingTable::scan duration", "timefusion.scan.latency_seconds", 0.99);
+
     observe!(gauge
         "timefusion.maintenance.sealed_compaction_debt_bytes",
         "Sealed compaction debt in DECODED bytes, not bytes on disk — roughly 12x the compressed footprint, and it is a stock of estimates that never decrements, so read it as a shape and never as a drain rate",
