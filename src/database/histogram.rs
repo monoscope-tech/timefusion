@@ -1101,10 +1101,7 @@ mod tests {
             let table_ref = db.resolve_table(&project, table).await?;
             let store = table_ref.read().await.log_store().object_store(None);
             for uri in db.list_file_uris(&project, table).await? {
-                indexer
-                    .build_index_for_file(table, &project, parquet_rel_of_uri(&uri).context("missing relative path")?, &uri, store.clone())
-                    .instrument(tracing::info_span!("tantivy_build", cause = "histogram"))
-                    .await?;
+                indexer.build_index_for_file(table, &project, parquet_rel_of_uri(&uri).context("missing relative path")?, &uri, store.clone()).await?;
             }
             Ok::<_, anyhow::Error>(())
         };

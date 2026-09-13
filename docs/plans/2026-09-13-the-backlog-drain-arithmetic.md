@@ -3,24 +3,53 @@
 2026-09-13, after #271 reached production (permit acquisition went from
 **0.036% to 46%**; the lane had been wedged, not slow).
 
-## The lane works now. It still cannot finish today.
+## FIRST: the "1 TB backlog" is ~100 GB on disk
 
-`sealed_compaction_debt_bytes` = **1.17 TB**. #271 caps a packing bin at what
-one sort can decode: `COORDINATOR_PER_SORT_BUDGET_BYTES` (1.25 GiB) /
-`DECODED_BYTES_PER_COMPRESSED` (12) = **~107 MB compressed**.
+`sealed_compaction_debt_bytes` sums **`task.estimated_decoded_bytes`**
+(`maintenance_coordinator.rs:3433`) — DECODED bytes, not bytes stored. At this
+codebase's own `DECODED_BYTES_PER_COMPRESSED` = 12, the **1.19 TB reads as
+~99 GB of actual stored data** across 196 pending tasks, i.e. ~507 MB
+compressed each.
 
-```
-1.17 TB / 107 MB           ≈ 11,000 bins
-observed: a 65.7 MB bin staged in 67 s -> ~110 s at the 107 MB cap
-K = 2 permits
-  => 2 x (3600/110) ≈ 65 bins/hour
-  => 11,000 / 65    ≈ 170 hours ≈ 7 days
-```
+This is the same compressed-vs-decoded confusion #271 exists to fix, showing up
+one level higher — in the number everyone quotes as "the backlog". Any plan
+sized against 1.19 TB of *files* is wrong by ~12x. **I made exactly that error
+first**, estimating 11,000 bins and ~7 days before reading the accumulator.
 
-**Draining this backlog "today" is not physically available at K=2**, whatever
-else is fixed. The honest framing is: the lane has gone from *stalled forever*
-to *finishing in about a week*, and the remaining question is what compresses
-that week.
+Corrected: ~99 GB / ~107 MB per bin ≈ **950 bins**, which at the observed
+24-105 bins/hour is **hours, not days**.
+
+## The lane works now, but the debt is not falling at anything like that rate
+
+Observed over 100 minutes on the fixed build: `sealed_compaction_debt_bytes`
+moved **0.5 GB** and `pending_sealed_consolidation` held flat at **196** — while
+SealedConsolidation completed ~48 units/hour. Two mechanisms are visible and
+neither is the sort stall #271 fixed:
+
+- **Tasks retry rather than retire.** `retry.HotPacking.compaction_debt_remaining`
+  = 54 and `retry.SealedConsolidation.compaction_debt_remaining` = 7: a unit
+  does a few bins and re-queues, so the pending COUNT is not a work-remaining
+  gauge.
+- **The bins being staged are tiny.** Every staged bin measured 42-47 files at
+  ~1.4 MB each, ~63 MB total. That is correct hygiene (file-count reduction) but
+  moves almost no bytes.
+
+### A refusal that looks like a #271 side effect and is NOT
+
+`pack_value_refused` reads **433 in 2 hours against 6 in the previous 9**, which
+invites the story that capping bins pushed them under
+`refuse_low_value_bin`'s 3-file threshold. **The rate refutes it**: rows per
+refusal is **898,650,262 / 433 = 2.08 M**, against the old process's
+13,863,476 / 6 = **2.31 M**. Same bin shape, not a smaller one.
+
+The raw counts never compared — the lane was *dead* for the older window, so it
+was not attempting bins to refuse. **Refusals per attempt is the only comparable
+figure, and it is unchanged.** Worth keeping as the template: whenever a lane
+goes from stalled to running, every one of its counters jumps, and none of those
+jumps is evidence by itself.
+
+What remains true is that ~2 M-row, sub-3-file bins are being refused and their
+bytes cannot consolidate — but that is pre-existing, not caused by #271.
 
 ### Where the dose-response came from
 
