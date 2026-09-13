@@ -199,6 +199,42 @@ pub fn build_partition_sql_from(spec: &RollupSpec, source: &str, from: &str, pro
     build_partition_sql_ranges(spec, source, from, "", project_id, date, &[])
 }
 
+/// The rollup PARTIAL for one batch of rows, aggregated in memory.
+///
+/// This is the write-side half of the append-and-merge model (ClickHouse
+/// `AggregatingMergeTree`: insert `-State`, merge during ordinary compaction,
+/// `-Merge` at read). A flush already holds its rows in memory, which is the
+/// cheapest possible place to aggregate them, and the output is small — prod
+/// 2026-09-13 measured **936,925 raw rows producing 4,894 partial rows (191:1)**
+/// at `dashboard_1m_v3`'s grain, worst tenant 74:1.
+///
+/// Deliberately the SAME SQL the rebuild uses (`build_cohort_sql_range_mode`)
+/// rather than a second aggregation path: two spellings of one aggregate is how
+/// a rollup silently disagrees with itself, and the equivalence this model rests
+/// on is only worth anything if both sides are literally the same expression.
+///
+/// It computes a partial and nothing else — no commit, no invalidation, no
+/// identity. **Appending one is NOT yet safe**: a rebuild self-heals but an
+/// append does not, so a batch aggregated twice over-counts permanently, and
+/// `min`/`max` cannot be retracted at all. `flush_bucket`'s own comment records
+/// that a timed-out commit can land the same rows twice, "accepted" precisely
+/// because dedup collapses duplicate ROWS — it cannot collapse a duplicated
+/// SUM. The caller that eventually appends these must therefore carry a batch
+/// identity and skip an already-landed one (the `already_landed` machinery), or
+/// dashboards over-count with no error anywhere.
+pub async fn rollup_partial_for_batches(
+    ctx: &datafusion::prelude::SessionContext, spec: &RollupSpec, source: &str, project_id: &str, date: &str, batches: &[arrow::record_batch::RecordBatch],
+    window: (i64, i64),
+) -> anyhow::Result<Vec<arrow::record_batch::RecordBatch>> {
+    let Some(first) = batches.first() else { return Ok(Vec::new()) };
+    let input = format!("__partial_input_{}", uuid::Uuid::new_v4().simple());
+    ctx.register_table(input.as_str(), std::sync::Arc::new(datafusion::datasource::MemTable::try_new(first.schema(), vec![batches.to_vec()])?))?;
+    let sql = build_cohort_sql_range_mode(spec, source, &input, std::slice::from_ref(&project_id.to_string()), date, window, false)?;
+    let partial = ctx.sql(&sql).await?.collect().await?;
+    let _ = ctx.deregister_table(input.as_str());
+    Ok(partial)
+}
+
 /// One measure's projection in a rollup build, as `<expression> AS <name>`.
 ///
 /// `derived` selects the tier-to-tier merge (folding the base tier's stored
@@ -2988,6 +3024,104 @@ mod tests {
 
     fn spec() -> RollupSpec {
         crate::schema::get_schema(SOURCE).expect("source schema").rollups.first().expect("declared rollup").clone()
+    }
+
+    /// APPEND-AND-MERGE EQUIVALENCE — the property the whole model rests on.
+    ///
+    /// If partials computed over two disjoint halves, concatenated and then
+    /// merged, do not equal one rebuild over the union, then appending partials
+    /// silently reports different numbers than rebuilding does — and no error
+    /// fires anywhere, because both answers are well-formed.
+    ///
+    /// This is ClickHouse `AggregatingMergeTree`'s contract (`-State` rows
+    /// combined by `-Merge`) stated as a test over THIS tree's own aggregate SQL,
+    /// and it is why only decomposable measures are expressible: `count`/`sum`
+    /// fold by `SUM`, `min`/`max` by `MIN`/`MAX`. The read path already emits
+    /// exactly this merge (`merge(partial_states) ... GROUP BY dims`), so what is
+    /// proved here is what production would compute.
+    #[tokio::test]
+    async fn partials_of_two_halves_merge_to_one_rebuild() {
+        use arrow::array::Float64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("project_id", DataType::Utf8, false),
+            // The aggregate SQL filters on the PARTITION columns, so a batch
+            // handed to `rollup_partial_for_batches` must carry `date` — which
+            // a real flush batch does, the raw table being partitioned by
+            // [project_id, date].
+            Field::new("date", DataType::Utf8, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("duration", DataType::Float64, true),
+        ]));
+        // Two services x two minutes, so the merge has to fold real groups
+        // rather than a single row that any implementation would get right.
+        let rows = |from: i64, n: i64| -> RecordBatch {
+            let times: Vec<i64> = (0..n).map(|i| (from + i % 2) * 60_000_000).collect();
+            let svcs: Vec<&str> = (0..n).map(|i| if i % 3 == 0 { "api" } else { "web" }).collect();
+            let durs: Vec<f64> = (0..n).map(|i| (i * 7 % 13) as f64).collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+                    Arc::new(StringArray::from(vec!["p"; n as usize])),
+                    Arc::new(StringArray::from(vec!["1970-01-01"; n as usize])),
+                    Arc::new(StringArray::from(svcs)),
+                    Arc::new(Float64Array::from(durs)),
+                ],
+            )
+            .expect("batch")
+        };
+        let spec = RollupSpec {
+            grain: "1m".into(),
+            name: Some("equiv".into()),
+            dimensions: vec!["svc".into()],
+            measures: vec![
+                RollupMeasure { name: "c".into(), agg: "count".into(), column: None, filter: None },
+                RollupMeasure { name: "s".into(), agg: "sum".into(), column: Some("duration".into()), filter: None },
+                RollupMeasure { name: "lo".into(), agg: "min".into(), column: Some("duration".into()), filter: None },
+                RollupMeasure { name: "hi".into(), agg: "max".into(), column: Some("duration".into()), filter: None },
+            ],
+            derive_from: None,
+        };
+        let ctx = datafusion::prelude::SessionContext::new();
+        let (first, second) = (rows(0, 9), rows(0, 7));
+        let window = (0, 10 * 60_000_000);
+        let date = "1970-01-01";
+
+        // APPEND side: each half aggregated on its own, exactly as a flush would.
+        let mut appended = Vec::new();
+        for half in [&first, &second] {
+            appended.extend(rollup_partial_for_batches(&ctx, &spec, SOURCE, "p", date, std::slice::from_ref(half), window).await.expect("partial"));
+        }
+        assert!(appended.len() >= 2, "precondition: two independent partials, not one combined aggregate");
+
+        // MERGE the appended partials the way the read path does.
+        let states = format!("__states_{}", uuid::Uuid::new_v4().simple());
+        let partial_schema = appended[0].schema();
+        ctx.register_table(states.as_str(), Arc::new(datafusion::datasource::MemTable::try_new(partial_schema, vec![appended.clone()]).expect("states")))
+            .expect("register states");
+        let merged = ctx
+            .sql(&format!("SELECT svc, SUM(c) AS c, SUM(s) AS s, MIN(lo) AS lo, MAX(hi) AS hi FROM {states} GROUP BY svc ORDER BY svc"))
+            .await
+            .expect("merge plan")
+            .collect()
+            .await
+            .expect("merge");
+
+        // REBUILD side: one aggregate over the union of the same rows.
+        let raw = format!("__raw_{}", uuid::Uuid::new_v4().simple());
+        ctx.register_table(raw.as_str(), Arc::new(datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![first, second]]).expect("raw")))
+            .expect("register raw");
+        let rebuilt = ctx
+            .sql(&format!("SELECT svc, COUNT(*) AS c, SUM(duration) AS s, MIN(duration) AS lo, MAX(duration) AS hi FROM {raw} GROUP BY svc ORDER BY svc"))
+            .await
+            .expect("rebuild plan")
+            .collect()
+            .await
+            .expect("rebuild");
+
+        let show = |batches: &[RecordBatch]| arrow::util::pretty::pretty_format_batches(batches).expect("format").to_string();
+        assert_eq!(show(&merged), show(&rebuilt), "appending partials and merging them must equal one rebuild over the same rows");
     }
 
     /// The two SQL arms `First` adds. Neither is reachable from the matcher
