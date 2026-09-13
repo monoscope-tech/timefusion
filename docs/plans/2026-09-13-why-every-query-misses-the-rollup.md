@@ -190,3 +190,57 @@ under-count class it was built to close.
 Sources: [About continuous aggregates](https://www.tigerdata.com/docs/use-timescale/latest/continuous-aggregates/about-continuous-aggregates),
 [Continuous aggregate refresh, demystified](https://www.tigerdata.com/blog/continuous-aggregate-refresh-demystified),
 [Understand continuous aggregates](https://www.tigerdata.com/docs/learn/continuous-aggregates)
+
+## THE FIX IS ~80% BUILT AND DORMANT
+
+`verify_slice_witness` (`rollup.rs:765`) already understands three witness kinds:
+
+| witness | what it proves | status |
+|---|---|---|
+| `Physical(rows)` | total `num_records` across the partition is unchanged | **the only one production uses** |
+| `PhysicalBelow { rows, bound }` | rows below a time bound unchanged — tolerant of growth above it | tests only |
+| `Logical { rows, lo, hi }` | **deduplicated** row count over the exact slice range | tests only |
+
+Both generalisations are implemented and unit-tested (`rollup.rs:4482-4509`), and
+nothing in production stamps or verifies with them. `slice_coverage_agrees` is
+hardcoded to `Physical` — its own doc says so — and passes `logical: None`, so
+the logical path is fed nothing:
+
+```rust
+let source = LiveSource { files: ..., logical: None };
+... verify_slice_witness(witness.map(SliceWitness::Physical), source) ...
+```
+
+**`Physical` is the wrong proof for this system, and the code says why.**
+`SourceFile::rows` is "the add action's `num_records` — PHYSICAL, so it counts
+tombstones and superseded merge-on-read versions", and `slice_coverage_agrees`
+notes "*'Rows only accrue' is false here — dedup rewrites and vacuum shrink
+`num_records` too*". So a dedup that removes only duplicates, or a consolidation
+that rewrites files with identical logical content, changes the witness and
+voids coverage **without changing a single answer the rollup would give**.
+
+That is exactly what the 2,618,297 `moved` refusals are, and why an eight-day-old
+partition fails.
+
+`Logical` is immune to both: it counts the deduplicated rows over the slice's own
+range, which is precisely the quantity the rollup aggregated. It is also
+preferable to `PhysicalBelow`, whose straddle rule makes a packed day
+`Unverifiable` — the reason its own comment calls it "a candidate and not a
+recommendation".
+
+### What remains to do
+
+1. **Stamp** slices with a logical row count at build time instead of (or
+   alongside) the physical tag. The logical-count index already exists; note the
+   2026-09-02 constraint that **its key must equal the dedup key**, or the count
+   it returns answers a different question.
+2. **Feed** `LiveSource::logical` on the verify path — currently `None` at the
+   only call site.
+3. **Oracle-compare** before trusting it: run both witnesses over real prod
+   slices and assert the `Logical` verdict never says Valid where the raw path
+   would disagree. The 08-22 slice-fingerprint attempt "routed nothing, failing
+   safe as a permanent miss"; the opposite failure — routing something it should
+   not — is the under-count class, and is not safe.
+
+This is the single highest-leverage item on the read path: the verifier is built
+and tested, and the work is stamping and plumbing rather than design.
