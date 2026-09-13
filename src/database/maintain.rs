@@ -685,6 +685,9 @@ use crate::database::rollup_unverifiable::{Tally, UnverifiableFate, Unverifiable
 /// spans, and separately the tagged files' slice ranges.
 type SpansByPartition = HashMap<(String, String), Vec<(i64, i64)>>;
 
+/// One base cell a derived rollup aggregates: `(span, generation, measures it proved)`.
+type BaseCell = ((i64, i64), String, Option<HashSet<String>>);
+
 /// Per `(project, date)`: the timestamp spans of its UNTAGGED tier files, and
 /// the slice ranges of its tagged ones. `uncovered_gaps` turns the pair into the
 /// work that would let `slice_retires` reach the untagged files.
@@ -2039,23 +2042,23 @@ impl Database {
         // base commit show as coverage the snapshot lacks, and the unit publishes short.
         // Each cell's `TAG_MEASURES` evidence rides along: a derived cell may only claim
         // a measure its base cells proved.
-        let cells: Vec<((i64, i64), String, Option<HashSet<String>>)> = derived
-            .then(|| {
-                self.rollup_slice_coverage
-                    .iter()
-                    .filter(|entry| {
-                        let (project, source, table, start, end) = entry.key();
-                        *project == key.project_id
-                            && *source == key.source
-                            && *table == from
-                            && key.slice.overlaps(*start, *end)
-                            && chrono::DateTime::from_timestamp_micros(*start)
-                                .is_some_and(|time| Self::rollup_generation_current(source, table, project, &time.date_naive().to_string(), entry.value()))
-                    })
-                    .map(|entry| ((entry.key().3, entry.key().4), entry.value().generation.clone(), entry.value().measures.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cells: Vec<BaseCell> = if derived {
+            self.rollup_slice_coverage
+                .iter()
+                .filter(|entry| {
+                    let (project, source, table, start, end) = entry.key();
+                    *project == key.project_id
+                        && *source == key.source
+                        && *table == from
+                        && key.slice.overlaps(*start, *end)
+                        && chrono::DateTime::from_timestamp_micros(*start)
+                            .is_some_and(|time| Self::rollup_generation_current(source, table, project, &time.date_naive().to_string(), entry.value()))
+                })
+                .map(|entry| ((entry.key().3, entry.key().4), entry.value().generation.clone(), entry.value().measures.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let base_generations: HashSet<String> = cells.iter().map(|(_, generation, _)| generation.clone()).collect();
         // `reduce` over no cells is `None`, so a non-derived unit has no evidence.
         let base_evidence = crate::rollup::base_measure_evidence(spec, cells.iter().map(|(_, _, measures)| measures.as_ref()));

@@ -2147,7 +2147,7 @@ mod tests {
         let body = Bytes::from(vec![b'p'; 2 * 1024 * 1024]);
         cache.put(&Path::from("t/date=2026-09-12/put.parquet"), PutPayload::from(body.clone())).await?;
 
-        mpu_put(&cache, &Path::from("t/date=2026-09-12/mpu.parquet"), &[body.clone()]).await?;
+        mpu_put(&cache, &Path::from("t/date=2026-09-12/mpu.parquet"), std::slice::from_ref(&body)).await?;
 
         let admission = cache.admission();
         assert_eq!(admission.write_capture_admitted.load(Ordering::Relaxed), 2, "both write paths must register as write capture");

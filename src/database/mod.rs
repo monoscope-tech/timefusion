@@ -8988,9 +8988,11 @@ impl ProjectRoutingTable {
         // window is NOT wholly certified (the plain skip above is cheaper) and
         // only here on the Delta-only path, where no MemBuffer leg can hold an
         // uncertified newer version.
-        let per_date_dates: HashSet<String> = (!skip_dedup && self.database.config.maintenance.timefusion_read_dedup_skip_per_date && !dedup_keys.is_empty())
-            .then_some(certified_dates)
-            .unwrap_or_default();
+        let per_date_dates: HashSet<String> = if !skip_dedup && self.database.config.maintenance.timefusion_read_dedup_skip_per_date && !dedup_keys.is_empty() {
+            certified_dates
+        } else {
+            HashSet::new()
+        };
         // Complement within the window: what the DedupExec leg must still read.
         // Derived from the same `window_dates` enumeration certification used,
         // so the two sides provably partition the window's dates.
