@@ -327,6 +327,15 @@ pub fn init_metrics(
         };
     }
 
+    /// Cumulative totals from a process-global atomic. A counter, not a gauge, so
+    /// `rate()` still reads correctly across the reset to zero that every deploy
+    /// causes — and this service redeploys on any non-docs push.
+    macro_rules! atomic_counter {
+        ($id:literal, $desc:literal, $read:expr) => {
+            meter.u64_observable_counter($id).with_description($desc).with_callback(|obs| obs.observe($read, &[])).build();
+        };
+    }
+
     layer_metric!(gauge "timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
     layer_metric!(gauge "timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
     layer_metric!(gauge "timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
@@ -367,6 +376,58 @@ pub fn init_metrics(
         "timefusion.rollup.maintenance.oldest_invalidation_age_seconds",
         "Age of the oldest durable rollup invalidation",
         maintenance_stats().rollup_oldest_invalidation_age_secs.load(Relaxed)
+    );
+
+    // THE MAINTENANCE LANE. None of this was exported before, so all of it lived
+    // only in `timefusion_stats` — a process-scoped table that resets on every
+    // deploy, and prod redeploys on any non-docs push. A full day of 2026-09-13
+    // went into distinguishing a lane that WEDGES (both permits held, zero claims,
+    // every throughput counter frozen) from one that is merely slow, and it could
+    // not be settled, because a point sample has nothing to be compared against
+    // and each restart erased the evidence. Meanwhile the metrics that DO have
+    // history told the story immediately: over the same seven days
+    // `pending_dirty_partitions` rose 340 -> 588 and `cron_long_running` tripled.
+    atomic_gauge!(
+        "timefusion.maintenance.permit_held_without_staging_seconds",
+        "Longest a hygiene permit has been held without reaching a sort. THE wedge signal: a wedged lane stops counting rather than counting badly, so every throughput metric goes quiet and quiet reads as healthy",
+        maintenance_stats().permit_held_without_staging_secs.load(Relaxed)
+    );
+    atomic_gauge!(
+        "timefusion.maintenance.permits_available",
+        "Free hygiene rewrite permits. Pinned at 0 while the lane is wedged",
+        maintenance_stats().light_rewrite_permits_available.load(Relaxed)
+    );
+    atomic_counter!(
+        "timefusion.maintenance.permits_acquired",
+        "Hygiene permits taken. Frozen against a climbing permits_unavailable is the wedge; both climbing is healthy contention",
+        maintenance_stats().compaction_permits_acquired.load(Relaxed)
+    );
+    atomic_counter!(
+        "timefusion.maintenance.permits_unavailable",
+        "Hygiene turns that found no free permit and gave up before claiming",
+        maintenance_stats().compaction_permits_unavailable.load(Relaxed)
+    );
+    // Committed bins per lane — the drain rate. Quoting one without history is how
+    // a working-window burst right after a restart gets reported as a sustained rate.
+    atomic_counter!(
+        "timefusion.maintenance.light_optimize_bins_committed",
+        "Hot-pack and sealed-consolidation bins committed",
+        maintenance_stats().light_optimize_bins_committed.load(Relaxed)
+    );
+    atomic_counter!(
+        "timefusion.maintenance.dedup_bins_committed",
+        "Dedup bins committed",
+        maintenance_stats().dedup_bins_committed.load(Relaxed)
+    );
+    // Queue depth per lane. Depth alone cannot tell slow from never-claimed —
+    // pair it with the permit counters above, which is what settles starvation.
+    atomic_gauge!("timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
+    atomic_gauge!("timefusion.maintenance.pending_dedup", "Dedup units queued", maintenance_stats().pending_dedup.load(Relaxed));
+    atomic_gauge!("timefusion.maintenance.pending_repair", "Repair units queued", maintenance_stats().pending_repair.load(Relaxed));
+    atomic_gauge!(
+        "timefusion.maintenance.sealed_compaction_debt_bytes",
+        "Sealed compaction debt in DECODED bytes, not bytes on disk — roughly 12x the compressed footprint, and it is a stock of estimates that never decrements, so read it as a shape and never as a drain rate",
+        maintenance_stats().sealed_compaction_debt_bytes.load(Relaxed)
     );
 
     if let Some(indexer_weak) = tantivy_indexer {
@@ -965,6 +1026,11 @@ atomic_stats! {
         /// at boot from `coordinator_share / COORDINATOR_PER_SORT_BUDGET -
         /// repair_holdback`, floored at 1 — never derive it by hand.
         light_rewrite_permits_available,
+        /// Longest a hygiene permit has been held WITHOUT reaching the sort, this
+        /// process. The wedge detector: the lane holds both permits and claims
+        /// nothing, so every throughput counter simply stops rather than reading
+        /// as bad, and a stopped counter is indistinguishable from a quiet one.
+        permit_held_without_staging_secs,
         light_rewrite_permits_total,
         /// Dashboard aggregates served from a rollup, split by how much of the
         /// window the rollup owned. `rollup_hits_hybrid` is what proves the

@@ -2771,7 +2771,12 @@ impl Database {
         // built to name — the same trap that kept #268's lifetime cap from ever
         // firing, since `tokio::time::timeout` cannot preempt a future that never
         // reaches an await point. Two permits bound this to two watchdogs.
-        const PERMIT_PHASES: [&str; 5] = ["claim", "admission", "resolve_table", "compaction_files", "staging"];
+        // Every await between taking the permit and starting the sort gets its own
+        // name. The earlier five stopped at `compaction_files`, which labelled the
+        // whole of the snapshot fold, the repair sortedness probe and the resume
+        // scan as "staging" — the one answer the evidence has already ruled out.
+        const PERMIT_PHASES: [&str; 8] =
+            ["claim", "admission", "resolve_table", "compaction_files", "processed_bytes", "repair_sorted_probe", "resume_scan", "staging"];
         struct AbortOnDrop(tokio::task::JoinHandle<()>);
         impl Drop for AbortOnDrop {
             fn drop(&mut self) {
@@ -2793,6 +2798,10 @@ impl Database {
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     held_secs += wait;
                     wait = (wait * 2).min(900);
+                    // The gauge is the half that outlives the process: a log line
+                    // has to be grepped on a host, this gets history in monoscope.
+                    let stats = crate::observability::maintenance_stats();
+                    stats.permit_held_without_staging_secs.fetch_max(held_secs, std::sync::atomic::Ordering::Relaxed);
                     warn!(
                         phase = PERMIT_PHASES[phase.load(std::sync::atomic::Ordering::Relaxed).min(PERMIT_PHASES.len() - 1)],
                         held_secs,
@@ -2835,6 +2844,7 @@ impl Database {
                 .filter(|file| selected.contains(file.path().as_ref()))
                 .fold(0u64, |bytes, file| bytes.saturating_add(estimated_decoded_bytes(file.size())))
         };
+        note(5);
         if operation == crate::maintenance_coordinator::Operation::Repair && self.repair_bin_already_sorted(&table_ref, &files).await {
             return self.settle_compaction_unit(&table_ref, &key).await.map(|()| true);
         }
@@ -2845,6 +2855,7 @@ impl Database {
         // staged parquet and a whole rewrite is thrown away.
         let date_marker =
             chrono::DateTime::from_timestamp_micros(key.slice.start_micros).map(|time| format!("date={}/", time.date_naive())).unwrap_or_default();
+        note(6);
         if let Some(bin) = self.resumable_staged_bin(&table_ref, &key.source, &key.project_id, &files).await {
             let result = self.commit_wave(&table_ref, &key.source, std::slice::from_ref(&date_marker), false, vec![bin], 0).await;
             let landed = result.failed.is_empty() && !result.landed.is_empty();
@@ -2854,6 +2865,7 @@ impl Database {
             }
             // The resume lost its race (inputs no longer live); stage normally.
         }
+        note(7);
         let runtime = self.coordinator_compaction_runtime_env(operation);
         let outcome = self
             .stage_hot_bin(&table_ref, &key.source, schema, &key.project_id, files, HotStageOptions { pass, runtime_env: Some(runtime), light_permit })
