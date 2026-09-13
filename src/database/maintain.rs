@@ -3844,11 +3844,17 @@ impl Database {
         if key.operation == Operation::Repair {
             return Ok(candidates.into_iter().filter(|add| !self.repair_verified_sorted.contains(&add.path)).take(1).map(|add| add.path).collect());
         }
+        // Bounded by what ONE SORT CAN DECODE, not only by the output size we
+        // would like. See `coordinator_bin_compressed_cap_bytes`: a 256 MiB
+        // compressed target decodes to ~3 GiB against a 1.25 GiB per-sort
+        // budget, and prod 2026-09-13 had every bin at that size stall
+        // indefinitely while every small one completed.
         let target = match key.operation {
             Operation::HotPacking => COORDINATOR_HOT_TARGET_BYTES,
             Operation::SealedConsolidation => COORDINATOR_SEALED_TARGET_BYTES,
             _ => return Ok(Vec::new()),
-        };
+        }
+        .min(crate::config::coordinator_bin_compressed_cap_bytes());
         let unsorted_candidates = candidates.iter().filter(|add| !add.is_sorted_run).count();
         let under_target_candidates = candidates.iter().filter(|add| add.size < target).count();
         // The PACKER's own two smallest under-target files. `plan_compaction_debt`

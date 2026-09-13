@@ -318,7 +318,9 @@ mod sqllogictest_tests {
             // PUT, which makes Delta commit versions non-atomic (see MINIO_TAG).
             // GenericImage because the MinIO module waits for "API:" on stdout,
             // and modern images banner on stderr (see e2e::harness).
-            let minio = GenericImage::new("minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+            // quay.io, NOT Docker Hub: the `minio/minio` tag 404s. Same reason
+            // and same registry as `tests/e2e/harness.rs::MINIO_IMAGE`.
+            let minio = GenericImage::new("quay.io/minio/minio", "RELEASE.2025-09-07T16-13-09Z")
                 .with_wait_for(WaitFor::message_on_stderr("API:"))
                 .with_cmd(["server", "/data"])
                 .with_env_var("MINIO_ROOT_USER", "minioadmin")
