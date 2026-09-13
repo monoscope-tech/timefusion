@@ -236,7 +236,14 @@ recommendation".
    it returns answers a different question.
 2. **Feed** `LiveSource::logical` on the verify path — currently `None` at the
    only call site.
-3. **Oracle-compare** before trusting it: run both witnesses over real prod
+3. **Settle the 2026-09-04 count-pushdown undercount FIRST.** `COUNT(*)` was
+   measured silently **27% low** and the pushdown was disabled in `2f08c4a6`.
+   That is the same logical-count family a `Logical` witness would be stamped
+   from. Establish whether the defect was in the INDEX or in the pushdown before
+   stamping witnesses from it: if the index undercounts, `Logical` either never
+   validates (safe but useless) or validates against a wrong count, which is the
+   under-count class itself.
+4. **Oracle-compare** before trusting it: run both witnesses over real prod
    slices and assert the `Logical` verdict never says Valid where the raw path
    would disagree. The 08-22 slice-fingerprint attempt "routed nothing, failing
    safe as a permanent miss"; the opposite failure — routing something it should

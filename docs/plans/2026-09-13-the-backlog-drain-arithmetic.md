@@ -26,6 +26,15 @@ moved **0.5 GB** and `pending_sealed_consolidation` held flat at **196** — whi
 SealedConsolidation completed ~48 units/hour. Two mechanisms are visible and
 neither is the sort stall #271 fixed:
 
+- **The gauge is a STOCK OF ESTIMATES and cannot show drain at all.**
+  `estimated_decoded_bytes` is set once when the task is created
+  (`maintenance_coordinator.rs:457`) and is never decremented as bins commit —
+  the only write after creation zeroes it wholesale (`:1222`). So the sum only
+  falls when a task leaves the pending set entirely. This resolves the
+  contradiction outright: committed bins imply ~18 GB/h of decoded work against
+  an observed 0.3 GB/h of gauge movement, because **the gauge is not measuring
+  work done.** A drain rate has to be computed from committed-bin `bytes_in` in
+  the logs; do not quote one from this counter.
 - **Tasks retry rather than retire.** `retry.HotPacking.compaction_debt_remaining`
   = 54 and `retry.SealedConsolidation.compaction_debt_remaining` = 7: a unit
   does a few bins and re-queues, so the pending COUNT is not a work-remaining
