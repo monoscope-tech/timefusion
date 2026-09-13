@@ -414,11 +414,7 @@ pub fn init_metrics(
         "Hot-pack and sealed-consolidation bins committed",
         maintenance_stats().light_optimize_bins_committed.load(Relaxed)
     );
-    atomic_counter!(
-        "timefusion.maintenance.dedup_bins_committed",
-        "Dedup bins committed",
-        maintenance_stats().dedup_bins_committed.load(Relaxed)
-    );
+    atomic_counter!("timefusion.maintenance.dedup_bins_committed", "Dedup bins committed", maintenance_stats().dedup_bins_committed.load(Relaxed));
     // Queue depth per lane. Depth alone cannot tell slow from never-claimed —
     // pair it with the permit counters above, which is what settles starvation.
     atomic_gauge!("timefusion.maintenance.pending_base_rollup", "BaseRollup units queued", maintenance_stats().pending_base_rollup.load(Relaxed));
