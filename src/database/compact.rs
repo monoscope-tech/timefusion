@@ -234,9 +234,7 @@ impl Database {
                     let table_owned = table_name.to_string();
                     let (built, reindex_errs) = futures::stream::iter(added.into_iter().map(|(pid, rel, uri)| {
                         let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
-                        async move {
-                            svc.build_index_for_file(&table, &pid, &rel, &uri, store).instrument(tracing::info_span!("tantivy_build", cause = "optimize")).await
-                        }
+                        async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
                     }))
                     .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1))
                     .fold((0usize, 0usize), |(built, errs), r| async move {
@@ -968,6 +966,27 @@ impl Database {
         // incomplete branch there discards `dropped` while its bins are already
         // committed work.
         crate::observability::count_maintenance_work("Dedup", "rows_dropped", dropped);
+        // CARRY THE ROLLUP WITNESS instead of letting the rewrite invalidate it.
+        //
+        // A rollup builds from a DEDUPLICATED read — `slice_input_sql` keeps
+        // `ROW_NUMBER() OVER (PARTITION BY dedup_keys ORDER BY tiebreak DESC)
+        // = 1` — and this sweep collapses the SAME `dedup_keys` keeping the
+        // greatest `dedup_tiebreak`. One schema declaration drives both, so
+        // dedup removes exactly the rows the build never counted: the rollup's
+        // numbers are unchanged and only its PROOF moved.
+        //
+        // The proof is the partition's physical `num_records`, and the delta is
+        // known exactly here — `dropped`, summed over LANDED bins only, so a bin
+        // that failed to commit contributes nothing. Subtract it and the witness
+        // is true again, with no scan and no object-store round trip.
+        //
+        // Prod 2026-09-13 measured this class at 18,418 `rollup_stale_shrank`
+        // against 229,361 `grew`, so this is the 7.4% — worth taking because it
+        // is nearly free and repairs slices already stamped, not because it is
+        // the larger lever. See `2026-09-13-stop-re-rolling-deduped-partitions.md`.
+        if dropped > 0 {
+            self.carry_dedup_witness(table_name, project_id, &date.to_string(), dropped);
+        }
         for bin in &result.landed {
             if let Some(d) = &bin.dedup {
                 info!("dedup rewrite: table={} chunk=[{}] dropped={} (before={} after={})", table_name, d.label, d.dropped(), d.before, d.after);
