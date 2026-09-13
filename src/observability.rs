@@ -971,6 +971,14 @@ atomic_stats! {
     #[derive(Default)]
     MaintenanceStats => MAINTENANCE_STATS as "maintenance" {
         checkpoints_created,
+        /// Durable maintenance-journal commits actually performed, and the
+        /// callers that rode someone else's instead of paying for their own
+        /// `fsync` (see `support::GroupCommit`). Both are gauges republished
+        /// from the committer. `coalesced / (performed + coalesced)` is the
+        /// share of the ingest path's durability barrier that costs no IO;
+        /// near zero under load means the batching is not engaging.
+        journal_commits,
+        journal_commits_coalesced,
         checkpoint_failed,
         /// Checkpoints that wrote OK but failed post-write footer verification
         /// (the referenced object isn't a readable Parquet). Log cleanup is
@@ -1051,6 +1059,67 @@ atomic_stats! {
         /// claimed, so the ratio is the share of rollup work that was bookkeeping.
         /// Prod 2026-09-11 measured that share at 72.6% of BaseRollup bytes.
         rollup_noop_rebuild_skipped as "rollup_noop_rebuild_skipped_total",
+        /// How many times the maintenance gauges were actually recomputed.
+        ///
+        /// `publish_statistics` is a full linear scan of the journal, and
+        /// `checkpoint` used to call it unconditionally — every claim, completion
+        /// and retry, under the one global `Mutex<TaskJournal>`. Prod 2026-09-11:
+        /// 71,849 tasks, ~2,032 checkpoints/min, 1.70 ms per scan measured at
+        /// that size — about a third of the 5.45 ms average `journal_hold`.
+        ///
+        /// Read against the checkpoint rate: this should sit near one per second
+        /// however busy maintenance gets. Tracking the checkpoint rate instead
+        /// means the throttle is not firing.
+        journal_stats_publishes as "journal_stats_publishes_total",
+        /// Finished tasks dropped from the journal because their slice is past
+        /// the abandonment horizon. A prod census on 2026-09-12 found 15,202 of
+        /// 79,682 (19.1%) in that state, so the first compaction after a deploy
+        /// should move this sharply once and then only trickle.
+        ///
+        /// Read `tasks_complete` alongside it: if this climbs while that does
+        /// not fall, something is re-creating the keys being pruned.
+        journal_retired_tasks_pruned as "journal_retired_tasks_pruned_total",
+        /// Base files a DERIVED unit refused for an obsolete generation, split by
+        /// whether refusing them actually cost anything.
+        ///
+        /// `reproduced` — the CURRENT-generation files the unit selected already
+        /// cover the refused file's whole span, so excluding it loses no rows and
+        /// no rebuild is demanded. This is the livelock that was: prod 2026-09-11
+        /// had derived units at attempts=78 minting a base rebuild every 32
+        /// minutes over `skipped_generation=1`, and the rebuild could never clear
+        /// it because `slice_retires` only retires a file CONTAINED in the
+        /// publishing slice.
+        ///
+        /// `unreproduced` — a genuine hole in current-generation evidence. The
+        /// unit mints the base rebuild and retries, exactly as before.
+        ///
+        /// Chronically rising `reproduced` with a flat `rollup_tier_untagged_found`
+        /// means obsolete tier files are accumulating and nothing retires them —
+        /// real garbage, but no longer a livelock.
+        rollup_base_refusal_reproduced as "rollup_base_refusal_reproduced_total",
+        rollup_base_refusal_unreproduced as "rollup_base_refusal_unreproduced_total",
+        /// Rollup-journal writes performed, and the ones skipped because the
+        /// encoded content had not moved since the last successful store.
+        ///
+        /// `store` costs TWO `fsync`s (temp file, then the parent directory
+        /// after the rename) and runs inside every group commit beside the task
+        /// journal's own — three per commit. Prod 2026-09-12 performed 30,075
+        /// commits in 2,640 s (11.4/s), which is ~100% duty on the commit
+        /// pipeline: `block.journal_commit_wait` averaged 362 ms, max 10.7 s,
+        /// on the pre-ack path.
+        ///
+        /// Read `skipped / (skipped + persists)`: steady ingest re-invalidates
+        /// the same hours idempotently, so a healthy system skips most commits.
+        /// A ratio near zero means the journal really is changing every commit
+        /// and the remaining cost is genuine.
+        rollup_journal_persists as "rollup_journal_persists_total",
+        rollup_journal_persist_skipped as "rollup_journal_persist_skipped_total",
+        /// Writes DEFERRED because the journal had changed but was written less
+        /// than `ROLLUP_JOURNAL_MAX_STALENESS` ago. Deferred, never dropped: the
+        /// content is still different at the next commit, so the next one past
+        /// the window writes it, and shutdown forces one. This is the term that
+        /// scales with ingest — `skipped` is the idle case.
+        rollup_journal_persist_deferred as "rollup_journal_persist_deferred_total",
         /// Waves not STARTED because the WAL was over its emergency-flush threshold
         /// (durability outranks compaction) or memory was near the cgroup limit.
         /// Chronic nonzero = compaction is being starved, not protected.
@@ -1110,6 +1179,40 @@ atomic_stats! {
         /// gauge, not a fault: read it against
         /// `maintenance_coordinator_unit_timed_out`, which it is meant to replace.
         compaction_permits_unavailable,
+        /// Packing/consolidation turns that DID take a `light_rewrite_sem` permit.
+        ///
+        /// The denominator `compaction_permits_unavailable` never had. On its own
+        /// a refusal count cannot distinguish healthy contention from a lane that
+        /// is dead: prod 2026-09-12 read 1,812 refusals in 55 minutes and it took
+        /// forty minutes of code reading to establish that the acquisitions behind
+        /// it were 2 per hour, against 196 planned cells and 1.1 TB of sealed
+        /// debt. Read `acquired / (acquired + unavailable)`.
+        compaction_permits_acquired,
+        /// Units killed by the absolute lifetime cap rather than by going idle —
+        /// see `coordinator_operation_lifetime_cap`.
+        ///
+        /// These are units that were making progress and still not converging. A
+        /// single one cost prod 7,634 s (8.5x its deadline) holding one of ~3
+        /// permits. Nonzero is the cap doing its job; it should be small, and if
+        /// it tracks the claim rate the units are being bisected too slowly.
+        maintenance_unit_lifetime_capped,
+        /// `light_rewrite_sem` permits free, sampled whenever a hygiene turn asks
+        /// for one, and the TOTAL the semaphore was built with.
+        ///
+        /// `compaction_permits_unavailable` counts refusals and
+        /// `compaction_permits_acquired` counts successes, but neither can say
+        /// whether the permits are HELD or simply do not exist — and those need
+        /// opposite fixes. Prod 2026-09-12: 12 acquisitions against 6,948
+        /// refusals with zero units capped, which is consistent with both.
+        ///
+        /// `light_rewrite_permits_total` is derived at boot from
+        /// `coordinator_share / COORDINATOR_PER_SORT_BUDGET - repair_holdback`,
+        /// floored at 1 — an arithmetic chain across five functions that has
+        /// silently collapsed to 1 before (prod 2026-09-01, HotPacking stopped
+        /// being claimed at all). Exporting it means never deriving it by hand
+        /// again.
+        light_rewrite_permits_available,
+        light_rewrite_permits_total,
         /// Dashboard aggregates served from a rollup, split by how much of the
         /// window the rollup owned. The OTel counters carry the same numbers but
         /// cannot be read back in-process, and these two are the only signal that

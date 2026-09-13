@@ -204,6 +204,15 @@ pub const TAG_PROJECT: &str = "timefusion.project";
 pub const TAG_SLICE_START: &str = "timefusion.slice_start_micros";
 pub const TAG_SLICE_END: &str = "timefusion.slice_end_micros";
 pub const TAG_SOURCE_FINGERPRINT: &str = "timefusion.source_fingerprint";
+/// The INPUT FILE SET this cell was aggregated from, deletion vectors included —
+/// the no-op-rebuild proof, persisted so it survives a restart.
+///
+/// Distinct from [`TAG_SOURCE_FINGERPRINT`], which hashes paths alone and is
+/// therefore blind to a deletion vector superseding an `Add` under the same
+/// path. Written by the publish site and read back by `recover_rollup_coverage`;
+/// absent on cells written before this tag existed, which yields `None` and
+/// declines the skip exactly as a missing proof should.
+pub const TAG_CONTENT_FINGERPRINT: &str = "timefusion.content_fingerprint";
 /// How many rows the SOURCE DATE PARTITION held when this slice was built —
 /// the `num_records` sum, exactly as `partition_stats_bounded` computes it.
 ///
@@ -742,6 +751,10 @@ pub struct TaskJournal {
     /// Keys removed since the last write, pending a `Removed` tombstone.
     removed_tasks: HashSet<TaskKey>,
     dirty_cursors: HashSet<String>,
+    /// When the gauges were last recomputed, so `checkpoint` does not rescan the
+    /// whole task list on every claim and completion — see
+    /// [`TaskJournal::publish_statistics_throttled`].
+    stats_published_at: Option<std::time::Instant>,
     fair_cursors: HashMap<Operation, String>,
     /// `(source, project_id, date)` whose BASE tier is already built, as read
     /// from real rollup coverage by `plan_rollup_backfill` every 60s.
@@ -1020,6 +1033,7 @@ impl TaskJournal {
             dirty_tasks: HashSet::new(),
             removed_tasks: HashSet::new(),
             dirty_cursors: HashSet::new(),
+            stats_published_at: None,
             fair_cursors: HashMap::new(),
             base_tier_ready: HashSet::new(),
             tier_holes: HashSet::new(),
@@ -3264,18 +3278,95 @@ impl TaskJournal {
         if fs::metadata(&self.wal_path).is_ok_and(|metadata| metadata.len() >= JOURNAL_COMPACT_BYTES) {
             self.compact()?;
         }
-        self.publish_statistics();
+        self.publish_statistics_throttled();
         Ok(())
+    }
+
+    /// How often `checkpoint` may recompute the maintenance gauges.
+    ///
+    /// These are observability, read by `timefusion_stats` and the dashboards;
+    /// nothing consults them transactionally, so a bound of one second is
+    /// invisible to every consumer while removing 97% of the scans.
+    const STATS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// `publish_statistics`, but at most once per [`Self::STATS_PUBLISH_INTERVAL`].
+    ///
+    /// `publish_statistics` is a FULL LINEAR SCAN of `snapshot.tasks`, and
+    /// `checkpoint` called it unconditionally — so it ran on every claim,
+    /// completion, retry and cursor update, while holding the one global
+    /// `Mutex<TaskJournal>` that all maintenance bookkeeping serializes on.
+    ///
+    /// Prod 2026-09-11 held 71,849 tasks (71,399 of them COMPLETE history that
+    /// moves no gauge but one counter) and took ~2,032 checkpoints per minute.
+    /// Measured locally at that exact size: **1.70 ms per call** — roughly a
+    /// third of the 5.45 ms average `journal_hold`, spent entirely on gauges.
+    /// The cost grows with journal HISTORY rather than with load, so it gets
+    /// worse while sitting still, and it is paid under a global lock whose duty
+    /// cycle (~19% of wall-clock) is the ceiling on maintenance throughput.
+    ///
+    /// Throttling is correct rather than merely cheap: the gauges describe the
+    /// journal's state, that state is republished on the next tick anyway, and
+    /// no reader can distinguish "published 900 ms ago" from "published now".
+    /// `publish_statistics` stays public and unthrottled for the callers that
+    /// do need an exact read immediately — chiefly tests.
+    fn publish_statistics_throttled(&mut self) {
+        let now = std::time::Instant::now();
+        if self.stats_published_at.is_some_and(|last| now.duration_since(last) < Self::STATS_PUBLISH_INTERVAL) {
+            return;
+        }
+        self.stats_published_at = Some(now);
+        self.publish_statistics();
     }
 
     /// Rewrite the authoritative snapshot even when the WAL is below its
     /// normal size threshold. Migrations that remove tasks cannot represent
     /// those deletions as append-only WAL records, so they must force this
     /// compaction before startup continues.
+    /// Drop FINISHED tasks whose slice is past the abandonment horizon.
+    ///
+    /// Nothing pruned the journal, so retired keys accumulated forever: a
+    /// `docker cp` census of the production journal on 2026-09-12 read 79,682
+    /// tasks, **99.2% of them Complete or Superseded**, with **15,202 (19.1%)
+    /// finished and older than `STARVATION_HORIZON_MICROS`** — including one
+    /// 1,344 days old. Every commit serializes that set, and `compact` rewrites
+    /// all 51 MB of it under the global mutex, which is where
+    /// `journal_hold.max_ms` spikes of 3.5 s come from.
+    ///
+    /// The horizon is the right cut because the scheduler has ALREADY abandoned
+    /// this work — `publish_statistics` counts it as `beyond_horizon_tasks`
+    /// rather than as backlog — and because the data itself is past the 30-day
+    /// retention, so no query can reach it. Only FINISHED tasks go: pending work
+    /// past the horizon stays, because that gauge is how the abandoned debt is
+    /// sized and removing it would hide the debt rather than pay it.
+    ///
+    /// Losing a finished task means `rollup_slice_complete` answers false for
+    /// that slice, and `recover_rollup_coverage` then `continue`s past it — it
+    /// does NOT enqueue a rebuild, so this cannot start a rework storm. The
+    /// cost is that a >31-day-old slice reads raw, and there is nothing left
+    /// there to read.
+    ///
+    /// Goes through `retain_tasks`, so each drop leaves a `JournalRecord::Removed`
+    /// tombstone and survives a restart on the cheap append — the same contract
+    /// `coarsen_sealed_slices_capped` relies on, and the reason this belongs on
+    /// the periodic hygiene pass rather than inside `compact`. `compact` is a
+    /// migration primitive that several callers use purely to persist a removal;
+    /// giving it a retention policy would make every one of them age-sensitive.
+    pub fn prune_retired_history(&mut self, now_micros: i64) -> usize {
+        let dropped = self.retain_tasks(|task| {
+            !matches!(task.state, TaskState::Complete | TaskState::Superseded)
+                || now_micros.saturating_sub(task.key.slice.end_micros) <= STARVATION_HORIZON_MICROS
+        });
+        if dropped != 0 {
+            crate::observability::maintenance_stats().journal_retired_tasks_pruned.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        dropped
+    }
+
     pub fn compact(&mut self) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+
         // Derived work is left out of the authoritative snapshot too, so a
         // reload starts with none of it and `plan_compaction_debt` re-derives
         // exactly what storage says is needed within its next 60 s pass.
@@ -3303,6 +3394,7 @@ impl TaskJournal {
     pub fn publish_statistics(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
+        stats.journal_stats_publishes.fetch_add(1, Relaxed);
         let mut counts = [0u64; 5];
         let mut backlog_bytes = 0u64;
         let mut sealed_debt_bytes = 0u64;
@@ -4353,6 +4445,123 @@ mod tests {
 
     /// (project, slice start, slice end, deadline, completed) — offsets from `ORDER_NOW`.
     type Stream = (&'static str, i64, i64, i64, bool);
+
+    /// `checkpoint` must not rescan the whole journal every time it is called.
+    ///
+    /// `publish_statistics` is O(tasks) and `checkpoint` ran it unconditionally,
+    /// while holding the single global `Mutex<TaskJournal>` that every claim,
+    /// completion and retry serializes on. Prod 2026-09-11 held 71,849 tasks —
+    /// 71,399 of them Complete history — and took ~2,032 checkpoints per minute;
+    /// the scan measured 1.70 ms at exactly that size, roughly a third of the
+    /// 5.45 ms average `journal_hold`. The cost grows with journal HISTORY, not
+    /// with load, so it worsens while the system sits still.
+    ///
+    /// Asserted on the SCAN COUNT rather than on a duration, because a timing
+    /// assertion on a shared CI box is a flake generator. Can-fail proof, run red
+    /// then restored: pointing `checkpoint` back at `publish_statistics` makes
+    /// this report 40 publishes for 40 checkpoints.
+    #[test]
+    fn checkpoint_does_not_rescan_the_journal_on_every_call() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let publishes = || crate::observability::maintenance_stats().journal_stats_publishes.load(Relaxed);
+
+        // The first checkpoint must publish: a process that never checkpointed
+        // twice would otherwise export nothing at all.
+        journal.upsert(task("p", 0, 1, Operation::BaseRollup));
+        journal.checkpoint().expect("checkpoint");
+        let after_first = publishes();
+
+        for i in 1..40i64 {
+            journal.upsert(task("p", i, i + 1, Operation::BaseRollup));
+            journal.checkpoint().expect("checkpoint");
+        }
+        assert_eq!(publishes(), after_first, "39 further checkpoints inside one second must not rescan the journal 39 more times");
+
+        // Throttled, not disabled — the gauges still describe the journal.
+        journal.publish_statistics();
+        assert_eq!(publishes(), after_first + 1);
+        assert_eq!(
+            crate::observability::maintenance_stats().pending_base_rollup.load(Relaxed),
+            40,
+            "an explicit publish must still report the true pending count"
+        );
+    }
+
+    /// The hygiene pass must shed FINISHED work past the abandonment horizon,
+    /// keep everything else, and make the drop survive a restart.
+    ///
+    /// Nothing pruned it, so retired keys accumulated forever. A `docker cp`
+    /// census of the production journal on 2026-09-12: 79,682 tasks, **99.2%
+    /// Complete or Superseded**, **15,202 (19.1%) finished and older than the
+    /// horizon** — one of them 1,344 days old. `compact` rewrites all 51 MB
+    /// under the global mutex, which is where `journal_hold.max_ms` spikes of
+    /// 3.5 s come from.
+    ///
+    /// Three things must NOT be pruned, and each is asserted: pending work past
+    /// the horizon (that is the abandoned-debt gauge, and hiding it is not
+    /// paying it), retrying work past the horizon, and finished work inside it.
+    ///
+    /// Can-fail proof, run red then restored: dropping the state test prunes the
+    /// pending task and the `beyond_horizon` assertion goes red; dropping the
+    /// age test prunes the recent one and the survivor count goes red.
+    #[test]
+    fn hygiene_sheds_finished_work_past_the_horizon_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 400 * DAY_MICROS;
+        let at = |days_ago: i64| {
+            let end = now - days_ago * DAY_MICROS;
+            (end - DAY_MICROS, end)
+        };
+        let mut add = |name: &str, days_ago: i64, state: TaskState| {
+            let (start, end) = at(days_ago);
+            let mut t = task(name, start, end, Operation::BaseRollup);
+            t.state = state;
+            journal.upsert(t);
+        };
+        add("old-complete", 40, TaskState::Complete);
+        add("old-superseded", 40, TaskState::Superseded);
+        add("old-pending", 40, TaskState::Pending);
+        add("old-retry", 40, TaskState::Retry);
+        add("fresh-complete", 2, TaskState::Complete);
+        add("fresh-pending", 2, TaskState::Pending);
+        // Persist FIRST, or the durability assertion at the end is vacuous: an
+        // unpersisted task cannot resurrect, so the tombstones would never be
+        // what kept it gone. (Measured — the assertion passed with
+        // `retain_tasks` bypassed until this checkpoint was added.)
+        journal.checkpoint().expect("persist the whole set before pruning any of it");
+
+        assert_eq!(journal.prune_retired_history(now), 2, "exactly the two finished-and-past-the-horizon tasks");
+        let survivors: Vec<&str> = journal.tasks().map(|t| t.key.project_id.as_str()).collect();
+        assert!(!survivors.contains(&"old-complete") && !survivors.contains(&"old-superseded"));
+        assert!(
+            survivors.contains(&"old-pending") && survivors.contains(&"old-retry"),
+            "abandoned work past the horizon is the debt gauge and must survive: {survivors:?}"
+        );
+        assert!(survivors.contains(&"fresh-complete") && survivors.contains(&"fresh-pending"), "work inside the horizon must survive: {survivors:?}");
+
+        // The index must still find what is left, or every later lookup silently
+        // misses — the failure a bare `retain` on the vector would have caused.
+        for name in ["old-pending", "fresh-complete"] {
+            let (start, end) = at(if name == "old-pending" { 40 } else { 2 });
+            let key = task(name, start, end, Operation::BaseRollup).key;
+            assert_eq!(journal.state(&key), Some(if name == "old-pending" { TaskState::Pending } else { TaskState::Complete }), "{name} must still be indexed");
+        }
+        assert_eq!(journal.prune_retired_history(now), 0, "a second pass has nothing left to drop");
+
+        // The drop must be DURABLE on the cheap append. `coarsen_sealed_slices`
+        // had exactly this bug: a pass removed tasks, persisted nothing, and the
+        // next restart undid it — prod took `pending_base_rollup` 88,618 -> 2,294
+        // with the on-disk journal byte-identical. Going through `retain_tasks`
+        // is what leaves the `Removed` tombstone that prevents it here.
+        journal.checkpoint().expect("checkpoint the tombstones");
+        let reloaded = TaskJournal::load(dir.path()).expect("reload");
+        let names: Vec<&str> = reloaded.tasks().map(|t| t.key.project_id.as_str()).collect();
+        assert!(!names.contains(&"old-complete") && !names.contains(&"old-superseded"), "pruned tasks must not resurrect after a restart: {names:?}");
+        assert_eq!(names.len(), 4, "and nothing else may vanish with them: {names:?}");
+    }
 
     /// Only outstanding ROLLUP work may veto a rollup backfill.
     ///

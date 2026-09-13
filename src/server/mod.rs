@@ -75,7 +75,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
         let obj_store = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
         let tcfg = Arc::new(cfg.tantivy.clone());
-        let svc = Arc::new(crate::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone()));
+        let svc = Arc::new(crate::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone(), cfg.core.timefusion_data_dir.clone()));
         layer = layer.with_tantivy_indexer(tantivy_index_callback(&db, Arc::clone(&svc)));
         let search = Arc::new(crate::tantivy::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone(), tcfg));
         // Two halves of one process: let a publish seed the reader's cache and

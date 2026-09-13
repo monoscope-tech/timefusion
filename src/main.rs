@@ -552,7 +552,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     } else {
         let obj_store = sidecar_store(&db, cfg, bucket, "tantivy").await?;
         let tcfg = Arc::new(cfg.tantivy.clone());
-        let svc = Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone()));
+        let svc = Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store.clone(), tcfg.clone(), cfg.core.timefusion_data_dir.clone()));
         layer = layer.with_tantivy_indexer(timefusion::server::tantivy_index_callback(&db, Arc::clone(&svc)));
         let search = Arc::new(timefusion::tantivy::search::TantivySearchService::new(obj_store, cfg.core.timefusion_data_dir.clone(), tcfg));
         // Two halves of one process: let a publish seed the reader's cache and
@@ -1056,7 +1056,11 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let db = match (cfg.tantivy.indexed_tables().is_empty(), cfg.aws.aws_s3_bucket.as_deref().unwrap_or_default()) {
         (false, bucket) if !bucket.is_empty() => {
             let obj_store = sidecar_store(&db, cfg, bucket, "tantivy").await?;
-            db.with_tantivy_indexer(Arc::new(timefusion::tantivy::search::TantivyIndexService::new(obj_store, Arc::new(cfg.tantivy.clone()))))
+            db.with_tantivy_indexer(Arc::new(timefusion::tantivy::search::TantivyIndexService::new(
+                obj_store,
+                Arc::new(cfg.tantivy.clone()),
+                cfg.core.timefusion_data_dir.clone(),
+            )))
         }
         _ => db,
     };

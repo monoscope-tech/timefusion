@@ -33,6 +33,23 @@
 #   clobbered down to it. 120 GiB of the host's 188 GB leaves room for monoscope
 #   and the collectors.
 # - Reservations 32 GiB: scheduling floor, unchanged.
+# - Limits.NanoCpus 32 CPUs: RAISED from 28 on 2026-09-12, and it was not
+#   recorded here at all before — the live service carried
+#   `NanoCpus=28000000000` while this file documented only the memory limit,
+#   which is exactly the drift this file exists to prevent.
+#
+#   The core count is not just a throughput knob: the whole maintenance budget
+#   tree derives from it. `coordinator_jobs` is `cores/3`, the coordinator's
+#   memory share is `jobs x 512 MiB`, and `light_optimize_k` subtracts a fixed
+#   3-slice repair holdback from that share. At 28 cores that arithmetic gives
+#   9 jobs, a 4.5 GiB share, 3 slices, and a hygiene permit count of ZERO
+#   before the `.max(1)` floor — which measured as SealedConsolidation doing
+#   exactly 0 worker-seconds in four hours against 1.1 TB of sealed debt.
+#
+#   32 takes it to 10 jobs and a 5 GiB share. Pair it with the holdback cap
+#   (`LIGHT_MIN_SLICES`): 32 cores alone still yields K=1 without that change,
+#   and the formula only reaches K=3 at 48 cores. The host has 48; 32 leaves
+#   16 for monoscope and the collectors.
 # - start-first updates: every deployed binary's liveness probe accepts only
 #   the intentional startup 57P03 responder, allowing WAL takeover to complete
 #   while the external SQL probe still counts that interval as unavailable.
@@ -53,7 +70,8 @@
     },
     "Resources": {
       "Limits": {
-        "MemoryBytes": 128849018880
+        "MemoryBytes": 128849018880,
+        "NanoCpus": 32000000000
       },
       "Reservations": {
         "MemoryBytes": 34359738368

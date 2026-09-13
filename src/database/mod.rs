@@ -821,6 +821,15 @@ type ZOrderFilesets = Arc<RwLock<HashMap<String, HashMap<chrono::NaiveDate, Hash
 /// Per-(project_id, table_name) DML serialization mutexes — see `Database::dml_lock`.
 type DmlLocks = Arc<dashmap::DashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
 
+/// The last durable state of the rollup journal: what was written and when.
+/// Both `None` until the first successful store, which is what makes a fresh
+/// process always write once rather than trusting an empty stamp.
+#[derive(Default, Debug)]
+struct PersistedRollupJournal {
+    digest: Option<u64>,
+    at: Option<std::time::Instant>,
+}
+
 type RollupSourceKey = (String, String, String);
 type RollupCoverageKey = (String, String, String, String);
 type RollupSliceCoverageKey = (String, String, String, i64, i64);
@@ -1407,6 +1416,28 @@ fn buffered_source_retry_delay(slice: crate::maintenance_coordinator::TimeSlice,
     const FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
     let earliest = slice.end_micros.saturating_add(crate::maintenance_coordinator::FINALIZATION_DELAY_MICROS);
     u64::try_from(earliest.saturating_sub(now_micros)).map_or(FLOOR, |micros| std::time::Duration::from_micros(micros).max(FLOOR))
+}
+
+/// Absolute wall-clock ceiling for a unit, for the lanes that hold a permit the
+/// rest of the fleet is waiting on.
+///
+/// `None` means the idle window alone governs, which is right wherever a unit
+/// costs only its worker. The rewrite lanes are different: `light_rewrite_sem`
+/// prices ~3 permits and `run_coordinator_compaction_selected` takes one BEFORE
+/// it claims, so one unit that never converges removes a third of the lane's
+/// capacity for as long as it runs — and the idle window places no bound on that.
+///
+/// Four times the idle deadline. Generous enough that a slow-but-converging unit
+/// finishes, short enough that a day-wide whale is bisected into children that
+/// fit rather than holding the lane for hours. `Repair` is included: it does not
+/// take the permit up front, but `stage_hot_bin` AWAITS one, which is the same
+/// hold by a different route.
+fn coordinator_operation_lifetime_cap(operation: crate::maintenance_coordinator::Operation) -> Option<std::time::Duration> {
+    use crate::maintenance_coordinator::Operation;
+    match operation {
+        Operation::HotPacking | Operation::SealedConsolidation | Operation::Repair => Some(coordinator_operation_timeout(operation) * 4),
+        Operation::BaseRollup | Operation::DerivedRollup | Operation::Dedup => None,
+    }
 }
 
 fn coordinator_operation_timeout(operation: crate::maintenance_coordinator::Operation) -> std::time::Duration {
@@ -2851,6 +2882,14 @@ pub struct Database {
     /// Serializes dirty-map mutation with journal snapshots, else two writers
     /// can persist out of order and lose the newer invalidation on restart.
     rollup_journal_lock: Arc<std::sync::Mutex<()>>,
+    /// What was last persisted of the rollup journal, so a commit whose content
+    /// has not moved — or whose write is not yet due — can skip two `fsync`s.
+    /// See `persist_rollup_journal_bytes`.
+    rollup_journal_persisted: Arc<std::sync::Mutex<PersistedRollupJournal>>,
+    /// Coalesces the durable half of that path (see [`Self::commit_journal`]).
+    /// The lock above covers only the in-memory mutation; the `fsync` behind it
+    /// is shared, so the ingest rate no longer sets the `fsync` rate.
+    journal_group_commit: Arc<crate::support::GroupCommit>,
     /// Durable slice work from the same pre-ack invalidation path as
     /// `rollup_dirty`; the finer-grained source of truth coordinator workers consume.
     maintenance_tasks: Arc<std::sync::Mutex<crate::maintenance_coordinator::TaskJournal>>,
@@ -3602,6 +3641,10 @@ impl Database {
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.derived.rewrite_permits().max(1);
         let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
+        // Exported, not re-derived. The value comes from a five-function
+        // arithmetic chain and has silently collapsed to 1 before (prod
+        // 2026-09-01), taking the whole hygiene lane with it.
+        crate::observability::maintenance_stats().light_rewrite_permits_total.store(light_rewrite_permits as u64, std::sync::atomic::Ordering::Relaxed);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         // In UNITS, not polls: one reader slot is `DECODE_UNITS_PER_READER`
         // units and a worst-case batch claims all of them, so the heap ceiling
@@ -3676,6 +3719,8 @@ impl Database {
             rollup_dirty,
             rollup_invalidated_at,
             rollup_journal_lock: Arc::new(std::sync::Mutex::new(())),
+            rollup_journal_persisted: Arc::new(std::sync::Mutex::new(PersistedRollupJournal::default())),
+            journal_group_commit: Arc::new(crate::support::GroupCommit::default()),
             maintenance_tasks: Arc::new(std::sync::Mutex::new(maintenance_tasks)),
             maintenance_admission,
             maintenance_debt_planned_at: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
@@ -6571,11 +6616,12 @@ impl Database {
 /// DataFusion's 50MB default and every scan re-decodes the parquet footer + page
 /// index (measured ~900ms metadata_load_time per query on prod).
 fn build_query_runtime_env(
-    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>, metadata_cache_bytes: usize,
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>, metadata_cache_bytes: usize, disk: datafusion::execution::disk_manager::DiskManagerBuilder,
 ) -> datafusion::execution::runtime_env::RuntimeEnv {
     datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_metadata_cache_limit(metadata_cache_bytes)
+        .with_disk_manager_builder(disk)
         .build()
         .expect("Failed to create runtime environment")
 }
@@ -12035,8 +12081,29 @@ mod writer_properties_tests {
     fn runtime_env_applies_metadata_cache_limit() {
         let pool = std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(1024 * 1024));
         let bytes = 321 * 1024 * 1024;
-        let rt = build_query_runtime_env(pool, bytes);
+        let dir = tempfile::tempdir().expect("spill dir");
+        let rt = build_query_runtime_env(pool, bytes, crate::database::spill_disk_builder(dir.path().to_path_buf(), 7));
         assert_eq!(rt.cache_manager.get_metadata_cache_limit(), bytes);
+    }
+
+    /// A COST guard: query spill must be bounded and land on the volume we chose.
+    ///
+    /// Until 2026-09-12 this runtime was built with no DiskManager, so spill went
+    /// to `std::env::temp_dir()` — the container's overlay layer — with no cap
+    /// this config could see. Root `pidstat` found 184 open fds under `/tmp`
+    /// against 204 for the maintenance dirs that WERE configured. The assertion
+    /// is the CAP, because a runtime that spills to the wrong place still answers
+    /// every query correctly and passes any correctness test.
+    #[test]
+    fn query_runtime_spill_is_bounded_and_not_the_process_temp_dir() {
+        let pool = std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(1024 * 1024));
+        let dir = tempfile::tempdir().expect("spill dir");
+        let rt = build_query_runtime_env(pool, 1024, crate::database::spill_disk_builder(dir.path().to_path_buf(), 7));
+
+        assert_eq!(rt.disk_manager.max_temp_directory_size(), 7 * 1024 * 1024 * 1024, "query spill must honour the configured cap, not DataFusion's default");
+        // DataFusion's default cap is far larger; matching it means no builder was applied.
+        let unconfigured = datafusion::execution::disk_manager::DiskManagerBuilder::default().build().unwrap().max_temp_directory_size();
+        assert_ne!(rt.disk_manager.max_temp_directory_size(), unconfigured, "an unconfigured DiskManager spills to the process temp dir");
     }
 
     // Read-side dedup skip: fingerprint is order-insensitive but content-
@@ -13983,6 +14050,98 @@ mod tests {
 
     /// Every live path in one tier partition, which is what "did the commit
     /// land?" means here.
+    /// A stale-generation base file whose span the CURRENT-generation files
+    /// already reproduce must not hold the derived tier hostage.
+    ///
+    /// Prod 2026-09-11: derived units sat at `attempts=78`, minting a fresh
+    /// day-wide base rebuild every `60 << 5` = 1920s — an exact 32-minute cycle —
+    /// over `skipped_generation=1`. ONE stale file. The rebuild can never clear
+    /// it, because `slice_retires` only retires a tagged file CONTAINED in the
+    /// publishing slice and the offender is wider than the children a day is
+    /// published as, so the loop is permanent. It cost 59% of maintenance
+    /// worker-seconds between them.
+    ///
+    /// Refusing to READ the file stays correct — `rollup_routing_rejects_legacy_materialization_generations`
+    /// pins that, and the `uncovered(slice, base_covered)` gate still refuses a
+    /// derived cell over a genuinely holey base. What changes is only whether the
+    /// refusal also DEMANDS a rebuild that provably cannot change the outcome.
+    ///
+    /// Can-fail proof, run red then restored: making `unreproduced_refusals`
+    /// return `refused.len()` — the previous always-mint behaviour — turns the
+    /// Complete assertion red with `base_generation_unverified`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_base_file_the_current_generation_reproduces_does_not_wedge_the_derived_tier() -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TAG_GENERATION, TaskState};
+        use deltalake::kernel::{
+            Action,
+            transaction::{CommitBuilder, TableReference},
+        };
+        use object_store::ObjectStoreExt as _;
+        let db = Arc::new(Database::with_config(create_test_config("rollup-stale-gen-reproduced")).await?);
+        db.cancel_maintenance();
+        let project = format!("stalegen_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        for hour in [1, 7, 13, 19] {
+            let at = day.and_hms_opt(hour, 0, 0).expect("hour").and_utc().timestamp_micros();
+            let batch = json_to_batch(vec![test_span_ts(&format!("row-{hour}"), "op", &project, at)])?;
+            db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await?;
+        }
+        let base_tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier");
+        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+
+        // A second copy of every base file, same slice tags, GENERATION mangled —
+        // the shape a spec change leaves behind. The originals stay live, so the
+        // current generation still reproduces every span the copies claim.
+        {
+            let tier = db.get_or_create_table(&project, &base_tier).await?;
+            let mut table = tier.read().await.clone();
+            let store = table.log_store().object_store(None);
+            #[allow(deprecated)]
+            let adds: Vec<_> = table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect();
+            assert!(!adds.is_empty(), "the base unit must have published files for there to be a stale copy of one");
+            let mut actions = Vec::new();
+            for mut add in adds {
+                let path = format!("{}-stalegen.parquet", add.path.trim_end_matches(".parquet"));
+                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+                add.path = path;
+                add.data_change = false;
+                if let Some(tags) = add.tags.as_mut() {
+                    tags.insert(TAG_GENERATION.to_owned(), Some("stale-generation".to_owned()));
+                }
+                actions.push(Action::Add(add));
+            }
+            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
+            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
+            table.state = Some(finalized.snapshot());
+            *tier.write().await = table;
+        }
+
+        let derived = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::DerivedRollup, 24, 0).await?;
+        assert_eq!(
+            derived.state,
+            Some(TaskState::Complete),
+            "a stale file the live current-generation files already reproduce must not demand a base rebuild: {:?}",
+            derived.retry_reason
+        );
+        let stats = crate::observability::maintenance_stats();
+        assert!(
+            stats.rollup_base_refusal_reproduced.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the refusal must still HAPPEN and be counted — this is about the mint, not about reading the stale file"
+        );
+
+        // And the derived tier holds the truth, not a short cell: four source rows.
+        let derived_tier = get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a derived tier");
+        let mut ctx = Arc::clone(&db).create_session_context();
+        db.setup_session_context(&mut ctx)?;
+        let batches = ctx.sql(&format!("SELECT SUM(request_count) FROM {derived_tier} WHERE project_id='{project}'")).await?.collect().await?;
+        assert_eq!(batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("int64").value(0), 4);
+        Ok(())
+    }
+
     async fn live_paths(db: &Database, project: &str, tier: &str) -> std::collections::HashSet<String> {
         let table_ref = db.get_or_create_table(project, tier).await.expect("table");
         let table = table_ref.read().await;
@@ -15442,6 +15601,54 @@ mod tests {
         Ok(())
     }
 
+    /// One write, one durability barrier — no matter how many partitions it touches.
+    ///
+    /// The maintenance journal must be `fsync`ed before a write is acknowledged
+    /// (a crash after that can only leave redundant tasks; nothing re-seeds a
+    /// mutation with no maintenance record). What is NOT required is paying for
+    /// that barrier once per (project, date) in the batch. Prod 2026-09-11 did:
+    /// an INSERT spanning three partitions cost three `fsync`s of the task
+    /// journal, three `publish_statistics` full task scans and three rollup
+    /// journal writes, on an array already at 98.8 % utilisation — while
+    /// `insert into otel_logs_and_spans` averaged 18.1 s.
+    ///
+    /// Asserts the COST, not just the outcome: a version that commits per
+    /// partition still produces exactly the same journal and passes every
+    /// correctness assertion below.
+    #[tokio::test]
+    async fn a_multi_partition_invalidation_costs_one_journal_commit() -> Result<()> {
+        use datafusion::arrow::{
+            array::TimestampMicrosecondArray,
+            datatypes::{DataType, Field, Schema, TimeUnit},
+        };
+
+        let db = Database::with_config(create_test_config("journal-group-commit-batches")).await?;
+        const DAY: i64 = 86_400_000_000;
+        // One inbound batch straddling three dates — the ordinary shape of a
+        // client flushing a buffer across a midnight boundary.
+        let day0 = chrono::NaiveDate::from_ymd_opt(2026, 8, 16).unwrap().and_hms_opt(9, 0, 0).unwrap().and_utc().timestamp_micros();
+        let days = [day0, day0 + DAY, day0 + 2 * DAY];
+        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(TimestampMicrosecondArray::from(days.to_vec()).with_timezone("UTC"))])?;
+
+        let (before, _) = db.journal_group_commit.counts();
+        db.invalidate_rollup_batches("customer-a", "otel_logs_and_spans", std::slice::from_ref(&batch))?;
+        let (after, _) = db.journal_group_commit.counts();
+
+        assert_eq!(after - before, 1, "{} dates in one write must share ONE journal commit, not one each", days.len());
+        // ...and every date is actually in it: the cheap version must not be
+        // cheap by doing less work.
+        let journal = db.maintenance_tasks.lock().unwrap();
+        for day in days {
+            let day_start = day - day.rem_euclid(DAY);
+            assert!(
+                journal.tasks().any(|task| task.key.project_id == "customer-a" && task.key.slice.overlaps(day_start, day_start + DAY)),
+                "the shared commit dropped the partition at {day_start}"
+            );
+        }
+        Ok(())
+    }
+
     /// A tenant's first write must not manufacture a full day of empty and future maintenance debt.
     ///
     /// File hygiene is planned by debt in `plan_compaction_debt` (one day-wide unit per project, only
@@ -15452,7 +15659,8 @@ mod tests {
         use crate::maintenance_coordinator::Operation;
 
         let db = Database::with_config(create_test_config("first-rollup-invalidation-is-sparse")).await?;
-        db.invalidate_rollup_hours("customer-a", "otel_logs_and_spans", "2026-08-16", 1 << 7)?;
+        db.apply_rollup_hours("customer-a", "otel_logs_and_spans", "2026-08-16", 1 << 7)?;
+        db.commit_journal()?;
 
         let journal = db.maintenance_tasks.lock().unwrap();
         let counts = journal.tasks().fold(HashMap::<Operation, usize>::new(), |mut counts, task| {

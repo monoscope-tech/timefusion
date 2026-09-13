@@ -294,6 +294,12 @@ pub struct CombinedCacheStats {
 #[derive(Debug, Default, Clone)]
 pub struct FoyerRuntimeStats {
     pub stats: CombinedCacheStats,
+    /// Admission accounting: who populated the main cache, and whether
+    /// write-captured entries were ever read before they left it.
+    pub admit_write_capture_bytes: u64,
+    pub admit_read_miss_bytes: u64,
+    pub admit_refresh_bytes: u64,
+    pub write_capture_admitted: u64,
     pub memory_size_bytes: usize,
     pub disk_size_bytes: usize,
     pub ttl_seconds: u64,
@@ -442,6 +448,51 @@ pub struct SharedFoyerCache {
     metadata_stats: StatsRef,
     config: FoyerCacheConfig,
     evictions: Arc<AtomicU64>,
+    admission: Arc<AdmissionStats>,
+}
+
+/// Which path put an entry in the main cache.
+///
+/// `WriteCapture` is the one under scrutiny. It tees every completed upload
+/// into the cache, so every file maintenance rewrites is also written to the
+/// local disk tier — whether or not anything ever reads it. Read-side counters
+/// cannot see it, which is why foyer looked innocent twice while the device
+/// absorbed ~500 MB/s (2026-09-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitSource {
+    /// Teed from a completed multipart upload (`CachingMultipartUpload`).
+    WriteCapture,
+    /// Populated because a read missed and had to fetch from the inner store.
+    ReadMiss,
+    /// Sliding-TTL re-insert of an entry that was already resident.
+    Refresh,
+}
+
+/// Admission accounting for the main cache, process-wide.
+///
+/// Answers the question the whole investigation turns on: of the entries
+/// write-capture admits, how many are read even once before they are evicted?
+/// That is the "one-hit wonder" test from the S3-FIFO line of work, and it
+/// decides whether write-capture is warming anything or just burning the disk.
+#[derive(Debug, Default)]
+pub struct AdmissionStats {
+    pub write_capture_bytes: AtomicU64,
+    pub read_miss_bytes: AtomicU64,
+    pub refresh_bytes: AtomicU64,
+    pub write_capture_admitted: AtomicU64,
+}
+
+impl AdmissionStats {
+    fn record(&self, source: AdmitSource, bytes: u64) {
+        match source {
+            AdmitSource::WriteCapture => {
+                self.write_capture_bytes.fetch_add(bytes, Ordering::Relaxed);
+                self.write_capture_admitted.fetch_add(1, Ordering::Relaxed);
+            }
+            AdmitSource::ReadMiss => drop(self.read_miss_bytes.fetch_add(bytes, Ordering::Relaxed)),
+            AdmitSource::Refresh => drop(self.refresh_bytes.fetch_add(bytes, Ordering::Relaxed)),
+        }
+    }
 }
 
 struct EvictionCounter(Arc<AtomicU64>);
@@ -493,6 +544,7 @@ impl SharedFoyerCache {
         // outputs (128MB) so they persist, capped to the device so it can't wedge.
         let data_block_size = capped_block_size(config.block_size_bytes, config.disk_size_bytes);
         let evictions = Arc::new(AtomicU64::new(0));
+        let admission = Arc::new(AdmissionStats::default());
 
         let cache = build_hybrid_cache(
             &config.cache_dir,
@@ -520,6 +572,7 @@ impl SharedFoyerCache {
             metadata_stats: Arc::new(RwLock::new(CacheStats::default())),
             config,
             evictions,
+            admission,
         })
     }
 
@@ -551,6 +604,10 @@ impl SharedFoyerCache {
             l2_used_bytes: crate::support::without_blocking_the_worker(|| allocated_bytes(&self.config.cache_dir)),
             entry_count: self.cache.memory().entries(),
             evictions: self.evictions.load(Ordering::Relaxed),
+            admit_write_capture_bytes: self.admission.write_capture_bytes.load(Ordering::Relaxed),
+            admit_read_miss_bytes: self.admission.read_miss_bytes.load(Ordering::Relaxed),
+            admit_refresh_bytes: self.admission.refresh_bytes.load(Ordering::Relaxed),
+            write_capture_admitted: self.admission.write_capture_admitted.load(Ordering::Relaxed),
         }
     }
 
@@ -832,6 +889,8 @@ pub struct FoyerObjectStoreCache {
     /// Keys a bypassed (wide) scan has asked to admit once already. See
     /// [`Self::repeat_sighting`].
     bypass_seen: Arc<DashSet<String>>,
+    /// Shared, process-wide: who admitted what, and whether it was ever read.
+    admission: Arc<AdmissionStats>,
 }
 
 impl FoyerObjectStoreCache {
@@ -847,6 +906,7 @@ impl FoyerObjectStoreCache {
             main_fetch_locks: Arc::new(DashMap::new()),
             bypass_seen: Arc::new(DashSet::new()),
             background_tasks: Arc::new(Mutex::new(JoinSet::new())),
+            admission: shared_cache.admission.clone(),
         }
     }
 
@@ -874,6 +934,11 @@ impl FoyerObjectStoreCache {
     pub async fn new(inner: Arc<dyn ObjectStore>, config: FoyerCacheConfig) -> anyhow::Result<Self> {
         let shared_cache = SharedFoyerCache::new(config).await?;
         Ok(Self::new_with_shared_cache(inner, &shared_cache))
+    }
+
+    /// Admission accounting for this store's (shared) main cache.
+    pub fn admission(&self) -> &AdmissionStats {
+        &self.admission
     }
 
     /// Record a metadata-tier hit and stamp the span fields that always
@@ -1100,7 +1165,7 @@ impl FoyerObjectStoreCache {
             span.record("cache_entry_bytes", data.len() as i64);
             span.record("cache_admission", if data.len() > self.config.l1_max_entry_bytes { "disk" } else { "memory" });
             let data = Bytes::from(data);
-            self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
+            self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()), AdmitSource::ReadMiss);
             Ok(Self::make_get_result(data, result.meta))
         }
         .await;
@@ -1423,7 +1488,7 @@ impl FoyerObjectStoreCache {
         if payload_size > 0 {
             let data = payload_for_cache.as_ref().concat();
             let meta = put_result_meta(location.clone(), payload_size as u64, &result);
-            self.insert_main_value(location, CacheValue::new(data, meta));
+            self.insert_main_value(location, CacheValue::new(data, meta), AdmitSource::WriteCapture);
             debug!("Warmed cache from write payload: {} (size: {} bytes)", location, payload_size);
         }
 
@@ -1447,22 +1512,28 @@ impl FoyerObjectStoreCache {
     /// Admit a full-file entry to the main cache, honoring the recent-days
     /// window (cold/old partitions are skipped → served from S3) and steering
     /// large entries to disk-only so they don't evict the L1 hot set.
-    fn insert_main_value(&self, location: &Path, value: CacheValue) {
+    fn insert_main_value(&self, location: &Path, value: CacheValue, source: AdmitSource) {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        self.admit(&self.cache, Self::make_cache_key(location), value, self.config.l1_max_entry_bytes);
+        let (key, bytes) = (Self::make_cache_key(location), value.data.len() as u64);
+        if self.admit(&self.cache, key.clone(), value, self.config.l1_max_entry_bytes) {
+            self.admission.record(source, bytes);
+        }
     }
 
     /// Single funnel for every cache population, so `scan_bypass_scope` can
     /// suppress all of them in one place. `l1_max_entry_bytes = 0` (metadata
     /// entries) keeps the default L1+disk placement.
-    fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
+    /// Returns whether the entry was actually admitted, so callers can account
+    /// for it without double-counting the bypass path.
+    fn admit(&self, cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) -> bool {
         if bypass_active() && !self.repeat_sighting(&key) {
             crate::observability::record_cache_insert_bypassed();
-            return;
+            return false;
         }
         insert_main(cache, key, value, l1_max_entry_bytes);
+        true
     }
 
     /// Has a bypassed scan already tried to admit `key` once?
@@ -1502,7 +1573,10 @@ impl FoyerObjectStoreCache {
         if !is_within_recent_window(location, self.config.cache_recent_days) {
             return;
         }
-        self.admit(&self.cache, key, range_value(location, data, file), self.config.l1_max_entry_bytes);
+        let bytes = data.len() as u64;
+        if self.admit(&self.cache, key.clone(), range_value(location, data, file), self.config.l1_max_entry_bytes) {
+            self.admission.record(AdmitSource::ReadMiss, bytes);
+        }
     }
 
     /// Cache a path's `ObjectMeta` (body-less entry) so later reads skip the HEAD.
@@ -1528,9 +1602,12 @@ impl FoyerObjectStoreCache {
             return;
         }
         let (cache, refreshing, key) = (cache.clone(), self.refreshing.clone(), key.to_string());
+        let admission = self.admission.clone();
         self.spawn_tracked(async move {
             let v = entry.value();
+            let bytes = v.data.len() as u64;
             insert_main(&cache, key.clone(), CacheValue::new(v.data.clone(), v.meta.clone()), l1_max_entry_bytes);
+            admission.record(AdmitSource::Refresh, bytes);
             refreshing.remove(&key);
         });
     }
@@ -1553,6 +1630,7 @@ struct CachingMultipartUpload {
     buffer: Option<Vec<u8>>,
     max_warm_bytes: usize,
     l1_max_entry_bytes: usize,
+    admission: Arc<AdmissionStats>,
     /// Holds this upload's slice of the process-wide capture budget; dropping
     /// it (abandon, complete, abort, or panic) returns the bytes.
     reservation: Option<CaptureReservation>,
@@ -1617,7 +1695,9 @@ impl MultipartUpload for CachingMultipartUpload {
             // Use the same key derivation as the read path so a multipart-warmed
             // entry is found by a later GET even if `make_cache_key` ever does
             // more than `location.to_string()`.
-            insert_main(&self.cache, FoyerObjectStoreCache::make_cache_key(&self.location), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
+            let key = FoyerObjectStoreCache::make_cache_key(&self.location);
+            insert_main(&self.cache, key.clone(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
+            self.admission.record(AdmitSource::WriteCapture, size);
             debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
         }
         Ok(result)
@@ -1707,6 +1787,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             buffer: reservation.is_some().then(Vec::new),
             max_warm_bytes: cap,
             l1_max_entry_bytes: self.config.l1_max_entry_bytes,
+            admission: self.admission.clone(),
             reservation,
         }))
     }
@@ -2342,6 +2423,60 @@ mod tests {
 
         cache.shutdown().await?;
         Ok(())
+    }
+
+    /// Both write-side warm paths must be accounted as WRITE CAPTURE, never as a
+    /// read miss.
+    ///
+    /// This is the guard for a defect that cost real time: the single-part
+    /// `put_cached` warm was tagged `ReadMiss`, so prod showed
+    /// `write_capture_admitted = 0` beside 290 GB of "read" admissions with the
+    /// main cache reporting no inner reads at all. The mislabelling sent the
+    /// investigation at the wrong code path. Asserting the SOURCE split is what
+    /// makes the counters trustworthy enough to decide anything.
+    #[tokio::test]
+    async fn both_write_paths_are_accounted_as_write_capture_not_read_miss() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let config = FoyerCacheConfig::test_config("wc_accounting");
+        let _dir = CacheDirGuard(config.cache_dir.clone());
+        let cache = FoyerObjectStoreCache::new(inner, config).await?;
+
+        // Single-part PUT: carries the bulk of write-side warming in prod.
+        let body = Bytes::from(vec![b'p'; 2 * 1024 * 1024]);
+        cache.put(&Path::from("t/date=2026-09-12/put.parquet"), PutPayload::from(body.clone())).await?;
+
+        // Multipart: the same warm through the tee.
+        let mut upload = cache.put_multipart(&Path::from("t/date=2026-09-12/mpu.parquet")).await?;
+        upload.put_part(body.clone().into()).await?;
+        upload.complete().await?;
+
+        let admission = cache.admission();
+        assert_eq!(admission.write_capture_admitted.load(Ordering::Relaxed), 2, "both write paths must register as write capture");
+        assert_eq!(
+            admission.read_miss_bytes.load(Ordering::Relaxed),
+            0,
+            "a write must never be accounted as a read miss — that mislabelling hid the real traffic"
+        );
+        assert_eq!(admission.write_capture_bytes.load(Ordering::Relaxed), 2 * body.len() as u64);
+        cache.shutdown().await?;
+        Ok(())
+    }
+
+    /// Bytes must land under the source that produced them — that split is the
+    /// whole point of this accounting, and getting it wrong once already sent an
+    /// investigation at the wrong code path.
+    #[test]
+    fn admission_bytes_are_attributed_to_the_source_that_produced_them() {
+        let stats = AdmissionStats::default();
+        stats.record(AdmitSource::WriteCapture, 10);
+        stats.record(AdmitSource::WriteCapture, 20);
+        stats.record(AdmitSource::ReadMiss, 30);
+        stats.record(AdmitSource::Refresh, 40);
+
+        assert_eq!(stats.write_capture_bytes.load(Ordering::Relaxed), 30);
+        assert_eq!(stats.write_capture_admitted.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.read_miss_bytes.load(Ordering::Relaxed), 30);
+        assert_eq!(stats.refresh_bytes.load(Ordering::Relaxed), 40);
     }
 
     /// `write_capture_max_bytes = 0` means "bounded only by the block size", not

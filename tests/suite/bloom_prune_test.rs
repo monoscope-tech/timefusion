@@ -152,7 +152,7 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     let storage_uri = format!("s3://{}/{}/tantivy", cfg.aws.aws_s3_bucket.clone().unwrap(), cfg.core.timefusion_table_prefix);
     let tstore = db.create_object_store(&storage_uri, &cfg.aws.build_storage_options(None)).await?;
     let tcfg = Arc::new(cfg.tantivy.clone());
-    let svc = Arc::new(TantivyIndexService::new(tstore.clone(), tcfg.clone()));
+    let svc = Arc::new(TantivyIndexService::new(tstore.clone(), tcfg.clone(), std::env::temp_dir().join(format!("tf-scratch-{}", uuid::Uuid::new_v4()))));
     let search = Arc::new(TantivySearchService::new(tstore, cfg.core.timefusion_data_dir.clone(), tcfg));
     let db = Arc::new(db.with_tantivy_search(search.clone()).with_tantivy_indexer(svc.clone()).with_bloom_prune(reg));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);

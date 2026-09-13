@@ -1189,6 +1189,13 @@ impl StatsTableProvider {
                     "l2_used_bytes" => s.l2_used_bytes,
                     "entry_count" => s.entry_count,
                     "evictions" => s.evictions,
+                    // Admission accounting. `write_capture` is invisible to the
+                    // read-side counters above, which is how ~500 MB/s of local
+                    // writes went unattributed twice (2026-09-12).
+                    "admit_write_capture_bytes" => s.admit_write_capture_bytes,
+                    "admit_read_miss_bytes" => s.admit_read_miss_bytes,
+                    "admit_refresh_bytes" => s.admit_refresh_bytes,
+                    "write_capture_admitted" => s.write_capture_admitted,
                 ])
                 .collect()
         });

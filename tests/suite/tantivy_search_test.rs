@@ -111,7 +111,9 @@ impl Env {
         Self {
             table,
             project,
-            svc: Arc::new(TantivyIndexService::new(store.clone(), Arc::new(index_cfg))),
+            // Scratch lives under the per-Env TempDir, so concurrent tests cannot
+            // collide and nothing is left behind.
+            svc: Arc::new(TantivyIndexService::new(store.clone(), Arc::new(index_cfg), cache.path().join("scratch"))),
             search: Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), Arc::new(search_cfg))),
             store,
             _cache: cache,
@@ -182,7 +184,7 @@ async fn histogram_reads_masked_buckets_without_materializing_hits() -> anyhow::
     let input_schema =
         Arc::new(ArrowSchema::new(vec![base.schema().field(0).clone(), base.schema().field(1).clone(), Field::new("level", lists.data_type().clone(), true)]));
     let input = RecordBatch::try_new(input_schema, vec![base.column(0).clone(), base.column(1).clone(), lists])?;
-    let (blob, stats) = build_and_pack(&table, std::slice::from_ref(&input), 3, MergeMode::Now)?;
+    let (blob, stats) = build_and_pack(&table, std::slice::from_ref(&input), 3, MergeMode::Now, &std::env::temp_dir())?;
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     upload(store.as_ref(), &object_store::path::Path::from("histogram"), blob).await?;
     let mut entry = ManifestEntry::failed("pending".into(), vec!["file".into()]);

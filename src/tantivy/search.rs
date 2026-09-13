@@ -1245,11 +1245,16 @@ pub struct TantivyIndexService {
     /// and both are `Arc`-held by `Database`; a strong ref here would make the
     /// pair mutually immortal.
     reader: Mutex<Option<std::sync::Weak<TantivySearchService>>>,
+    /// Data-volume root under which index builds take their scratch space.
+    /// Explicit rather than defaulted to `std::env::temp_dir()` — see
+    /// `crate::tantivy::scratch_tempdir` for what that default cost in prod.
+    scratch_root: PathBuf,
 }
 
 impl TantivyIndexService {
-    pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>) -> Self {
-        Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN), reader: Mutex::new(None) }
+    pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>, scratch_root: PathBuf) -> Self {
+        crate::tantivy::reap_orphaned_scratch_dirs(&scratch_root);
+        Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN), reader: Mutex::new(None), scratch_root }
     }
 
     /// Attach the reader whose cache publishes should seed. Without this the
@@ -1344,7 +1349,7 @@ impl TantivyIndexService {
     ) -> Result<Option<(String, crate::tantivy::ManifestEntry)>> {
         let path = super::index_path_for_parquet(table_name, parquet_rel);
         let table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
-        let result = super::build_parquet_and_pack(delta_store, parquet_rel, table, self.config.compression_level(), MergeMode::Now).await;
+        let result = super::build_parquet_and_pack(delta_store, parquet_rel, table, self.config.compression_level(), MergeMode::Now, &self.scratch_root).await;
         self.publish_built_index(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], true, result, defer).await
     }
 
@@ -1363,8 +1368,9 @@ impl TantivyIndexService {
         let (ordinals_valid, merge) = (false, MergeMode::Deferred);
         let svc_table = crate::schema::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
         let level = self.config.compression_level();
+        let scratch = self.scratch_root.clone();
         let pack_result = tokio::task::spawn_blocking(move || {
-            let (blob, stats) = super::build_and_pack(svc_table, &batches, level, merge)?;
+            let (blob, stats) = super::build_and_pack(svc_table, &batches, level, merge, &scratch)?;
             // Guard against publishing a corrupt archive (see super::verify_blob).
             super::verify_blob(&blob).context("verify packed blob")?;
             Ok::<_, anyhow::Error>((blob, stats))

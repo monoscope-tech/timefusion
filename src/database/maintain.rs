@@ -208,7 +208,7 @@ mod liveness_clock_tests {
             }
             "committed"
         };
-        super::run_until_idle(std::time::Duration::from_secs(30), Arc::clone(progress), work).await.ok()
+        super::run_until_idle_capped(std::time::Duration::from_secs(30), None, Arc::clone(progress), work).await.ok()
     }
 
     /// The whole point: a unit that is still writing rows outlives its window.
@@ -249,7 +249,7 @@ mod liveness_clock_tests {
             }
             Ok::<_, anyhow::Error>("committed")
         };
-        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, work).await??;
+        let result = super::run_until_idle_capped(std::time::Duration::from_secs(30), None, progress, work).await??;
         assert_eq!(result, "committed", "completed short queries must prevent a false idle timeout");
         Ok(())
     }
@@ -381,7 +381,7 @@ mod liveness_clock_tests {
     async fn work_that_writes_nothing_is_given_up_on() {
         let progress = Arc::new(AtomicU64::new(0));
         let stalled = async { std::future::pending::<&str>().await };
-        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, stalled).await;
+        let result = super::run_until_idle_capped(std::time::Duration::from_secs(30), None, progress, stalled).await;
         assert!(result.is_err(), "an idle unit must not hold its worker forever");
     }
 
@@ -781,10 +781,33 @@ fn plan_output_rows(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> u64 
 /// `docs/plans/2026-08-31-how-other-systems-schedule-maintenance.md`). The
 /// counter is per-unit, never shared, so one worker's progress cannot excuse
 /// another's stall.
-async fn run_until_idle<T>(
-    idle: std::time::Duration, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>,
+/// Run `work` until it stops making progress for `idle`, or until `cap` of total
+/// wall clock has elapsed.
+///
+/// The idle window alone is the right shape for a unit that owns only a worker — a
+/// slow unit making progress should not be killed for being slow. It is the
+/// WRONG shape for a unit holding a scarce permit, because it places no upper
+/// bound on the hold at all.
+///
+/// Prod 2026-09-12 measured the consequence. A single day-wide
+/// `SealedConsolidation` over the shared project ran **7,634 s — 8.5x its 900 s
+/// deadline** — and returned `outcome=Some(Running)` having completed nothing,
+/// while `maintenance_coordinator_unit_timed_out` fired ZERO times. It holds one
+/// of only ~3 `light_rewrite_sem` permits for that entire time, and because that
+/// permit is taken BEFORE the claim, every other hygiene attempt is refused
+/// outright: `compaction_permits_unavailable` reached 1,812 in 55 minutes while
+/// HotPacking and SealedConsolidation together recorded **0 worker-seconds** and
+/// 2 claims in an hour, against 196 planned cells and 1.1 TB of sealed debt.
+///
+/// Killing such a unit is not lost work: the `TaskLease` requeues it on drop and
+/// `abandon_running` bisects it, which is exactly what a whale day-wide unit
+/// needs — smaller children that fit. The ceiling is generous on purpose, so it
+/// fires on units that are not converging rather than on merely slow ones.
+async fn run_until_idle_capped<T>(
+    idle: std::time::Duration, cap: Option<std::time::Duration>, progress: Arc<std::sync::atomic::AtomicU64>, work: impl Future<Output = T>,
 ) -> Result<T, tokio::time::error::Elapsed> {
     use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
     // BOXED, not `pin!`ed on the stack. `work` is the coordinator's whole
     // dispatch future and this frame sits inside an already-deep async stack:
     // holding it inline overflowed the worker stack in a debug build
@@ -795,7 +818,9 @@ async fn run_until_idle<T>(
         match tokio::time::timeout(idle, &mut work).await {
             Ok(value) => return Ok(value),
             Err(elapsed) => match progress.load(Relaxed) {
-                moved if moved != last => last = moved,
+                // Progress moved, so the unit is alive — but a permit-holding
+                // lane still owes the rest of the fleet an upper bound.
+                moved if moved != last && cap.is_none_or(|cap| started.elapsed() < cap) => last = moved,
                 _ => return Err(elapsed),
             },
         }
@@ -890,6 +915,11 @@ impl Database {
     }
 
     fn persist_rollup_journal(&self) -> std::io::Result<()> {
+        self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, false)
+    }
+
+    /// The journal's current entry set, with the gauges it also feeds.
+    fn rollup_journal_entries(&self) -> Vec<crate::rollup_journal::RollupInvalidation> {
         let entries: Vec<_> = self
             .rollup_source_epochs
             .iter()
@@ -918,18 +948,129 @@ impl Database {
             .max()
             .unwrap_or(0);
         stats.rollup_oldest_invalidation_age_secs.store(oldest_age_secs, std::sync::atomic::Ordering::Relaxed);
-        crate::rollup_journal::store(&self.config.core.timefusion_data_dir, &entries)
+
+        entries
+    }
+
+    /// How stale the on-disk rollup journal may be.
+    ///
+    /// Commits run at ~11/s in production, so this is ~1 durable write per
+    /// second instead of ~11, and the journal is at most this far behind.
+    const ROLLUP_JOURNAL_MAX_STALENESS: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Persist the encoded rollup journal, unless it is unchanged or not yet due.
+    ///
+    /// **Why this may be deferred at all.** `rollup_journal` is scheduling
+    /// state, not a correctness boundary — its own module says so, and
+    /// `maintenance_tasks` is documented as "the finer-grained source of truth
+    /// coordinator workers consume". Both are written from the SAME pre-ack
+    /// invalidation, but only the task journal's `checkpoint` records the work
+    /// items; `rollup_dirty` is read in exactly one place, to requeue
+    /// partitions when bootstrap tasks were *discarded*. So a lost second of it
+    /// weakens a backup whose primary was fsynced in the same commit, and an
+    /// absent entry already means "full rebuild required" to the builder — the
+    /// conservative direction.
+    ///
+    /// **Why it is worth deferring.** `store` costs TWO `fsync`s — the temp
+    /// file, then the parent directory after the rename — and ran inside every
+    /// group commit beside the task journal's own. Three per commit, on an
+    /// array measured at 98.8% utilisation with a 63-620 ms write wait. Prod
+    /// 2026-09-12 performed 30,075 commits in 2,640 s (11.4/s), i.e. ~100% duty
+    /// on the commit pipeline, and `block.journal_commit_wait` averaged 362 ms
+    /// (max 10.7 s) on the PRE-ACK path because every arrival queues behind it.
+    ///
+    /// The content check is kept as well and is free: it compares the bytes
+    /// actually encoded, so any skew or hash collision can only produce an
+    /// EXTRA write, never a missed one. `None` until a store succeeds, so the
+    /// first write of a process always happens, and the stamp advances only
+    /// after `store_encoded` returns `Ok`.
+    ///
+    /// `force` bypasses the staleness window for shutdown, where there is no
+    /// next commit to carry the write.
+    fn persist_rollup_journal_bytes(&self, bytes: Vec<u8>, force: bool) -> std::io::Result<()> {
+        use std::{
+            hash::{Hash, Hasher},
+            sync::atomic::Ordering::Relaxed,
+        };
+        let stats = crate::observability::maintenance_stats();
+        let digest = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        };
+        let mut persisted = crate::support::lock(&self.rollup_journal_persisted);
+        if persisted.digest == Some(digest) {
+            stats.rollup_journal_persist_skipped.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        // Deferred, not dropped: the content is still different on the next
+        // commit, so the next one past the window writes it. `force` and the
+        // never-written case both bypass this.
+        if !force
+            && let Some(at) = persisted.at
+            && at.elapsed() < Self::ROLLUP_JOURNAL_MAX_STALENESS
+        {
+            stats.rollup_journal_persist_deferred.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        crate::rollup_journal::store_encoded(&self.config.core.timefusion_data_dir, &bytes)?;
+        persisted.digest = Some(digest);
+        persisted.at = Some(std::time::Instant::now());
+        stats.rollup_journal_persists.fetch_add(1, Relaxed);
+        Ok(())
+    }
+
+    /// Write the rollup journal unconditionally, for shutdown — the one point
+    /// where no later commit exists to carry a deferred write.
+    pub(crate) fn flush_rollup_journal(&self) -> std::io::Result<()> {
+        let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
+        self.persist_rollup_journal_bytes(crate::rollup_journal::encode(&self.rollup_journal_entries())?, true)
     }
 
     /// `mint_dedup=false` only for hours touched EXCLUSIVELY by self-authored
     /// DV-dedup commits (see [`DV_DEDUP_COMMIT_KEY`]); everything else must
     /// pass true.
     pub(crate) fn enqueue_maintenance_hours(&self, project_id: &str, source: &str, date: &str, hours: u32, mint_dedup: bool) -> std::io::Result<()> {
+        self.mint_maintenance_hours(project_id, source, date, hours, mint_dedup)?;
+        self.commit_journal()
+    }
+
+    /// Mint the slice work without making it durable — see
+    /// [`Self::commit_journal`] for who pays for the `fsync` and when.
+    fn mint_maintenance_hours(&self, project_id: &str, source: &str, date: &str, hours: u32, mint_dedup: bool) -> std::io::Result<()> {
         let Some(schema) = get_schema(source) else { return Ok(()) };
         if schema.rollups.is_empty() || hours == 0 {
             return Ok(());
         }
-        self.enqueue_invalidations(project_id, source, date, Some(hours), mint_dedup).map_err(std::io::Error::other)
+        let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(std::io::Error::other)?;
+        let day_start = day.and_hms_opt(0, 0, 0).ok_or_else(|| std::io::Error::other("invalid maintenance date"))?.and_utc().timestamp_micros();
+        let observed_at = crate::support::now_micros();
+        let mut journal = self.journal();
+        for spec in &schema.rollups {
+            let target = spec.table_name(source);
+            for (start, end) in crate::rollup::dirty_ranges(day_start, hours) {
+                journal
+                    .invalidate(crate::maintenance_coordinator::Invalidation {
+                        source_table: source,
+                        rollup_table: &target,
+                        source,
+                        project_id,
+                        start_micros: start,
+                        end_micros: end,
+                        observed_at_micros: observed_at,
+                        derived: spec.derive_from.is_some(),
+                        mint_dedup,
+                        // The ONLY caller passing `mint_dedup=false` is the
+                        // reconciler's DV-dedup-only hours (`hours & !with_dedup`);
+                        // every other caller passes true. A DV-dedup-only hour needs
+                        // no rollup rebuild either (see `Invalidation::mint_rollup`),
+                        // so the two flags move together here.
+                        mint_rollup: mint_dedup,
+                    })
+                    .map_err(std::io::Error::other)?;
+            }
+        }
+        Ok(())
     }
 
     fn enqueue_maintenance_partition(&self, project_id: &str, source: &str, date: &str) -> Result<()> {
@@ -1134,9 +1275,12 @@ impl Database {
                     self.enqueue_maintenance_partition(&project, source, &date)?;
                     queued = queued.saturating_add(1 + schema.rollups.len());
                 } else {
+                    // The two halves of one partition's hours — mint both, then
+                    // commit once.
                     let with_dedup = dedup_hours.get(&(partition_project, date.clone())).copied().unwrap_or(0) & hours;
-                    self.enqueue_maintenance_hours(&project, source, &date, with_dedup, true)?;
-                    self.enqueue_maintenance_hours(&project, source, &date, hours & !with_dedup, false)?;
+                    self.mint_maintenance_hours(&project, source, &date, with_dedup, true)?;
+                    self.mint_maintenance_hours(&project, source, &date, hours & !with_dedup, false)?;
+                    self.commit_journal()?;
                     queued = queued.saturating_add(usize::try_from(hours.count_ones()).unwrap_or(24) * schema.rollups.len());
                 }
                 tokio::task::yield_now().await;
@@ -2578,7 +2722,7 @@ impl Database {
         } else {
             Vec::new()
         };
-        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes, content_fp) = {
+        let (snapshot, log_store, selected, estimated_bytes, source_rows, partition_identity, whole_file_bytes, content_fp, refused_spans, selected_spans) = {
             let table = from_table.read().await;
             let witness_guard = match &witness_table {
                 Some(table) => Some(table.read().await),
@@ -2612,6 +2756,8 @@ impl Database {
             let partition_identity = partition_stats.map(|stats| (stats.fingerprint, stats.min_ts, stats.max_ts));
             let partition_paths = dedup_partition_paths(snapshot.log_data().iter().map(|file| file.path().to_string()), &key.project_id, &date_string);
             let mut selected = Vec::new();
+            let mut refused_spans: Vec<Option<(i64, i64)>> = Vec::new();
+            let mut selected_spans: Vec<(i64, i64)> = Vec::new();
             let mut estimated = 0u64;
             let mut whole_file_bytes = 0u64;
             let mut content_fp = 0u64;
@@ -2688,7 +2834,26 @@ impl Database {
                     // older materialization generation that overlap that range.
                     if !Self::add_tag(&add, crate::maintenance_coordinator::TAG_GENERATION).is_some_and(|generation| base_generations.contains(generation)) {
                         skipped_generation += 1;
+                        // WHAT was refused, not just how many. A refusal only
+                        // costs something if no CURRENT-generation file
+                        // reproduces the same span — see the mint below. The
+                        // tagged range is the file's own claim; a file with no
+                        // tags falls back to its statistics, and one with
+                        // neither is unbounded and can never be shown
+                        // reproduced (`None`), which keeps the mint firing.
+                        refused_spans.push(Self::slice_tag_range(&add).map(|(start, end)| (start, end.saturating_sub(1))).or_else(|| {
+                            match add_ts_bounds(&add) {
+                                (Some(lo), Some(hi)) => Some((lo, hi)),
+                                _ => None,
+                            }
+                        }));
                         continue;
+                    }
+                    // The span this ACCEPTED file vouches for, against which a
+                    // refusal is judged. Taken from the same tags the refusal
+                    // reads, so the two are the same kind of claim.
+                    if let Some(range) = Self::slice_tag_range(&add) {
+                        selected_spans.push(range);
                     }
                 }
                 // `coarsen_to_width` charges the unprorated half once per
@@ -2701,7 +2866,7 @@ impl Database {
                 content_fp ^= file_content_hash(&path, add.deletion_vector.as_ref());
                 selected.push(path);
             }
-            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes, content_fp)
+            (snapshot, table.log_store(), selected, estimated, source_rows, partition_identity, whole_file_bytes, content_fp, refused_spans, selected_spans)
         };
         let input_footprint = crate::maintenance_coordinator::InputFootprint::new(&selected, whole_file_bytes);
         // Same reason as the dedup preflight: record it on every claim, not only
@@ -2734,10 +2899,36 @@ impl Database {
                 "base files carry no slice tags; checked by timestamp range and materialization generation"
             );
         }
-        if skipped_generation > 0 {
-            // Excluding an unverified file is not evidence that its rows were
-            // empty. Rebuild this base range from its source and retry the
-            // derived unit, even if an in-memory coverage claim still spans it.
+        // Excluding an unverified file is not evidence that its rows were empty,
+        // so a refusal normally means: rebuild this base range from its source
+        // and retry the derived unit. #221 deliberately does that even when an
+        // in-memory coverage claim still spans the range, because that map is
+        // not trustworthy enough to authorize dropping rows.
+        //
+        // But a refusal whose span is ALREADY reproduced by the CURRENT-generation
+        // files this unit selected costs nothing to exclude, and demanding a
+        // rebuild for it is a livelock: the rebuild republishes the same slices
+        // and cannot retire the offending file, because `slice_retires` only
+        // retires a tagged file CONTAINED in the publishing slice and the
+        // offender is wider than the children the day is published as. Prod
+        // 2026-09-11 measured the result — derived units at attempts=78, minting
+        // a fresh base rebuild every `60 << 5` = 1920s forever, with
+        // `skipped_generation=1` doing it. ONE stale file.
+        //
+        // The test is made against `selected_spans` — the tags of the files this
+        // unit is actually reading out of the live tier snapshot — and NOT
+        // against `base_covered`, which comes from the coverage map #221 chose
+        // to distrust. `ranges_cover`'s `hi` is inclusive, which is why the
+        // refused spans were pushed with an inclusive end.
+        //
+        // A refusal with no readable span at all is `None` and is never counted
+        // as reproduced, so the unbounded case still mints. Excluding a file
+        // this way does not let the unit publish short either: the
+        // `uncovered(slice, base_covered)` gate below is the real safety net and
+        // still refuses a derived cell over a holey base.
+        let unreproduced = crate::rollup::unreproduced_refusals(&refused_spans, &selected_spans);
+        if unreproduced > 0 {
+            crate::observability::maintenance_stats().rollup_base_refusal_unreproduced.fetch_add(unreproduced, Relaxed);
             let base_spec = source_schema
                 .rollups
                 .iter()
@@ -2761,6 +2952,9 @@ impl Database {
             let attempts = self.journal().attempts(&key);
             retry("base_generation_unverified".to_owned(), std::time::Duration::from_secs(60u64 << attempts.min(5)))?;
             return Ok(true);
+        }
+        if skipped_generation > 0 {
+            crate::observability::maintenance_stats().rollup_base_refusal_reproduced.fetch_add(skipped_generation, Relaxed);
         }
         // A DERIVED unit's witness describes the RAW partition, but its INPUT is
         // the base tier — witness table != input table, which is the one
@@ -2846,7 +3040,7 @@ impl Database {
         //
         // The proof is the live SLICE coverage, which is the same map the read
         // path routes on, and it is exactly right for this test because of what
-        // clears it: `invalidate_rollup_hours` — the CONTENT-change path, taken
+        // clears it: `apply_rollup_hours` — the CONTENT-change path, taken
         // by ingest and DML — drops the covering entries, while the reconciler's
         // commit observation does not. So a real change cannot be skipped and a
         // bookkeeping re-mint cannot cost a scan.
@@ -3107,22 +3301,30 @@ impl Database {
         let commit_started = std::time::Instant::now();
         for add in &mut adds {
             add.data_change = true;
-            add.tags.get_or_insert_default().extend(
-                [
-                    (crate::maintenance_coordinator::TAG_SOURCE, key.source.clone()),
-                    (crate::maintenance_coordinator::TAG_PROJECT, key.project_id.clone()),
-                    (crate::maintenance_coordinator::TAG_SLICE_START, key.slice.start_micros.to_string()),
-                    (crate::maintenance_coordinator::TAG_SLICE_END, key.slice.end_micros.to_string()),
-                    (crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT, source_fp.to_string()),
-                    (crate::maintenance_coordinator::TAG_GENERATION, generation.clone()),
-                    // Absent (older generations) means the read path cannot verify
-                    // this slice and must refuse it, so write the sentinel rather
-                    // than omitting the tag when the source reports no count.
-                    (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
-                    (crate::maintenance_coordinator::TAG_MEASURES, materialized.join(",")),
-                ]
-                .map(|(name, value)| (name.to_owned(), Some(value))),
-            );
+            let mut tags = add.tags.take().unwrap_or_default();
+            for (name, value) in [
+                (crate::maintenance_coordinator::TAG_SOURCE, key.source.clone()),
+                (crate::maintenance_coordinator::TAG_PROJECT, key.project_id.clone()),
+                (crate::maintenance_coordinator::TAG_SLICE_START, key.slice.start_micros.to_string()),
+                (crate::maintenance_coordinator::TAG_SLICE_END, key.slice.end_micros.to_string()),
+                (crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT, source_fp.to_string()),
+                // Persisted so the no-op skip survives a restart. Without it,
+                // coverage rebuilt from these tags carries `content_fp: None`
+                // and nothing can be skipped until the slice has published once
+                // more in the new process — and production restarts on every
+                // non-docs push (three times in two and a half hours on
+                // 2026-09-12), so uptime is the scarce resource.
+                (crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT, content_fp.to_string()),
+                (crate::maintenance_coordinator::TAG_GENERATION, generation.clone()),
+                // Absent (older generations) means the read path cannot verify
+                // this slice and must refuse it, so write the sentinel rather
+                // than omitting the tag when the source reports no count.
+                (crate::maintenance_coordinator::TAG_SOURCE_ROWS, source_rows.unwrap_or(-1).to_string()),
+                (crate::maintenance_coordinator::TAG_MEASURES, materialized.join(",")),
+            ] {
+                tags.insert(name.to_owned(), Some(value));
+            }
+            add.tags = Some(tags);
         }
 
         let live_adds = staging_table.snapshot()?.log_data().iter().map(|file| add_action(&file)).collect::<Vec<_>>();
@@ -3765,13 +3967,28 @@ impl Database {
         // 0s, returning at `repair_bin_already_sorted`/`take(1)` without ever
         // reaching `stage_hot_bin`, so gating it would invent a starvation.
         let light_permit = match operation {
-            Operation::HotPacking | Operation::SealedConsolidation => match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    crate::observability::maintenance_stats().compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(false);
+            Operation::HotPacking | Operation::SealedConsolidation => {
+                // Sampled on BOTH arms, because a refusal count cannot say
+                // whether the permits are held or simply absent. Prod
+                // 2026-09-12 read 12 acquisitions against 6,948 refusals with
+                // `maintenance_unit_lifetime_capped` at 0 — so no hygiene unit
+                // was holding them and no long unit was being capped, which
+                // leaves "held by something else" and "there are none" as the
+                // only candidates. Those need opposite fixes and nothing in the
+                // process could tell them apart.
+                let stats = crate::observability::maintenance_stats();
+                stats.light_rewrite_permits_available.store(self.light_rewrite_sem.available_permits() as u64, std::sync::atomic::Ordering::Relaxed);
+                match Arc::clone(&self.light_rewrite_sem).try_acquire_owned() {
+                    Ok(permit) => {
+                        stats.compaction_permits_acquired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Some(permit)
+                    }
+                    Err(_) => {
+                        stats.compaction_permits_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(false);
+                    }
                 }
-            },
+            }
             _ => None,
         };
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
@@ -3941,6 +4158,12 @@ impl Database {
             };
             let report = {
                 let mut journal = self.journal();
+                // Same pass, same tombstone mechanism: shed finished work whose
+                // slice the scheduler has already abandoned. A prod census on
+                // 2026-09-12 found 15,202 of 79,682 tasks (19.1%) in that state,
+                // and every commit serializes the set while `compact` rewrites
+                // all 51 MB of it under the global mutex.
+                journal.prune_retired_history(crate::support::now_micros());
                 let report = journal.coarsen_sealed_slices_capped(crate::support::now_micros(), &|project, _source, date| {
                     ceilings.get(&(project.to_string(), date.to_string())).or_else(|| ceilings.get(&("default".to_string(), date.to_string()))).copied()
                 });
@@ -4071,17 +4294,11 @@ impl Database {
             // answered from the timeout count alone, because a timeout says only
             // "longer than the deadline", never how much longer.
             let started = std::time::Instant::now();
-            let outcome = run_until_idle(timeout, Arc::clone(&progress), work).await;
-            let elapsed = started.elapsed();
-            // Before `result?`: a unit that errors after 800s spent that capacity
-            // just as surely as one that succeeded — and a unit killed by the
-            // deadline spent it too.
-            crate::observability::count_maintenance_work(label, "worker_secs", elapsed.as_secs());
-            crate::observability::count_maintenance_work(label, "progress_rows", progress.load(std::sync::atomic::Ordering::Relaxed));
-            let completed = match outcome {
+            let completed = match run_until_idle_capped(timeout, coordinator_operation_lifetime_cap(operation), Arc::clone(&progress), work).await {
                 Ok(result) => {
                     // Only the slow tail: a unit finishing well inside its
                     // deadline says nothing, and this runs on every claim.
+                    let elapsed = started.elapsed();
                     if elapsed.as_secs_f64() > timeout.as_secs_f64() / 4.0 {
                         info!(
                             ?operation,
@@ -4098,10 +4315,20 @@ impl Database {
                     // Dropping the operation future drops its TaskLease. The
                     // claimed unit is durably requeued and all resource tokens
                     // are released before another project gets a turn.
-                    warn!(?operation, timeout_seconds = timeout.as_secs(), event = "maintenance_coordinator_unit_timed_out");
+                    let capped = coordinator_operation_lifetime_cap(operation).is_some_and(|cap| started.elapsed() >= cap);
+                    if capped {
+                        crate::observability::maintenance_stats().maintenance_unit_lifetime_capped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    warn!(
+                        ?operation,
+                        timeout_seconds = timeout.as_secs(),
+                        ran_secs = started.elapsed().as_secs(),
+                        capped,
+                        event = "maintenance_coordinator_unit_timed_out"
+                    );
                     // `killed_secs` is a strict subset of `worker_secs`: the
                     // share of the fleet's capacity that produced nothing.
-                    crate::observability::count_maintenance_work(label, "killed_secs", elapsed.as_secs());
+                    crate::observability::count_maintenance_work(label, "killed_secs", started.elapsed().as_secs());
                     return Ok(true);
                 }
             };
@@ -4125,7 +4352,51 @@ impl Database {
         Ok(completed)
     }
 
-    pub(crate) fn invalidate_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
+    /// Durable half of the invalidation path: flush the task journal and the
+    /// rollup journal, coalescing with any concurrent caller.
+    ///
+    /// It stays BEFORE the write is acknowledged — a crash at any later point
+    /// can only leave redundant tasks, never a mutation with no maintenance
+    /// record, and nothing re-seeds one (WAL replay does not run this path).
+    /// What changes is only who pays: `GroupCommit` lets overlapping writers
+    /// share one `fsync`, so the cost tracks the commit rate rather than the
+    /// ingest rate. Prod 2026-09-11 did this per INSERT, per (project, date),
+    /// on an array already at 98.8 % utilisation.
+    ///
+    /// Called with `rollup_journal_lock` RELEASED. That lock orders the
+    /// in-memory mutations; holding it across the commit would serialise every
+    /// writer behind the `fsync` and leave nothing to coalesce. Durability is
+    /// unaffected: the ticket is taken after this caller's mutations are
+    /// applied, and a commit flushes everything outstanding, so a commit that
+    /// covers the ticket has necessarily flushed them.
+    ///
+    /// Instrumented and worker-protected for the same reason `journal_lock_wait`
+    /// is: a follower blocks on a condvar for up to two commit durations, which
+    /// is a blocking wait on a runtime worker — the 2026-08-24 shape. Without
+    /// `block.journal_commit_wait` this change would replace a measured stall
+    /// with an unmeasured one.
+    pub(crate) fn commit_journal(&self) -> std::io::Result<()> {
+        let wait = crate::observability::BlockWatch::new("journal_commit_wait");
+        crate::support::without_blocking_the_worker(|| {
+            self.journal_group_commit.commit(|| {
+                self.journal().checkpoint().map_err(std::io::Error::other)?;
+                self.persist_rollup_journal()
+            })
+        })?;
+        drop(wait);
+        let (performed, coalesced) = self.journal_group_commit.counts();
+        let stats = crate::observability::maintenance_stats();
+        stats.journal_commits.store(performed, std::sync::atomic::Ordering::Relaxed);
+        stats.journal_commits_coalesced.store(coalesced, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// In-memory half: mark the partition dirty and mint its slice work. Not
+    /// durable on its own — the caller must reach [`Self::commit_journal`]
+    /// before acknowledging the write that caused it. Split out so a caller
+    /// touching several partitions (an INSERT batch spanning dates or projects,
+    /// a source-wide DML) pays for ONE commit rather than one per partition.
+    pub(crate) fn apply_rollup_hours(&self, project_id: &str, source: &str, date: &str, hours: u32) -> std::io::Result<()> {
         let _journal_guard = crate::support::lock(&self.rollup_journal_lock);
         let source_key = (project_id.to_string(), source.to_string(), date.to_string());
         // The mutation tells us exactly which hours became dirty. Expanding a
@@ -4156,12 +4427,11 @@ impl Database {
                 project != project_id || table != source || !ranges.iter().any(|(dirty_start, dirty_end)| *start < *dirty_end && *end > *dirty_start)
             });
         }
-        // Checkpoint slice work before the legacy journal and before the write
-        // is acknowledged. A crash at any later point can only leave redundant
-        // tasks; it cannot leave a mutation with no maintenance record.
-        self.enqueue_maintenance_hours(project_id, source, date, affected_hours, true)?;
-        self.persist_rollup_journal()?;
-        Ok(())
+        // Mint the slice work. It becomes durable in `commit_journal`, which the
+        // caller MUST reach before acknowledging the write — a crash after that
+        // can only leave redundant tasks, never a mutation with no maintenance
+        // record.
+        self.mint_maintenance_hours(project_id, source, date, affected_hours, true)
     }
 
     /// Invalidate only the partitions a non-MOR UPDATE/DELETE statement can have changed.
@@ -4178,10 +4448,15 @@ impl Database {
     ) -> std::io::Result<()> {
         let moves_rows = assignments.iter().any(|(column, _)| column == "timestamp");
         let masks = (!moves_rows).then(|| predicate.and_then(crate::rollup::timestamp_window)).flatten().and_then(|(lo, hi)| window_hour_masks(lo, hi));
-        masks.map_or_else(
-            || self.invalidate_rollup_source(project_id, source),
-            |masks| masks.into_iter().try_for_each(|(date, hours)| self.invalidate_rollup_hours(project_id, source, &date, hours)),
-        )
+        match masks {
+            Some(masks) => {
+                for (date, hours) in masks {
+                    self.apply_rollup_hours(project_id, source, &date, hours)?;
+                }
+                self.commit_journal()
+            }
+            None => self.invalidate_rollup_source(project_id, source),
+        }
     }
 
     pub(crate) fn invalidate_rollup_source(&self, project_id: &str, source: &str) -> std::io::Result<()> {
@@ -4195,13 +4470,13 @@ impl Database {
             self.rollup_source_epochs.entry(key.clone()).and_modify(|epoch| *epoch = epoch.saturating_add(1));
             self.rollup_dirty.insert(key.clone(), crate::rollup::ALL_HOURS);
             self.rollup_invalidated_at.entry(key.clone()).or_insert_with(crate::storage::now_unix_ms);
-            self.enqueue_maintenance_hours(&key.0, &key.1, &key.2, crate::rollup::ALL_HOURS, true)?;
+            self.mint_maintenance_hours(&key.0, &key.1, &key.2, crate::rollup::ALL_HOURS, true)?;
         }
         self.rollup_coverage.retain(|(project, table, _, _), _| project != project_id || table != source);
         self.rollup_slice_coverage.retain(|(project, table, ..), _| project != project_id || table != source);
         self.rollup_backoff.retain(|(project, table, _, _), _| project != project_id || table != source);
-        self.persist_rollup_journal()?;
-        Ok(())
+        drop(_journal_guard);
+        self.commit_journal()
     }
 
     /// Walks the batches' dates, so it is gated on the master switch as well as
@@ -4235,10 +4510,14 @@ impl Database {
         }
         // The hours come from the rows themselves, so an enrichment touching one
         // hour marks one hour — and the repair rebuilds one hour instead of 24.
+        //
+        // ONE commit for the whole batch, not one per date: only the last needs
+        // to be durable before this write is acknowledged, and a batch spanning
+        // three dates used to cost three `fsync`s and three full task scans.
         for (date, hours) in dates {
-            self.invalidate_rollup_hours(project_id, source, &date, hours)?;
+            self.apply_rollup_hours(project_id, source, &date, hours)?;
         }
-        Ok(())
+        self.commit_journal()
     }
 
     /// Exclusive upper bound on row timestamps a file may contain to be folded into a slice.
@@ -4879,133 +5158,155 @@ impl Database {
             // New generations carry complete coverage identity in Delta Add
             // tags. Recovery reads only the transaction log; no rollup data
             // scan competes with foreground queries at startup.
-            let (tagged, paths_by_identity, measures_by_identity, witness_reasons, witnessed) = match self.resolve_table("default", &target).await {
-                Ok(table) => {
-                    let table = table.read().await;
-                    // `source_rows` is part of the KEY so a partition rebuilt against a
-                    // different source count cannot merge with the older evidence.
-                    // A SET, not a count: the per-identity `num_records` sum this
-                    // used to carry fed exactly one `debug!` line and a placeholder
-                    // zero on the ledger-seeded path, so it was a field that read
-                    // as measured on one route and unset on another while meaning
-                    // nothing on either.
-                    let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
-                    // Paths per tagged identity, keyed exactly like `groups` so the
-                    // FILTERED loop below can recover them. The ledger must not be
-                    // written from this raw loop: the filters that follow
-                    // (`rollup_slice_complete`, and the `generation_id` match) are
-                    // what decide whether a slice is READABLE, and a ledger written
-                    // before them claims coverage the read path refuses — the one
-                    // failure this design must never have.
-                    let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
-                    // Why each witness-less identity has no witness, and which
-                    // identities DO carry one — keyed WITHOUT `source_rows`, so a
-                    // slice whose files disagree (a rewrite that stripped the tag
-                    // off some of them) is distinguishable from one that never had
-                    // it. Different repair entirely, indistinguishable in a count.
-                    let mut witness_reasons: HashMap<SliceKey, UnverifiableReason> = HashMap::new();
-                    let mut witnessed: std::collections::HashSet<SliceKey> = std::collections::HashSet::new();
-                    // Not part of the identity: two files of one slice that
-                    // disagree about their measures are still the same slice,
-                    // and folding measures into the key would instead make them
-                    // two entries racing for one coverage slot.
-                    let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
-                    for add in table.snapshot()?.log_data().iter() {
-                        let action = add_action(&add);
-                        // An untagged file proves no coverage, so this loop has
-                        // always skipped it. Skipping SILENTLY is what let 352 of
-                        // them accumulate over a month: `slice_retires` can now
-                        // retire one, but only when something publishes that
-                        // partition, and a sealed day that already has coverage is
-                        // never republished — nothing would ever enqueue it.
-                        // Remember the partition so the rebuild can be requested
-                        // below, which is what makes the tail self-healing rather
-                        // than a manual list someone has to keep.
-                        // Both arms feed `uncovered_gaps`: the untagged file's
-                        // own statistics span is the work, and the tagged
-                        // ranges beside it are what is already done. `hi + 1`
-                        // because statistics bounds are inclusive while a slice
-                        // end is not.
-                        let file_partition = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default");
-                        if let Some(partition) = file_partition.clone() {
-                            let tags = action.tags.as_ref();
-                            let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
-                            match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
-                                (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
-                                _ => {
-                                    untagged_files = untagged_files.saturating_add(1);
-                                    untagged_spans
-                                        .entry(partition)
-                                        .or_default()
-                                        .extend(action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1))));
+            let (tagged, paths_by_identity, measures_by_identity, content_fp_by_identity, witness_reasons, witnessed) =
+                match self.resolve_table("default", &target).await {
+                    Ok(table) => {
+                        let table = table.read().await;
+                        // `source_rows` is part of the KEY so a partition rebuilt against a
+                        // different source count cannot merge with the older evidence.
+                        // A SET, not a count: the per-identity `num_records` sum this
+                        // used to carry fed exactly one `debug!` line and a placeholder
+                        // zero on the ledger-seeded path, so it was a field that read
+                        // as measured on one route and unset on another while meaning
+                        // nothing on either.
+                        let mut groups: std::collections::HashSet<TaggedSliceIdentity> = std::collections::HashSet::new();
+                        // Paths per tagged identity, keyed exactly like `groups` so the
+                        // FILTERED loop below can recover them. The ledger must not be
+                        // written from this raw loop: the filters that follow
+                        // (`rollup_slice_complete`, and the `generation_id` match) are
+                        // what decide whether a slice is READABLE, and a ledger written
+                        // before them claims coverage the read path refuses — the one
+                        // failure this design must never have.
+                        let mut paths_by_identity: HashMap<TaggedSliceIdentity, (String, Vec<String>)> = HashMap::new();
+                        // Why each witness-less identity has no witness, and which
+                        // identities DO carry one — keyed WITHOUT `source_rows`, so a
+                        // slice whose files disagree (a rewrite that stripped the tag
+                        // off some of them) is distinguishable from one that never had
+                        // it. Different repair entirely, indistinguishable in a count.
+                        let mut witness_reasons: HashMap<SliceKey, UnverifiableReason> = HashMap::new();
+                        let mut witnessed: std::collections::HashSet<SliceKey> = std::collections::HashSet::new();
+                        // Not part of the identity: two files of one slice that
+                        // disagree about their measures are still the same slice,
+                        // and folding measures into the key would instead make them
+                        // two entries racing for one coverage slot.
+                        let mut measures_by_identity: HashMap<TaggedSliceIdentity, Option<BTreeSet<String>>> = HashMap::new();
+                        // The input set each identity was aggregated from. Several
+                        // files serve one identity and all carry the SAME value —
+                        // it is a property of the unit, not of the file — so any
+                        // disagreement means the tags cannot be trusted for this
+                        // purpose and the entry collapses to `None`, which declines
+                        // the skip. Absent on cells written before the tag existed.
+                        let mut content_fp_by_identity: HashMap<TaggedSliceIdentity, Option<u64>> = HashMap::new();
+                        for add in table.snapshot()?.log_data().iter() {
+                            let action = add_action(&add);
+                            // An untagged file proves no coverage, so this loop has
+                            // always skipped it. Skipping SILENTLY is what let 352 of
+                            // them accumulate over a month: `slice_retires` can now
+                            // retire one, but only when something publishes that
+                            // partition, and a sealed day that already has coverage is
+                            // never republished — nothing would ever enqueue it.
+                            // Remember the partition so the rebuild can be requested
+                            // below, which is what makes the tail self-healing rather
+                            // than a manual list someone has to keep.
+                            // Both arms feed `uncovered_gaps`: the untagged file's
+                            // own statistics span is the work, and the tagged
+                            // ranges beside it are what is already done. `hi + 1`
+                            // because statistics bounds are inclusive while a slice
+                            // end is not.
+                            let file_partition = Self::maintenance_partition_from_action(&action.path, Some(&action.partition_values), "default");
+                            if let Some(partition) = file_partition.clone() {
+                                let tags = action.tags.as_ref();
+                                let tag = |name: &str| tags?.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
+                                match (tag(crate::maintenance_coordinator::TAG_SLICE_START), tag(crate::maintenance_coordinator::TAG_SLICE_END)) {
+                                    (Some(start), Some(end)) => tagged_spans.entry(partition).or_default().push((start, end)),
+                                    _ => {
+                                        untagged_files = untagged_files.saturating_add(1);
+                                        untagged_spans.entry(partition).or_default().extend(
+                                            action.stats.as_deref().and_then(crate::rollup::stats_time_range).map(|(lo, hi)| (lo, hi.saturating_add(1))),
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        let Some(tags) = action.tags.as_ref() else { continue };
-                        let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
-                        if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
-                            continue;
-                        }
-                        let (Some(project), Some(generation), Some(source_fp), Some(slice_start), Some(slice_end)) = (
-                            tag(crate::maintenance_coordinator::TAG_PROJECT),
-                            tag(crate::maintenance_coordinator::TAG_GENERATION),
-                            tag(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse::<u64>().ok()),
-                            tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
-                            tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
-                        ) else {
-                            // Tagged for THIS source, yet not identifiable: the file
-                            // is dropped from the tagged set and counted nowhere
-                            // else, so without this it is an invisible population.
-                            crate::database::rollup_unverifiable::IDENTITY_TAG_INCOMPLETE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            continue;
-                        };
-                        // Absent on generations written before the tag; `-1` is the
-                        // sentinel a build writes when the source reported no count.
-                        // Both become `None`, which the read path refuses to verify —
-                        // and `classify_witness` says WHICH, from the one place that
-                        // decides, so the split cannot fail to sum to the total.
-                        let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
-                        let source_rows = witness.ok();
-                        let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
-                        match witness {
-                            Ok(_) => {
-                                witnessed.insert(slice_key);
+                            let Some(tags) = action.tags.as_ref() else { continue };
+                            let tag = |name: &str| tags.get(name).and_then(Option::as_deref);
+                            if tag(crate::maintenance_coordinator::TAG_SOURCE) != Some(source) {
+                                continue;
                             }
-                            // Lowest variant wins, so a slice seen under two
-                            // reasons attributes deterministically whatever order
-                            // the log lists its files in.
-                            Err(reason) => {
-                                witness_reasons.entry(slice_key).and_modify(|held| *held = (*held).min(reason)).or_insert(reason);
+                            let (Some(project), Some(generation), Some(source_fp), Some(slice_start), Some(slice_end)) = (
+                                tag(crate::maintenance_coordinator::TAG_PROJECT),
+                                tag(crate::maintenance_coordinator::TAG_GENERATION),
+                                tag(crate::maintenance_coordinator::TAG_SOURCE_FINGERPRINT).and_then(|value| value.parse::<u64>().ok()),
+                                tag(crate::maintenance_coordinator::TAG_SLICE_START).and_then(|value| value.parse::<i64>().ok()),
+                                tag(crate::maintenance_coordinator::TAG_SLICE_END).and_then(|value| value.parse::<i64>().ok()),
+                            ) else {
+                                // Tagged for THIS source, yet not identifiable: the file
+                                // is dropped from the tagged set and counted nowhere
+                                // else, so without this it is an invisible population.
+                                crate::database::rollup_unverifiable::IDENTITY_TAG_INCOMPLETE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                continue;
+                            };
+                            // Absent on generations written before the tag; `-1` is the
+                            // sentinel a build writes when the source reported no count.
+                            // Both become `None`, which the read path refuses to verify —
+                            // and `classify_witness` says WHICH, from the one place that
+                            // decides, so the split cannot fail to sum to the total.
+                            let witness = crate::database::rollup_unverifiable::classify_witness(tag(crate::maintenance_coordinator::TAG_SOURCE_ROWS));
+                            let source_rows = witness.ok();
+                            let slice_key = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp);
+                            match witness {
+                                Ok(_) => {
+                                    witnessed.insert(slice_key);
+                                }
+                                // Lowest variant wins, so a slice seen under two
+                                // reasons attributes deterministically whatever order
+                                // the log lists its files in.
+                                Err(reason) => {
+                                    witness_reasons.entry(slice_key).and_modify(|held| *held = (*held).min(reason)).or_insert(reason);
+                                }
+                            }
+                            // Absent means "no evidence", NOT "no measures" — the two
+                            // permit different queries, so an empty tag value must
+                            // still parse as `Some(∅)`. Several files can serve one
+                            // slice identity, and the slice can only be read for a
+                            // measure they ALL carry, hence the intersection.
+                            let measures = tag(crate::maintenance_coordinator::TAG_MEASURES)
+                                .map(|value| value.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<BTreeSet<String>>());
+                            let identity = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows);
+                            let merged = match measures_by_identity.remove(&identity) {
+                                Some(seen) => seen.zip(measures).map(|(left, right)| &left & &right),
+                                None => measures,
+                            };
+                            measures_by_identity.insert(identity.clone(), merged);
+                            let content_fp = tag(crate::maintenance_coordinator::TAG_CONTENT_FINGERPRINT).and_then(|value| value.parse::<u64>().ok());
+                            let agreed = match content_fp_by_identity.remove(&identity) {
+                                Some(seen) if seen == content_fp => seen,
+                                Some(_) => None,
+                                None => content_fp,
+                            };
+                            content_fp_by_identity.insert(identity.clone(), agreed);
+                            groups.insert(identity);
+                            // Same facts, recorded explicitly. The date comes from the
+                            // file's own partition rather than from `slice_start`,
+                            // because a day-wide slice starts at midnight of the day it
+                            // covers while a file in `date=D` cannot hold rows outside
+                            // `D` — the partition is the stronger statement.
+                            if let Some((partition_project, _date)) = file_partition.as_ref() {
+                                // The date comes from the file's PARTITION, not from
+                                // `slice_start`: a file in `date=D` cannot hold rows
+                                // outside `D`, so the partition is the stronger
+                                // statement, and a day-wide slice beginning at midnight
+                                // would otherwise be indistinguishable from one that
+                                // merely starts there.
+                                let entry = paths_by_identity
+                                    .entry((project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows))
+                                    .or_insert_with(|| ((*partition_project).to_owned(), Vec::new()));
+                                entry.1.push(action.path.clone());
                             }
                         }
-                        // Absent means "no evidence", NOT "no measures" — the two
-                        // permit different queries, so an empty tag value must
-                        // still parse as `Some(∅)`. Several files can serve one
-                        // slice identity, and the slice can only be read for a
-                        // measure they ALL carry, hence the intersection.
-                        let measures = tag(crate::maintenance_coordinator::TAG_MEASURES)
-                            .map(|value| value.split(',').filter(|name| !name.is_empty()).map(str::to_owned).collect::<BTreeSet<String>>());
-                        let identity = (project.to_owned(), slice_start, slice_end, generation.to_owned(), source_fp, source_rows);
-                        let merged = match measures_by_identity.remove(&identity) {
-                            Some(seen) => seen.zip(measures).map(|(left, right)| &left & &right),
-                            None => measures,
-                        };
-                        measures_by_identity.insert(identity.clone(), merged);
-                        groups.insert(identity.clone());
-                        // The date comes from the file's PARTITION, not from
-                        // `slice_start`: a file in `date=D` cannot hold rows
-                        // outside `D`, so the partition is the stronger statement,
-                        // and a day-wide slice beginning at midnight would
-                        // otherwise be indistinguishable from one that merely
-                        // starts there.
-                        if let Some((partition_project, _date)) = file_partition.as_ref() {
-                            paths_by_identity.entry(identity).or_insert_with(|| ((*partition_project).to_owned(), Vec::new())).1.push(action.path.clone());
-                        }
+                        (groups, paths_by_identity, measures_by_identity, content_fp_by_identity, witness_reasons, witnessed)
                     }
-                    (groups, paths_by_identity, measures_by_identity, witness_reasons, witnessed)
-                }
-                Err(_) => Default::default(),
-            };
+                    Err(_) => Default::default(),
+                };
             // Filled by the FILTERED loop below, then verified and written once
             // per tier. Nothing is recorded for a slice the read path would
             // refuse, because the ledger is meant to become the authority and an
@@ -5201,6 +5502,15 @@ impl Database {
                             },
                         );
                     }
+                    // The no-op skip's two halves, both recovered from the SAME
+                    // tags the rest of this loop trusts: the input set the cell
+                    // was aggregated from, and how many files it published. An
+                    // absent tag yields `None`/`0`, and either alone declines
+                    // the skip — so a cell written before this tag existed costs
+                    // one rebuild rather than freezing.
+                    let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
+                    let content_fp = content_fp_by_identity.get(&identity).copied().flatten();
+                    let output_files = paths_by_identity.get(&identity).map_or(0, |(_, paths)| u32::try_from(paths.len()).unwrap_or(u32::MAX));
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
                         RollupCoverage {
@@ -5210,8 +5520,8 @@ impl Database {
                             source_rows,
                             covered_through: slice_end,
                             measures: measures.map(|names| names.into_iter().collect()),
-                            content_fp: None,
-                            output_files: 0,
+                            content_fp,
+                            output_files,
                         },
                     );
                     recovered += 1;
@@ -9552,6 +9862,14 @@ impl Database {
             warn!("DML coalescer drain exceeded shutdown deadline — un-drained deferred Delta legs lost (crash-equivalent; mem-leg values survive in WAL)");
         }
 
+        // The rollup journal's durable write is throttled on the commit path, so
+        // shutdown is the one point with no later commit to carry a deferred
+        // one. Best-effort: it is scheduling state, and failing the shutdown
+        // over it would be worse than the conservative rebuild losing it costs.
+        if let Err(error) = self.flush_rollup_journal() {
+            warn!(%error, event = "rollup_journal_shutdown_flush_failed");
+        }
+
         // Cancel maintenance tasks
         self.maintenance_shutdown.cancel();
 
@@ -10025,7 +10343,7 @@ mod rollup_noop_skip_tests {
     /// `skipped_generation` branch calls `journal.enqueue` on the BASE key it
     /// could not verify, which upserts an already-Complete unit back to Pending
     /// over the SAME slice. Coverage is untouched — unlike the CONTENT-change
-    /// path (`invalidate_rollup_hours`), which drops it — so the rebuild it asks
+    /// path (`apply_rollup_hours`), which drops it — so the rebuild it asks
     /// for is the one that must be proved needless rather than paid for. Prod
     /// repeats this every 32 minutes (`60 << 5`, the branch's backoff cap).
     fn remint_published_base_slices(db: &Database) -> Result<()> {
@@ -10076,6 +10394,51 @@ mod rollup_noop_skip_tests {
         db.drain_coordinator_rollups(64).await
     }
 
+    /// The skip must survive a restart, or it is nearly useless in production.
+    ///
+    /// Coverage rebuilt from tier tags at boot carried `content_fp: None` and
+    /// `output_files: 0`, and either alone declines the skip — so NOTHING could
+    /// be skipped until a slice had published once more in the new process.
+    /// Production restarts on every non-docs push: three times in two and a half
+    /// hours on 2026-09-12, and `rollup_noop_rebuild_skipped_total` read **0** on
+    /// a 31-minute process against 38 on a 44-minute one. Uptime, not coverage,
+    /// was the binding constraint.
+    ///
+    /// The restart is a second `Database` over the same data dir, the same shape
+    /// `a_certification_survives_a_restart_and_still_grants_the_skip` uses.
+    ///
+    /// Can-fail proof, run red then restored: dropping `TAG_CONTENT_FINGERPRINT`
+    /// from the publish tag block leaves this red — no skip after the restart —
+    /// which is exactly the production behaviour being fixed.
+    #[serial]
+    #[tokio::test]
+    async fn a_restart_recovers_the_proof_the_skip_needs() -> Result<()> {
+        let mut cfg = (*TestConfigBuilder::new("rollup_noop_restart").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 7;
+        let cfg = Arc::new(cfg);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+
+        {
+            let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about restarts");
+        }
+
+        // A brand-new Database over the same data dir — a deploy, in miniature.
+        // Its coverage comes only from what the tier's tags carry.
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let published_at = tier_version(&db).await.expect("the tier must exist after the first process published into it");
+
+        let before = skips();
+        remint_published_base_slices(&db)?;
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?;
+        assert!(skips() > before, "a slice re-minted after a restart must still be proved redundant from its tags");
+        assert_eq!(tier_version(&db).await, Some(published_at), "and must not write to the tier");
+        Ok(())
+    }
+
     /// Prod 2026-09-11: BaseRollup held 59% of maintenance worker-seconds and
     /// **72.6% of its decoded bytes republished a slice already published in the
     /// same three hours**, 99.6% of consecutive republications emitting an
@@ -10114,8 +10477,13 @@ mod rollup_noop_skip_tests {
         assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about rebuilding");
         let published_at = tier_version(&db).await.expect("the rollup tier must exist once a unit has published into it");
 
-        // Re-minting every published slice is prod's 32-minute re-pend over an
-        // unmoved input, verbatim — see `remint_published_base_slices`.
+        // The re-mint prod actually performs, verbatim: the derived tier's
+        // `skipped_generation` branch calls `journal.enqueue` on the BASE key it
+        // could not verify, which upserts an already-Complete unit back to
+        // Pending over the SAME slice. Coverage is untouched — unlike the
+        // CONTENT-change path (`apply_rollup_hours`), which drops it — so
+        // the rebuild it asks for is provably needless. Re-minting every
+        // published slice is the same fact at 32-minute cadence.
         let before = skips();
         remint_and_drain(&db).await?;
         assert!(skips() > before, "a re-pended unit over an unmoved input must be proved redundant, not rebuilt");
@@ -10132,7 +10500,7 @@ mod rollup_noop_skip_tests {
     /// file PATH — the resurrection trap the DV-dedup design named. The rollup's
     /// coverage is not dropped by a dedup wave either (that wave reaches the
     /// journal through `reconcile_maintenance_task_cursors`, not through
-    /// `invalidate_rollup_hours`), so a paths-only fingerprint would report
+    /// `apply_rollup_hours`), so a paths-only fingerprint would report
     /// "nothing moved" over a partition that just lost rows and freeze a rollup
     /// that still counts the duplicates.
     ///
@@ -10171,5 +10539,170 @@ mod rollup_noop_skip_tests {
             "a deletion vector masked a duplicate this rollup had already counted; a paths-only fingerprint would have called that unchanged"
         );
         Ok(())
+    }
+}
+
+/// The rollup journal's two `fsync`s must not be paid on every commit.
+#[cfg(test)]
+mod rollup_journal_persist_tests {
+    use serial_test::serial;
+
+    use super::*;
+    use crate::support::test_helpers::TestConfigBuilder;
+
+    fn counts() -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = crate::observability::maintenance_stats();
+        (s.rollup_journal_persists.load(Relaxed), s.rollup_journal_persist_skipped.load(Relaxed), s.rollup_journal_persist_deferred.load(Relaxed))
+    }
+
+    /// `store` costs TWO `fsync`s — the temp file, then the parent directory
+    /// after the rename — and ran inside every group commit beside the task
+    /// journal's own `sync_all`. Three per commit, on an array measured at
+    /// 98.8% utilisation with a 63-620 ms write wait. Prod 2026-09-12 performed
+    /// 30,075 commits in 2,640 s (11.4/s), i.e. ~100% duty on the commit
+    /// pipeline, and `block.journal_commit_wait` averaged **362 ms** (max
+    /// 10.7 s) on the PRE-ACK path because every arrival queued behind it.
+    ///
+    /// Deferring is sound because `rollup_journal` is scheduling state, not a
+    /// correctness boundary: `maintenance_tasks` is "the finer-grained source
+    /// of truth coordinator workers consume", it is fsynced in the SAME commit,
+    /// and `rollup_dirty` is read in one place only — to requeue partitions
+    /// when bootstrap tasks were discarded.
+    ///
+    /// A content hash alone would NOT have helped: `apply_rollup_hours`
+    /// increments the source epoch on every call, so the encoded journal really
+    /// does change on every ingest invalidation. That is why this throttles by
+    /// TIME as well, and why the skip assertion below would pass vacuously
+    /// without the deferral.
+    ///
+    /// Can-fail proof, run red then restored: setting
+    /// `ROLLUP_JOURNAL_MAX_STALENESS` to zero makes the deferral assertion red
+    /// (13 writes for 13 commits, the pre-change behaviour).
+    #[serial]
+    #[tokio::test]
+    async fn repeated_commits_do_not_each_rewrite_the_rollup_journal() -> Result<()> {
+        let cfg = TestConfigBuilder::new("rollup_journal_persist").with_rollups().build();
+        let db = Database::with_config(cfg).await?;
+        let project = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = (chrono::Utc::now() - chrono::Duration::days(2)).date_naive().to_string();
+
+        // The first write of a process always happens: there is no stamp yet,
+        // so an empty one must not be mistaken for "already persisted".
+        db.apply_rollup_hours(&project, "otel_logs_and_spans", &date, 1 << 12)?;
+        db.commit_journal()?;
+        assert!(counts().0 > 0, "the first persist of a process must write");
+
+        // The steady-ingest shape. Every call bumps the source epoch, so the
+        // CONTENT differs every time — only the staleness window stops these.
+        let before = counts();
+        for hour in 0..13u32 {
+            db.apply_rollup_hours(&project, "otel_logs_and_spans", &date, 1 << hour)?;
+            db.commit_journal()?;
+        }
+        let after = counts();
+        assert_eq!(after.0, before.0, "13 commits inside the staleness window must not each pay two fsyncs");
+        assert_eq!(after.2 - before.2, 13, "and each must be counted as deferred, not silently dropped");
+
+        // Deferred is not dropped. Shutdown has no later commit to carry the
+        // write, so it forces one — and the journal on disk then holds the
+        // hours those deferred commits marked.
+        db.flush_rollup_journal()?;
+        assert_eq!(counts().0 - after.0, 1, "shutdown must flush what the window deferred");
+        let persisted = crate::rollup_journal::load(&db.config.core.timefusion_data_dir);
+        let entry =
+            persisted.iter().find(|entry| entry.project_id == project && entry.date == date).expect("the partition must be on disk after a forced flush");
+        assert_eq!(entry.dirty_hours & 0x1fff, 0x1fff, "every hour marked during the deferred window must have reached disk");
+
+        // Nothing changed since that flush, so the next commit writes nothing
+        // even though the window has no say — this is the idle case.
+        let before = counts();
+        db.commit_journal()?;
+        assert_eq!(counts().1 - before.1, 1, "an unchanged journal must be skipped on content, not merely deferred");
+        assert_eq!(counts().0, before.0, "and must not write");
+        Ok(())
+    }
+}
+
+/// The absolute lifetime cap on permit-holding maintenance units.
+#[cfg(test)]
+mod unit_lifetime_cap_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering::Relaxed},
+        },
+        time::Duration,
+    };
+
+    use super::{coordinator_operation_lifetime_cap, run_until_idle_capped};
+    use crate::maintenance_coordinator::Operation;
+
+    /// A unit that keeps reporting progress but never finishes must still be
+    /// stopped when it holds a permit the rest of the fleet is waiting on.
+    ///
+    /// `run_until_idle` is an IDLE window by design — a slow but converging unit
+    /// should not be killed for being slow. That is right when a unit costs only
+    /// its worker and wrong when it holds one of ~3 `light_rewrite_sem` permits,
+    /// because it bounds the hold at nothing at all.
+    ///
+    /// Prod 2026-09-12: one day-wide `SealedConsolidation` ran **7,634 s, 8.5x
+    /// its 900 s deadline**, returned `outcome=Some(Running)` having completed
+    /// nothing, and `maintenance_coordinator_unit_timed_out` fired ZERO times.
+    /// Meanwhile `compaction_permits_unavailable` hit 1,812 in 55 minutes,
+    /// HotPacking and SealedConsolidation recorded **0 worker-seconds** between
+    /// them, and 196 cells and 1.1 TB of sealed debt went unworked.
+    ///
+    /// Both directions, because a cap that fires on converging work is its own
+    /// outage.
+    ///
+    /// Can-fail proof, run red then restored: passing `None` for the cap — the
+    /// old `run_until_idle` behaviour — hangs the first case until the test
+    /// harness kills it, because that is precisely a unit that never stops.
+    #[tokio::test(start_paused = true)]
+    async fn a_progressing_unit_that_never_converges_is_still_stopped() {
+        let idle = Duration::from_millis(900);
+        let cap = Duration::from_millis(3_600);
+        let progress = Arc::new(AtomicU64::new(0));
+        let ticker = Arc::clone(&progress);
+        // Never returns, but reports progress inside every idle window — exactly
+        // the shape that ran for 7,634 s in production.
+        let forever = async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                ticker.fetch_add(1, Relaxed);
+            }
+        };
+        let started = tokio::time::Instant::now();
+        assert!(run_until_idle_capped(idle, Some(cap), progress, forever).await.is_err(), "a unit past its lifetime cap must be stopped");
+        assert!(started.elapsed() >= cap, "and not before the cap");
+
+        // The other direction: work that FINISHES inside the cap is untouched,
+        // including work slower than a single idle window.
+        let progress = Arc::new(AtomicU64::new(0));
+        let ticker = Arc::clone(&progress);
+        let converging = async move {
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                ticker.fetch_add(1, Relaxed);
+            }
+            7u32
+        };
+        assert_eq!(run_until_idle_capped(idle, Some(cap), progress, converging).await.ok(), Some(7), "converging work must not be killed");
+    }
+
+    /// Only the lanes that hold a permit get a cap. A rollup unit costs its
+    /// worker and nothing else, and rollup cost is set by input FILE COUNT —
+    /// bisecting it converges on nothing, which is why its deadline was
+    /// lengthened rather than shortened.
+    #[test]
+    fn only_the_permit_holding_lanes_are_capped() {
+        for operation in [Operation::HotPacking, Operation::SealedConsolidation, Operation::Repair] {
+            let cap = coordinator_operation_lifetime_cap(operation).expect("permit-holding lanes are capped");
+            assert_eq!(cap, crate::database::coordinator_operation_timeout(operation) * 4, "{operation:?}");
+        }
+        for operation in [Operation::BaseRollup, Operation::DerivedRollup, Operation::Dedup] {
+            assert!(coordinator_operation_lifetime_cap(operation).is_none(), "{operation:?} holds no permit and must keep idle-only semantics");
+        }
     }
 }

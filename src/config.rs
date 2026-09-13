@@ -267,6 +267,14 @@ const REPAIR_REWRITE_TARGET_FILES: usize = 2;
 /// 1.79 is the passing point, not a midpoint guess — the cliff is between these
 /// two rungs and this takes the safe side of it.
 const SAFE_DECODED_PER_POOL_BYTE: f64 = 1.79;
+/// Per-sort slices the hygiene lane keeps whatever repair would like to reserve.
+///
+/// Two, not one, because HotPacking and SealedConsolidation SHARE the permit:
+/// at one they cannot even run concurrently, and any unit that stalls takes the
+/// whole lane with it. Only a share too small to hold two sorts goes below this,
+/// and such a box cannot run the coordinator meaningfully anyway.
+const LIGHT_MIN_SLICES: usize = 2;
+
 /// Heavy maintenance's slice of the whole maintenance pool. 0.30 is what the
 /// old `0.40 of the residual` came to before the coordinator's share grew; see
 /// `heavy_share_bytes` for why it is no longer expressed against the residual.
@@ -629,7 +637,33 @@ impl DerivedBudget {
         // before they could. Prod 2026-09-01: `Not enough memory to continue
         // external sort` on repair staging as soon as long-running units and
         // K=4 hygiene bins shared 8 GB sixteen ways.
-        let mem_bound = (self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES).saturating_sub(self.repair_pool_holdback_slices());
+        // The repair holdback yields before the hygiene lane is zeroed.
+        //
+        // K=1 is not a small configuration, it is an OUTAGE: the permit is taken
+        // BEFORE the claim, and one permit shared by HotPacking and
+        // SealedConsolidation across every worker means a single long unit stops
+        // the lane dead. The comment on `repair_pool_holdback_slices` already
+        // names this as "the 2026-09-01 HotPacking outage class" — and the
+        // formula could still produce it, so naming it was not enough.
+        //
+        // Prod 2026-09-12 was in it again, and the margin was two cores. The
+        // container is capped at `NanoCpus=28` of a 48-core host, so
+        // `cores/3` gives 9 jobs, a 4.5 GiB coordinator share, 3 slices — and a
+        // fixed 3-slice holdback took all three. Measured consequence over four
+        // hours: HotPacking 426 worker-seconds, **SealedConsolidation zero**,
+        // 641 permit acquisitions against 32,779 refusals, and 1.1 TB of sealed
+        // debt that did not move. One SealedConsolidation unit held the single
+        // permit from 19:14 to 21:19; the moment it released, seven hygiene
+        // units ran in five minutes.
+        //
+        // Repair keeps its holdback wherever the share can pay for it — on the
+        // 48-core box this function was calibrated for, slices=6 and the
+        // arithmetic is unchanged. Below that, repair drops toward one-way
+        // concurrency instead of hygiene dropping to none. That is the right way
+        // round: a repair sort that cannot fit RETRIES, while a dead hygiene
+        // lane is unbounded debt, and `pending_repair` was 0 throughout.
+        let slices = self.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
+        let mem_bound = slices.saturating_sub(self.repair_pool_holdback_slices().min(slices.saturating_sub(LIGHT_MIN_SLICES)));
         let cpu_bound = self.cores / 4;
         mem_bound.min(cpu_bound).min(hot_project_count).max(1)
     }
@@ -2100,6 +2134,21 @@ pub struct MaintenanceConfig {
     /// concurrently by construction (the clamp) — revisit if that changes.
     #[serde_inline_default(220)]
     pub timefusion_maintenance_spill_max_gb: u64,
+    /// Cap for QUERY spill, which lives under `<data_dir>/query_spill`.
+    ///
+    /// Until 2026-09-12 the query `RuntimeEnv` was built with no DiskManager at
+    /// all, so every spill went to `std::env::temp_dir()` — `/tmp` inside the
+    /// container, i.e. the overlay2 layer — bounded only by DataFusion's own
+    /// default and invisible to every knob here. Root-level `pidstat` put the
+    /// process at 367 MB/s with 184 open fds under `/tmp`, against 204 for the
+    /// maintenance spill dirs that WERE configured.
+    ///
+    /// 64 GiB: maintenance already reserves `timefusion_maintenance_spill_max_gb`
+    /// (220) on the same volume, and only one heavy maintenance spiller runs at a
+    /// time by construction. A query needing more than this should fail rather
+    /// than fill the volume the WAL also lives on.
+    #[serde_inline_default(64)]
+    pub timefusion_query_spill_max_gb: u64,
     /// Emergency kill switch for the Dedup contiguity rank term (prefer the
     /// slice that EXTENDS a completed run — see `TaskJournal::rank`). ON by
     /// default; set `=false` only to revert the ordering in prod without a
@@ -4083,5 +4132,55 @@ mod secret_crypto_tests {
         assert_eq!(decrypt_or_passthrough("plain").unwrap(), "plain");
         // nonce-only payload => no ciphertext left after the split
         assert!(decrypt_or_passthrough(&format!("{ENC_PREFIX}{}", B64.encode([0u8; NONCE_LEN]))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod light_permit_floor_tests {
+    use super::*;
+
+    /// `light_optimize_k` may never return 1 on a box whose coordinator share
+    /// can hold two sorts.
+    ///
+    /// One permit is an outage, not a small configuration: it is taken BEFORE
+    /// the claim and shared by HotPacking and SealedConsolidation, so at K=1 the
+    /// two cannot run concurrently and any stalled unit stops the lane.
+    ///
+    /// Prod 2026-09-12 was there, two cores short of the boundary. The container
+    /// is capped at `NanoCpus=28` of a 48-core host: `cores/3` = 9 jobs, a
+    /// 4.5 GiB share, 3 slices, and a fixed 3-slice repair holdback took all
+    /// three. Over four hours that produced SealedConsolidation = **0**
+    /// worker-seconds, 32,779 permit refusals, and 1.1 TB of sealed debt that
+    /// did not move.
+    ///
+    /// Can-fail proof, run red then restored: dropping the `.min(...)` that caps
+    /// the holdback puts 28 and 30 cores back at K=1.
+    #[test_case::test_case(28, 1; "prod: 28-core cgroup cap, the box this was found on")]
+    #[test_case::test_case(30, 1; "just past the jobs boundary and still starved before the fix")]
+    #[test_case::test_case(16, 1; "a small box")]
+    #[test_case::test_case(48, 3; "the box the formula was calibrated for")]
+    fn the_hygiene_lane_never_collapses_to_one_permit(cores: usize, slices_before_fix: usize) {
+        let budget = DerivedBudget::from_limits(120 * GIB, cores);
+        let k = budget.max_light_optimize_k();
+        let share_slices = budget.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
+        assert!(
+            k >= LIGHT_MIN_SLICES.min(share_slices),
+            "cores={cores}: share holds {share_slices} sorts but K={k} (was {slices_before_fix} before the holdback cap)"
+        );
+        // And the calibrated box is untouched — repair keeps its full holdback
+        // wherever the share can pay for it.
+        if cores == 48 {
+            assert_eq!(k, 3, "the 48-core derivation must not move");
+        }
+    }
+
+    /// A box too small to hold two sorts is left alone rather than
+    /// over-committed — the floor is a floor, not a demand.
+    #[test]
+    fn a_tiny_share_is_not_over_committed() {
+        let budget = DerivedBudget::from_limits(2 * GIB, 2);
+        let share_slices = budget.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
+        assert!(share_slices < LIGHT_MIN_SLICES, "precondition: this box cannot hold two sorts");
+        assert_eq!(budget.max_light_optimize_k(), 1, "and must not be pushed to two");
     }
 }
