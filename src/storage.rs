@@ -3453,6 +3453,88 @@ pub const DIRTY_BINS: (&str, &str) = ("dedup_dirty_bins.json", "dirty-bin queue"
 
 pub const ROLLUP_COVERAGE: (&str, &str) = ("rollup_coverage_ledger.json", "rollup coverage ledger");
 
+/// Rows landed dedups removed from a partition SINCE its rollup slices were last
+/// stamped — the durable half of the witness carry-forward.
+///
+/// A rollup's witness is the partition's physical `num_records`, held in the tier
+/// files' `TAG_SOURCE_ROWS`. A dedup removes exactly the rows the rollup's
+/// deduplicated read never counted, so the rollup's NUMBERS are unchanged and
+/// only that count moved — by an amount the dedup commit knows exactly.
+///
+/// Rewriting the tags would mean a metadata-only Delta commit per dedup wave
+/// against the tier, and tier rewrites are what drive tantivy's backfill
+/// re-indexing (83% of its ~10 cores, prod 2026-09-13). So the delta lives here:
+/// recovery reads the tag and SUBTRACTS this. Same answer, one small JSON write.
+///
+/// Cleared when the cell republishes, because a fresh tag already reflects the
+/// post-dedup count and subtracting twice would understate it. Every race fails
+/// SAFE — an over- or under-subtraction disagrees with the live count and costs a
+/// rebuild, which is exactly today's behaviour; it can never serve a wrong
+/// number, because the witness gates ROUTING and nothing else.
+pub const WITNESS_CARRY: (&str, &str) = ("rollup_witness_carry.json", "rollup witness carry");
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct StoredCarry {
+    source: String,
+    project_id: String,
+    date: String,
+    dropped: u64,
+}
+
+/// Durable per-partition dedup drop counts. See [`WITNESS_CARRY`].
+#[derive(Debug)]
+pub struct WitnessCarry {
+    data_dir: std::path::PathBuf,
+    cells: dashmap::DashMap<(String, String, String), u64>,
+}
+
+impl WitnessCarry {
+    pub fn load(data_dir: impl Into<std::path::PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        let cells =
+            load_sidecar::<StoredCarry>(&data_dir, WITNESS_CARRY).into_iter().map(|row| ((row.source, row.project_id, row.date), row.dropped)).collect();
+        Self { data_dir, cells }
+    }
+
+    /// Accumulate what a landed dedup removed; returns the running total.
+    pub fn add(&self, source: &str, project_id: &str, date: &str, dropped: u64) -> u64 {
+        let total = {
+            let mut slot = self.cells.entry((source.to_owned(), project_id.to_owned(), date.to_owned())).or_insert(0);
+            *slot = slot.saturating_add(dropped);
+            *slot
+        };
+        self.persist();
+        total
+    }
+
+    /// What to subtract from a tag-derived witness for this partition.
+    pub fn carried(&self, source: &str, project_id: &str, date: &str) -> u64 {
+        self.cells.get(&(source.to_owned(), project_id.to_owned(), date.to_owned())).map_or(0, |slot| *slot.value())
+    }
+
+    /// A republish stamps a fresh tag over the post-dedup count, so the
+    /// accumulated delta is already reflected and must not be applied again.
+    pub fn clear(&self, source: &str, project_id: &str, date: &str) {
+        if self.cells.remove(&(source.to_owned(), project_id.to_owned(), date.to_owned())).is_some() {
+            self.persist();
+        }
+    }
+
+    fn persist(&self) {
+        let rows: Vec<StoredCarry> = self
+            .cells
+            .iter()
+            .map(|cell| {
+                let (source, project_id, date) = cell.key().clone();
+                StoredCarry { source, project_id, date, dropped: *cell.value() }
+            })
+            .collect();
+        if !store_sidecar(&self.data_dir, WITNESS_CARRY, &rows) {
+            crate::observability::maintenance_stats().coverage_ledger_persist_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// One slice of a rollup tier, and what it was built FROM.
 ///
 /// Today the same facts live in Delta metadata tags on each parquet file

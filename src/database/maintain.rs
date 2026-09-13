@@ -3721,6 +3721,11 @@ impl Database {
             }
             // One coordinator unit is one (project, slice) publication, which is
             // what "staged project" counts on the cohort path too.
+            // The fresh tag this publish just wrote already counts the
+            // post-dedup partition, so the accumulated delta is spent. Leaving
+            // it would subtract the same rows twice and understate the witness,
+            // which reads as `shrank` and costs the rebuild this exists to avoid.
+            self.witness_carry.clear(&key.source, &key.project_id, &date.to_string());
             stats.rollup_staged_projects.fetch_add(1, Relaxed);
             if derived {
                 stats.rollup_rebuilds_incremental.fetch_add(1, Relaxed);
@@ -4894,12 +4899,14 @@ impl Database {
     /// `min`/`max`/`sum` over the survivors could genuinely differ. So this is
     /// gated on the declaration rather than applied blanket.
     ///
-    /// IN-MEMORY ONLY, deliberately, and it is therefore INCOMPLETE: the
-    /// recovery authority is the tier files' `TAG_SOURCE_ROWS`, and a restart
-    /// re-reads those. Until the tags are updated too this repair survives only
-    /// until the next deploy — which prod does constantly. The remaining holders
-    /// are the journal publication, the coverage ledger and those tags; see
-    /// `2026-09-13-stop-re-rolling-deduped-partitions.md` Part 1.
+    /// DURABLE. The recovery authority is the tier files' `TAG_SOURCE_ROWS`, and
+    /// a restart re-reads those — so an in-memory-only repair would survive only
+    /// until the next deploy, which prod does several times a day, leaving every
+    /// carried cell to be rebuilt anyway. Rather than rewrite the tags (a
+    /// metadata-only Delta commit per dedup wave on the tier, whose rewrites
+    /// drive tantivy's backfill), the delta is recorded in
+    /// [`crate::storage::WITNESS_CARRY`] and SUBTRACTED from the tag at
+    /// recovery. Same answer, one small JSON write.
     pub(crate) fn carry_dedup_witness(&self, table_name: &str, project_id: &str, date: &str, dropped: u64) {
         if get_schema(table_name).is_none_or(|schema| schema.dedup_tiebreak.is_none()) {
             return;
@@ -4917,9 +4924,12 @@ impl Database {
                 carried = carried.saturating_add(1);
             }
         });
+        // Durable first: if the process dies between here and the next
+        // recovery, the sidecar is what makes the carry survive.
+        let total = self.witness_carry.add(table_name, project_id, date, dropped);
         if carried > 0 {
             crate::observability::maintenance_stats().rollup_witness_carried.fetch_add(carried, std::sync::atomic::Ordering::Relaxed);
-            debug!(table_name, project_id, date, dropped, carried, event = "rollup_witness_carried_across_dedup");
+            debug!(table_name, project_id, date, dropped, carried, total, event = "rollup_witness_carried_across_dedup");
         }
     }
 
@@ -5591,6 +5601,18 @@ impl Database {
                     let identity = (project_id.clone(), slice_start, slice_end, generation.clone(), source_fp, source_rows);
                     let content_fp = content_fp_by_identity.get(&identity).copied().flatten();
                     let output_files = paths_by_identity.get(&identity).map_or(0, |(_, paths)| u32::try_from(paths.len()).unwrap_or(u32::MAX));
+                    // THE ONE PLACE the carry is applied. A tag records the
+                    // partition count at build time; dedups landed since removed
+                    // rows the rollup never counted, so the tag overstates the
+                    // live count by exactly what `WITNESS_CARRY` accumulated.
+                    // Applying it HERE — where a tag becomes in-memory coverage —
+                    // means every reader downstream (the read path's
+                    // `slice_coverage_agrees`, `recover_date_coverage`, the
+                    // ledger) sees one consistent carried value and none of them
+                    // needs to know the carry exists. Applying it at each
+                    // comparison instead would double-count against the
+                    // in-memory carry `carry_dedup_witness` already performs.
+                    let source_rows = source_rows.map(|rows| rows.saturating_sub(self.witness_carry.carried(source, &project_id, &date)));
                     self.rollup_slice_coverage.insert(
                         (project_id, source.to_string(), target.clone(), slice_start, slice_end),
                         RollupCoverage {
@@ -10516,6 +10538,57 @@ mod rollup_noop_skip_tests {
         db.drain_coordinator_rollups(64).await?;
         assert!(skips() > before, "a slice re-minted after a restart must still be proved redundant from its tags");
         assert_eq!(tier_version(&db).await, Some(published_at), "and must not write to the tier");
+        Ok(())
+    }
+
+    /// The carry must SURVIVE A RESTART, or it is worthless here.
+    ///
+    /// Prod redeploys several times a day, and every restart re-derives rollup
+    /// coverage from the tier files' `TAG_SOURCE_ROWS` — which still record the
+    /// PRE-dedup partition count. An in-memory-only carry is therefore undone by
+    /// the next deploy, leaving exactly the rebuilds it exists to avoid. That is
+    /// the failure this asserts against, and it is invisible to any test that
+    /// stays inside one process.
+    ///
+    /// The restart is a second `Database` over the same data dir, the same shape
+    /// `a_restart_recovers_the_proof_the_skip_needs` uses.
+    ///
+    /// Can-fail: drop the `witness_carry.carried(...)` subtraction at the
+    /// tag-materialisation site and the recovered witness comes back at its
+    /// pre-dedup value.
+    #[serial]
+    #[tokio::test]
+    async fn the_witness_carry_survives_a_restart() -> Result<()> {
+        let cfg = Arc::new((*TestConfigBuilder::new("witness_carry_restart").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone());
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        const DROPPED: u64 = 4;
+
+        let stamped = {
+            let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+            assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so there is no witness to carry");
+            db.recover_rollup_coverage("otel_logs_and_spans").await?;
+            let stamped = db
+                .rollup_slice_coverage
+                .iter()
+                .find(|e| e.key().0 == project_id && e.key().1 == "otel_logs_and_spans")
+                .and_then(|e| e.value().source_rows)
+                .expect("recovery must stamp a row witness");
+            db.carry_dedup_witness("otel_logs_and_spans", &project_id, &date.to_string(), DROPPED);
+            stamped
+        };
+
+        // A brand-new Database over the same data dir — a deploy, in miniature.
+        // Its coverage comes from the tags, which still hold the PRE-dedup count.
+        let db = Arc::new(Database::with_config(cfg).await?);
+        db.recover_rollup_coverage("otel_logs_and_spans").await?;
+        let recovered = db
+            .rollup_slice_coverage
+            .iter()
+            .find(|e| e.key().0 == project_id && e.key().1 == "otel_logs_and_spans")
+            .and_then(|e| e.value().source_rows)
+            .expect("the restarted process must recover slice coverage");
+        assert_eq!(recovered, stamped.saturating_sub(DROPPED), "the carry must survive the restart; a tag-only value would read {stamped}");
         Ok(())
     }
 
