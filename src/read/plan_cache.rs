@@ -976,9 +976,13 @@ mod tests {
 
     /// A lifted time fn may only ever be a tz-aware nanosecond timestamp.
     fn ts_nanos(v: &ScalarValue) -> i64 {
+        ts_nanos_opt(v).unwrap_or_else(|| panic!("expected tz-aware nanosecond timestamp, got {v:?}"))
+    }
+
+    fn ts_nanos_opt(v: &ScalarValue) -> Option<i64> {
         match v {
-            ScalarValue::TimestampNanosecond(Some(ns), Some(_)) => *ns,
-            v => panic!("expected tz-aware nanosecond timestamp, got {v:?}"),
+            ScalarValue::TimestampNanosecond(Some(ns), Some(_)) => Some(*ns),
+            _ => None,
         }
     }
 
@@ -1105,7 +1109,7 @@ mod tests {
     /// where the generated index must land above the client's highest `$N`.
     // Pure path: strings lift too, and the `twin` proves the key is reusable across refreshes.
     #[test_case("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'", 0, true, &["$1", "$2"],
-        Some("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'") => 2 ; "pure path lifts project_id and now()")]
+        Some("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'") => 3 ; "pure path lifts project_id, now() and the interval string")]
     // Mixed path: client $1 kept, now() becomes $2, and the string stays inline.
     #[test_case("SELECT id FROM t WHERE project_id = $1 AND level = 'error' AND ts > now() - INTERVAL '1 hour'", 1, false, &["$1", "$2", "'error'"],
         None::<&str> => 1 ; "mixed parameterizes time fns above client binds only")]
@@ -1114,8 +1118,9 @@ mod tests {
             let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
             let (param, values) = parameterize_statement(&parse(sql), base, include_strings).expect("now() parameterizes");
             let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-            // The time fn is lifted last, so it is the final value.
-            let ns = ts_nanos(values.last().expect("a value was lifted"));
+            // Find the lifted instant by TYPE, not position: with `include_strings`
+            // the INTERVAL literal lifts after the time fn, so it is not always last.
+            let ns = values.iter().find_map(ts_nanos_opt).expect("a tz-aware instant was lifted");
             assert!(before <= ns && ns <= after, "the lifted instant is fresh, not frozen");
             (param.to_string(), values)
         };
