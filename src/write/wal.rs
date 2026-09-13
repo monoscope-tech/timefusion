@@ -1491,6 +1491,28 @@ mod tests {
         wal.merge_persisted_positions(project, table, &[Some(tail[0]), None, None, None]).unwrap();
     }
 
+    /// `n` zero-padded decimal strings of exactly `width` bytes each.
+    fn wide_strs(n: usize, width: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{i:0>width$}")).collect()
+    }
+
+    /// Read every entry of `("proj", table)`, asserting no frame failed to decode.
+    fn read_all(wal: &WalManager, table: &str) -> Vec<WalEntry> {
+        let (entries, errors) = wal.read_entries_raw("proj", table, None, true).unwrap();
+        assert_eq!(errors, 0);
+        entries
+    }
+
+    /// Process A over `dir`: seed shard 0, write a clean snapshot, return shard
+    /// 0's position. The manager drops here so the caller can reopen the dir.
+    fn seed_and_snapshot(dir: &tempfile::TempDir, table: &str) -> Option<WalPosition> {
+        let wal = sync_wal(dir);
+        seed_shard0(&wal, "proj", table);
+        let shard0 = wal.persisted_read_positions("proj", table).unwrap()[0];
+        wal.write_cursor_snapshot(true, true).unwrap();
+        shard0
+    }
+
     /// Single non-null `body: Utf8` column; payload size is controlled by row width.
     fn str_batch(strs: &[String]) -> RecordBatch {
         RecordBatch::try_new(
@@ -1548,7 +1570,7 @@ mod tests {
     #[test]
     fn replayed_batch_charged_logical_not_message_body() {
         let (n_cols, n_rows) = (30usize, 50usize);
-        let payload: Vec<String> = (0..n_rows).map(|i| format!("{i:0>100}")).collect();
+        let payload = wide_strs(n_rows, 100);
         let mut fields = vec![Field::new("ts", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())), false)];
         fields.extend((0..n_cols).map(|i| Field::new(format!("c{i}"), if i % 2 == 0 { DataType::Utf8View } else { DataType::Utf8 }, true)));
         let ts = chrono::Utc::now().timestamp_micros();
@@ -1633,12 +1655,11 @@ mod tests {
 
         // ~112MB of string payload (35k rows × 3.2KB) — over WAL_SPLIT_TARGET.
         let n_rows = 35_000;
-        let batch = str_batch(&(0..n_rows).map(|i| format!("{i:0>3200}")).collect::<Vec<_>>());
+        let batch = str_batch(&wide_strs(n_rows, 3200));
 
         wal.append_batch("proj", &table, std::slice::from_ref(&batch), |_, _| {}).unwrap();
 
-        let (entries, errors) = wal.read_entries_raw("proj", &table, None, true).unwrap();
-        assert_eq!(errors, 0);
+        let entries = read_all(&wal, &table);
         let rows: usize =
             entries.iter().map(|e| deserialize_record_batch(&e.data).expect("every acked WAL entry must be replayable (within the size cap)").num_rows()).sum();
         assert_eq!(rows, n_rows, "no acked rows may be lost across the WAL round-trip");
@@ -1653,7 +1674,7 @@ mod tests {
     fn split_to_wal_payloads_bounds_every_entry() {
         use arrow::array::Array;
         let (target, hard_max) = (8 * 1024, 32 * 1024);
-        let expected: Vec<String> = (0..100).map(|i| format!("{i:0>200}")).collect();
+        let expected = wide_strs(100, 200);
         let payloads = split_to_wal_payloads(&str_batch(&expected), target, hard_max).unwrap();
         assert!(payloads.len() > 1);
         let rows: Vec<String> = decode_bounded(&payloads, target)
@@ -1665,14 +1686,12 @@ mod tests {
             .collect();
         assert_eq!(rows, expected, "rows preserved in order");
 
-        let fat_row = str_batch(&["x".repeat(16 * 1024)]);
-        let whole = split_to_wal_payloads(&fat_row, target, hard_max).unwrap();
+        let whole = split_to_wal_payloads(&str_batch(&["x".repeat(16 * 1024)]), target, hard_max).unwrap();
         assert_eq!(whole.len(), 1, "a single row between target and hard cap must pass through whole");
         assert_eq!(deserialize_record_batch(&whole[0]).unwrap().num_rows(), 1);
 
-        let too_fat_row = str_batch(&["x".repeat(64 * 1024)]);
         assert!(
-            matches!(split_to_wal_payloads(&too_fat_row, target, hard_max), Err(WalError::BatchTooLarge { .. })),
+            matches!(split_to_wal_payloads(&str_batch(&["x".repeat(64 * 1024)]), target, hard_max), Err(WalError::BatchTooLarge { .. })),
             "a single row over the hard cap must fail the append explicitly, not ack-then-drop"
         );
     }
@@ -1683,7 +1702,7 @@ mod tests {
     #[test]
     fn split_to_wal_payloads_flattens_dictionary_columns() {
         use arrow::array::{Array, DictionaryArray, Int32Array, StringArray};
-        let values = StringArray::from((0..200).map(|i| format!("{i:0>2048}")).collect::<Vec<_>>());
+        let values = StringArray::from(wide_strs(200, 2048));
         let keys = Int32Array::from((0..1000).map(|i| i % 200).collect::<Vec<i32>>());
         let dict = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(keys, Arc::new(values)).unwrap();
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("body", dict.data_type().clone(), false)])), vec![Arc::new(dict)]).unwrap();
@@ -1740,8 +1759,7 @@ mod tests {
 
         // checkpoint=true: walrus's uncheckpointed read_next never advances the
         // cursor, so a read-all loop with `false` re-reads the first entry forever.
-        let (entries, errors) = wal.read_entries_raw("proj", &table, None, true).unwrap();
-        assert_eq!(errors, 0);
+        let entries = read_all(&wal, &table);
         assert_eq!(entries.len(), 2, "both appends must be present and readable with ack_fsync on");
         assert!(entries.iter().any(|e| e.operation == WalOperation::Delete));
         assert!(entries.iter().any(|e| e.operation == WalOperation::Insert));
@@ -1796,14 +1814,11 @@ mod tests {
         assert!(holds.iter().all(Option::is_some), "P0 must map never-persisted shards to explicit ORIGIN holds, got {holds:?}");
 
         // Simulate a crashed replay: consume to tail (persists progress).
-        let (entries, _) = wal.read_entries_raw("proj", &table, None, true).unwrap();
-        assert_eq!(entries.len(), 1);
-        let (entries, _) = wal.read_entries_raw("proj", &table, None, true).unwrap();
-        assert!(entries.is_empty(), "cursor must be at tail after consuming");
+        assert_eq!(read_all(&wal, &table).len(), 1);
+        assert!(read_all(&wal, &table).is_empty(), "cursor must be at tail after consuming");
 
         assert!(wal.apply_recovery_rewind_marker().unwrap(), "marker must be found and applied");
-        let (entries, _) = wal.read_entries_raw("proj", &table, None, true).unwrap();
-        assert_eq!(entries.len(), 1, "rewind must make the consumed entry replayable again");
+        assert_eq!(read_all(&wal, &table).len(), 1, "rewind must make the consumed entry replayable again");
 
         wal.remove_recovery_rewind_marker();
         assert!(!wal.apply_recovery_rewind_marker().unwrap(), "marker gone after removal");
@@ -1851,15 +1866,9 @@ mod tests {
         let table = uniq("tbl");
 
         // Process A: append, advance cursor, write snapshot with clean flag.
-        {
-            let wal = sync_wal(&dir);
-            seed_shard0(&wal, "proj", &table);
-            let before = wal.persisted_read_positions("proj", &table).unwrap();
-            assert!(before[0].is_some_and(|p| !p.is_origin()), "advance must move shard 0 off origin");
-
-            wal.write_cursor_snapshot(true, true).unwrap();
-            assert!(path.join(".timefusion_meta/cursor_snapshot.json").exists());
-        }
+        let before = seed_and_snapshot(&dir, &table);
+        assert!(before.is_some_and(|p| !p.is_origin()), "advance must move shard 0 off origin");
+        assert!(path.join(".timefusion_meta/cursor_snapshot.json").exists());
 
         // Process B: fresh manager, snapshot present.
         {
@@ -1893,11 +1902,7 @@ mod tests {
         // Shard-count mismatch: write a 4-shard snapshot, re-open with 8.
         let dir = tempfile::tempdir().unwrap();
         let table = uniq("tbl");
-        {
-            let wal = sync_wal(&dir);
-            seed_shard0(&wal, "proj", &table);
-            wal.write_cursor_snapshot(true, true).unwrap();
-        }
+        let _ = seed_and_snapshot(&dir, &table);
         let wal = wal_in(&dir, crate::config::WalFsyncMode::SyncEach, 8);
         assert!(wal.load_cursor_snapshot().is_none(), "shard-count mismatch must be rejected");
     }
@@ -2041,31 +2046,35 @@ mod tests {
         drop(replacement);
     }
 
-    #[test]
-    fn gc_wal_files_skips_meta_and_respects_cutoff() {
-        use std::time::Duration;
-
+    /// One GC contract over four sweep configurations, returning
+    /// `(deleted, bytes_freed)`. Only aged, unprotected WAL segments are
+    /// reclaimable: the durability floor overrides mtime age (during a crash
+    /// loop the aged files ARE the un-flushed backlog), `.timefusion_meta` is
+    /// exempt, and the walk — which deletes ANY file past the cutoff with no
+    /// name filter — must never descend into `quarantine/`, the ONLY copy of
+    /// data parked for a human. `floor_offset_secs` is relative to now.
+    #[test_case(3600, None => (0, 0) ; "segments younger than max_age are kept")]
+    #[test_case(0, None => (2, 3072) ; "past the cutoff only wal segments are reclaimed")]
+    #[test_case(0, Some(-3600) => (0, 0) ; "unflushed floor overrides mtime age")]
+    #[test_case(0, Some(3600) => (2, 3072) ; "a future floor adds no protection beyond age")]
+    fn gc_wal_files_reclaims_only_aged_unprotected_segments(max_age_secs: u64, floor_offset_secs: Option<i64>) -> (u64, u64) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        touch(root, ".timefusion_meta/cursor_snapshot.json", 2);
-        touch(root, ".timefusion_meta/topics", 0);
-        let f1 = touch(root, "1779989695814", 1024);
-        let f2 = touch(root, "1780994113609", 2048);
+        let meta = [touch(root, ".timefusion_meta/cursor_snapshot.json", 2), touch(root, ".timefusion_meta/topics", 0)];
+        let segs = [touch(root, "1779989695814", 1024), touch(root, "1780994113609", 2048)];
+        let parked = [
+            touch(root, "quarantine/1779989695814_insert_corrupt_p__t.bin", 256),
+            touch(root, "quarantine/dml/1785139919343391_abc_p__t.arrow", 256),
+            touch(root, "quarantine/dml/1785139919343391_abc_p__t.meta", 256),
+        ];
 
-        // Pass 1: max_age = 1h. Both files were created just now → kept.
-        let (deleted, bytes_freed) = gc_wal_files(root, Duration::from_secs(3600), None).unwrap();
-        assert_eq!(deleted, 0);
-        assert_eq!(bytes_freed, 0);
-        assert!(f1.exists() && f2.exists());
+        let floor = floor_offset_secs.map(|secs| chrono::Utc::now().timestamp_micros() + secs * 1_000_000);
+        let swept = gc_wal_files(root, std::time::Duration::from_secs(max_age_secs), floor).unwrap();
 
-        // Pass 2: max_age = 0 → every file is past the cutoff, but
-        // `.timefusion_meta` is exempt.
-        let (deleted, bytes_freed) = gc_wal_files(root, Duration::ZERO, None).unwrap();
-        assert_eq!(deleted, 2);
-        assert_eq!(bytes_freed, 1024 + 2048);
-        assert!(!f1.exists() && !f2.exists());
-        assert!(root.join(".timefusion_meta/cursor_snapshot.json").exists(), "meta dir must be skipped");
-        assert!(root.join(".timefusion_meta/topics").exists());
+        assert!(meta.iter().all(|p| p.exists()), "meta dir must be skipped");
+        assert!(parked.iter().all(|p| p.exists()), "quarantine payloads and sidecars must never be reclaimed by GC");
+        assert_eq!(segs.iter().filter(|p| p.exists()).count(), 2 - swept.0 as usize, "the deleted count must match the segments actually gone");
+        swept
     }
 
     /// The alertable count must include BOTH the flat `quarantine/*.bin` WAL
@@ -2090,48 +2099,6 @@ mod tests {
         // Absent dir must be zero, not an error.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(quarantine_stats(empty.path()), (0, 0));
-    }
-
-    /// The GC walk deletes ANY file past the age cutoff with no name filter, so
-    /// it must never descend into `quarantine/`: those bytes are the ONLY copy
-    /// of data parked for a human.
-    #[test]
-    fn gc_wal_files_never_deletes_quarantined_data() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let wal_seg = touch(root, "1779989695814", 256);
-        let parked_wal = touch(root, "quarantine/1779989695814_insert_corrupt_p__t.bin", 256);
-        let parked_dml = touch(root, "quarantine/dml/1785139919343391_abc_p__t.arrow", 256);
-        let parked_meta = touch(root, "quarantine/dml/1785139919343391_abc_p__t.meta", 256);
-
-        // max_age=0 ⇒ everything is past the cutoff.
-        let (deleted, _) = gc_wal_files(root, std::time::Duration::ZERO, None).unwrap();
-        assert_eq!(deleted, 1, "only the WAL segment should be reclaimed");
-        assert!(!wal_seg.exists());
-        assert!(parked_wal.exists(), "WAL quarantine payload deleted by GC");
-        assert!(parked_dml.exists(), "DML quarantine payload deleted by GC");
-        assert!(parked_meta.exists(), "DML quarantine sidecar deleted by GC");
-    }
-
-    /// The durability floor must override mtime age: during a crash loop the
-    /// aged files ARE the un-flushed backlog.
-    #[test]
-    fn gc_wal_files_respects_unflushed_floor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let f = touch(root, "1770000000000", 512);
-
-        // max_age=0 alone would delete it, but the floor (minus slack) keeps
-        // every file modified since the oldest un-flushed append.
-        let floor = chrono::Utc::now().timestamp_micros() - 3600 * 1_000_000;
-        let (deleted, _) = gc_wal_files(root, std::time::Duration::ZERO, Some(floor)).unwrap();
-        assert_eq!(deleted, 0, "file newer than the un-flushed floor must survive");
-        assert!(f.exists());
-
-        // A floor far in the future imposes no extra protection beyond age.
-        let (deleted, _) = gc_wal_files(root, std::time::Duration::ZERO, Some(chrono::Utc::now().timestamp_micros() + 3600 * 1_000_000)).unwrap();
-        assert_eq!(deleted, 1);
-        assert!(!f.exists());
     }
 
     /// Boot GC gating: `clean_shutdown=true` is NOT a drain claim (shutdown

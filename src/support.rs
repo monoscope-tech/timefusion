@@ -286,6 +286,19 @@ mod tests {
         assert_eq!((performed, coalesced), (2, FOLLOWERS - 1), "all but the two leaders must be recorded as riding someone else's commit");
     }
 
+    /// Commits from a fresh caller, reporting whether its own commit actually ran
+    /// rather than riding a watermark a failed leader left behind.
+    fn next_caller_commits(group: &GroupCommit) -> bool {
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        group
+            .commit(|| {
+                ran.store(true, Ordering::Relaxed);
+                Ok::<_, &str>(())
+            })
+            .unwrap();
+        ran.load(Ordering::Relaxed)
+    }
+
     /// A panicking leader must hand leadership back. The assertion that matters
     /// is that the second call RETURNS at all; it hangs forever without `Drop`.
     #[test]
@@ -293,34 +306,15 @@ mod tests {
         let group = GroupCommit::default();
         let died = std::thread::scope(|scope| scope.spawn(|| group.commit(|| -> Result<(), &str> { panic!("disk on fire") })).join());
         assert!(died.is_err(), "the panic must reach the leader's own caller");
-
-        let committed = std::sync::atomic::AtomicBool::new(false);
-        group
-            .commit(|| {
-                committed.store(true, Ordering::Relaxed);
-                Ok::<_, &str>(())
-            })
-            .unwrap();
-        assert!(committed.load(Ordering::Relaxed), "the next caller must be able to lead; a panic must not advance the durable watermark either");
+        assert!(next_caller_commits(&group), "the next caller must be able to lead; a panic must not advance the durable watermark either");
     }
 
     /// A failed commit must not be inherited: the waiters behind it retry.
     #[test]
     fn a_failed_commit_is_not_reported_as_durable_to_the_waiters() {
         let group = GroupCommit::default();
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let first = group.commit(|| {
-            attempts.fetch_add(1, Ordering::Relaxed);
-            Err::<(), &str>("disk full")
-        });
-        assert_eq!(first, Err("disk full"));
-        group
-            .commit(|| {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, &str>(())
-            })
-            .unwrap();
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(group.commit(|| Err::<(), &str>("disk full")), Err("disk full"));
+        assert!(next_caller_commits(&group), "the waiter behind a failed commit must perform its own");
     }
 }
 

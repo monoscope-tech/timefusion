@@ -725,8 +725,7 @@ mod tests {
             covered_ranges: vec![(11, 13), (10, 12)],
         };
         let sources = vec![SourceRows { batches: vec![delta.slice(0, 2), delta.slice(2, 3)], live: BooleanBuffer::from(vec![true, true, true, false, true]) }];
-        let keys = keys();
-        let resolved = resolve_with_memory(sources, memory, &keys, Some("version"), Some("deleted"), ctx()).await?;
+        let resolved = resolve_with_memory(sources, memory, &keys(), Some("version"), Some("deleted"), ctx()).await?;
         assert_eq!(resolved.winners[0].iter().collect::<Vec<_>>(), vec![true, false, false, false, true]);
         assert_eq!(resolved.winners[1].iter().collect::<Vec<_>>(), vec![true], "memory authority suppresses even a higher version from an older flush");
         assert_eq!(resolved.sources[0].batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5, "physical rows must remain available for fallback");
@@ -754,16 +753,14 @@ mod tests {
         }];
         let winners = winner_masks(&original, &keys, Some("version"), None, ctx()).await?;
         let cached = original.iter().cloned().zip(winners).map(|(source, live)| SourceRows { live, ..source }).collect_vec();
-        for version in [None, Some(1), Some(3), Some(4)] {
-            for deleted in [None, Some(false), Some(true)] {
-                for ranges in [vec![], vec![(10, 11)], vec![(10, 12)]] {
-                    let batches = vec![batch(&[("p", "s", "a", 10, version, deleted)])];
-                    let memory = || crate::write::mem_buffer::MemSnapshot { batches: batches.clone(), covered_ranges: ranges.clone() };
-                    let expected = resolve_with_memory(original.clone(), memory(), &keys, Some("version"), Some("deleted"), ctx()).await?;
-                    let actual = resolve_with_memory(cached.clone(), memory(), &keys, Some("version"), Some("deleted"), ctx()).await?;
-                    assert_eq!(actual.winners, expected.winners, "version={version:?}, deleted={deleted:?}, ranges={ranges:?}");
-                }
-            }
+        for (version, deleted, ranges) in
+            itertools::iproduct!([None, Some(1), Some(3), Some(4)], [None, Some(false), Some(true)], [vec![], vec![(10, 11)], vec![(10, 12)]])
+        {
+            let batches = vec![batch(&[("p", "s", "a", 10, version, deleted)])];
+            let memory = || crate::write::mem_buffer::MemSnapshot { batches: batches.clone(), covered_ranges: ranges.clone() };
+            let expected = resolve_with_memory(original.clone(), memory(), &keys, Some("version"), Some("deleted"), ctx()).await?;
+            let actual = resolve_with_memory(cached.clone(), memory(), &keys, Some("version"), Some("deleted"), ctx()).await?;
+            assert_eq!(actual.winners, expected.winners, "version={version:?}, deleted={deleted:?}, ranges={ranges:?}");
         }
         Ok(())
     }
@@ -778,8 +775,7 @@ mod tests {
         let sources =
             [SourceRows { batches: vec![old], live: BooleanBuffer::new_set(rows) }, SourceRows { batches: vec![newer], live: BooleanBuffer::new_set(1) }];
         let context = datafusion::prelude::SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_batch_size(rows));
-        let keys = keys();
-        let masks = winner_masks(&sources, &keys, Some("version"), Some("deleted"), context.task_ctx()).await?;
+        let masks = winner_masks(&sources, &keys(), Some("version"), Some("deleted"), context.task_ctx()).await?;
         assert_eq!(masks[0].count_set_bits(), rows - 1);
         assert!(!masks[0].value(rows - 1), "the pre-boundary version must lose");
         assert!(masks[1].value(0), "the post-boundary newer version must win");
@@ -810,14 +806,13 @@ mod tests {
             SourceRows { batches: vec![newer], live: BooleanBuffer::new_set(5) },
             SourceRows { batches: vec![memory], live: BooleanBuffer::new_set(2) },
         ];
-        let keys = keys();
-        let masks = winner_masks(&sources, &keys, Some("version"), Some("deleted"), ctx()).await?;
+        let masks = winner_masks(&sources, &keys(), Some("version"), Some("deleted"), ctx()).await?;
         assert_eq!(
             masks.iter().map(|mask| mask.iter().collect::<Vec<_>>()).collect::<Vec<_>>(),
             vec![vec![false, true, true, false, true, false, false], vec![false, false, false, true, true], vec![true, true],]
         );
         sources[0].live = BooleanBuffer::new_set(1);
-        assert!(winner_masks(&sources, &keys, Some("version"), Some("deleted"), ctx()).await.is_err());
+        assert!(winner_masks(&sources, &keys(), Some("version"), Some("deleted"), ctx()).await.is_err());
         Ok(())
     }
 }

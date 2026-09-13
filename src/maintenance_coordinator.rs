@@ -2734,6 +2734,27 @@ mod tests {
         journal.tasks().find(|candidate| candidate.key == *key).map(|candidate| candidate.deadline_micros).expect("requeued")
     }
 
+    /// The journal WAL's size on disk — what the idempotence tests compare.
+    fn wal_len(journal: &TaskJournal) -> u64 {
+        fs::metadata(&journal.wal_path).expect("wal").len()
+    }
+
+    /// One invalidation of `[start, end)` on project "p", as ingest emits it.
+    fn invalidation(rollup_table: &'static str, start_micros: i64, end_micros: i64, observed_at_micros: i64, derived: bool) -> Invalidation<'static> {
+        Invalidation {
+            source_table: "source",
+            rollup_table,
+            source: "source",
+            project_id: "p",
+            start_micros,
+            end_micros,
+            observed_at_micros,
+            derived,
+            mint_dedup: true,
+            mint_rollup: true,
+        }
+    }
+
     /// The operation's own deadline, in micros — the floor a burned unit waits.
     fn floor_micros(operation: Operation) -> i64 {
         i64::try_from(operation_deadline_secs(operation) * 1_000_000).expect("fits")
@@ -2923,9 +2944,9 @@ mod tests {
     /// invisible. Counters are per-process under nextest, so these are exact.
     #[test]
     fn both_split_declines_are_counted() {
+        use std::sync::atomic::Ordering::Relaxed;
         let stats = crate::observability::maintenance_stats();
-        let floor0 = stats.split_declined_at_floor.load(std::sync::atomic::Ordering::Relaxed);
-        let width0 = stats.split_declined_no_width.load(std::sync::atomic::Ordering::Relaxed);
+        let (floor0, width0) = (stats.split_declined_at_floor.load(Relaxed), stats.split_declined_no_width.load(Relaxed));
 
         let (_dir, mut journal) = new_journal();
 
@@ -2937,12 +2958,8 @@ mod tests {
         let narrow_key = upserted(&mut journal, task("whale", DAY_MICROS, DAY_MICROS + MIN_SLICE_MICROS, Operation::BaseRollup));
         assert!(!journal.split_time_task(&narrow_key, 96 * MAX_DECODED_BYTES, None), "a minimum-width unit has nothing to split into");
 
-        assert_eq!(stats.split_declined_at_floor.load(std::sync::atomic::Ordering::Relaxed), floor0 + 1, "the floor decline is counted");
-        assert_eq!(
-            stats.split_declined_no_width.load(std::sync::atomic::Ordering::Relaxed),
-            width0 + 1,
-            "the no-width decline must be counted too — this is the branch that was silent"
-        );
+        assert_eq!(stats.split_declined_at_floor.load(Relaxed), floor0 + 1, "the floor decline is counted");
+        assert_eq!(stats.split_declined_no_width.load(Relaxed), width0 + 1, "the no-width decline must be counted too — this is the branch that was silent");
     }
 
     /// The guard above is only as good as the evidence it reads, and that
@@ -3024,15 +3041,15 @@ mod tests {
         let key = task("customer", 0, 1, Operation::BaseRollup).key;
         journal.enqueue(key.clone(), 10, 512, 1);
         journal.checkpoint().expect("first checkpoint");
-        let first_size = fs::metadata(&journal.wal_path).expect("wal").len();
+        let first_size = wal_len(&journal);
 
         journal.enqueue(key.clone(), 20, 512, 2);
         journal.checkpoint().expect("idempotent checkpoint");
-        assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_size);
+        assert_eq!(wal_len(&journal), first_size);
 
         journal.enqueue(key, 5, 512, 3);
         journal.checkpoint().expect("earlier deadline checkpoint");
-        assert!(fs::metadata(&journal.wal_path).expect("wal").len() > first_size);
+        assert!(wal_len(&journal) > first_size);
     }
 
     /// Scheduling order, case by case. Historical debt runs newest SLICE first,
@@ -3228,20 +3245,7 @@ mod tests {
     #[test]
     fn derived_invalidations_use_one_aligned_hour() {
         let (_dir, mut journal) = new_journal();
-        journal
-            .invalidate(Invalidation {
-                source_table: "source",
-                rollup_table: "derived",
-                source: "source",
-                project_id: "p",
-                start_micros: NORMAL_SLICE_MICROS,
-                end_micros: 2 * NORMAL_SLICE_MICROS,
-                observed_at_micros: 0,
-                derived: true,
-                mint_dedup: true,
-                mint_rollup: true,
-            })
-            .expect("invalidate");
+        journal.invalidate(invalidation("derived", NORMAL_SLICE_MICROS, 2 * NORMAL_SLICE_MICROS, 0, true)).expect("invalidate");
         let derived = journal.tasks().find(|task| task.key.operation == Operation::DerivedRollup).expect("derived task");
         assert_eq!(derived.key.slice.width(), DERIVED_SLICE_MICROS);
         assert_eq!(derived.key.slice.start_micros % DERIVED_SLICE_MICROS, 0);
@@ -3428,31 +3432,22 @@ mod tests {
         assert!(recovered.publish(&key, Publication { source_fingerprint: 9, generation: "g".to_owned(), rows: 0, source_rows: None }));
         recovered.checkpoint().expect("coverage checkpoint");
         let recovered = TaskJournal::load(dir.path()).expect("recover publication");
-        assert_eq!(recovered.published_rollups("source", "table").len(), 1);
+        let published = recovered.published_rollups("source", "table");
+        assert_eq!(published.len(), 1);
+        assert_eq!((published[0].1.rows, published[0].1.source_fingerprint), (0, 9), "an empty publication survives the restart with its fingerprint intact");
     }
 
     #[test]
     fn invalidation_is_idempotent_and_extends_the_quiet_period() {
         let (_dir, mut journal) = new_journal();
         // The same slice, re-invalidated; only `observed_at_micros` moves.
-        let observed_at = |observed_at_micros| Invalidation {
-            source_table: "source",
-            rollup_table: "rollup",
-            source: "source",
-            project_id: "p",
-            start_micros: 0,
-            end_micros: NORMAL_SLICE_MICROS,
-            observed_at_micros,
-            derived: false,
-            mint_dedup: true,
-            mint_rollup: true,
-        };
+        let observed_at = |observed_at_micros| invalidation("rollup", 0, NORMAL_SLICE_MICROS, observed_at_micros, false);
         journal.invalidate(observed_at(10)).expect("invalidate");
         journal.checkpoint().expect("first invalidation checkpoint");
-        let first_wal_size = fs::metadata(&journal.wal_path).expect("wal").len();
+        let first_wal_size = wal_len(&journal);
         journal.invalidate(observed_at(20)).expect("invalidate again");
         journal.checkpoint().expect("same-bucket checkpoint");
-        assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_wal_size, "same deadline bucket must not rewrite tasks");
+        assert_eq!(wal_len(&journal), first_wal_size, "same deadline bucket must not rewrite tasks");
         journal.invalidate(observed_at(INVALIDATION_DEADLINE_BUCKET_MICROS + 1)).expect("invalidate in next bucket");
         // Two, not three: Dedup and the rollup. HotPacking is planned by debt in
         // `plan_compaction_debt`, never minted per slice.
@@ -3546,36 +3541,30 @@ mod tests {
         assert_eq!(claimed.key.project_id, "sealed", "historical derived work must win the claim, not today's");
     }
 
-    /// A derived unit whose base TIER already exists must be claimable, even
-    /// when no `BaseRollup` journal task records that it was built.
-    #[test]
-    fn a_derived_unit_runs_when_its_base_tier_exists_without_a_journal_record() {
+    /// A derived unit whose base TIER already exists must be claimable, even when
+    /// no `BaseRollup` journal task records that it was built — through BOTH paths
+    /// that carry the proof. `prove_base_tier_for_day` is the one that reaches a
+    /// unit `enqueue` can no longer touch: a blocked derived unit stays queued,
+    /// which makes its day ineligible for backfill admission.
+    #[test_case::test_case(true ; "the backfill planner re-enqueues with the proof")]
+    #[test_case::test_case(false ; "an already-queued unit is told its base tier exists")]
+    fn a_derived_unit_runs_once_its_base_tier_is_proven(via_enqueue: bool) {
         let (_dir, mut journal) = new_journal();
-        let derived = |project: &str| derived_key(project, 0, 3_600_000_000);
+        let key = derived_key("historical", 0, 3_600_000_000);
 
         // No completed base task covers this slice, so the unit is refused.
-        journal.enqueue(derived("historical"), 0, 1, 0);
+        journal.enqueue(key.clone(), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "without evidence the dependency gate still holds");
 
-        // The backfill planner reads real tier coverage; that proof must be enough.
-        journal.enqueue_with_base_tier(derived("historical"), 0, 1, 0, true);
+        if via_enqueue {
+            // The backfill planner reads real tier coverage; that proof must be enough.
+            journal.enqueue_with_base_tier(key.clone(), 0, 1, 0, true);
+        } else {
+            let day = (0, 24 * 3_600_000_000i64);
+            assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 1, "the proof lands on an existing task");
+            assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 0, "and is idempotent");
+        }
         assert_eq!(journal.claim_next(Operation::DerivedRollup, 0, true).expect("proven base tier makes the unit claimable").key.project_id, "historical");
-    }
-
-    /// The planner must be able to prove the base tier for a task it can no longer
-    /// reach through `enqueue`: a blocked derived unit stays queued, which makes its
-    /// day ineligible for backfill admission, the only path that carries the proof.
-    #[test]
-    fn an_already_queued_derived_unit_can_still_be_told_its_base_tier_exists() {
-        let (_dir, mut journal) = new_journal();
-        let key = derived_key("p", 0, 3_600_000_000);
-        journal.enqueue(key.clone(), 0, 1, 0);
-        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: blocked by the dependency gate");
-
-        let day = (0, 24 * 3_600_000_000i64);
-        assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 1, "the proof lands on an existing task");
-        assert_eq!(journal.prove_base_tier_for_day(&key, day.0, day.1), 0, "and is idempotent");
-        assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "the unit becomes claimable without being re-enqueued");
     }
 
     /// The hygiene benefit band must separate cells at the sizes that exist, while
@@ -4262,6 +4251,19 @@ mod tests {
             .collect()
     }
 
+    /// Claims `ticks` times, re-opening each claimed unit so every tick faces the
+    /// same choice, and counts the claims matching `wanted`.
+    fn claims_matching(journal: &mut TaskJournal, operation: Operation, now: i64, ticks: usize, wanted: impl Fn(&MaintenanceTask) -> bool) -> usize {
+        let mut matched = 0;
+        for _ in 0..ticks {
+            let Some(claimed) = journal.claim_next(operation, now, true) else { continue };
+            matched += usize::from(wanted(&claimed));
+            journal.complete(&claimed.key);
+            journal.enqueue(claimed.key.clone(), 0, 0, 0);
+        }
+        matched
+    }
+
     /// Enqueues a unit stamped with the file set it reads, so fusion can price a
     /// group of children as one scan.
     fn enqueue_with_input(journal: &mut TaskJournal, key: &TaskKey, bytes: u64, input: InputFootprint) {
@@ -4370,48 +4372,37 @@ mod tests {
         assert_eq!(live, vec![DAY_MICROS], "the day unit must absorb all 144 slices, leaving one unit for the cell; got {live:?}");
     }
 
-    /// A SUPERSEDED day unit subsumes nothing: it would delete the children the
-    /// split just created, leaving the cell with no queued work at all.
-    #[test]
-    fn a_superseded_day_unit_does_not_subsume_the_children_that_replaced_it() {
+    /// A day unit that is not itself queued work subsumes nothing: a SUPERSEDED one
+    /// would delete the children the split just created, leaving the cell with no
+    /// queued work at all, and a COMPLETE one would silently lose the rebuild a
+    /// narrower later invalidation asks for.
+    #[test_case::test_case(true ; "a superseded day unit does not subsume the children that replaced it")]
+    #[test_case::test_case(false ; "a complete day unit does not subsume a later invalidation")]
+    fn a_non_pending_day_unit_does_not_subsume_the_work_under_it(superseded: bool) {
         let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
         let parent = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
-        journal.enqueue(parent.clone(), 0, 0, 0);
-        journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
-        assert_eq!(journal.state(&parent), Some(TaskState::Superseded), "the parent must be superseded for this to prove anything");
+        journal.enqueue(parent.clone(), 0, if superseded { 0 } else { 16 }, 0);
+        let expected = if superseded {
+            journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
+            TaskState::Superseded
+        } else {
+            journal.complete(&parent);
+            let start = day + 5 * NORMAL_SLICE_MICROS;
+            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
+            TaskState::Complete
+        };
+        assert_eq!(journal.state(&parent), Some(expected), "the parent must be in that state for this to prove anything");
         let children = journal.tasks().filter(|t| t.state == TaskState::Pending && t.key.operation == Operation::BaseRollup).count();
-        assert!(children > 0, "the split must have produced children");
+        assert!(children > 0, "precondition: narrow pending work exists under the parent");
 
         journal.coarsen_sealed_slices(now);
 
         assert!(
             journal.tasks().any(|t| matches!(t.state, TaskState::Pending | TaskState::Retry) && t.key.operation == Operation::BaseRollup),
-            "the split's children must survive; a superseded parent is not queued work"
-        );
-    }
-
-    /// A COMPLETE day unit subsumes nothing either: a narrower unit inside it is a
-    /// later invalidation, and dropping it would lose that rebuild silently.
-    #[test]
-    fn a_complete_day_unit_does_not_subsume_a_later_invalidation() {
-        let (_dir, mut journal) = new_journal();
-        let now = 10 * DAY_MICROS;
-        let day = 3 * DAY_MICROS;
-
-        let parent = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
-        journal.enqueue(parent.clone(), 0, 16, 0);
-        journal.complete(&parent);
-        let start = day + 5 * NORMAL_SLICE_MICROS;
-        journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
-
-        journal.coarsen_sealed_slices(now);
-
-        assert!(
-            journal.tasks().any(|t| t.state == TaskState::Pending && t.key.operation == Operation::BaseRollup),
-            "a later invalidation inside a COMPLETE day must survive"
+            "the work under a parent that is not queued work must survive"
         );
     }
 
@@ -4491,53 +4482,28 @@ mod tests {
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
     }
 
-    /// A busy pool is not an oversized unit: splitting on a transient refusal
-    /// multiplies the queue into shards that are each refused in turn.
-    #[test]
-    fn a_busy_pool_refusal_must_not_be_classed_as_a_capacity_failure() {
-        assert!(is_capacity_failure("resource_admission"), "a static over-budget estimate still splits");
-        assert!(!is_capacity_failure("admission_busy"), "but a transient busy pool must back off, not multiply the queue");
-    }
-
-    /// The occupancy ceiling is only meaningful if the request reflects the unit's
-    /// real size; a uniform max-size request makes every lane hot-loop on refusal.
-    #[test]
-    fn a_small_unit_is_admitted_by_a_pool_that_refuses_a_large_one() {
-        const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
-        // Three quarters full.
-        let ceiling = super::occupancy_scaled_ceiling(CAPACITY / 4, CAPACITY);
-        assert!(ceiling < MAX_DECODED_BYTES, "a busy pool must refuse a max-size unit");
-        assert!(
-            ceiling >= MAX_DECODED_BYTES / 16,
-            "and still admit a small one: a hygiene-sized unit must fit under the ceiling of a busy pool, or the fleet hot-loops on admission"
-        );
-    }
-
-    /// A unit priced at exactly `MAX_DECODED_BYTES` must be admissible into a pool
-    /// that is merely BUSY. `byte_bounded_units` piles its output up at that
-    /// constant, so a ceiling strictly below `MAX` would lock those units out.
-    #[test]
-    fn a_max_sized_unit_is_admitted_by_a_busy_pool_not_only_an_idle_one() {
-        const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
-        // One single unit reserved — the least busy a working pool can be.
-        let ceiling = super::occupancy_scaled_ceiling(CAPACITY - MAX_DECODED_BYTES, CAPACITY);
-        assert!(
-            ceiling >= MAX_DECODED_BYTES,
-            "a pool with ONE unit reserved refused a max-sized request (ceiling {ceiling} < {MAX_DECODED_BYTES}); \
-             every unit the splitter produces is priced at exactly that, so they can only ever run on a perfectly empty pool"
-        );
-    }
-
     /// A busy pool admits only small work, so an oversized unit is never admitted
-    /// into a position where it would have to be killed.
+    /// into a position where it would have to be killed — but the ceiling is only
+    /// meaningful if it still admits the sizes the splitter actually produces.
     #[test]
     fn the_admission_ceiling_shrinks_as_the_pool_fills() {
         const CAPACITY: u64 = MAX_DECODED_BYTES * 16;
         let ceiling = |free| super::occupancy_scaled_ceiling(free, CAPACITY);
         assert_eq!(ceiling(CAPACITY), MAX_DECODED_BYTES, "an idle pool admits the largest unit");
         assert!(ceiling(CAPACITY / 4) < MAX_DECODED_BYTES, "a three-quarters-full pool admits less");
+        assert!(
+            ceiling(CAPACITY / 4) >= MAX_DECODED_BYTES / 16,
+            "and still admit a small one: a hygiene-sized unit must fit under the ceiling of a busy pool, or the fleet hot-loops on admission"
+        );
         assert!(ceiling(0) >= MAX_DECODED_BYTES / 16, "but a full pool must still admit the small hygiene bins, or file counts run away");
         assert!(ceiling(CAPACITY / 2) > ceiling(CAPACITY / 4), "and the ceiling must be monotone in free space");
+        // One single unit reserved — the least busy a working pool can be.
+        let one_reserved = ceiling(CAPACITY - MAX_DECODED_BYTES);
+        assert!(
+            one_reserved >= MAX_DECODED_BYTES,
+            "a pool with ONE unit reserved refused a max-sized request (ceiling {one_reserved} < {MAX_DECODED_BYTES}); \
+             every unit the splitter produces is priced at exactly that, so they can only ever run on a perfectly empty pool"
+        );
     }
 
     /// Fusion must not refuse a group priced against its PARTITION just because
@@ -4873,17 +4839,7 @@ mod tests {
             journal.enqueue(frontier, 0, 0, 0);
             journal.enqueue(sealed, 0, 0, 0);
             journal.frontier_lag_secs.store(lag, std::sync::atomic::Ordering::Relaxed);
-            let mut sealed_claims = 0;
-            for _ in 0..8 {
-                let Some(claimed) = journal.claim_next(Operation::BaseRollup, now, true) else { continue };
-                if !is_live_frontier(claimed.key.slice, now) {
-                    sealed_claims += 1;
-                }
-                journal.complete(&claimed.key);
-                // Re-open both so every tick has a choice to make.
-                journal.enqueue(claimed.key.clone(), 0, 0, 0);
-            }
-            sealed_claims
+            claims_matching(&mut journal, Operation::BaseRollup, now, 8, |claimed| !is_live_frontier(claimed.key.slice, now))
         };
 
         assert!(claims(0) > 0, "a keeping-up frontier must still leave sealed work its reserved share");
@@ -4914,16 +4870,8 @@ mod tests {
         journal.enqueue(ancient.clone(), 0, 0, 0);
         journal.enqueue(inside.clone(), 0, 0, 0);
 
-        let mut inside_claims = 0;
-        for _ in 0..16 {
-            let Some(claimed) = journal.claim_next(Operation::Dedup, now, true) else { continue };
-            if claimed.key == inside {
-                inside_claims += 1;
-            }
-            journal.complete(&claimed.key);
-            // Re-open both, so the ancient unit is always available to win again.
-            journal.enqueue(claimed.key.clone(), 0, 0, 0);
-        }
+        // Every claim is re-opened, so the ancient unit is always available to win again.
+        let inside_claims = claims_matching(&mut journal, Operation::Dedup, now, 16, |claimed| claimed.key == inside);
         assert!(
             inside_claims > 0,
             "a unit inside the horizon must get a claim; without a reserved turn the past-horizon unit wins every tick \
@@ -4957,17 +4905,22 @@ mod tests {
     }
 
     /// Classification is string-based because the DataFusion error arrives
-    /// type-erased through delta-rs/anyhow; these strings are the contract.
-    #[test]
-    fn capacity_failures_are_recognised_from_prod_text() {
-        assert!(is_capacity_failure(
-            "dedup: Not enough memory to continue external sort. Consider increasing the memory limit config: \
-             'datafusion.runtime.memory_limit', or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'."
-        ));
-        assert!(is_capacity_failure("compaction: Resources exhausted: Additional allocation failed for ExternalSorter[1] with top memory consumers"));
-        for benign in ["dedup: Object at location ... not found", "compaction: transaction failed: version 2667 already exists", "source_not_flushed"] {
-            assert!(!is_capacity_failure(benign), "must not shrink a slice over a fault that has nothing to do with size: {benign}");
-        }
+    /// type-erased through delta-rs/anyhow; these strings are the contract. A slice
+    /// must not shrink over a fault that has nothing to do with size, and a busy
+    /// pool is not an oversized unit: splitting on a transient refusal multiplies
+    /// the queue into shards that are each refused in turn.
+    #[test_case::test_case("resource_admission" => true ; "a static over-budget estimate still splits")]
+    #[test_case::test_case("admission_busy" => false ; "a transient busy pool must back off, not multiply the queue")]
+    #[test_case::test_case(
+        "dedup: Not enough memory to continue external sort. Consider increasing the memory limit config: \
+         'datafusion.runtime.memory_limit', or decreasing the config: 'datafusion.execution.sort_spill_reservation_bytes'."
+        => true ; "the sort-OOM wording")]
+    #[test_case::test_case("compaction: Resources exhausted: Additional allocation failed for ExternalSorter[1] with top memory consumers" => true ; "pool exhaustion")]
+    #[test_case::test_case("dedup: Object at location ... not found" => false ; "a missing object has nothing to do with size")]
+    #[test_case::test_case("compaction: transaction failed: version 2667 already exists" => false ; "a commit conflict has nothing to do with size")]
+    #[test_case::test_case("source_not_flushed" => false ; "a dependency failure has nothing to do with size")]
+    fn capacity_failures_are_recognised_from_prod_text(failure: &str) -> bool {
+        is_capacity_failure(failure)
     }
 
     /// There must be exactly ONE capacity classifier. A local copy that misses the

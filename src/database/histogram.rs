@@ -1051,6 +1051,7 @@ mod tests {
     async fn tantivy_unique_partition_uses_exact_count_proof_and_declines_new_versions() -> Result<()> {
         use crate::support::test_helpers::{json_to_batch_for, minio_test_config};
         use crate::tantivy::search::{TantivyIndexService, parquet_rel_of_uri};
+        use serde_json::Value;
         let dir = tempfile::tempdir()?;
         let project = format!("p-{}", uuid::Uuid::new_v4());
         let config = minio_test_config(&project, &dir.path().to_string_lossy());
@@ -1065,12 +1066,15 @@ mod tests {
         let db = super::super::Database::with_config(config.clone()).await?.with_tantivy_search(search.clone()).with_tantivy_indexer(indexer.clone());
         let table = "mor_versioned";
         let timestamp = chrono::Utc::now().timestamp_micros() - DAY_MICROS;
-        let date = chrono::DateTime::from_timestamp_micros(timestamp).unwrap().date_naive().to_string();
+        let date_of = |ts: i64| chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+        let date = date_of(timestamp);
         let hash = "a".repeat(2048);
         let row =
             |id: &str, tag: &str| serde_json::json!({"project_id": project, "timestamp": timestamp, "date": date, "id": id, "name": tag, "hashes": [tag]});
+        let (dbr, proj) = (&db, project.as_str());
+        let insert = |rows: Vec<Value>| async move { dbr.insert_records_batch(proj, table, vec![json_to_batch_for(table, rows)?], true, None).await };
         let records = (0..4).map(|id| row(&id.to_string(), &hash)).collect();
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, records)?], true, None).await?;
+        insert(records).await?;
         let build_indexes = || async {
             let table_ref = db.resolve_table(&project, table).await?;
             let store = table_ref.read().await.log_store().object_store(None);
@@ -1115,10 +1119,8 @@ mod tests {
         let window = HistogramWindow::new(timestamp, timestamp + 1, 1_000_000, 0, 2)?;
         let membership = Membership::Contains { column: "hashes".into(), value: hash.clone() };
         let context = Arc::new(TaskContext::default());
-        assert!(
-            db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(),
-            "index coverage alone cannot prove visibility"
-        );
+        let indexed = || async { db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await };
+        assert!(indexed().await.is_err(), "index coverage alone cannot prove visibility");
         let absent = Membership::Contains { column: "hashes".into(), value: "absent".into() };
         let mut empty = db.capture_histogram(&project, table, window, Some(&absent), 64, context.clone()).await?;
         for result in [empty.count().await, empty.count_streaming().await] {
@@ -1175,20 +1177,17 @@ mod tests {
         let persisted = db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
         assert_eq!(persisted.counts, result.counts, "persisted proof survives winner-cache eviction and manifest reload");
         assert_eq!(persisted.scanned_sources, 0);
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("0", "b")])?], true, None).await?;
+        insert(vec![row("0", "b")]).await?;
         build_indexes().await?;
         assert_eq!(captured.count().await?.counts.values().sum::<u64>(), 4, "the retained proof belongs to the old file set");
-        assert!(db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(), "new files invalidate the old proof");
+        assert!(indexed().await.is_err(), "new files invalidate the old proof");
         assert_eq!(db.build_histogram_count_proof(&partition).await?, None, "duplicate physical keys cannot receive a uniqueness proof");
         db.build_logical_count_partition(&partition, true).await?;
-        assert!(
-            db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(),
-            "logical count smaller than physical count cannot authorize index-only counting"
-        );
+        assert!(indexed().await.is_err(), "logical count smaller than physical count cannot authorize index-only counting");
         assert_eq!(db.indexed_histogram(&project, table, window, Some(&membership), 1024 * 1024, context.clone()).await?.counts.values().sum::<u64>(), 3);
         // One dirty day's hash arrays exceed the former 64 MiB decoded limit.
         let wide_timestamp = timestamp - 3 * DAY_MICROS;
-        let wide_date = chrono::DateTime::from_timestamp_micros(wide_timestamp).unwrap().date_naive().to_string();
+        let wide_date = date_of(wide_timestamp);
         let wide_row = |id: usize, tag: &str| {
             let mut record = row(&id.to_string(), tag);
             record["timestamp"] = serde_json::json!(wide_timestamp);
@@ -1202,8 +1201,8 @@ mod tests {
                 record
             })
             .collect();
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, records)?], true, None).await?;
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![wide_row(0, "b")])?], true, None).await?;
+        insert(records).await?;
+        insert(vec![wide_row(0, "b")]).await?;
         build_indexes().await?;
         let wide_window = HistogramWindow::new(wide_timestamp, wide_timestamp + 1, 1_000_000, 0, 2)?;
         let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
@@ -1221,28 +1220,26 @@ mod tests {
         let result = wide.count_streaming().await?;
         assert_eq!(result.counts.values().sum::<u64>(), 64);
         assert_eq!(result.scanned_sources, 0, "wide hashes stay in the index during version resolution");
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![wide_row(1, "b")])?], true, None).await?;
+        insert(vec![wide_row(1, "b")]).await?;
         let mut partial = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context.clone()).await?;
         let result = partial.count_streaming().await?;
         assert_eq!(result.counts.values().sum::<u64>(), 63, "an unindexed replacement must suppress its indexed old version");
         assert_eq!(result.scanned_sources, 1);
-        let cache_hits = search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
+        let cache_hits = || search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
+        let before = cache_hits();
         let prepares = search.stats.histogram_parquet_prepares.load(Ordering::Relaxed);
         assert_eq!(partial.count_streaming().await?.counts, result.counts, "repeated partial histograms preserve exact buckets");
         assert_eq!(search.stats.histogram_parquet_prepares.load(Ordering::Relaxed) - prepares, 1, "only the unindexed replacement needs Parquet metadata");
-        assert!(
-            search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed) > cache_hits,
-            "repeated streaming histograms must reuse captured Delta visibility"
-        );
+        assert!(cache_hits() > before, "repeated streaming histograms must reuse captured Delta visibility");
         let saved_memory = std::mem::take(&mut partial.memory);
         for (id, tag, deleted, expected) in [(66, hash.as_str(), false, 64), (2, "b", false, 62), (2, hash.as_str(), true, 62)] {
             let mut record = wide_row(id, tag);
             record["updated_at"] = serde_json::json!(chrono::Utc::now().timestamp_micros() + DAY_MICROS);
             record["deleted"] = serde_json::json!(deleted);
             partial.memory.batches = vec![json_to_batch_for(table, vec![record])?];
-            let before = search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
+            let before = cache_hits();
             assert_eq!(partial.count_streaming().await?.counts.values().sum::<u64>(), expected, "fresh memory insert/update/delete overrides cached Delta");
-            assert_eq!(search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed), before, "overlapping memory must decline cached masks");
+            assert_eq!(cache_hits(), before, "overlapping memory must decline cached masks");
         }
         partial.memory.batches.clear();
         partial.memory.covered_ranges = vec![(wide_timestamp, wide_timestamp + 1)];
@@ -1252,9 +1249,9 @@ mod tests {
             let mut record = wide_row(66, &hash);
             record["timestamp"] = serde_json::json!(wide_timestamp + DAY_MICROS);
             partial.memory.batches = vec![json_to_batch_for(table, vec![record; rows])?];
-            let before = search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed);
+            let before = cache_hits();
             assert_eq!(partial.count_streaming().await?.counts, result.counts, "unrelated memory has a fresh correctly sized mask");
-            assert!(search.stats.histogram_delta_cache_hits.load(Ordering::Relaxed) > before);
+            assert!(cache_hits() > before);
         }
         partial.memory = saved_memory;
         assert_eq!(wide.count_streaming().await?.counts.values().sum::<u64>(), 64, "later writes cannot replace captured sources");
@@ -1272,7 +1269,7 @@ mod tests {
                 record
             })
             .collect();
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, records)?], true, None).await?;
+        insert(records).await?;
         let narrow = db.capture_histogram(&project, table, wide_window, Some(&membership), 64 * 1024 * 1024, wide_context).await?;
         assert_eq!(narrow.count_streaming().await?.counts.values().sum::<u64>(), 63, "out-of-window keys must not force a daily sort or spill");
         drop(narrow.cache.reserve(32 * 1024 * 1024, &pool)?);
@@ -1292,12 +1289,9 @@ mod tests {
             .await?;
         table_guard.state = Some(committed.snapshot().clone());
         drop(table_guard);
-        assert!(
-            db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await.is_err(),
-            "a same-path DV change invalidates the cached proof"
-        );
+        assert!(indexed().await.is_err(), "a same-path DV change invalidates the cached proof");
         assert_eq!(db.build_histogram_count_proof(&partition).await?, Some(4));
-        let result = db.indexed_histogram(&project, table, window, Some(&membership), 64, context.clone()).await?;
+        let result = indexed().await?;
         assert_eq!(result.counts.values().sum::<u64>(), 3);
         assert_eq!(result.scanned_sources, 0, "a newly proven unique partition counts through its pinned DV mask");
         assert_eq!(captured.count().await?.counts.values().sum::<u64>(), 4, "old capture retains pre-DV visibility");
@@ -1316,17 +1310,17 @@ mod tests {
         assert!(error.to_string().contains("resident cache budget"), "the same input must exceed the disabled winner cache: {error}");
         let mut tombstone = row("deleted-row", "b");
         tombstone["deleted"] = serde_json::json!(true);
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![tombstone])?], true, None).await?;
+        insert(vec![tombstone]).await?;
         assert_eq!(db.build_histogram_count_proof(&partition).await?, None, "physical tombstones cannot be certified as live rows");
         let batch_rows = super::super::build_optimize_session_state(1, db.maintenance_runtime_env()).config().options().execution.batch_size;
         let dense_timestamp = timestamp - DAY_MICROS;
-        let dense_date = chrono::DateTime::from_timestamp_micros(dense_timestamp).unwrap().date_naive().to_string();
+        let dense_date = date_of(dense_timestamp);
         let dense_row = |id: usize| serde_json::json!({"project_id": project, "timestamp": dense_timestamp, "date": dense_date, "id": format!("{id:08}")});
         let rows = 2 * batch_rows + 1;
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, (0..rows).map(dense_row).collect())?], true, None).await?;
+        insert((0..rows).map(dense_row).collect()).await?;
         let dense_partition = crate::read::CountPartition { date: dense_date.clone(), ..partition.clone() };
         assert_eq!(db.build_histogram_count_proof(&dense_partition).await?, Some(u64::try_from(rows)?), "unique keys span several output batches");
-        db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![dense_row(batch_rows - 1)])?], true, None).await?;
+        insert(vec![dense_row(batch_rows - 1)]).await?;
         assert_eq!(db.build_histogram_count_proof(&dense_partition).await?, None, "duplicate keys at a sorted batch boundary must decline");
         Ok(())
     }
@@ -1348,6 +1342,13 @@ mod tests {
             keys: vec!["timestamp".into()],
             tiebreak: None,
         };
+        let dv = |path: &str, offset, size_in_bytes| deltalake::kernel::DeletionVectorDescriptor {
+            storage_type: deltalake::kernel::StorageType::UuidRelativePath,
+            path_or_inline_dv: path.into(),
+            offset,
+            size_in_bytes,
+            cardinality: 1,
+        };
         let entry = |key| -> Result<Arc<CachedDelta>> {
             let reservation = MemoryConsumer::new("cache-test").register(&pool);
             reservation.try_grow(HistogramDeltaCache::MAX_RESIDENT_BYTES)?;
@@ -1364,15 +1365,7 @@ mod tests {
                 3 => changed.files[0].partition_values.insert("project".into(), Some("other".into())).map(|_| ()).unwrap(),
                 4 => changed.keys.push("id".into()),
                 5 => changed.tiebreak = Some("updated_at".into()),
-                6 => {
-                    changed.files[0].deletion_vector = Some(deltalake::kernel::DeletionVectorDescriptor {
-                        storage_type: deltalake::kernel::StorageType::UuidRelativePath,
-                        path_or_inline_dv: "dv".into(),
-                        offset: Some(1),
-                        size_in_bytes: 10,
-                        cardinality: 1,
-                    })
-                }
+                6 => changed.files[0].deletion_vector = Some(dv("dv", Some(1), 10)),
                 _ => changed.schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Utf8, true)])),
             }
             assert!(cache.get(&changed).is_none(), "changed identity field {field} must miss");
@@ -1400,15 +1393,7 @@ mod tests {
                 0 => changed.bounds.start += 1,
                 1 => changed.bounds.end += 1,
                 2 => changed.tombstone = Some("deleted".into()),
-                _ => {
-                    changed.delta.files[0].deletion_vector = Some(deltalake::kernel::DeletionVectorDescriptor {
-                        storage_type: deltalake::kernel::StorageType::UuidRelativePath,
-                        path_or_inline_dv: "new-dv".into(),
-                        offset: Some(0),
-                        size_in_bytes: 8,
-                        cardinality: 1,
-                    })
-                }
+                _ => changed.delta.files[0].deletion_vector = Some(dv("new-dv", Some(0), 8)),
             }
             assert!(cache.visibility(&changed).is_none(), "visibility identity field {field} must invalidate reuse");
         }

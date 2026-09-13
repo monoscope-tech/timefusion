@@ -1828,30 +1828,28 @@ mod tests {
         assert_eq!(parquet_variant::VariantPath::try_from(path.as_str()).unwrap().len(), 3);
     }
 
-    #[test]
-    fn percentile_agg_state_is_bounded() {
-        let mut digest = TDigestWrapper::default();
-        digest.insert_batch((0..100_000).map(|value| value as f64));
-        assert!(digest.to_bytes().unwrap().len() < 10_000, "percentile state must not grow with input rows");
+    /// A t-digest holding `values`.
+    fn digest(values: impl IntoIterator<Item = f64>) -> TDigestWrapper {
+        let mut wrapper = TDigestWrapper::default();
+        wrapper.insert_batch(values);
+        wrapper
     }
 
     #[test]
-    fn percentile_agg_merge_preserves_tail_estimate() {
-        let mut left = TDigestWrapper::default();
-        let mut right = TDigestWrapper::default();
-        left.insert_batch((0..50_000).map(|value| value as f64));
-        right.insert_batch((50_000..100_000).map(|value| value as f64));
-        left.merge(&right);
+    fn percentile_agg_state_is_bounded_and_merge_preserves_the_tail() {
+        assert!(TDigestWrapper::default().digest.is_none(), "no digest until a batch arrives");
+        assert!(digest(vec![10.0, 20.0]).digest.is_some(), "a batch creates the digest");
+        assert!(digest((0..100_000).map(|value| value as f64)).to_bytes().unwrap().len() < 10_000, "percentile state must not grow with input rows");
 
-        assert!(left.to_bytes().unwrap().len() < 10_000);
-        assert!((left.digest.as_ref().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0);
+        let mut left = digest((0..50_000).map(|value| value as f64));
+        left.merge(&digest((50_000..100_000).map(|value| value as f64)));
+        assert!(left.to_bytes().unwrap().len() < 10_000, "a merged state stays bounded too");
+        assert!((left.digest.as_ref().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0, "merge preserves the p95 tail estimate");
     }
 
     #[tokio::test]
     async fn tdigest_merge_merges_serialized_percentile_states() {
-        let mut ctx = datafusion::prelude::SessionContext::new();
-        register_custom_functions(&mut ctx).expect("functions register");
-        let batches = ctx
+        let batches = udf_ctx()
             .sql(
                 "SELECT approx_percentile(0.95, tdigest_merge(digest)) FROM (\
                    SELECT percentile_agg(value) AS digest FROM (VALUES (1.0), (2.0), (3.0)) AS low(value) \
@@ -1868,11 +1866,16 @@ mod tests {
         assert!(values.value(0) > 90.0);
     }
 
+    /// A session with the real registered UDFs — the fixture every query test starts from.
+    fn udf_ctx() -> datafusion::prelude::SessionContext {
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        register_custom_functions(&mut ctx).expect("functions register");
+        ctx
+    }
+
     /// The one UTF-8 string a query returns, through the real registered UDFs.
     async fn text(sql: &str) -> String {
-        let mut ctx = datafusion::prelude::SessionContext::new();
-        register_custom_functions(&mut ctx).unwrap();
-        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let batches = udf_ctx().sql(sql).await.unwrap().collect().await.unwrap();
         batches[0].column(0).as_any().downcast_ref::<StringViewArray>().unwrap().value(0).to_string()
     }
 
@@ -1923,18 +1926,13 @@ mod tests {
         text(&format!("SELECT to_char({ts}, '{fmt}') AS s")).await
     }
 
-    /// PG parity: `to_jsonb(text[])` produces an array of JSON *strings*. Elements
-    /// that happen to look like JSON must NOT be re-parsed into objects/arrays.
+    /// The rendered text already pins that elements are JSON strings; this pins that
+    /// it still *parses back* as an array of strings, not objects/arrays.
     #[tokio::test]
     async fn test_to_jsonb_text_array_elements_stay_strings() {
         let array = text(r#"SELECT to_jsonb(make_array('{"a":1}', '[1,2]', 'plain', '123')) AS s"#).await;
-        assert_eq!(array, r#"["{\"a\":1}","[1,2]","plain","123"]"#);
         let parsed: serde_json::Value = serde_json::from_str(&array).unwrap();
         assert!(parsed.as_array().unwrap().iter().all(serde_json::Value::is_string), "elements must stay strings: {parsed}");
-        // Top-level Utf8 scalars keep the JSON sniff, so JSON-bearing columns surface as JSON.
-        assert_eq!(text(r#"SELECT to_jsonb('{"a":1}') AS s"#).await, r#"{"a":1}"#);
-        // to_json shares array_to_json_values, so the same rule applies.
-        assert_eq!(text(r#"SELECT to_json(make_array('{"a":1}')) AS s"#).await, r#"["{\"a\":1}"]"#);
     }
 
     /// LargeList and FixedSizeList must keep list structure and follow the same
@@ -1942,20 +1940,20 @@ mod tests {
     #[test]
     fn test_large_and_fixed_size_list_to_json_values() {
         use datafusion::arrow::array::{FixedSizeListBuilder, GenericListBuilder, StringViewBuilder};
-        let expected = vec![serde_json::json!([r#"{"a":1}"#, "plain"])];
+        let elements = [r#"{"a":1}"#, "plain"];
+        let expected = vec![serde_json::json!(elements)];
+
         let mut b = GenericListBuilder::<i64, _>::new(StringViewBuilder::new());
-        b.values().append_value(r#"{"a":1}"#);
-        b.values().append_value("plain");
+        elements.into_iter().for_each(|value| b.values().append_value(value));
         b.append(true);
         let arr: ArrayRef = Arc::new(b.finish());
-        assert_eq!(array_to_json_values(&arr).unwrap(), expected);
+        assert_eq!(array_to_json_values(&arr).unwrap(), expected, "LargeList");
 
         let mut b = FixedSizeListBuilder::new(StringViewBuilder::new(), 2);
-        b.values().append_value(r#"{"a":1}"#);
-        b.values().append_value("plain");
+        elements.into_iter().for_each(|value| b.values().append_value(value));
         b.append(true);
         let arr: ArrayRef = Arc::new(b.finish());
-        assert_eq!(array_to_json_values(&arr).unwrap(), expected);
+        assert_eq!(array_to_json_values(&arr).unwrap(), expected, "FixedSizeList");
     }
 
     /// `json_build_array` must stay linear in rows (not O(rows² × args)) and must
@@ -1986,43 +1984,23 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_tdigest_wrapper() {
-        assert!(TDigestWrapper::default().digest.is_none());
-        let mut wrapper = TDigestWrapper::default();
-        wrapper.insert_batch(vec![10.0, 20.0]);
-        assert!(wrapper.digest.is_some());
-    }
-
-    #[test]
     fn test_parse_interval_to_micros() {
-        // Both spellings — `N unit` and the space-less `Nunit` — for every unit alias.
-        let cases: &[(&str, i64)] = &[
-            ("1 second", 1_000_000),
-            ("5 seconds", 5_000_000),
-            ("1 minute", 60_000_000),
-            ("5 minutes", 300_000_000),
-            ("1 hour", 3_600_000_000),
-            ("2 hours", 7_200_000_000),
-            ("1 day", 86_400_000_000),
-            ("1 week", 604_800_000_000),
-            ("5 min", 300_000_000),
-            ("5 mins", 300_000_000),
-            ("5 m", 300_000_000),
-            ("1second", 1_000_000),
-            ("5seconds", 5_000_000),
-            ("1minute", 60_000_000),
-            ("5minutes", 300_000_000),
-            ("30m", 1_800_000_000),
-            ("1h", 3_600_000_000),
-            ("2h", 7_200_000_000),
-            ("1d", 86_400_000_000),
-            ("1w", 604_800_000_000),
-            ("5min", 300_000_000),
-            ("5mins", 300_000_000),
-            ("5s", 5_000_000),
+        // Every spelling of one unit — `N unit`, the space-less `Nunit`, and each alias.
+        let cases: &[(i64, &[&str])] = &[
+            (1_000_000, &["1 second", "1second"]),
+            (5_000_000, &["5 seconds", "5seconds", "5s"]),
+            (60_000_000, &["1 minute", "1minute"]),
+            (300_000_000, &["5 minutes", "5minutes", "5 min", "5min", "5 mins", "5mins", "5 m"]),
+            (1_800_000_000, &["30m"]),
+            (3_600_000_000, &["1 hour", "1h"]),
+            (7_200_000_000, &["2 hours", "2h"]),
+            (86_400_000_000, &["1 day", "1d"]),
+            (604_800_000_000, &["1 week", "1w"]),
         ];
-        for (input, expected) in cases {
-            assert_eq!(parse_interval_to_micros(input).unwrap(), *expected, "interval: {input}");
+        for (expected, spellings) in cases {
+            for input in *spellings {
+                assert_eq!(parse_interval_to_micros(input).unwrap(), *expected, "interval: {input}");
+            }
         }
         // No unit, no number, non-numeric value, unit-before-number, and overflow.
         for bad in ["invalid", "5", "abc minutes", "m5", "9223372036854 weeks"] {
@@ -2030,12 +2008,17 @@ mod tests {
         }
     }
 
-    /// `row_to_json` is PG's `to_json` over a record. Keys come out SORTED (PG
+    /// PG parity for JSON rendering. `to_jsonb(text[])` yields an array of JSON
+    /// *strings* — elements that happen to look like JSON must NOT be re-parsed.
+    /// `row_to_json` is PG's `to_json` over a record; its keys come out SORTED (PG
     /// `jsonb` order, not `json` column order) because serde_json's Map is a BTreeMap.
+    #[test_case::test_case(r#"SELECT to_jsonb(make_array('{"a":1}', '[1,2]', 'plain', '123')) AS s"# => r#"["{\"a\":1}","[1,2]","plain","123"]"# ; "text array elements stay strings")]
+    #[test_case::test_case(r#"SELECT to_jsonb('{"a":1}') AS s"# => r#"{"a":1}"# ; "a top level utf8 scalar keeps the JSON sniff")]
+    #[test_case::test_case(r#"SELECT to_json(make_array('{"a":1}')) AS s"# => r#"["{\"a\":1}"]"# ; "to_json shares array_to_json_values")]
     #[test_case::test_case("SELECT row_to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "row_to_json of a struct")]
     #[test_case::test_case("SELECT to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "to_json of a struct column")]
     #[tokio::test]
-    async fn row_to_json_renders_a_struct_as_a_json_object(sql: &str) -> String {
+    async fn json_rendering_matches_postgres(sql: &str) -> String {
         text(sql).await
     }
 
@@ -2044,10 +2027,7 @@ mod tests {
     /// analyzer rule could rewrite it. Use the struct form above.
     #[tokio::test]
     async fn bare_relation_alias_is_still_unsupported() {
-        use datafusion::prelude::SessionContext;
-        let mut ctx = SessionContext::new();
-        register_custom_functions(&mut ctx).unwrap();
-        let error = ctx.sql("SELECT row_to_json(t) FROM (SELECT 1 AS total) t").await.unwrap_err().to_string();
+        let error = udf_ctx().sql("SELECT row_to_json(t) FROM (SELECT 1 AS total) t").await.unwrap_err().to_string();
         assert!(error.contains("No field named t"), "unexpected error: {error}");
     }
 }

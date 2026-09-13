@@ -130,8 +130,17 @@ mod liveness_clock_tests {
     };
     use std::time::Duration;
 
+    /// Every liveness test here runs against the same 30s idle window, uncapped.
+    async fn run_capped<T>(progress: &Arc<AtomicU64>, work: impl std::future::Future<Output = T>) -> Result<T, tokio::time::error::Elapsed> {
+        super::run_until_idle_capped(Duration::from_secs(30), None, Arc::clone(progress), work).await
+    }
+
+    async fn physical(ctx: &SessionContext, sql: &str) -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+        ctx.sql(sql).await.expect("sql").create_physical_plan().await.expect("physical")
+    }
+
     /// 100s of work in five 20s steps, against a 30s idle window.
-    async fn five_steps_under_a_30s_window(progress: &Arc<AtomicU64>, step: impl Fn()) -> Option<&'static str> {
+    async fn five_steps_under_a_30s_window(progress: &Arc<AtomicU64>, step: impl Fn()) {
         let work = async {
             for _ in 0..5 {
                 tokio::time::sleep(Duration::from_secs(20)).await;
@@ -139,7 +148,7 @@ mod liveness_clock_tests {
             }
             "committed"
         };
-        super::run_until_idle_capped(Duration::from_secs(30), None, Arc::clone(progress), work).await.ok()
+        assert_eq!(run_capped(progress, work).await.ok(), Some("committed"), "100s of steady progress must survive a 30s idle window");
     }
 
     /// A unit that is still writing rows outlives its idle window.
@@ -147,11 +156,10 @@ mod liveness_clock_tests {
     async fn work_that_keeps_writing_rows_outlives_its_idle_window() {
         let progress = Arc::new(AtomicU64::new(0));
         let ticker = Arc::clone(&progress);
-        let result = five_steps_under_a_30s_window(&progress, move || {
+        five_steps_under_a_30s_window(&progress, move || {
             ticker.fetch_add(1, Relaxed);
         })
         .await;
-        assert_eq!(result, Some("committed"), "100s of steady progress must survive a 30s idle window");
     }
 
     /// A write loop deep inside the unit keeps the clock alive through
@@ -159,7 +167,7 @@ mod liveness_clock_tests {
     #[tokio::test(start_paused = true)]
     async fn a_deep_write_loop_keeps_its_unit_alive() {
         let progress = Arc::new(AtomicU64::new(0));
-        assert_eq!(five_steps_under_a_30s_window(&progress, || super::note_unit_progress(1_000)).await, Some("committed"));
+        five_steps_under_a_30s_window(&progress, || super::note_unit_progress(1_000)).await;
         assert_eq!(progress.load(Relaxed), 5_000, "the task-local reached the counter the clock reads");
     }
 
@@ -176,7 +184,7 @@ mod liveness_clock_tests {
             }
             Ok::<_, anyhow::Error>("committed")
         };
-        let result = super::run_until_idle_capped(Duration::from_secs(30), None, progress, work).await??;
+        let result = run_capped(&progress, work).await??;
         assert_eq!(result, "committed", "completed short queries must prevent a false idle timeout");
         Ok(())
     }
@@ -194,7 +202,7 @@ mod liveness_clock_tests {
         super::UNIT_PROGRESS
             .scope(Arc::clone(&progress), async {
                 let ctx = SessionContext::new();
-                let plan = ctx.sql("SELECT 1 AS a UNION ALL SELECT 2 ORDER BY a").await.expect("plan").create_physical_plan().await.expect("physical");
+                let plan = physical(&ctx, "SELECT 1 AS a UNION ALL SELECT 2 ORDER BY a").await;
                 let watch = super::PlanProgress::watch(Arc::clone(&plan));
                 datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("collect");
                 // One tick past the watcher's interval.
@@ -241,7 +249,7 @@ mod liveness_clock_tests {
         let ctx = SessionContext::new();
         ctx.register_parquet("t", dir.path().to_str().expect("utf8"), ParquetReadOptions::default()).await.expect("register");
         async fn scanned(ctx: &SessionContext, sql: &str) -> (u64, u64) {
-            let plan = ctx.sql(sql).await.expect("sql").create_physical_plan().await.expect("physical");
+            let plan = physical(ctx, sql).await;
             datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await.expect("collect");
             (super::plan_metric_sum(plan.as_ref(), "bytes_scanned"), super::plan_metric_sum(plan.as_ref(), "files_processed"))
         }
@@ -276,8 +284,7 @@ mod liveness_clock_tests {
         super::UNIT_PROGRESS
             .scope(Arc::clone(&progress), async {
                 let ctx = SessionContext::new();
-                let plan = ctx.sql("SELECT 1 AS a").await.expect("plan").create_physical_plan().await.expect("physical");
-                drop(super::PlanProgress::watch(plan));
+                drop(super::PlanProgress::watch(physical(&ctx, "SELECT 1 AS a").await));
                 tokio::time::sleep(Duration::from_secs(120)).await;
             })
             .await;
@@ -287,8 +294,7 @@ mod liveness_clock_tests {
     #[tokio::test(start_paused = true)]
     async fn work_that_writes_nothing_is_given_up_on() {
         let progress = Arc::new(AtomicU64::new(0));
-        let stalled = async { std::future::pending::<&str>().await };
-        let result = super::run_until_idle_capped(Duration::from_secs(30), None, progress, stalled).await;
+        let result = run_capped(&progress, std::future::pending::<&str>()).await;
         assert!(result.is_err(), "an idle unit must not hold its worker forever");
     }
 
@@ -7805,18 +7811,27 @@ mod certify_on_completion_tests {
         masked: Option<Vec<DvEntry>>,
     }
 
-    /// Seeds a cross-file duplicate on a sealed past day (two Delta commits → two files),
-    /// snapshots the pre-state the certification guard compares against, and runs ONE dedup
-    /// pass, asserting the single drop so each arm below states only what is distinct.
-    async fn dedup_pass(cfg: Arc<crate::config::AppConfig>) -> Result<Pass> {
+    /// Seeds a cross-file duplicate (`dup_id`) on a sealed past day — two Delta commits, so two
+    /// files — plus one `extra` row per id in the FIRST file.
+    async fn seed_dup_day(cfg: Arc<crate::config::AppConfig>, extra: &[&str]) -> Result<(Database, String, chrono::NaiveDate, Arc<RwLock<DeltaTable>>)> {
         let db = Database::with_config(cfg).await?;
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
-        let row = |name: &str| json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]);
-        db.insert_records_batch(&project_id, TABLE, vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project_id, TABLE, vec![row("second")?], true, None).await?;
+        let span = |id: &str, name: &str| test_span_ts(id, name, &project_id, ts);
+        let mut first = vec![span("dup_id", "first")];
+        first.extend(extra.iter().map(|&id| span(id, "extra")));
+        db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(first)?], true, None).await?;
+        db.insert_records_batch(&project_id, TABLE, vec![json_to_batch(vec![span("dup_id", "second")])?], true, None).await?;
         let table_ref = db.unified_tables().read().await.get(TABLE).expect("table created").clone();
         let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
+        Ok((db, project_id, date, table_ref))
+    }
+
+    /// Snapshots the pre-state the certification guard compares against, then runs ONE dedup
+    /// pass over the seeded day, asserting the single drop so each arm below states only what
+    /// is distinct.
+    async fn dedup_pass(cfg: Arc<crate::config::AppConfig>) -> Result<Pass> {
+        let (db, project_id, date, table_ref) = seed_dup_day(cfg, &[]).await?;
         let (pre_files, pre_dv) = {
             let (table, marker) = (table_ref.read().await, format!("date={date}"));
             let files = Database::partition_files_by_pid(&table, &marker)?.remove(&project_id).unwrap_or_default();
@@ -7868,33 +7883,25 @@ mod certify_on_completion_tests {
         Ok(())
     }
 
-    /// A masked pass whose live post `(path, dv)` set holds a DV beyond `pre` + its OWN
-    /// attachments must DECLINE, fail-closed.
+    /// A pass that cannot account for its own post-state must DECLINE, fail-closed.
+    ///
+    /// The masked arm WITHHOLDS its attachments, so expected post = pre and the pass's own DV is
+    /// indistinguishable from a foreign interleaved one. The CoW arm pins the plumbing — a CoW
+    /// pass reports `masked = None` end-to-end and never takes the masked exemption; its decline
+    /// is over-determined (both `dropped` and `fp_moved` fire).
+    #[test_case::test_case(true ; "a foreign dv in live post declines the masked pass")]
+    #[test_case::test_case(false ; "a cow pass that dropped rows still declines")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_foreign_dv_in_live_post_declines_the_masked_pass() -> Result<()> {
-        let pass = dedup_pass(TestConfigBuilder::new("certify_foreign_dv").build()).await?;
-        assert!(pass.masked.is_some(), "precondition: the pass took the DV path");
+    async fn a_pass_that_cannot_account_for_its_post_state_declines(masked_path: bool) -> Result<()> {
+        let builder = TestConfigBuilder::new(if masked_path { "certify_foreign_dv" } else { "certify_cow_declines" });
+        let pass = dedup_pass(if masked_path { builder.build() } else { builder.without_deletion_vectors().build() }).await?;
+        assert_eq!(pass.masked.is_some(), masked_path, "precondition: the pass must take the {} path", if masked_path { "DV" } else { "CoW" });
+        assert!(masked_path || pass.pre_dv.iter().all(|(_, d)| d.is_none()), "CoW setup must start DV-free");
 
-        // Withhold the attachments: expected post = pre, so the pass's own committed DV is
-        // indistinguishable from a foreign interleaved one.
-        assert!(pass.certify(Some(&[])).await?.is_none(), "a DV the pass cannot account for must decline certification");
+        let atts: Option<&[DvEntry]> = masked_path.then_some(&[]);
+        assert!(pass.certify(atts).await?.is_none(), "a pass whose post-state it cannot account for must not certify");
         assert!(!pass.certified(), "no live certification may survive the decline");
-        Ok(())
-    }
-
-    /// A CoW rewrite that dropped rows still declines (its post-state is new files the pass
-    /// never re-verified). What this uniquely pins is the plumbing: a CoW pass reports
-    /// `masked = None` end-to-end and never takes the masked exemption. The decline itself is
-    /// over-determined here (both `dropped` and `fp_moved` fire).
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_cow_pass_that_dropped_rows_still_declines() -> Result<()> {
-        let pass = dedup_pass(TestConfigBuilder::new("certify_cow_declines").without_deletion_vectors().build()).await?;
-        assert!(pass.pre_dv.iter().all(|(_, dv)| dv.is_none()), "CoW setup must start DV-free");
-        assert!(pass.masked.is_none(), "a CoW rewrite must NOT report masked attachments");
-
-        assert!(pass.certify(None).await?.is_none(), "a row-dropping CoW pass must not certify");
         Ok(())
     }
 
@@ -7906,22 +7913,13 @@ mod certify_on_completion_tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dml_dv_landing_between_staging_and_commit_is_not_clobbered() -> Result<()> {
-        let cfg = TestConfigBuilder::new("certify_dml_race").build();
-        let db = Database::with_config(cfg).await?;
-        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
         // File 1 holds the duplicate AND the row the DML will delete.
-        let b1 = json_to_batch(vec![test_span_ts("dup_id", "first", &project_id, ts), test_span_ts("victim", "extra", &project_id, ts)])?;
-        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b1], true, None).await?;
-        let b2 = json_to_batch(vec![test_span_ts("dup_id", "second", &project_id, ts)])?;
-        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b2], true, None).await?;
-        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-        let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
+        let (db, project_id, date, table_ref) = seed_dup_day(TestConfigBuilder::new("certify_dml_race").build(), &["victim"]).await?;
         assert_eq!(delta_physical_row_count(&table_ref).await?, 3);
 
         // Stage (but do not commit) the DV-dedup wave.
         let options = DedupRangeOptions { slice: None, dirty_key: None, limits: None };
-        let (units, complete) = db.stage_dedup_partition_range(&table_ref, "otel_logs_and_spans", &project_id, date, options).await?;
+        let (units, complete) = db.stage_dedup_partition_range(&table_ref, TABLE, &project_id, date, options).await?;
         assert!(complete && !units.is_empty(), "expected a staged DV unit");
 
         // Foreign DML-DV interleaves: delete the victim via the delta DeleteBuilder directly,
@@ -7932,7 +7930,7 @@ mod certify_on_completion_tests {
         *table_ref.write().await = dt;
 
         let markers = vec![format!("date={date}/")];
-        let result = db.commit_wave(&table_ref, "otel_logs_and_spans", &markers, true, units, 0).await;
+        let result = db.commit_wave(&table_ref, TABLE, &markers, true, units, 0).await;
 
         // Either outcome is acceptable — landed against the fresh state, or declined — but
         // never a clobber:
@@ -7943,7 +7941,7 @@ mod certify_on_completion_tests {
         let unique: HashSet<&String> = live.iter().collect();
         assert_eq!(live.len(), unique.len(), "no path may have two live adds (stale-Remove double-add clobber): {live:?}");
         let victims: i64 = {
-            let batches = db.query_delta_only(&format!("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'victim'")).await?;
+            let batches = db.query_delta_only(&format!("SELECT count(*) FROM {TABLE} WHERE project_id = '{project_id}' AND id = 'victim'")).await?;
             use datafusion::arrow::array::AsArray;
             batches[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0)
         };
@@ -8014,24 +8012,37 @@ mod rollup_noop_skip_tests {
         Ok((db, project_id, chrono::Utc::now().date_naive() - chrono::Duration::days(3)))
     }
 
+    /// Past the coordinator's cadence, so every ready rollup unit drains.
+    async fn advance_and_drain(db: &Database) -> Result<usize> {
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await
+    }
+
     /// One re-mint cycle: re-mint every published slice, then drain.
     async fn remint_and_drain(db: &Database) -> Result<()> {
         remint_published_base_slices(db)?;
-        crate::support::advance_micros(16 * 60 * 1_000_000);
-        db.drain_coordinator_rollups(64).await?;
-        Ok(())
+        advance_and_drain(db).await.map(|_| ())
+    }
+
+    /// The dedup sweep over the unified table — what masks losers with a deletion vector.
+    async fn dedup_unified(db: &Database) -> Result<()> {
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await
+    }
+
+    /// One span at `hour` on `date`, through the real write path.
+    async fn insert_span(db: &Database, project_id: &str, date: chrono::NaiveDate, hour: u32, id: &str, op: &str) -> Result<()> {
+        let ts = date.and_hms_opt(hour, 0, 0).expect("valid hour").and_utc().timestamp_micros();
+        let batch = json_to_batch(vec![test_span_ts(id, op, project_id, ts)])?;
+        db.insert_records_batch(project_id, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| ())
     }
 
     /// Insert one span on `date` and drive every rollup unit the day produces.
     async fn build_day(db: &Database, project_id: &str, date: chrono::NaiveDate, id: &str) -> Result<usize> {
-        let ts = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        let batch = json_to_batch(vec![test_span_ts(id, "op", project_id, ts)])?;
-        db.insert_records_batch(project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        insert_span(db, project_id, date, 12, id, "op").await?;
+        dedup_unified(db).await?;
         db.plan_rollup_backfill().await?;
-        crate::support::advance_micros(16 * 60 * 1_000_000);
-        db.drain_coordinator_rollups(64).await
+        advance_and_drain(db).await
     }
 
     /// The skip must survive a restart: coverage rebuilt from tier tags at boot must carry a
@@ -8056,9 +8067,7 @@ mod rollup_noop_skip_tests {
         let published_at = tier_version(&db).await.expect("the tier must exist after the first process published into it");
 
         let before = skips();
-        remint_published_base_slices(&db)?;
-        crate::support::advance_micros(16 * 60 * 1_000_000);
-        db.drain_coordinator_rollups(64).await?;
+        remint_and_drain(&db).await?;
         assert!(skips() > before, "a slice re-minted after a restart must still be proved redundant from its tags");
         assert_eq!(tier_version(&db).await, Some(published_at), "and must not write to the tier");
         Ok(())
@@ -8073,8 +8082,9 @@ mod rollup_noop_skip_tests {
     #[serial]
     #[tokio::test]
     async fn a_landed_dedup_carries_the_rollup_witness() -> Result<()> {
-        let cfg = Arc::new((*TestConfigBuilder::new("rollup_witness_carry").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone());
-        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        // Deliberately NOT `rollup_cfg`: this scenario runs on the default backfill window.
+        let cfg = TestConfigBuilder::new("rollup_witness_carry").with_buffer_mode(BufferMode::Enabled).with_rollups().build();
+        let db = Arc::new(Database::with_config(cfg).await?);
         let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
         assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so there is no witness to carry");
@@ -8106,13 +8116,7 @@ mod rollup_noop_skip_tests {
     #[serial]
     #[tokio::test]
     async fn an_overtaken_slice_is_queued_to_be_re_proven() -> Result<()> {
-        let mut cfg = (*TestConfigBuilder::new("rollup_moved_requeue").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 7;
-        let cfg = Arc::new(cfg);
-        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
-
-        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        let (db, project_id, date) = rollup_db("rollup_moved_requeue").await?;
         assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so there is no witnessed slice to overtake");
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
         assert!(db.rollup_slice_coverage.iter().next().is_some(), "precondition: recovery must have stamped slice coverage to overtake");
@@ -8120,11 +8124,8 @@ mod rollup_noop_skip_tests {
         // OVERTAKE it WITHOUT rebuilding: a second row moves the partition's live
         // `num_records` past every stamped witness. Deliberately not `build_day`, which ends in
         // `drain_coordinator_rollups` and would re-publish the slice, restamping the witness.
-        let ts = date.and_hms_opt(13, 0, 0).expect("1pm").and_utc().timestamp_micros();
-        let batch = json_to_batch(vec![test_span_ts("overtakes-the-witness", "op", &project_id, ts)])?;
-        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        insert_span(&db, &project_id, date, 13, "overtakes-the-witness", "op").await?;
+        dedup_unified(&db).await?;
 
         let before = pending_base_rollups(&db);
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
@@ -8182,21 +8183,17 @@ mod rollup_noop_skip_tests {
     #[tokio::test]
     async fn a_deletion_vector_that_masks_rows_in_place_still_forces_a_rebuild() -> Result<()> {
         let (db, project_id, date) = rollup_db("rollup_noop_dv").await?;
-        let ts = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
 
         // The same id twice, in two commits, so the duplicate spans two files.
         for name in ["first", "second"] {
-            let batch = json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)])?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+            insert_span(&db, &project_id, date, 12, "dup_id", name).await?;
         }
         db.plan_rollup_backfill().await?;
-        crate::support::advance_micros(16 * 60 * 1_000_000);
-        assert!(db.drain_coordinator_rollups(64).await? > 0, "no rollup unit ran, so nothing here says anything about masking");
+        assert!(advance_and_drain(&db).await? > 0, "no rollup unit ran, so nothing here says anything about masking");
         let before_dedup = tier_version(&db).await.expect("the rollup tier must exist once a unit has published into it");
 
         // Mask the loser. Paths do not move; `numRecords` does not move either.
-        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-        db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
+        dedup_unified(&db).await?;
 
         remint_and_drain(&db).await?;
         assert!(

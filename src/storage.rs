@@ -1939,22 +1939,32 @@ mod tests {
         Ok(())
     }
 
+    /// An untouched entry expires and is re-fetched; one queried past ttl/2 is
+    /// re-stamped by the sliding refresh and survives past the base TTL.
+    #[test_case::test_case("ttl", 100, None, 200, 0, 1, 1 ; "an expired entry is re-fetched, not served")]
+    #[test_case::test_case("sliding_ttl", 1000, Some(600), 400, 1, 0, 0 ; "a query past ttl/2 slides the TTL forward")]
     #[tokio::test]
-    async fn test_ttl_expiration() -> anyhow::Result<()> {
-        let (cache, _dir) = cache_with("ttl", Arc::new(InMemory::new()), |c| c.ttl = Duration::from_millis(100)).await?;
+    async fn ttl_expires_unless_a_query_slides_it(
+        name: &str, ttl_ms: u64, touch_after_ms: Option<u64>, wait_ms: u64, hits: u64, misses: u64, expirations: u64,
+    ) -> anyhow::Result<()> {
+        let (cache, _dir) = cache_with(name, Arc::new(InMemory::new()), |c| c.ttl = Duration::from_millis(ttl_ms)).await?;
 
-        let path = Path::from("test/ttl_file.parquet");
-        cache.put(&path, PutPayload::from(Bytes::from_static(b"test data"))).await?;
+        let path = Path::from("table/part-ttl.parquet");
+        cache.put(&path, PutPayload::from(Bytes::from(vec![b'h'; 4096]))).await?;
+
+        // Read either immediately (no refresh) or past ttl/2, which re-stamps the entry.
+        if let Some(t) = touch_after_ms {
+            tokio::time::sleep(Duration::from_millis(t)).await;
+        }
         let _ = cache.get(&path).await?;
-        cache.reset_stats().await; // normalize: only the post-expiry read is under test
+        tokio::time::sleep(Duration::from_millis(200)).await; // let a sliding re-insert land
 
-        tokio::time::sleep(Duration::from_millis(200)).await; // 2x the TTL
+        cache.reset_stats().await; // normalize: only the final read is under test
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         let _ = cache.get(&path).await?;
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.ttl_expirations, 1, "the stale entry must be counted as expired");
-        assert_eq!(stats.main.misses, 1, "an expired entry is re-fetched, not served");
-        assert_eq!(stats.main.hits, 0);
+        assert_eq!((stats.main.hits, stats.main.misses, stats.main.ttl_expirations), (hits, misses, expirations), "({name})");
 
         cache.shutdown().await?;
         Ok(())
@@ -2154,30 +2164,6 @@ mod tests {
         FoyerCacheConfig::from_app_config(&cfg).block_size_bytes
     }
 
-    #[tokio::test]
-    async fn test_sliding_ttl_refresh_on_query() -> anyhow::Result<()> {
-        let (cache, _dir) = cache_with("sliding_ttl", Arc::new(InMemory::new()), |c| c.ttl = Duration::from_millis(1000)).await?;
-
-        let path = Path::from("table/part-hot.parquet");
-        cache.put(&path, PutPayload::from(Bytes::from(vec![b'h'; 4096]))).await?;
-
-        // Query past ttl/2 → sliding-TTL refresh re-stamps the entry to "now".
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        let _ = cache.get(&path).await?; // hit + background touch
-        tokio::time::sleep(Duration::from_millis(200)).await; // let the re-insert land
-
-        // Now past the base TTL but inside the refreshed window.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        cache.reset_stats().await;
-        let _ = cache.get(&path).await?;
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.hits, 1, "queried entry should survive past base TTL via sliding refresh");
-        assert_eq!(stats.main.misses, 0);
-
-        cache.shutdown().await?;
-        Ok(())
-    }
-
     #[test]
     fn test_is_within_recent_window() {
         let today = Utc::now().date_naive();
@@ -2192,26 +2178,19 @@ mod tests {
         assert!(is_within_recent_window(&Path::from("t/_delta_log/00001.json"), 8));
     }
 
+    #[test_case::test_case("recent_window_hot", 0, 1, 0 ; "a recent-partition write is cached")]
+    #[test_case::test_case("recent_window_old", 30, 0, 1 ; "an old-partition write is skipped, so the read goes to S3")]
     #[tokio::test]
-    async fn test_recent_window_skips_old_partition_writes() -> anyhow::Result<()> {
-        let (cache, _dir) = cache_with("recent_window", Arc::new(InMemory::new()), |c| c.cache_recent_days = 8).await?;
+    async fn recent_window_admits_only_recent_partition_writes(name: &str, days_old: i64, hits: u64, misses: u64) -> anyhow::Result<()> {
+        let (cache, _dir) = cache_with(name, Arc::new(InMemory::new()), |c| c.cache_recent_days = 8).await?;
         cache.reset_stats().await;
 
-        let today = Utc::now().date_naive();
-        let recent = Path::from(format!("t/date={}/part.parquet", today));
-        let old = Path::from(format!("t/date={}/part.parquet", today - chrono::Duration::days(30)));
-        let data = Bytes::from(vec![b'a'; 4096]);
+        let path = Path::from(format!("t/date={}/part.parquet", Utc::now().date_naive() - chrono::Duration::days(days_old)));
+        cache.put(&path, PutPayload::from(Bytes::from(vec![b'a'; 4096]))).await?;
+        let _ = cache.get(&path).await?;
 
-        cache.put(&recent, PutPayload::from(data.clone())).await?;
-        let _ = cache.get(&recent).await?;
-        assert_eq!(cache.get_stats().await.main.hits, 1, "recent write should be cached");
-
-        cache.reset_stats().await;
-        cache.put(&old, PutPayload::from(data.clone())).await?;
-        let _ = cache.get(&old).await?;
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.hits, 0, "old-partition write should not be cached");
-        assert_eq!(stats.main.misses, 1, "old partition served from S3");
+        assert_eq!((stats.main.hits, stats.main.misses), (hits, misses), "({name})");
 
         cache.shutdown().await?;
         Ok(())
@@ -2472,52 +2451,35 @@ mod tests {
         Ok(())
     }
 
-    /// A data-range miss on a large parquet file is range-only; full-file warming
-    /// never happens on the query path.
+    /// A data-range miss on a large parquet file is range-only — full-file warming
+    /// never happens on the query path — and a later range inside an
+    /// already-fetched window is a hit that never touches the inner store.
+    #[test_case::test_case("large_warm", 4096, &[100..200, 200..300], 100..200, 2, 200 ; "unaligned file: exact ranges, a repeated range hits")]
+    #[test_case::test_case("aligned_ranges", 3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize, std::slice::from_ref(&(100..1_500_000)), 200..1_400_000, 1, 2 * PARQUET_RANGE_ALIGNMENT_BYTES ; "aligned window: a shifted predicate range in the same window hits")]
     #[tokio::test]
-    async fn large_file_query_miss_reads_ranges_without_warming_full_file() -> anyhow::Result<()> {
+    async fn large_file_ranges_are_cached_per_range_not_as_a_full_file(
+        name: &str, body_len: usize, cold_ranges: &[Range<u64>], warm_range: Range<u64>, misses: u64, bytes_read: u64,
+    ) -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
-        let (shared, cache, _dir) = shared_with("large_warm", mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
+        let (shared, cache, _dir) = shared_with(name, mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
 
-        let path = Path::from("tbl/date=2026-01-02/big.parquet");
-        let body: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let path = Path::from(format!("tbl/date=2026-01-02/{name}.parquet"));
+        let body: Vec<u8> = (0..body_len).map(|i| (i % 251) as u8).collect();
         mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
 
-        assert_eq!(&cache.get_range_cached(&path, 100..200).await?[..], &body[100..200]);
-        assert_eq!(&cache.get_range_cached(&path, 200..300).await?[..], &body[200..300]);
+        for r in cold_ranges {
+            assert_eq!(&cache.get_range_cached(&path, r.clone()).await?[..], &body[r.start as usize..r.end as usize]);
+        }
         assert!(!shared.contains_data(path.as_ref()), "query ranges must not trigger a full-file cache population");
         let cold = cache.get_stats().await.main;
-        assert_eq!(cold.range_misses, 2);
-        assert_eq!(cold.range_bytes_read, 200, "inner bytes must track requested ranges, not the 4096-byte object");
-        assert_eq!(cold.inner_bytes_read, 200);
+        assert_eq!(cold.range_misses, misses);
+        assert_eq!(cold.range_bytes_read, bytes_read, "inner bytes must track the fetched ranges, not the whole object ({name})");
+        assert_eq!(cold.inner_bytes_read, bytes_read);
 
-        assert_eq!(&cache.get_range_cached(&path, 100..200).await?[..], &body[100..200]);
+        assert_eq!(&cache.get_range_cached(&path, warm_range.clone()).await?[..], &body[warm_range.start as usize..warm_range.end as usize]);
         let warm = cache.get_stats().await.main;
-        assert_eq!(warm.range_hits, 1, "a repeated coalesced range must hit the main range cache");
+        assert_eq!(warm.range_hits, 1, "a range inside an already-fetched window must hit the main range cache ({name})");
         assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read, "a range hit must not touch the inner store");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sliding_large_file_ranges_reuse_aligned_cache_entry() -> anyhow::Result<()> {
-        let mem = Arc::new(InMemory::new());
-        let (_shared, cache, _dir) = shared_with("aligned_ranges", mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
-
-        let path = Path::from("tbl/date=2026-01-02/large.parquet");
-        let body: Vec<u8> = (0..3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize).map(|i| (i % 251) as u8).collect();
-        mem.put(&path, PutPayload::from(Bytes::from(body.clone()))).await?;
-
-        let first = 100..1_500_000;
-        let shifted = 200..1_400_000;
-        assert_eq!(&cache.get_range_cached(&path, first.clone()).await?[..], &body[first.start as usize..first.end as usize]);
-        let cold = cache.get_stats().await.main;
-        assert_eq!(cold.range_misses, 1);
-        assert_eq!(cold.inner_bytes_read, 2 * PARQUET_RANGE_ALIGNMENT_BYTES);
-
-        assert_eq!(&cache.get_range_cached(&path, shifted.clone()).await?[..], &body[shifted.start as usize..shifted.end as usize]);
-        let warm = cache.get_stats().await.main;
-        assert_eq!(warm.range_hits, 1, "a shifted predicate range in the same aligned window must hit");
-        assert_eq!(warm.inner_bytes_read, cold.inner_bytes_read);
         Ok(())
     }
 

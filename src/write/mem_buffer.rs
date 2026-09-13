@@ -2699,18 +2699,10 @@ mod tests {
 
     #[test]
     fn dedup_batches_keep_last_on_composite_key() {
-        let schema = schema_of([("timestamp", ts_ty(), false), ("id", Int64, false), ("payload", Utf8View, false)]);
-        let mk = |ts: Vec<i64>, ids: Vec<i64>, pl: Vec<&str>| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")), Arc::new(Int64Array::from(ids)), Arc::new(StringViewArray::from(pl))],
-            )
-            .unwrap()
-        };
         let batches = vec![
-            mk(vec![100, 200], vec![1, 2], vec!["v1-old", "v2-old"]),
-            mk(vec![100, 300], vec![1, 3], vec!["v1-new", "v3"]),
-            mk(vec![200], vec![2], vec!["v2-new"]),
+            key_batch(Some("timestamp"), &[(1, Some(100), "v1-old"), (2, Some(200), "v2-old")]),
+            key_batch(Some("timestamp"), &[(1, Some(100), "v1-new"), (3, Some(300), "v3")]),
+            key_batch(Some("timestamp"), &[(2, Some(200), "v2-new")]),
         ];
         let keys = vec!["id".to_string(), "timestamp".to_string()];
         let out = dedup_batches(batches, &keys, None, None).expect("dedup ok");
@@ -2720,13 +2712,25 @@ mod tests {
         assert_eq!(got, vec![(1, "v1-new".into()), (3, "v3".into()), (2, "v2-new".into())]);
     }
 
-    /// A NULL tiebreak sorts LOWEST in either arrival order, so an unstamped row
-    /// always loses to a stamped one.
-    #[test_case(&[(None, "legacy"), (Some(10), "stamped")] => vec!["stamped".to_string()] ; "NULL arrives first")]
-    #[test_case(&[(Some(10), "stamped"), (None, "legacy")] => vec!["stamped".to_string()] ; "NULL arrives last")]
-    fn dedup_batches_null_tiebreak_always_loses(rows: &[(Option<i64>, &str)]) -> Vec<String> {
-        let batches = rows.iter().map(|&(stamp, payload)| key_batch(Some("updated_at"), &[(1, stamp, payload)])).collect();
-        col_strings(&dedup_batches(batches, &["id".to_string()], Some("updated_at"), None).expect("dedup ok"), "payload")
+    /// Keep-greatest-per-key on the tiebreak column: a NULL tiebreak sorts
+    /// LOWEST in either arrival order, input position never decides, and a batch
+    /// with no tiebreak column degrades to last-occurrence-wins instead of
+    /// failing — failing makes such buckets permanently unflushable.
+    /// Rows are sorted before comparison: the batch order out of dedup is incidental.
+    #[test_case(Some("updated_at"), Some("updated_at"), &[&[(1, None, "legacy")], &[(1, Some(10), "stamped")]]
+        => vec![(1, "stamped".to_string())] ; "NULL tiebreak arrives first and still loses")]
+    #[test_case(Some("updated_at"), Some("updated_at"), &[&[(1, Some(10), "stamped")], &[(1, None, "legacy")]]
+        => vec![(1, "stamped".to_string())] ; "NULL tiebreak arrives last and still loses")]
+    #[test_case(Some("observed"), Some("observed"), &[&[(1, Some(200), "1-enriched"), (2, None, "2-base")], &[(1, Some(100), "1-base"), (2, Some(50), "2-enriched")]]
+        => vec![(1, "1-enriched".to_string()), (2, "2-enriched".to_string())] ; "greatest tiebreak wins per key whatever its input position")]
+    #[test_case(None, Some("updated_at"), &[&[(1, None, "old")], &[(1, None, "new")]]
+        => vec![(1, "new".to_string())] ; "a legacy batch with no tiebreak column flushes as last-occurrence-wins")]
+    fn dedup_batches_tiebreak_keeps_greatest(stamp_col: Option<&str>, tiebreak: Option<&str>, rows: &[&[(i64, Option<i64>, &str)]]) -> Vec<(i64, String)> {
+        let batches = rows.iter().map(|r| key_batch(stamp_col, r)).collect();
+        let out = dedup_batches(batches, &["id".to_string()], tiebreak, None).expect("dedup ok");
+        let mut got: Vec<(i64, String)> = col_i64(&out, "id").into_iter().zip(col_strings(&out, "payload")).collect();
+        got.sort();
+        got
     }
 
     #[test]
@@ -2744,8 +2748,7 @@ mod tests {
     /// Arrow's 2GB i32 string-offset limit on a large flush.
     #[test]
     fn dedup_batches_does_not_concatenate_full_payload() {
-        let mk = |id: i64, p: &str| key_batch(None, &[(id, None, p)]);
-        let batches = vec![mk(1, "a"), mk(2, "b"), mk(3, "c")];
+        let batches = vec![key_batch(None, &[(1, None, "a")]), key_batch(None, &[(2, None, "b")]), key_batch(None, &[(3, None, "c")])];
         let out = dedup_batches(batches, &["id".to_string()], None, None).expect("dedup ok");
         assert_eq!(out.len(), 3, "distinct-key batches must be returned un-fused (no 2GB-prone concat)");
         assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
@@ -2753,33 +2756,12 @@ mod tests {
 
     #[test]
     fn dedup_batches_errors_on_unknown_key() {
-        let batch = create_test_batch(1);
-        let err = dedup_batches(vec![batch], &["nonexistent".to_string()], None, None).unwrap_err();
+        let err = dedup_batches(vec![create_test_batch(1)], &["nonexistent".to_string()], None, None).unwrap_err();
         assert!(err.to_string().contains("nonexistent"), "msg: {err}");
-    }
-
-    /// A batch with no tiebreak column must degrade to last-occurrence-wins,
-    /// not fail — failing makes such buckets permanently unflushable.
-    #[test]
-    fn dedup_batches_tolerates_a_legacy_batch_with_no_tiebreak_column() {
-        let mk = |id: i64, p: &str| key_batch(None, &[(id, None, p)]);
-        let batches = vec![mk(1, "old"), mk(1, "new")];
-        let out = dedup_batches(batches, &["id".to_string()], Some("updated_at"), None).expect("a legacy batch must flush, not fail the whole commit");
-        assert_eq!(col_strings(&out, "payload"), vec!["new".to_string()], "with no tiebreak available the last occurrence must win");
-
-        assert!(dedup_batches(vec![mk(1, "x")], &["nope".to_string()], None, None).is_err(), "a missing dedup key must still fail loudly");
-    }
-
-    /// With a tiebreak column the greatest tiebreak value wins per key,
-    /// regardless of input position, and a non-null tiebreak beats a null one.
-    #[test]
-    fn dedup_batches_tiebreak_keeps_greatest() {
-        let mk = |rows: &[(i64, Option<i64>, &str)]| key_batch(Some("observed"), rows);
-        let batches = vec![mk(&[(1, Some(200), "1-enriched"), (2, None, "2-base")]), mk(&[(1, Some(100), "1-base"), (2, Some(50), "2-enriched")])];
-        let out = dedup_batches(batches, &["id".to_string()], Some("observed"), None).expect("dedup ok");
-        let mut got: Vec<(i64, String)> = col_i64(&out, "id").into_iter().zip(col_strings(&out, "payload")).collect();
-        got.sort();
-        assert_eq!(got, vec![(1, "1-enriched".into()), (2, "2-enriched".into())]);
+        assert!(
+            dedup_batches(vec![key_batch(None, &[(1, None, "x")])], &["nope".to_string()], None, None).is_err(),
+            "a missing dedup key must still fail loudly"
+        );
     }
 
     /// Merge-on-read version collapse: the survivor is the greatest `updated_at`
@@ -2959,23 +2941,31 @@ mod tests {
         assert_ne!(again.min_timestamp, bucket_id * dur, "must not collapse to bucket start");
     }
 
-    #[test]
-    fn test_bucket_partitioning() {
+    /// Bucket membership is half-open, so adjacent windows and the microsecond
+    /// before a boundary land in separate buckets. Returns
+    /// `(query batches, total buckets)`.
+    #[test_case(&[5 * BUCKET_DURATION_MICROS, 6 * BUCKET_DURATION_MICROS] => (2, 2) ; "adjacent buckets")]
+    #[test_case(&[BUCKET_DURATION_MICROS] => (1, 1) ; "the boundary instant alone opens exactly one bucket")]
+    #[test_case(&[BUCKET_DURATION_MICROS, BUCKET_DURATION_MICROS - 1] => (2, 2) ; "one microsecond earlier belongs to the previous bucket")]
+    fn inserts_land_in_half_open_buckets(timestamps: &[i64]) -> (usize, usize) {
         let buffer = MemBuffer::new();
-        let now = chrono::Utc::now().timestamp_micros();
-        let (ts1, ts2) = (now, now + BUCKET_DURATION_MICROS); // adjacent buckets
+        for &ts in timestamps {
+            buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        }
+        (buffer.query("project1", "table1", &[]).unwrap().len(), buffer.get_stats().total_buckets)
+    }
 
-        buffer.insert("project1", "table1", create_test_batch(ts1), ts1).unwrap();
-        buffer.insert("project1", "table1", create_test_batch(ts2), ts2).unwrap();
-
-        assert_eq!(buffer.query("project1", "table1", &[]).unwrap().len(), 2);
-        assert_eq!(buffer.get_stats().total_buckets, 2);
+    /// Start of a sealed (no longer current) bucket window, aligned to the window
+    /// so `ts + 60s` stays in the same bucket; `get_bucket_ranges` only reports
+    /// non-current buckets. Wall clock, not the virtual clock, on purpose.
+    fn sealed_bucket_start() -> i64 {
+        (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS
     }
 
     #[test]
     fn merge_snapshot_preserves_rows_and_delete_exclusions_across_flush() {
         let buffer = MemBuffer::new();
-        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
+        let ts = sealed_bucket_start();
         let bucket_id = MemBuffer::compute_bucket_id(ts);
         let batch = create_test_batch(ts);
         let rows = batch.num_rows();
@@ -3026,9 +3016,7 @@ mod tests {
     #[test]
     fn prefix_drain_narrows_survivor_range_to_late_rows() {
         let buffer = MemBuffer::new();
-        // Sealed bucket aligned to its window start so ts+60s stays in the same
-        // bucket; get_bucket_ranges only reports non-current buckets.
-        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
+        let ts = sealed_bucket_start();
         let bucket_id = MemBuffer::compute_bucket_id(ts);
 
         buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
@@ -3060,7 +3048,7 @@ mod tests {
     #[test_case("narrow_then_insert"; "partial-drain narrowing undone by a later row")]
     fn a_flushed_instant_stays_visible_however_the_bucket_emptied(mode: &str) {
         let buffer = MemBuffer::new();
-        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
+        let ts = sealed_bucket_start();
         let bucket_id = MemBuffer::compute_bucket_id(ts);
 
         // The row that reaches Delta and leaves memory, in every mode.
@@ -3336,12 +3324,29 @@ mod tests {
         dml_buffer("p", "t", vec![1], vec!["a"]).df_schema_for("p", "t").unwrap()
     }
 
-    /// Returns whether the predicate parsed; UDFs resolve only with a registry.
-    #[test_case("coalesce(name, '') = 'x'", false => false ; "without a registry a UDF is rejected with 'No functions registered'")]
-    #[test_case("coalesce(name, '') = 'x'", true => true ; "coalesce resolves with a registry")]
-    #[test_case("to_char(timestamp, 'YYYY') = '2024'", true => true ; "to_char resolves with a registry")]
-    fn parse_sql_predicate_resolves_udfs_only_with_a_registry(sql: &str, with_registry: bool) -> bool {
-        let schema = test_table_df_schema();
+    /// The widened replay schema the normalized `hashes` enrichment
+    /// UPDATE...FROM re-parses against (source col → `source__tag`).
+    fn widened_hashes_df_schema() -> DFSchema {
+        let hashes = ("hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true);
+        let cols = [("context___span_id", Utf8View, true), ("context___trace_id", Utf8View, true), ("timestamp", ts_ty(), true)];
+        DFSchema::try_from(schema_of(cols.into_iter().chain([hashes, ("source__tag", Utf8View, true)])).as_ref().clone()).unwrap()
+    }
+
+    /// Returns whether the predicate parsed. UDFs resolve only with a registry,
+    /// and the prod `hashes` shapes (array_concat + CASE + array literals) must
+    /// re-parse against the widened replay schema — qualifier stripping alone is
+    /// not enough.
+    #[test_case("coalesce(name, '') = 'x'", false, false => false ; "without a registry a UDF is rejected with 'No functions registered'")]
+    #[test_case("coalesce(name, '') = 'x'", true, false => true ; "coalesce resolves with a registry")]
+    #[test_case("to_char(timestamp, 'YYYY') = '2024'", true, false => true ; "to_char resolves with a registry")]
+    #[test_case("((context___span_id IS NOT NULL AND context___trace_id IS NOT NULL) \
+                 AND (\"timestamp\" >= CAST('2026-07-05T14:37:49.995+00:00' AS TIMESTAMP)) \
+                 AND (\"timestamp\" < CAST('2026-07-05T14:38:22.731+00:00' AS TIMESTAMP)))", true, true
+        => true ; "normalized prod hashes-update predicate parses after normalization")]
+    #[test_case("array_concat(CASE WHEN hashes IS NOT NULL THEN hashes ELSE [] END, [source__tag])", true, true
+        => true ; "normalized prod hashes-update assignment parses after normalization")]
+    fn parse_sql_predicate_resolves_udfs_with_a_registry_and_prod_hashes_shapes(sql: &str, with_registry: bool, widened: bool) -> bool {
+        let schema = if widened { widened_hashes_df_schema() } else { test_table_df_schema() };
         let owned = crate::read::functions::function_registry().unwrap();
         let registry = with_registry.then(|| owned.as_ref());
         match super::parse_sql_predicate(sql, &schema, registry) {
@@ -3351,29 +3356,6 @@ mod tests {
                 false
             }
         }
-    }
-
-    /// The normalized `hashes` enrichment UPDATE...FROM (array_concat + CASE +
-    /// array literals, source col → `source__tag`) must re-parse against the
-    /// widened replay schema — qualifier stripping alone is not enough.
-    #[test]
-    fn parse_prod_hashes_update_from_shape_after_normalization() {
-        let hashes = ("hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true);
-        let cols = [("context___span_id", Utf8View, true), ("context___trace_id", Utf8View, true), ("timestamp", ts_ty(), true)];
-        let widened = DFSchema::try_from(schema_of(cols.into_iter().chain([hashes, ("source__tag", Utf8View, true)])).as_ref().clone()).unwrap();
-        let reg = crate::read::functions::function_registry().unwrap();
-
-        super::parse_sql_predicate(
-            "((context___span_id IS NOT NULL AND context___trace_id IS NOT NULL) \
-             AND (\"timestamp\" >= CAST('2026-07-05T14:37:49.995+00:00' AS TIMESTAMP)) \
-             AND (\"timestamp\" < CAST('2026-07-05T14:38:22.731+00:00' AS TIMESTAMP)))",
-            &widened,
-            Some(reg.as_ref()),
-        )
-        .expect("normalized hashes-update predicate must parse");
-
-        super::parse_sql_predicate("array_concat(CASE WHEN hashes IS NOT NULL THEN hashes ELSE [] END, [source__tag])", &widened, Some(reg.as_ref()))
-            .expect("normalized hashes-update assignment must parse");
     }
 
     // upper() survives logical->physical lowering; coalesce is rewritten to CASE.
@@ -3419,19 +3401,6 @@ mod tests {
     #[test_case(-BUCKET_DURATION_MICROS * 2 => -2 ; "20 minutes before epoch should be bucket -2")]
     fn compute_bucket_id_is_half_open(ts: i64) -> i64 {
         MemBuffer::compute_bucket_id(ts)
-    }
-
-    /// Two rows one microsecond apart across a boundary must land in two
-    /// separate buckets.
-    #[test]
-    fn bucket_boundaries_are_half_open() {
-        let buffer = MemBuffer::new();
-        buffer.insert("project1", "table1", create_test_batch(BUCKET_DURATION_MICROS), BUCKET_DURATION_MICROS).unwrap();
-        assert_eq!(buffer.get_stats().total_buckets, 1, "the boundary instant alone opens exactly one bucket");
-
-        let just_before = BUCKET_DURATION_MICROS - 1;
-        buffer.insert("project1", "table1", create_test_batch(just_before), just_before).unwrap();
-        assert_eq!(buffer.get_stats().total_buckets, 2, "one microsecond earlier belongs to the previous bucket");
     }
 
     /// The rollup read path splits a window at the oldest buffered row:

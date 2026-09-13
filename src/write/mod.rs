@@ -3274,7 +3274,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::*;
-    use crate::support::test_helpers::{json_to_batch, test_span};
+    use crate::support::test_helpers::{json_to_batch, query_col_strings, test_layer, test_span};
 
     /// `landed_digest` must be order-independent (replay reorders batches relative to the
     /// original flush) and must never cancel — hence addition, not XOR, which would collapse a
@@ -3473,12 +3473,6 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// Short unique (project, table) names — walrus caps topic metadata at 62 bytes.
-    fn unique_names() -> (String, String) {
-        let id = &uuid::Uuid::new_v4().to_string()[..4];
-        (format!("p{id}"), format!("t{id}"))
-    }
-
     /// tempdir + [`create_test_config`] + a layer on it. The `TempDir` must stay bound for the
     /// test's lifetime — dropping it deletes the layer's data dir.
     fn test_env() -> (TempDir, Arc<AppConfig>, BufferedWriteLayer) {
@@ -3553,7 +3547,7 @@ mod tests {
     #[tokio::test]
     async fn a_deep_backlog_flushes_in_bounded_chunks() {
         let dir = tempdir().unwrap();
-        let (project, table) = unique_names();
+        let (project, table) = test_ids("u");
         let (commits, rows) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let layer = layer_with(create_test_config(dir.path().to_path_buf()), counting_delta(commits.clone(), rows.clone()));
 
@@ -3583,7 +3577,7 @@ mod tests {
     async fn fresh_small_sealed_buckets_dwell_then_flush() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |_| {});
-        let (project, table) = unique_names();
+        let (project, table) = test_ids("u");
         let commits = Arc::new(AtomicU64::new(0));
         let layer = layer_with(cfg, counting_delta(commits.clone(), Arc::new(AtomicU64::new(0))));
 
@@ -3604,7 +3598,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_query() {
         let (_dir, _cfg, layer) = test_env();
-        let (project, table) = unique_names();
+        let (project, table) = test_ids("u");
 
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
 
@@ -3773,14 +3767,10 @@ mod tests {
     async fn test_recovery() {
         let (_dir, cfg, project, table) = test_ids_env("r");
 
-        {
-            let layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-            let batch = create_test_batch(&project);
-            layer.insert(&project, &table, vec![batch]).await.unwrap();
-        }
+        ack_then_crash(&cfg, &project, &table).await;
 
         {
-            let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
+            let layer = Arc::new(test_layer(cfg).unwrap());
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
             assert_eq!(layer.snapshot_stats().wal_recovery_duration_ms, stats.recovery_duration_ms);
@@ -3799,11 +3789,8 @@ mod tests {
     async fn wal_replay_restores_entries_older_than_retention() {
         let (_dir, cfg, project, table) = test_ids_env("ar");
 
-        {
-            let layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-            layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
-            // Crash without flushing — the WAL is the rows' only copy.
-        }
+        // Crash without flushing — the WAL is the rows' only copy.
+        ack_then_crash(&cfg, &project, &table).await;
 
         let retention_micros = cfg.buffer.retention_mins() as i64 * 60 * 1_000_000;
         crate::support::set_micros(chrono::Utc::now().timestamp_micros() + 2 * retention_micros);
@@ -4158,16 +4145,34 @@ mod tests {
     }
 
     /// A layer whose Delta callback tallies the rows it was handed.
-    fn counting_row_layer(cfg: &Arc<AppConfig>, flushed: Arc<AtomicU64>) -> BufferedWriteLayer {
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _wm: DeltaWatermark| {
-            let flushed = flushed.clone();
-            Box::pin(async move {
-                flushed.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
-                Ok(Vec::new())
-            })
-        }));
-        layer
+    fn counting_row_layer(cfg: &Arc<AppConfig>, flushed: Arc<AtomicU64>) -> Arc<BufferedWriteLayer> {
+        layer_with(
+            Arc::clone(cfg),
+            Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _wm: DeltaWatermark| {
+                let flushed = flushed.clone();
+                Box::pin(async move {
+                    flushed.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
+                    Ok(Vec::new())
+                })
+            }),
+        )
+    }
+
+    /// Crash replay after its first relief drain, then resume on a fresh layer.
+    /// Returns (rows drained before the crash, rows drained after it, the
+    /// resumed run's stats, the resumed layer).
+    async fn crash_then_resume_replay(cfg: &Arc<AppConfig>) -> (u64, u64, RecoveryStats, Arc<BufferedWriteLayer>) {
+        let pre = Arc::new(AtomicU64::new(0));
+        let layer2 = counting_row_layer(cfg, pre.clone());
+        layer2.test_crash_after_reliefs.store(1, Ordering::Relaxed);
+        assert!(layer2.recover_from_wal().await.is_err(), "test hook should have crashed replay mid-run");
+        let flushed_pre = pre.load(Ordering::Relaxed);
+        drop(layer2);
+
+        let post = Arc::new(AtomicU64::new(0));
+        let layer3 = counting_row_layer(cfg, post.clone());
+        let stats = layer3.recover_from_wal().await.unwrap();
+        (flushed_pre, post.load(Ordering::Relaxed), stats, layer3)
     }
 
     /// A crash mid-replay must re-replay only the still-un-drained tail, not
@@ -4187,24 +4192,13 @@ mod tests {
         let cfg_small = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_buffer_max_memory_mb = 64);
 
         // Crash right after the first relief drain advances the marker.
-        let flushed2 = Arc::new(AtomicU64::new(0));
-        let layer2 = counting_row_layer(&cfg_small, flushed2.clone());
-        layer2.test_crash_after_reliefs.store(1, Ordering::Relaxed);
-        let layer2 = Arc::new(layer2);
-        assert!(layer2.recover_from_wal().await.is_err(), "test hook should have crashed replay mid-run");
-        let flushed_pre_crash = flushed2.load(Ordering::Relaxed);
+        let (flushed_pre_crash, flushed_post, stats, layer3) = crash_then_resume_replay(&cfg_small).await;
         assert!(flushed_pre_crash > 0, "no bucket drained before the simulated crash");
-        drop(layer2);
-
-        let flushed3 = Arc::new(AtomicU64::new(0));
-        let layer3 = Arc::new(counting_row_layer(&cfg_small, flushed3.clone()));
-        let stats = layer3.recover_from_wal().await.unwrap();
         let replayed = stats.entries_replayed;
         assert!(replayed < TOTAL, "resume re-replayed the whole backlog ({replayed} of {TOTAL}) — rewind marker never advanced");
         // No acked-write loss: drained-across-both-lives plus still-buffered
         // must cover every original row.
         let buffered = rows_in(&layer3, &project, &table) as u64;
-        let flushed_post = flushed3.load(Ordering::Relaxed);
         assert!(flushed_pre_crash + flushed_post + buffered >= TOTAL, "rows lost across crash+resume: {flushed_pre_crash}+{flushed_post}+{buffered} < {TOTAL}");
     }
 
@@ -4227,19 +4221,8 @@ mod tests {
 
         // Crash after the first relief drain — at that point the second
         // tenant's topic has almost certainly not been reached yet.
-        let flushed2 = Arc::new(AtomicU64::new(0));
-        let layer2 = counting_row_layer(&cfg_small, flushed2.clone());
-        layer2.test_crash_after_reliefs.store(1, Ordering::Relaxed);
-        let layer2 = Arc::new(layer2);
-        assert!(layer2.recover_from_wal().await.is_err(), "test hook should have crashed replay mid-run");
-        let flushed_pre = flushed2.load(Ordering::Relaxed);
-        drop(layer2);
-
-        let flushed3 = Arc::new(AtomicU64::new(0));
-        let layer3 = Arc::new(counting_row_layer(&cfg_small, flushed3.clone()));
-        let stats = layer3.recover_from_wal().await.unwrap();
+        let (flushed_pre, flushed_post, stats, layer3) = crash_then_resume_replay(&cfg_small).await;
         let buffered: u64 = tenants.iter().map(|(project, table)| rows_in(&layer3, project, table) as u64).sum();
-        let flushed_post = flushed3.load(Ordering::Relaxed);
         assert!(flushed_pre + flushed_post + buffered >= TOTAL, "rows lost across multi-topic crash+resume: {flushed_pre}+{flushed_post}+{buffered} < {TOTAL}");
         // A tenant rewound to ORIGIN would re-replay its full history on top of
         // the crashed tenant's remainder, pushing entries_replayed over TOTAL.
@@ -4280,12 +4263,8 @@ mod tests {
             // Crash: drop without shutdown — no clean-shutdown cursor snapshot.
         }
 
-        {
-            let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
-            layer.recover_from_wal().await.unwrap();
-            let ids = crate::support::test_helpers::query_col_strings(&layer, &project, &table, "id");
-            assert!(ids.contains(&"live".to_string()), "acked open-bucket row lost across crash: WAL cursor advanced past its entry (got rows {ids:?})");
-        }
+        let ids = recovered_col(cfg, &project, &table, "id").await;
+        assert!(ids.contains(&"live".to_string()), "acked open-bucket row lost across crash: WAL cursor advanced past its entry (got rows {ids:?})");
     }
 
     /// A DELETE racing an airborne commit must stick: the commit lands
@@ -4329,13 +4308,9 @@ mod tests {
             assert_eq!(ids, vec!["keeper".to_string()], "post-delete state must survive the dirty finish (got {ids:?})");
         }
 
-        {
-            let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
-            layer.recover_from_wal().await.unwrap();
-            let ids = crate::support::test_helpers::query_col_strings(&layer, &project, &table, "id");
-            assert!(!ids.contains(&"doomed".to_string()), "acked DELETE resurrected after crash+replay (got {ids:?})");
-            assert!(ids.contains(&"keeper".to_string()), "surviving row lost across crash (got {ids:?})");
-        }
+        let ids = recovered_col(cfg, &project, &table, "id").await;
+        assert!(!ids.contains(&"doomed".to_string()), "acked DELETE resurrected after crash+replay (got {ids:?})");
+        assert!(ids.contains(&"keeper".to_string()), "surviving row lost across crash (got {ids:?})");
     }
 
     /// Sealed rows must stay queryable while their Delta commit is airborne —
@@ -4426,6 +4401,21 @@ mod tests {
         layer.query(project, table, &[]).unwrap().iter().map(|b| b.num_rows()).sum()
     }
 
+    /// Boot a fresh layer on `cfg`, replay the WAL, and read one column back —
+    /// the post-crash half of the crash+recover tests.
+    async fn recovered_col(cfg: Arc<AppConfig>, project: &str, table: &str, col: &str) -> Vec<String> {
+        let layer = Arc::new(test_layer(cfg).unwrap());
+        layer.recover_from_wal().await.unwrap();
+        query_col_strings(&layer, project, table, col)
+    }
+
+    /// Ack one [`create_test_batch`] into the WAL and drop the layer without
+    /// flushing: the rows exist only in the WAL, the unclean-exit shape.
+    async fn ack_then_crash(cfg: &Arc<AppConfig>, project: &str, table: &str) {
+        let layer = test_layer(Arc::clone(cfg)).unwrap();
+        layer.insert(project, table, vec![create_test_batch(project)]).await.unwrap();
+    }
+
     /// A one-row batch for `project`, stamped at `ts`.
     fn span_batch(id: &str, name: &str, project: &str, ts: i64) -> RecordBatch {
         json_to_batch(vec![crate::support::test_helpers::test_span_ts(id, name, project, ts)]).unwrap()
@@ -4506,13 +4496,9 @@ mod tests {
             // Crash: drop without shutdown.
         }
 
-        {
-            let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
-            layer.recover_from_wal().await.unwrap();
-            let names = crate::support::test_helpers::query_col_strings(&layer, &project, &table, "name");
-            assert!(!names.is_empty(), "expected rows after WAL recovery");
-            assert!(names.iter().all(|n| n == "renamed"), "acked UPDATE reverted: its WAL entry was drained by an unrelated flush (got {names:?})");
-        }
+        let names = recovered_col(cfg, &project, &table, "name").await;
+        assert!(!names.is_empty(), "expected rows after WAL recovery");
+        assert!(names.iter().all(|n| n == "renamed"), "acked UPDATE reverted: its WAL entry was drained by an unrelated flush (got {names:?})");
     }
 
     /// A DML predicate carrying a timestamp literal must round-trip through the
@@ -4535,14 +4521,9 @@ mod tests {
             assert_eq!(updated, 3, "pre-restart update should hit all rows");
         }
 
-        {
-            let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
-            layer.recover_from_wal().await.unwrap();
-            let names = crate::support::test_helpers::query_col_strings(&layer, &project, &table, "name");
-            assert!(!names.is_empty(), "expected rows after WAL recovery");
-            let renamed = names.iter().all(|n| n == "renamed");
-            assert!(renamed, "WAL replay dropped the UPDATE — timestamp-literal predicate failed to parse on replay (got {names:?})");
-        }
+        let names = recovered_col(cfg, &project, &table, "name").await;
+        assert!(!names.is_empty(), "expected rows after WAL recovery");
+        assert!(names.iter().all(|n| n == "renamed"), "WAL replay dropped the UPDATE — timestamp-literal predicate failed to parse on replay (got {names:?})");
     }
 
     /// Shutdown must finish within its budget AND persist a `clean_shutdown=true`
@@ -4629,23 +4610,23 @@ mod tests {
         assert!(snap.clean_shutdown && snap.drained);
     }
 
+    #[test_case::test_case(false ; "cancelled handoff reopens admission")]
+    #[test_case::test_case(true ; "shutdown fence keeps admission closed")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn cancelled_deploy_handoff_restores_admission_unless_shutdown_fenced_it() {
-        for shutting_down in [false, true] {
-            let (_dir, cfg, ..) = test_ids_env("ch");
-            let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
-            let _flush = layer.flush_lock.lock().await;
-            let mut handoff = Box::pin(layer.prepare_deploy_handoff());
-            assert!(futures::poll!(handoff.as_mut()).is_pending());
-            assert!(layer.admit_write().is_err());
-            if shutting_down {
-                layer.stop_accepting_writes();
-            }
-            drop(handoff);
-            assert_eq!(layer.admit_write().is_ok(), !shutting_down);
-            assert!(!layer.is_deploy_handoff_ready());
+    async fn cancelled_deploy_handoff_restores_admission_unless_shutdown_fenced_it(shutting_down: bool) {
+        let (_dir, cfg, ..) = test_ids_env("ch");
+        let layer = Arc::new(test_layer(cfg).unwrap());
+        let _flush = layer.flush_lock.lock().await;
+        let mut handoff = Box::pin(layer.prepare_deploy_handoff());
+        assert!(futures::poll!(handoff.as_mut()).is_pending());
+        assert!(layer.admit_write().is_err());
+        if shutting_down {
+            layer.stop_accepting_writes();
         }
+        drop(handoff);
+        assert_eq!(layer.admit_write().is_ok(), !shutting_down);
+        assert!(!layer.is_deploy_handoff_ready());
     }
 
     #[serial]
@@ -4812,7 +4793,7 @@ mod tests {
             }),
         );
 
-        let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
+        let old_ts = sealed_ts();
         // The fast table gets more rows so largest-first ordering flushes it
         // first even at flush_parallelism = 1.
         let mk = |id: &str, span: &str, p: &str| crate::support::test_helpers::test_span_ts(id, span, p, old_ts);
@@ -4845,30 +4826,19 @@ mod tests {
         let t0 = chrono::Utc::now().timestamp_micros();
         crate::support::set_micros(t0);
 
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let (e2, g2) = (Arc::clone(&entered), Arc::clone(&gate));
-        let layer = layer_with(
-            Arc::clone(&cfg),
-            Arc::new(move |_p, _t, _b, _wm| {
-                let (e, g) = (Arc::clone(&e2), Arc::clone(&g2));
-                Box::pin(async move {
-                    e.notify_one();
-                    g.notified().await;
-                    Ok(Vec::new())
-                })
-            }),
-        );
+        let (entered, release, cb) = parked_delta();
+        let layer = layer_with(Arc::clone(&cfg), cb);
 
         layer.insert(&project, &table, vec![span_batch("a", "s1", &project, t0)]).await.unwrap();
 
+        let entered_wait = entered.notified();
         let l2 = Arc::clone(&layer);
         let flush = tokio::spawn(async move { l2.flush_all_now().await });
-        entered.notified().await; // snapshot taken, commit airborne
+        entered_wait.await; // snapshot taken, commit airborne
         // Late arrival into the SAME open window: it survives the drain and
         // keeps the bucket alive.
         layer.insert(&project, &table, vec![span_batch("b", "s2", &project, t0 + 1_000)]).await.unwrap();
-        gate.notify_one();
+        release.add_permits(1);
         flush.await.unwrap().unwrap();
 
         // Seal the window: the surviving bucket is no longer `current`.
@@ -4961,9 +4931,7 @@ mod tests {
         // Reboot: clock steps back an epoch and the in-memory clock is gone.
         crate::support::set_micros(3_000_000_000_000_000);
         crate::write::reset_stamp_state(table);
-        let layer2 = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
-        layer2.recover_from_wal().await.unwrap();
-        let replayed = crate::support::test_helpers::query_col_strings(&layer2, &project, table, "updated_at");
+        let replayed = recovered_col(cfg, &project, table, "updated_at").await;
         assert_eq!(replayed, stamped, "replay must reproduce the durable stamp, not re-issue one");
         let next = crate::write::next_stamp(table);
         crate::support::unfreeze();
@@ -5119,12 +5087,8 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn test_pressure_pct() {
-        let (_dir, cfg, project, table) = test_ids_env("p");
+        let (_dir, layer, ..) = layer_after_insert("p", 1).await;
 
-        let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        assert_eq!(layer.pressure_pct(), 0, "empty layer should report 0%");
-
-        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
         let pct = layer.pressure_pct();
         assert!(pct <= 100, "pressure must be bounded 0..=100, got {pct}");
         // Tiny batch on 4GB default budget — should be effectively 0%.
@@ -5136,15 +5100,22 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn wal_holds_recorded_on_insert() {
-        let (_dir, cfg, project, table) = test_ids_env("c");
-
-        let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
         // 3 batches → 3 WAL entries on one shard for this insert.
-        let batches = vec![create_test_batch(&project), create_test_batch(&project), create_test_batch(&project)];
-        layer.insert(&project, &table, batches).await.unwrap();
+        let (_dir, layer, project, table) = layer_after_insert("c", 3).await;
 
         let holds = layer.mem_buffer.wal_holds(&project, &table, layer.wal.shards_per_topic());
         assert!(holds.iter().any(Option::is_some), "insert must record a pre-append cursor hold on its shard, got {holds:?}");
+    }
+
+    /// A layer on its own tempdir with one insert of `batches` [`create_test_batch`]es
+    /// applied. Asserts the empty-layer pressure floor on the way through; the
+    /// returned `TempDir` must outlive the layer.
+    async fn layer_after_insert(prefix: &str, batches: usize) -> (TempDir, BufferedWriteLayer, String, String) {
+        let (dir, cfg, project, table) = test_ids_env(prefix);
+        let layer = test_layer(cfg).unwrap();
+        assert_eq!(layer.pressure_pct(), 0, "empty layer should report 0%");
+        layer.insert(&project, &table, vec![create_test_batch(&project); batches]).await.unwrap();
+        (dir, layer, project, table)
     }
 
     /// A timestamp two bucket-durations in the past — i.e. inside a bucket that
@@ -5275,7 +5246,7 @@ mod tests {
             tweak(c);
         });
         let layer = layer_with(cfg, cb);
-        let ts_micros = crate::support::now_micros() - if sealed { 2 * crate::write::mem_buffer::bucket_duration_micros() } else { 0 };
+        let ts_micros = if sealed { sealed_ts() } else { crate::support::now_micros() };
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
             Field::new("payload", DataType::Utf8, false),
@@ -5374,9 +5345,7 @@ mod tests {
             // Crash: drop without shutdown.
         }
 
-        let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
-        layer.recover_from_wal().await.unwrap();
-        let ids = crate::support::test_helpers::query_col_strings(&layer, &project, &table, "id");
+        let ids = recovered_col(cfg, &project, &table, "id").await;
         assert!(ids.contains(&"old".to_string()), "stuck completed bucket must survive force-flush + crash (got {ids:?})");
     }
 
@@ -5437,10 +5406,7 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn test_memory_reservation() {
-        let (_dir, cfg, project, table) = test_ids_env("m");
-        let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-
-        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+        let (_dir, layer, ..) = layer_after_insert("m", 1).await;
 
         // The reservation is handed to MemBuffer on success, so it must read 0.
         assert_eq!(layer.reserved_bytes.load(Ordering::Acquire), 0);

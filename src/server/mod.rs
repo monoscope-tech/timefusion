@@ -1223,21 +1223,17 @@ mod pgwire_handlers_tests {
     use std::{sync::Arc, time::Duration};
     use test_case::test_case;
 
-    /// The admin-command tables render the parsed command's fields into one
-    /// `|`-joined literal, so a single expected value pins every field; a
-    /// rejection flattens to `Err(())` (the message text is not contracted).
+    /// Admin-command tables flatten the parsed fields into one `|`-joined literal (one expected value pins every field); a rejection becomes `Err(())`.
     type Parsed = Result<Option<String>, ()>;
 
     #[tokio::test]
     async fn query_stream_observes_the_server_deadline() {
-        let response = Response::Query(QueryResponse::new(
-            Arc::new(vec![]),
-            futures::stream::once(async {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Err::<DataRow, _>(crate::server::pg_compat::statement_timeout_error())
-            }),
-        ));
-        let Response::Query(mut response) = with_response_deadline(response, Some(tokio::time::Instant::now() + Duration::from_millis(1))) else {
+        let rows = futures::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err::<DataRow, _>(crate::server::pg_compat::statement_timeout_error())
+        });
+        let deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1));
+        let Response::Query(mut response) = with_response_deadline(Response::Query(QueryResponse::new(Arc::new(vec![]), rows)), deadline) else {
             panic!("expected query response");
         };
         assert!(matches!(response.data_rows.next().await, Some(Err(PgWireError::UserError(_)))));
@@ -1294,8 +1290,7 @@ mod pgwire_handlers_tests {
         Ok(())
     }
 
-    /// The statement timeout applies to reads only; see
-    /// `statement_timeout_applies`.
+    /// The statement timeout applies to reads only.
     #[test_case("SELECT count(*) FROM otel_logs_and_spans" => true ; "read")]
     #[test_case("SHOW server_version" => true ; "show")]
     #[test_case("INSERT INTO otel_logs_and_spans VALUES (1)" => false ; "insert")]
@@ -1305,17 +1300,12 @@ mod pgwire_handlers_tests {
         super::statement_timeout_applies(query)
     }
 
-    /// The statement deadline is COOPERATIVE: `tokio::time::timeout_at` only
-    /// runs when a poll returns `Pending`, so a future that computes without
-    /// yielding overruns it indefinitely. This is why long-running operators
-    /// (`DedupExec`, `GatedScanExec`) wrap their output in
-    /// `coop::make_cooperative`. The test pins the LIMITATION — rewrite it
-    /// deliberately if the deadline is ever made preemptive.
+    /// Pins a LIMITATION: the deadline is cooperative (`timeout_at` only fires on a `Pending` poll), which is why long-running operators
+    /// (`DedupExec`, `GatedScanExec`) wrap their output in `coop::make_cooperative`. Rewrite this only if the deadline is made preemptive.
     #[tokio::test(start_paused = true)]
     async fn the_statement_deadline_cannot_interrupt_a_future_that_never_yields() {
         use super::run_with_statement_timeout;
-        // Awaits a timer ⇒ returns Pending, so the deadline is observed. Under a
-        // paused clock tokio auto-advances when idle: no real 10s wait.
+        // Awaits a timer ⇒ returns Pending, so the deadline is observed; the paused clock auto-advances when idle, so there is no real 10s wait.
         let yielding = async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             Ok(())
@@ -1331,8 +1321,7 @@ mod pgwire_handlers_tests {
         assert_eq!(value, 42, "it completed, which is precisely the failure mode");
     }
 
-    // Case / spacing / quote / trailing-semicolon tolerance on the accepted form;
-    // bare OPTIMIZE (no date) is rejected — it would compact all history in-process.
+    // Case/spacing/quote/semicolon tolerance; bare OPTIMIZE (no date) is rejected — it would compact all history in-process.
     #[test_case("OPTIMIZE otel_logs_and_spans WHERE date = '2026-06-19'" => Ok(Some("otel_logs_and_spans|2026-06-19|None".to_string())) ; "table and date")]
     #[test_case("optimize t where DATE='2026-01-02';" => Ok(Some("t|2026-01-02|None".to_string())) ; "lowercase, unspaced, trailing semicolon")]
     #[test_case("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  " => Ok(Some("t|2026-01-02|None".to_string())) ; "loose spacing and double quotes")]
@@ -1354,8 +1343,7 @@ mod pgwire_handlers_tests {
         parse_optimize(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{}|{:?}", c.table, c.date, c.project_id)))
     }
 
-    // RETAIN clause, case / plural / trailing-semicolon tolerance. Unlike
-    // OPTIMIZE, a bare VACUUM (no table) is rejected — name the table.
+    // RETAIN clause plus case/plural/semicolon tolerance; unlike OPTIMIZE, a bare VACUUM (no table) is rejected — name the table.
     #[test_case("VACUUM otel_logs_and_spans" => Ok(Some("otel_logs_and_spans|None".to_string())) ; "table, default retention")]
     #[test_case("vacuum t RETAIN 48 HOURS;" => Ok(Some("t|Some(48)".to_string())) ; "plural HOURS with trailing semicolon")]
     #[test_case("  VACUUM  t  retain  1  hour  " => Ok(Some("t|Some(1)".to_string())) ; "singular hour, loose spacing")]
@@ -1370,9 +1358,7 @@ mod pgwire_handlers_tests {
         parse_vacuum(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{:?}", c.table, c.retention_hours)))
     }
 
-    // Both are argument-free on purpose: FLUSH drains the whole MemBuffer and
-    // HANDOFF leases the pre-deploy write fence. Anything with arguments, or a
-    // mere prefix match, falls through.
+    // Both verbs are argument-free on purpose (FLUSH drains the MemBuffer, HANDOFF leases the pre-deploy write fence); arguments or a mere prefix fall through.
     #[test_case(parse_flush, "FLUSH" => true ; "bare FLUSH")]
     #[test_case(parse_flush, "  flush ; " => true ; "flush, padded and semicoloned")]
     #[test_case(parse_flush, "FLUSH t" => false ; "FLUSH takes no argument")]
@@ -1396,8 +1382,7 @@ mod pgwire_handlers_tests {
         parse_delta_history(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{}", c.table, c.limit)))
     }
 
-    // `DELTA ACTIONS` and `DELTA RECOVERY AUDIT` share `<table> VERSION <n>`, so
-    // they share one table; `parse` selects the command under test.
+    // `DELTA ACTIONS` and `DELTA RECOVERY AUDIT` share `<table> VERSION <n>`, so they share one table; `parse` selects the command under test.
     #[test_case(parse_delta_actions, "DELTA ACTIONS otel_logs_and_spans VERSION 462919;" => Ok(Some("otel_logs_and_spans|462919".to_string())) ; "actions at one exact version")]
     #[test_case(parse_delta_actions, "DELTA ACTIONS t" => Err(()) ; "actions without a version")]
     #[test_case(parse_delta_actions, "DELTA ACTIONS t VERSION nope" => Err(()) ; "actions with a non-numeric version")]
@@ -1430,8 +1415,7 @@ mod pgwire_handlers_tests {
         assert!(!first_template.contains("project-123"));
     }
 
-    // Non-ABORT queries take the Cow::Borrowed fast path; we just check the
-    // content is identical. Don't false-match identifiers/columns starting with ABORT.
+    // Non-ABORT queries take the Cow::Borrowed fast path (content identical); identifiers merely starting with ABORT must not match.
     #[test_case("ABORT" => "ROLLBACK" ; "bare ABORT")]
     #[test_case("ABORT;" => "ROLLBACK;" ; "ABORT with semicolon")]
     #[test_case("  abort  " => "ROLLBACK  " ; "lowercase, padded")]
@@ -1581,26 +1565,12 @@ mod pgwire_early_bind_tests {
         (port, shutdown, task)
     }
 
-    async fn assert_closed(client: &mut TcpStream, why: &str) {
-        let mut tail = [0u8; 1];
-        assert_eq!(client.read(&mut tail).await.unwrap(), 0, "{why}");
-    }
-
-    /// Reads the error frame body; the leading `E` tag must already be consumed.
-    async fn assert_57p03_body(client: &mut TcpStream) {
-        let mut len_buf = [0u8; 4];
-        client.read_exact(&mut len_buf).await.unwrap();
-        let body_len = u32::from_be_bytes(len_buf) as usize - 4;
-        let mut body = vec![0u8; body_len];
-        client.read_exact(&mut body).await.unwrap();
-        assert!(body.windows(5).any(|w| w == b"57P03"));
-    }
-
-    async fn assert_57p03(client: &mut TcpStream) {
-        let mut tag = [0u8; 1];
-        client.read_exact(&mut tag).await.unwrap();
-        assert_eq!(tag[0], b'E');
-        assert_57p03_body(client).await;
+    /// The server always closes after answering, so draining to EOF yields the
+    /// whole reply; empty means the connection was dropped unanswered.
+    async fn read_reply(client: &mut TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        buf
     }
 
     /// One startup shape per case: an optional SSL/GSS negotiation round, the
@@ -1629,12 +1599,10 @@ mod pgwire_early_bind_tests {
         client.write_all(&declared_len.to_be_bytes()).await.unwrap();
         client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         client.write_all(params).await.unwrap();
-        let mut tag = [0u8; 1];
-        let answered = client.read(&mut tag).await.unwrap() == 1;
+        let reply = read_reply(&mut client).await;
+        let answered = !reply.is_empty();
         if answered {
-            assert_eq!(tag[0], b'E');
-            assert_57p03_body(&mut client).await;
-            assert_closed(&mut client, "server must close after error").await;
+            assert_eq!(reply, build_starting_up_response(), "must be the canned 57P03 frame, then close");
         }
         shutdown.cancel();
         let _ = task.await;
@@ -1649,7 +1617,7 @@ mod pgwire_early_bind_tests {
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         // No bytes sent; advance virtual time past the timeout.
         tokio::time::advance(STARTUP_READ_TIMEOUT + Duration::from_secs(1)).await;
-        assert_closed(&mut client, "server must close after timeout").await;
+        assert!(read_reply(&mut client).await.is_empty(), "server must close after timeout");
         shutdown.cancel();
         let _ = task.await;
     }
@@ -1669,7 +1637,8 @@ mod pgwire_early_bind_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let mut probe = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            if tokio::time::timeout(Duration::from_millis(200), assert_57p03(&mut probe)).await.is_ok() {
+            if let Ok(reply) = tokio::time::timeout(Duration::from_millis(200), read_reply(&mut probe)).await {
+                assert_eq!(reply, build_starting_up_response(), "cap fast-path must serve the canned 57P03 frame");
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "cap fast-path never observed");
@@ -1683,11 +1652,10 @@ mod pgwire_early_bind_tests {
 
 #[cfg(test)]
 mod streaming_tests {
-    use datafusion_postgres::pgwire::messages::data::DataRow;
     use datafusion_postgres::pgwire::{
         api::{query::send_partial_query_response, results::QueryResponse},
         error::PgWireError,
-        messages::PgWireBackendMessage,
+        messages::{PgWireBackendMessage, data::DataRow},
     };
     use futures::{SinkExt, StreamExt, channel::mpsc};
     use std::sync::Arc;
@@ -1840,11 +1808,7 @@ mod streaming_tests {
             // The simple protocol must also flush and remain cancellable.
             let rows = client.simple_query_raw("SELECT n FROM gated").await?;
             futures::pin_mut!(rows);
-            loop {
-                if matches!(rows.next().await.unwrap()?, tokio_postgres::SimpleQueryMessage::Row(_)) {
-                    break;
-                }
-            }
+            while !matches!(rows.next().await.unwrap()?, tokio_postgres::SimpleQueryMessage::Row(_)) {}
             client.cancel_token().cancel_query(NoTls).await?;
             drain_to_error(&mut rows, None, "simple query was never canceled").await;
             assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42);

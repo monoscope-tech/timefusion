@@ -2521,7 +2521,7 @@ impl DmlCoalescer {
 mod tests {
     use datafusion::{
         arrow::{
-            array::{Int64Array, StringArray},
+            array::{ArrayRef, Int64Array, StringArray},
             datatypes::{DataType, Field, Schema},
         },
         prelude::col,
@@ -2529,9 +2529,15 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::database::HistogramDmlScope::{self, All, Timestamps};
 
     fn ts(micros: i64) -> ScalarValue {
         ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into()))
+    }
+
+    /// A timestamp literal with no timezone, as an UPDATE's own bounds arrive.
+    fn micros(n: i64) -> Expr {
+        lit(ScalarValue::TimestampMicrosecond(Some(n), None))
     }
 
     fn window(lo: i64, hi: i64) -> Expr {
@@ -2544,6 +2550,32 @@ mod tests {
             ScalarValue::TimestampMicrosecond(Some(v), _) => *v,
             other => panic!("not a timestamp bound: {other:?}"),
         }
+    }
+
+    /// A non-nullable schema from `(name, type)` pairs.
+    fn schema_of(fields: &[(&str, DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(fields.iter().map(|(name, ty)| Field::new(*name, ty.clone(), false)).collect::<Vec<_>>()))
+    }
+
+    fn int_batch(name: &str, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(schema_of(&[(name, DataType::Int64)]), vec![Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    fn str_batch(columns: &[(&str, &[&str])]) -> RecordBatch {
+        let fields: Vec<_> = columns.iter().map(|(name, _)| (*name, DataType::Utf8)).collect();
+        RecordBatch::try_new(schema_of(&fields), columns.iter().map(|(_, v)| Arc::new(StringArray::from(v.to_vec())) as ArrayRef).collect()).unwrap()
+    }
+
+    /// Quarantine artifacts of one kind, in directory order.
+    fn parked(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == ext)).collect()
+    }
+
+    /// Chunk row counts must tile the input exactly, in slices no larger than `cap`.
+    fn assert_tiles(counts: &[usize], cap: usize, rows: usize) {
+        assert_eq!(counts.len(), rows.div_ceil(cap), "wrong number of chunks");
+        assert!(counts.iter().all(|&n| n <= cap), "a chunk exceeded the cap");
+        assert_eq!(counts.iter().sum::<usize>(), rows, "chunking must not drop or duplicate rows");
     }
 
     /// A `PendingGroup` with shared defaults; callers override what their case
@@ -2570,7 +2602,7 @@ mod tests {
     #[serial_test::serial]
     fn terminal_failure_quarantines_rows_recoverably() {
         let dir = tempfile::tempdir().unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false), Field::new("n", DataType::Int64, false)]));
+        let schema = schema_of(&[("id", DataType::Utf8), ("n", DataType::Int64)]);
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a", "b"])), Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
         let key = GroupKey { project_id: "proj/1".into(), table_name: "otel_logs_and_spans".into(), fingerprint: 7 };
         let mut group = pending(schema.clone(), DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp"), vec![(batch.clone(), (None, None))]);
@@ -2580,13 +2612,11 @@ mod tests {
         assert!(quarantine_group(dir.path(), &key, &group, std::slice::from_ref(&batch), "resources exhausted"));
         assert_eq!(crate::observability::dml_stats().coalesce_quarantined.load(Ordering::Relaxed), before + 1);
 
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
-        let arrow = files.iter().find(|p| p.extension().is_some_and(|e| e == "arrow")).expect("no .arrow payload");
-        let meta = std::fs::read_to_string(files.iter().find(|p| p.extension().is_some_and(|e| e == "meta")).expect("no .meta")).unwrap();
+        let arrow = parked(dir.path(), "arrow").pop().expect("no .arrow payload");
+        let meta = std::fs::read_to_string(parked(dir.path(), "meta").pop().expect("no .meta")).unwrap();
 
         // Payload round-trips through Arrow IPC with rows intact.
-        let f = std::fs::File::open(arrow).unwrap();
-        let reader = datafusion::arrow::ipc::reader::FileReader::try_new(f, None).unwrap();
+        let reader = datafusion::arrow::ipc::reader::FileReader::try_new(std::fs::File::open(&arrow).unwrap(), None).unwrap();
         let read: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         assert_eq!(read.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         assert_eq!(read[0].schema().fields().len(), 2);
@@ -2608,31 +2638,26 @@ mod tests {
     #[serial_test::serial]
     fn parks_are_collision_proof_and_partial_loss_pages() {
         let dir = tempfile::tempdir().unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let batch = int_batch("n", vec![1]);
         let key = GroupKey { project_id: "p".into(), table_name: "t".into(), fingerprint: 1 };
-        let mut group = pending(schema.clone(), DecomposedPredicate::decompose(None, "timestamp"), vec![(batch.clone(), (None, None))]);
+        let mut group = pending(batch.schema(), DecomposedPredicate::decompose(None, "timestamp"), vec![(batch.clone(), (None, None))]);
         group.join_keys = vec![("n".into(), "n".into())];
         group.assignments = vec![("n".into(), lit(1i64))];
 
         for _ in 0..3 {
             assert!(quarantine_group(dir.path(), &key, &group, std::slice::from_ref(&batch), "x"));
         }
-        let payloads = std::fs::read_dir(dir.path()).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "arrow")).count();
-        assert_eq!(payloads, 3, "parks overwrote each other instead of getting distinct names");
+        assert_eq!(parked(dir.path(), "arrow").len(), 3, "parks overwrote each other instead of getting distinct names");
 
         // A schema-mismatched batch cannot go in the IPC file; that is real loss
         // and must bump the paging metric.
-        let other =
-            RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)])), vec![Arc::new(StringArray::from(vec!["z"]))]).unwrap();
+        let other = str_batch(&[("s", &["z"][..])]);
         group.batches = vec![(batch.clone(), (None, None)), (other.clone(), (None, None))];
         let dropped_before = crate::observability::dml_stats().coalesce_quarantined.load(Ordering::Relaxed);
         assert!(quarantine_group(dir.path(), &key, &group, &[batch.clone(), other], "mixed"));
         assert_eq!(crate::observability::dml_stats().coalesce_quarantined.load(Ordering::Relaxed), dropped_before + 1);
-        let meta = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "meta"))
+        let meta = parked(dir.path(), "meta")
+            .iter()
             .map(|p| std::fs::read_to_string(p).unwrap())
             .find(|m| m.contains("reason=mixed"))
             .expect("no meta for the mixed-schema park");
@@ -2645,14 +2670,9 @@ mod tests {
     #[test]
     fn oversized_round_chunks_to_bounded_merges() {
         let rows = MAX_MERGE_ROWS * 2 + 7;
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        let round = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))]).unwrap();
-
-        let chunks: Vec<RecordBatch> = chunk_rows(&round, MAX_MERGE_ROWS).collect();
-
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|c| c.num_rows() <= MAX_MERGE_ROWS));
-        assert_eq!(chunks.iter().map(RecordBatch::num_rows).sum::<usize>(), rows, "chunking must not drop or duplicate rows");
+        let round = int_batch("n", (0..rows as i64).collect());
+        let counts: Vec<usize> = chunk_rows(&round, MAX_MERGE_ROWS).map(|c| c.num_rows()).collect();
+        assert_tiles(&counts, MAX_MERGE_ROWS, rows);
     }
 
     #[test]
@@ -2669,20 +2689,13 @@ mod tests {
         assert!(parts.iter().any(|p| p.contains("project_id")));
     }
 
-    #[test]
-    fn widen_takes_union_window() {
+    /// Widening `[100, 200)` with another statement's window, as `(lower, upper)` micros.
+    #[test_case(window(50, 150) => (Some(50i64), Some(200i64)) ; "overlapping windows take the union")]
+    #[test_case(col("timestamp").gt_eq(lit(ts(10))) => (Some(10i64), None) ; "a statement without an upper bound widens the union to unbounded")]
+    fn widen_takes_union_window(other: Expr) -> (Option<i64>, Option<i64>) {
         let mut a = DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp");
-        let b = DecomposedPredicate::decompose(Some(&window(50, 150)), "timestamp");
-        a.widen(&b);
-        assert_eq!(a.lower.unwrap().value, ts(50));
-        assert_eq!(a.upper.unwrap().value, ts(200));
-
-        // A statement without an upper bound widens the union to unbounded.
-        let mut a = DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp");
-        let unbounded = DecomposedPredicate::decompose(Some(&col("timestamp").gt_eq(lit(ts(10)))), "timestamp");
-        a.widen(&unbounded);
-        assert_eq!(a.lower.unwrap().value, ts(10));
-        assert!(a.upper.is_none());
+        a.widen(&DecomposedPredicate::decompose(Some(&other), "timestamp"));
+        (a.lower.as_ref().map(m), a.upper.as_ref().map(m))
     }
 
     /// A clamped bound as the case lines spell it: `(micros, inclusive)`.
@@ -2738,11 +2751,7 @@ mod tests {
 
     #[test]
     fn split_rounds_separates_duplicate_keys_and_drops_exact_dups() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("span_id", DataType::Utf8, false),
-            Field::new("tag", DataType::Utf8, false),
-            Field::new("n", DataType::Int64, false),
-        ]));
+        let schema = schema_of(&[("span_id", DataType::Utf8), ("tag", DataType::Utf8), ("n", DataType::Int64)]);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -2762,23 +2771,21 @@ mod tests {
         assert_eq!(total, 4, "exact duplicate dropped");
     }
 
-    #[test]
-    fn is_project_eq_matches_only_exact_literal_equality() {
-        assert!(is_project_eq(&col("project_id").eq(lit("p1")), "p1"));
-        assert!(is_project_eq(&lit("p1").eq(col("project_id")), "p1")); // swapped operands
-        assert!(!is_project_eq(&col("project_id").eq(lit("p2")), "p1")); // other project
-        assert!(!is_project_eq(&col("project_id").not_eq(lit("p1")), "p1")); // wrong op
-        assert!(!is_project_eq(&col("other_col").eq(lit("p1")), "p1")); // wrong column
+    #[test_case(col("project_id").eq(lit("p1")) => true ; "exact literal equality")]
+    #[test_case(lit("p1").eq(col("project_id")) => true ; "swapped operands")]
+    #[test_case(col("project_id").eq(lit("p2")) => false ; "other project")]
+    #[test_case(col("project_id").not_eq(lit("p1")) => false ; "wrong op")]
+    #[test_case(col("other_col").eq(lit("p1")) => false ; "wrong column")]
+    fn is_project_eq_matches_only_exact_literal_equality(predicate: Expr) -> bool {
+        is_project_eq(&predicate, "p1")
     }
 
     /// Pin the folded group's whole shape: appended project column + join key,
     /// IN-list residual, union window, and a member-set-sensitive fingerprint.
     #[test]
     fn build_folded_appends_project_column_and_unions_windows() {
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("span_id", DataType::Utf8, false), Field::new("tag", DataType::Utf8, false)]));
-        let batch = |ids: &[&str]| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(ids.to_vec())), Arc::new(StringArray::from(vec!["t"; ids.len()]))]).unwrap()
-        };
+        let schema = schema_of(&[("span_id", DataType::Utf8), ("tag", DataType::Utf8)]);
+        let batch = |ids: &[&str]| str_batch(&[("span_id", ids), ("tag", &vec!["t"; ids.len()][..])]);
         let member = |project: &str, lo: i64, hi: i64, ids: &[&str]| {
             let pred = col("project_id").eq(lit(project)).and(window(lo, hi));
             let d = DecomposedPredicate::decompose(Some(&pred), "timestamp");
@@ -2822,8 +2829,7 @@ mod tests {
     /// Build a group whose statements each carry their own window, the way
     /// `enqueue` records them (group predicate widened, per-batch bounds kept).
     fn group_with_windows(windows: &[(i64, Option<i64>)]) -> PendingGroup {
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a"]))]).unwrap();
+        let batch = str_batch(&[("id", &["a"][..])]);
         let decomposed: Vec<DecomposedPredicate> = windows
             .iter()
             .map(|&(lo, hi)| {
@@ -2838,30 +2844,27 @@ mod tests {
             p.widen(d);
             p
         });
-        let mut group = pending(schema, predicate, decomposed.into_iter().map(|d| (batch.clone(), (d.lower, d.upper))).collect());
+        let mut group = pending(batch.schema(), predicate, decomposed.into_iter().map(|d| (batch.clone(), (d.lower, d.upper))).collect());
         group.attempts = 2;
         group
     }
 
-    #[test]
-    fn histogram_scope_requires_exact_target_timestamp_bounds() {
-        use crate::database::HistogramDmlScope::{All, Timestamps};
-        let micros = |n| lit(ScalarValue::TimestampMicrosecond(Some(n), None));
-        for (predicate, expected) in [
-            (window(0, 60), Timestamps(0..=59)),
-            (col("timestamp").gt(micros(0)).and(col("timestamp").lt_eq(micros(60))), Timestamps(1..=60)),
-            (window(0, 60).or(window(120, 180)), All),
-            (col("timestamp").gt_eq(micros(0)), All),
-            (window(60, 0), All),
-            (window(i64::MIN, i64::MIN), All),
-            (col("timestamp").gt_eq(micros(0)).and(col("timestamp").lt(lit(ScalarValue::TimestampNanosecond(Some(1_500), None)))), All),
-        ] {
-            assert_eq!(histogram_dml_scope(Some(&predicate), &[], None), expected);
-        }
-        assert_eq!(histogram_dml_scope(None, &[], None), All);
-        assert_eq!(histogram_dml_scope(Some(&window(0, 60)), &[("timestamp".into(), micros(120))], None), All);
-        let schema = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None), false)]));
-        assert_eq!(histogram_dml_scope(Some(&window(0, 60)), &[], Some(schema.as_ref())), All, "source-side bounds cannot prove a target range");
+    /// Only proven bounds on the TARGET timestamp narrow the fence; every other
+    /// shape must widen to `All`. The bool picks a source schema that itself
+    /// carries a `timestamp` column.
+    #[test_case(Some(window(0, 60)), vec![], false => Timestamps(0..=59) ; "half-open window becomes inclusive micros")]
+    #[test_case(Some(col("timestamp").gt(micros(0)).and(col("timestamp").lt_eq(micros(60)))), vec![], false => Timestamps(1..=60) ; "exclusive lower and inclusive upper both shift by one")]
+    #[test_case(Some(window(0, 60).or(window(120, 180))), vec![], false => All ; "a disjunction of windows proves nothing")]
+    #[test_case(Some(col("timestamp").gt_eq(micros(0))), vec![], false => All ; "no upper bound")]
+    #[test_case(Some(window(60, 0)), vec![], false => All ; "inverted window")]
+    #[test_case(Some(window(i64::MIN, i64::MIN)), vec![], false => All ; "degenerate i64::MIN window")]
+    #[test_case(Some(col("timestamp").gt_eq(micros(0)).and(col("timestamp").lt(lit(ScalarValue::TimestampNanosecond(Some(1_500), None))))), vec![], false => All ; "sub-microsecond nanosecond bound is not exact")]
+    #[test_case(None, vec![], false => All ; "no predicate at all")]
+    #[test_case(Some(window(0, 60)), vec![("timestamp".into(), micros(120))], false => All ; "an assignment to timestamp moves rows out of the window")]
+    #[test_case(Some(window(0, 60)), vec![], true => All ; "source-side bounds cannot prove a target range")]
+    fn histogram_scope_requires_exact_target_timestamp_bounds(pred: Option<Expr>, assign: Vec<(String, Expr)>, source_ts: bool) -> HistogramDmlScope {
+        let source = source_ts.then(|| Schema::new(vec![Field::new("timestamp", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None), false)]));
+        histogram_dml_scope(pred.as_ref(), &assign, source.as_ref())
     }
 
     #[tokio::test]
@@ -2974,18 +2977,15 @@ mod tests {
         assert_eq!(bucket_group(g).into_iter().map(|u| u.batches.len()).sum::<usize>(), 0);
     }
 
-    #[test]
-    fn fingerprint_groups_same_shape_only() {
+    /// Does this predicate land in the same group as `project_id = 'p1' AND [1, 2)`?
+    #[test_case(window(5, 9).and(col("project_id").eq(lit("p1"))) => true ; "same residual order-insensitively, different window")]
+    #[test_case(col("project_id").eq(lit("p2")).and(window(1, 2)) => false ; "different residual constant")]
+    fn fingerprint_groups_same_shape_only(other: Expr) -> bool {
         let jk = vec![("context___span_id".to_string(), "span_id".to_string())];
         let assign = vec![("hashes".to_string(), col("source.tag"))];
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("span_id", DataType::Utf8, false)]));
-        let d1 = DecomposedPredicate::decompose(Some(&col("project_id").eq(lit("p1")).and(window(1, 2))), "timestamp");
-        let d2 = DecomposedPredicate::decompose(Some(&window(5, 9).and(col("project_id").eq(lit("p1")))), "timestamp");
-        // Same residual (order-insensitive), different windows → same group.
-        assert_eq!(shape_fingerprint(&jk, &assign, &d1.residual, &schema), shape_fingerprint(&jk, &assign, &d2.residual, &schema));
-        // Different residual constant → different group.
-        let d3 = DecomposedPredicate::decompose(Some(&col("project_id").eq(lit("p2")).and(window(1, 2))), "timestamp");
-        assert_ne!(shape_fingerprint(&jk, &assign, &d1.residual, &schema), shape_fingerprint(&jk, &assign, &d3.residual, &schema));
+        let schema = schema_of(&[("span_id", DataType::Utf8)]);
+        let fp = |pred: &Expr| shape_fingerprint(&jk, &assign, &DecomposedPredicate::decompose(Some(pred), "timestamp").residual, &schema);
+        fp(&col("project_id").eq(lit("p1")).and(window(1, 2))) == fp(&other)
     }
 
     /// The DML session must decode the wide otel schema at the same batch size as
@@ -3010,9 +3010,8 @@ mod tests {
         let schema = batch.schema();
         let chunks = bounded_mor_source_chunks(UpdateSource { batch, schema, join_keys: vec![("context___span_id".into(), "span_id".into())] });
 
-        assert_eq!(chunks.iter().map(|chunk| chunk.batch.num_rows()).sum::<usize>(), rows);
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|chunk| chunk.batch.num_rows() <= MOR_KEY_PUSHDOWN_ROWS));
-        assert_eq!(chunks[2].batch.num_rows(), 17);
+        let counts: Vec<usize> = chunks.iter().map(|chunk| chunk.batch.num_rows()).collect();
+        assert_tiles(&counts, MOR_KEY_PUSHDOWN_ROWS, rows);
+        assert_eq!(counts[2], 17, "the tail chunk carries the remainder");
     }
 }

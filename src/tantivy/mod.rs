@@ -338,6 +338,7 @@ mod builder_tests {
         datatypes::{Field, Schema as ArrowSchema, TimeUnit},
     };
     use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
+    use test_case::test_case;
 
     use super::*;
     use crate::{
@@ -394,68 +395,64 @@ mod builder_tests {
         .unwrap()
     }
 
-    #[test]
-    fn list_elements_preserve_exact_terms_and_legacy_text() -> Result<()> {
+    #[test_case(TantivyListMode::Elements, vec![("err:a", 2), ("x y", 1), ("err:a x y", 0), ("", 1), ("*", 1), ("α", 1)] ; "elements mode indexes each element as its own exact term")]
+    #[test_case(TantivyListMode::JoinedText, vec![("err:a", 0), ("x y", 0), ("err:a x y", 1), ("", 0), ("* α", 1)] ; "legacy joined-text mode indexes the whole list as one term")]
+    fn list_elements_preserve_exact_terms_and_legacy_text(mode: TantivyListMode, cases: Vec<(&str, usize)>) -> Result<()> {
         use arrow::array::{ListBuilder, StringBuilder};
-        for (mode, cases) in [
-            (TantivyListMode::Elements, vec![("err:a", 2), ("x y", 1), ("err:a x y", 0), ("", 1), ("*", 1), ("α", 1)]),
-            (TantivyListMode::JoinedText, vec![("err:a", 0), ("x y", 0), ("err:a x y", 1), ("", 0), ("* α", 1)]),
+        let mut table = table();
+        table.fields[2].data_type = "List(Utf8)".into();
+        table.fields[2].tantivy.as_mut().unwrap().list_mode = mode;
+        let mut lists = ListBuilder::new(StringBuilder::new());
+        for values in [
+            Some(vec![Some("err:a"), Some("x y")]),
+            Some(vec![Some("err:a"), Some("err:a")]),
+            Some(vec![Some("")]),
+            Some(vec![None]),
+            Some(vec![]),
+            None,
+            Some(vec![Some("*"), Some("α")]),
         ] {
-            let mut table = table();
-            table.fields[2].data_type = "List(Utf8)".into();
-            table.fields[2].tantivy.as_mut().unwrap().list_mode = mode;
-            let mut lists = ListBuilder::new(StringBuilder::new());
-            for values in [
-                Some(vec![Some("err:a"), Some("x y")]),
-                Some(vec![Some("err:a"), Some("err:a")]),
-                Some(vec![Some("")]),
-                Some(vec![None]),
-                Some(vec![]),
-                None,
-                Some(vec![Some("*"), Some("α")]),
-            ] {
-                values.iter().flatten().for_each(|value| lists.values().append_option(*value));
-                lists.append(values.is_some());
-            }
-            let values: ArrayRef = Arc::new(lists.finish());
-            let input = RecordBatch::try_new(
-                arrow_schema(values.data_type().clone()),
-                vec![
-                    Arc::new(TimestampMicrosecondArray::from(vec![0; 7]).with_timezone("UTC")),
-                    Arc::new(StringArray::from_iter_values((0..7).map(|i| i.to_string()))),
-                    values,
-                ],
-            )?;
-            let (index, built, stats) = build_in_memory(&table, std::slice::from_ref(&input))?;
-            assert_eq!(stats.element_fields.contains("level"), mode == TantivyListMode::Elements);
-            let mut entry = ManifestEntry::failed("old build".into(), vec!["file".into()]);
-            entry.index = Some("index".into());
-            entry.error = None;
-            assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "legacy index must not stop element backfill");
-            entry.element_fields = stats.element_fields.clone();
-            assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "element histograms need physical ordinals");
-            entry.ordinals_valid = true;
-            assert!(entry.covers_current_elements(&table));
-            entry.schema_version = SCHEMA_VERSION + 1;
-            assert!(!entry.covers_current_elements(&table));
-            let reader = index.reader()?;
-            for (term, expected) in cases {
-                let q = TermQuery::new(Term::from_field_text(built.user_fields["level"].field, term), IndexRecordOption::Basic);
-                assert_eq!(reader.searcher().search(&q, &tantivy::collector::Count)?, expected, "{mode:?}: {term:?}");
-                if mode == TantivyListMode::Elements {
-                    let predicate = histogram::Membership::Contains { column: "level".into(), value: term.into() };
-                    let counts = histogram::HistogramWindow::new(-1, 1, 1, 0, 2)?.count_rows(
-                        std::slice::from_ref(&input),
-                        &arrow::buffer::BooleanBuffer::new_set(7),
-                        Some(&predicate),
-                    )?;
-                    assert_eq!(counts.values().sum::<u64>(), expected as u64, "captured-row membership must match exact indexed elements");
-                }
-            }
+            values.iter().flatten().for_each(|value| lists.values().append_option(*value));
+            lists.append(values.is_some());
+        }
+        let values: ArrayRef = Arc::new(lists.finish());
+        let input = RecordBatch::try_new(
+            arrow_schema(values.data_type().clone()),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![0; 7]).with_timezone("UTC")),
+                Arc::new(StringArray::from_iter_values((0..7).map(|i| i.to_string()))),
+                values,
+            ],
+        )?;
+        let (index, built, stats) = build_in_memory(&table, std::slice::from_ref(&input))?;
+        assert_eq!(stats.element_fields.contains("level"), mode == TantivyListMode::Elements);
+        let mut entry = ManifestEntry::failed("old build".into(), vec!["file".into()]);
+        entry.index = Some("index".into());
+        entry.error = None;
+        assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "legacy index must not stop element backfill");
+        entry.element_fields = stats.element_fields.clone();
+        assert_eq!(entry.covers_current_elements(&table), mode == TantivyListMode::JoinedText, "element histograms need physical ordinals");
+        entry.ordinals_valid = true;
+        assert!(entry.covers_current_elements(&table));
+        entry.schema_version = SCHEMA_VERSION + 1;
+        assert!(!entry.covers_current_elements(&table));
+        let reader = index.reader()?;
+        for (term, expected) in cases {
+            let q = TermQuery::new(Term::from_field_text(built.user_fields["level"].field, term), IndexRecordOption::Basic);
+            assert_eq!(reader.searcher().search(&q, &tantivy::collector::Count)?, expected, "{mode:?}: {term:?}");
             if mode == TantivyListMode::Elements {
-                table.fields[2].tantivy.as_mut().unwrap().tokenizer = Some("default".into());
-                assert!(build_in_memory(&table, &[input]).is_err(), "element mode must reject tokenized text");
+                let predicate = histogram::Membership::Contains { column: "level".into(), value: term.into() };
+                let counts = histogram::HistogramWindow::new(-1, 1, 1, 0, 2)?.count_rows(
+                    std::slice::from_ref(&input),
+                    &arrow::buffer::BooleanBuffer::new_set(7),
+                    Some(&predicate),
+                )?;
+                assert_eq!(counts.values().sum::<u64>(), expected as u64, "captured-row membership must match exact indexed elements");
             }
+        }
+        if mode == TantivyListMode::Elements {
+            table.fields[2].tantivy.as_mut().unwrap().tokenizer = Some("default".into());
+            assert!(build_in_memory(&table, &[input]).is_err(), "element mode must reject tokenized text");
         }
         Ok(())
     }
@@ -492,27 +489,19 @@ mod builder_tests {
         assert_eq!(error_hits(&index, &built), unmerged);
     }
 
-    /// A COST guard, not a correctness one: the build must put its scratch on
-    /// the volume it was handed and write NOTHING under the process temp dir.
+    /// COST guards, not correctness ones: the build must keep its scratch on
+    /// the volume it was handed (nothing under the process temp dir), and
+    /// verification must not materialise the index on disk a second time — a
+    /// disk-writing version still passes every correctness assertion.
     #[test]
-    fn index_builds_keep_scratch_off_the_process_temp_dir() {
+    fn index_builds_keep_scratch_off_the_process_temp_dir_and_verifying_materializes_nothing() {
         let scratch = tempfile::tempdir().expect("scratch root");
         let (blob, stats) = build_and_pack(&table(), &[batch(0), batch(1)], 1, MergeMode::Now, scratch.path()).expect("build");
-        verify_blob(&blob).expect("verify");
 
         assert_eq!(stats.rows, 2, "build must actually have indexed the batches");
         // Asserts the ROOT, not leftover files: scratch dirs are reclaimed on
         // drop, so counting files under a redirected TMPDIR proves nothing.
         assert!(scratch.path().join("tantivy_scratch").is_dir(), "build must root its scratch under the volume it was given");
-    }
-
-    /// COST guard: verification must not materialise the index on disk a
-    /// second time — a disk-writing version still passes every correctness
-    /// assertion, so the assertion has to be that nothing was written.
-    #[test]
-    fn verifying_a_blob_materializes_nothing_on_disk() {
-        let scratch = tempfile::tempdir().expect("scratch");
-        let (blob, _) = build_and_pack(&table(), &[batch(0), batch(1)], 1, MergeMode::Now, scratch.path()).expect("build");
 
         let before = std::fs::read_dir(scratch_root(scratch.path())).map(|e| e.count()).unwrap_or(0);
         verify_blob(&blob).expect("fresh blob verifies");

@@ -1261,13 +1261,13 @@ mod stats_table_tests {
         (0..batch.num_rows()).map(|i| (components.value(i).to_string(), keys.value(i).to_string(), values.value(i).to_string())).collect()
     }
 
-    fn assert_has(rows: &[OwnedRow], component: &str, key: &str) {
-        assert!(rows.iter().any(|(c, k, _)| c == component && k == key), "missing {component}.{key}");
+    /// The `component` rows whose key carries `prefix` — the shape both registry-completeness tests compare against their registry.
+    fn exposed_keys(rows: &[OwnedRow], component: &str, prefix: &str) -> std::collections::BTreeSet<String> {
+        rows.iter().filter(|(c, k, _)| c == component && k.starts_with(prefix)).map(|(_, k, _)| k.clone()).collect()
     }
 
-    /// Every optional wiring attached at once, so one snapshot proves them all.
-    /// `with_scan_metrics` is required: the `memory` component is emitted inside
-    /// the scan-metrics branch, so an unwired scan hides every pool row too.
+    /// Every optional wiring at once. `with_scan_metrics` is required: the `memory`
+    /// component is emitted inside that branch, so an unwired scan hides every pool row too.
     fn fully_wired_rows() -> Vec<OwnedRow> {
         let snapshot = FoyerRuntimeStats {
             memory_size_bytes: 4 * 1024 * 1024,
@@ -1294,9 +1294,8 @@ mod stats_table_tests {
         )
     }
 
-    /// One snapshot, every wired component: the rows a `timefusion_stats` query
-    /// must carry, plus the handful whose VALUE is the point — a pool pct must
-    /// divide used by the size it was handed.
+    /// One snapshot, every wired component: the rows a `timefusion_stats` query must
+    /// carry, plus the handful whose VALUE is the point — a pool pct divides used by the size it was handed.
     #[test]
     fn exposes_every_wired_component_foyer_pools_logical_count_runtime_scan_and_parquet() {
         use crate::database::scan_metric_names::{SCAN_DERIVED_ROWS, SCAN_ROWS};
@@ -1305,9 +1304,10 @@ mod stats_table_tests {
         drop(crate::observability::TimedSection::new("test_section"));
 
         let rows = fully_wired_rows();
+        // `keys` is a space-separated list; each one must own a row.
         let expect = |component: &str, keys: &str| {
-            for key in keys.split(' ') {
-                assert_has(&rows, component, key);
+            for key in keys.split_whitespace() {
+                assert!(rows.iter().any(|(c, k, _)| c == component && k == key), "missing {component}.{key}");
             }
         };
 
@@ -1326,7 +1326,7 @@ mod stats_table_tests {
         }
         expect("parquet", "metadata_cache_hits bytes_read");
         for (component, key) in SCAN_ROWS.iter().map(|(c, k, _)| (*c, *k)).chain(SCAN_DERIVED_ROWS.iter().copied()) {
-            assert_has(&rows, component, key);
+            expect(component, key);
         }
 
         // Rows whose VALUE, not mere presence, is the assertion.
@@ -1340,16 +1340,14 @@ mod stats_table_tests {
         }
     }
 
-    /// Scan metrics wired and nothing else: an unwired pool reports 0 rather
-    /// than dividing by zero, and every counter `scan_metrics!` declares reaches
-    /// `timefusion_stats` — including the `derived` rows computed here by hand,
-    /// which are the one way a declared counter can go silently unexposed.
+    /// Scan metrics wired and nothing else: an unwired pool reports 0 rather than dividing by zero, and every counter
+    /// `scan_metrics!` declares reaches `timefusion_stats` — including the hand-computed `derived` rows, the one way a declared counter goes silently unexposed.
     #[test]
     fn unwired_pools_read_zero_and_every_declared_scan_metric_has_a_row() {
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
         assert!(rows.contains(&("memory".into(), "maintenance_pool_pct".into(), "0".into())), "an unwired pool reports 0, not a panic");
 
-        let exposed = rows.iter().filter(|(component, key, _)| component == "scan" && key.starts_with("prefilter_skipped_")).count();
+        let exposed = exposed_keys(&rows, "scan", "prefilter_skipped_").len();
         assert_eq!(
             exposed,
             crate::database::scan_metric_names::PREFILTER_SKIP_REASONS.len(),
@@ -1358,9 +1356,8 @@ mod stats_table_tests {
         );
     }
 
-    /// Set equality (not a count) between the unverifiable-slice buckets and the
-    /// exposed rows: it exists to fail the day someone re-introduces a
-    /// hand-maintained key list, which would leave rows reading a confident 0.
+    /// Set equality (not a count) between the unverifiable-slice buckets and the exposed rows: it fails the day
+    /// someone re-introduces a hand-maintained key list, which would leave rows reading a confident 0.
     #[test]
     fn every_unverifiable_bucket_is_exposed() {
         use crate::database::rollup_unverifiable::{UnverifiableFate, UnverifiableReason};
@@ -1371,11 +1368,7 @@ mod stats_table_tests {
             .map(|suffix| format!("rollup_unverifiable_{suffix}"))
             .collect();
         let rows = snapshot_rows(&StatsTableProvider::new(None));
-        let exposed: std::collections::BTreeSet<String> = rows
-            .iter()
-            .filter(|(component, key, _)| component == "maintenance" && key.starts_with("rollup_unverifiable_"))
-            .map(|(_, key, _)| key.clone())
-            .collect();
+        let exposed = exposed_keys(&rows, "maintenance", "rollup_unverifiable_");
         assert_eq!(exposed, expected, "the exposed rows and the bucket lists must be the same set — an unexposed bucket cannot be attributed");
     }
 }

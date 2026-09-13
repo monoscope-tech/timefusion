@@ -974,6 +974,14 @@ mod tests {
         ScalarValue::Utf8(Some(s.into()))
     }
 
+    /// A lifted time fn may only ever be a tz-aware nanosecond timestamp.
+    fn ts_nanos(v: &ScalarValue) -> i64 {
+        match v {
+            ScalarValue::TimestampNanosecond(Some(ns), Some(_)) => *ns,
+            v => panic!("expected tz-aware nanosecond timestamp, got {v:?}"),
+        }
+    }
+
     proptest::proptest! {
         /// The premise of the cross-connection cache: the shape key depends on the
         /// AST's SHAPE only, never on the literal values it carries.
@@ -1009,20 +1017,38 @@ mod tests {
     }
 
     /// Literals that are NOT ordinal-safe value contexts must survive verbatim in
-    /// the shape key; in each case only the `'p'` project id may be lifted.
+    /// the shape key; in each case only the `'p'` project id may be lifted. Where a
+    /// `twin` is given it differs from `sql` ONLY in its literals, so both must
+    /// render the identical shape key.
     // Substring OFFSETs carry a number, so the statement still caches.
-    #[test_case("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'", &["FROM 3"] => vec![utf8("p")] ; "an offset substring still caches, offset inline")]
+    #[test_case("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'", None::<&str>, &["FROM 3"], &[] => vec![utf8("p")] ; "an offset substring still caches, offset inline")]
     // Ordinals and LIMIT/OFFSET are bare Number nodes; parameterizing them would
     // turn ORDER BY 1 into ordering by a constant.
-    #[test_case("SELECT status_code, count(*) FROM t WHERE project_id = 'p' GROUP BY 1 ORDER BY 1 LIMIT 100 OFFSET 20", &["GROUP BY 1", "ORDER BY 1", "LIMIT 100", "OFFSET 20"]
+    #[test_case("SELECT status_code, count(*) FROM t WHERE project_id = 'p' GROUP BY 1 ORDER BY 1 LIMIT 100 OFFSET 20", None::<&str>, &["GROUP BY 1", "ORDER BY 1", "LIMIT 100", "OFFSET 20"], &[]
         => vec![utf8("p")] ; "ordinals and limit stay inline")]
     // A $N placeholder hides an array literal from PgArrayLiteralRewriter (which
     // matches Expr::Literal only), mis-casting it to a single-element list.
-    #[test_case("SELECT ARRAY_LENGTH(COALESCE(parent_id, '{a,b}')) FROM t WHERE project_id = 'p'", &["'{a,b}'"] => vec![utf8("p")] ; "parameterize keeps pg array literals inline")]
-    fn only_the_unsafe_literals_stay_inline(sql: &str, inline: &[&str]) -> Vec<ScalarValue> {
+    #[test_case("SELECT ARRAY_LENGTH(COALESCE(parent_id, '{a,b}')) FROM t WHERE project_id = 'p'", None::<&str>, &["'{a,b}'"], &[] => vec![utf8("p")] ; "parameterize keeps pg array literals inline")]
+    // Strings and the comparison number lift, in walk order; LIMIT is not an
+    // ordinal-safe value context so it stays inline.
+    #[test_case("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100", Some("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 9 LIMIT 100"),
+        &["$1", "$2", "$3", "LIMIT 100"], &[]
+        => vec![utf8("p1"), utf8("2026-07-01"), ScalarValue::Int64(Some(5))] ; "parameterize extracts strings and value context numbers in walk order")]
+    // Shapes differing only by numeric literals must collapse to one entry.
+    #[test_case("SELECT time_bucket(60, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 500 AND timestamp >= 1721000000000000",
+        Some("SELECT time_bucket(300, timestamp), approx_percentile(0.99, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000"),
+        &[], &["60", "0.95", "500"]
+        => with |v: Vec<ScalarValue>| assert_eq!(v.len(), 5, "4 numbers + the 'p' string all captured: {v:?}") ; "numeric literals in value contexts parameterize")]
+    fn only_the_unsafe_literals_stay_inline(sql: &str, twin: Option<&str>, inline: &[&str], replaced: &[&str]) -> Vec<ScalarValue> {
         let (text, values) = shape(sql);
         for frag in inline {
             assert!(text.contains(frag), "{frag} must stay inline: {text}");
+        }
+        for frag in replaced {
+            assert!(!text.contains(frag), "{frag} must be replaced by a placeholder: {text}");
+        }
+        if let Some(twin) = twin {
+            assert_eq!(text, shape(twin).0, "shape key must be literal-insensitive");
         }
         values
     }
@@ -1052,37 +1078,6 @@ mod tests {
         normalize_count_star(&parse(sql)).map(|s| s.to_string())
     }
 
-    #[test]
-    fn parameterize_extracts_strings_and_value_context_numbers_in_walk_order() {
-        let (text, values) = shape("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100");
-        assert!(text.contains("$1") && text.contains("$2") && text.contains("$3"), "strings + the comparison number become placeholders: {text}");
-        assert!(text.contains("LIMIT 100"), "LIMIT stays inline (not an ordinal-safe value context): {text}");
-        // Walk order: 'p1', '2026-07-01', then the numeric 5 from `n = 5`.
-        assert_eq!(values, vec![utf8("p1"), utf8("2026-07-01"), ScalarValue::Int64(Some(5))], "values extracted in walk order");
-        // Same shape with different literals (incl. the number) → identical shape key.
-        assert_eq!(
-            text,
-            shape("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 9 LIMIT 100").0,
-            "shape key must be literal-insensitive"
-        );
-    }
-
-    #[test]
-    fn numeric_literals_in_value_contexts_parameterize() {
-        // Shapes differing only by numeric literals must collapse to one entry.
-        let (ta, va) = shape(
-            "SELECT time_bucket(60, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 500 AND timestamp >= 1721000000000000",
-        );
-        let tb = shape(
-            "SELECT time_bucket(300, timestamp), approx_percentile(0.99, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000",
-        )
-        .0;
-        assert!(!ta.contains("60") && !ta.contains("0.95") && !ta.contains("500"), "numerics replaced: {ta}");
-        assert_eq!(ta, tb, "shape identical across differing numeric literals");
-        // 4 numbers + the 'p' string all captured.
-        assert_eq!(va.len(), 5, "captured {:?}", va);
-    }
-
     /// The optimizer const-folds time fns from the query start time, so caching
     /// the optimized plan would freeze the window. The Date/Time-returning subset
     /// must additionally stay off the shape path.
@@ -1099,38 +1094,40 @@ mod tests {
         (contains_plan_time_folded_fn(&stmt), contains_unparameterizable_time_fn(&stmt))
     }
 
-    #[test]
-    fn parameterize_replaces_now_with_fresh_timestamp_placeholder() {
-        let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-        let (text, values) = shape("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'");
-        let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-        assert!(!text.to_lowercase().contains("now("), "now() replaced by placeholder: {text}");
-        assert!(text.contains("$1") && text.contains("$2"), "project_id + now() both placeholders: {text}");
-        // Second value is the timestamp bound to the captured instant.
-        match values[1] {
-            ScalarValue::TimestampNanosecond(Some(ns), Some(_)) => assert!(before <= ns && ns <= after, "fresh instant"),
-            ref v => panic!("expected tz-aware nanosecond timestamp, got {v:?}"),
-        }
-        // Shape is literal-insensitive: two refreshes yield the same placeholder text.
-        assert_eq!(text, shape("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'").0, "reusable shape key across refreshes");
-    }
-
     #[test_case("SELECT id FROM t WHERE project_id = $1 AND n = $3" => 3 ; "highest client bind wins")]
     #[test_case("SELECT id FROM t WHERE project_id = 'p'" => 0 ; "no binds at all")]
     fn max_placeholder_index_finds_highest_client_bind(sql: &str) -> usize {
         max_placeholder_index(&parse(sql))
     }
 
-    #[test]
-    fn mixed_parameterizes_time_fns_above_client_binds_only() {
-        let stmt = parse("SELECT id FROM t WHERE project_id = $1 AND level = 'error' AND ts > now() - INTERVAL '1 hour'");
-        let (param, values) = parameterize_statement(&stmt, 1, false).expect("now() parameterizes");
-        let text = param.to_string();
-        assert!(!text.to_lowercase().contains("now("), "now() replaced: {text}");
-        assert!(text.contains("$1") && text.contains("$2"), "client $1 kept, now() → $2: {text}");
-        assert!(text.contains("'error'"), "string literal stays inline in mixed path: {text}");
-        assert_eq!(values.len(), 1, "only the time-fn is extracted");
-        assert!(matches!(values[0], ScalarValue::TimestampNanosecond(Some(_), Some(_))));
+    /// `now()` lifts to a placeholder bound to a FRESH instant (caching a folded
+    /// one would freeze the window) — on the pure path and on the mixed path,
+    /// where the generated index must land above the client's highest `$N`.
+    // Pure path: strings lift too, and the `twin` proves the key is reusable across refreshes.
+    #[test_case("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'", 0, true, &["$1", "$2"],
+        Some("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'") => 2 ; "pure path lifts project_id and now()")]
+    // Mixed path: client $1 kept, now() becomes $2, and the string stays inline.
+    #[test_case("SELECT id FROM t WHERE project_id = $1 AND level = 'error' AND ts > now() - INTERVAL '1 hour'", 1, false, &["$1", "$2", "'error'"],
+        None::<&str> => 1 ; "mixed parameterizes time fns above client binds only")]
+    fn now_lifts_to_a_fresh_timestamp_placeholder(sql: &str, base: usize, include_strings: bool, contains: &[&str], twin: Option<&str>) -> usize {
+        let render = |sql: &str| {
+            let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+            let (param, values) = parameterize_statement(&parse(sql), base, include_strings).expect("now() parameterizes");
+            let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+            // The time fn is lifted last, so it is the final value.
+            let ns = ts_nanos(values.last().expect("a value was lifted"));
+            assert!(before <= ns && ns <= after, "the lifted instant is fresh, not frozen");
+            (param.to_string(), values)
+        };
+        let (text, values) = render(sql);
+        assert!(!text.to_lowercase().contains("now("), "now() replaced by a placeholder: {text}");
+        for frag in contains {
+            assert!(text.contains(frag), "{frag} expected in: {text}");
+        }
+        if let Some(twin) = twin {
+            assert_eq!(text, render(twin).0, "reusable shape key across refreshes");
+        }
+        values.len()
     }
 
     #[test]
@@ -1141,10 +1138,7 @@ mod tests {
         let a = hook.extra_execute_params(Some(&mixed));
         let b = hook.extra_execute_params(Some(&mixed));
         assert_eq!(a.len(), 1);
-        match (&a[0], &b[0]) {
-            (ScalarValue::TimestampNanosecond(Some(x), _), ScalarValue::TimestampNanosecond(Some(y), _)) => assert!(y >= x, "monotonic fresh instant"),
-            _ => panic!("expected tz-aware nanosecond timestamps"),
-        }
+        assert!(ts_nanos(&b[0]) >= ts_nanos(&a[0]), "monotonic fresh instant");
         // Pure path (no client bind) substitutes at parse → no execute-time extras.
         assert!(hook.extra_execute_params(Some(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now()"))).is_empty());
         // No time fn → nothing to inject.
@@ -1165,7 +1159,7 @@ mod tests {
         };
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("project_id", DataType::Utf8, true)]));
         let ctx = SessionContext::new();
-        ctx.register_table("t", Arc::new(MemTable::try_new(schema.clone(), vec![vec![]]).unwrap())).unwrap();
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
         ctx
     }
 

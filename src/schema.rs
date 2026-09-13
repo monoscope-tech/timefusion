@@ -809,39 +809,29 @@ mod tests {
         assert!(unknown.synthesize(source()).is_err(), "an unknown column must still be rejected");
     }
 
-    #[test]
-    fn legacy_rollup_generations_remain_readable_during_migration() {
-        for name in [
-            "otel_logs_and_spans_rollup_dashboard_1m_v2",
-            "otel_logs_and_spans_rollup_dashboard_1h_v1",
-            "otel_metrics_rollup_metrics_1m_v1",
-            "otel_metrics_rollup_metrics_1h_v1",
-        ] {
-            assert!(get_schema(name).is_some(), "legacy rollup schema {name} must remain registered during canary");
-        }
+    #[test_case("otel_logs_and_spans_rollup_dashboard_1m_v2")]
+    #[test_case("otel_logs_and_spans_rollup_dashboard_1h_v1")]
+    #[test_case("otel_metrics_rollup_metrics_1m_v1")]
+    #[test_case("otel_metrics_rollup_metrics_1h_v1")]
+    fn legacy_rollup_generations_remain_readable_during_migration(name: &str) {
+        assert!(get_schema(name).is_some(), "legacy rollup schema {name} must remain registered during canary");
     }
 
     /// Migrated columns must be declared in the SAME SHAPE AND ORDER the stored
     /// Delta schema was widened in — last, nullable, never before a pre-existing
     /// field. Otherwise the write path builds batches the transaction log's
     /// column set does not match, and every write fails.
-    #[test]
-    fn shipped_mor_tables_declare_the_migrated_columns_last() {
-        for name in ["otel_logs_and_spans", "otel_metrics"] {
-            let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
-            assert!(schema.version_append, "{name} ships merge-on-read");
-            assert_tombstone_shape(name);
-            assert!(matches!(schema.field_def("updated_at"), Some((ArrowDataType::Timestamp(..), true))), "{name}.updated_at must be a nullable timestamp");
-
-            // `migrate-columns` APPENDS, so a later migration must extend this
-            // list at the end, never insert mid-list.
-            let migrated: &[&str] = match name {
-                "otel_logs_and_spans" => &["updated_at", "deleted", "attributes___http___route"],
-                _ => &["updated_at", "deleted"],
-            };
-            let tail: Vec<&str> = schema.fields.iter().rev().take(migrated.len()).map(|f| f.name.as_str()).rev().collect();
-            assert_eq!(tail, migrated, "{name}: migrated columns must be the LAST fields, in migration order (7d68f01)");
-        }
+    /// `migrate-columns` APPENDS, so a later migration must extend a row's list
+    /// at the end, never insert mid-list.
+    #[test_case("otel_logs_and_spans", &["updated_at", "deleted", "attributes___http___route"] ; "otel_logs_and_spans")]
+    #[test_case("otel_metrics", &["updated_at", "deleted"] ; "otel_metrics")]
+    fn shipped_mor_tables_declare_the_migrated_columns_last(name: &str, migrated: &[&str]) {
+        let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
+        assert!(schema.version_append, "{name} ships merge-on-read");
+        assert_tombstone_shape(name);
+        assert!(matches!(schema.field_def("updated_at"), Some((ArrowDataType::Timestamp(..), true))), "{name}.updated_at must be a nullable timestamp");
+        let tail: Vec<&str> = schema.fields.iter().rev().take(migrated.len()).map(|f| f.name.as_str()).rev().collect();
+        assert_eq!(tail, migrated, "{name}: migrated columns must be the LAST fields, in migration order (7d68f01)");
     }
 
     #[test]
@@ -857,21 +847,22 @@ mod tests {
     }
 
     /// `tombstones_possible` is what the COUNT(*) stats pushdown gates on, so it
-    /// must track the declared column rather than the write-path flag.
-    #[test]
-    fn tombstones_possible_tracks_storage_not_the_write_path() {
-        let parse = |extra: &str| parse_schema(extra, FIELDS_YAML);
+    /// must track the declared column rather than the write-path flag: turning
+    /// `version_append` off does not delete tombstones already written.
+    #[test_case("" => false ; "no tombstone column at all")]
+    #[test_case("tombstone_column: deleted\n" => true ; "declared column alone means tombstones may exist with the write path off")]
+    #[test_case("tombstone_column: deleted\nversion_append: true\n" => true ; "write path on")]
+    fn tombstones_possible_tracks_storage_not_the_write_path(extra: &str) -> bool {
+        parse_schema(extra, FIELDS_YAML).tombstones_possible()
+    }
 
-        assert!(!parse("").tombstones_possible(), "no tombstone column at all");
-        // Turning `version_append` off does not delete tombstones already
-        // written, so a declared column alone means they may sit in storage.
-        assert!(parse("tombstone_column: deleted\n").tombstones_possible(), "declared column ⇒ tombstones may exist even with the write path off");
-        assert!(parse("tombstone_column: deleted\nversion_append: true\n").tombstones_possible(), "write path on → tombstones can exist");
-        assert!(get_schema("otel_logs_and_spans").unwrap().tombstones_possible(), "otel ships merge-on-read");
-        assert!(get_schema("mor_versioned").unwrap().tombstones_possible());
-        // `mor_dormant` declares a tiebreak but NO tombstone column, so nothing
-        // could ever have tombstoned it — the stats fast path stays available.
-        assert!(!get_schema("mor_dormant").unwrap().tombstones_possible());
+    /// `mor_dormant` declares a tiebreak but NO tombstone column, so nothing could
+    /// ever have tombstoned it — the stats fast path stays available.
+    #[test_case("otel_logs_and_spans" => true ; "otel ships merge-on-read")]
+    #[test_case("mor_versioned" => true ; "mor_versioned")]
+    #[test_case("mor_dormant" => false ; "tiebreak without a tombstone column")]
+    fn shipped_schemas_report_tombstones_only_when_declared(name: &str) -> bool {
+        get_schema(name).unwrap().tombstones_possible()
     }
 
     #[test]

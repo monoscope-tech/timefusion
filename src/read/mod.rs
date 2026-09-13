@@ -1167,7 +1167,7 @@ mod tests {
     /// It defaults ON (off also disables LIMIT early termination).
     #[test]
     fn bounded_dedup_kill_switch_forces_full_set() {
-        let plan = greatest_plan(vec![vbatch(&["a", "a"], &[5, 10], &[Some(1), Some(2)])]);
+        let plan = dedup_plan(vec![vbatch(&["a", "a"], &[5, 10], &[Some(1), Some(2)])], true, true);
         let schema = plan.input.schema();
         assert!(detect_bound(&plan.input, &plan.keys, &schema, false).is_none(), "flag off ⇒ full-set regardless of declared ordering");
         assert!(bounded_dedup_enabled(), "default must stay ON: full-set has no LIMIT early termination");
@@ -1184,20 +1184,17 @@ mod tests {
         assert_eq!(ordering_violations(), before + 1);
     }
 
-    /// EXPLAIN must say which seen-set mode a scan runs: `full-set` retains
-    /// every key for the whole scan, `bounded` clears per run.
-    #[test]
-    fn explain_reveals_seen_set_mode() {
-        let b = batch(&["a"], &[10]);
-        let keys = vec!["id".to_string(), "v".to_string()];
-
-        let sorted = DedupExec::new(source(&[vec![b.clone()]], Some(col_asc("v", 1))), keys.clone(), None).unwrap();
-        let shown = format!("{}", datafusion::physical_plan::displayable(&sorted).one_line());
-        assert!(shown.contains("mode=bounded[v]"), "sorted input must report the bounded window, got: {shown}");
-
-        let unsorted = DedupExec::new(source(&[vec![b]], None), keys, None).unwrap();
-        let shown = format!("{}", datafusion::physical_plan::displayable(&unsorted).one_line());
-        assert!(shown.contains("mode=full-set"), "unsorted input must report the unbounded seen-set, got: {shown}");
+    /// EXPLAIN must name both the seen-set mode — `full-set` retains every key
+    /// for the whole scan, `bounded` clears per run — and the SURVIVOR rule:
+    /// `full-set/first` serves the pre-update row, `full-set/greatest` is right.
+    #[test_case::test_case(true, false => "bounded[ts]/first" ; "sorted input reports the bounded window")]
+    #[test_case::test_case(false, false => "full-set/first" ; "unsorted input reports the unbounded seen-set")]
+    #[test_case::test_case(false, true => "full-set/greatest" ; "unsorted plus a tiebreak reports keep-greatest")]
+    #[test_case::test_case(true, true => "bounded[ts]/greatest" ; "sorted plus a tiebreak reports both")]
+    fn explain_reveals_seen_set_mode_and_survivor_rule(ordered: bool, tiebreak: bool) -> String {
+        let plan = dedup_plan(vec![vbatch(&["a"], &[10], &[Some(1)])], ordered, tiebreak);
+        let shown = format!("{}", datafusion::physical_plan::displayable(&plan).one_line());
+        shown.split_once("mode=").expect("EXPLAIN must report a mode").1.trim().to_string()
     }
 
     // ---- plumbing ----
@@ -1217,6 +1214,13 @@ mod tests {
         LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new(name, idx)), SortOptions::default())]).unwrap()
     }
 
+    /// A context whose memory pool admits exactly `bytes`.
+    fn pool_ctx(bytes: usize) -> Arc<TaskContext> {
+        use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
+        let runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(bytes))).build_arc().unwrap();
+        Arc::new(TaskContext::default().with_runtime(runtime))
+    }
+
     // ---- keep-greatest (merge-on-read phase 2) ----
 
     /// (id Utf8, ts Int64, tb Int64 nullable) — dedup key `(id, ts)` sorted by
@@ -1234,17 +1238,14 @@ mod tests {
         .unwrap()
     }
 
-    fn greatest_plan(batches: Vec<RecordBatch>) -> DedupExec {
-        let src = source(&[batches], Some(col_asc("ts", 1)));
-        DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
-    }
-
-    /// Same, but the source declares NO ordering — the merge-on-read shape,
-    /// where an UPDATE rewrites a row under its original timestamp so the
-    /// Delta leg's files overlap in time.
-    fn unbounded_greatest_plan(batches: Vec<RecordBatch>) -> DedupExec {
-        let src = source(&[batches], None);
-        DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap()
+    /// A `DedupExec` over the `(id, ts, tb)` shape, keyed `(ts, id)`.
+    /// `ordered` declares the `ts` ordering on the source (bounded runs);
+    /// `ordered = false` is the merge-on-read shape, where an UPDATE rewrites a
+    /// row under its original timestamp so the Delta leg's files overlap in
+    /// time. `tiebreak` supplies the `tb` version stamp.
+    fn dedup_plan(batches: Vec<RecordBatch>, ordered: bool, tiebreak: bool) -> DedupExec {
+        let src = source(&[batches], ordered.then(|| col_asc("ts", 1)));
+        DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], tiebreak.then(|| "tb".to_string()), None).unwrap()
     }
 
     /// Unsorted input MUST still keep the greatest version: degrading to
@@ -1252,13 +1253,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn keep_greatest_without_a_bound_still_picks_the_newest_version() {
         // `a` is updated in a LATER batch; `b`'s newer version arrives FIRST.
-        let plan = unbounded_greatest_plan(vec![vbatch(&["a", "b"], &[10, 20], &[Some(1), Some(9)]), vbatch(&["b", "a"], &[20, 10], &[Some(2), Some(7)])]);
+        let plan = dedup_plan(vec![vbatch(&["a", "b"], &[10, 20], &[Some(1), Some(9)]), vbatch(&["b", "a"], &[20, 10], &[Some(2), Some(7)])], false, true);
         let mut got = collect_rows(&plan).await;
         got.sort();
         assert_eq!(got, vec![("a".into(), 10, Some(7)), ("b".into(), 20, Some(9))], "unbounded keep-greatest must win on the tiebreak, not on arrival order");
 
         // A NULL stamp must lose to any stamped version, in either order.
-        let plan = unbounded_greatest_plan(vec![vbatch(&["c"], &[30], &[None]), vbatch(&["c"], &[30], &[Some(4)])]);
+        let plan = dedup_plan(vec![vbatch(&["c"], &[30], &[None]), vbatch(&["c"], &[30], &[Some(4)])], false, true);
         assert_eq!(collect_rows(&plan).await, vec![("c".into(), 30, Some(4))]);
     }
 
@@ -1279,7 +1280,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let plan = DedupExec::with_tiebreak(source(&[vec![batch]], Some(col_asc("ts", 1))), vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap();
+        let plan = dedup_plan(vec![batch], true, true);
         let batches = datafusion::physical_plan::collect(Arc::new(plan), Arc::new(TaskContext::default())).await.unwrap();
         let rows = batches.iter().flat_map(|batch| {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -1293,12 +1294,9 @@ mod tests {
     /// fails its own query instead of growing untracked anon heap.
     #[tokio::test(flavor = "multi_thread")]
     async fn unbounded_run_buffer_is_pool_tracked_so_an_oversized_scan_fails_its_query() {
-        use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
         let batches: Vec<RecordBatch> = (0..64).map(|i| vbatch(&[format!("k{i}").as_str()], &[i], &[Some(i)])).collect();
-        let plan = unbounded_greatest_plan(batches);
-        let runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(512))).build_arc().unwrap();
-        let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
-        let mut stream = plan.execute(0, ctx).unwrap();
+        let plan = dedup_plan(batches, false, true);
+        let mut stream = plan.execute(0, pool_ctx(512)).unwrap();
         let mut err = None;
         while let Some(r) = futures::StreamExt::next(&mut stream).await {
             if let Err(e) = r {
@@ -1315,7 +1313,6 @@ mod tests {
     /// `get_array_memory_size` charges the whole parent column-chunk block.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_batch_slicing_a_big_parent_is_charged_for_its_own_rows() {
-        use datafusion::execution::{memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder};
         // One 64k-row parent per column; each batch keeps two rows of it.
         let ids: Vec<String> = (0..65536).map(|i| format!("k{i}")).collect();
         let parent_id = StringArray::from(ids.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1337,9 +1334,7 @@ mod tests {
 
         // Above the 16 rows retained, far below 8 x the inherited charge:
         // only honest accounting fits in this pool.
-        let runtime = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(inherited))).build_arc().unwrap();
-        let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
-        let out = datafusion::physical_plan::collect(Arc::new(unbounded_greatest_plan(batches)), ctx)
+        let out = datafusion::physical_plan::collect(Arc::new(dedup_plan(batches, false, true)), pool_ctx(inherited))
             .await
             .expect("16 sliced rows must not be charged the whole parent");
         assert_eq!(out.iter().map(RecordBatch::num_rows).sum::<usize>(), owned, "every distinct key must survive");
@@ -1351,15 +1346,6 @@ mod tests {
         let err = check_unbounded_growth(UNBOUNDED_GREATEST_MAX_BYTES, 1).unwrap_err();
         assert!(format!("{err}").contains("per-query limit"));
         assert!(check_unbounded_growth(usize::MAX, 1).is_err(), "overflow must fail closed");
-    }
-
-    /// EXPLAIN must distinguish the SURVIVOR rule, not just the seen-set size:
-    /// `full-set/first` serves the pre-update row, `full-set/greatest` is right.
-    #[test]
-    fn explain_reports_the_survivor_rule() {
-        let plan = unbounded_greatest_plan(vec![vbatch(&["a"], &[1], &[Some(1)])]);
-        let shown = format!("{}", datafusion::physical_plan::displayable(&plan).one_line());
-        assert!(shown.contains("mode=full-set/greatest"), "unsorted + tiebreak must report keep-greatest, got: {shown}");
     }
 
     /// The `(id, ts, tb)` rows of `batches`, in batch order.
@@ -1410,9 +1396,7 @@ mod tests {
     // A table WITHOUT a tiebreak still keeps first: nothing ranks its versions.
     #[test_case::test_case(false, false, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(1))] ; "unordered input without a tiebreak keeps first")]
     fn dedup_survivor_rules(ordered: bool, tiebreak: bool, spec: &[BatchSpec<'_>]) -> Vec<(String, i64, Option<i64>)> {
-        let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
-        let src = source(&[batches], ordered.then(|| col_asc("ts", 1)));
-        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], tiebreak.then(|| "tb".to_string()), None).unwrap();
+        let plan = dedup_plan(spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect(), ordered, tiebreak);
         tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(collect_rows(&plan))
     }
 
@@ -1424,7 +1408,7 @@ mod tests {
         let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let ts: Vec<i64> = (0..4096).collect();
         let tb: Vec<Option<i64>> = (0..4096).map(Some).collect();
-        let plan = Arc::new(greatest_plan(vec![vbatch(&id_refs, &ts, &tb)]));
+        let plan = Arc::new(dedup_plan(vec![vbatch(&id_refs, &ts, &tb)], true, true));
         let batches = datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default())).await.unwrap();
         assert_eq!(batches.len(), 1, "one input batch must not fragment into one output batch per timestamp");
         assert_eq!(batches[0].num_rows(), 4096);
@@ -2864,6 +2848,14 @@ mod logical_count_index_tests {
         .unwrap()
     }
 
+    fn index_of(rows: &[(i64, &str, Option<i64>, bool)]) -> LogicalCountIndex {
+        let mut index = LogicalCountIndex::new();
+        for &(timestamp, id, tiebreak, deleted) in rows {
+            index.apply(timestamp, id, tiebreak, deleted);
+        }
+        index
+    }
+
     #[test]
     fn resolves_duplicates_updates_and_tombstones_exactly() {
         let mut index = LogicalCountIndex::new();
@@ -2895,10 +2887,7 @@ mod logical_count_index_tests {
 
     #[test]
     fn multiple_ids_at_one_timestamp_track_delete_transitions() {
-        let mut index = LogicalCountIndex::new();
-        index.apply(42, "a", Some(1), false);
-        index.apply(42, "b", Some(1), false);
-        index.apply(42, "c", Some(1), true);
+        let mut index = index_of(&[(42, "a", Some(1), false), (42, "b", Some(1), false), (42, "c", Some(1), true)]);
         assert_eq!(index.count(42, 43), 2);
         index.apply(42, "a", Some(2), true);
         assert_eq!(index.count(42, 43), 1);
@@ -2953,8 +2942,7 @@ mod logical_count_index_tests {
         index.apply_batch(&versions(&[(10, "a", Some(1), Some(false)), (20, "b", Some(1), None), (30, "gone", Some(2), Some(true))]), columns).unwrap();
         assert_eq!(index.count(0, 100), 2);
 
-        // a tombstoned, b a stale no-op, gone resurrected, c new and unflushed;
-        // a repeated copy with an equal tiebreak stays one logical row.
+        // a tombstoned, b a stale no-op then a repeat with an equal tiebreak, gone resurrected, c new and unflushed.
         let tail = [versions(&[
             (10, "a", Some(3), Some(true)),
             (20, "b", Some(0), Some(true)),
@@ -2970,9 +2958,7 @@ mod logical_count_index_tests {
     #[test]
     fn covered_overlay_replaces_delta_rows_like_the_union_scan() {
         let columns = cols();
-        let mut index = LogicalCountIndex::new();
-        index.apply(10, "old", Some(1), false);
-        index.apply(20, "newer-delta", Some(5), false);
+        let mut index = index_of(&[(10, "old", Some(1), false), (20, "newer-delta", Some(5), false)]);
         index.finalize().unwrap();
         let mem = [versions(&[(10, "old", Some(2), Some(true)), (20, "newer-delta", Some(3), Some(true))])];
 
@@ -2985,10 +2971,7 @@ mod logical_count_index_tests {
     fn arrow_cache_round_trip_is_exact_and_snapshot_bound() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("project/date.arrow");
-        let mut index = LogicalCountIndex::new();
-        index.apply(10, "a", None, false);
-        index.apply(10, "a", Some(2), true);
-        index.apply(60_000_001, "b", Some(3), false);
+        let index = index_of(&[(10, "a", None, false), (10, "a", Some(2), true), (60_000_001, "b", Some(3), false)]);
         let files = unmasked(&["date=2026-08-04/a.parquet"]);
         index.save(&path, 99, &files).unwrap();
 
@@ -3020,8 +3003,7 @@ mod logical_count_index_tests {
         let dir = tempfile::tempdir().unwrap();
         let key = part("p/unsafe", "2026-08-04");
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), usize::MAX);
-        let mut index = LogicalCountIndex::new();
-        index.apply(42, "id", Some(1), false);
+        let index = index_of(&[(42, "id", Some(1), false)]);
         cache.install(key.clone(), 7, unmasked(&["a.parquet"]), index).unwrap();
         assert_eq!(cache.get(&key, 7).unwrap().logical_rows(), 1);
         assert!(cache.get(&key, 8).is_none());
@@ -3060,15 +3042,10 @@ mod logical_count_index_tests {
 
     #[test]
     fn same_path_visibility_changes_reject_memory_and_disk_counts() {
-        use deltalake::kernel::{DeletionVectorDescriptor, StorageType};
+        use deltalake::kernel::{DeletionVectorDescriptor, StorageType::UuidRelativePath};
         let dv = |offset| {
-            Some(DeletionVectorDescriptor {
-                storage_type: StorageType::UuidRelativePath,
-                path_or_inline_dv: "same-sidecar".into(),
-                offset: Some(offset),
-                size_in_bytes: 10,
-                cardinality: 1,
-            })
+            let path_or_inline_dv = "same-sidecar".into();
+            Some(DeletionVectorDescriptor { storage_type: UuidRelativePath, path_or_inline_dv, offset: Some(offset), size_in_bytes: 10, cardinality: 1 })
         };
         for (before, after) in [(None, dv(1)), (dv(1), dv(2)), (dv(1), None)] {
             let dir = tempfile::tempdir().unwrap();
@@ -3093,16 +3070,14 @@ mod logical_count_index_tests {
     fn resident_cache_evicts_the_least_recent_partition_within_budget() {
         let dir = tempfile::tempdir().unwrap();
         let key = |project: &str| part(project, "2026-08-04");
-        let mut first = LogicalCountIndex::new();
-        first.apply(1, "a", Some(1), false);
+        let mut first = index_of(&[(1, "a", Some(1), false)]);
         first.finalize().unwrap();
         let per_entry = first.estimated_heap_bytes();
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), per_entry);
         cache.install(key("a"), 1, unmasked(&["a.parquet"]), first).unwrap();
         assert!(cache.get_memory(&key("a"), 1).is_some());
 
-        let mut second = LogicalCountIndex::new();
-        second.apply(2, "b", Some(1), false);
+        let second = index_of(&[(2, "b", Some(1), false)]);
         cache.install(key("b"), 2, unmasked(&["b.parquet"]), second).unwrap();
         assert!(cache.get_memory(&key("a"), 1).is_none());
         assert!(cache.get_memory(&key("b"), 2).is_some());

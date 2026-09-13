@@ -959,6 +959,9 @@ mod tests {
     use super::*;
     use crate::maintenance_coordinator::FRONTIER_LAG_BUDGET_SECS;
 
+    /// Every scenario starts here; sealed slices count back from it.
+    const START: i64 = 100 * DAY_MICROS;
+
     fn key(project: &str, op: Operation, start: i64, width: i64) -> TaskKey {
         let table = match op {
             Operation::BaseRollup => "otel_logs_and_spans_rollup_dashboard_1m_v3",
@@ -1003,11 +1006,11 @@ mod tests {
     #[test]
     fn an_idle_journal_stays_idle() {
         let idle = SimConfig { mint_frontier: false, ..cfg(2) };
-        let report = run(empty_journal(), &idle, 100 * DAY_MICROS).unwrap();
+        let report = run(empty_journal(), &idle, START).unwrap();
         assert_eq!(report.executions, 0, "nothing to do means nothing done");
         assert_eq!(report.pending_end, 0);
         // Minting with no streams to mint from is a caller error, not silence.
-        let report = run(empty_journal(), &cfg(1), 100 * DAY_MICROS);
+        let report = run(empty_journal(), &cfg(1), START);
         assert!(report.is_err(), "no streams + minting must say so");
     }
 
@@ -1015,8 +1018,7 @@ mod tests {
     fn the_frontier_already_lags_at_13_projects_and_diverges_further_at_10x() {
         // Pins the SHAPE, not a level: 13 projects already exceed the lag
         // budget, and more load is strictly worse.
-        let start = 100 * DAY_MICROS;
-        let report_13 = run(journal_with_streams(13), &cfg(6), start).unwrap();
+        let report_13 = run(journal_with_streams(13), &cfg(6), START).unwrap();
         let pending_13 = report_13.pending_end;
         assert!(
             report_13.frontier_lag_secs_max > FRONTIER_LAG_BUDGET_SECS,
@@ -1025,7 +1027,7 @@ mod tests {
         );
 
         let cfg_10x = SimConfig { streams: Some(260), ..cfg(2) };
-        let report_10x = run(journal_with_streams(13), &cfg_10x, start).unwrap();
+        let report_10x = run(journal_with_streams(13), &cfg_10x, START).unwrap();
         assert!(report_10x.pending_end > 10 * pending_13.max(1), "10x must diverge: pending {} vs {} at 13 projects", report_10x.pending_end, pending_13);
         // Do NOT add a lag comparison here: the two runs use different horizons
         // and max lag is bounded by run length, so the worse configuration can
@@ -1079,14 +1081,13 @@ mod tests {
     fn a_sealed_backlog_builds_contiguous_coverage() {
         // 2 projects x 30 sealed days x (base + derived day units), no minting.
         let mut journal = journal_with_streams(0);
-        let start = 100 * DAY_MICROS;
-        // Contiguity counts back from yesterday at sim END (start + 24h
-        // = day 101), so the window is days 100..=71 relative to start.
+        // Contiguity counts back from yesterday at sim END (START + 24h
+        // = day 101), so the window is days 100..=71 relative to START.
         for (p, day, op) in itertools::iproduct!(["a", "b"], 0..30i64, [Operation::BaseRollup, Operation::DerivedRollup]) {
-            journal.enqueue(key(p, op, start - day * DAY_MICROS, DAY_MICROS), start, MAX_DECODED_BYTES, 0);
+            journal.enqueue(key(p, op, START - day * DAY_MICROS, DAY_MICROS), START, MAX_DECODED_BYTES, 0);
         }
         let cfg = SimConfig { mint_frontier: false, ..cfg(25) };
-        let report = run(journal, &cfg, start).unwrap();
+        let report = run(journal, &cfg, START).unwrap();
         assert_eq!(report.min_contiguous_days_end, 30, "all 30 sealed days built: {report:#?}");
         assert!(report.hours_to_contiguous_30.is_some(), "the moment of arrival is recorded");
         assert_eq!(report.pending_end, 0, "nothing left pending");
@@ -1098,13 +1099,11 @@ mod tests {
         // units, not one: ~70% of dedup samples finish near 0s and never
         // approach the deadline, so one unit would be a coin flip.
         let mut journal = journal_with_streams(0);
-        let start = 100 * DAY_MICROS;
         for unit in 0..20 {
-            let slice_start = start - DAY_MICROS * (unit + 1);
-            journal.enqueue(key("a", Operation::Dedup, slice_start, DAY_MICROS), start, MAX_DECODED_BYTES, 0);
+            journal.enqueue(key("a", Operation::Dedup, START - DAY_MICROS * (unit + 1), DAY_MICROS), START, MAX_DECODED_BYTES, 0);
         }
         let cfg = SimConfig { mint_frontier: false, duration_scale: 10.0, workers: 1, ..cfg(12) };
-        let report = run(journal, &cfg, start).unwrap();
+        let report = run(journal, &cfg, START).unwrap();
         assert!(report.splits >= 1, "repeat overruns must bisect the unit: {report:#?}");
     }
 
@@ -1113,7 +1112,7 @@ mod tests {
         let mut journal = journal_with_streams(4);
         let before: HashMap<_, _> = journal.tasks().map(|task| (task.key.clone(), serde_json::to_value(task).unwrap())).collect();
         let streams = streams_from_journal(&journal);
-        let hour_start = 100 * DAY_MICROS + 7 * HOUR_MICROS;
+        let hour_start = START + 7 * HOUR_MICROS;
         reconcile_restart(&mut journal, &streams, hour_start + HOUR_MICROS / 2);
         let added: Vec<_> = journal.tasks().filter(|task| !before.contains_key(&task.key)).collect();
         assert_eq!(added.len(), 13 * streams.len(), "each stream needs six dedup slices, six base slices, and one derived hour");
@@ -1134,8 +1133,7 @@ mod tests {
     }
 
     fn synth_run_at(floored: bool, guard: SplitGuard, whale_x_max: u64, duration_scale: f64) -> (SimReport, String, String) {
-        let start = 100 * DAY_MICROS;
-        let queue = synthetic_whale_queue(start, floored, whale_x_max, 1);
+        let queue = synthetic_whale_queue(START, floored, whale_x_max, 1);
         let cfg = SimConfig {
             mint_frontier: false,
             workers: 16,
@@ -1145,7 +1143,7 @@ mod tests {
             duration_scale,
             ..Default::default()
         };
-        let report = run(queue.journal, &cfg, start).unwrap();
+        let report = run(queue.journal, &cfg, START).unwrap();
         (report, queue.whale_cell, queue.stamped_cell)
     }
 
@@ -1153,12 +1151,33 @@ mod tests {
         report.units_per_cell.get(cell).copied().unwrap_or_default()
     }
 
+    /// One run plus its printed row: the union of what either sweep below reads.
+    fn sweep_row(floored: bool, guard: SplitGuard, whale_x_max: u64) {
+        let (report, whale, stamped) = synth_run_at(floored, guard, whale_x_max, 1.0);
+        println!(
+            "whale={whale_x_max:>3}x floored={floored} guard={guard:?} whale_units={:>5} stamped={} at_min={:>5} declined={:>4} splits={} completed={:>5} sharded={}/{} narrowest={}s max_run={}MB pending {}->{} execs={}\n  samples={:?}",
+            cell_units(&report, &whale),
+            cell_units(&report, &stamped),
+            report.units_at_min_slice,
+            report.split_declined_at_floor,
+            report.byte_splits,
+            report.completions.values().sum::<u64>(),
+            report.sharded_runs_above_min_slice,
+            report.sharded_runs,
+            report.narrowest_sharded_run_micros / MICROS,
+            report.max_run_bytes / 1_000_000,
+            report.pending_start,
+            report.pending_end,
+            report.executions,
+            report.samples.iter().map(|s| (s.max_cell_pending, s.split_declined_at_floor)).collect::<Vec<_>>(),
+        );
+    }
+
     /// Walk the whale lineage one preflight at a time, printing what each level
     /// measured against what its parent measured.
     #[test]
     fn whale_lineage_trace() {
-        let start = 100 * DAY_MICROS;
-        let queue = synthetic_whale_queue(start, true, 100, 1);
+        let queue = synthetic_whale_queue(START, true, 100, 1);
         let (mut journal, model) = (queue.journal, queue.model);
         let mut report = SimReport::default();
         // Deep enough to reach the DECLINE, not just the splits above it.
@@ -1267,50 +1286,25 @@ mod tests {
     /// the constant can only be argued from the table.
     #[test]
     fn threshold_sweep() {
-        for whale_x_max in [100, 20, 5] {
-            for guard in [SplitGuard::Ratio(1, 2), SplitGuard::Ratio(2, 3), SplitGuard::Ratio(3, 4), SplitGuard::Ratio(4, 5), SplitGuard::Off] {
-                let (report, whale, _) = synth_run_at(true, guard, whale_x_max, 1.0);
-                println!(
-                    "whale={whale_x_max:>3}x guard={guard:?} whale_units={:>5} at_min={:>5} declined={:>4} completed={:>5} sharded_above_min={} pending_end={}",
-                    cell_units(&report, &whale),
-                    report.units_at_min_slice,
-                    report.split_declined_at_floor,
-                    report.completions.values().sum::<u64>(),
-                    report.sharded_runs_above_min_slice,
-                    report.pending_end,
-                );
-            }
+        for (whale_x_max, guard) in itertools::iproduct!(
+            [100, 20, 5],
+            [SplitGuard::Ratio(1, 2), SplitGuard::Ratio(2, 3), SplitGuard::Ratio(3, 4), SplitGuard::Ratio(4, 5), SplitGuard::Off]
+        ) {
+            sweep_row(true, guard, whale_x_max);
         }
     }
 
     #[test]
     fn synth_criteria() {
         for (floored, guard) in [(true, SplitGuard::Off), (false, SplitGuard::Off), (false, SplitGuard::Shipped), (true, SplitGuard::Shipped)] {
-            let (report, whale, stamped) = synth_run(floored, guard);
-            println!(
-                "floored={floored} guard={guard:?} whale={} stamped={} at_min={} declined={} splits={} sharded={}/{} narrowest={}s max_run={}MB pending {}->{} execs={}\n  samples={:?}",
-                cell_units(&report, &whale),
-                cell_units(&report, &stamped),
-                report.units_at_min_slice,
-                report.split_declined_at_floor,
-                report.byte_splits,
-                report.sharded_runs_above_min_slice,
-                report.sharded_runs,
-                report.narrowest_sharded_run_micros / MICROS,
-                report.max_run_bytes / 1_000_000,
-                report.pending_start,
-                report.pending_end,
-                report.executions,
-                report.samples.iter().map(|s| (s.max_cell_pending, s.split_declined_at_floor)).collect::<Vec<_>>(),
-            );
+            sweep_row(floored, guard, 100);
         }
     }
 
     #[test]
     fn the_sim_is_deterministic_per_seed() {
-        let start = 100 * DAY_MICROS;
-        let a = run(journal_with_streams(4), &cfg(3), start).unwrap();
-        let b = run(journal_with_streams(4), &cfg(3), start).unwrap();
+        let a = run(journal_with_streams(4), &cfg(3), START).unwrap();
+        let b = run(journal_with_streams(4), &cfg(3), START).unwrap();
         assert_eq!(a.executions, b.executions);
         assert_eq!(a.pending_end, b.pending_end);
         assert_eq!(a.frontier_lag_secs_max, b.frontier_lag_secs_max);

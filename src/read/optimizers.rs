@@ -1196,12 +1196,8 @@ mod tantivy_rewriter_tests {
         Expr::Column(Column::new_unqualified(name))
     }
 
-    fn cmp(c: &str, op: Operator, val: &str) -> Expr {
-        Expr::BinaryExpr(BinaryExpr::new(Box::new(col(c)), op, Box::new(lit(val))))
-    }
-
     fn eq(c: &str, val: &str) -> Expr {
-        cmp(c, Operator::Eq, val)
+        re(c, Operator::Eq, val, false)
     }
 
     fn ilike(c: &str, pat: &str) -> Expr {
@@ -1228,7 +1224,7 @@ mod tantivy_rewriter_tests {
     #[test_case(eq("tid", UID), true => ready("tid", UID) ; "dashed uuid: the `-` survives (e2e-proven)")]
     #[test_case(eq("tid", "abc123"), false => None ; "flag off reverts to bloom/stats")]
     #[test_case(eq("name", "runServer"), true => None ; "ngram3 is lossy for equality")]
-    #[test_case(cmp("tid", Operator::NotEq, "abc"), true => None ; "`!=` has no term form")]
+    #[test_case(re("tid", Operator::NotEq, "abc", false), true => None ; "`!=` has no term form")]
     #[test_case(eq("tid", "a:b"), true => None ; "colon is query syntax")]
     #[test_case(eq("tid", "foo bar"), true => None ; "space, AND-split can't match one raw token")]
     #[test_case(eq("tid", "a.b"), true => None ; "dot conservatively excluded")]

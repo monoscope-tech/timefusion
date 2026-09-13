@@ -2151,17 +2151,18 @@ mod immutable_audit_tests {
         (count, sql)
     }
 
-    /// `MIN`/`MAX` ignore nulls, so the audit needs a null-transition term to
-    /// see a column absent on first emit and filled on retry — and it must be
-    /// two-sided, since a column null in every version agrees.
-    #[test]
-    fn the_audit_catches_a_null_to_value_transition_not_just_differing_values() {
-        let sql = audit_sql();
-        assert!(sql.contains("MIN(") && sql.contains("MAX("), "differing non-null values are caught");
-        assert!(
-            sql.contains("> 0 AND COUNT(") && sql.contains("< COUNT(*)"),
-            "a null-in-some-versions transition is caught, and only when the column is set in at least one: {sql}"
-        );
+    /// `MIN`/`MAX` catch differing non-null values with O(1) state per group —
+    /// `COUNT(DISTINCT c)` would keep a per-group hash set for each of the ~150
+    /// audited columns. They ignore nulls, so the two-sided null-count term is
+    /// what sees a column absent on first emit and filled on retry, and only
+    /// when the column is set in at least one version.
+    #[test_case("MIN(" => true ; "MIN catches differing non-null values")]
+    #[test_case("MAX(" => true ; "MAX catches differing non-null values")]
+    #[test_case("> 0 AND COUNT(" => true ; "a null to value transition is caught")]
+    #[test_case("< COUNT(*)" => true ; "a transition counts only when the column is set in some version")]
+    #[test_case("COUNT(DISTINCT" => false ; "the audit builds no per-group hash set per column")]
+    fn the_audit_sql_has_the_shape_that_makes_it_correct_and_cheap(fragment: &str) -> bool {
+        audit_sql().contains(fragment)
     }
 
     /// The grouping columns, tiebreak and tombstone vary across versions by
@@ -2205,17 +2206,6 @@ mod immutable_audit_tests {
 
         let (count, sql) = audit_count(&["id", "level"], batch).await;
         assert_eq!(count, 2, "`a` differs outright and `b` goes null -> error; `c` agrees and `d` is null throughout ({sql})");
-    }
-
-    /// `COUNT(DISTINCT c)` keeps a per-group hash set per column, and this
-    /// schema audits ~150 columns; `MIN`/`MAX` answer the same question with
-    /// O(1) state per group.
-    #[test]
-    fn the_audit_uses_no_distinct_accumulators() {
-        let sql = audit_sql();
-        assert!(!sql.contains("COUNT(DISTINCT"), "the audit must not build a per-group hash set per column; it audits ~150 of them");
-        let audited = sql.matches("MIN(").count();
-        assert!(audited > 50, "the real schema audits many columns, or this test proves nothing: {audited}");
     }
 
     /// `MIN`/`MAX` must PLAN for every non-composite type the audit admits: a
@@ -2383,12 +2373,13 @@ mod immutable_audit_tests {
     }
 
     /// Both audit forms must read the SAME column list, or the streaming path
-    /// silently audits a different set than the SQL path it replaces.
+    /// silently audits a different set than the SQL path it replaces. The size
+    /// assertion is also what pins that the SQL form audits many columns.
     #[test]
     fn both_audit_forms_read_one_column_list() {
         let columns = Database::immutable_audit_columns(logs_schema());
         let sql = audit_sql();
-        assert!(!columns.is_empty(), "the logs schema must have auditable columns");
+        assert!(columns.len() > 50, "the real schema audits many columns, or this test proves nothing: {}", columns.len());
         for column in &columns {
             assert!(sql.contains(&format!("MIN(\"{column}\")")), "{column} is audited by the streaming form but absent from the SQL form");
         }

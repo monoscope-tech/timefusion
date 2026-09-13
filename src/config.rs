@@ -1894,8 +1894,10 @@ mod tests {
         assert_eq!(cli.coordinator_share_bytes(), 0, "the CLI drives engines directly; no coordinator competes for the pool");
     }
 
+    /// `TIMEFUSION_MEMORY_BUDGET_GB` must scale the WHOLE tree from one input and
+    /// must never raise the limit above what the cgroup allows.
     #[test]
-    fn budget_tree_allocates_the_entire_limit() {
+    fn budget_tree_allocates_the_entire_limit_and_the_override_only_lowers() {
         let b = DerivedBudget::from_limits(120 * GIB, 48);
         let total = b.query_pool_bytes + b.ingest_buffer_bytes + b.foyer_memory_bytes + b.writer_reserve_bytes + b.maintenance_pool_bytes;
         // The tree must NOT hand out every byte: 15% stays unsanctioned for the
@@ -1907,18 +1909,12 @@ mod tests {
         // 120 - (24 query + 24 buffer + 12 foyer + 12 writer reserve + 18 slack).
         assert_eq!(b.maintenance_pool_bytes, 30 * GIB, "maintenance takes the remainder AFTER slack");
         assert_eq!(b.tick_budget(Duration::from_secs(300)), Duration::from_secs(240), "a tick budget is 80% of the cron period");
-    }
 
-    /// `TIMEFUSION_MEMORY_BUDGET_GB` must scale the WHOLE tree from one input and
-    /// must never raise the limit above what the cgroup allows.
-    #[test]
-    fn memory_budget_override_scales_whole_tree_and_only_lowers() {
-        let full = DerivedBudget::from_limits(120 * GIB, 48);
         let capped = DerivedBudget::from_limits(80 * GIB, 48);
         assert_eq!(capped.query_pool_bytes, 16 * GIB);
         assert_eq!(capped.ingest_buffer_bytes, 16 * GIB);
         assert_eq!(capped.foyer_memory_bytes, 8 * GIB);
-        assert!(capped.maintenance_pool_bytes < full.maintenance_pool_bytes, "maintenance shrinks with the rest, not at its expense");
+        assert!(capped.maintenance_pool_bytes < b.maintenance_pool_bytes, "maintenance shrinks with the rest, not at its expense");
 
         // The clamp: an over-large request can never budget past the cgroup.
         assert_eq!(effective_limit(80 * GIB, Some(200 * GIB)), 80 * GIB);
@@ -1928,15 +1924,13 @@ mod tests {
 
     // Bare numbers must coerce to seconds (a unitless value panics
     // object_store's Duration parse at boot); values with a unit pass through.
-    #[test]
-    fn normalize_duration_coerces_bare_numbers_to_seconds() {
-        assert_eq!(normalize_duration(Some("150"), "60s"), "150s");
-        assert_eq!(normalize_duration(Some("150s"), "60s"), "150s");
-        assert_eq!(normalize_duration(Some("3m"), "60s"), "3m");
-        assert_eq!(normalize_duration(Some(""), "60s"), "", "an explicitly-empty value is passed through, not defaulted");
-        assert_eq!(normalize_duration(None, "60s"), "60s");
-        let aws = AwsConfig { timefusion_s3_connect_timeout: Some("150".into()), ..Default::default() };
-        assert_eq!(aws.connect_timeout(), "150s");
+    #[test_case::test_case(Some("150"), "60s" => "150s" ; "a bare number coerces to seconds")]
+    #[test_case::test_case(Some("150s"), "60s" => "150s" ; "an explicit seconds unit passes through")]
+    #[test_case::test_case(Some("3m"), "60s" => "3m" ; "a non-seconds unit passes through")]
+    #[test_case::test_case(Some(""), "60s" => "" ; "an explicitly-empty value is passed through, not defaulted")]
+    #[test_case::test_case(None, "60s" => "60s" ; "unset takes the default")]
+    fn normalize_duration_coerces_bare_numbers_to_seconds(configured: Option<&str>, default: &str) -> String {
+        normalize_duration(configured, default)
     }
 
     /// The commit-log request class must stay ORDERS OF MAGNITUDE under the data
@@ -1948,6 +1942,8 @@ mod tests {
         assert_eq!(aws.request_timeout(), "900s");
         let tuned = AwsConfig { timefusion_s3_log_request_timeout: Some("45".into()), ..Default::default() };
         assert_eq!(tuned.log_request_timeout(), "45s", "bare numbers coerce here too, or boot panics");
+        let connect = AwsConfig { timefusion_s3_connect_timeout: Some("150".into()), ..Default::default() };
+        assert_eq!(connect.connect_timeout(), "150s", "the connect timeout coerces the same way");
     }
 
     #[test]
@@ -2075,37 +2071,36 @@ mod tests {
     /// coordinator pool must scale with the jobs sharing it, and the three
     /// maintenance shares must still sum to the pool. Each job's slice must also
     /// clear `ExternalSorterMerge`'s 32 MB floor, or units fail instead of spilling.
-    #[test]
-    fn coordinator_jobs_and_pool_scale_with_the_box() {
+    #[test_case::test_case(80, 48, 2..=16 ; "prod-shaped box must run maintenance in parallel")]
+    #[test_case::test_case(16, 4, 1..=2 ; "a 4-core box must not run maintenance wide")]
+    #[test_case::test_case(8, 4, 1..=2 ; "a tiny box stays modest rather than thrashing")]
+    fn coordinator_jobs_and_pool_scale_with_the_box(limit_gb: usize, cores: usize, jobs: std::ops::RangeInclusive<usize>) {
+        let b = DerivedBudget::from_limits(limit_gb * GIB, cores);
+        let committed = b.query_pool_bytes() + b.buffer_max_bytes() + b.foyer_memory_bytes() + b.writer_reserve_bytes() + b.maintenance_pool_bytes();
+        assert!(committed <= limit_gb * GIB, "{limit_gb} GiB box over-committed: {committed}");
+        assert_eq!(
+            b.coordinator_share_bytes() + b.heavy_share_bytes() + b.light_share_bytes(),
+            b.maintenance_pool_bytes(),
+            "{limit_gb} GiB/{cores}-core: maintenance shares must partition the pool, not overcommit it"
+        );
         // Only meaningful when the operator has not pinned the override.
         if std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").is_ok() {
             return;
         }
-        let prod = DerivedBudget::from_limits(80 * GIB, 48);
-        assert!(prod.coordinator_jobs() > 1, "prod-shaped box must run maintenance in parallel, got {}", prod.coordinator_jobs());
+        assert!(jobs.contains(&b.coordinator_jobs()), "{limit_gb} GiB/{cores}-core: expected {jobs:?} jobs, got {}", b.coordinator_jobs());
         // Every admitted unit reserves at most MAX_DECODED_BYTES, so concurrent
         // decode reservation must still fit the maintenance pool.
-        assert!(prod.coordinator_jobs() * 512 * MIB <= prod.maintenance_pool_bytes(), "concurrent 512 MiB units must fit the maintenance pool");
-        // Small boxes stay modest rather than thrashing.
-        let small = DerivedBudget::from_limits(16 * GIB, 4);
-        assert!(small.coordinator_jobs() <= 2, "a 4-core box must not run maintenance wide, got {}", small.coordinator_jobs());
-        assert!(small.coordinator_jobs() * 512 * MIB <= small.maintenance_pool_bytes(), "concurrent units must fit a small box's pool too");
-
-        for (limit_gb, cores) in [(80, 48), (16, 4), (8, 4)] {
-            let b = DerivedBudget::from_limits(limit_gb * GIB, cores);
-            let per_job = b.coordinator_share_bytes() / b.coordinator_jobs();
-            assert!(
-                per_job >= 32 * 1024 * 1024,
-                "{limit_gb} GiB/{cores}-core: each of {} jobs gets {} MB, below the 32 MB sort floor",
-                b.coordinator_jobs(),
-                per_job / (1024 * 1024)
-            );
-            assert_eq!(
-                b.coordinator_share_bytes() + b.heavy_share_bytes() + b.light_share_bytes(),
-                b.maintenance_pool_bytes(),
-                "{limit_gb} GiB/{cores}-core: maintenance shares must partition the pool, not overcommit it"
-            );
-        }
+        assert!(
+            b.coordinator_jobs() * 512 * MIB <= b.maintenance_pool_bytes(),
+            "{limit_gb} GiB/{cores}-core: concurrent 512 MiB units must fit the maintenance pool"
+        );
+        let per_job = b.coordinator_share_bytes() / b.coordinator_jobs();
+        assert!(
+            per_job >= 32 * MIB,
+            "{limit_gb} GiB/{cores}-core: each of {} jobs gets {} MB, below the 32 MB sort floor",
+            b.coordinator_jobs(),
+            per_job / MIB
+        );
     }
 
     /// The hot-packing permit must be priced against the pool its units allocate
@@ -2140,14 +2135,9 @@ mod tests {
     // Small box (16 GiB / 4 cores): degrades to K=1, nothing underflows/zeroes.
     #[test]
     fn derived_budget_small_box_degrades_to_k1() {
-        let tiny = DerivedBudget::from_limits(8 * GIB, 4);
-        let tiny_sum =
-            tiny.query_pool_bytes() + tiny.buffer_max_bytes() + tiny.foyer_memory_bytes() + tiny.writer_reserve_bytes() + tiny.maintenance_pool_bytes();
-        assert!(tiny_sum <= 8 * GIB, "8 GiB box over-committed: {tiny_sum}");
         let b = DerivedBudget::from_limits(16 * GIB, 4);
         // cores/4 = 1 pins it here whatever the memory term says.
         assert_eq!(b.light_optimize_k(11), 1);
-
         assert!(b.maintenance_pool_bytes() >= GIB);
         assert!(b.light_share_bytes() > 0);
         assert!(b.heavy_share_bytes() > 0);

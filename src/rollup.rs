@@ -2808,15 +2808,79 @@ mod tests {
         assert!(route.measures_available(None), "a count chart must keep routing off a cell written before TAG_MEASURES");
     }
 
-    /// Grouped charts emit `COALESCE(<dimension>, 'null')`, never the bare
-    /// column, and group by bucket AND dimension together.
-    #[tokio::test]
-    async fn a_grouped_chart_coalescing_its_dimension_routes() {
-        let sql = format!(
+    /// Shapes that must route, whose every `want` must reach the single-leg
+    /// rewrite verbatim and whose rewrite must reassemble into the query's own
+    /// schema.
+    // Grouped charts emit `COALESCE(<dimension>, 'null')`, never the bare column, and group by bucket AND dimension together.
+    #[test_case::test_case(
+        &format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(resource___service___name, 'null') AS svc, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
-        );
-        assert_rewrite_contains(&sql, &["COALESCE(resource___service___name, 'null')"]).await;
+        ),
+        &["COALESCE(resource___service___name, 'null')"] ; "a grouped chart coalescing its dimension routes")]
+    // A bare-column coalesce is left alone by CSE; the `::text` cast repeats a COMPUTATION and gets lifted into `__common_expr_1`.
+    #[test_case::test_case(
+        &format!(
+            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(status_code::text, 'null') AS sc, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
+        ),
+        &["COALESCE(status_code, 'null')"] ; "a grouped chart casting its dimension routes despite cse")]
+    // A real log-explorer count chart verbatim: `extract(epoch …)` over the bucket, the `::text` coalesce, `count(*)::float`.
+    #[test_case::test_case(
+        &format!(
+            "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer, COALESCE(status_code::text, 'null'), count(*)::float AS count_ \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY time_bucket('1 hours', timestamp), COALESCE(status_code::text, 'null')"
+        ),
+        &["COALESCE(status_code, 'null')"] ; "the log explorer count chart routes verbatim")]
+    // A bare `count(*)` reads Delta statistics, so the benchmark spells it `count(1) FROM (SELECT id …) t`; the walker must descend that `SubqueryAlias`.
+    #[test_case::test_case(
+        &format!("SELECT count(1) FROM (SELECT id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t"),
+        &["request_count"] ; "the benchmark count shape routes through its derived table")]
+    // The qualifier proof: the aggregate groups by `t.status_code` while the rewrite can only produce an unqualified one, so a rewrite that did not
+    // carry the `t` qualifier back fails to resolve rather than answering — the reassembly IS the assertion.
+    #[test_case::test_case(
+        &format!(
+            "SELECT time_bucket('1 hours', t.timestamp) AS tb, t.status_code, count(*)::float AS count_ \
+             FROM (SELECT timestamp, status_code, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t \
+             GROUP BY 1, 2"
+        ),
+        &["status_code"] ; "a grouped derived table keeps its alias qualifier through the rewrite")]
+    // The epoch wrapper AND its integer cast must survive, or the substituted rewrite will not match the aggregate's schema types.
+    #[test_case::test_case(
+        &format!(
+            "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer AS tb, COUNT(*) \
+             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
+        ),
+        &["date_part('EPOCH', time_bucket('1 hours', timestamp))", "CAST(date_part('EPOCH'"] ; "a chart grouping by extract epoch of a bucket routes")]
+    #[test_case::test_case(
+        &format!("SELECT COUNT(*) + 1 AS total FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"),
+        &[] ; "a scalar projection above the aggregate survives untouched")]
+    // The promotion to a pre-filtered measure must carry a HAVING, or a bucket where nothing matched comes back as a 0 row instead of being absent.
+    #[test_case::test_case(
+        &format!(
+            "SELECT time_bucket('1 hours', timestamp) AS bucket, COUNT(*) AS c \
+             FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1 ORDER BY 1 DESC"
+        ),
+        &["server_request_count", "HAVING"] ; "a row filter that matches a declared measure filter routes with a having")]
+    // The aggregate's own FILTER and the promoted row filter combine into exactly what `server_error_count` declares.
+    #[test_case::test_case(
+        &format!(
+            "SELECT time_bucket('1 hours', timestamp) AS bucket, \
+                    COUNT(*) FILTER (WHERE status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500) AS errors \
+             FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1"
+        ),
+        &["server_error_count"] ; "an aggregate filter combines with the promoted row filter")]
+    // An aggregate inside a CTE is reachable because the matcher searches the tree instead of peeling the root.
+    #[test_case::test_case(
+        &format!(
+            "WITH bucketed AS (SELECT time_bucket('1 hours', timestamp) AS t, avg(duration) AS mean \
+                               FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1) \
+             SELECT t, mean FROM bucketed ORDER BY 1 DESC"
+        ),
+        &[] ; "an aggregate inside a cte is reachable")]
+    #[tokio::test]
+    async fn a_dashboard_shape_routes_and_its_rewrite_reassembles(sql: &str, wants: &[&str]) {
+        assert_rewrite_contains(sql, wants).await;
     }
 
     /// A measure on the not-yet-servable list is refused on a TAGGED cell, not
@@ -2836,29 +2900,6 @@ mod tests {
         let tagged: std::collections::HashSet<String> = ["service_name_hll".to_owned()].into_iter().collect();
         assert!(!route.measures_available(Some(&tagged)), "a TAGGED cell must not serve a measure whose stored state is known empty");
         assert!(!route.measures_available(None), "and an untagged cell must not either");
-    }
-
-    /// The same chart with a `::text` cast: `COALESCE(col, 'null')` repeats a
-    /// bare column, which CSE leaves alone, while `COALESCE(col::text, 'null')`
-    /// repeats a COMPUTATION and gets lifted into `__common_expr_1`.
-    #[tokio::test]
-    async fn a_grouped_chart_casting_its_dimension_routes_despite_cse() {
-        let sql = format!(
-            "SELECT time_bucket('1 hours', timestamp) AS tb, COALESCE(status_code::text, 'null') AS sc, COUNT(*) \
-             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1, 2"
-        );
-        assert_rewrite_contains(&sql, &["COALESCE(status_code, 'null')"]).await;
-    }
-
-    /// A real log-explorer count chart verbatim — `extract(epoch …)` over the
-    /// bucket, the `::text` coalesce over the dimension, `count(*)::float`.
-    #[tokio::test]
-    async fn the_log_explorer_count_chart_routes_verbatim() {
-        let sql = format!(
-            "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer, COALESCE(status_code::text, 'null'), count(*)::float AS count_ \
-             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY time_bucket('1 hours', timestamp), COALESCE(status_code::text, 'null')"
-        );
-        assert_rewrite_contains(&sql, &["COALESCE(status_code, 'null')"]).await;
     }
 
     /// A group expression the matcher cannot serve must DECLINE, not vanish.
@@ -2947,23 +2988,37 @@ mod tests {
         assert!(refused.contains(expected_node), "the refusal must name the node that stopped the walk, got {refused:?} for {}", plan.display_indent());
     }
 
-    /// Under `col IS NOT NULL` — consumed above rather than pushed, so neither
-    /// leg re-applies it — `count(*)` is exactly `count(col)`, which
-    /// `duration_count` declares.
-    #[tokio::test]
-    async fn a_guarded_count_resolves_to_the_guard_column() {
-        let state = session().await;
-        let sql = format!(
+    /// Single-leg rewrites, checked for the states they must read and the ones
+    /// they must not.
+    // Under `col IS NOT NULL` — consumed above rather than pushed, so neither leg
+    // re-applies it — `count(*)` is exactly `count(col)`, which `duration_count`
+    // declares; `request_count` counts null-duration rows the guard excluded.
+    #[test_case::test_case(
+        &format!(
             "SELECT time_bucket('1 hours', timestamp) AS tb, COUNT(*) AS c \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND duration IS NOT NULL GROUP BY 1"
-        );
-        let generated = routed_sql(&state, &sql).await;
-        assert!(generated.contains("duration_count"), "the guarded count(*) must resolve to count(duration): {generated}");
-        assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
+        ),
+        &["duration_count"], &["request_count"] ; "a guarded count resolves to the guard column")]
+    #[test_case::test_case(
+        &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND kind = 'server' AND {WINDOW}"),
+        &["AND (kind = 'server')"], &[] ; "matcher applies dimension predicates to the rollup scan")]
+    // An `avg` over two Int64 measures divides as integers unless it casts first, and the CASE's DOUBLE only widens an already-truncated value.
+    #[test_case::test_case(
+        &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"),
+        &["CAST(SUM(duration_sum) AS DOUBLE) / CAST(SUM(duration_count) AS DOUBLE)"], &[] ; "avg casts before dividing so it does not truncate")]
+    #[tokio::test]
+    async fn the_single_leg_rewrite_reads_the_states_the_shape_requires(sql: &str, wants: &[&str], absent: &[&str]) {
+        let generated = routed_sql(&session().await, sql).await;
+        for want in wants {
+            assert!(generated.contains(want), "`{want}` must reach the rewrite: {generated}");
+        }
+        for unwanted in absent {
+            assert!(!generated.contains(unwanted), "`{unwanted}` must not reach the rewrite: {generated}");
+        }
     }
 
-    /// …including beside a percentile: the match level resolves both states and
-    /// the per-slice measure gate decides where they may be read from.
+    /// A guarded count beside a percentile: the match level resolves both states
+    /// and the per-slice measure gate decides where they may be read from.
     #[tokio::test]
     async fn a_guarded_count_beside_a_percentile_resolves_both_states() {
         let state = session().await;
@@ -2977,96 +3032,83 @@ mod tests {
         assert!(!generated.contains("request_count"), "request_count counts null-duration rows the guard excluded: {generated}");
     }
 
-    /// A spec disqualified by GRAIN ALONE must not report the miss, or a coarse
-    /// tier's complaint masks the finer tier's real reason.
-    #[tokio::test]
-    async fn a_sub_hour_bucket_reports_the_group_by_not_the_grain() {
-        // A day-wide window on purpose: the 1h tier must be disqualified by the
-        // BUCKET WIDTH (`PartialBucket`) rather than by a window too narrow to
-        // hold two of its grains.
-        let sql = format!(
+    /// Shapes that must decline with exactly the reason named — the reason IS the
+    /// `rollup_misses` label a dashboard is diagnosed from, so a wrong one is a
+    /// silent misdiagnosis.
+    // A spec disqualified by GRAIN ALONE must not report the miss, or the 1h tier's complaint masks the 1m tier's real reason. The window is day-wide on
+    // purpose: the 1h tier must be disqualified by the BUCKET WIDTH (`PartialBucket`), not by a window too narrow to hold two of its grains.
+    #[test_case::test_case(
+        &format!(
             "SELECT time_bucket('30 minutes', timestamp) AS tb, status_message, COUNT(*) FROM {SOURCE} \
              WHERE project_id = 'project' AND timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) GROUP BY 1, 2"
-        );
-        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::UnknownGroupBy), "the 1h tier's grain complaint must not mask the 1m tier's real reason");
+        ),
+        MissReason::UnknownGroupBy ; "a sub hour bucket reports the group by not the grain")]
+    // No timestamp truncates to an unaligned instant: inventing `[X, X+width)` would serve an hour of rows for a query that must return none.
+    #[test_case::test_case(
+        &format!(
+            "SELECT project_id, COUNT(*) FROM {SOURCE} \
+             WHERE timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
+             AND date_trunc('hour', timestamp) = to_timestamp_micros(90061000000) GROUP BY 1"
+        ),
+        MissReason::UnknownFilter ; "a date trunc equality against an unaligned literal is refused")]
+    // Grouping by project_id is what makes a filterless query answerable; without a group key the rewrite would fold every project into one row.
+    #[test_case::test_case(&format!("SELECT COUNT(*) FROM {SOURCE} WHERE {WINDOW}"), MissReason::MissingProject
+        ; "a query with neither a project filter nor a project group is refused")]
+    // `status_message` appears in no declared measure filter: the *not eligible* half of the split, which nothing could ever have answered.
+    #[test_case::test_case(
+        &format!(
+            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND status_message = 'nope' \
+             GROUP BY time_bucket('1 hours', timestamp)"
+        ),
+        MissReason::FilterNotEligible ; "a residual filter with no declared measure still refuses")]
+    // The other half: a drifted panel whose residual constrains a column a declared measure DOES filter on is a near-miss worth its own counter.
+    #[test_case::test_case(
+        &format!(
+            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND {SERVER} AND status_message = 'nope' \
+             GROUP BY time_bucket('1 hours', timestamp)"
+        ),
+        MissReason::UnknownFilter ; "a near miss on a declared column is distinguished from an ineligible one")]
+    // `name` is not a declared dimension, so it can only *select* a pre-filtered measure — and groups the raw query eliminates would come back as 0/NULL rows.
+    #[test_case::test_case(
+        &format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND name = 'monoscope.http' AND {WINDOW}"),
+        MissReason::UnknownFilter ; "a residual row filter refuses the route rather than inventing zero rows")]
+    #[tokio::test]
+    async fn a_shape_the_matcher_refuses_names_its_reason(sql: &str, reason: MissReason) {
+        let miss = route_alone(sql).await.err();
+        assert_eq!(miss, Some(reason), "expected {reason:?}, got {miss:?} for: {sql}");
     }
 
-    /// A bare `count(*)` is answered from Delta statistics, so anything measuring
-    /// the scan is spelled `count(1) FROM (SELECT id …) t`; the walker must
-    /// descend through that `SubqueryAlias`.
-    #[tokio::test]
-    async fn the_benchmark_count_shape_routes_through_its_derived_table() {
-        // An unguarded count over a derived table is the tier's `request_count`.
-        assert_rewrite_contains(&format!("SELECT count(1) FROM (SELECT id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t"), &["request_count"])
-            .await;
-    }
-
-    /// The qualifier proof. An alias RE-QUALIFIES its output, so the aggregate's
-    /// group field is `t.status_code` while the rollup rewrite can only produce an
-    /// unqualified `status_code` — and the projection above still references
-    /// `t.status_code`. `dml::requalified` puts the qualifier back field for
-    /// field and `substitute`'s bottom-up `recompute_schema` re-resolves that
-    /// reference, so a qualifier that did not line up fails there rather than
-    /// reading the wrong column.
-    #[tokio::test]
-    async fn a_grouped_derived_table_keeps_its_alias_qualifier_through_the_rewrite() {
-        let sql = format!(
-            "SELECT time_bucket('1 hours', t.timestamp) AS tb, t.status_code, count(*)::float AS count_ \
-             FROM (SELECT timestamp, status_code, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t \
-             GROUP BY 1, 2"
-        );
-        // The reassembly inside `assert_rewrite_contains` IS the qualifier
-        // assertion: a rewrite that did not carry the `t` qualifier back fails to
-        // resolve rather than answering.
-        assert_rewrite_contains(&sql, &["status_code"]).await;
-    }
-
-    /// The boundary that makes the arm above safe: `kind AS status_code` walked
-    /// through would read the declared `status_code` dimension off `kind` and
-    /// answer the wrong rows silently, so a renaming subquery must be refused.
-    #[tokio::test]
-    async fn a_derived_table_that_renames_a_column_still_declines() {
-        let sql = format!(
+    /// Shapes that must decline rather than route to a column the matcher cannot
+    /// prove is there. Declining is the invariant; WHICH reason each declines
+    /// with is deliberately not.
+    // `kind AS status_code` walked through would read the declared `status_code` dimension off `kind` and answer the wrong rows silently.
+    #[test_case::test_case(
+        &format!(
             "SELECT t.status_code, count(*) \
              FROM (SELECT kind AS status_code, timestamp, project_id FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}) t GROUP BY 1"
-        );
-        assert!(!matches!(route_alone(&sql).await, Ok(Some(_))), "a rename under an alias must never be read as the dimension it shadows");
-    }
-
-    /// The coalesce arm is deliberately narrow: anything it cannot prove must
-    /// decline rather than route to a column that is not there.
-    #[test_case::test_case("COALESCE(status_message, 'null')" ; "a column that is not a declared dimension")]
-    #[test_case::test_case("COALESCE(resource___service___name, name, 'null')" ; "three-argument coalesce")]
-    #[test_case::test_case("COALESCE(CONCAT(resource___service___name, 'x'), 'null')" ; "coalesce over an expression, not a column")]
-    #[tokio::test]
-    async fn a_coalesce_the_matcher_cannot_prove_still_declines(group: &str) {
-        let sql = format!("SELECT {group} AS g, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1");
-        assert!(matches!(route_alone(&sql).await, Err(_) | Ok(None)), "{group} must not route");
-    }
-
-    /// `extract(epoch from time_bucket(...))::integer` must route, and the
-    /// wrapper must survive into the rewrite cast and all — the rewrite is
-    /// substituted for this aggregate and has to match its schema types.
-    #[tokio::test]
-    async fn a_chart_grouping_by_extract_epoch_of_a_bucket_routes() {
-        let sql = format!(
-            "SELECT extract(epoch from time_bucket('1 hours', timestamp))::integer AS tb, COUNT(*) \
-             FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
-        );
-        // The epoch wrapper AND its integer cast, or the schemas will not match.
-        assert_rewrite_contains(&sql, &["date_part('EPOCH', time_bucket('1 hours', timestamp))", "CAST(date_part('EPOCH'"]).await;
-    }
-
-    /// `extract(epoch …)` is accepted because it is 1:1 over buckets; every other
-    /// field is many-to-one and would merge groups the raw path keeps apart.
-    #[tokio::test]
-    async fn extracting_any_field_but_epoch_from_a_bucket_still_declines() {
-        let sql = format!(
+        ) ; "a derived table that renames a column still declines")]
+    // The coalesce arm is deliberately narrow.
+    #[test_case::test_case(
+        &format!("SELECT COALESCE(status_message, 'null') AS g, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1")
+        ; "a column that is not a declared dimension")]
+    #[test_case::test_case(
+        &format!("SELECT COALESCE(resource___service___name, name, 'null') AS g, COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1")
+        ; "three-argument coalesce")]
+    #[test_case::test_case(
+        &format!(
+            "SELECT COALESCE(CONCAT(resource___service___name, 'x'), 'null') AS g, COUNT(*) FROM {SOURCE} \
+             WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
+        ) ; "coalesce over an expression, not a column")]
+    // `extract(epoch …)` is accepted because it is 1:1 over buckets; every other field is many-to-one and would merge groups the raw path keeps apart.
+    #[test_case::test_case(
+        &format!(
             "SELECT extract(hour from time_bucket('1 hours', timestamp))::integer AS tb, COUNT(*) \
              FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1"
-        );
-        // Declining is the invariant; WHICH reason it declines with is not.
-        assert!(matches!(route_alone(&sql).await, Err(_) | Ok(None)), "a non-EPOCH field must not route");
+        ) ; "extracting any field but epoch from a bucket still declines")]
+    #[tokio::test]
+    async fn a_shape_the_matcher_cannot_prove_still_declines(sql: &str) {
+        let route = route_alone(sql).await;
+        assert!(matches!(route, Err(_) | Ok(None)), "must not route, got {route:?} for: {sql}");
     }
 
     #[tokio::test]
@@ -3118,19 +3160,6 @@ mod tests {
         assert_substitutes(&state, &sql, None).await;
     }
 
-    /// No timestamp truncates to an unaligned instant, so the predicate is
-    /// unsatisfiable rather than a window. Inventing `[X, X+width)` for it would
-    /// serve an hour of rows for a query that must return none.
-    #[tokio::test]
-    async fn a_date_trunc_equality_against_an_unaligned_literal_is_refused() {
-        let sql = format!(
-            "SELECT project_id, COUNT(*) FROM {SOURCE} \
-             WHERE timestamp >= to_timestamp_micros(0) AND timestamp < to_timestamp_micros(86400000000) \
-             AND date_trunc('hour', timestamp) = to_timestamp_micros(90061000000) GROUP BY 1"
-        );
-        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::UnknownFilter), "an unaligned truncation must be refused as UnknownFilter");
-    }
-
     /// One project short of coverage must not refuse the query for every other
     /// project. The legs must PARTITION (project x time): covered projects read
     /// the rollup over the interior and raw over the fringes, uncovered projects
@@ -3166,27 +3195,6 @@ mod tests {
         let all_covered = route.sql(&generations, &[(route.lo, route.hi)], &ProjectSplit { covered: None, raw_only: Vec::new() });
         assert_eq!(unsplit, all_covered);
         assert!(!unsplit.contains("project_id IN"), "no project list when every project is covered: {unsplit}");
-    }
-
-    /// Grouping by project_id is what makes the query answerable; merely
-    /// omitting the filter does not. Without a group key the rewrite would
-    /// silently fold every project into one row.
-    #[tokio::test]
-    async fn a_query_with_neither_a_project_filter_nor_a_project_group_is_refused() {
-        let miss = route_alone(&format!("SELECT COUNT(*) FROM {SOURCE} WHERE {WINDOW}")).await.err();
-        assert_eq!(miss, Some(MissReason::MissingProject), "expected MissingProject, got {miss:?}");
-    }
-
-    #[tokio::test]
-    async fn a_scalar_projection_above_the_aggregate_survives_untouched() {
-        assert_rewrite_contains(&format!("SELECT COUNT(*) + 1 AS total FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}"), &[]).await;
-    }
-
-    #[tokio::test]
-    async fn matcher_applies_dimension_predicates_to_the_rollup_scan() {
-        let state = session().await;
-        let sql = format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND kind = 'server' AND {WINDOW}");
-        assert!(routed_sql(&state, &sql).await.contains("AND (kind = 'server')"));
     }
 
     /// The three ranges must PARTITION `[lo, hi)`, and both interior endpoints
@@ -3675,75 +3683,6 @@ mod tests {
         assert_ne!(literal(ScalarValue::Int64(Some(1))), literal(ScalarValue::Utf8(Some("1".into()))));
     }
 
-    /// A row filter matching a declared measure filter routes to the pre-filtered
-    /// measure, and the promotion must carry a HAVING: without it a bucket where
-    /// nothing matched comes back as a 0 row instead of being absent.
-    #[tokio::test]
-    async fn a_row_filter_that_matches_a_declared_measure_filter_routes_with_a_having() {
-        let sql = format!(
-            "SELECT time_bucket('1 hours', timestamp) AS bucket, COUNT(*) AS c \
-             FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1 ORDER BY 1 DESC"
-        );
-        assert_rewrite_contains(&sql, &["server_request_count", "HAVING"]).await;
-    }
-
-    /// The aggregate's own FILTER and the promoted row filter combine, so the
-    /// error widget resolves to `server_error_count` — declared as exactly that
-    /// conjunction.
-    #[tokio::test]
-    async fn an_aggregate_filter_combines_with_the_promoted_row_filter() {
-        let sql = format!(
-            "SELECT time_bucket('1 hours', timestamp) AS bucket, \
-                    COUNT(*) FILTER (WHERE status_code = 'ERROR' OR COALESCE(attributes___http___response___status_code, 0) >= 500) AS errors \
-             FROM {SOURCE} WHERE project_id = 'project' AND {SERVER} AND {WINDOW} GROUP BY 1"
-        );
-        assert_rewrite_contains(&sql, &["server_error_count"]).await;
-    }
-
-    /// A residual filter that matches NOTHING declared must still refuse. The
-    /// promotion widens what routes; it must not widen what is answered wrongly.
-    ///
-    /// `status_message` appears in no declared measure filter, so this is the
-    /// *not eligible* half of the split: nothing could ever have answered it.
-    #[tokio::test]
-    async fn a_residual_filter_with_no_declared_measure_still_refuses() {
-        let sql = format!(
-            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND status_message = 'nope' \
-             GROUP BY time_bucket('1 hours', timestamp)"
-        );
-        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::FilterNotEligible), "an unmatched residual must not be promoted");
-    }
-
-    /// The other half of the split: a residual that constrains a column a
-    /// declared measure DOES filter on is a near-miss worth its own counter, so
-    /// "we should have matched this" stays distinguishable from "this was never a
-    /// candidate".
-    #[tokio::test]
-    async fn a_near_miss_on_a_declared_column_is_distinguished_from_an_ineligible_one() {
-        // A drifted panel: the declared server filter plus one extra conjunct.
-        let sql = format!(
-            "SELECT COUNT(*) AS c FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} AND {SERVER} AND status_message = 'nope' \
-             GROUP BY time_bucket('1 hours', timestamp)"
-        );
-        assert_eq!(
-            route_alone(&sql).await.err(),
-            Some(MissReason::UnknownFilter),
-            "a residual on a column declared measures filter on is a near-miss, not an ineligible query"
-        );
-    }
-
-    /// An aggregate inside a CTE is reachable because the matcher searches the
-    /// tree instead of peeling the root.
-    #[tokio::test]
-    async fn an_aggregate_inside_a_cte_is_reachable() {
-        let sql = format!(
-            "WITH bucketed AS (SELECT time_bucket('1 hours', timestamp) AS t, avg(duration) AS mean \
-                               FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW} GROUP BY 1) \
-             SELECT t, mean FROM bucketed ORDER BY 1 DESC"
-        );
-        assert_rewrite_contains(&sql, &[]).await;
-    }
-
     /// A matcher that only accepts a bare aggregate root would never fire:
     /// `ORDER BY ... DESC` sits above the aggregate on real dashboard queries.
     #[tokio::test]
@@ -3791,26 +3730,6 @@ mod tests {
         );
         let unrelated = route_for(&state, &format!("SELECT kind FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await;
         assert!(matches!(unrelated, Ok(None)), "a non-aggregate query must not be counted as a miss: {unrelated:?}");
-    }
-
-    /// An `avg` over two Int64 measures divides as integers; the CASE's DOUBLE
-    /// only widens an already-truncated value, so the schema gate cannot see it.
-    #[tokio::test]
-    async fn avg_casts_before_dividing_so_it_does_not_truncate() {
-        let state = session().await;
-        let sql = routed_sql(&state, &format!("SELECT avg(duration) FROM {SOURCE} WHERE project_id = 'project' AND {WINDOW}")).await;
-        assert!(sql.contains("CAST(SUM(duration_sum) AS DOUBLE) / CAST(SUM(duration_count) AS DOUBLE)"), "avg must divide in floating point: {sql}");
-    }
-
-    /// A `WHERE` predicate that only *selects* a pre-filtered measure is not
-    /// applied by the rewrite, so groups and buckets the raw query eliminates
-    /// come back as 0/NULL rows. Refuse the route instead.
-    #[tokio::test]
-    async fn a_residual_row_filter_refuses_the_route_rather_than_inventing_zero_rows() {
-        // `name` is not a declared dimension, so it cannot be pushed into the
-        // rollup scan; it can only pick a pre-filtered measure.
-        let sql = format!("SELECT COUNT(*) FROM {SOURCE} WHERE project_id = 'project' AND name = 'monoscope.http' AND {WINDOW}");
-        assert_eq!(route_alone(&sql).await.err(), Some(MissReason::UnknownFilter), "a residual filter must not route");
     }
 
     /// `project_id = <column>` must not be consumed and dropped, or the rollup
