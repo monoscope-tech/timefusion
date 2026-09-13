@@ -2748,9 +2748,9 @@ impl Database {
             }
             _ => None,
         };
-        // PHASE CLOCK over the whole window in which a light permit is held but no
-        // sort has begun. Prod 2026-09-13, on a 54-minute-old process carrying every
-        // one of tonight's permit and packer fixes:
+        // PHASE WATCHDOG over the window in which a light permit is held but no
+        // sort has begun. Prod 2026-09-13, on a 54-minute-old process carrying
+        // every one of tonight's permit and packer fixes:
         //
         //     light_optimize_bins_committed:   150 -> 150       FROZEN
         //     compaction_permits_acquired:     370 -> 370       FROZEN
@@ -2759,34 +2759,45 @@ impl Database {
         //     HotPacking + SealedConsolidation claims in 6 min: 0
         //     wave_bin_staging_started in 20 min:               0
         //
-        // Both permits were held by units that never released them, and because the
-        // permit is taken BEFORE the claim the hygiene lanes then stop claiming at
-        // all. The lane does not drain slowly — it WEDGES, and prod's constant
-        // redeploys keep clearing and re-forming the wedge, which reads as slowness.
+        // Both permits were held by units that never released them, and because
+        // the permit is taken BEFORE the claim the hygiene lanes then stop
+        // claiming at all. The lane does not drain slowly — it WEDGES, and prod's
+        // constant redeploys keep clearing and re-forming it, which reads as
+        // slowness.
         //
-        // No staging starts, so the block is somewhere in claim -> admission ->
-        // resolve_table -> compaction_files. Every one of those is plausible: the
-        // journal mutex, the second semaphore, an object-store round trip, and a
-        // walk of a 3-4k-file snapshot. Four consecutive failed passes at the packer
-        // came from picking the plausible candidate instead of measuring, so this
-        // measures. #268's lifetime cap cannot substitute — `tokio::time::timeout`
-        // cannot preempt a future that never reaches an await point.
-        let held_at = std::time::Instant::now();
-        let mut phase = "claim";
-        let note = |next: &'static str, at: &mut &'static str| {
-            let elapsed = held_at.elapsed();
-            if elapsed >= std::time::Duration::from_secs(30) {
-                warn!(
-                    phase = *at,
-                    elapsed_secs = elapsed.as_secs(),
-                    event = "compaction_permit_held_without_staging",
-                    "a light permit was held this long before reaching the next phase"
-                );
+        // The reporter must be a SEPARATE TASK, not a check on the way past each
+        // checkpoint. A unit that hangs never reaches the next checkpoint, so a
+        // completion-based clock stays silent on precisely the failure it is
+        // built to name — the same trap that kept #268's lifetime cap from ever
+        // firing, since `tokio::time::timeout` cannot preempt a future that never
+        // reaches an await point. Two permits bound this to two watchdogs.
+        const PERMIT_PHASES: [&str; 5] = ["claim", "admission", "resolve_table", "compaction_files", "staging"];
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
             }
-            *at = next;
-        };
+        }
+        let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let note = |next: usize| phase.store(next, std::sync::atomic::Ordering::Relaxed);
+        let _watchdog = AbortOnDrop(tokio::spawn({
+            let phase = Arc::clone(&phase);
+            async move {
+                let mut held_secs = 0u64;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    held_secs += 60;
+                    warn!(
+                        phase = PERMIT_PHASES[phase.load(std::sync::atomic::Ordering::Relaxed).min(PERMIT_PHASES.len() - 1)],
+                        held_secs,
+                        event = "compaction_permit_held_without_staging",
+                        "a light permit has been held this long without starting a sort"
+                    );
+                }
+            }
+        }));
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
-        note("admission", &mut phase);
+        note(1);
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
@@ -2797,14 +2808,14 @@ impl Database {
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             return self.retried(&key, "admission_busy".to_owned(), admission_backoff(task.attempts));
         };
-        note("resolve_table", &mut phase);
+        note(2);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
             Ok(table) => table,
             Err(error) => return retry(format!("resolve_compaction_source: {error:#}"), 30),
         };
-        note("compaction_files", &mut phase);
+        note(3);
         let files = self.coordinator_compaction_files(&table_ref, &key).await?;
-        note("staging", &mut phase);
+        note(4);
         if files.is_empty() {
             return self.completed(&key);
         }
