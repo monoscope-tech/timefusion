@@ -11,7 +11,13 @@
 
 use std::time::Duration;
 
-use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_dormant_at, insert_dormant_named};
+use super::harness::{E2eEnv, E2eEnvBuilder, FROZEN_START_MICROS, insert_dormant_at, insert_dormant_named};
+use tokio_postgres::Client;
+
+/// DV-enabled env; callers chain any extra builder options plus `.start()`.
+fn dv_env() -> E2eEnvBuilder {
+    E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60))
+}
 
 /// Live parquet data files for the default tenant table.
 async fn parquet_files(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
@@ -20,21 +26,54 @@ async fn parquet_files(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
     Ok(uris.into_iter().filter(|u| u.ends_with(".parquet")).collect())
 }
 
+/// `n` rows `{prefix}-0..n` one second apart from `base`.
+async fn seed(client: &Client, prefix: &str, n: i64, base: i64) -> anyhow::Result<()> {
+    for i in 0..n {
+        insert_dormant_at(client, &format!("{prefix}-{i}"), base + i * 1_000_000).await?;
+    }
+    Ok(())
+}
+
+/// Tenant row count, with an optional extra `AND ...` predicate.
+async fn count(client: &Client, filter: &str) -> anyhow::Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1 {filter}");
+    Ok(client.query_one(sql.as_str(), &[&"e2e_project"]).await?.get(0))
+}
+
+async fn status_code(client: &Client, id: &str) -> anyhow::Result<String> {
+    Ok(client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = $2", &[&"e2e_project", &id]).await?.get(0))
+}
+
+/// Every id must read back invisible; `ctx` names the operation that must not resurrect it.
+async fn assert_ids_gone(client: &Client, ids: &[&str], ctx: &str) -> anyhow::Result<()> {
+    for id in ids {
+        assert_eq!(count(client, &format!("AND id = '{id}'")).await?, 0, "row {id} must stay gone: {ctx}");
+    }
+    Ok(())
+}
+
+/// Seed `n` rows and flush into exactly ONE Delta parquet file (the advance past the
+/// bucket duration is what makes the bucket flushable), so DML targets Delta, not MemBuffer.
+async fn seed_into_one_file(env: &E2eEnv, client: &Client, prefix: &str, n: i64) -> anyhow::Result<Vec<String>> {
+    seed(client, prefix, n, FROZEN_START_MICROS).await?;
+    env.advance(Duration::from_secs(180));
+    env.force_flush().await?;
+    let files = parquet_files(env).await?;
+    assert_eq!(files.len(), 1, "expected one flushed data file, got {files:?}");
+    Ok(files)
+}
+
+async fn unified_table(env: &E2eEnv) -> anyhow::Result<std::sync::Arc<tokio::sync::RwLock<deltalake::DeltaTable>>> {
+    timefusion::database::get_unified_delta_table(env.db().unified_tables(), "mor_dormant").await.ok_or_else(|| anyhow::anyhow!("unified table not found"))
+}
+
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().start().await?;
     let client = env.pg_client().await?;
 
-    let sec = 1_000_000i64;
-    for i in 0..5 {
-        insert_dormant_at(&client, &format!("u-{i}"), FROZEN_START_MICROS + i * sec).await?;
-    }
-    // Flush to Delta so the DML targets a Delta parquet file, not the MemBuffer.
-    env.advance(Duration::from_secs(180));
-    env.force_flush().await?;
-    let files_before = parquet_files(&env).await?;
-    assert_eq!(files_before.len(), 1, "expected one flushed data file, got {files_before:?}");
+    let files_before = seed_into_one_file(&env, &client, "u", 5).await?;
 
     // DV UPDATE: mask row u-1 in the original file and append its rewritten copy.
     client.execute("UPDATE mor_dormant SET status_code = 'ERR' WHERE project_id = 'e2e_project' AND id = 'u-1'", &[]).await?;
@@ -45,22 +84,14 @@ async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Res
     assert!(files_before.iter().all(|f| files_after.contains(f)), "the original file must remain live under a DV, not be rewritten");
 
     // Row count unchanged; the masked original row is hidden and the new one shows.
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 5, "UPDATE must not change the row count");
-
-    let updated: String = client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = 'u-1'", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(updated, "ERR", "the DV-updated row must read back the new value");
-
-    let untouched: String = client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = 'u-3'", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(untouched, "OK", "unmatched rows stay untouched");
+    assert_eq!(count(&client, "").await?, 5, "UPDATE must not change the row count");
+    assert_eq!(status_code(&client, "u-1").await?, "ERR", "the DV-updated row must read back the new value");
+    assert_eq!(status_code(&client, "u-3").await?, "OK", "unmatched rows stay untouched");
 
     // DV DELETE: mask row u-2.
     client.execute("DELETE FROM mor_dormant WHERE project_id = 'e2e_project' AND id = 'u-2'", &[]).await?;
-    let after_delete: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(after_delete, 4, "DV DELETE must hide exactly the matched row");
-
-    let gone: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1 AND id = 'u-2'", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(gone, 0, "deleted row must not reappear");
+    assert_eq!(count(&client, "").await?, 4, "DV DELETE must hide exactly the matched row");
+    assert_ids_gone(&client, &["u-2"], "DV DELETE").await?;
 
     Ok(())
 }
@@ -80,16 +111,13 @@ async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Resu
 
     // The two explicit flushes define the two source files. A background tick
     // between INSERTs can otherwise split the fixture on a busy test runner.
-    let env =
-        E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).with_flush_interval(Duration::from_secs(3600)).start().await?;
+    let env = dv_env().with_flush_interval(Duration::from_secs(3600)).start().await?;
     let client = env.pg_client().await?;
 
     let past = 1_735_689_600_000_000i64; // 2025-01-01, sealed relative to real now
     let sec = 1_000_000i64;
     // File 1: three unique rows + the row we will duplicate.
-    for i in 0..3 {
-        insert_dormant_at(&client, &format!("u-{i}"), past + i * sec).await?;
-    }
+    seed(&client, "u", 3, past).await?;
     insert_dormant_at(&client, "dup", past + 100 * sec).await?;
     env.force_flush().await?;
     // File 2: the DUPLICATE (identical timestamp+id dedup key; different
@@ -104,8 +132,7 @@ async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Resu
 
     // Read-time DedupExec already hides the physical duplicate, so the logical
     // count is 5 before dedup runs — dedup's job is to make that physical.
-    let count_before: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count_before, 5, "read-time dedup already resolves the duplicate");
+    assert_eq!(count(&client, "").await?, 5, "read-time dedup already resolves the duplicate");
 
     // DV-dedup the partition.
     let table_ref = env.db().resolve_table("e2e_project", "mor_dormant").await?;
@@ -128,19 +155,13 @@ async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Resu
     };
     assert_eq!(dv_files, 1, "exactly one file must carry a deletion vector, got {dv_files}");
 
-    let count_after: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count_after, 5, "count unchanged by DV-dedup");
+    assert_eq!(count(&client, "").await?, 5, "count unchanged by DV-dedup");
 
     // No resurrection: OPTIMIZE reads DV-masked, drops the loser physically, and
     // writes DV-free files.
-    let unified = timefusion::database::get_unified_delta_table(env.db().unified_tables(), "mor_dormant")
-        .await
-        .ok_or_else(|| anyhow::anyhow!("unified table not found"))?;
-    env.db().optimize_table(&unified, "mor_dormant", None).await?;
-    let count_final: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count_final, 5, "OPTIMIZE must not resurrect the DV-dropped duplicate");
-    let dup_final: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1 AND id = 'dup'", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(dup_final, 1, "the duplicate must resolve to exactly one row");
+    env.db().optimize_table(&unified_table(&env).await?, "mor_dormant", None).await?;
+    assert_eq!(count(&client, "").await?, 5, "OPTIMIZE must not resurrect the DV-dropped duplicate");
+    assert_eq!(count(&client, "AND id = 'dup'").await?, 1, "the duplicate must resolve to exactly one row");
 
     Ok(())
 }
@@ -151,31 +172,22 @@ async fn dv_dedup_drops_cross_file_duplicate_without_rewriting() -> anyhow::Resu
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn dv_state_survives_restart() -> anyhow::Result<()> {
-    let mut env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let mut env = dv_env().start().await?;
     {
         let client = env.pg_client().await?;
-        let sec = 1_000_000i64;
-        for i in 0..6 {
-            insert_dormant_at(&client, &format!("r-{i}"), FROZEN_START_MICROS + i * sec).await?;
-        }
+        seed(&client, "r", 6, FROZEN_START_MICROS).await?;
         env.force_flush().await?;
         client.execute("DELETE FROM mor_dormant WHERE project_id = 'e2e_project' AND id IN ('r-1','r-2')", &[]).await?;
         client.execute("UPDATE mor_dormant SET status_code = 'ERR' WHERE project_id = 'e2e_project' AND id = 'r-3'", &[]).await?;
-        let count: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-        assert_eq!(count, 4, "pre-restart count wrong");
+        assert_eq!(count(&client, "").await?, 4, "pre-restart count wrong");
     }
 
     env.restart().await?;
 
     let client = env.pg_client().await?;
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 4, "DV-deleted rows resurrected across restart");
-    for id in ["r-1", "r-2"] {
-        let gone: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1 AND id = $2", &[&"e2e_project", &id]).await?.get(0);
-        assert_eq!(gone, 0, "deleted row {id} came back after restart");
-    }
-    let updated: String = client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = 'r-3'", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(updated, "ERR", "DV update lost across restart");
+    assert_eq!(count(&client, "").await?, 4, "DV-deleted rows resurrected across restart");
+    assert_ids_gone(&client, &["r-1", "r-2"], "restart must reload DVs from the Delta log").await?;
+    assert_eq!(status_code(&client, "r-3").await?, "ERR", "DV update lost across restart");
     Ok(())
 }
 
@@ -185,13 +197,10 @@ async fn dv_state_survives_restart() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn dv_compaction_consolidates_deletion_vectors() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().start().await?;
     let client = env.pg_client().await?;
 
-    let sec = 1_000_000i64;
-    for i in 0..20 {
-        insert_dormant_at(&client, &format!("c-{i}"), FROZEN_START_MICROS + i * sec).await?;
-    }
+    seed(&client, "c", 20, FROZEN_START_MICROS).await?;
     env.force_flush().await?;
 
     // DV DELETE 3 rows and DV UPDATE 2 rows (mask + append).
@@ -199,22 +208,13 @@ async fn dv_compaction_consolidates_deletion_vectors() -> anyhow::Result<()> {
     client.execute("UPDATE mor_dormant SET status_code = 'ERR' WHERE project_id = 'e2e_project' AND id IN ('c-4','c-5')", &[]).await?;
 
     // Full compaction: reads DV-masked data, drops deleted rows, writes DV-free files.
-    let db = env.db();
-    let table_ref =
-        timefusion::database::get_unified_delta_table(db.unified_tables(), "mor_dormant").await.ok_or_else(|| anyhow::anyhow!("unified table not found"))?;
-    db.optimize_table(&table_ref, "mor_dormant", None).await?;
+    env.db().optimize_table(&unified_table(&env).await?, "mor_dormant", None).await?;
 
     // Post-compaction: deleted rows stay gone, updated rows keep their new value.
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 17, "compaction resurrected DV-deleted rows");
+    assert_eq!(count(&client, "").await?, 17, "compaction resurrected DV-deleted rows");
+    assert_eq!(count(&client, "AND status_code = 'ERR'").await?, 2, "DV-updated rows lost their value across compaction");
 
-    let errs: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1 AND status_code = 'ERR'", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(errs, 2, "DV-updated rows lost their value across compaction");
-
-    for id in ["c-1", "c-2", "c-3"] {
-        let gone: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1 AND id = $2", &[&"e2e_project", &id]).await?.get(0);
-        assert_eq!(gone, 0, "deleted row {id} reappeared after compaction");
-    }
+    assert_ids_gone(&client, &["c-1", "c-2", "c-3"], "compaction must consolidate DVs, not resurrect rows").await?;
     Ok(())
 }
 
@@ -223,17 +223,10 @@ async fn dv_compaction_consolidates_deletion_vectors() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn dv_merge_update_from_source_masks_and_appends() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().start().await?;
     let client = env.pg_client().await?;
 
-    let sec = 1_000_000i64;
-    for i in 0..5 {
-        insert_dormant_at(&client, &format!("m-{i}"), FROZEN_START_MICROS + i * sec).await?;
-    }
-    env.advance(Duration::from_secs(180));
-    env.force_flush().await?;
-    let files_before = parquet_files(&env).await?;
-    assert_eq!(files_before.len(), 1, "expected one flushed data file, got {files_before:?}");
+    let files_before = seed_into_one_file(&env, &client, "m", 5).await?;
 
     // MERGE-update: join the target against a VALUES source on id, set status_code
     // from the source. Routes through perform_delta_merge_update -> DV merge op.
@@ -252,12 +245,10 @@ async fn dv_merge_update_from_source_masks_and_appends() -> anyhow::Result<()> {
         "DV merge-update should keep the masked original and append updated rows (before={files_before:?} after={files_after:?})"
     );
 
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM mor_dormant WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 5, "merge-update must not change the row count");
+    assert_eq!(count(&client, "").await?, 5, "merge-update must not change the row count");
 
     for (id, expected) in [("m-1", "X1"), ("m-3", "X3"), ("m-2", "OK"), ("m-0", "OK")] {
-        let got: String = client.query_one("SELECT status_code FROM mor_dormant WHERE project_id = $1 AND id = $2", &[&"e2e_project", &id]).await?.get(0);
-        assert_eq!(got, expected, "row {id} should read status_code={expected}");
+        assert_eq!(status_code(&client, id).await?, expected, "row {id} should read status_code={expected}");
     }
 
     Ok(())

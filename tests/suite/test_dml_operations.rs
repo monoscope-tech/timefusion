@@ -3,410 +3,103 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::Result;
-    use datafusion::{arrow, arrow::array::AsArray};
+    use datafusion::{
+        arrow,
+        arrow::{array::AsArray, record_batch::RecordBatch},
+        prelude::SessionContext,
+    };
     use serial_test::serial;
+    use test_case::test_case;
     use timefusion::{
         config::AppConfig,
         database::Database,
-        support::test_helpers::{array_get_str as get_str, minio_test_config},
+        support::test_helpers::{array_get_str as get_str, json_to_batch, json_to_batch_for, minio_test_config, test_layer},
     };
-    use tracing::info;
+
+    // Delta-Only DML Tests (no buffered layer - operations go directly to Delta)
+    // These tests verify that UPDATE/DELETE work correctly on Delta Lake tables.
+
+    const OTEL: &str = "otel_logs_and_spans";
+    /// `mor_dormant` is the in-place-DML fixture: `otel_logs_and_spans` flipped
+    /// `version_append` on 2026-08-02, so it no longer takes the delta-rs MERGE
+    /// path those tests are about. See `schemas/mor_dormant.yaml`.
+    const INPLACE_TABLE: &str = "mor_dormant";
+
+    /// (id, name, level, duration) — the three rows every UPDATE case starts from.
+    const BASE_RECORDS: &[(&str, &str, &str, i64)] = &[("1", "Alice", "INFO", 100), ("2", "Bob", "ERROR", 200), ("3", "Charlie", "INFO", 300)];
 
     fn create_test_config(test_id: &str) -> Arc<AppConfig> {
         minio_test_config(test_id, &format!("/tmp/timefusion-dml-{test_id}"))
     }
 
-    // Delta-Only DML Tests (no buffered layer - operations go directly to Delta)
-    // These tests verify that UPDATE/DELETE work correctly on Delta Lake tables.
+    /// Logging + a uniquely-prefixed config, the opening of every test here.
+    fn test_cfg() -> Arc<AppConfig> {
+        timefusion::support::init_test_logging();
+        create_test_config(&uuid::Uuid::new_v4().to_string()[..8])
+    }
+
+    fn records(specs: &[(&str, &str, &str, i64)], now: chrono::DateTime<chrono::Utc>) -> Vec<serde_json::Value> {
+        specs
+            .iter()
+            .map(|&(id, name, level, duration)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "project_id": "test_project",
+                    "timestamp": now.timestamp_micros(),
+                    "level": level,
+                    "status_code": if level == "ERROR" { "ERROR" } else { "OK" },
+                    "duration": duration,
+                    "date": now.date_naive().to_string(),
+                    "hashes": [],
+                    "summary": []
+                })
+            })
+            .collect()
+    }
 
     fn create_test_records(now: chrono::DateTime<chrono::Utc>) -> Vec<serde_json::Value> {
-        vec![
-            serde_json::json!({
-                "id": "1",
-                "name": "Alice",
-                "project_id": "test_project",
-                "timestamp": now.timestamp_micros(),
-                "level": "INFO",
-                "status_code": "OK",
-                "duration": 100,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            }),
-            serde_json::json!({
-                "id": "2",
-                "name": "Bob",
-                "project_id": "test_project",
-                "timestamp": now.timestamp_micros(),
-                "level": "ERROR",
-                "status_code": "ERROR",
-                "duration": 200,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            }),
-            serde_json::json!({
-                "id": "3",
-                "name": "Charlie",
-                "project_id": "test_project",
-                "timestamp": now.timestamp_micros(),
-                "level": "INFO",
-                "status_code": "OK",
-                "duration": 300,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            }),
-        ]
+        records(BASE_RECORDS, now)
     }
 
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_query() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
+    async fn db_with(cfg: Arc<AppConfig>) -> Result<(Arc<Database>, SessionContext)> {
         let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        info!("Executing UPDATE query");
-        let df = ctx.sql("UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'").await?;
-        let result = df.collect().await?;
-
-        assert_eq!(result.len(), 1);
-        let batch = &result[0];
-        assert_eq!(batch.num_rows(), 1);
-
-        let rows_updated = batch.column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
-
-        let df = ctx.sql("SELECT id, name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id").await?;
-        let results = df.collect().await?;
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 3);
-
-        let name_col_idx = batch.schema().fields().iter().position(|f| f.name() == "name").unwrap();
-        let duration_col_idx = batch.schema().fields().iter().position(|f| f.name() == "duration").unwrap();
-
-        let name_col = batch.column(name_col_idx).as_ref();
-        let duration_col = batch.column(duration_col_idx).as_primitive::<arrow::datatypes::Int64Type>();
-
-        for i in 0..batch.num_rows() {
-            match get_str(name_col, i).as_str() {
-                "Bob" => assert_eq!(duration_col.value(i), 500, "Bob's duration should be updated to 500"),
-                "Alice" => assert_eq!(duration_col.value(i), 100, "Alice's duration should remain 100"),
-                "Charlie" => assert_eq!(duration_col.value(i), 300, "Charlie's duration should remain 300"),
-                _ => unreachable!(),
-            }
-        }
-
-        Ok(())
+        Ok((db, ctx))
     }
 
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_delete_with_predicate() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        info!("Executing DELETE query");
-        let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
-        let result = df.collect().await?;
-
-        assert_eq!(result.len(), 1);
-        let batch = &result[0];
-        assert_eq!(batch.num_rows(), 1);
-
-        let rows_deleted = batch.column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_deleted, 1, "Expected 1 row to be deleted");
-
-        let df = ctx.sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id").await?;
-        let results = df.collect().await?;
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 2); // Only Alice and Charlie should remain
-
-        let id_col_idx = batch.schema().fields().iter().position(|f| f.name() == "id").unwrap();
-        let name_col_idx = batch.schema().fields().iter().position(|f| f.name() == "name").unwrap();
-
-        let id_col = batch.column(id_col_idx).as_ref();
-        let name_col = batch.column(name_col_idx).as_ref();
-
-        assert_eq!(get_str(id_col, 0), "1");
-        assert_eq!(get_str(name_col, 0), "Alice");
-        assert_eq!(get_str(id_col, 1), "3");
-        assert_eq!(get_str(name_col, 1), "Charlie");
-
-        Ok(())
+    /// Fresh database + session with `BASE_RECORDS` committed straight to Delta.
+    async fn seeded(table: &str) -> Result<(Arc<Database>, SessionContext)> {
+        let (db, ctx) = db_with(test_cfg()).await?;
+        let batch = json_to_batch_for(table, create_test_records(chrono::Utc::now()))?;
+        db.insert_records_batch("test_project", table, vec![batch], true, None).await?;
+        Ok((db, ctx))
     }
 
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_delete_all_matching() -> Result<()> {
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = vec![
-            serde_json::json!({
-                "id": "1",
-                "name": "Record1",
-                "project_id": "test_project",
-                "timestamp": now.timestamp_micros(),
-                "level": "ERROR",
-                "status_code": "ERROR",
-                "duration": 100,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            }),
-            serde_json::json!({
-                "id": "2",
-                "name": "Record2",
-                "project_id": "test_project",
-                "timestamp": now.timestamp_micros(),
-                "level": "INFO",
-                "status_code": "OK",
-                "duration": 200,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            }),
-            serde_json::json!({
-                "id": "3",
-                "name": "Record3",
-                "project_id": "test_project",
-                "timestamp": now.timestamp_micros(),
-                "level": "ERROR",
-                "status_code": "ERROR",
-                "duration": 300,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            }),
-            serde_json::json!({
-                "id": "4",
-                "name": "Record4",
-                "project_id": "test_project",
-                "timestamp": now.timestamp_micros(),
-                "level": "ERROR",
-                "status_code": "ERROR",
-                "duration": 400,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            }),
-        ];
-
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        // Delete all ERROR level records
-        let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
-        let result = df.collect().await?;
-
-        let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_deleted, 3, "Expected 3 rows to be deleted");
-
-        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
-        let results = df.collect().await?;
-        let count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(count, 1, "Expected 1 row to remain");
-
-        let df = ctx.sql("SELECT id, level FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
-        let results = df.collect().await?;
-        let batch = &results[0];
-
-        let id_col = batch.column(0).as_ref();
-        let level_col = batch.column(1).as_ref();
-
-        assert_eq!(get_str(id_col, 0), "2");
-        assert_eq!(get_str(level_col, 0), "INFO");
-
-        Ok(())
+    /// Rows affected by a DML statement — also holds the shape asserts every
+    /// caller used to repeat (exactly one batch, exactly one row).
+    fn affected(result: &[RecordBatch]) -> u64 {
+        assert_eq!(result.len(), 1, "DML returns a single batch");
+        assert_eq!(result[0].num_rows(), 1, "DML returns a single count row");
+        result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0)
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_update_multiple_columns() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        // Update multiple columns at once
-        info!("Executing multi-column UPDATE query");
-        let df = ctx.sql("UPDATE otel_logs_and_spans SET hashes = make_array('999', 'WARN') WHERE project_id = 'test_project' AND name = 'Alice'").await?;
-        let result = df.collect().await?;
-
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
-
-        let df = ctx.sql("SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration, COALESCE(array_element(hashes, 2), level) AS level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Alice'").await?;
-        let results = df.collect().await?;
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 1);
-
-        let duration_idx = batch.schema().fields().iter().position(|f| f.name() == "duration").unwrap();
-        let level_idx = batch.schema().fields().iter().position(|f| f.name() == "level").unwrap();
-
-        let duration_col = batch.column(duration_idx).as_primitive::<arrow::datatypes::Int64Type>();
-        let level_col = batch.column(level_idx).as_ref();
-
-        assert_eq!(duration_col.value(0), 999, "Duration should be updated to 999");
-        assert_eq!(get_str(level_col, 0), "WARN", "Level should be updated to WARN");
-
-        Ok(())
+    async fn exec_dml(ctx: &SessionContext, sql: &str) -> Result<u64> {
+        Ok(affected(&ctx.sql(sql).await?.collect().await?))
     }
 
-    #[serial]
-    #[tokio::test]
-    async fn test_delete_verify_counts() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-
-        let records = vec![
-            serde_json::json!({
-                "id": "1", "name": "R1", "project_id": "test_project",
-                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
-                "duration": 100, "date": now.date_naive().to_string(), "hashes": [], "summary": []
-            }),
-            serde_json::json!({
-                "id": "2", "name": "R2", "project_id": "test_project",
-                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
-                "duration": 200, "date": now.date_naive().to_string(), "hashes": [], "summary": []
-            }),
-            serde_json::json!({
-                "id": "3", "name": "R3", "project_id": "test_project",
-                "timestamp": now.timestamp_micros(), "level": "ERROR", "status_code": "ERROR",
-                "duration": 300, "date": now.date_naive().to_string(), "hashes": [], "summary": []
-            }),
-            serde_json::json!({
-                "id": "4", "name": "R4", "project_id": "test_project",
-                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
-                "duration": 400, "date": now.date_naive().to_string(), "hashes": [], "summary": []
-            }),
-            serde_json::json!({
-                "id": "5", "name": "R5", "project_id": "test_project",
-                "timestamp": now.timestamp_micros(), "level": "ERROR", "status_code": "ERROR",
-                "duration": 500, "date": now.date_naive().to_string(), "hashes": [], "summary": []
-            }),
-        ];
-
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
-        let results = df.collect().await?;
-        let initial_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(initial_count, 5, "Should have 5 rows initially");
-
-        // Delete ERROR records
-        let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
-        let result = df.collect().await?;
-        let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_deleted, 2, "Should delete 2 ERROR records");
-
-        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
-        let results = df.collect().await?;
-        let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(final_count, 3, "Should have 3 rows after delete");
-
-        Ok(())
+    fn col_str(batch: &RecordBatch, name: &str, i: usize) -> String {
+        get_str(batch.column(batch.schema().index_of(name).unwrap()).as_ref(), i)
     }
 
-    // Regression: DataFusion's CommonSubexprEliminate optimizer wraps the UPDATE
-    // assignment Projection in an inner Projection that defines synthetic
-    // `__common_expr_*` columns. extract_dml_info used to overwrite the real
-    // assignments with that inner Projection's contents, so mem_buffer failed
-    // with "Column '__common_expr_1' not found".
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_with_common_subexpression() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        // `duration + 100` appears twice in SET — CSE-eligible subexpr that
-        // the optimizer hoists into a `__common_expr_*` alias.
-        info!("Executing UPDATE with CSE-eligible subexpression");
-        let df = ctx
-            .sql(
-                // The same subexpression TWICE, which is what exercises common
-                // subexpression elimination. It used to span two assignments;
-                // only `hashes` is declared mutable now, so both uses live in
-                // one array — the plan shape under test is unchanged.
-                "UPDATE otel_logs_and_spans \
-                 SET hashes = make_array(CAST(duration + 100 AS VARCHAR), CAST(duration + 100 AS VARCHAR)) \
-                 WHERE project_id = 'test_project' AND name = 'Bob'",
-            )
-            .await?;
-        let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 1, "Expected Bob's row to be updated");
-
-        let df = ctx.sql("SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
-        let results = df.collect().await?;
-        let duration = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(duration, 300, "Bob's duration should be 200 + 100 = 300");
-
-        Ok(())
+    async fn count_rows(ctx: &SessionContext, table: &str) -> Result<i64> {
+        let results = ctx.sql(&format!("SELECT COUNT(*) FROM {table} WHERE project_id = 'test_project'")).await?.collect().await?;
+        Ok(results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
     }
 
-    /// Helper: select `duration` for `name` in `test_project`, ordered by name.
-    /// `mor_dormant` is the in-place-DML fixture: `otel_logs_and_spans` flipped
-    /// `version_append` on 2026-08-02, so it no longer takes the delta-rs MERGE
-    /// path these tests are about. See `schemas/mor_dormant.yaml`.
-    const INPLACE_TABLE: &str = "mor_dormant";
-
-    async fn duration_by_name_in(ctx: &datafusion::prelude::SessionContext, table: &str, name: &str) -> Result<i64> {
+    /// Helper: select `duration` for `name` in `test_project`.
+    async fn duration_by_name_in(ctx: &SessionContext, table: &str, name: &str) -> Result<i64> {
         let q = format!(
             "SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM {table} WHERE project_id = 'test_project' AND name = '{}'",
             name
@@ -417,243 +110,193 @@ mod tests {
         Ok(results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
     }
 
-    async fn duration_by_name(ctx: &datafusion::prelude::SessionContext, name: &str) -> Result<i64> {
-        duration_by_name_in(ctx, "otel_logs_and_spans", name).await
+    async fn duration_by_name(ctx: &SessionContext, name: &str) -> Result<i64> {
+        duration_by_name_in(ctx, OTEL, name).await
     }
 
-    /// VALUES-list source: smallest possible `UPDATE ... FROM` shape.
-    /// Sets Bob.duration = 500 and Alice.duration = 999 via a single statement.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_from_values() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        let df = ctx
-            .sql(
-                "UPDATE otel_logs_and_spans
-                   SET hashes = make_array(CAST(u.d AS VARCHAR))
-                   FROM (VALUES ('Bob', 500), ('Alice', 999)) AS u(name, d)
-                   WHERE project_id = 'test_project'
-                     AND otel_logs_and_spans.name = u.name",
-            )
-            .await?;
-        let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 2, "Expected 2 rows updated (Bob, Alice)");
-
-        assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
-        assert_eq!(duration_by_name(&ctx, "Alice").await?, 999);
-        assert_eq!(duration_by_name(&ctx, "Charlie").await?, 300, "Charlie unchanged");
-        Ok(())
-    }
-
-    /// Source row whose key doesn't match any target row must not affect any target row.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_from_no_match_no_change() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        let df = ctx
-            .sql(
-                "UPDATE otel_logs_and_spans
-                   SET hashes = make_array(CAST(u.d AS VARCHAR))
-                   FROM (VALUES ('Nobody', 42)) AS u(name, d)
-                   WHERE project_id = 'test_project'
-                     AND otel_logs_and_spans.name = u.name",
-            )
-            .await?;
-        let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 0, "Expected 0 rows updated");
-
-        // All three original durations intact.
-        assert_eq!(duration_by_name(&ctx, "Bob").await?, 200);
-        assert_eq!(duration_by_name(&ctx, "Alice").await?, 100);
-        assert_eq!(duration_by_name(&ctx, "Charlie").await?, 300);
-        Ok(())
-    }
-
-    /// Extra `WHERE` predicate AND-ed with the join keys must narrow the update.
-    /// Source matches Bob and Alice; predicate further constrains to Bob only.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_from_with_predicate() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        let df = ctx
-            .sql(
-                "UPDATE otel_logs_and_spans
-                   SET hashes = make_array(CAST(u.d AS VARCHAR))
-                   FROM (VALUES ('Bob', 777), ('Alice', 888)) AS u(name, d)
-                   WHERE project_id = 'test_project'
-                     AND otel_logs_and_spans.name = u.name
-                     AND otel_logs_and_spans.name = 'Bob'",
-            )
-            .await?;
-        let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 1, "Predicate should narrow to Bob only");
-
-        assert_eq!(duration_by_name(&ctx, "Bob").await?, 777);
-        assert_eq!(duration_by_name(&ctx, "Alice").await?, 100, "Alice excluded by predicate");
-        assert_eq!(duration_by_name(&ctx, "Charlie").await?, 300);
-        Ok(())
-    }
-
-    /// Structural mirror of monoscope's UPDATE-2 SQL: parallel unnested text
-    /// arrays as the source rowset, table aliases (`o`, `u`), array-append
-    /// into a list column. If DataFusion's planner or our rewriters fall over
-    /// on this shape (unnest inside FROM subquery, user aliases on both
-    /// sides, list-typed assignment target) this catches it pre-prod.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_from_unnest_text_array() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        // Monoscope UPDATE-2 lifted shape: parallel unnest of text[] arrays
-        // bound as `u(span_name, tag)`, append into `hashes`. Join is on
-        // `name` here (single key); monoscope uses two: span_id + trace_id —
-        // structurally identical.
-        let df = ctx
-            .sql(
-                "UPDATE otel_logs_and_spans o
-                    SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
-                    FROM (
-                      SELECT unnest(ARRAY['Bob', 'Alice']::text[])      AS span_name,
-                             unnest(ARRAY['pat:bob', 'pat:alice']::text[]) AS tag
-                    ) u
-                    WHERE o.project_id = 'test_project'
-                      AND o.name = u.span_name",
-            )
-            .await?;
-        let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 2, "Expected 2 rows tagged (Bob, Alice)");
-        Ok(())
-    }
-
-    /// Idempotency aspect of the monoscope UPDATE-2 shape: re-running the
-    /// same statement with the `NOT @>` predicate must touch zero rows.
-    /// Currently `#[ignore]`d — `MergeBuilder` returns the rows that the
-    /// join matched even when the SET expression produces an unchanged value
-    /// after the WHEN MATCHED predicate trims them. Untangling needs deeper
-    /// investigation of MergeBuilder's accounting of WHEN MATCHED with
-    /// non-trivial predicate filtering. Monoscope's re-extraction safety on
-    /// TF will rely on this — track as a follow-up.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_from_unnest_text_array_idempotent() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        let sql = "UPDATE otel_logs_and_spans o
-                    SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
-                    FROM (
-                      SELECT unnest(ARRAY['Bob', 'Alice']::text[])      AS span_name,
-                             unnest(ARRAY['pat:bob', 'pat:alice']::text[]) AS tag
-                    ) u
-                    WHERE o.project_id = 'test_project'
-                      AND o.name = u.span_name
-                      AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])";
-        let _ = ctx.sql(sql).await?.collect().await?;
-        let r2 = ctx.sql(sql).await?.collect().await?;
-        let n = r2[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(n, 0, "Re-running idempotent UPDATE must touch zero rows");
-        Ok(())
-    }
-
-    /// Regression for the prod 2026-08-03 write-amplification bug: the
-    /// cross-side guard lives in `join.filter`, and the optimizer pushes the
-    /// target-side conjuncts (project_id + TIMESTAMP BOUNDS) into a `Filter`
-    /// BELOW the join — `extract_dml_info` used to let that deeper Filter
-    /// OVERWRITE the accumulated predicate, silently dropping the guard, so
-    /// every enrichment pass re-appended versions for every matched row. The
-    /// timestamp bound is what distinguishes this from the idempotency test
-    /// above: it is the conjunct that did the clobbering in prod. Also
-    /// exercises the join-key IN-list pushdown on its engaged (< cap) path.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_guard_survives_pushed_down_time_bounds() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        let sql = format!(
-            "UPDATE otel_logs_and_spans o
-               SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag]
-              FROM (SELECT unnest(ARRAY['Bob','Alice']::text[]) AS span_name,
-                           unnest(ARRAY['pat:bob','pat:alice']::text[]) AS tag) u
-             WHERE o.project_id = 'test_project'
-               AND o.timestamp >= '{}' AND o.timestamp < '{}'
-               AND o.name = u.span_name
-               AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])",
-            (now - chrono::Duration::hours(1)).to_rfc3339(),
-            (now + chrono::Duration::hours(1)).to_rfc3339()
+    /// `(duration, level)` of one row, projected through `hashes`: only `hashes`
+    /// is a mutable column on `otel_logs_and_spans`, so an UPDATE's effect is
+    /// read back as `hashes[1]` (duration) and `hashes[2]` (level), falling back
+    /// to the stored column when the array is shorter.
+    async fn row_by_name(ctx: &SessionContext, name: &str) -> Result<(i64, String)> {
+        let q = format!(
+            "SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration, \
+                    COALESCE(array_element(hashes, 2), level) AS level \
+             FROM {OTEL} WHERE project_id = 'test_project' AND name = '{name}'"
         );
-        let r1 = ctx.sql(&sql).await?.collect().await?;
-        let n1 = r1[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(n1, 2, "first pass tags Bob and Alice");
-        let r2 = ctx.sql(&sql).await?.collect().await?;
-        let n2 = r2[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(n2, 0, "the @> guard must survive the pushed-down time bounds — re-run touches nothing");
-        Ok(())
+        let results = ctx.sql(&q).await?.collect().await?;
+        assert!(!results.is_empty() && results[0].num_rows() == 1, "row_by_name: expected 1 row for {name}");
+        let b = &results[0];
+        let duration = b.column(b.schema().index_of("duration")?).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        Ok((duration, col_str(b, "level", 0)))
+    }
+
+    /// Runs one UPDATE over `BASE_RECORDS` and renders rows-affected plus the
+    /// post-state of ALL three rows, so each case line asserts both the count
+    /// and that untouched rows stayed untouched.
+    #[test_case(
+        "UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'"
+        => "rows=1 Alice=100/INFO Bob=500/ERROR Charlie=300/INFO" ; "test_update_query: single-column UPDATE touches only Bob")]
+    #[test_case(
+        "UPDATE otel_logs_and_spans SET hashes = make_array('999', 'WARN') WHERE project_id = 'test_project' AND name = 'Alice'"
+        => "rows=1 Alice=999/WARN Bob=200/ERROR Charlie=300/INFO" ; "test_update_multiple_columns: multi-value SET on Alice")]
+    // Regression: DataFusion's CommonSubexprEliminate optimizer wraps the UPDATE
+    // assignment Projection in an inner Projection that defines synthetic
+    // `__common_expr_*` columns. extract_dml_info used to overwrite the real
+    // assignments with that inner Projection's contents, so mem_buffer failed
+    // with "Column '__common_expr_1' not found".
+    // `duration + 100` appears TWICE in SET — the CSE-eligible subexpr the
+    // optimizer hoists into a `__common_expr_*` alias. It used to span two
+    // assignments; only `hashes` is declared mutable now, so both uses live in
+    // one array — the plan shape under test is unchanged. Bob: 200 + 100 = 300.
+    #[test_case(
+        "UPDATE otel_logs_and_spans \
+         SET hashes = make_array(CAST(duration + 100 AS VARCHAR), CAST(duration + 100 AS VARCHAR)) \
+         WHERE project_id = 'test_project' AND name = 'Bob'"
+        => "rows=1 Alice=100/INFO Bob=300/300 Charlie=300/INFO" ; "test_update_with_common_subexpression")]
+    // VALUES-list source: smallest possible `UPDATE ... FROM` shape.
+    #[test_case(
+        "UPDATE otel_logs_and_spans
+           SET hashes = make_array(CAST(u.d AS VARCHAR))
+           FROM (VALUES ('Bob', 500), ('Alice', 999)) AS u(name, d)
+           WHERE project_id = 'test_project'
+             AND otel_logs_and_spans.name = u.name"
+        => "rows=2 Alice=999/INFO Bob=500/ERROR Charlie=300/INFO" ; "test_update_from_values")]
+    // Source row whose key doesn't match any target row must not affect any target row.
+    #[test_case(
+        "UPDATE otel_logs_and_spans
+           SET hashes = make_array(CAST(u.d AS VARCHAR))
+           FROM (VALUES ('Nobody', 42)) AS u(name, d)
+           WHERE project_id = 'test_project'
+             AND otel_logs_and_spans.name = u.name"
+        => "rows=0 Alice=100/INFO Bob=200/ERROR Charlie=300/INFO" ; "test_update_from_no_match_no_change")]
+    // Extra `WHERE` predicate AND-ed with the join keys must narrow the update:
+    // source matches Bob and Alice, predicate further constrains to Bob only.
+    #[test_case(
+        "UPDATE otel_logs_and_spans
+           SET hashes = make_array(CAST(u.d AS VARCHAR))
+           FROM (VALUES ('Bob', 777), ('Alice', 888)) AS u(name, d)
+           WHERE project_id = 'test_project'
+             AND otel_logs_and_spans.name = u.name
+             AND otel_logs_and_spans.name = 'Bob'"
+        => "rows=1 Alice=100/INFO Bob=777/ERROR Charlie=300/INFO" ; "test_update_from_with_predicate")]
+    // Multi-column SET in a single `UPDATE ... FROM` — mirrors the monoscope
+    // pattern of assigning several fields from a joined source row.
+    #[test_case(
+        "UPDATE otel_logs_and_spans
+           SET hashes = make_array(CAST(u.d AS VARCHAR), u.lvl)
+           FROM (VALUES ('Bob', 1234, 'WARN')) AS u(name, d, lvl)
+           WHERE project_id = 'test_project'
+             AND otel_logs_and_spans.name = u.name"
+        => "rows=1 Alice=100/INFO Bob=1234/WARN Charlie=300/INFO" ; "test_update_from_multi_column_set")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_over_base_records(sql: &'static str) -> String {
+        let (_db, ctx) = seeded(OTEL).await.unwrap();
+        let n = exec_dml(&ctx, sql).await.unwrap();
+        let mut out = format!("rows={n}");
+        for name in ["Alice", "Bob", "Charlie"] {
+            let (duration, level) = row_by_name(&ctx, name).await.unwrap();
+            out.push_str(&format!(" {name}={duration}/{level}"));
+        }
+        out
+    }
+
+    /// Runs the same `UPDATE ... FROM` statement TWICE and reports the rows
+    /// affected by each pass — the shape that separates "re-runs are cheap"
+    /// from "every enrichment pass re-appends versions for every matched row".
+    /// `{lo}`/`{hi}` in the template are substituted with now ± 1h.
+    // Structural mirror of monoscope's UPDATE-2 SQL: parallel unnested text
+    // arrays as the source rowset, table aliases (`o`, `u`), array-append into
+    // a list column. If DataFusion's planner or our rewriters fall over on this
+    // shape (unnest inside FROM subquery, user aliases on both sides,
+    // list-typed assignment target) this catches it pre-prod. Join is on `name`
+    // here (single key); monoscope uses two: span_id + trace_id — structurally
+    // identical. With no guard predicate, a second pass re-tags both rows.
+    #[test_case(
+        "UPDATE otel_logs_and_spans o
+            SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
+            FROM (
+              SELECT unnest(ARRAY['Bob', 'Alice']::text[])      AS span_name,
+                     unnest(ARRAY['pat:bob', 'pat:alice']::text[]) AS tag
+            ) u
+            WHERE o.project_id = 'test_project'
+              AND o.name = u.span_name"
+        => (2, 2) ; "test_update_from_unnest_text_array")]
+    // Idempotency aspect of the monoscope UPDATE-2 shape: re-running the same
+    // statement with the `NOT @>` predicate must touch zero rows.
+    // Historical note: `MergeBuilder` returns the rows that the join matched
+    // even when the SET expression produces an unchanged value after the WHEN
+    // MATCHED predicate trims them. Untangling needs deeper investigation of
+    // MergeBuilder's accounting of WHEN MATCHED with non-trivial predicate
+    // filtering. Monoscope's re-extraction safety on TF relies on this.
+    #[test_case(
+        "UPDATE otel_logs_and_spans o
+            SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
+            FROM (
+              SELECT unnest(ARRAY['Bob', 'Alice']::text[])      AS span_name,
+                     unnest(ARRAY['pat:bob', 'pat:alice']::text[]) AS tag
+            ) u
+            WHERE o.project_id = 'test_project'
+              AND o.name = u.span_name
+              AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])"
+        => (2, 0) ; "test_update_from_unnest_text_array_idempotent")]
+    // Regression for the prod 2026-08-03 write-amplification bug: the
+    // cross-side guard lives in `join.filter`, and the optimizer pushes the
+    // target-side conjuncts (project_id + TIMESTAMP BOUNDS) into a `Filter`
+    // BELOW the join — `extract_dml_info` used to let that deeper Filter
+    // OVERWRITE the accumulated predicate, silently dropping the guard, so
+    // every enrichment pass re-appended versions for every matched row. The
+    // timestamp bound is what distinguishes this from the idempotency case
+    // above: it is the conjunct that did the clobbering in prod. Also
+    // exercises the join-key IN-list pushdown on its engaged (< cap) path.
+    #[test_case(
+        "UPDATE otel_logs_and_spans o
+           SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
+          FROM (SELECT unnest(ARRAY['Bob','Alice']::text[]) AS span_name,
+                       unnest(ARRAY['pat:bob','pat:alice']::text[]) AS tag) u
+         WHERE o.project_id = 'test_project'
+           AND o.timestamp >= '{lo}' AND o.timestamp < '{hi}'
+           AND o.name = u.span_name
+           AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])"
+        => (2, 0) ; "test_update_guard_survives_pushed_down_time_bounds")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_from_run_twice(sql_template: &'static str) -> (u64, u64) {
+        let (_db, ctx) = seeded(OTEL).await.unwrap();
+        let now = chrono::Utc::now();
+        let sql =
+            sql_template.replace("{lo}", &(now - chrono::Duration::hours(1)).to_rfc3339()).replace("{hi}", &(now + chrono::Duration::hours(1)).to_rfc3339());
+        (exec_dml(&ctx, &sql).await.unwrap(), exec_dml(&ctx, &sql).await.unwrap())
+    }
+
+    /// Seeds `specs`, checks they are all visible, deletes every `ERROR` row and
+    /// renders the delete count plus the surviving rows in `id` order.
+    #[test_case(BASE_RECORDS => "deleted=1 remaining=1/Alice/INFO,3/Charlie/INFO" ; "test_delete_with_predicate: one ERROR of three")]
+    #[test_case(
+        &[("1", "Record1", "ERROR", 100), ("2", "Record2", "INFO", 200), ("3", "Record3", "ERROR", 300), ("4", "Record4", "ERROR", 400)]
+        => "deleted=3 remaining=2/Record2/INFO" ; "test_delete_all_matching: three ERRORs of four")]
+    #[test_case(
+        &[("1", "R1", "INFO", 100), ("2", "R2", "INFO", 200), ("3", "R3", "ERROR", 300), ("4", "R4", "INFO", 400), ("5", "R5", "ERROR", 500)]
+        => "deleted=2 remaining=1/R1/INFO,2/R2/INFO,4/R4/INFO" ; "test_delete_verify_counts: two ERRORs of five")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_error_rows(seed: &'static [(&'static str, &'static str, &'static str, i64)]) -> String {
+        let (db, ctx) = db_with(test_cfg()).await.unwrap();
+        let batch = json_to_batch(records(seed, chrono::Utc::now())).unwrap();
+        db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await.unwrap();
+        assert_eq!(count_rows(&ctx, OTEL).await.unwrap() as usize, seed.len(), "every seeded row must be visible before the DELETE");
+
+        let deleted = exec_dml(&ctx, "DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await.unwrap();
+
+        let results =
+            ctx.sql("SELECT id, name, level FROM otel_logs_and_spans WHERE project_id = 'test_project' ORDER BY id").await.unwrap().collect().await.unwrap();
+        let remaining: Vec<String> = results
+            .iter()
+            .flat_map(|b| (0..b.num_rows()).map(move |i| format!("{}/{}/{}", col_str(b, "id", i), col_str(b, "name", i), col_str(b, "level", i))))
+            .collect();
+        assert_eq!(count_rows(&ctx, OTEL).await.unwrap() as usize, remaining.len(), "COUNT(*) must agree with the projected rows");
+        format!("deleted={deleted} remaining={}", remaining.join(","))
     }
 
     /// A source larger than one join-key IN-list bound (4096 rows) is split
@@ -663,17 +306,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_source_beyond_key_pushdown_cap() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        let (_db, ctx) = seeded(OTEL).await?;
 
         // 4100 keys: 4098 misses + Bob + Alice.
         let names: Vec<String> = (0..4098).map(|i| format!("'nobody-{i}'")).chain(["'Bob'".into(), "'Alice'".into()]).collect();
@@ -687,9 +320,7 @@ mod tests {
             names.join(","),
             tags.join(",")
         );
-        let r = ctx.sql(&sql).await?.collect().await?;
-        let n = r[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(n, 2, "over-bound source chunks must still match exactly Bob and Alice");
+        assert_eq!(exec_dml(&ctx, &sql).await?, 2, "over-bound source chunks must still match exactly Bob and Alice");
         Ok(())
     }
 
@@ -704,12 +335,10 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_mem_leg_survives_late_layer_attach() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
+        let cfg = test_cfg();
         // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment; #[serial]
         // prevents concurrent access to this process-global.
-        let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
+        let layer = Arc::new(test_layer(Arc::clone(&cfg))?);
 
         let db0 = Database::with_config(cfg).await?;
         // Session context created BEFORE the layer is attached — main.rs order.
@@ -717,15 +346,12 @@ mod tests {
         let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
         db.setup_session_context(&mut ctx)?;
 
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
+        let batch = json_to_batch(create_test_records(chrono::Utc::now()))?;
         // skip_queue=false → rows land in the buffer, not Delta.
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], false, None).await?;
+        db.insert_records_batch("test_project", OTEL, vec![batch], false, None).await?;
 
-        let df = ctx.sql("UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'").await?;
-        let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        let rows_updated =
+            exec_dml(&ctx, "UPDATE otel_logs_and_spans SET hashes = make_array('500') WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         assert_eq!(rows_updated, 1, "UPDATE must reach buffer rows through a session created before the layer was attached");
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
         Ok(())
@@ -741,18 +367,13 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_does_not_block_readers_or_writers() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let mut cfg = (*create_test_config(&test_id)).clone();
+        let mut cfg = (*test_cfg()).clone();
         // This test observes concurrency during a SLOW merge. Force copy-on-write:
         // the merge-on-read DV path finishes in milliseconds (it appends the matched
         // rows + tiny DVs instead of rewriting whole files), leaving no window to
         // observe reader/writer overlap. Lock behavior is orthogonal to the DV path.
         cfg.maintenance.timefusion_use_deletion_vectors = false;
-        let cfg = Arc::new(cfg);
-        let db = Arc::new(Database::with_config(cfg).await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
+        let (db, ctx) = db_with(Arc::new(cfg)).await?;
 
         // Many separate commits → many files; the merge below matches one row
         // in every file, so it must rewrite all of them — slow enough to
@@ -768,7 +389,7 @@ mod tests {
         // just as much — so the merge is given more work at a fixed table size.
         const MATCHED_PER_FILE: usize = 200;
         for f in 0..FILES {
-            let records: Vec<serde_json::Value> = (0..ROWS_PER_FILE)
+            let recs: Vec<serde_json::Value> = (0..ROWS_PER_FILE)
                 .map(|r| {
                     serde_json::json!({
                         "id": format!("f{f}_r{r}"),
@@ -780,7 +401,7 @@ mod tests {
                     })
                 })
                 .collect();
-            let batch = timefusion::support::test_helpers::json_to_batch_for(INPLACE_TABLE, records)?;
+            let batch = json_to_batch_for(INPLACE_TABLE, recs)?;
             db.insert_records_batch("test_project", INPLACE_TABLE, vec![batch], true, None).await?;
         }
 
@@ -802,14 +423,11 @@ mod tests {
         assert!(!update_handle.is_finished(), "UPDATE finished too fast to observe concurrency — grow FILES/ROWS_PER_FILE");
 
         // Reader mid-UPDATE.
-        let df = ctx.sql("SELECT COUNT(*) FROM mor_dormant WHERE project_id = 'test_project'").await?;
-        let results = df.collect().await?;
-        let count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(count as usize, FILES * ROWS_PER_FILE);
+        assert_eq!(count_rows(&ctx, INPLACE_TABLE).await? as usize, FILES * ROWS_PER_FILE);
         assert!(!update_handle.is_finished(), "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock");
 
         // Writer mid-UPDATE (direct Delta insert commits + swaps the handle).
-        let extra = timefusion::support::test_helpers::json_to_batch_for(
+        let extra = json_to_batch_for(
             INPLACE_TABLE,
             vec![serde_json::json!({
                 "id": "extra", "name": "Extra", "project_id": "test_project",
@@ -820,55 +438,24 @@ mod tests {
         db.insert_records_batch("test_project", INPLACE_TABLE, vec![extra], true, None).await?;
         assert!(!update_handle.is_finished(), "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock");
 
-        let result = update_handle.await??;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated as usize, FILES * MATCHED_PER_FILE);
+        assert_eq!(affected(&update_handle.await??) as usize, FILES * MATCHED_PER_FILE);
 
         // The mid-UPDATE insert must not just be un-blocked — its row must
         // survive the UPDATE's snapshot swap.
-        let df = ctx.sql("SELECT COUNT(*) FROM mor_dormant WHERE project_id = 'test_project'").await?;
-        let results = df.collect().await?;
-        let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(final_count as usize, FILES * ROWS_PER_FILE + 1, "concurrent insert's row lost across the DML swap");
+        assert_eq!(count_rows(&ctx, INPLACE_TABLE).await? as usize, FILES * ROWS_PER_FILE + 1, "concurrent insert's row lost across the DML swap");
         Ok(())
     }
 
-    /// Multi-column SET in a single `UPDATE ... FROM` — mirrors the monoscope
-    /// pattern of assigning several fields from a joined source row.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_update_from_multi_column_set() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let db = Arc::new(Database::with_config(cfg).await?);
+    /// Database + session with the DML coalescer running and a timer that never
+    /// fires, so every drain in these tests is explicit.
+    async fn coalescing_db() -> Result<(Arc<Database>, SessionContext)> {
+        let mut cfg = (*test_cfg()).clone();
+        cfg.buffer.timefusion_dml_coalesce_secs = 3600;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        db.start_dml_coalescer();
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
-
-        let now = chrono::Utc::now();
-        let records = create_test_records(now);
-        let batch = timefusion::support::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
-
-        let df = ctx
-            .sql(
-                "UPDATE otel_logs_and_spans
-                   SET hashes = make_array(CAST(u.d AS VARCHAR), u.lvl)
-                   FROM (VALUES ('Bob', 1234, 'WARN')) AS u(name, d, lvl)
-                   WHERE project_id = 'test_project'
-                     AND otel_logs_and_spans.name = u.name",
-            )
-            .await?;
-        let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 1);
-
-        let df = ctx.sql("SELECT COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration, COALESCE(array_element(hashes, 2), level) AS level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
-        let results = df.collect().await?;
-        let b = &results[0];
-        assert_eq!(b.column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 1234);
-        assert_eq!(get_str(b.column(1).as_ref(), 0), "WARN");
-        Ok(())
+        Ok((db, ctx))
     }
 
     /// With `TIMEFUSION_DML_COALESCE_SECS > 0`, the Delta leg of
@@ -878,17 +465,9 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_from_coalesced_defers_and_drains() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let mut cfg = (*create_test_config(&test_id)).clone();
-        cfg.buffer.timefusion_dml_coalesce_secs = 3600; // timer never fires; drains are explicit
-        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
-        db.start_dml_coalescer();
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
+        let (db, ctx) = coalescing_db().await?;
 
-        let now = chrono::Utc::now();
-        let batch = timefusion::support::test_helpers::json_to_batch_for(INPLACE_TABLE, create_test_records(now))?;
+        let batch = json_to_batch_for(INPLACE_TABLE, create_test_records(chrono::Utc::now()))?;
         db.insert_records_batch("test_project", INPLACE_TABLE, vec![batch], true, None).await?;
 
         let update = |val: i64, name: &str| {
@@ -901,9 +480,7 @@ mod tests {
             )
         };
         for sql in [update(500, "Bob"), update(999, "Alice")] {
-            let result = ctx.sql(&sql).await?.collect().await?;
-            let rows = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-            assert_eq!(rows, 0, "deferred statement reports 0 rows (no mem leg here)");
+            assert_eq!(exec_dml(&ctx, &sql).await?, 0, "deferred statement reports 0 rows (no mem leg here)");
         }
         // Nothing merged yet: Delta untouched until a drain.
         assert_eq!(duration_by_name_in(&ctx, INPLACE_TABLE, "Bob").await?, 200);
@@ -932,18 +509,10 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn coalescer_splits_duplicate_source_keys_single_statement() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let mut cfg = (*create_test_config(&test_id)).clone();
-        cfg.buffer.timefusion_dml_coalesce_secs = 3600; // explicit drains only
-        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
-        db.start_dml_coalescer();
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
+        let (db, ctx) = coalescing_db().await?;
 
-        let now = chrono::Utc::now();
-        let batch = timefusion::support::test_helpers::json_to_batch(create_test_records(now))?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        let batch = json_to_batch(create_test_records(chrono::Utc::now()))?;
+        db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await?;
 
         // One statement, source has TWO rows for name='Bob' → duplicate join keys.
         let sql = "UPDATE otel_logs_and_spans
@@ -972,14 +541,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn coalescer_splits_duplicate_composite_source_keys() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let mut cfg = (*create_test_config(&test_id)).clone();
-        cfg.buffer.timefusion_dml_coalesce_secs = 3600;
-        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
-        db.start_dml_coalescer();
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
+        let (db, ctx) = coalescing_db().await?;
 
         // One target span identified by (context___span_id, context___trace_id).
         let now = chrono::Utc::now();
@@ -989,8 +551,8 @@ mod tests {
             "context___span_id": "S1", "context___trace_id": "T1",
             "hashes": [], "summary": []
         });
-        let batch = timefusion::support::test_helpers::json_to_batch(vec![rec])?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        let batch = json_to_batch(vec![rec])?;
+        db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await?;
 
         // Source: two rows for the SAME (span_id, trace_id) — the multi-tag shape.
         let sql = "UPDATE otel_logs_and_spans o
@@ -1007,8 +569,11 @@ mod tests {
             .await?
             .collect()
             .await?;
-        let got = get_str(name[0].column(name[0].schema().index_of("name")?).as_ref(), 0);
-        assert_eq!(got, "b", "composite dup-key source must split into rounds and apply (last wins), not be dropped by a cardinality abort");
+        assert_eq!(
+            col_str(&name[0], "name", 0),
+            "b",
+            "composite dup-key source must split into rounds and apply (last wins), not be dropped by a cardinality abort"
+        );
         Ok(())
     }
 
@@ -1027,30 +592,26 @@ mod tests {
         // draining into the void), and this test is precisely about the flush
         // persisting the post-DML value.
         let db0 = Database::with_config(Arc::clone(&cfg)).await?;
-        let layer =
-            Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
+        let layer = Arc::new(test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
         let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
-        let now = chrono::Utc::now();
-        let batch = timefusion::support::test_helpers::json_to_batch(create_test_records(now))?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        let batch = json_to_batch(create_test_records(chrono::Utc::now()))?;
+        db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await?;
 
         // Rows are buffer-resident. The mem leg applies; the Delta leg has
         // nothing committed to touch (and a time window above the watermark
         // is clamped away entirely).
-        let df = ctx
-            .sql(
-                "UPDATE otel_logs_and_spans
-                   SET hashes = make_array(CAST(u.d AS VARCHAR))
-                   FROM (VALUES ('Bob', 4242)) AS u(name, d)
-                   WHERE project_id = 'test_project'
-                     AND otel_logs_and_spans.name = u.name",
-            )
-            .await?;
-        let result = df.collect().await?;
-        let rows = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        let rows = exec_dml(
+            &ctx,
+            "UPDATE otel_logs_and_spans
+               SET hashes = make_array(CAST(u.d AS VARCHAR))
+               FROM (VALUES ('Bob', 4242)) AS u(name, d)
+               WHERE project_id = 'test_project'
+                 AND otel_logs_and_spans.name = u.name",
+        )
+        .await?;
         assert_eq!(rows, 1, "mem leg updated the buffered row");
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 4242, "overlay read sees the update immediately");
 
@@ -1078,10 +639,8 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_applies_to_rows_outside_event_time_bound() -> Result<()> {
-        timefusion::support::init_test_logging();
-        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
-        let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?);
+        let cfg = test_cfg();
+        let layer = Arc::new(test_layer(Arc::clone(&cfg))?);
         let db0 = Database::with_config(cfg).await?;
         let mut ctx = Arc::new(db0.clone()).create_session_context();
         let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
@@ -1093,9 +652,9 @@ mod tests {
             "timestamp": far_future, "level": "INFO", "status_code": "OK", "duration": 1,
             "date": "2238-12-31", "hashes": [], "summary": []
         });
-        let batch = timefusion::support::test_helpers::json_to_batch(vec![record])?;
+        let batch = json_to_batch(vec![record])?;
         // skip_queue=true: straight to Delta, as prod's junk predates the bound.
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        db.insert_records_batch("test_project", OTEL, vec![batch], true, None).await?;
 
         ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'junk-2238'").await?.collect().await?;
 

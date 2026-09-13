@@ -20,21 +20,31 @@ use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_for};
 
 const ONE_DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
 
-/// Advance past retention and evict so a later query reads purely from Delta.
-async fn drain(env: &E2eEnv) -> anyhow::Result<()> {
-    env.advance(Duration::from_micros(ONE_DAY_MICROS as u64));
-    env.force_evict().await?;
-    let mem = env.snapshot_stats().mem_total_rows;
-    assert_eq!(mem, 0, "MemBuffer not drained ({mem} rows left)");
-    Ok(())
-}
-
-async fn insert_n(env: &E2eEnv, n: i64) -> anyhow::Result<()> {
+/// Build an env (optionally forcing `checkpoint_interval`), insert `n` rows and
+/// flush them to Delta. The flush must succeed — every test below builds on a
+/// landed commit.
+async fn flushed_env(checkpoint_interval: Option<u64>, n: i64) -> anyhow::Result<E2eEnv> {
+    let mut b = E2eEnv::builder();
+    if let Some(i) = checkpoint_interval {
+        b = b.with_checkpoint_interval(i);
+    }
+    let env = b.start().await?;
     let client = env.pg_client().await?;
     for i in 0..n {
         insert_for(&client, "e2e_project", &format!("row-{i}"), FROZEN_START_MICROS + i * 1_000).await?;
     }
-    Ok(())
+    assert_eq!(env.force_flush().await?.buckets_failed, 0, "flush must succeed");
+    Ok(env)
+}
+
+/// Advance past retention and evict so the COUNT reads purely from Delta.
+async fn drained_count(env: &E2eEnv) -> anyhow::Result<i64> {
+    env.advance(Duration::from_micros(ONE_DAY_MICROS as u64));
+    env.force_evict().await?;
+    let mem = env.snapshot_stats().mem_total_rows;
+    assert_eq!(mem, 0, "MemBuffer not drained ({mem} rows left)");
+    let client = env.pg_client().await?;
+    Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0))
 }
 
 /// A. The flush commit path must NOT create a checkpoint, even with
@@ -45,19 +55,12 @@ async fn insert_n(env: &E2eEnv, n: i64) -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn commit_path_does_not_checkpoint() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_checkpoint_interval(1).start().await?;
-    insert_n(&env, 40).await?;
-
-    let stats = env.force_flush().await?;
-    assert_eq!(stats.buckets_failed, 0, "flush must succeed");
+    let env = flushed_env(Some(1), 40).await?;
 
     let checkpoints = env.db().test_checkpoint_file_count("e2e_project", "otel_logs_and_spans").await?;
     assert_eq!(checkpoints, 0, "commit path must NOT checkpoint (hook must be off the flush path)");
 
-    drain(&env).await?;
-    let client = env.pg_client().await?;
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 40, "rows lost on the flush path");
+    assert_eq!(drained_count(&env).await?, 40, "rows lost on the flush path");
     Ok(())
 }
 
@@ -70,9 +73,7 @@ async fn commit_path_does_not_checkpoint() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_distinguishes_landed_from_not_landed() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().start().await?;
-    insert_n(&env, 10).await?;
-    env.force_flush().await?;
+    let env = flushed_env(None, 10).await?;
 
     assert!(env.db().test_probe_landed("e2e_project", "otel_logs_and_spans").await?, "committed adds ⇒ Landed");
     assert!(env.db().test_probe_bogus_not_landed("e2e_project", "otel_logs_and_spans").await?, "an add never written to the log ⇒ NotLanded");
@@ -86,9 +87,7 @@ async fn probe_distinguishes_landed_from_not_landed() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn out_of_band_checkpoint_runs() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_checkpoint_interval(1).start().await?;
-    insert_n(&env, 5).await?;
-    env.force_flush().await?;
+    let env = flushed_env(Some(1), 5).await?;
     assert_eq!(env.db().test_checkpoint_file_count("e2e_project", "otel_logs_and_spans").await?, 0, "no checkpoint yet");
 
     let before = maintenance_stats().checkpoints_created.load(Relaxed);
@@ -103,9 +102,7 @@ async fn out_of_band_checkpoint_runs() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn reconcile_removes_dangling_add() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().start().await?;
-    insert_n(&env, 10).await?;
-    env.force_flush().await?;
+    let env = flushed_env(None, 10).await?;
 
     // Simulate the commit-path deletion bug: a committed parquet vanishes.
     env.db().test_delete_first_active_file("e2e_project", "otel_logs_and_spans").await?;
@@ -115,8 +112,6 @@ async fn reconcile_removes_dangling_add() -> anyhow::Result<()> {
     assert!(maintenance_stats().dangling_removed.load(Relaxed) > before, "reconcile did not Remove the dangling Add");
 
     // Table is consistent again: planning a Delta scan must not error on the
-    drain(&env).await?;
-    let client = env.pg_client().await?;
-    let _: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    let _ = drained_count(&env).await?;
     Ok(())
 }

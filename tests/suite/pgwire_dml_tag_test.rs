@@ -22,13 +22,22 @@ mod pgwire_dml_tag {
     const SPAN_INSERT_COLS: &str =
         "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary)";
 
+    /// The one span row shared by the execute/simple-query/sqlx cases;
+    /// `project_expr`/`id_expr` are SQL fragments (a literal or a `$N` placeholder),
+    /// which is what lets the same row cross the extended and simple protocols.
+    fn span_insert(project_expr: &str, id_expr: &str) -> String {
+        format!("{SPAN_INSERT_COLS} VALUES ({project_expr}, CURRENT_DATE, NOW(), {id_expr}, 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])")
+    }
+
     struct TestServer {
         port: u16,
         shutdown: Arc<Notify>,
     }
 
     impl TestServer {
-        async fn start() -> Result<Self> {
+        /// Starts the server and hands back the connection made while waiting
+        /// for it to accept — every test needs one.
+        async fn start() -> Result<(Self, Client)> {
             timefusion::support::init_test_logging();
             let test_id = Uuid::new_v4().to_string();
             // OS-assigned free port: bind, capture, drop. The tiny race window
@@ -57,8 +66,8 @@ mod pgwire_dml_tag {
                     }
                 }
             });
-            Self::connect(port).await?;
-            Ok(Self { port, shutdown })
+            let client = Self::connect(port).await?;
+            Ok((Self { port, shutdown }, client))
         }
 
         async fn connect(port: u16) -> Result<Client> {
@@ -82,10 +91,6 @@ mod pgwire_dml_tag {
             Err(last_err.map(anyhow::Error::from).unwrap_or_else(|| anyhow::anyhow!("no connect attempt")))
                 .context("pgwire server did not accept connections within 10s")
         }
-
-        async fn client(&self) -> Result<Client> {
-            Self::connect(self.port).await
-        }
     }
 
     impl Drop for TestServer {
@@ -98,8 +103,7 @@ mod pgwire_dml_tag {
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn prepared_dml_describes_as_no_data() -> Result<()> {
-        let server = TestServer::start().await?;
-        let client = server.client().await?;
+        let (_server, client) = TestServer::start().await?;
 
         let cases: &[(&str, String)] = &[
             ("INSERT", format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, $3, $4, $5, $6, ARRAY[]::text[], $7)")),
@@ -123,18 +127,29 @@ mod pgwire_dml_tag {
 
     /// Describe fix must not break Execute: bind + execute writes the row and
     /// the CommandComplete tag reports `affected = 1`.
+    ///
+    /// Simple-query path: no `Row` messages may precede `CommandComplete`.
+    /// `simple_query` exposes the raw stream where `execute` would discard rows.
+    /// SQL is built by interpolation (not parameterised) because simple-query
+    /// is by definition the no-parameters wire path — `$N` placeholders only
+    /// exist in the extended/prepared protocol.
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn prepared_insert_executes_and_writes_row() -> Result<()> {
-        let server = TestServer::start().await?;
-        let client = server.client().await?;
-        let id = Uuid::new_v4().to_string();
-        let sql = format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])");
-        let n = client.execute(&sql, &[&"test_project", &id]).await?;
-        assert_eq!(n, 1);
+    async fn prepared_and_simple_query_insert_write_rows_without_row_messages() -> Result<()> {
+        let (_server, client) = TestServer::start().await?;
 
+        // Extended protocol: bind + execute.
+        let id = Uuid::new_v4().to_string();
+        let n = client.execute(&span_insert("$1", "$2"), &[&"test_project", &id]).await?;
+        assert_eq!(n, 1);
         let row = client.query_one("SELECT id FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &id]).await?;
         assert_eq!(row.get::<_, String>(0), id);
+
+        // Simple-query protocol: raw message stream.
+        let simple_id = Uuid::new_v4().to_string();
+        let msgs = client.simple_query(&span_insert("'test_project'", &format!("'{simple_id}'"))).await?;
+        assert!(!msgs.iter().any(|m| matches!(m, SimpleQueryMessage::Row(_))), "INSERT must not emit DataRow messages");
+        assert!(msgs.iter().any(|m| matches!(m, SimpleQueryMessage::CommandComplete(_))), "expected CommandComplete");
         Ok(())
     }
 
@@ -146,35 +161,16 @@ mod pgwire_dml_tag {
     async fn sqlx_describe_insert_returns_no_columns() -> Result<()> {
         use sqlx::{Column, Connection, Executor};
 
-        let server = TestServer::start().await?;
+        let (server, _client) = TestServer::start().await?;
         let url = format!("postgres://postgres:postgres@localhost:{}/postgres", server.port);
         let mut conn = sqlx::postgres::PgConnection::connect(&url).await?;
 
-        let describe =
-            conn.describe(&format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])")).await?;
+        let describe = conn.describe(&span_insert("$1", "$2")).await?;
         assert!(
             describe.columns.is_empty(),
             "sqlx::describe must report no columns for INSERT without RETURNING; got {:?}",
             describe.columns.iter().map(|c| c.name().to_string()).collect::<Vec<_>>(),
         );
-        Ok(())
-    }
-
-    /// Simple-query path: no `Row` messages may precede `CommandComplete`.
-    /// `simple_query` exposes the raw stream where `execute` would discard rows.
-    /// SQL is built by interpolation (not parameterised) because simple-query
-    /// is by definition the no-parameters wire path — `$N` placeholders only
-    /// exist in the extended/prepared protocol.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial]
-    async fn simple_query_insert_sends_no_row_messages() -> Result<()> {
-        let server = TestServer::start().await?;
-        let client = server.client().await?;
-        let id = Uuid::new_v4().to_string();
-        let sql = format!("{SPAN_INSERT_COLS} VALUES ('test_project', CURRENT_DATE, NOW(), '{id}', 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])");
-        let msgs = client.simple_query(&sql).await?;
-        assert!(!msgs.iter().any(|m| matches!(m, SimpleQueryMessage::Row(_))), "INSERT must not emit DataRow messages");
-        assert!(msgs.iter().any(|m| matches!(m, SimpleQueryMessage::CommandComplete(_))), "expected CommandComplete");
         Ok(())
     }
 
@@ -192,8 +188,7 @@ mod pgwire_dml_tag {
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn update_from_param_unnest_executes() -> Result<()> {
-        let server = TestServer::start().await?;
-        let client = server.client().await?;
+        let (_server, client) = TestServer::start().await?;
         let id = Uuid::new_v4().to_string();
 
         client

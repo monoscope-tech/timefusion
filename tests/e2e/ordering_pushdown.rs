@@ -13,7 +13,44 @@
 
 use std::time::Duration;
 
+use tokio_postgres::Client;
+
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
+
+const SEC: i64 = 1_000_000;
+const BUCKET_SECS: u64 = 60;
+
+/// The physical plan for `sql`, flattened to one string per EXPLAIN row.
+async fn explain(client: &Client, sql: &str) -> anyhow::Result<String> {
+    Ok(client
+        .query(&format!("EXPLAIN {sql}"), &[])
+        .await?
+        .iter()
+        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// `flushes` Delta files of 5 `old-*` rows each, plus 5 newer `new-*` rows left
+/// in the current (open) MemBuffer bucket — so a query with no lower time bound
+/// spans MemBuffer ∪ Delta, across multiple ordered Delta readers.
+async fn mem_and_delta_env(flushes: i64) -> anyhow::Result<(E2eEnv, Client)> {
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(BUCKET_SECS)).with_retention(Duration::from_secs(60 * 60)).start().await?;
+    let client = env.pg_client().await?;
+    for batch in 0..flushes {
+        let base = FROZEN_START_MICROS + batch * (BUCKET_SECS as i64) * 3 * SEC;
+        for i in 0..5 {
+            insert_at(&client, &format!("old-{}", batch * 5 + i), base + i * SEC).await?;
+        }
+        env.advance(Duration::from_secs(BUCKET_SECS * 3));
+        env.force_flush().await?;
+    }
+    let new_base = FROZEN_START_MICROS + (BUCKET_SECS as i64) * 3 * flushes * SEC;
+    for i in 0..5 {
+        insert_at(&client, &format!("new-{i}"), new_base + i * SEC).await?;
+    }
+    Ok((env, client))
+}
 
 /// monoscope's ACTUAL log-explorer listing must stream, not materialise.
 ///
@@ -38,19 +75,7 @@ use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_monoscope_log_explorer_listing_streams() -> anyhow::Result<()> {
-    let bucket_secs = 60u64;
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
-    let client = env.pg_client().await?;
-    let sec = 1_000_000i64;
-    for i in 0..5 {
-        insert_at(&client, &format!("old-{i}"), FROZEN_START_MICROS + i * sec).await?;
-    }
-    env.advance(Duration::from_secs(bucket_secs * 3));
-    env.force_flush().await?;
-    let new_base = FROZEN_START_MICROS + (bucket_secs as i64) * 3 * sec;
-    for i in 0..5 {
-        insert_at(&client, &format!("new-{i}"), new_base + i * sec).await?;
-    }
+    let (_env, client) = mem_and_delta_env(1).await?;
 
     // The prod projection, verbatim in shape.
     let sql = "SELECT jsonb_build_array(id, to_char(timestamp at time zone 'UTC', 'YYYY-MM-DD'), context___trace_id, name, duration, \
@@ -58,13 +83,7 @@ async fn the_monoscope_log_explorer_listing_streams() -> anyhow::Result<()> {
                coalesce(errors is not null or (kind = 'server' and (lower(level) = 'error' or severity___severity_number >= 17 or status_code = 'ERROR')), false), \
                to_jsonb(summary), context___span_id, kind) \
                FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
-    let plan: String = client
-        .query(&format!("EXPLAIN {sql}"), &[])
-        .await?
-        .iter()
-        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let plan = explain(&client, sql).await?;
 
     // A blocking `SortExec` over the window is the prod failure: with a real
     // tenant's data behind it that is the 5.5 GB ExternalSorterMerge.
@@ -79,39 +98,15 @@ async fn the_monoscope_log_explorer_listing_streams() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
-    let bucket_secs = 60u64;
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
-    let client = env.pg_client().await?;
-
-    let sec = 1_000_000i64;
     // Two separate flushes exercise ordered readers across multiple Delta files.
-    for batch in 0..2 {
-        let base = FROZEN_START_MICROS + batch * (bucket_secs as i64) * 3 * sec;
-        for i in 0..5 {
-            insert_at(&client, &format!("old-{}", batch * 5 + i), base + i * sec).await?;
-        }
-        env.advance(Duration::from_secs(bucket_secs * 3));
-        env.force_flush().await?;
-    }
-
-    // 5 newer rows stay in MemBuffer (current, open bucket).
-    let new_base = FROZEN_START_MICROS + (bucket_secs as i64) * 6 * sec;
-    for i in 0..5 {
-        insert_at(&client, &format!("new-{i}"), new_base + i * sec).await?;
-    }
+    let (_env, client) = mem_and_delta_env(2).await?;
 
     // The query has no lower time bound, so it spans MemBuffer ∪ Delta.
     let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 12";
 
     // Plan shape: the union became order-preserving → a streaming merge, not a
     // blocking sort over the full window.
-    let plan: String = client
-        .query(&format!("EXPLAIN {sql}"), &[])
-        .await?
-        .iter()
-        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let plan = explain(&client, sql).await?;
     assert!(plan.contains("SortPreservingMergeExec"), "expected a streaming SortPreservingMergeExec (ordering pushdown fired); plan was:\n{plan}");
 
     // The result must cross memory and both Delta files, with no omissions or duplicates.
@@ -139,16 +134,15 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<()> {
-    let bucket_secs = 60u64;
     let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_bucket_duration(Duration::from_secs(BUCKET_SECS))
         .with_retention(Duration::from_secs(60 * 60))
         .with_optimize_sort_by()
         .start()
         .await?;
     let client = env.pg_client().await?;
 
-    let sec = 1_000_000i64;
+    let sec = SEC;
     // 9 rows across 3 buckets, flushed one bucket at a time → 3 distinct Delta
     // files for SortBy to actually merge. A single force_flush coalesces all
     // completed buckets into one file, which the incremental SortBy correctly
@@ -158,7 +152,7 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
             let idx = b * 3 + i;
             insert_at(&client, &format!("d-{idx}"), FROZEN_START_MICROS + idx * 20 * sec).await?;
         }
-        env.advance(Duration::from_secs(bucket_secs * 2));
+        env.advance(Duration::from_secs(BUCKET_SECS * 2));
         env.force_flush().await?;
     }
 
@@ -169,19 +163,13 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
     assert!(removed >= 1 && added >= 1, "compaction should have rewritten files (removed={removed}, added={added})");
 
     // Fresh rows into MemBuffer so the query spans MemBuffer ∪ (optimized) Delta.
-    let new_base = FROZEN_START_MICROS + (bucket_secs as i64) * 6 * sec;
+    let new_base = FROZEN_START_MICROS + (BUCKET_SECS as i64) * 6 * sec;
     for i in 0..3 {
         insert_at(&client, &format!("m-{i}"), new_base + i * sec).await?;
     }
 
     let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
-    let plan: String = client
-        .query(&format!("EXPLAIN {sql}"), &[])
-        .await?
-        .iter()
-        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let plan = explain(&client, sql).await?;
     assert!(plan.contains("SortPreservingMergeExec"), "optimized partition must still advertise DESC ordering (SortBy footer); plan was:\n{plan}");
 
     let rows = client.query(sql, &[]).await?;
@@ -191,33 +179,14 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
     Ok(())
 }
 
-// One non-conforming file must not cost the conforming majority its ordering
-// claim — the 30-day `log_list` mechanism.
-//
-// The delta-rs fork deliberately ISOLATES files whose footer does not declare
-// the scan's common ordering: the conforming files keep the `[timestamp DESC]`
-// claim in one `DataSourceExec` and the rest are unioned in as a sibling with no
-// claim ("isolate, don't surrender"). But a `UnionExec` advertises an ordering
-// only when EVERY child does, so the Delta leg as a whole then advertises none —
-// and `ProjectRoutingTable::scan`'s own `mem ∪ delta` union sees an unordered,
-// unsortable Delta leg, bails, and DataFusion plants a BLOCKING `SortExec` over
-// the entire window. A `LIMIT 251` newest-first listing therefore reads every
-// selected byte instead of the newest few files: prod p1 at 30 d selected 431 GB
-// for 251 rows, while the same query at 14 d (all files conforming) streamed in
-// 1.6 s.
-//
-// Fixture: a plain (non-SortBy) `compact_date` concatenates two flushed files
-// into one file with no declared footer order, then one further flush adds a
-// conforming file beside it. The claim must survive the isolation split.
 /// Build the fixture at a given repair budget and return `(plan, top-3 ids)`.
 ///
 /// A plain (non-SortBy) `compact_date` concatenates two flushed files into one
 /// file with no declared footer order; one further flush adds a conforming file
 /// beside it, which is the fork's isolation shape.
 async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<String>, String)> {
-    let bucket_secs = 60u64;
     let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_bucket_duration(Duration::from_secs(BUCKET_SECS))
         .with_retention(Duration::from_secs(60 * 60))
         // The fixture owns its flushes. Left on the default interval the periodic
         // task fires between two of the three inserts below, so the last flush
@@ -231,13 +200,13 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
         .start()
         .await?;
     let client = env.pg_client().await?;
-    let sec = 1_000_000i64;
+    let sec = SEC;
 
     for b in 0..2i64 {
         for i in 0..3i64 {
             insert_at(&client, &format!("u-{}", b * 3 + i), FROZEN_START_MICROS + (b * 3 + i) * sec).await?;
         }
-        env.advance(Duration::from_secs(bucket_secs * 2));
+        env.advance(Duration::from_secs(BUCKET_SECS * 2));
         env.force_flush().await?;
     }
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().date_naive();
@@ -245,13 +214,11 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
     let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date, None).await?;
     assert!(removed >= 2 && added >= 1, "the fixture needs a real concatenation (removed={removed}, added={added})");
 
-    // ONE statement, not three. Three separate INSERTs are three MemBuffer
-    // batches, and whether the flush coalesces them into one Delta file is a
-    // timing decision — when it does not, the conforming file the test needs
-    // arrives as a 1-row and a 2-row file, the 2-row one holds s-7,s-8
-    // ASCENDING and declares no `timestamp DESC` footer, and NO child of the
-    // union carries the ordering claim for the repair to propagate. That is the
-    // whole of this test's intermittency; it was never the repair.
+    // ONE statement, not three: three separate INSERTs are three MemBuffer
+    // batches and whether the flush coalesces them into one Delta file is a
+    // timing decision, with exactly the split-file consequence described on
+    // `with_flush_interval` above. That is the whole of this test's
+    // intermittency; it was never the repair.
     {
         let dt = |i: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS + (6 + i) * sec).unwrap();
         let values = (0..3i64)
@@ -274,7 +241,7 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
             )
             .await?;
     }
-    env.advance(Duration::from_secs(bucket_secs * 2));
+    env.advance(Duration::from_secs(BUCKET_SECS * 2));
     env.force_flush().await?;
 
     // Fail on the FIXTURE, not on the plan, when the shape is wrong: "3 files
@@ -287,13 +254,7 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
     }
 
     let sql = "SELECT id, timestamp FROM otel_logs_and_spans WHERE project_id = 'e2e_project' ORDER BY timestamp DESC LIMIT 3";
-    let plan: String = client
-        .query(&format!("EXPLAIN {sql}"), &[])
-        .await?
-        .iter()
-        .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let plan = explain(&client, sql).await?;
     let ids = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
     // The fixture's own shape, from the Delta log. A plan missing the ordering
     // claim is a SYMPTOM; whether the fixture even built the two-file
@@ -328,9 +289,11 @@ async fn isolated_union_plan(budget_mb: u64) -> anyhow::Result<(String, Vec<Stri
 // scan's common ordering: the conforming files keep the `[timestamp DESC]` claim
 // in one `DataSourceExec` and the rest are unioned in as a sibling with no claim
 // ("isolate, don't surrender"). But a `UnionExec` advertises an ordering only when
-// EVERY child does, so the Delta leg as a whole then advertises none — `DedupExec`
-// falls to its unbounded `full-set` mode and `ORDER BY timestamp DESC LIMIT n`
-// stays a BLOCKING `SortExec` over the whole window. A 251-row newest-first
+// EVERY child does, so the Delta leg as a whole then advertises none —
+// `ProjectRoutingTable::scan`'s own `mem ∪ delta` union sees an unordered,
+// unsortable Delta leg and bails, `DedupExec` falls to its unbounded `full-set`
+// mode, and `ORDER BY timestamp DESC LIMIT n` stays a BLOCKING `SortExec` over
+// the whole window. A 251-row newest-first
 // listing therefore READS every selected byte: prod p1 at 30 d selected 431 GB for
 // 251 rows, while the same query at 14 d (all files conforming) streamed in 1.6 s.
 //

@@ -7,7 +7,26 @@
 
 use std::time::Duration;
 
-use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at, insert_for};
+use super::harness::{E2eEnv, E2eEnvBuilder, FROZEN_START_MICROS, insert_at, insert_for};
+
+/// The assertion every test here ends with: rows visible for one project.
+async fn count_rows(client: &tokio_postgres::Client, project: &str) -> anyhow::Result<i64> {
+    Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&project]).await?.get(0))
+}
+
+async fn insert_n(client: &tokio_postgres::Client, prefix: &str, n: usize) -> anyhow::Result<()> {
+    for i in 0..n {
+        insert_at(client, &format!("{prefix}-{i}"), FROZEN_START_MICROS).await?;
+    }
+    Ok(())
+}
+
+/// Disable Foyer; push flush/eviction far into the future so the background
+/// tasks can't advance the WAL cursor past our writes before we crash, and
+/// every flush below is explicit.
+fn quiesced() -> E2eEnvBuilder {
+    E2eEnv::builder().with_foyer_disabled().with_flush_interval(Duration::from_secs(3600)).with_eviction_interval(Duration::from_secs(3600))
+}
 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
@@ -15,9 +34,7 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
     let mut env = E2eEnv::builder().start().await?;
     {
         let client = env.pg_client().await?;
-        for i in 0..5 {
-            insert_at(&client, &format!("f-{i}"), FROZEN_START_MICROS).await?;
-        }
+        insert_n(&client, "f", 5).await?;
         let stats = env.force_flush().await?;
         assert!(stats.buckets_flushed > 0, "expected at least one bucket flushed, got {stats:?}");
         // Client must drop before restart so the pgwire shutdown notify
@@ -27,11 +44,9 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
     env.restart().await?;
 
     let client = env.pg_client().await?;
-    let count: i64 =
-        tokio::time::timeout(Duration::from_secs(10), client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]))
-            .await
-            .map_err(|_| anyhow::anyhow!("post-restart SELECT timed out"))??
-            .get(0);
+    let count = tokio::time::timeout(Duration::from_secs(10), count_rows(&client, "e2e_project"))
+        .await
+        .map_err(|_| anyhow::anyhow!("post-restart SELECT timed out"))??;
     assert_eq!(count, 5, "flushed rows lost across restart");
     Ok(())
 }
@@ -47,20 +62,12 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
-    // Disable Foyer; push flush/eviction far into the future so the
-    // background tasks can't advance the WAL cursor past our writes
-    // before we crash. The assertion is strictly about WAL replay.
-    let mut env = E2eEnv::builder()
-        .with_foyer_disabled()
-        .with_flush_interval(Duration::from_secs(3600))
-        .with_eviction_interval(Duration::from_secs(3600))
-        .start()
-        .await?;
+    // The assertion is strictly about WAL replay, so no background task may
+    // advance the cursor past our writes — see `quiesced`.
+    let mut env = quiesced().start().await?;
     {
         let client = env.pg_client().await?;
-        for i in 0..3 {
-            insert_at(&client, &format!("w-{i}"), FROZEN_START_MICROS).await?;
-        }
+        insert_n(&client, "w", 3).await?;
         // Deliberately do NOT call force_flush — rows are only in WAL+MemBuffer.
         let stats = env.snapshot_stats();
         assert!(stats.mem_total_rows >= 3, "expected rows in MemBuffer pre-crash, got {stats:?}");
@@ -75,8 +82,7 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
     assert!(stats.mem_total_rows >= 3, "WAL replay did not restore rows into MemBuffer; post-restart stats={stats:?}");
 
     let client = env.pg_client().await?;
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 3, "rows lost across restart — WAL replay broken");
+    assert_eq!(count_rows(&client, "e2e_project").await?, 3, "rows lost across restart — WAL replay broken");
     Ok(())
 }
 
@@ -127,7 +133,7 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     let client = env.pg_client().await?;
     for p in 0..PROJECTS {
         let project = format!("p-{p}");
-        let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&project]).await?.get(0);
+        let count = count_rows(&client, &project).await?;
         assert_eq!(count, (FLUSHED_ROUNDS * 5 + 5) as i64, "dirty restart lost or duplicated rows for {project}");
     }
 
@@ -167,19 +173,10 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyhow::Result<()> {
-    let mut env = E2eEnv::builder()
-        .with_landed_skip()
-        .with_foyer_disabled()
-        // Every flush here is explicit; no background racing.
-        .with_flush_interval(Duration::from_secs(3600))
-        .with_eviction_interval(Duration::from_secs(3600))
-        .start()
-        .await?;
+    let mut env = quiesced().with_landed_skip().start().await?;
     {
         let client = env.pg_client().await?;
-        for i in 0..5 {
-            insert_at(&client, &format!("ld-{i}"), FROZEN_START_MICROS).await?;
-        }
+        insert_n(&client, "ld", 5).await?;
         // The commit lands; the advance that should follow it does not.
         env.buffered_layer().set_drop_cursor_advance_for_test(true);
         let stats = env.force_flush().await?;
@@ -203,7 +200,6 @@ async fn replayed_rows_that_delta_already_holds_are_not_written_again() -> anyho
     );
 
     let client = env.pg_client().await?;
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 5, "the declined flush must not have cost any rows");
+    assert_eq!(count_rows(&client, "e2e_project").await?, 5, "the declined flush must not have cost any rows");
     Ok(())
 }

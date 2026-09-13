@@ -27,11 +27,14 @@ use timefusion::{
     config::{AppConfig, TantivyConfig},
     database::Database,
     support::test_helpers::json_to_batch,
-    tantivy::search::{TantivyIndexService, TantivySearchService},
+    tantivy::{
+        search::{TantivyIndexService, TantivySearchService},
+        udf::{PredNode, TextMatchPred},
+    },
     write::DeltaWriteCallback,
 };
 
-fn cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
+fn cfg(test_id: &str) -> Arc<AppConfig> {
     let mut c = AppConfig::default();
     c.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
     c.aws.aws_access_key_id = Some("minioadmin".into());
@@ -40,7 +43,7 @@ fn cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
     c.aws.aws_default_region = Some("us-east-1".into());
     c.aws.aws_allow_http = Some("true".into());
     c.core.timefusion_table_prefix = format!("tantivy-e2e-{test_id}");
-    c.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{test_id}"));
+    c.core.timefusion_data_dir = data_dir(test_id);
     c.cache.timefusion_foyer_disabled = true;
     c.tantivy = TantivyConfig {
         timefusion_tantivy_compression_level: 3,
@@ -51,10 +54,16 @@ fn cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
     Arc::new(c)
 }
 
+/// The on-disk cache root `cfg` gives a test id — tests that build a second
+/// `TantivySearchService` by hand must point at the same directory.
+fn data_dir(test_id: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{test_id}"))
+}
+
 /// Build a DB with the full BufferedWriteLayer + Tantivy callback wired up,
 /// returning an immediately-flushing layer (interval=1s).
 async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, SessionContext, Option<Arc<TantivyIndexService>>)> {
-    let cfg_arc = cfg(test_id, tantivy_enabled);
+    let cfg_arc = cfg(test_id);
     let mut db = Database::with_config(cfg_arc.clone()).await?;
 
     // BufferedWriteLayer with delta writer
@@ -99,12 +108,13 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
 /// is derived from the message ("failed" → ERROR, "timeout" → WARN, else
 /// INFO) so tests can query `WHERE level = 'ERROR'` to exercise the
 /// rewriter's `=` path against the raw-tokenized indexed column.
-fn make_batch(project: &str, rows: Vec<(&str, &str, &str)>) -> RecordBatch {
+fn make_batch<S: AsRef<str>>(project: &str, rows: &[(S, S, S)]) -> RecordBatch {
     let now = chrono::Utc::now();
     let records: Vec<_> = rows
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(i, (id, name, msg))| {
+            let (id, name, msg) = (id.as_ref(), name.as_ref(), msg.as_ref());
             let ts = now.timestamp_micros() + i as i64;
             let lvl = if msg.contains("failed") || msg.contains("declined") {
                 "ERROR"
@@ -152,12 +162,116 @@ async fn collect_ids(ctx: &SessionContext, sql: &str) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// Sum of column 1 (the `count(*)` of a `time_bucket` histogram query).
+async fn sum_counts(ctx: &SessionContext, sql: &str) -> Result<i64> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    Ok(batches.iter().flat_map(|b| b.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum())
+}
+
+async fn row_count(ctx: &SessionContext, sql: &str) -> Result<usize> {
+    Ok(ctx.sql(sql).await?.collect().await?.iter().map(RecordBatch::num_rows).sum())
+}
+
+fn leaf(column: &str, query: &str) -> PredNode {
+    PredNode::Leaf(TextMatchPred { column: column.into(), query: query.into() })
+}
+
+fn snapshots(db: &Database) -> u64 {
+    db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn flush_all(db: &Database) -> Result<()> {
+    db.buffered_layer().cloned().expect("layer present").flush_all_now().await?;
+    Ok(())
+}
+
 // Each test uses a unique project_id derived from a UUID so that the shared
 // MinIO bucket (timefusion-tests) doesn't expose state across runs/tests.
 fn unique_project() -> String {
     format!("p-{}", &uuid::Uuid::new_v4().to_string()[..12])
 }
 const TABLE: &str = "otel_logs_and_spans";
+
+/// Where the fixture rows live when the query runs.
+#[derive(Clone, Copy)]
+enum Land {
+    /// Straight to Delta (skip_queue) — bypasses the BufferedWriteLayer, so no
+    /// tantivy index is ever built for these rows.
+    Delta,
+    /// Left in MemBuffer, never flushed — definitely not indexed.
+    Mem,
+    /// Through the BufferedWriteLayer and force-flushed, so a real index exists.
+    Flushed,
+}
+
+/// A tantivy-on / tantivy-off pair holding identical rows in one project. Every
+/// prefilter test below shares the same correctness invariant — the routed
+/// result must equal the full-scan baseline AND an exact id list — so it is
+/// asserted once here instead of copied per test.
+struct Pair {
+    on: Database,
+    off: Database,
+    ctx: SessionContext,
+    ctx_off: SessionContext,
+    svc: Arc<TantivyIndexService>,
+    cache_root: PathBuf,
+    p: String,
+}
+
+impl Pair {
+    async fn new<S: AsRef<str>>(tag: &str, land: Land, rows: &[(S, S, S)]) -> Result<Self> {
+        let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let on_id = format!("{id}-{tag}-on");
+        let (on, ctx, svc) = build_db(&on_id, true).await?;
+        let (off, ctx_off, _) = build_db(&format!("{id}-{tag}-off"), false).await?;
+        let pair = Self { on, off, ctx, ctx_off, svc: svc.expect("tantivy enabled"), cache_root: data_dir(&on_id), p: unique_project() };
+        pair.write(land, rows).await?;
+        Ok(pair)
+    }
+
+    async fn write<S: AsRef<str>>(&self, land: Land, rows: &[(S, S, S)]) -> Result<()> {
+        for db in [&self.on, &self.off] {
+            db.insert_records_batch(&self.p, TABLE, vec![make_batch(&self.p, rows)], matches!(land, Land::Delta), None).await?;
+            if matches!(land, Land::Flushed) {
+                flush_all(db).await?;
+            }
+        }
+        if matches!(land, Land::Mem) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
+    fn id_sql(&self, predicate: &str) -> String {
+        format!("SELECT id FROM {TABLE} WHERE project_id='{}' AND {predicate}", self.p)
+    }
+
+    /// The tantivy-off full-scan result, without touching the enabled context —
+    /// querying that would populate its five-second manifest cache.
+    async fn baseline_ids(&self, predicate: &str) -> Result<Vec<String>> {
+        collect_ids(&self.ctx_off, &self.id_sql(predicate)).await
+    }
+
+    async fn assert_ids(&self, predicate: &str, want: &[&str], why: &str) -> Result<()> {
+        let sql = self.id_sql(predicate);
+        let on = collect_ids(&self.ctx, &sql).await?;
+        assert_eq!(on, collect_ids(&self.ctx_off, &sql).await?, "{why}: routed result must equal the full-scan baseline [{predicate}]");
+        assert_eq!(on, want.iter().map(ToString::to_string).collect::<Vec<_>>(), "{why} [{predicate}]");
+        Ok(())
+    }
+
+    async fn wait_manifest(&self, want: usize) -> Result<timefusion::tantivy::Manifest> {
+        wait_for_manifest_entries(self.svc.object_store.as_ref(), &self.p, want).await
+    }
+}
+
+/// One flush group: a single matching row plus nine fillers, so the covered
+/// index stays under `prefilter_min_selectivity_pct` and the prefilter engages.
+fn flush_group(hit_id: &str, hit_msg: &str, filler_prefix: &str) -> Vec<(String, String, String)> {
+    std::iter::once((hit_id.to_string(), "n".to_string(), hit_msg.to_string()))
+        .chain((1..10).map(|i| (format!("{filler_prefix}{i}"), "n".to_string(), "ordinary".to_string())))
+        .collect()
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -205,10 +319,7 @@ async fn tantivy_histogram_daily_budget_preserves_buckets_and_captured_files() -
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<()> {
-    use timefusion::{
-        support::test_helpers::json_to_batch_for,
-        tantivy::udf::{PredNode, TextMatchPred},
-    };
+    use timefusion::support::test_helpers::json_to_batch_for;
 
     let id = uuid::Uuid::new_v4().to_string();
     let (db, ctx, svc) = build_db(&format!("{id}-mutable"), true).await?;
@@ -224,18 +335,13 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
         now.format("%Y-%m-%d %H:%M:%S%.6f"),
         (now + chrono::Duration::microseconds(1)).format("%Y-%m-%d %H:%M:%S%.6f")
     );
-    let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
-    let result = ctx.sql(&unindexed_sql).await?.collect().await?;
-    assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 1);
-    assert_eq!(
-        db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
-        before,
-        "without usable indexes, narrow SQL must avoid whole-day histogram visibility work"
-    );
+    let before = snapshots(&db);
+    assert_eq!(sum_counts(&ctx, &unindexed_sql).await?, 1);
+    assert_eq!(snapshots(&db), before, "without usable indexes, narrow SQL must avoid whole-day histogram visibility work");
     let mut newer = vec![row("changed", "b")];
     newer.extend((0..9).map(|i| row(&format!("filler-{i}"), "b")));
     db.insert_records_batch(&project, table, vec![json_to_batch_for(table, newer)?], false, None).await?;
-    db.buffered_layer().unwrap().flush_all_now().await?;
+    flush_all(&db).await?;
     let svc = svc.unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let manifest = loop {
@@ -250,19 +356,9 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
         manifest.entries.values().all(|entry| entry.ordinals_valid && entry.covered_files.len() == 1),
         "flush-created indexes must preserve physical Parquet row ordinals without manual backfill"
     );
-    let result = ctx.sql(&unindexed_sql).await?.collect().await?;
-    assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 0, "the newer nonmatching version must suppress the old match");
-    assert_eq!(
-        db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
-        before + 1,
-        "freshly flushed hashes must reach the histogram path without manual backfill"
-    );
-    let result = db
-        .tantivy_search()
-        .unwrap()
-        .search_with_stats(table, &project, &PredNode::Leaf(TextMatchPred { column: "name".into(), query: "a".into() }), 100, None)
-        .await?
-        .expect("usable newer index");
+    assert_eq!(row_count(&ctx, &unindexed_sql).await?, 0, "the newer nonmatching version must suppress the old match");
+    assert_eq!(snapshots(&db), before + 1, "freshly flushed hashes must reach the histogram path without manual backfill");
+    let result = db.tantivy_search().unwrap().search_with_stats(table, &project, &leaf("name", "a"), 100, None).await?.expect("usable newer index");
     assert!(result.hits.is_empty(), "only the uncovered old version matches");
     assert_eq!(result.indexed_rows, 10);
     assert_eq!(db.list_file_uris(&project, table).await?.len(), 2, "both physical versions must survive in separate files");
@@ -290,27 +386,16 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
             now.format("%Y-%m-%d %H:%M:%S%.6f"),
             (now + chrono::Duration::microseconds(1)).format("%Y-%m-%d %H:%M:%S%.6f")
         );
-        let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
-        let result = ctx.sql(&sql).await?.collect().await?;
-        assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 10);
+        let before = snapshots(&db);
+        assert_eq!(sum_counts(&ctx, &sql).await?, 10);
         let logical = ctx.state().create_logical_plan(&sql).await?;
-        assert_eq!(
-            db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
-            before + 1,
-            "SQL must reach the histogram service: {}",
-            ctx.state().optimize(&logical)?.display_indent()
-        );
+        assert_eq!(snapshots(&db), before + 1, "SQL must reach the histogram service: {}", ctx.state().optimize(&logical)?.display_indent());
         let union = sql.replace("array_has(hashes, 'b')", "(array_has(hashes, 'b') OR array_has(hashes, 'c'))");
-        let result = ctx.sql(&union).await?.collect().await?;
-        assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 11);
-        assert_eq!(db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed), before + 2);
+        assert_eq!(sum_counts(&ctx, &union).await?, 11);
+        assert_eq!(snapshots(&db), before + 2);
         let unsupported = sql.replace("AND array_has", "AND name = 'does-not-match' AND array_has");
-        assert_eq!(ctx.sql(&unsupported).await?.collect().await?.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
-        assert_eq!(
-            db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
-            before + 2,
-            "unsupported filters must remain on the ordinary plan"
-        );
+        assert_eq!(row_count(&ctx, &unsupported).await?, 0);
+        assert_eq!(snapshots(&db), before + 2, "unsupported filters must remain on the ordinary plan");
         for (predicate, expected, routed) in [
             ("hashes @> ARRAY['b']", 10, true),
             ("hashes @> ARRAY['b', 'b']", 10, true),
@@ -323,20 +408,10 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
             ("hashes && ARRAY[NULL]::text[]", 0, false),
         ] {
             let query = sql.replace("array_has(hashes, 'b')", predicate);
-            let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
-            let result = ctx.sql(&query).await?.collect().await?;
-            assert_eq!(
-                result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(),
-                expected,
-                "{predicate}"
-            );
+            let before = snapshots(&db);
+            assert_eq!(sum_counts(&ctx, &query).await?, expected, "{predicate}");
             let logical = ctx.state().create_logical_plan(&query).await?;
-            assert_eq!(
-                db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed),
-                before + u64::from(routed),
-                "{predicate}: {}",
-                ctx.state().optimize(&logical)?.display_indent()
-            );
+            assert_eq!(snapshots(&db), before + u64::from(routed), "{predicate}: {}", ctx.state().optimize(&logical)?.display_indent());
         }
     }
     let lo = (now - chrono::Duration::days(30)).timestamp_micros();
@@ -360,16 +435,15 @@ async fn mutable_index_filter_cannot_resurrect_an_uncovered_version() -> Result<
         (union(&left, &branch(mid, hi, "c")), 1, false),
         (union(&left, &right.replacen("SELECT timestamp", "SELECT updated_at", 1)), 10, false),
     ] {
-        let before = db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed);
-        let result = ctx.sql(&query).await?.collect().await?;
-        assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), expected, "{query}");
-        assert_eq!(db.tantivy_search().unwrap().stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed), before + u64::from(routed), "{query}");
+        let before = snapshots(&db);
+        assert_eq!(sum_counts(&ctx, &query).await?, expected, "{query}");
+        assert_eq!(snapshots(&db), before + u64::from(routed), "{query}");
     }
     let predicate = timefusion::tantivy::histogram::Membership::Contains { column: "hashes".into(), value: "c".into() };
     let captured = db.capture_histogram(&project, table, window, Some(&predicate), 16 * 1024 * 1024, ctx.task_ctx()).await?;
     let (count, write) = tokio::join!(captured.count(), async {
         db.insert_records_batch(&project, table, vec![json_to_batch_for(table, vec![row("after-capture", "b")])?], false, None).await?;
-        db.buffered_layer().unwrap().flush_all_now().await?;
+        flush_all(&db).await?;
         Ok::<_, anyhow::Error>(())
     });
     write?;
@@ -404,28 +478,16 @@ async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, projec
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn delta_flushed_text_match_matches_baseline() -> Result<()> {
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, _svc) = build_db(&format!("{id}-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-off"), false).await?;
-    let p = unique_project();
-
-    let rows = vec![
+    let rows = [
         ("a", "auth", "user login successful"),
         ("b", "auth", "user login failed: bad password"),
         ("c", "payment", "charge succeeded"),
         ("d", "payment", "charge failed: declined card"),
     ];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], true, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], true, None).await?;
-
+    let pair = Pair::new("direct", Land::Delta, &rows).await?;
     // No tantivy index was built (skip_queue=true bypasses BufferedWriteLayer).
     // Search returns None → no prefilter applied → UDF post-filter does the work.
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND text_match(status_message, 'failed')");
-    let r_on = collect_ids(&ctx, &q).await?;
-    let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "result with tantivy on must equal baseline");
-    assert_eq!(r_on, vec!["b".to_string(), "d".to_string()]);
-    Ok(())
+    pair.assert_ids("text_match(status_message, 'failed')", &["b", "d"], "unindexed text_match falls back to the UDF post-filter").await
 }
 
 #[serial]
@@ -435,22 +497,9 @@ async fn membuffer_only_level_eq_falls_back_correctly() -> Result<()> {
     // (bloom/stats handle it), so `level = 'ERROR'` runs directly against the
     // in-memory batches. Correctness invariant: result identical to the
     // tantivy-off baseline.
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, _svc) = build_db(&format!("{id}-mem-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-mem-off"), false).await?;
-    let p = unique_project();
-
-    let rows = vec![("x1", "service-a", "operation completed"), ("x2", "service-a", "operation failed"), ("x3", "service-b", "request timeout")];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
-    let r_on = collect_ids(&ctx, &q).await?;
-    let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "MemBuffer-only result must equal baseline with rewriter on");
-    assert_eq!(r_on, vec!["x2".to_string()]);
-    Ok(())
+    let rows = [("x1", "service-a", "operation completed"), ("x2", "service-a", "operation failed"), ("x3", "service-b", "request timeout")];
+    let pair = Pair::new("mem", Land::Mem, &rows).await?;
+    pair.assert_ids("level = 'ERROR'", &["x2"], "MemBuffer-only result must equal baseline with rewriter on").await
 }
 
 #[serial]
@@ -464,10 +513,8 @@ async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buff
     let svc = svc.expect("service should be present when tantivy is enabled");
     let p = unique_project();
 
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("f1", "svc", "hello world")])], false, None).await?;
-
-    let layer = db.buffered_layer().cloned().expect("layer present");
-    layer.flush_all_now().await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, &[("f1", "svc", "hello world")])], false, None).await?;
+    flush_all(&db).await?;
 
     let store = svc.object_store.clone();
     let m = wait_for_manifest_entries(store.as_ref(), &p, 1).await?;
@@ -510,26 +557,9 @@ async fn mixed_membuffer_and_delta_level_eq_returns_union() -> Result<()> {
     //   - Delta side pruned by bloom filters / column stats
     //   - MemBuffer side is queried directly with the predicate
     //   - Result is the union with no duplicates and no missed rows
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, _svc) = build_db(&format!("{id}-mix-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-mix-off"), false).await?;
-    let p = unique_project();
-
-    let delta_rows = vec![("d-old1", "n", "old failed operation"), ("d-old2", "n", "old successful operation")];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows.clone())], true, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows)], true, None).await?;
-
-    let mem_rows = vec![("m-new1", "n", "new failed operation"), ("m-new2", "n", "new clean operation")];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows.clone())], false, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows)], false, None).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
-    let r_on = collect_ids(&ctx, &q).await?;
-    let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "mixed-mode results must be identical between on/off");
-    assert_eq!(r_on, vec!["d-old1".to_string(), "m-new1".to_string()]);
-    Ok(())
+    let pair = Pair::new("mix", Land::Delta, &[("d-old1", "n", "old failed operation"), ("d-old2", "n", "old successful operation")]).await?;
+    pair.write(Land::Mem, &[("m-new1", "n", "new failed operation"), ("m-new2", "n", "new clean operation")]).await?;
+    pair.assert_ids("level = 'ERROR'", &["d-old1", "m-new1"], "mixed-mode results must be identical between on/off").await
 }
 
 #[serial]
@@ -544,10 +574,10 @@ async fn compaction_gc_drops_stale_indexes_keeps_live_ones() -> Result<()> {
     let svc = svc.expect("tantivy enabled");
     let p = unique_project();
 
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("g1", "n", "first")])], false, None).await?;
-    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("g2", "n", "second")])], false, None).await?;
-    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    for (gid, msg) in [("g1", "first"), ("g2", "second")] {
+        db.insert_records_batch(&p, TABLE, vec![make_batch(&p, &[(gid, "n", msg)])], false, None).await?;
+        flush_all(&db).await?;
+    }
 
     let m_before = wait_for_manifest_entries(svc.object_store.as_ref(), &p, 2).await?;
     assert_eq!(m_before.entries.len(), 2, "two flushes → two manifest entries");
@@ -573,13 +603,7 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     // BufferedWriteLayer + flush so a real tantivy index exists. Then query
     // and verify the result still matches the baseline (correctness in the
     // happy path where the index covers all rows).
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, svc) = build_db(&format!("{id}-pf-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-pf-off"), false).await?;
-    let p = unique_project();
-    let svc = svc.expect("tantivy enabled");
-
-    let rows = vec![
+    let rows = [
         ("k1", "auth", "login failed: bad password"),
         ("k2", "auth", "login successful"),
         ("k3", "billing", "charge declined"),
@@ -589,16 +613,10 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
         ("k6", "billing", "err -1234 code"),
         ("k7", "auth", "foo NOT bar baz"),
     ];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
-
-    // Flush so tantivy indexes are produced and the membuffer is emptied.
-    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    let pair = Pair::new("pf", Land::Flushed, &rows).await?;
 
     // Confirm a manifest entry exists for the ON case.
-    let m = wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
-    assert!(!m.entries.is_empty(), "manifest should have entries after flush");
+    assert!(!pair.wait_manifest(1).await?.entries.is_empty(), "manifest should have entries after flush");
 
     // Real-world SQL using a substring LIKE (the path that still routes
     // through tantivy — exact `=` is now served by bloom filters/stats). The
@@ -607,28 +625,16 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     // the tantivy prefilter; the original LIKE re-runs on the scan output.
     //   "login failed: bad password" → k1   "login successful" → k2
     //   "charge declined"            → k3   "charge succeeded" → k4
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND status_message LIKE '%login%'");
-    let r_on = collect_ids(&ctx, &q).await?;
-    let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "post-flush prefilter must match baseline for `LIKE '%login%'`");
-    assert_eq!(r_on, vec!["k1".to_string(), "k2".to_string()]);
-
-    let q2 = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND status_message LIKE '%charge%'");
-    let r2_on = collect_ids(&ctx, &q2).await?;
-    let r2_off = collect_ids(&ctx2, &q2).await?;
-    assert_eq!(r2_on, r2_off);
-    assert_eq!(r2_on, vec!["k3".to_string(), "k4".to_string()]);
-
-    // Regression: a routed substring literal carrying tantivy query-grammar
-    // tokens (whitespace-adjacent `-` → MustNot, bare `NOT` → operator) used to
-    // parse "successfully" into a query matching nothing, so the intersecting
-    // `id IN (hits)` prefilter silently dropped the row that actually matched.
-    for (pat, want) in [("accept -header", "k5"), ("err -1234", "k6"), ("foo NOT bar", "k7")] {
-        let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND status_message LIKE '%{pat}%'");
-        let on = collect_ids(&ctx, &q).await?;
-        let off = collect_ids(&ctx2, &q).await?;
-        assert_eq!(on, off, "prefilter must match baseline for `LIKE '%{pat}%'`");
-        assert_eq!(on, vec![want.to_string()], "`LIKE '%{pat}%'` must return its matching row");
+    //
+    // The last three are a regression: a routed substring literal carrying
+    // tantivy query-grammar tokens (whitespace-adjacent `-` → MustNot, bare
+    // `NOT` → operator) used to parse "successfully" into a query matching
+    // nothing, so the intersecting `id IN (hits)` prefilter silently dropped
+    // the row that actually matched.
+    for (pat, want) in
+        [("login", vec!["k1", "k2"]), ("charge", vec!["k3", "k4"]), ("accept -header", vec!["k5"]), ("err -1234", vec!["k6"]), ("foo NOT bar", vec!["k7"])]
+    {
+        pair.assert_ids(&format!("status_message LIKE '%{pat}%'"), &want, "post-flush prefilter must match baseline").await?;
     }
     Ok(())
 }
@@ -640,88 +646,32 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
 /// name='billing'` must NOT collapse to ∅ (the 2026-06-16 bug) — `name` is
 /// ngram3 so its `=` isn't routed, `collect_text_match_tree` marks the OR
 /// opaque, the scan falls back, and the original predicate runs.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn flushed_eq_prefilter_matches_baseline_and_or_is_safe() -> Result<()> {
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, svc) = build_db(&format!("{id}-eq-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-eq-off"), false).await?;
-    let p = unique_project();
-    let svc = svc.expect("tantivy enabled");
-
-    // level derived from message: "failed"/"declined" → ERROR, else INFO.
-    let rows = vec![
-        ("k1", "auth", "login failed: bad password"), // ERROR
-        ("k2", "auth", "login successful"),           // INFO
-        ("k3", "billing", "charge declined"),         // ERROR
-        ("k4", "billing", "charge succeeded"),        // INFO
-    ];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
-    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
-
-    // (a) Exact `=` routes through tantivy; result must equal the baseline.
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
-    let r_on = collect_ids(&ctx, &q).await?;
-    let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "`level='ERROR'` prefilter must match the full-scan baseline");
-    assert_eq!(r_on, vec!["k1".to_string(), "k3".to_string()]);
-
-    // (b) OR must not return ∅: ERROR rows (k1,k3) ∪ billing rows (k3,k4) = {k1,k3,k4}.
-    let q_or = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND (level = 'ERROR' OR name = 'billing')");
-    let or_on = collect_ids(&ctx, &q_or).await?;
-    let or_off = collect_ids(&ctx2, &q_or).await?;
-    assert_eq!(or_on, or_off, "OR of two `=`s must match baseline (no empty-intersection bug)");
-    assert_eq!(or_on, vec!["k1".to_string(), "k3".to_string(), "k4".to_string()]);
-    Ok(())
-}
-
+///
 /// OR-union + IN-list routing: a disjunction of two ROUTABLE raw `=`s and an
 /// `id IN (...)` list both engage the prefilter (PredTree Or → tantivy
 /// Should) and must match the full-scan baseline exactly.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn flushed_or_union_and_in_list_match_baseline() -> Result<()> {
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, svc) = build_db(&format!("{id}-orin-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-orin-off"), false).await?;
-    let p = unique_project();
-    let svc = svc.expect("tantivy enabled");
-
-    let rows = vec![
+async fn flushed_eq_or_and_in_list_prefilters_match_baseline() -> Result<()> {
+    // level derived from message: "failed"/"declined" → ERROR, else INFO.
+    let rows = [
         ("k1", "auth", "login failed: bad password"), // ERROR
         ("k2", "auth", "login successful"),           // INFO
         ("k3", "billing", "charge declined"),         // ERROR
         ("k4", "billing", "charge succeeded"),        // INFO
     ];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
-    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
+    let pair = Pair::new("eq", Land::Flushed, &rows).await?;
+    pair.wait_manifest(1).await?;
 
-    // OR of two raw `=`s (level and id are both raw-tokenized): union.
-    let q_or = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND (level = 'ERROR' OR id = 'k4')");
-    let on = collect_ids(&ctx, &q_or).await?;
-    let off = collect_ids(&ctx2, &q_or).await?;
-    assert_eq!(on, off, "routable OR must union, not intersect");
-    assert_eq!(on, vec!["k1".to_string(), "k3".to_string(), "k4".to_string()]);
-
-    // IN-list on a raw column routes as OR-of-terms.
-    let q_in = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND id IN ('k2','k3')");
-    let on = collect_ids(&ctx, &q_in).await?;
-    let off = collect_ids(&ctx2, &q_in).await?;
-    assert_eq!(on, off, "IN-list routing must match baseline");
-    assert_eq!(on, vec!["k2".to_string(), "k3".to_string()]);
-
-    // NOT IN must never be routed (no term form) — baseline correctness only.
-    let q_nin = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND id NOT IN ('k2','k3')");
-    let on = collect_ids(&ctx, &q_nin).await?;
-    let off = collect_ids(&ctx2, &q_nin).await?;
-    assert_eq!(on, off);
-    assert_eq!(on, vec!["k1".to_string(), "k4".to_string()]);
+    for (predicate, want, why) in [
+        ("level = 'ERROR'", vec!["k1", "k3"], "`level='ERROR'` prefilter must match the full-scan baseline"),
+        ("(level = 'ERROR' OR name = 'billing')", vec!["k1", "k3", "k4"], "2026-06-16: OR of two `=`s must not empty-intersect"),
+        ("(level = 'ERROR' OR id = 'k4')", vec!["k1", "k3", "k4"], "routable OR must union, not intersect"),
+        ("id IN ('k2','k3')", vec!["k2", "k3"], "IN-list routing must match baseline"),
+        ("id NOT IN ('k2','k3')", vec!["k1", "k4"], "NOT IN must never be routed (no term form) — baseline correctness only"),
+    ] {
+        pair.assert_ids(predicate, &want, why).await?;
+    }
     Ok(())
 }
 
@@ -734,45 +684,22 @@ async fn flushed_or_union_and_in_list_match_baseline() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, svc) = build_db(&format!("{id}-uuideq-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-uuideq-off"), false).await?;
-    let p = unique_project();
-    let svc = svc.expect("tantivy enabled");
-
     let uid = "0fee13b9-ac71-5c55-acd1-109542595054"; // realistic monoscope id: dashes = QueryParser NOT
-    let rows = vec![(uid, "auth", "login ok"), ("11111111-2222-3333-4444-555555555555", "auth", "other")];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
-    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
+    let other = "11111111-2222-3333-4444-555555555555";
+    let pair = Pair::new("uuideq", Land::Flushed, &[(uid, "auth", "login ok"), (other, "auth", "other")]).await?;
+    pair.wait_manifest(1).await?;
 
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND id = '{uid}'");
-    let r_on = collect_ids(&ctx, &q).await?;
-    let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "exact `id=` on a dashed UUID must match baseline (QueryParser must not eat the `-`)");
-    assert_eq!(r_on, vec![uid.to_string()]);
+    pair.assert_ids(&format!("id = '{uid}'"), &[uid], "exact `id=` on a dashed UUID must match baseline (QueryParser must not eat the `-`)").await?;
 
     // DECISIVE: query the tantivy search service directly so the result can't
     // be rescued by the full-scan fallback. If this returns the uid, the
     // prefilter genuinely fires for exact dashed-UUID equality; if it's empty,
     // the SQL test above only passed because the scan fell back (P0 = no-op).
-    let cache_root = std::path::PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{id}-uuideq-on"));
-    let search = TantivySearchService::new(svc.object_store.clone(), cache_root, Arc::new(TantivyConfig::default()));
-    let hits: Vec<String> = search
-        .search_with_stats(
-            TABLE,
-            &p,
-            &timefusion::tantivy::udf::PredNode::Leaf(timefusion::tantivy::udf::TextMatchPred { column: "id".into(), query: uid.into() }),
-            1000,
-            None,
-        )
-        .await?
-        .map(|r| r.hits.into_iter().map(|h| h.id).collect())
-        .unwrap_or_default();
+    let search = TantivySearchService::new(pair.svc.object_store.clone(), pair.cache_root.clone(), Arc::new(TantivyConfig::default()));
+    let hits: Vec<String> =
+        search.search_with_stats(TABLE, &pair.p, &leaf("id", uid), 1000, None).await?.map(|r| r.hits.into_iter().map(|h| h.id).collect()).unwrap_or_default();
     assert!(hits.contains(&uid.to_string()), "tantivy exact search on `id` must return the dashed UUID, not fall back; got {hits:?}");
-    assert!(!hits.contains(&"11111111-2222-3333-4444-555555555555".to_string()), "must not over-match other ids; got {hits:?}");
+    assert!(!hits.contains(&other.to_string()), "must not over-match other ids; got {hits:?}");
     Ok(())
 }
 
@@ -790,48 +717,11 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
 async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Result<()> {
     use timefusion::tantivy::{load_manifest, save_manifest};
 
-    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-    let (db, ctx, svc) = build_db(&format!("{id}-cov-on"), true).await?;
-    let (db2, ctx2, _) = build_db(&format!("{id}-cov-off"), false).await?;
-    let p = unique_project();
-    let svc = svc.expect("tantivy enabled");
-
     // Two separate flushes → two parquet files, each with its own index entry.
-    let first = vec![
-        ("c1", "n", "login alpha"),
-        ("d11", "n", "ordinary"),
-        ("d12", "n", "ordinary"),
-        ("d13", "n", "ordinary"),
-        ("d14", "n", "ordinary"),
-        ("d15", "n", "ordinary"),
-        ("d16", "n", "ordinary"),
-        ("d17", "n", "ordinary"),
-        ("d18", "n", "ordinary"),
-        ("d19", "n", "ordinary"),
-    ];
-    for db_x in [&db, &db2] {
-        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, first.clone())], false, None).await?;
-        db_x.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    }
-    let second = vec![
-        ("c2", "n", "login beta"),
-        ("d21", "n", "ordinary"),
-        ("d22", "n", "ordinary"),
-        ("d23", "n", "ordinary"),
-        ("d24", "n", "ordinary"),
-        ("d25", "n", "ordinary"),
-        ("d26", "n", "ordinary"),
-        ("d27", "n", "ordinary"),
-        ("d28", "n", "ordinary"),
-        ("d29", "n", "ordinary"),
-    ];
-    for db_x in [&db, &db2] {
-        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, second.clone())], false, None).await?;
-        db_x.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    }
-    let store = svc.object_store.clone();
-    let m = wait_for_manifest_entries(store.as_ref(), &p, 2).await?;
-    assert_eq!(m.entries.len(), 2, "two flushes → two entries");
+    let pair = Pair::new("cov", Land::Flushed, &flush_group("c1", "login alpha", "d1")).await?;
+    pair.write(Land::Flushed, &flush_group("c2", "login beta", "d2")).await?;
+    let store = pair.svc.object_store.clone();
+    assert_eq!(pair.wait_manifest(2).await?.entries.len(), 2, "two flushes → two entries");
 
     // Baseline: both rows match. Do not query the enabled context yet: that
     // would populate its five-second manifest cache before we mutate coverage
@@ -839,44 +729,35 @@ async fn uncovered_live_file_uses_hybrid_prefilter_without_dropping_rows() -> Re
     // Match the production point-lookup shape: a completely routable OR of
     // exact/raw and substring predicates. The analyzer adds text_match leaves
     // while preserving these originals as the final correctness filter.
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND (id = 'c1' OR status_message LIKE '%login%')");
-    assert_eq!(collect_ids(&ctx2, &q).await?, vec!["c1".to_string(), "c2".to_string()]);
+    let predicate = "(id = 'c1' OR status_message LIKE '%login%')";
+    assert_eq!(pair.baseline_ids(predicate).await?, vec!["c1".to_string(), "c2".to_string()]);
 
     // Neuter exactly one entry: its parquet stays LIVE in Delta but is now
     // uncovered (index=None). The other entry remains valid + returns hits.
-    let mut m2 = load_manifest(store.as_ref(), TABLE, &p).await?;
+    let mut m2 = load_manifest(store.as_ref(), TABLE, &pair.p).await?;
     let first_key = m2.entries.keys().next().cloned().unwrap();
     let e = m2.entries.get_mut(&first_key).unwrap();
     e.index = None;
     e.error = Some("simulated uncovered file".into());
-    save_manifest(store.as_ref(), TABLE, &p, &m2).await?;
+    save_manifest(store.as_ref(), TABLE, &pair.p, &m2).await?;
 
     // With one live file uncovered, the covered file uses Tantivy and the
     // uncovered file scans raw. Their disjoint union must still return BOTH
     // rows. Applying the covered file's id set globally would drop one.
-    let direct = db
+    let direct = pair
+        .on
         .tantivy_search()
         .expect("search service")
-        .search_with_stats(
-            TABLE,
-            &p,
-            &timefusion::tantivy::udf::PredNode::Leaf(timefusion::tantivy::udf::TextMatchPred { column: "status_message".into(), query: "login".into() }),
-            1000,
-            None,
-        )
+        .search_with_stats(TABLE, &pair.p, &leaf("status_message", "login"), 1000, None)
         .await?
         .expect("one usable covered index");
     assert_eq!(direct.covered_files.len(), 1, "the fixture must have exactly one covered and one uncovered file");
     assert_eq!(direct.hits.len(), 1, "the covered index must be selective enough to engage the prefilter");
     assert_eq!(direct.indexed_rows, 10);
-    let explain = ctx.sql(&format!("EXPLAIN {q}")).await?.collect().await?;
+    let explain = pair.ctx.sql(&format!("EXPLAIN {}", pair.id_sql(predicate))).await?.collect().await?;
     let rendered = datafusion::arrow::util::pretty::pretty_format_batches(&explain)?.to_string();
     assert!(rendered.contains("UnionExec"), "partial coverage must produce indexed+raw Delta legs, not a global full-scan fallback:\n{rendered}");
-    let r_on = collect_ids(&ctx, &q).await?;
-    let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "uncovered live file must not drop rows from the prefilter");
-    assert_eq!(r_on, vec!["c1".to_string(), "c2".to_string()], "both matching rows survive the coverage gate");
-    Ok(())
+    pair.assert_ids(predicate, &["c1", "c2"], "uncovered live file must not drop rows; both matching rows survive the coverage gate").await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -917,8 +798,7 @@ async fn startup_backfills_existing_hashes_without_an_opt_in() -> Result<()> {
         timestamp.format("%Y-%m-%d %H:%M:%S%.6f"),
         (timestamp + chrono::Duration::microseconds(1)).format("%Y-%m-%d %H:%M:%S%.6f")
     );
-    let result = ctx.sql(&sql).await?.collect().await?;
-    assert_eq!(result.iter().flat_map(|batch| batch.column(1).as_primitive::<arrow::datatypes::Int64Type>().values()).sum::<i64>(), 1);
+    assert_eq!(sum_counts(&ctx, &sql).await?, 1);
     assert_eq!(search.stats.histogram_snapshots.load(std::sync::atomic::Ordering::Relaxed), 1, "backfilled hashes must reach native SQL counting");
     db.shutdown().await?;
     Ok(())

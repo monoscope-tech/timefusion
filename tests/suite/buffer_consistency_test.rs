@@ -1,9 +1,15 @@
 //! Buffer consistency tests - verifies query results are consistent whether data is in MemBuffer or Delta.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use anyhow::Result;
-use datafusion::arrow::array::{Array, AsArray, StringViewArray};
+use datafusion::{
+    arrow::{
+        array::{Array, AsArray, RecordBatch, StringViewArray},
+        datatypes::Int64Type,
+    },
+    prelude::SessionContext,
+};
 use serial_test::serial;
 use test_case::test_case;
 use timefusion::{
@@ -12,11 +18,18 @@ use timefusion::{
     write::BufferedWriteLayer,
 };
 
+const TABLE: &str = "otel_logs_and_spans";
+
 fn get_str(arr: &dyn Array, idx: usize) -> String {
     arr.as_any().downcast_ref::<StringViewArray>().map(|a| a.value(idx).to_string()).unwrap_or_default()
 }
 
-async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<BufferedWriteLayer>, String)> {
+fn get_i64(batch: &RecordBatch, col: usize, idx: usize) -> i64 {
+    batch.column(col).as_primitive::<Int64Type>().value(idx)
+}
+
+/// Database + buffered layer + a session context wired exactly as the pgwire path builds one.
+async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<BufferedWriteLayer>, String, SessionContext)> {
     let cfg = TestConfigBuilder::new("buf_test").with_buffer_mode(mode).build();
     // Wire the SAME Delta writer prod does. A layer without it does not fail —
     // `flush_bucket` used to log "no delta write callback" and drain the bucket
@@ -27,12 +40,15 @@ async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<Bu
     let layer = Arc::new(timefusion::support::test_helpers::test_layer(Arc::clone(&cfg))?.with_delta_writer(timefusion::server::delta_write_callback(&db0)));
     let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    Ok((db, layer, project_id))
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    Ok((db, layer, project_id, ctx))
 }
 
-fn create_records(project_id: &str, count: usize) -> Vec<serde_json::Value> {
+/// `duration = None` means `100 + i`, matching the varying-duration fixtures.
+fn create_range(project_id: &str, range: Range<usize>, duration: Option<i64>) -> Vec<serde_json::Value> {
     let now = chrono::Utc::now();
-    (0..count)
+    range
         .map(|i| {
             serde_json::json!({
                 "id": format!("id_{}", i),
@@ -40,13 +56,27 @@ fn create_records(project_id: &str, count: usize) -> Vec<serde_json::Value> {
                 "project_id": project_id,
                 "timestamp": now.timestamp_micros() + i as i64,
                 "level": "INFO",
-                "duration": 100 + i as i64,
+                "duration": duration.unwrap_or(100 + i as i64),
                 "date": now.date_naive().to_string(),
                 "hashes": [],
                 "summary": []
             })
         })
         .collect()
+}
+
+fn create_records(project_id: &str, count: usize) -> Vec<serde_json::Value> {
+    create_range(project_id, 0..count, None)
+}
+
+async fn insert(db: &Database, project_id: &str, records: Vec<serde_json::Value>, skip_queue: bool) -> Result<()> {
+    db.insert_records_batch(project_id, TABLE, vec![json_to_batch(records)?], skip_queue, None).await?;
+    Ok(())
+}
+
+async fn count_rows(ctx: &SessionContext, project_id: &str) -> Result<i64> {
+    let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM {TABLE} WHERE project_id = '{project_id}'")).await?.collect().await?;
+    Ok(get_i64(&result[0], 0, 0))
 }
 
 // Parameterized tests - run in both buffer modes
@@ -56,18 +86,9 @@ fn create_records(project_id: &str, count: usize) -> Vec<serde_json::Value> {
 #[serial]
 #[tokio::test]
 async fn test_insert_query(mode: BufferMode) -> Result<()> {
-    let (db, _layer, project_id) = setup_db_with_buffer(mode).await?;
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-
-    let records = create_records(&project_id, 10);
-    let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-
-    let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
-
-    let count = result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(count, 10, "Expected 10 rows");
+    let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
+    insert(&db, &project_id, create_records(&project_id, 10), true).await?;
+    assert_eq!(count_rows(&ctx, &project_id).await?, 10, "Expected 10 rows");
     Ok(())
 }
 
@@ -76,14 +97,10 @@ async fn test_insert_query(mode: BufferMode) -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn test_select_columns(mode: BufferMode) -> Result<()> {
-    let (db, _layer, project_id) = setup_db_with_buffer(mode).await?;
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
+    let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
+    insert(&db, &project_id, vec![test_span("test1", "my_span", &project_id)], true).await?;
 
-    let batch = json_to_batch(vec![test_span("test1", "my_span", &project_id)])?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-
-    let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
+    let result = ctx.sql(&format!("SELECT id, name FROM {TABLE} WHERE project_id = '{project_id}'")).await?.collect().await?;
 
     assert_eq!(result[0].num_rows(), 1);
     assert_eq!(get_str(result[0].column(0).as_ref(), 0), "test1");
@@ -96,27 +113,23 @@ async fn test_select_columns(mode: BufferMode) -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn test_update(mode: BufferMode) -> Result<()> {
-    let (db, _layer, project_id) = setup_db_with_buffer(mode).await?;
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
+    let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
+    insert(&db, &project_id, create_records(&project_id, 3), true).await?;
 
-    let records = create_records(&project_id, 3);
-    let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    ctx.sql(&format!("UPDATE {TABLE} SET hashes = make_array('999') WHERE project_id = '{project_id}' AND name = 'name_1'")).await?.collect().await?;
 
-    ctx.sql(&format!("UPDATE otel_logs_and_spans SET hashes = make_array('999') WHERE project_id = '{}' AND name = 'name_1'", project_id))
+    let result = ctx
+        .sql(&format!(
+            "SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM {TABLE} WHERE project_id = '{project_id}' ORDER BY name"
+        ))
         .await?
         .collect()
         .await?;
 
-    let result = ctx.sql(&format!("SELECT name, COALESCE(array_element(hashes, 1), CAST(duration AS VARCHAR))::BIGINT AS duration FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY name", project_id)).await?.collect().await?;
-
     let batch = &result[0];
     for i in 0..batch.num_rows() {
-        let name = get_str(batch.column(0).as_ref(), i);
-        let duration = batch.column(1).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(i);
-        if name == "name_1" {
-            assert_eq!(duration, 999, "name_1 should have duration=999");
+        if get_str(batch.column(0).as_ref(), i) == "name_1" {
+            assert_eq!(get_i64(batch, 1, i), 999, "name_1 should have duration=999");
         }
     }
     Ok(())
@@ -127,20 +140,12 @@ async fn test_update(mode: BufferMode) -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn test_delete(mode: BufferMode) -> Result<()> {
-    let (db, _layer, project_id) = setup_db_with_buffer(mode).await?;
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
+    let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
+    insert(&db, &project_id, create_records(&project_id, 5), true).await?;
 
-    let records = create_records(&project_id, 5);
-    let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    ctx.sql(&format!("DELETE FROM {TABLE} WHERE project_id = '{project_id}' AND name = 'name_2'")).await?.collect().await?;
 
-    ctx.sql(&format!("DELETE FROM otel_logs_and_spans WHERE project_id = '{}' AND name = 'name_2'", project_id)).await?.collect().await?;
-
-    let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
-
-    let count = result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(count, 4, "Expected 4 rows after delete");
+    assert_eq!(count_rows(&ctx, &project_id).await?, 4, "Expected 4 rows after delete");
     Ok(())
 }
 
@@ -149,23 +154,16 @@ async fn test_delete(mode: BufferMode) -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn test_aggregations(mode: BufferMode) -> Result<()> {
-    let (db, _layer, project_id) = setup_db_with_buffer(mode).await?;
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-
-    let records = create_records(&project_id, 10);
-    let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    let (db, _layer, project_id, ctx) = setup_db_with_buffer(mode).await?;
+    insert(&db, &project_id, create_records(&project_id, 10), true).await?;
 
     let result = ctx
-        .sql(&format!("SELECT COUNT(*) as cnt, SUM(duration) as total, AVG(duration) as avg_dur FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
+        .sql(&format!("SELECT COUNT(*) as cnt, SUM(duration) as total, AVG(duration) as avg_dur FROM {TABLE} WHERE project_id = '{project_id}'"))
         .await?
         .collect()
         .await?;
 
-    let batch = &result[0];
-    let cnt = batch.column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(cnt, 10);
+    assert_eq!(get_i64(&result[0], 0, 0), 10);
     Ok(())
 }
 
@@ -184,36 +182,12 @@ async fn test_aggregations(mode: BufferMode) -> Result<()> {
 #[ignore = "tests architecturally-unsupported simultaneous-write-both-legs pattern; see comment above"]
 #[tokio::test]
 async fn test_partial_flush_union() -> Result<()> {
-    let (db, _layer, project_id) = setup_db_with_buffer(BufferMode::Enabled).await?;
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
+    let (db, _layer, project_id, ctx) = setup_db_with_buffer(BufferMode::Enabled).await?;
 
-    let batch1 = json_to_batch(create_records(&project_id, 50))?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true, None).await?;
+    insert(&db, &project_id, create_records(&project_id, 50), true).await?;
+    insert(&db, &project_id, create_range(&project_id, 50..100, None), false).await?;
 
-    let now = chrono::Utc::now();
-    let records2: Vec<_> = (50..100)
-        .map(|i| {
-            serde_json::json!({
-                "id": format!("id_{}", i),
-                "name": format!("name_{}", i),
-                "project_id": &project_id,
-                "timestamp": now.timestamp_micros() + i as i64,
-                "level": "INFO",
-                "duration": 100 + i as i64,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            })
-        })
-        .collect();
-    let batch2 = json_to_batch(records2)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false, None).await?;
-
-    let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
-
-    let count = result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(count, 100, "Expected 100 rows from union of buffer + Delta");
+    assert_eq!(count_rows(&ctx, &project_id).await?, 100, "Expected 100 rows from union of buffer + Delta");
     Ok(())
 }
 
@@ -221,43 +195,17 @@ async fn test_partial_flush_union() -> Result<()> {
 #[ignore = "tests architecturally-unsupported simultaneous-write-both-legs pattern; see test_partial_flush_union comment"]
 #[tokio::test]
 async fn test_delta_only_query() -> Result<()> {
-    let (db, _layer, project_id) = setup_db_with_buffer(BufferMode::Enabled).await?;
+    let (db, _layer, project_id, ctx) = setup_db_with_buffer(BufferMode::Enabled).await?;
 
-    let batch1 = json_to_batch(create_records(&project_id, 30))?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true, None).await?;
-
-    let now = chrono::Utc::now();
-    let records2: Vec<_> = (30..50)
-        .map(|i| {
-            serde_json::json!({
-                "id": format!("id_{}", i),
-                "name": format!("name_{}", i),
-                "project_id": &project_id,
-                "timestamp": now.timestamp_micros() + i as i64,
-                "level": "INFO",
-                "duration": 100,
-                "date": now.date_naive().to_string(),
-                "hashes": [],
-                "summary": []
-            })
-        })
-        .collect();
-    let batch2 = json_to_batch(records2)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false, None).await?;
+    insert(&db, &project_id, create_records(&project_id, 30), true).await?;
+    insert(&db, &project_id, create_range(&project_id, 30..50, Some(100)), false).await?;
 
     // Delta-only query should return only Delta data (30 rows)
-    let delta_result = db.query_delta_only(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?;
-
-    let delta_count = delta_result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(delta_count, 30, "Delta-only should return 30 rows from Delta");
+    let delta_result = db.query_delta_only(&format!("SELECT COUNT(*) as cnt FROM {TABLE} WHERE project_id = '{project_id}'")).await?;
+    assert_eq!(get_i64(&delta_result[0], 0, 0), 30, "Delta-only should return 30 rows from Delta");
 
     // Normal query should return all 50 (30 from Delta + 20 from buffer)
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-    let full_result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
-
-    let full_count = full_result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
-    assert_eq!(full_count, 50, "Full query should return all 50 rows");
+    assert_eq!(count_rows(&ctx, &project_id).await?, 50, "Full query should return all 50 rows");
     Ok(())
 }
 
@@ -266,10 +214,9 @@ async fn test_delta_only_query() -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn test_immediate_flush_drains_buffer() -> Result<()> {
-    let (db, layer, project_id) = setup_db_with_buffer(BufferMode::FlushImmediately).await?;
+    let (db, layer, project_id, ctx) = setup_db_with_buffer(BufferMode::FlushImmediately).await?;
 
-    let batch = json_to_batch(create_records(&project_id, 10))?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+    insert(&db, &project_id, create_records(&project_id, 10), false).await?;
 
     // Buffer should be empty after immediate flush (flush drains buffer even without callback)
     assert!(layer.is_empty(), "Buffer should be empty after immediate flush");
@@ -277,9 +224,6 @@ async fn test_immediate_flush_drains_buffer() -> Result<()> {
     // empty buffer proves the rows LEFT MemBuffer, not that they arrived in
     // Delta, so on its own it is equally consistent with the flush dropping
     // them on the floor.
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-    let got = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project_id}'")).await?.collect().await?;
-    assert_eq!(got[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 10, "every drained row must be readable from Delta");
+    assert_eq!(count_rows(&ctx, &project_id).await?, 10, "every drained row must be readable from Delta");
     Ok(())
 }

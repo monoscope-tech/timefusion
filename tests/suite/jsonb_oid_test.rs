@@ -18,7 +18,6 @@ mod jsonb_oid {
     use uuid::Uuid;
 
     const JSONB_OID: u32 = 3802;
-    const JSON_OID: u32 = 114;
 
     struct Server {
         port: u16,
@@ -91,33 +90,32 @@ mod jsonb_oid {
         }
     }
 
+    /// `prepare` round-trips RowDescription; the column type OID it reports is
+    /// what hasql / strict drivers inspect.
+    async fn column_oid(client: &tokio_postgres::Client, sql: &str) -> Result<u32> {
+        Ok(client.prepare(sql).await?.columns()[0].type_().oid())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn jsonb_build_array_returns_jsonb_oid() -> Result<()> {
         let server = Server::start().await?;
         let client = server.connect().await?;
 
-        // tokio-postgres `prepare` round-trips RowDescription; column type OID
-        // is what hasql / strict drivers inspect.
-        let stmt = client.prepare("SELECT jsonb_build_array(1, 'a', true) AS j").await?;
-        assert_eq!(stmt.columns()[0].type_().oid(), JSONB_OID, "jsonb_build_array must surface PG jsonb OID, not text");
+        for (sql, want, why) in [
+            ("SELECT jsonb_build_array(1, 'a', true) AS j", JSONB_OID, "jsonb_build_array must surface PG jsonb OID, not text"),
+            ("SELECT to_jsonb('{\"k\":\"v\"}') AS j", JSONB_OID, "to_jsonb must surface PG jsonb OID, not text"),
+            // json (non-b) variants must still be text — we did NOT alias json_build_array.
+            // Pinned to the exact text OID (which also proves it never claims jsonb) so we notice if it changes.
+            ("SELECT json_build_array(1) AS j", Type::TEXT.oid(), "json_build_array stays text-typed, must not claim jsonb"),
+        ] {
+            assert_eq!(column_oid(&client, sql).await?, want, "{why} ({sql})");
+        }
 
         // Binary decode via serde_json::Value (tokio-postgres uses binary by default).
         let row = client.query_one("SELECT jsonb_build_array(1, 'a', true) AS j", &[]).await?;
         let v: serde_json::Value = row.get(0);
         assert_eq!(v, serde_json::json!([1, "a", true]));
-
-        // to_jsonb same story
-        let stmt2 = client.prepare("SELECT to_jsonb('{\"k\":\"v\"}') AS j").await?;
-        assert_eq!(stmt2.columns()[0].type_().oid(), JSONB_OID);
-
-        // json (non-b) variants must still be text — we did NOT alias json_build_array.
-        let stmt3 = client.prepare("SELECT json_build_array(1) AS j").await?;
-        let oid = stmt3.columns()[0].type_().oid();
-        assert!(oid != JSONB_OID, "json_build_array must not claim jsonb (was {oid})");
-        // It's actually text today; pin that so we notice if it changes.
-        assert_eq!(oid, Type::TEXT.oid(), "json_build_array stays text-typed; OID {oid}");
-        let _ = JSON_OID; // referenced for future use
 
         Ok(())
     }

@@ -145,31 +145,37 @@ async fn pgadmin_role_probe_answers_with_a_bound_parameter() -> Result<()> {
     Ok(())
 }
 
+/// Runs `sql` over the SIMPLE protocol against a fresh server and renders every
+/// row as `chart_name=chart_data`, sorted so multi-branch results are stable.
+async fn simple_query_charts(sql: &str) -> Result<Vec<String>> {
+    let server = TestServer::start().await?;
+    let messages = server.client().await?.simple_query(sql).await?;
+    let mut charts: Vec<String> = messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(format!("{}={}", row.get("chart_name").unwrap_or_default(), row.get("chart_data").unwrap_or_default()))
+            }
+            _ => None,
+        })
+        .collect();
+    charts.sort();
+    Ok(charts)
+}
+
 /// pgAdmin's dashboard polls this every 5s over the SIMPLE protocol, so it must
 /// work there and not only via the extended path the .slt harness exercises.
 /// `row_to_json(t)` names a whole row, which DataFusion rejects during SQL
 /// planning; RowToJsonRecordRewriter turns it into named_struct first.
 #[tokio::test(flavor = "multi_thread")]
 async fn pgadmin_dashboard_row_to_json_over_simple_protocol() -> Result<()> {
-    let server = TestServer::start().await?;
-    let messages = server
-        .client()
-        .await?
-        .simple_query(
-            "SELECT 'session_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
-             FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_activity) AS \"total\", \
-                          (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'active') AS \"active\") t",
-        )
-        .await?;
-    let row = messages
-        .iter()
-        .find_map(|message| match message {
-            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
-            _ => None,
-        })
-        .context("expected a row")?;
-    assert_eq!(row.get("chart_name"), Some("session_stats"));
-    assert_eq!(row.get("chart_data"), Some(r#"{"active":0,"total":0}"#));
+    let charts = simple_query_charts(
+        "SELECT 'session_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
+         FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_activity) AS \"total\", \
+                      (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'active') AS \"active\") t",
+    )
+    .await?;
+    assert_eq!(charts, [r#"session_stats={"active":0,"total":0}"#]);
     Ok(())
 }
 
@@ -179,29 +185,16 @@ async fn pgadmin_dashboard_row_to_json_over_simple_protocol() -> Result<()> {
 /// `No field named t. Valid fields are t."Total", t."Active", t."Idle"`.
 #[tokio::test(flavor = "multi_thread")]
 async fn pgadmin_dashboard_rewrites_every_union_branch() -> Result<()> {
-    let server = TestServer::start().await?;
-    let messages = server
-        .client()
-        .await?
-        .simple_query(
-            "SELECT 'session_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
-             FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_activity) AS \"Total\", \
-                          (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'idle') AS \"Idle\") t \
-             UNION ALL \
-             SELECT 'tps_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
-             FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_database) AS \"Transactions\") t",
-        )
-        .await?;
-    let rows: Vec<_> = messages
-        .iter()
-        .filter_map(|message| match message {
-            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(rows.len(), 2, "both union branches must return");
-    let mut data: Vec<_> = rows.iter().map(|row| row.get("chart_data").unwrap_or_default()).collect();
-    data.sort_unstable();
-    assert_eq!(data, vec![r#"{"Idle":0,"Total":0}"#, r#"{"Transactions":0}"#]);
+    let charts = simple_query_charts(
+        "SELECT 'session_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
+         FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_activity) AS \"Total\", \
+                      (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'idle') AS \"Idle\") t \
+         UNION ALL \
+         SELECT 'tps_stats' AS chart_name, pg_catalog.row_to_json(t) AS chart_data \
+         FROM (SELECT (SELECT count(*) FROM pg_catalog.pg_stat_database) AS \"Transactions\") t",
+    )
+    .await?;
+    assert_eq!(charts.len(), 2, "both union branches must return");
+    assert_eq!(charts, [r#"session_stats={"Idle":0,"Total":0}"#, r#"tps_stats={"Transactions":0}"#]);
     Ok(())
 }

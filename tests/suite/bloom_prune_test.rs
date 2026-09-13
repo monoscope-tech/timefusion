@@ -22,6 +22,18 @@ fn row(id: &str, project_id: &str, ts: i64, trace_id: &str) -> serde_json::Value
     })
 }
 
+/// The in-window timestamp every test writes at: 3h ago, so the ±1h query
+/// window in `count_by_trace_id` stays on the same day as the row's partition.
+fn ts() -> i64 {
+    (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros()
+}
+
+/// One Delta commit of `rows` into otel_logs_and_spans.
+async fn insert(db: &Arc<Database>, project_id: &str, rows: Vec<serde_json::Value>) -> Result<()> {
+    db.insert_records_batch(project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+    Ok(())
+}
+
 /// Database + a bloom registry attached, plus a fresh project id. The registry's
 /// own object store (sidecar storage) is independent of the table's S3 store —
 /// `bloom_sidecar_reconcile` reads parquet through the table's store and writes
@@ -52,11 +64,11 @@ async fn count_by_trace_id(db: &Arc<Database>, project_id: &str, trace_id: &str,
 #[tokio::test]
 async fn bloom_sidecar_build_has_no_false_negatives() -> Result<()> {
     let (db, project_id) = setup("bloom_no_fn").await?;
-    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let ts = ts();
 
     // ~100 rows, one distinguished present trace_id among many distinct ones.
     let rows: Vec<_> = (0..100).map(|i| row(&format!("id-{i}"), &project_id, ts, &format!("trace-{i}"))).collect();
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(rows)?], true, None).await?;
+    insert(&db, &project_id, rows).await?;
 
     let (built, errors) = db.bloom_sidecar_reconcile().await?;
     assert!(built >= 1, "reconcile should have built at least one file's sidecar, got {built}");
@@ -74,10 +86,10 @@ async fn bloom_pruning_never_drops_updated_or_deleted_versions() -> Result<()> {
     let (db, project_id) = setup("bloom_mor").await?;
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let ts = ts();
     let trace_id = "trace-mor";
 
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![row("mor-1", &project_id, ts, trace_id)])?], true, None).await?;
+    insert(&db, &project_id, vec![row("mor-1", &project_id, ts, trace_id)]).await?;
     db.bloom_sidecar_reconcile().await?;
     assert_eq!(count_by_trace_id(&db, &project_id, trace_id, ts).await?, 1);
 
@@ -102,12 +114,12 @@ async fn bloom_pruning_never_drops_updated_or_deleted_versions() -> Result<()> {
 async fn bloom_pruning_excludes_files_and_empty_needle_scans_zero_files() -> Result<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let (db, project_id) = setup("bloom_exclude").await?;
-    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let ts = ts();
 
     // Two independent Delta commits (two files, same project/date) with
     // disjoint trace_id sets.
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![row("a1", &project_id, ts, "trace-A")])?], true, None).await?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![row("b1", &project_id, ts, "trace-B")])?], true, None).await?;
+    insert(&db, &project_id, vec![row("a1", &project_id, ts, "trace-A")]).await?;
+    insert(&db, &project_id, vec![row("b1", &project_id, ts, "trace-B")]).await?;
     db.bloom_sidecar_reconcile().await?;
 
     let reg = db.bloom_prune().expect("registry attached");
@@ -144,7 +156,7 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     let search = Arc::new(TantivySearchService::new(tstore, cfg.core.timefusion_data_dir.clone(), tcfg));
     let db = Arc::new(db.with_tantivy_search(search.clone()).with_tantivy_indexer(svc.clone()).with_bloom_prune(reg));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let ts = ts();
 
     // File 1: tantivy-COVERED (manifest published via the indexer callback,
     // exactly what the flush hook does). File 2: raw debt, never indexed.
@@ -152,7 +164,7 @@ async fn split_path_bloom_prunes_indexed_and_raw_legs() -> Result<()> {
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![b1.clone()], true, None).await?;
     let file1: Vec<String> = db.list_file_uris(&project_id, "otel_logs_and_spans").await?;
     svc.clone().batch_callback()(project_id.clone(), "otel_logs_and_spans".into(), vec![b1], file1.clone()).await?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![row("b1", &project_id, ts, "trace-raw")])?], true, None).await?;
+    insert(&db, &project_id, vec![row("b1", &project_id, ts, "trace-raw")]).await?;
     let all: Vec<String> = db.list_file_uris(&project_id, "otel_logs_and_spans").await?;
     assert!(all.len() > file1.len(), "second insert must add an uncovered file");
     db.bloom_sidecar_reconcile().await?;

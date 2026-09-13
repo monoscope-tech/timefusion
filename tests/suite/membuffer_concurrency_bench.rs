@@ -22,6 +22,15 @@ use arrow::{
 };
 use timefusion::write::mem_buffer::MemBuffer;
 
+/// Reads a `BENCH_*` knob from the environment, falling back to `default`.
+fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64
+}
+
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
@@ -55,16 +64,16 @@ fn batch(schema: Arc<Schema>, base_ts: i64, n: usize) -> RecordBatch {
 #[ignore = "microbench: opt-in via --run-ignored; use a release build for real numbers"]
 fn ingest_dedup_insert_overhead_bench() {
     use timefusion::write::{IngestDedupIndex, ingest_dedup_filter_batch, ingest_identity_idxs, per_row_identities};
-    let preload: usize = std::env::var("BENCH_PRELOAD").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000_000);
-    let writers: usize = std::env::var("BENCH_WRITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-    let slice_s: u64 = std::env::var("BENCH_DURATION").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-    let slices: usize = std::env::var("BENCH_SLICES").ok().and_then(|s| s.parse().ok()).unwrap_or(6); // 3 per arm, alternated
+    let preload: usize = env_or("BENCH_PRELOAD", 20_000_000);
+    let writers: usize = env_or("BENCH_WRITERS", 8);
+    let slice_s: u64 = env_or("BENCH_DURATION", 3);
+    let slices: usize = env_or("BENCH_SLICES", 6); // 3 per arm, alternated
     let batch_rows: usize = 128;
     let table = "otel_logs_and_spans";
 
     // Realistic otel batches (the real ~90-column schema), distinct ids per
     // batch so probe keys are fresh — the steady state.
-    let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+    let now_micros = now_micros();
     let mk_batch = |tag: &str, b: usize| {
         timefusion::write::mem_buffer::compact_batch(
             timefusion::support::test_helpers::json_to_batch(
@@ -216,11 +225,11 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 #[test]
 #[ignore = "long-running microbench: default BENCH_DURATION=20s × 300 writers / 75 readers — opt-in via `cargo test -- --ignored concurrent_insert_query_bench` or override env (BENCH_DURATION=5)"]
 fn concurrent_insert_query_bench() {
-    let projects: usize = std::env::var("BENCH_PROJECTS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-    let readers: usize = std::env::var("BENCH_READERS").ok().and_then(|s| s.parse().ok()).unwrap_or(75);
-    let duration_s: u64 = std::env::var("BENCH_DURATION").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    let batch_size: usize = std::env::var("BENCH_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-    let writer_rate: f64 = std::env::var("BENCH_WRITER_RATE").ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    let projects: usize = env_or("BENCH_PROJECTS", 300);
+    let readers: usize = env_or("BENCH_READERS", 75);
+    let duration_s: u64 = env_or("BENCH_DURATION", 20);
+    let batch_size: usize = env_or("BENCH_BATCH", 30);
+    let writer_rate: f64 = env_or("BENCH_WRITER_RATE", 5.0);
 
     println!("\n=== membuffer microbench ===");
     println!("projects={projects} readers={readers} duration={duration_s}s batch={batch_size} writer_rate={writer_rate}/s");
@@ -228,7 +237,7 @@ fn concurrent_insert_query_bench() {
     let buf = Arc::new(MemBuffer::new());
     let schema = schema();
     let stop = Arc::new(AtomicBool::new(false));
-    let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64;
+    let now_micros = now_micros();
 
     let inserts = Arc::new(AtomicU64::new(0));
     let mut writer_handles = vec![];

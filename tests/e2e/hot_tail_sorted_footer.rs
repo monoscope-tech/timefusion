@@ -22,8 +22,54 @@
 use std::time::Duration;
 
 use timefusion::support;
+use tokio_postgres::Client;
 
-use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
+use super::harness::{E2eEnv, E2eEnvBuilder, FROZEN_START_MICROS, insert_at};
+
+const SEC: i64 = 1_000_000;
+const PROJECT: &str = "e2e_project";
+const TABLE: &str = "otel_logs_and_spans";
+
+/// The shape every test here shares: 60s buckets, an hour of retention, and a
+/// sort key to declare. The flags that make each test its own scenario stay at
+/// the call site, next to the comment explaining why that test needs them.
+fn base_env() -> E2eEnvBuilder {
+    E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(60 * 60)).with_optimize_sort_by()
+}
+
+/// `flushes` separately-committed files of 3 rows each in one partition.
+/// `seal = Some(d)` advances the clock past the bucket before flushing (the
+/// today/hot-tail shape); `seal = None` flushes and then snaps the clock back to
+/// the frozen start, so a backdated partition ends up sealed.
+async fn seed_flushes(env: &E2eEnv, client: &Client, prefix: &str, flushes: i64, ts: impl Fn(i64, i64) -> i64, seal: Option<Duration>) -> anyhow::Result<()> {
+    for b in 0..flushes {
+        for i in 0..3i64 {
+            insert_at(client, &format!("{prefix}-{b}-{i}"), ts(b, i)).await?;
+        }
+        if let Some(d) = seal {
+            env.advance(d);
+        }
+        env.force_flush().await?;
+        if seal.is_none() {
+            support::set_micros(FROZEN_START_MICROS);
+        }
+    }
+    Ok(())
+}
+
+async fn live_files(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
+    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
+    let t = table_ref.read().await;
+    Ok(t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect())
+}
+
+fn repair_ticks_yielded() -> u64 {
+    timefusion::observability::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn row_count(client: &Client) -> anyhow::Result<i64> {
+    Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&PROJECT]).await?.get(0))
+}
 
 /// After hot-tail compaction, a recent-window `ORDER BY timestamp DESC LIMIT n`
 /// must still plan as a streaming merge — which it can only do if every file in
@@ -32,10 +78,7 @@ use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 #[tokio::test(flavor = "multi_thread")]
 async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_the_sort_budget() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
+    let env = base_env()
         // The production shape: every bin is over the in-process sort budget.
         .with_sort_skip_bytes(0)
         .start()
@@ -49,29 +92,21 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
     // The hot tail only considers TODAY's partition and only files whose EVENT
     // time is sealed (15 min behind the clock), so the rows go 30 min before the
     // frozen "now" and the clock stays inside the same UTC day.
-    let sec = 1_000_000i64;
-    let base = FROZEN_START_MICROS - 1800 * sec;
+    let base = FROZEN_START_MICROS - 1800 * SEC;
     // 6 flushes: `timefusion_compact_min_files` is 5, so a smaller run selects no
     // bin at all and the pass is a silent no-op.
-    for b in 0..6i64 {
-        for i in 0..3i64 {
-            let idx = b * 3 + i;
-            insert_at(&client, &format!("h-{idx}"), base + idx * 20 * sec).await?;
-        }
-        env.advance(Duration::from_secs(bucket_secs * 2));
-        env.force_flush().await?;
-    }
+    seed_flushes(&env, &client, "h", 6, |b, i| base + (b * 3 + i) * 20 * SEC, Some(Duration::from_secs(bucket_secs * 2))).await?;
 
-    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Pack).await?;
+    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
+    env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Pack).await?;
 
     // Fresh rows so the scan spans MemBuffer ∪ the compacted Delta partition —
     // the shape a dashboard query actually takes.
     // Advance to the frozen start so every written row is now sealed.
     support::set_micros(FROZEN_START_MICROS);
-    let new_base = FROZEN_START_MICROS - 60 * sec;
+    let new_base = FROZEN_START_MICROS - 60 * SEC;
     for i in 0..3i64 {
-        insert_at(&client, &format!("m-{i}"), new_base + i * sec).await?;
+        insert_at(&client, &format!("m-{i}"), new_base + i * SEC).await?;
     }
 
     // The hot tail collapsed every Delta file into one, and the fresh rows are
@@ -97,8 +132,7 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
     );
 
     // ...and the rewrite must not have lost or duplicated anything.
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 21, "18 compacted + 3 buffered rows must survive the sorted rewrite exactly once");
+    assert_eq!(row_count(&client).await?, 21, "18 compacted + 3 buffered rows must survive the sorted rewrite exactly once");
 
     let top: Vec<String> = client.query(sql, &[]).await?.iter().map(|r| r.get::<_, String>(0)).collect();
     assert_eq!(top, vec!["m-2", "m-1", "m-0"], "newest-first ordering must still be correct after the rewrite");
@@ -121,10 +155,7 @@ async fn hot_tail_output_declares_its_sorted_footer_even_when_the_bin_exceeds_th
 #[tokio::test(flavor = "multi_thread")]
 async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
+    let env = base_env()
         // Every flush output is unsorted (the large-coalesced-bucket shape)...
         .with_sort_skip_bytes(0)
         // ...and counts as converged, so the ONLY way it is ever rewritten is
@@ -135,35 +166,21 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
     env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
-    let sec = 1_000_000i64;
-    let base = FROZEN_START_MICROS - 1800 * sec;
-    for b in 0..6i64 {
-        for i in 0..3i64 {
-            let idx = b * 3 + i;
-            insert_at(&client, &format!("r-{idx}"), base + idx * 20 * sec).await?;
-        }
-        env.advance(Duration::from_secs(bucket_secs * 2));
-        env.force_flush().await?;
-    }
+    let base = FROZEN_START_MICROS - 1800 * SEC;
+    seed_flushes(&env, &client, "r", 6, |b, i| base + (b * 3 + i) * 20 * SEC, Some(Duration::from_secs(bucket_secs * 2))).await?;
     support::set_micros(FROZEN_START_MICROS);
 
-    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    let before: Vec<String> = {
-        let t = table_ref.read().await;
-        t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect()
-    };
+    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
+    let before = live_files(&env).await?;
     assert!(!before.is_empty(), "the fixture must have produced files to repair");
 
     // Several ticks: repair takes ONE file per bin and only once a project has
     // no packable slice left, so a backlog drains gradually by design.
     for _ in 0..6 {
-        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Pack).await?;
+        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Pack).await?;
     }
 
-    let after: Vec<String> = {
-        let t = table_ref.read().await;
-        t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect()
-    };
+    let after = live_files(&env).await?;
     let rewritten = before.iter().filter(|p| !after.contains(p)).count();
     assert!(
         rewritten > 0,
@@ -173,18 +190,14 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
 
     // The repair must converge: once rewritten the output is a tagged sorted
     // infinite 1->1 rewrite loop.
-    let settled: Vec<String> = {
-        for _ in 0..3 {
-            env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Pack).await?;
-        }
-        let t = table_ref.read().await;
-        t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).collect()
-    };
+    for _ in 0..3 {
+        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Pack).await?;
+    }
+    let settled = live_files(&env).await?;
     let churn = after.iter().filter(|p| !settled.contains(p)).count();
     assert_eq!(churn, 0, "repair must be one-time: a rewritten file carries SORTED_RUN_TAG and is never re-selected");
 
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, 18, "the repair must not lose or duplicate rows");
+    assert_eq!(row_count(&client).await?, 18, "the repair must not lose or duplicate rows");
 
     Ok(())
 }
@@ -213,13 +226,9 @@ async fn hot_tail_repairs_a_converged_file_that_has_no_sorted_footer() -> anyhow
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyhow::Result<()> {
-    let sec = 1_000_000i64;
     // Yesterday: repair only scans SEALED dates (today belongs to packing).
-    let yesterday = FROZEN_START_MICROS - 24 * 3600 * sec;
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(60))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
+    let yesterday = FROZEN_START_MICROS - 24 * 3600 * SEC;
+    let env = base_env()
         // Converged, so nothing but repair would ever look at these files.
         .with_light_optimize_target(1024)
         // REQUIRED for this test to mean anything. The assertion counts lines in
@@ -236,22 +245,13 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
 
     // Four separate flushes -> four untagged suspects in one sealed partition.
     const SUSPECTS: usize = 4;
-    for b in 0..SUSPECTS as i64 {
-        for i in 0..3i64 {
-            insert_at(&client, &format!("s-{b}-{i}"), yesterday + (b * 300 + i * 20) * sec).await?;
-        }
-        env.force_flush().await?;
-        support::set_micros(FROZEN_START_MICROS);
-    }
+    seed_flushes(&env, &client, "s", SUSPECTS as i64, |b, i| yesterday + (b * 300 + i * 20) * SEC, None).await?;
 
-    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    let before = {
-        let t = table_ref.read().await;
-        t.snapshot()?.log_data().iter().count()
-    };
+    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
+    let before = live_files(&env).await?.len();
     assert!(before >= SUSPECTS, "fixture must produce at least {SUSPECTS} suspects, got {before}");
 
-    env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair).await?;
+    env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair).await?;
 
     // The verified-sorted set is what admission consults, and it is persisted —
     // so it is also the thing a pass that gave up early leaves half-written.
@@ -263,8 +263,7 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
          Stopping at the first is how a 663-file backlog moved ~1 file per pass. file={verified:?}"
     );
 
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, (SUSPECTS as i64) * 3, "verification must not touch data");
+    assert_eq!(row_count(&client).await?, (SUSPECTS as i64) * 3, "verification must not touch data");
 
     Ok(())
 }
@@ -284,12 +283,8 @@ async fn one_repair_pass_clears_every_sorted_suspect_not_one_per_pass() -> anyho
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool() -> anyhow::Result<()> {
-    let sec = 1_000_000i64;
-    let yesterday = FROZEN_START_MICROS - 24 * 3600 * sec;
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(60))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
+    let yesterday = FROZEN_START_MICROS - 24 * 3600 * SEC;
+    let env = base_env()
         .with_light_optimize_target(1024)
         // Without this the fixture has NO repair work at all: write-time marking
         // (2026-08-28) records these flushed files as verified-sorted the moment
@@ -304,31 +299,25 @@ async fn a_second_table_skips_its_repair_tick_rather_than_sharing_the_light_pool
         .await?;
     env.db().cancel_maintenance();
     let client = env.pg_client().await?;
-    for b in 0..4i64 {
-        for i in 0..3i64 {
-            insert_at(&client, &format!("x-{b}-{i}"), yesterday + (b * 300 + i * 20) * sec).await?;
-        }
-        env.force_flush().await?;
-        support::set_micros(FROZEN_START_MICROS);
-    }
+    seed_flushes(&env, &client, "x", 4, |b, i| yesterday + (b * 300 + i * 20) * SEC, None).await?;
 
-    let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    let before = timefusion::observability::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed);
+    let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
+    let before = repair_ticks_yielded();
 
     // Same table twice is the same contention the two tables have: one
     // process-wide permit, two concurrent passes.
     let (a, b) = tokio::join!(
-        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair),
-        env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair),
+        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair),
+        env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair),
     );
     a?;
     b?;
-    let yielded = timefusion::observability::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let yielded = repair_ticks_yielded() - before;
     assert_eq!(yielded, 1, "exactly one of two overlapping repair passes must yield the permit, got {yielded}");
 
     // And the permit must be RELEASED: a later pass still runs.
-    env.db().optimize_table_light(&table_ref, "otel_logs_and_spans", timefusion::database::TailPass::Repair).await?;
-    let after = timefusion::observability::maintenance_stats().repair_ticks_yielded.load(std::sync::atomic::Ordering::Relaxed) - before;
+    env.db().optimize_table_light(&table_ref, TABLE, timefusion::database::TailPass::Repair).await?;
+    let after = repair_ticks_yielded() - before;
     assert_eq!(after, 1, "the permit leaked — a pass that ran alone still yielded");
 
     Ok(())

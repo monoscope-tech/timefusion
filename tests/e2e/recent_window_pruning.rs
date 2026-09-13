@@ -15,6 +15,30 @@ use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
+const BUCKET_SECS: u64 = 60;
+const SEC: i64 = 1_000_000;
+
+/// Format a micros timestamp as the SQL literal the queries compare against.
+fn ts(micros: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string()
+}
+
+/// Insert `chunks * 100` rows 1s apart from `FROZEN_START_MICROS`, flushing after each
+/// chunk so several Delta files exist, then drain the MemBuffer so the query hits Delta
+/// only (no unordered mem branch).
+async fn seed_flushed_chunks(env: &E2eEnv, client: &tokio_postgres::Client, chunks: i64) -> anyhow::Result<()> {
+    for idx in 0..chunks * 100 {
+        insert_at(client, &format!("r-{idx:04}"), FROZEN_START_MICROS + idx * SEC).await?;
+        if idx % 100 == 99 {
+            env.advance(Duration::from_secs(BUCKET_SECS * 2));
+            env.force_flush().await?;
+        }
+    }
+    env.advance(Duration::from_secs(60 * 61));
+    env.force_evict().await?;
+    Ok(())
+}
+
 /// Parse a scalar DataSourceExec metric `name=N` (first digit run after `name`).
 fn scan_metric(plan: &str, name: &str) -> Option<i64> {
     let i = plan.rfind(name)?;
@@ -44,9 +68,8 @@ async fn explain_analyze(client: &tokio_postgres::Client, sql: &str) -> anyhow::
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Result<()> {
-    let bucket_secs = 60u64;
     let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_bucket_duration(Duration::from_secs(BUCKET_SECS))
         .with_retention(Duration::from_secs(60 * 60))
         .with_page_row_count_limit(50)
         // Deterministic file list. The flush spawns the sidecar tantivy index
@@ -73,20 +96,9 @@ async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Resul
     env.db().cancel_maintenance();
     let client = env.pg_client().await?;
 
-    let sec = 1_000_000i64;
-    for chunk in 0..2i64 {
-        for i in 0..100i64 {
-            let idx = chunk * 100 + i;
-            insert_at(&client, &format!("r-{idx:04}"), FROZEN_START_MICROS + idx * sec).await?;
-        }
-        env.advance(Duration::from_secs(bucket_secs * 2));
-        env.force_flush().await?;
-    }
-    // Drain MemBuffer so the query hits Delta only.
-    env.advance(Duration::from_secs(60 * 61));
-    env.force_evict().await?;
+    seed_flushed_chunks(&env, &client, 2).await?;
 
-    let start_ts = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().format("%Y-%m-%d %H:%M:%S%.f");
+    let start_ts = ts(FROZEN_START_MICROS);
     // Explicit text_match mirrors what the tantivy rewrite injects, without
     // depending on the optimizer rule firing in this harness.
     let sql = format!(
@@ -125,12 +137,11 @@ async fn text_match_conjunct_does_not_poison_parquet_pushdown() -> anyhow::Resul
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
-    let bucket_secs = 60u64;
     // Small pages (50 rows) so ~600 rows → ~12 pages in one row group, mirroring
     // prod's single-row-group compacted file but with fine page granularity.
     // Deletion Vectors stay ON (harness default = prod config) — the bug.
     let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_bucket_duration(Duration::from_secs(BUCKET_SECS))
         .with_retention(Duration::from_secs(60 * 60))
         .with_optimize_sort_by()
         .with_page_row_count_limit(50)
@@ -143,19 +154,8 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
 
     // 600 rows spanning ~10 minutes (1s apart), flushed in chunks so several
     // Delta files exist for the compaction to merge into one sorted file.
-    let sec = 1_000_000i64;
     let total_rows = 600i64;
-    for chunk in 0..6i64 {
-        for i in 0..100i64 {
-            let idx = chunk * 100 + i;
-            insert_at(&client, &format!("r-{idx:04}"), FROZEN_START_MICROS + idx * sec).await?;
-        }
-        env.advance(Duration::from_secs(bucket_secs * 2));
-        env.force_flush().await?;
-    }
-    // Drain MemBuffer so the query hits Delta only (no unordered mem branch).
-    env.advance(Duration::from_secs(60 * 61));
-    env.force_evict().await?;
+    seed_flushed_chunks(&env, &client, total_rows / 100).await?;
 
     // Compact → one timestamp-DESC-sorted file, one row group, ~12 pages.
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().date_naive();
@@ -164,8 +164,7 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
     assert!(removed >= 2 && added >= 1, "compaction should merge files (removed={removed}, added={added})");
 
     // Narrow trailing window: newest ~50 rows (last ~50s of the 600s span).
-    let cutoff = FROZEN_START_MICROS + (total_rows - 50) * sec;
-    let cutoff_ts = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(cutoff).unwrap().format("%Y-%m-%d %H:%M:%S%.f");
+    let cutoff_ts = ts(FROZEN_START_MICROS + (total_rows - 50) * SEC);
     let sql = format!("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND timestamp > '{cutoff_ts}'");
 
     // Sanity: the window really is ~50 rows out of 600.

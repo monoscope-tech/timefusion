@@ -9,18 +9,24 @@ use super::harness::E2eEnv;
 
 const QUERY_RESPONSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// The single-row INSERT every smoke test uses: today's partition and a
+/// current timestamp, with id/name/status_code/status_message/level/summary
+/// bound as parameters `$2..$7`.
+fn insert_sql() -> String {
+    format!(
+        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
+         VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[]::text[], $7)",
+        chrono::Utc::now().date_naive(),
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+    )
+}
+
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn pgwire_query_returns_response() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;
     let client = env.pg_client().await?;
-
-    let insert = format!(
-        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
-         VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[]::text[], $7)",
-        chrono::Utc::now().date_naive(),
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
-    );
+    let insert = insert_sql();
 
     tokio::time::timeout(QUERY_RESPONSE_BUDGET, client.execute(&insert, &[&"e2e_project", &"smoke-1", &"smoke", &"OK", &"hi", &"INFO", &vec!["s"]]))
         .await
@@ -43,13 +49,7 @@ async fn pgwire_query_returns_response() -> anyhow::Result<()> {
 async fn count_star_returns_correct_value() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;
     let client = env.pg_client().await?;
-
-    let insert = format!(
-        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
-         VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[]::text[], $7)",
-        chrono::Utc::now().date_naive(),
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
-    );
+    let insert = insert_sql();
 
     for i in 0..7 {
         client.execute(&insert, &[&"e2e_project", &format!("smoke-{i}"), &"s", &"OK", &"m", &"INFO", &vec!["s"]]).await?;

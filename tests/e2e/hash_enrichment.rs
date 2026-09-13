@@ -8,6 +8,36 @@ use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
+/// Every test here runs the prod merge-on-read DV path with the 60s buckets the
+/// enrichment flow assumes. `coalesce_secs > 0` defers the Delta leg to the DML
+/// coalescer (prod runs 60); `prune` is the join-key bloom filter.
+async fn env_with(prune: bool, coalesce_secs: u64) -> anyhow::Result<E2eEnv> {
+    E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_dml_merge_key_prune(prune)
+        .with_dml_coalesce_secs(coalesce_secs)
+        .with_bucket_duration(Duration::from_secs(60))
+        .start()
+        .await
+}
+
+/// Synchronous DML (coalesce=0), key-prune on — the default for these tests.
+async fn dv_env() -> anyhow::Result<E2eEnv> {
+    env_with(true, 0).await
+}
+
+/// Push every buffered row out of the MemBuffer so a following enrichment MUST
+/// hit the Delta merge scan (DV rewrite) rather than the mem leg.
+async fn flush_and_evict(env: &E2eEnv) -> anyhow::Result<()> {
+    env.force_flush().await?;
+    env.force_evict().await?;
+    Ok(())
+}
+
+fn ts(micros: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string()
+}
+
 async fn insert_span(client: &tokio_postgres::Client, id: &str, span: &str, trace: &str, ts: i64) -> anyhow::Result<()> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap();
     let sql = format!(
@@ -41,20 +71,38 @@ async fn insert_span_batch(client: &tokio_postgres::Client, round: usize, rows: 
     Ok((spans, traces))
 }
 
-/// The exact enrichment UPDATE-2 shape from monoscope BackgroundJobs.hs.
-async fn enrich(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &str) -> anyhow::Result<u64> {
-    let sql = format!(
+/// The enrichment UPDATE-2 skeleton from monoscope BackgroundJobs.hs. `set_tag`
+/// is the appended-tag expression, `source` the FROM subquery body, and `bounds`
+/// the `timestamp >= lo AND timestamp < hi` predicate monoscope always sends.
+fn enrich_sql(set_tag: &str, source: &str, bounds: Option<(i64, i64)>) -> String {
+    let bounded = bounds.map_or(String::new(), |(lo, hi)| format!(" AND o.timestamp >= '{}' AND o.timestamp < '{}'", ts(lo), ts(hi)));
+    format!(
         "UPDATE otel_logs_and_spans o \
-           SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY['{tag}'] \
-           FROM ( SELECT unnest(ARRAY['{span}']::text[]) AS span_id, \
-                         unnest(ARRAY['{trace}']::text[]) AS trace_id, \
-                         unnest(ARRAY['{tag}']::text[])   AS tag ) u \
-           WHERE o.project_id = 'e2e_project' \
+           SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[{set_tag}] \
+           FROM ( {source} ) u \
+           WHERE o.project_id = 'e2e_project'{bounded} \
              AND o.context___span_id = u.span_id \
              AND o.context___trace_id = u.trace_id \
              AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])"
-    );
-    Ok(client.execute(&sql, &[]).await?)
+    )
+}
+
+/// Flat inlined `unnest(ARRAY[...])` source — the shape that does NOT trigger
+/// the prod projection crash (see `enrich_prod_shape`).
+fn inline_source(spans: &[&str], traces: &[&str], tags: &[&str]) -> String {
+    let arr = |xs: &[&str]| xs.iter().map(|x| format!("'{x}'")).collect::<Vec<_>>().join(",");
+    format!(
+        "SELECT unnest(ARRAY[{}]::text[]) AS span_id, unnest(ARRAY[{}]::text[]) AS trace_id, unnest(ARRAY[{}]::text[])   AS tag",
+        arr(spans),
+        arr(traces),
+        arr(tags)
+    )
+}
+
+/// The exact enrichment UPDATE-2 shape from monoscope BackgroundJobs.hs: one
+/// key, the tag a literal in the SET.
+async fn enrich(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &str) -> anyhow::Result<u64> {
+    Ok(client.execute(&enrich_sql(&format!("'{tag}'"), &inline_source(&[span], &[trace], &[tag]), None), &[]).await?)
 }
 
 /// Enrichment where one batch carries the SAME (span,trace) key twice with
@@ -62,22 +110,8 @@ async fn enrich(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &
 /// rows" shape. Both tags must be applied (append-accumulate), so the merge must
 /// split same-key rows into successive rounds, not dedup them.
 async fn enrich_multi(client: &tokio_postgres::Client, span: &str, trace: &str, tags: &[&str]) -> anyhow::Result<u64> {
-    let arr = |xs: &[&str]| xs.iter().map(|x| format!("'{x}'")).collect::<Vec<_>>().join(",");
-    let spans = arr(&vec![span; tags.len()]);
-    let traces = arr(&vec![trace; tags.len()]);
-    let sql = format!(
-        "UPDATE otel_logs_and_spans o \
-           SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag] \
-           FROM ( SELECT unnest(ARRAY[{spans}]::text[]) AS span_id, \
-                         unnest(ARRAY[{traces}]::text[]) AS trace_id, \
-                         unnest(ARRAY[{}]::text[])   AS tag ) u \
-           WHERE o.project_id = 'e2e_project' \
-             AND o.context___span_id = u.span_id \
-             AND o.context___trace_id = u.trace_id \
-             AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])",
-        arr(tags)
-    );
-    Ok(client.execute(&sql, &[]).await?)
+    let (spans, traces) = (vec![span; tags.len()], vec![trace; tags.len()]);
+    Ok(client.execute(&enrich_sql("u.tag", &inline_source(&spans, &traces, tags), None), &[]).await?)
 }
 
 /// Exact prod shape: two equi-keys AND `timestamp >= lo AND timestamp < hi`
@@ -85,21 +119,7 @@ async fn enrich_multi(client: &tokio_postgres::Client, span: &str, trace: &str, 
 /// otel_logs_and_spans.context___span_id" schema error if the time bounds change
 /// the merge plan's projection.
 async fn enrich_bounded(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &str, lo: i64, hi: i64) -> anyhow::Result<u64> {
-    let ts = |m: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(m).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string();
-    let sql = format!(
-        "UPDATE otel_logs_and_spans o \
-           SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag] \
-           FROM ( SELECT unnest(ARRAY['{span}']::text[]) AS span_id, \
-                         unnest(ARRAY['{trace}']::text[]) AS trace_id, \
-                         unnest(ARRAY['{tag}']::text[])   AS tag ) u \
-           WHERE o.project_id = 'e2e_project' AND o.timestamp >= '{}' AND o.timestamp < '{}' \
-             AND o.context___span_id = u.span_id \
-             AND o.context___trace_id = u.trace_id \
-             AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])",
-        ts(lo),
-        ts(hi)
-    );
-    Ok(client.execute(&sql, &[]).await?)
+    Ok(client.execute(&enrich_sql("u.tag", &inline_source(&[span], &[trace], &[tag]), Some((lo, hi))), &[]).await?)
 }
 
 /// The EXACT monoscope prod shape: nested source subquery with `ORDER BY`, and
@@ -109,35 +129,29 @@ async fn enrich_bounded(client: &tokio_postgres::Client, span: &str, trace: &str
 /// otel_logs_and_spans.context___span_id" crash + dropped rows. Flat inlined
 /// unnest (see `enrich`) does NOT trigger it.
 async fn enrich_prod_shape(client: &tokio_postgres::Client, spans: &[&str], traces: &[&str], tags: &[&str], lo: i64, hi: i64) -> anyhow::Result<u64> {
-    let ts = |m: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(m).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string();
-    let sql = format!(
-        "UPDATE otel_logs_and_spans o \
-           SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag] \
-           FROM ( SELECT span_id, trace_id, tag FROM \
-                    ( SELECT unnest($1::text[]) AS span_id, unnest($2::text[]) AS trace_id, unnest($3::text[]) AS tag ) raw \
-                  ORDER BY span_id, trace_id ) u \
-           WHERE o.project_id = 'e2e_project' AND o.timestamp >= '{}' AND o.timestamp < '{}' \
-             AND o.context___span_id = u.span_id \
-             AND o.context___trace_id = u.trace_id \
-             AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])",
-        ts(lo),
-        ts(hi)
+    let sql = enrich_sql(
+        "u.tag",
+        "SELECT span_id, trace_id, tag FROM \
+           ( SELECT unnest($1::text[]) AS span_id, unnest($2::text[]) AS trace_id, unnest($3::text[]) AS tag ) raw \
+         ORDER BY span_id, trace_id",
+        Some((lo, hi)),
     );
     let (sv, tv, gv) = (spans.to_vec(), traces.to_vec(), tags.to_vec());
     Ok(client.execute(&sql, &[&sv, &tv, &gv]).await?)
 }
 
+async fn count_by_hash_in(client: &tokio_postgres::Client, table: &str, project: &str, tag: &str) -> anyhow::Result<i64> {
+    Ok(client.query_one(&format!("SELECT COUNT(*) FROM {table} WHERE project_id = '{project}' AND hashes && ARRAY['{tag}']::text[]"), &[]).await?.get(0))
+}
+
 async fn count_by_hash(client: &tokio_postgres::Client, tag: &str) -> anyhow::Result<i64> {
-    Ok(client
-        .query_one(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND hashes && ARRAY['{tag}']::text[]"), &[])
-        .await?
-        .get(0))
+    count_by_hash_in(client, "otel_logs_and_spans", "e2e_project", tag).await
 }
 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().await?;
     let client = env.pg_client().await?;
 
     insert_span(&client, "h-1", "span-1", "trace-1", FROZEN_START_MICROS).await?;
@@ -156,38 +170,35 @@ async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result
     // The first row's hash must be unaffected.
     assert_eq!(count_by_hash(&client, "H1").await?, 1, "H1 lost after enriching a different row");
 
-    // (projection pushdown may drop `hashes` from the scan while the predicate
-    // still references it). Reproduces prod "Predicate references unknown column: hashes". ---
-    let rows = client
-        .query(
+    // Hash predicates must survive projection pushdown (which may drop `hashes`
+    // from the scan while the predicate still references it) and, for the
+    // IS NOT NULL case, delta_kernel data-skipping — both reproduced prod
+    // "Predicate references unknown column: hashes", the second breaking every
+    // hash query that includes the null-check.
+    for (sql, want, what) in [
+        (
             "SELECT id, timestamp, hashes FROM otel_logs_and_spans \
              WHERE project_id = 'e2e_project' AND hashes && ARRAY['H1']::text[] \
              ORDER BY timestamp DESC LIMIT 5",
-            &[],
-        )
-        .await?;
-    assert_eq!(rows.len(), 1, "ORDER BY + LIMIT hash filter returned wrong rows");
-
-    let rows = client
-        .query(
+            1,
+            "ORDER BY + LIMIT hash filter returned wrong rows",
+        ),
+        (
             "SELECT id, timestamp, hashes FROM otel_logs_and_spans \
              WHERE project_id = 'e2e_project' AND array_length(hashes, 1) > 0 \
              ORDER BY timestamp DESC LIMIT 5",
-            &[],
-        )
-        .await?;
-    assert_eq!(rows.len(), 2, "ORDER BY + LIMIT array_length filter returned wrong rows");
-
-    // pushed to delta_kernel data-skipping and errored "Predicate references unknown
-    // column: hashes", breaking every hash query that includes the null-check. ---
-    let rows = client
-        .query(
+            2,
+            "ORDER BY + LIMIT array_length filter returned wrong rows",
+        ),
+        (
             "SELECT id FROM otel_logs_and_spans \
              WHERE project_id = 'e2e_project' AND hashes IS NOT NULL AND array_length(hashes, 1) > 0 LIMIT 5",
-            &[],
-        )
-        .await?;
-    assert_eq!(rows.len(), 2, "hashes IS NOT NULL filter dropped rows or errored");
+            2,
+            "hashes IS NOT NULL filter dropped rows or errored",
+        ),
+    ] {
+        assert_eq!(client.query(sql, &[]).await?.len(), want, "{what}");
+    }
 
     Ok(())
 }
@@ -198,7 +209,7 @@ async fn hash_enrichment_queryable_membuffer_and_after_flush() -> anyhow::Result
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_same_key_multiple_tags_applies_all() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().await?;
     let client = env.pg_client().await?;
 
     // MemBuffer path.
@@ -240,7 +251,7 @@ async fn bench_bloom_prune_ab() -> anyhow::Result<()> {
     const ROWS_PER_FILE: usize = 400;
 
     async fn run(prune: bool) -> anyhow::Result<std::time::Duration> {
-        let env = E2eEnv::builder().with_deletion_vectors().with_dml_merge_key_prune(prune).with_bucket_duration(Duration::from_secs(60)).start().await?;
+        let env = env_with(prune, 0).await?;
         let client = env.pg_client().await?;
         for f in 0..FILES {
             insert_file(&client, &env, &format!("f{f}"), ROWS_PER_FILE, FROZEN_START_MICROS).await?;
@@ -276,7 +287,7 @@ async fn bench_bloom_prune_ab() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_bloom_prune_never_drops_a_match() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().await?;
     let client = env.pg_client().await?;
 
     const N: usize = 8;
@@ -290,12 +301,14 @@ async fn hash_enrichment_bloom_prune_never_drops_a_match() -> anyhow::Result<()>
 
     // Enrich spans in several different files; each must be found despite the
     // bloom-prune IN-filter narrowing the scan.
-    for i in [3usize, 6, 0, 7] {
+    const ENRICHED: [usize; 4] = [3, 6, 0, 7];
+    for i in ENRICHED {
         let tag = format!("P{i}");
         let updated = enrich(&client, &format!("span-{i}"), &format!("trace-{i}"), &tag).await?;
         assert_eq!(updated, 1, "bloom-prune enrichment of span-{i} matched no rows (false bloom negative?)");
     }
-    for i in [3usize, 6, 0, 7] {
+    // Re-checked only after ALL enrichments: a later DV rewrite must not drop an earlier tag.
+    for i in ENRICHED {
         assert_eq!(count_by_hash(&client, &format!("P{i}")).await?, 1, "bloom-prune: tag P{i} lost");
     }
     Ok(())
@@ -311,7 +324,7 @@ async fn hash_enrichment_bloom_prune_never_drops_a_match() -> anyhow::Result<()>
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_prod_shape_ordered_subquery_dv_path() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().await?;
     let client = env.pg_client().await?;
 
     insert_span(&client, "ps-1", "span-x", "trace-x", FROZEN_START_MICROS).await?;
@@ -334,7 +347,7 @@ async fn hash_enrichment_prod_shape_ordered_subquery_dv_path() -> anyhow::Result
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn hash_enrichment_bounded_timestamp_dv_path() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = dv_env().await?;
     let client = env.pg_client().await?;
 
     insert_span(&client, "b-1", "span-b", "trace-b", FROZEN_START_MICROS).await?;
@@ -358,20 +371,13 @@ async fn hash_enrichment_bounded_timestamp_dv_path() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<()> {
-    let env = E2eEnv::builder()
-        .with_deletion_vectors()
-        .with_dml_merge_key_prune(true)
-        .with_dml_coalesce_secs(60)
-        .with_bucket_duration(Duration::from_secs(60))
-        .start()
-        .await?;
+    let env = env_with(true, 60).await?;
     let client = env.pg_client().await?;
 
     // Row lands in Delta and is evicted from the MemBuffer, so only the deferred
     // Delta leg can apply the enrichment (the mem leg no-ops).
     insert_span(&client, "c-1", "span-c", "trace-c", FROZEN_START_MICROS).await?;
-    env.force_flush().await?;
-    env.force_evict().await?;
+    flush_and_evict(&env).await?;
 
     // Enrich with the EXACT prod shape (nested ORDER BY source), routed through
     // the coalescer: mem leg no-ops (row evicted), Delta leg deferred.
@@ -402,15 +408,8 @@ async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::Result<()> {
-    let env = E2eEnv::builder()
-        .with_deletion_vectors()
-        .with_dml_merge_key_prune(true)
-        .with_dml_coalesce_secs(60)
-        .with_bucket_duration(Duration::from_secs(60))
-        .start()
-        .await?;
+    let env = env_with(true, 60).await?;
     let client = env.pg_client().await?;
-    let ts = |m: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(m).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string();
     let projects = ["fold_a", "fold_b", "fold_c"];
 
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
@@ -425,21 +424,22 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
         client.execute(&sql, &[]).await?;
     }
     // Rows must be Delta-only so the enrichment rides the deferred Delta leg.
-    env.force_flush().await?;
-    env.force_evict().await?;
+    flush_and_evict(&env).await?;
 
     let merges_before = timefusion::observability::dml_stats().coalesce_merges.load(std::sync::atomic::Ordering::Relaxed);
     let (lo, hi) = (FROZEN_START_MICROS - 1_000_000, FROZEN_START_MICROS + 60_000_000);
     for p in projects {
+        // NOT `enrich_sql`: this shape carries no `NOT (hashes @> ...)` guard, and
+        // which conjuncts reach the DV merge's filter is what the prod crashes here were.
+        let (span, trace, tag) = (format!("span-{p}"), format!("trace-{p}"), format!("TAG-{p}"));
         let sql = format!(
             "UPDATE mor_dormant o \
                SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag] \
-               FROM ( SELECT unnest(ARRAY['span-{p}']::text[]) AS span_id, \
-                             unnest(ARRAY['trace-{p}']::text[]) AS trace_id, \
-                             unnest(ARRAY['TAG-{p}']::text[])   AS tag ) u \
+               FROM ( {} ) u \
                WHERE o.project_id = '{p}' AND o.timestamp >= '{}' AND o.timestamp < '{}' \
                  AND o.context___span_id = u.span_id \
                  AND o.context___trace_id = u.trace_id",
+            inline_source(&[span.as_str()], &[trace.as_str()], &[tag.as_str()]),
             ts(lo),
             ts(hi)
         );
@@ -448,9 +448,7 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
     env.drain_dml_coalescer().await;
 
     for p in projects {
-        let count: i64 =
-            client.query_one(&format!("SELECT COUNT(*) FROM mor_dormant WHERE project_id = '{p}' AND hashes && ARRAY['TAG-{p}']::text[]"), &[]).await?.get(0);
-        assert_eq!(count, 1, "folded enrichment lost project {p}'s tag");
+        assert_eq!(count_by_hash_in(&client, "mor_dormant", p, &format!("TAG-{p}")).await?, 1, "folded enrichment lost project {p}'s tag");
     }
     let merges = timefusion::observability::dml_stats().coalesce_merges.load(std::sync::atomic::Ordering::Relaxed) - merges_before;
     assert_eq!(merges, 1, "expected ONE folded merge for {} same-shape project groups, got {merges}", projects.len());
@@ -482,13 +480,7 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
-    let env = E2eEnv::builder()
-        .with_deletion_vectors()
-        .with_dml_merge_key_prune(true)
-        .with_dml_coalesce_secs(60) // defer the Delta leg so we control when it runs
-        .with_bucket_duration(Duration::from_secs(60))
-        .start()
-        .await?;
+    let env = env_with(true, 60).await?; // coalesce defers the Delta leg so we control when it runs
     let client = env.pg_client().await?;
 
     const ROUNDS: usize = 5;
@@ -500,8 +492,7 @@ async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
         //     deferred Delta leg (merge-on-read DV rewrite) rather than MemBuffer.
         let (spans, traces) = insert_span_batch(&client, round, BASE_ROWS, FROZEN_START_MICROS).await?;
         expected += BASE_ROWS;
-        env.force_flush().await?;
-        env.force_evict().await?;
+        flush_and_evict(&env).await?;
 
         // (2) Queue an enrichment for the baseline rows; the coalescer holds the
         //     Delta leg until we drain it.
@@ -537,8 +528,7 @@ async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
         drain.await?;
 
         // (4) Nothing may have vanished. Count from Delta only.
-        env.force_flush().await?;
-        env.force_evict().await?;
+        flush_and_evict(&env).await?;
         let row = client.query_one("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project'", &[]).await?;
         let got: i64 = row.get(0);
         assert_eq!(

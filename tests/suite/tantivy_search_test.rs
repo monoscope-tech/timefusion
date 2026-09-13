@@ -91,6 +91,70 @@ fn batch(rows: &[(i64, &str, &str)]) -> RecordBatch {
     RecordBatch::try_new(schema, vec![ts, id, level, hashes]).unwrap()
 }
 
+/// Store + indexer + reader over one cache dir — the setup every scenario below
+/// shares. Which config a test picks is SEMANTIC, not style: derived
+/// `TantivyConfig::default()` is all-zeros/false while `prod_defaults()` is what
+/// production deserializes (see `prod_defaults`), so the constructors keep them
+/// apart and never substitute one for the other.
+struct Env {
+    table: &'static str,
+    project: &'static str,
+    store: Arc<dyn object_store::ObjectStore>,
+    svc: Arc<TantivyIndexService>,
+    search: Arc<TantivySearchService>,
+    _cache: TempDir,
+}
+
+impl Env {
+    fn new(table: &'static str, project: &'static str, store: Arc<dyn object_store::ObjectStore>, index_cfg: TantivyConfig, search_cfg: TantivyConfig) -> Self {
+        let cache = TempDir::new().unwrap();
+        Self {
+            table,
+            project,
+            svc: Arc::new(TantivyIndexService::new(store.clone(), Arc::new(index_cfg))),
+            search: Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), Arc::new(search_cfg))),
+            store,
+            _cache: cache,
+        }
+    }
+    /// Indexer on zstd level 3 (cheap builds), reader on the derived default.
+    fn zstd3(table: &'static str, project: &'static str) -> Self {
+        let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
+        Self::new(table, project, Arc::new(InMemory::new()), cfg, TantivyConfig::default())
+    }
+    /// Both sides on the DERIVED default.
+    fn plain(table: &'static str, project: &'static str) -> Self {
+        Self::new(table, project, Arc::new(InMemory::new()), TantivyConfig::default(), TantivyConfig::default())
+    }
+    /// Both sides on the config production actually deserializes.
+    fn prod(table: &'static str, project: &'static str) -> Self {
+        Self::new(table, project, Arc::new(InMemory::new()), prod_defaults(), prod_defaults())
+    }
+    /// Wires publish-time cache seeding; chained before the first publish.
+    fn seeded(self) -> Self {
+        self.svc.with_reader(&self.search);
+        self
+    }
+    async fn publish(&self, rows: &[(i64, &str, &str)], uris: &[&str]) {
+        self.svc.clone().batch_callback()(self.project.to_string(), self.table.to_string(), vec![batch(rows)], uris.iter().map(|u| (*u).to_string()).collect())
+            .await
+            .expect("callback");
+    }
+    async fn manifest(&self) -> timefusion::tantivy::Manifest {
+        load_manifest(self.store.as_ref(), self.table, self.project).await.unwrap()
+    }
+    async fn hits(&self, field: &str, query: &str) -> Option<Vec<timefusion::tantivy::search::Hit>> {
+        self.search.search(self.table, self.project, field, query).await.unwrap()
+    }
+    async fn gc(&self, live: &[&str]) -> timefusion::tantivy::search::GcReport {
+        self.svc.gc_after_compaction(self.table, self.project, &live.iter().map(|u| (*u).to_string()).collect::<Vec<_>>()).await.unwrap()
+    }
+    async fn carry_forward(&self, removed: &[&str], added: &[&str]) -> bool {
+        let owned = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        self.svc.carry_forward_after_compaction(self.table, self.project, &owned(removed), &owned(added)).await.unwrap()
+    }
+}
+
 #[tokio::test]
 async fn histogram_reads_masked_buckets_without_materializing_hits() -> anyhow::Result<()> {
     use arrow::{
@@ -226,20 +290,13 @@ async fn callback_builds_index_and_search_returns_hits() {
     // Manually register the schema is tricky here because the schema_loader
     // pulls from compiled YAML. Use the otel_logs_and_spans table instead and
     // is configured for tantivy in the production YAML.
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p1";
-
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.clone().batch_callback();
+    let env = Env::zstd3("otel_logs_and_spans", "p1");
 
     // here are timestamp/id/level — the rest of the columns can be missing
     // because schema validation is on the Delta side, not tantivy.
-    let b = batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "INFO")]);
-    cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["test-uri".into()]).await.expect("callback");
+    env.publish(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "INFO")], &["test-uri"]).await;
 
-    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = env.manifest().await;
     assert_eq!(m.entries.len(), 1);
     let entry = m.entries.values().next().unwrap();
     assert_eq!(entry.rows, 3);
@@ -248,15 +305,12 @@ async fn callback_builds_index_and_search_returns_hits() {
     assert_eq!(entry.max_timestamp_micros, Some(3_000_000));
 
     // Search via TantivySearchService
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store.clone(), cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
-    let hits = search.search(table_name, project_id, "level", "ERROR").await.expect("search").expect("usable index");
+    let hits = env.hits("level", "ERROR").await.expect("usable index");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "b");
     assert_eq!(hits[0].timestamp_micros, 2_000_000);
 
-    let hits2 = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
-    assert_eq!(hits, hits2);
+    assert_eq!(hits, env.hits("level", "ERROR").await.unwrap());
 }
 
 #[tokio::test]
@@ -264,19 +318,12 @@ async fn multi_pred_and_is_single_pass_and_conjunctive() {
     // Two predicates run as ONE combined query per index: only the row
     // matching BOTH survives, and indexed_rows counts the index set once
     // (not once per predicate).
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-multipred";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
-    let cb = svc.batch_callback();
-    let b = batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "ERROR")]);
-    cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
+    let env = Env::plain("otel_logs_and_spans", "p-multipred");
+    env.publish(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "ERROR")], &["f1"]).await;
 
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
     let preds = vec![TextMatchPred { column: "level".into(), query: "ERROR".into() }, TextMatchPred { column: "id".into(), query: "c".into() }];
     let node = timefusion::tantivy::udf::PredNode::from_preds(&preds).expect("non-empty");
-    let r = search.search_with_stats(table_name, project_id, &node, 1000, None).await.unwrap().expect("usable");
+    let r = env.search.search_with_stats(env.table, env.project, &node, 1000, None).await.unwrap().expect("usable");
     assert_eq!(r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec!["c".to_string()]);
     assert_eq!(r.indexed_rows, 3, "denominator must count the index set once, not per predicate");
 }
@@ -287,46 +334,30 @@ async fn single_file_flush_publishes_partition_mirrored_blob() {
     // manifest entry by the table-relative path and upload the blob at the
     // partition-mirrored location (suffix swap), while still covering the
     // ORIGINAL absolute URI for the coverage gate.
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-mirrored";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
-    let cb = svc.batch_callback();
-    let uri = format!("s3://bucket/timefusion/default/{table_name}/project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
-    let rel = format!("project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
-    let b = batch(&[(1_000_000, "a", "ERROR")]);
-    cb(project_id.to_string(), table_name.to_string(), vec![b], vec![uri.clone()]).await.unwrap();
+    let env = Env::plain("otel_logs_and_spans", "p-mirrored");
+    let uri = format!("s3://bucket/timefusion/default/{}/project_id={}/date=2026-07-05/part-00000-abc-c000.zstd.parquet", env.table, env.project);
+    let rel = format!("project_id={}/date=2026-07-05/part-00000-abc-c000.zstd.parquet", env.project);
+    env.publish(&[(1_000_000, "a", "ERROR")], &[uri.as_str()]).await;
 
-    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = env.manifest().await;
     let entry = m.entries.get(&rel).expect("manifest keyed by table-relative parquet path");
     assert_eq!(entry.covered_files, vec![uri], "covered_files must keep the absolute URI");
     let blob = entry.index.as_ref().expect("index built");
-    assert_eq!(timefusion::tantivy::index_to_parquet_rel(table_name, blob).as_deref(), Some(rel.as_str()), "generation must retain source identity");
+    assert_eq!(timefusion::tantivy::index_to_parquet_rel(env.table, blob).as_deref(), Some(rel.as_str()), "generation must retain source identity");
 
     // And the read side must find + query it.
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
-    let hits = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
-    assert_eq!(hits.len(), 1);
+    assert_eq!(env.hits("level", "ERROR").await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn reader_cache_avoids_reopen_across_queries() {
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-readercache";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
-    let cb = svc.batch_callback();
-    let b = batch(&[(1_000_000, "a", "ERROR")]);
-    cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
+    let env = Env::plain("otel_logs_and_spans", "p-readercache");
+    env.publish(&[(1_000_000, "a", "ERROR")], &["f1"]).await;
 
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
     for _ in 0..3 {
-        let hits = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
-        assert_eq!(hits.len(), 1);
+        assert_eq!(env.hits("level", "ERROR").await.unwrap().len(), 1);
     }
-    assert_eq!(search.stats.index_opens.load(Relaxed), 1, "one cold open; subsequent queries must hit the reader LRU");
+    assert_eq!(env.search.stats.index_opens.load(Relaxed), 1, "one cold open; subsequent queries must hit the reader LRU");
 }
 
 /// Seeding on publish must make the first query read local disk instead of S3.
@@ -337,100 +368,71 @@ async fn reader_cache_avoids_reopen_across_queries() {
 /// ("never fetch from S3 what we already built locally") being claimed.
 #[tokio::test]
 async fn seeded_cache_serves_first_query_without_object_store_reads() {
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-seeded";
-    let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let store = Arc::new(FailAfterArm::new(inner));
-    let cfg = Arc::new(prod_defaults());
-    assert!(cfg.seed_cache_on_publish(), "seeding is the default this test covers");
+    assert!(prod_defaults().seed_cache_on_publish(), "seeding is the default this test covers");
+    let store = Arc::new(FailAfterArm::new(Arc::new(InMemory::new())));
+    let env = Env::new("otel_logs_and_spans", "p-seeded", store.clone(), prod_defaults(), prod_defaults()).seeded();
 
-    let cache = TempDir::new().unwrap();
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
-    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
-    svc.with_reader(&search);
-
-    let cb = svc.clone().batch_callback();
-    cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
-    assert_eq!(search.stats.cache_seeded.load(Relaxed), 1, "publish must seed the reader's extracted-index cache");
-    assert_eq!(search.stats.cache_seed_failures.load(Relaxed), 0);
+    env.publish(&[(1_000_000, "a", "ERROR")], &["f1"]).await;
+    assert_eq!(env.search.stats.cache_seeded.load(Relaxed), 1, "publish must seed the reader's extracted-index cache");
+    assert_eq!(env.search.stats.cache_seed_failures.load(Relaxed), 0);
 
     // The manifest was read once during publish; keep it cached, then cut S3 off.
-    search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
-    let fetches_before = search.stats.blob_fetches.load(Relaxed);
+    env.hits("level", "ERROR").await.unwrap();
+    let fetches_before = env.search.stats.blob_fetches.load(Relaxed);
     store.arm();
 
-    let hits = search.search(table_name, project_id, "level", "ERROR").await.expect("search must not touch S3").expect("usable index");
+    let hits = env.search.search(env.table, env.project, "level", "ERROR").await.expect("search must not touch S3").expect("usable index");
     assert_eq!(hits.len(), 1);
-    assert_eq!(search.stats.blob_fetches.load(Relaxed), fetches_before, "a seeded index must never be re-downloaded");
+    assert_eq!(env.search.stats.blob_fetches.load(Relaxed), fetches_before, "a seeded index must never be re-downloaded");
     assert_eq!(fetches_before, 0, "the very first query must already be served locally");
 }
 
 #[tokio::test]
 async fn rebuilding_the_same_file_replaces_cached_terms_without_overwriting_old_blob() {
-    let table = "otel_logs_and_spans";
-    let project = "generation-test";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = Arc::new(prod_defaults());
-    let cache = TempDir::new().unwrap();
-    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().into(), cfg.clone()));
-    let indexer = Arc::new(TantivyIndexService::new(store.clone(), cfg));
-    indexer.with_reader(&search);
-    let callback = indexer.clone().batch_callback();
-    let uri = format!("s3://bucket/{table}/project_id={project}/date=2026-09-08/part-file.parquet");
+    let env = Env::prod("otel_logs_and_spans", "generation-test").seeded();
+    let uri = format!("s3://bucket/{}/project_id={}/date=2026-09-08/part-file.parquet", env.table, env.project);
     let mut previous_blob = None;
     for level in ["ERROR", "INFO"] {
-        callback(project.into(), table.into(), vec![batch(&[(0, "event", level)])], vec![uri.clone()]).await.unwrap();
-        let manifest = load_manifest(store.as_ref(), table, project).await.unwrap();
+        env.publish(&[(0, "event", level)], &[uri.as_str()]).await;
+        let manifest = env.manifest().await;
         assert_eq!(manifest.entries.len(), 1);
         let blob = manifest.entries.values().next().unwrap().index.clone().unwrap();
         if let Some(old) = previous_blob {
             assert_ne!(blob, old, "replacement must have a distinct immutable identity");
-            store.head(&object_store::path::Path::from(old)).await.expect("old snapshot can still read its blob");
+            env.store.head(&object_store::path::Path::from(old)).await.expect("old snapshot can still read its blob");
         }
         previous_blob = Some(blob);
-        assert_eq!(search.search(table, project, "level", "ERROR").await.unwrap().unwrap().len(), usize::from(level == "ERROR"));
-        assert_eq!(search.search(table, project, "level", "INFO").await.unwrap().unwrap().len(), usize::from(level == "INFO"));
+        assert_eq!(env.hits("level", "ERROR").await.unwrap().len(), usize::from(level == "ERROR"));
+        assert_eq!(env.hits("level", "INFO").await.unwrap().len(), usize::from(level == "INFO"));
     }
-    assert_eq!(search.stats.blob_fetches.load(Relaxed), 0, "both generations use their own seeded cache");
-    let manifest = load_manifest(store.as_ref(), table, project).await.unwrap();
+    assert_eq!(env.search.stats.blob_fetches.load(Relaxed), 0, "both generations use their own seeded cache");
+    let manifest = env.manifest().await;
     assert_eq!(manifest.retired_blobs.len(), 1, "replaced generation must remain tracked for collection");
     let retired = manifest.retired_blobs.keys().next().unwrap().clone();
-    let grace = indexer.gc_after_compaction(table, project, std::slice::from_ref(&uri)).await.unwrap();
-    assert_eq!(grace.blobs_deleted, 0, "recent snapshots retain the old generation");
-    timefusion::tantivy::mutate(store.as_ref(), table, project, |manifest| {
+    assert_eq!(env.gc(&[uri.as_str()]).await.blobs_deleted, 0, "recent snapshots retain the old generation");
+    timefusion::tantivy::mutate(env.store.as_ref(), env.table, env.project, |manifest| {
         manifest.retired_blobs.values_mut().for_each(|at| *at = chrono::Utc::now() - chrono::Duration::days(2));
         ((), true)
     })
     .await
     .unwrap();
-    let collected = indexer.gc_after_compaction(table, project, &[uri]).await.unwrap();
-    assert_eq!(collected.blobs_deleted, 1);
-    assert!(matches!(store.head(&object_store::path::Path::from(retired)).await, Err(object_store::Error::NotFound { .. })));
-    store.head(&object_store::path::Path::from(previous_blob.unwrap())).await.expect("current generation must remain readable");
-    assert!(load_manifest(store.as_ref(), table, project).await.unwrap().retired_blobs.is_empty());
+    assert_eq!(env.gc(&[uri.as_str()]).await.blobs_deleted, 1);
+    assert!(matches!(env.store.head(&object_store::path::Path::from(retired)).await, Err(object_store::Error::NotFound { .. })));
+    env.store.head(&object_store::path::Path::from(previous_blob.unwrap())).await.expect("current generation must remain readable");
+    assert!(env.manifest().await.retired_blobs.is_empty());
 }
 
 /// Installing the same blob twice — the indexer seeding while a query
 /// downloads — must converge on one readable dir, not error or corrupt.
 #[tokio::test]
 async fn concurrent_install_of_same_index_is_idempotent() {
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-race";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
-    let cache = TempDir::new().unwrap();
-    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
-    svc.with_reader(&search);
-
-    let cb = svc.clone().batch_callback();
-    cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
+    let env = Env::prod("otel_logs_and_spans", "p-race").seeded();
+    env.publish(&[(1_000_000, "a", "ERROR")], &["f1"]).await;
 
     // Publish again over the top: same key, same blob path, dir already present.
-    cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
-    assert_eq!(search.stats.cache_seed_failures.load(Relaxed), 0, "re-seeding an existing dir must not be an error");
-    let hits = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
-    assert_eq!(hits.len(), 1, "index stays readable after a repeat install");
+    env.publish(&[(1_000_000, "a", "ERROR")], &["f1"]).await;
+    assert_eq!(env.search.stats.cache_seed_failures.load(Relaxed), 0, "re-seeding an existing dir must not be an error");
+    assert_eq!(env.hits("level", "ERROR").await.unwrap().len(), 1, "index stays readable after a repeat install");
 }
 
 /// A publish must leave the manifest cache WARM, not empty.
@@ -442,29 +444,21 @@ async fn concurrent_install_of_same_index_is_idempotent() {
 /// needed and the 300s TTL bought nothing.
 #[tokio::test]
 async fn publishing_keeps_the_manifest_cache_warm_and_current() {
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-manifest-warm";
-    let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let store = Arc::new(FailAfterArm::new(inner));
-    let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
-    let cache = TempDir::new().unwrap();
-    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
-    svc.with_reader(&search);
-    let cb = svc.clone().batch_callback();
+    let store = Arc::new(FailAfterArm::new(Arc::new(InMemory::new())));
+    let env = Env::new("otel_logs_and_spans", "p-manifest-warm", store.clone(), prod_defaults(), prod_defaults()).seeded();
 
     // First publish + query: populates the manifest cache.
-    cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec!["f1".into()]).await.unwrap();
-    search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
-    let loads_after_first = search.stats.manifest_loads.load(Relaxed);
+    env.publish(&[(1_000_000, "a", "ERROR")], &["f1"]).await;
+    env.hits("level", "ERROR").await.unwrap();
+    let loads_after_first = env.search.stats.manifest_loads.load(Relaxed);
 
     // Second publish, then cut the object store off entirely. If publishing had
     // evicted the manifest, this search would have to reload it and would fail.
-    cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["f2".into()]).await.unwrap();
+    env.publish(&[(2_000_000, "b", "ERROR")], &["f2"]).await;
     store.arm();
 
-    let hits = search.search(table_name, project_id, "level", "ERROR").await.expect("must not reload the manifest").expect("usable index");
-    assert_eq!(search.stats.manifest_loads.load(Relaxed), loads_after_first, "a publish must not force a manifest reload");
+    let hits = env.search.search(env.table, env.project, "level", "ERROR").await.expect("must not reload the manifest").expect("usable index");
+    assert_eq!(env.search.stats.manifest_loads.load(Relaxed), loads_after_first, "a publish must not force a manifest reload");
     // ...and the cache must be CURRENT, not merely warm: the second publish's
     // rows have to be visible, which is the thing a stale cache would lose.
     let ids: Vec<_> = hits.iter().map(|h| h.id.as_str()).collect();
@@ -480,21 +474,13 @@ async fn publishing_keeps_the_manifest_cache_warm_and_current() {
 /// snapshot) would show up as missing entries.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batched_manifest_commit_lands_every_deferred_entry() {
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-batch";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
-    let cache = TempDir::new().unwrap();
-    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
-    svc.with_reader(&search);
-    let cb = svc.clone().batch_callback();
+    let env = Env::prod("otel_logs_and_spans", "p-batch").seeded();
 
     // Three files, published normally, give us real blobs to point entries at.
     for (ts, id, uri) in [(1_000_000, "a", "f1"), (2_000_000, "b", "f2"), (3_000_000, "c", "f3")] {
-        cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
+        env.publish(&[(ts, id, "ERROR")], &[uri]).await;
     }
-    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = env.manifest().await;
     assert_eq!(m.entries.len(), 3);
 
     // Re-commit all three as ONE batch, plus a fresh key: the batch must add
@@ -507,16 +493,16 @@ async fn a_batched_manifest_commit_lands_every_deferred_entry() {
     let existing: Vec<String> = m.entries.keys().cloned().collect();
     let template = m.entries.values().next().unwrap().clone();
     let fresh: Vec<_> = ["k-fresh-1", "k-fresh-2"].iter().map(|k| ((*k).to_string(), template.clone())).collect();
-    timefusion::tantivy::upsert_manifest_many(store.as_ref(), table_name, project_id, fresh.clone()).await.unwrap();
+    timefusion::tantivy::upsert_manifest_many(env.store.as_ref(), env.table, env.project, fresh.clone()).await.unwrap();
 
-    let after = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let after = env.manifest().await;
     assert_eq!(after.entries.len(), existing.len() + fresh.len(), "batch must ADD to the manifest, not replace it");
     for k in existing.iter().chain(fresh.iter().map(|(k, _)| k)) {
         assert!(after.entries.contains_key(k), "batch lost an entry: {k}");
     }
     // An empty batch must not rewrite the manifest at all.
-    timefusion::tantivy::upsert_manifest_many(store.as_ref(), table_name, project_id, Vec::new()).await.unwrap();
-    assert_eq!(load_manifest(store.as_ref(), table_name, project_id).await.unwrap().entries.len(), after.entries.len());
+    timefusion::tantivy::upsert_manifest_many(env.store.as_ref(), env.table, env.project, Vec::new()).await.unwrap();
+    assert_eq!(env.manifest().await.entries.len(), after.entries.len());
 }
 
 /// The mirror image of the test above, and the reason both are needed: a
@@ -525,29 +511,20 @@ async fn a_batched_manifest_commit_lands_every_deferred_entry() {
 /// the plan path routing at a blob that no longer exists for up to a full TTL.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_after_compaction_drops_the_cached_manifest() {
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-manifest-gc";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = Arc::new(prod_defaults());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), cfg.clone()));
-    let cache = TempDir::new().unwrap();
-    let search = Arc::new(TantivySearchService::new(store.clone(), cache.path().to_path_buf(), cfg));
-    svc.with_reader(&search);
-    let cb = svc.clone().batch_callback();
+    let env = Env::prod("otel_logs_and_spans", "p-manifest-gc").seeded();
 
     for (ts, id, uri) in [(1_000_000, "a", "f1"), (2_000_000, "b", "f2")] {
-        cb(project_id.to_string(), table_name.to_string(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
+        env.publish(&[(ts, id, "ERROR")], &[uri]).await;
     }
-    let warm = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
+    let warm = env.hits("level", "ERROR").await.unwrap();
     assert_eq!(warm.len(), 2, "both publishes should be visible before the GC");
-    let loads_before = search.stats.manifest_loads.load(Relaxed);
+    let loads_before = env.search.stats.manifest_loads.load(Relaxed);
 
     // f2 is no longer live — compaction rewrote it away.
-    let report = svc.gc_after_compaction(table_name, project_id, &["f1".to_string()]).await.unwrap();
-    assert_eq!(report.entries_removed, 1);
+    assert_eq!(env.gc(&["f1"]).await.entries_removed, 1);
 
-    let after = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
-    assert!(search.stats.manifest_loads.load(Relaxed) > loads_before, "GC must invalidate the cache so the next query reloads the pruned manifest");
+    let after = env.hits("level", "ERROR").await.unwrap();
+    assert!(env.search.stats.manifest_loads.load(Relaxed) > loads_before, "GC must invalidate the cache so the next query reloads the pruned manifest");
     let ids: Vec<_> = after.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids, ["a"], "the GC'd entry must not be consulted, got {ids:?}");
 }
@@ -622,23 +599,18 @@ async fn callback_skips_when_table_not_indexed() {
     // Tantivy is now auto-on for any table whose schema declares
     // `tantivy.indexed: true` fields. Pass a synthetic table name with
     // no schema and no override-list match — callback must be a no-op.
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig::default();
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.batch_callback();
-    let b = batch(&[(1_000_000, "a", "INFO")]);
-    cb("p1".into(), "no_such_table".into(), vec![b], vec![]).await.expect("noop callback");
-    let m = load_manifest(store.as_ref(), "no_such_table", "p1").await.unwrap();
-    assert!(m.entries.is_empty(), "no manifest entry should be written for an unknown table");
+    let env = Env::plain("no_such_table", "p1");
+    env.publish(&[(1_000_000, "a", "INFO")], &[]).await;
+    assert!(env.manifest().await.entries.is_empty(), "no manifest entry should be written for an unknown table");
 }
 
 #[tokio::test]
 async fn search_falls_back_when_manifest_entry_marked_failed() {
     // Simulate an entry whose build failed: index=None, error=Some.
     // search() must skip it and return zero hits (no panic).
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let env = Env::plain("logs", "p1");
     upsert_manifest(
-        store.as_ref(),
+        env.store.as_ref(),
         "logs",
         "p1",
         "bucket-bad",
@@ -657,42 +629,31 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
     )
     .await
     .unwrap();
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
     // the caller falls back to full scan + UDF post-filter.
-    let hits = search.search("logs", "p1", "level", "ERROR").await.unwrap();
-    assert!(hits.is_none());
+    assert!(env.hits("level", "ERROR").await.is_none());
 }
 
 #[tokio::test]
 async fn gc_after_compaction_clears_manifest_and_blobs() {
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p1";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.clone().batch_callback();
-    cb(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "INFO")])], vec!["file_a".into()]).await.unwrap();
-    cb(project_id.into(), table_name.into(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["file_b".into()]).await.unwrap();
-    let m_before = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
-    assert_eq!(m_before.entries.len(), 2);
+    let env = Env::zstd3("otel_logs_and_spans", "p1");
+    env.publish(&[(1_000_000, "a", "INFO")], &["file_a"]).await;
+    env.publish(&[(2_000_000, "b", "ERROR")], &["file_b"]).await;
+    assert_eq!(env.manifest().await.entries.len(), 2);
 
     // Compaction has rewritten file_a away but file_b survives. Only the
     // entry covering file_a should be dropped.
-    let report = svc.gc_after_compaction(table_name, project_id, &["file_b".to_string()]).await.unwrap();
+    let report = env.gc(&["file_b"]).await;
     assert_eq!(report.entries_removed, 1, "only one entry should be stale");
     assert_eq!(report.kept, 1, "the entry covering file_b should be kept");
 
-    let m_after = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let m_after = env.manifest().await;
     assert_eq!(m_after.entries.len(), 1, "one entry should remain");
     let surviving = m_after.entries.values().next().unwrap();
     assert_eq!(surviving.covered_files, vec!["file_b".to_string()]);
 
     // Calling GC with no live URIs should drop the remaining entry.
-    let report2 = svc.gc_after_compaction(table_name, project_id, &[]).await.unwrap();
-    assert_eq!(report2.entries_removed, 1);
-    let m_final = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
-    assert!(m_final.entries.is_empty());
+    assert_eq!(env.gc(&[]).await.entries_removed, 1);
+    assert!(env.manifest().await.entries.is_empty());
 }
 
 /// Carry-forward must match inputs whatever PATH FORM the caller uses. The
@@ -702,19 +663,16 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
 /// subsystem's recurring failure mode.
 #[tokio::test]
 async fn carry_forward_matches_relative_and_absolute_paths_alike() {
-    let (table_name, project_id) = ("otel_logs_and_spans", "p-relpaths");
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
+    let env = Env::zstd3("otel_logs_and_spans", "p-relpaths");
     // Covered under an ABSOLUTE uri, exactly as the flush/optimize paths record it.
     let abs = "s3://bucket/timefusion/default/otel_logs_and_spans/project_id=p-relpaths/date=2026-08-01/in.parquet";
-    svc.clone().batch_callback()(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "ERROR")])], vec![abs.into()]).await.unwrap();
+    env.publish(&[(1_000_000, "a", "ERROR")], &[abs]).await;
 
     // Removed given RELATIVE, as `StagedBin::target_paths` holds it.
     let rel = "project_id=p-relpaths/date=2026-08-01/in.parquet";
-    let applied = svc.carry_forward_after_compaction(table_name, project_id, &[rel.into()], &["out".into()]).await.unwrap();
+    let applied = env.carry_forward(&[rel], &["out"]).await;
     assert!(applied, "a relative input path must match an absolute covered_files entry, or the wave path silently never carries forward");
-    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = env.manifest().await;
     assert!(m.entries.values().any(|e| e.covered_files.contains(&"out".to_string())), "the output must end up covered");
 }
 
@@ -725,25 +683,21 @@ async fn carry_forward_matches_relative_and_absolute_paths_alike() {
 /// no-build is the throughput half (builds run ~4/hr on prod).
 #[tokio::test]
 async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
-    let (table_name, project_id) = ("otel_logs_and_spans", "p-carry");
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.clone().batch_callback();
+    let env = Env::zstd3("otel_logs_and_spans", "p-carry");
     for (ts, id, uri) in [(1_000_000, "a", "in_a"), (2_000_000, "b", "in_b")] {
-        cb(project_id.into(), table_name.into(), vec![batch(&[(ts, id, "ERROR")])], vec![uri.into()]).await.unwrap();
+        env.publish(&[(ts, id, "ERROR")], &[uri]).await;
     }
 
     // An input nobody indexed => refuse, and change nothing.
-    let refused = svc.carry_forward_after_compaction(table_name, project_id, &["in_a".into(), "never_indexed".into()], &["out".into()]).await.unwrap();
+    let refused = env.carry_forward(&["in_a", "never_indexed"], &["out"]).await;
     assert!(!refused, "an uncovered input means the output holds unseen rows — carrying forward would be a false negative");
-    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = env.manifest().await;
     assert!(m.entries.values().all(|e| !e.covered_files.contains(&"out".to_string())), "a refused carry-forward must not half-apply");
 
     // Both inputs covered => the output is covered, by edit not by build.
-    let applied = svc.carry_forward_after_compaction(table_name, project_id, &["in_a".into(), "in_b".into()], &["out".into()]).await.unwrap();
+    let applied = env.carry_forward(&["in_a", "in_b"], &["out"]).await;
     assert!(applied, "every input was covered, so the output's rows are all already indexed");
-    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    let m = env.manifest().await;
     let covering: Vec<_> = m.entries.values().filter(|e| e.covered_files.contains(&"out".to_string())).collect();
     assert_eq!(covering.len(), 2, "every entry covering an input must cover the output, or zero-hit pruning could drop rows it holds");
     assert!(covering.iter().all(|e| !e.ordinals_valid), "row ordinals are per-file positions; the output's are not the inputs'");
@@ -765,31 +719,19 @@ async fn carry_forward_covers_a_rewrite_only_when_every_input_was_covered() {
 /// them against the wrong file — so the survivor gives them up.
 #[tokio::test]
 async fn gc_keeps_a_multi_file_entry_for_its_surviving_files() {
-    let (table_name, project_id) = ("otel_logs_and_spans", "p1");
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
+    let env = Env::zstd3("otel_logs_and_spans", "p1");
     // Two added files in ONE commit => one entry covering both.
-    svc.clone().batch_callback()(
-        project_id.into(),
-        table_name.into(),
-        vec![batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR")])],
-        vec!["file_a".into(), "file_b".into()],
-    )
-    .await
-    .unwrap();
+    env.publish(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR")], &["file_a", "file_b"]).await;
 
-    let report = svc.gc_after_compaction(table_name, project_id, &["file_b".to_string()]).await.unwrap();
-    assert_eq!(report.entries_removed, 0, "file_b is still live, so its entry must survive");
-    let m = load_manifest(store.as_ref(), table_name, project_id).await.unwrap();
+    assert_eq!(env.gc(&["file_b"]).await.entries_removed, 0, "file_b is still live, so its entry must survive");
+    let m = env.manifest().await;
     let e = m.entries.values().next().expect("entry kept");
     assert_eq!(e.covered_files, vec!["file_b".to_string()], "the departed file must be pruned from covered_files");
     assert!(!e.ordinals_valid, "a pruned entry's ordinals no longer address its remaining file");
 
     // Last member gone => nothing left to cover, entry and blob go.
-    let report = svc.gc_after_compaction(table_name, project_id, &[]).await.unwrap();
-    assert_eq!(report.entries_removed, 1, "an entry with no live covered file is stale");
-    assert!(load_manifest(store.as_ref(), table_name, project_id).await.unwrap().entries.is_empty());
+    assert_eq!(env.gc(&[]).await.entries_removed, 1, "an entry with no live covered file is stale");
+    assert!(env.manifest().await.entries.is_empty());
 }
 
 #[tokio::test]
@@ -799,31 +741,24 @@ async fn search_time_prunes_non_overlapping_indexes() {
     // this is the fix for the cold-old-data latency cliff. With no window, both
     // are searched (today's behavior). Correctness: a pruned index only covers
     // rows outside the window, which the query's timestamp filter excludes.
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p1";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.batch_callback();
+    let env = Env::zstd3("otel_logs_and_spans", "p1");
 
     let old_ts = 1_000_000_000i64; // ~16:40 1970
     let new_ts = 2_000_000_000_000i64; // ~2033 — far from the old window
-    cb(project_id.into(), table_name.into(), vec![batch(&[(old_ts, "old1", "ERROR")])], vec!["uri-old".into()]).await.unwrap();
-    cb(project_id.into(), table_name.into(), vec![batch(&[(new_ts, "new1", "ERROR")])], vec!["uri-new".into()]).await.unwrap();
-
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
+    env.publish(&[(old_ts, "old1", "ERROR")], &["uri-old"]).await;
+    env.publish(&[(new_ts, "new1", "ERROR")], &["uri-new"]).await;
 
     // Window around the OLD index only → prune the NEW one.
-    let r = search
-        .search_with_stats(table_name, project_id, &level_error_node(), 1000, Some((old_ts - 100, old_ts + 100)))
+    let r = env
+        .search
+        .search_with_stats(env.table, env.project, &level_error_node(), 1000, Some((old_ts - 100, old_ts + 100)))
         .await
         .unwrap()
         .expect("old index overlaps → usable");
     assert_eq!(r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec!["old1".to_string()], "time-pruning must return only the overlapping index's hits");
 
     // No range → both indexes searched (unchanged behavior).
-    let r_all = search.search_with_stats(table_name, project_id, &level_error_node(), 1000, None).await.unwrap().unwrap();
+    let r_all = env.search.search_with_stats(env.table, env.project, &level_error_node(), 1000, None).await.unwrap().unwrap();
     let mut all: Vec<String> = r_all.hits.iter().map(|h| h.id.clone()).collect();
     all.sort();
     assert_eq!(all, vec!["new1".to_string(), "old1".to_string()], "no range must search all indexes");
@@ -833,22 +768,13 @@ async fn search_time_prunes_non_overlapping_indexes() {
 async fn search_skips_indexes_that_dont_have_the_field() {
     // An older index won't have a newly-added field. search() must not error;
     // it should simply skip those indexes and return hits from the others.
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p1";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
-    let cb = svc.batch_callback();
-    let b = batch(&[(1_000_000, "a", "INFO")]);
-    cb(project_id.into(), table_name.into(), vec![b], vec!["uri".into()]).await.unwrap();
+    let env = Env::zstd3("otel_logs_and_spans", "p1");
+    env.publish(&[(1_000_000, "a", "INFO")], &["uri"]).await;
 
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(TantivyConfig::default()));
     // Querying a field that isn't tantivy-indexed (context___trace_state has no
     // `tantivy:` config) yields no usable index → None. NB: parent_id/id/trace_id
     // ARE indexed now (P0 equality routing), so this uses a still-unindexed field.
-    let hits = search.search(table_name, project_id, "context___trace_state", "anything").await.unwrap();
-    assert!(hits.is_none());
+    assert!(env.hits("context___trace_state", "anything").await.is_none());
 }
 
 #[tokio::test]
@@ -858,24 +784,18 @@ async fn a_fat_needle_aborts_before_materializing_hits() {
     // materialized whole per-index hit vectors (TopDocs cap 1M, doc-store read
     // per hit) before the cumulative max_hits abort threw the work away. The
     // abort verdict must be reached by counting, not by materializing O(hits).
-    let table_name = "otel_logs_and_spans";
-    let project_id = "p-fatneedle";
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(prod_defaults())));
-    let cb = svc.batch_callback();
+    let env = Env::prod("otel_logs_and_spans", "p-fatneedle");
     let rows: Vec<(i64, String, &str)> = (0..50).map(|i| (1_000_000 + i as i64, format!("id-{i}"), "ERROR")).collect();
     let rows_ref: Vec<(i64, &str, &str)> = rows.iter().map(|(t, id, l)| (*t, id.as_str(), *l)).collect();
-    cb(project_id.to_string(), table_name.to_string(), vec![batch(&rows_ref)], vec!["fat-uri".into()]).await.unwrap();
+    env.publish(&rows_ref, &["fat-uri"]).await;
 
-    let cache = TempDir::new().unwrap();
-    let search = TantivySearchService::new(store, cache.path().to_path_buf(), Arc::new(prod_defaults()));
-    let r = search.search_with_stats(table_name, project_id, &level_error_node(), 10, None).await.unwrap();
+    let r = env.search.search_with_stats(env.table, env.project, &level_error_node(), 10, None).await.unwrap();
     assert!(r.is_none(), "an over-cap needle must abort the prefilter");
-    let materialized = search.stats.hits_materialized.load(Relaxed);
+    let materialized = env.search.stats.hits_materialized.load(Relaxed);
     assert!(materialized <= 22, "abort must not materialize O(total hits); materialized {materialized} for cap 10");
 
     // And a selective needle on the same index still completes untruncated.
     let node = timefusion::tantivy::udf::PredNode::Leaf(TextMatchPred { column: "id".into(), query: "id-7".into() });
-    let r = search.search_with_stats(table_name, project_id, &node, 10, None).await.unwrap().expect("usable");
+    let r = env.search.search_with_stats(env.table, env.project, &node, 10, None).await.unwrap().expect("usable");
     assert_eq!(r.hits.len(), 1);
 }

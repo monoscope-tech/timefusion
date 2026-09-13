@@ -45,6 +45,7 @@ mod query_pool_insert {
 
     use anyhow::Result;
     use serial_test::serial;
+    use test_case::test_case;
     use timefusion::{config::AppConfig, database::Database, support::test_helpers::minio_test_config};
 
     /// Rows per INSERT, and INSERTs run concurrently — the ~30-writer shape of
@@ -120,21 +121,15 @@ mod query_pool_insert {
 
     /// The answer this file exists for: concurrent INSERTs leave the query pool
     /// untouched, so the pool's policy cannot bounce them.
+    ///
+    /// `buffered` = prod's route (`use_queue=buffered_layer`); `direct` = the
+    /// direct-to-Delta fallback, which does strictly MORE DataFusion work than
+    /// prod's buffered route — it commits the staged write inline.
+    #[test_case(true ; "buffered")]
+    #[test_case(false ; "direct")]
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_buffered_insert_does_not_reserve_from_the_query_pool() -> Result<()> {
-        assert_insert_reserves_nothing(true).await
-    }
-
-    /// The direct-to-Delta fallback, which does strictly MORE DataFusion work
-    /// than prod's buffered route — it commits the staged write inline.
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_direct_insert_does_not_reserve_from_the_query_pool() -> Result<()> {
-        assert_insert_reserves_nothing(false).await
-    }
-
-    async fn assert_insert_reserves_nothing(buffered: bool) -> Result<()> {
+    async fn a_insert_does_not_reserve_from_the_query_pool(buffered: bool) -> Result<()> {
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let db = fair_spill_db(&test_id, buffered).await?;
         // `insert_records_batch` branches on exactly this, so pin the route

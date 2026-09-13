@@ -7,7 +7,7 @@ mod integration {
     use serial_test::serial;
     use timefusion::{database::Database, support::test_helpers::minio_test_config};
     use tokio::sync::Notify;
-    use tokio_postgres::{Client, NoTls};
+    use tokio_postgres::{Client, NoTls, types::ToSql};
     use uuid::Uuid;
 
     struct TestServer {
@@ -83,11 +83,22 @@ mod integration {
 
         fn insert_sql() -> String {
             format!(
-                "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) 
+                "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary)
                  VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[]::text[], $7)",
                 chrono::Utc::now().date_naive(),
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
             )
+        }
+
+        /// One row into `test_project` with level=INFO and empty hashes; every
+        /// other column stays an explicit argument so no case loses its literal.
+        async fn insert_row(client: &Client, id: &str, name: &str, status_code: &str, status_message: &str, summary: &str) -> Result<()> {
+            client.execute(&Self::insert_sql(), &[&"test_project", &id, &name, &status_code, &status_message, &"INFO", &vec![summary.to_string()]]).await?;
+            Ok(())
+        }
+
+        async fn count(client: &Client, filter: &str, params: &[&(dyn ToSql + Sync)]) -> Result<i64> {
+            Ok(client.query_one(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE {filter}"), params).await?.get(0))
         }
     }
 
@@ -102,15 +113,10 @@ mod integration {
     async fn test_postgres_integration() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
-        let insert = TestServer::insert_sql();
 
-        client
-            .execute(&insert, &[&"test_project", &server.test_id, &"test_span_name", &"OK", &"Test integration", &"INFO", &vec!["Integration test summary"]])
-            .await?;
+        TestServer::insert_row(&client, &server.test_id, "test_span_name", "OK", "Test integration", "Integration test summary").await?;
 
-        let count: i64 =
-            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &server.test_id]).await?.get(0);
-        assert_eq!(count, 1);
+        assert_eq!(TestServer::count(&client, "project_id = $1 AND id = $2", &[&"test_project", &server.test_id]).await?, 1);
 
         let row = client
             .query_one("SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &server.test_id])
@@ -120,24 +126,11 @@ mod integration {
 
         // Batch insert
         for i in 0..5 {
-            client
-                .execute(
-                    &insert,
-                    &[
-                        &"test_project",
-                        &Uuid::new_v4().to_string(),
-                        &format!("batch_span_{i}"),
-                        &"OK",
-                        &format!("Batch test {i}"),
-                        &"INFO",
-                        &vec![format!("Batch test summary {i}")],
-                    ],
-                )
-                .await?;
+            let id = Uuid::new_v4().to_string();
+            TestServer::insert_row(&client, &id, &format!("batch_span_{i}"), "OK", &format!("Batch test {i}"), &format!("Batch test summary {i}")).await?;
         }
 
-        let total: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
-        assert_eq!(total, 6);
+        assert_eq!(TestServer::count(&client, "project_id = $1", &[&"test_project"]).await?, 6);
 
         // Targeted column selection — keeps the test focused on a specific row's
         // typed columns. VariantSelectRewriter already serializes Variant columns
@@ -154,10 +147,9 @@ mod integration {
     async fn test_update_operations() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
-        let insert = TestServer::insert_sql();
 
         let span_id = Uuid::new_v4().to_string();
-        client.execute(&insert, &[&"test_project", &span_id, &"original_name", &"OK", &"Original message", &"INFO", &vec!["Original summary"]]).await?;
+        TestServer::insert_row(&client, &span_id, "original_name", "OK", "Original message", "Original summary").await?;
 
         client
             .execute(
@@ -189,21 +181,17 @@ mod integration {
 
         for i in 0..3 {
             let status = if i % 2 == 0 { "OK" } else { "ERROR" };
-            client.execute(&insert, &[&"test_project", &format!("update_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]]).await?;
+            TestServer::insert_row(&client, &format!("update_test_{i}"), "test", status, "Message", "Summary").await?;
         }
 
         client
             .execute("UPDATE otel_logs_and_spans SET hashes = make_array($1) WHERE project_id = $2 AND status_code = $3", &[&"SUCCESS", &"test_project", &"OK"])
             .await?;
 
-        let count: i64 = client
-            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND array_element(hashes, 1) = $2", &[&"test_project", &"SUCCESS"])
-            .await?
-            .get(0);
         // THREE, not two: `status_code` is immutable now, so the multi-field
         // UPDATE above no longer flips the first span away from 'OK' and it is
         // caught by this conditional UPDATE too.
-        assert_eq!(count, 3);
+        assert_eq!(TestServer::count(&client, "project_id = $1 AND array_element(hashes, 1) = $2", &[&"test_project", &"SUCCESS"]).await?, 3);
 
         Ok(())
     }
@@ -213,21 +201,14 @@ mod integration {
     async fn test_delete_operations() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
-        let insert = TestServer::insert_sql();
 
         let span_id = Uuid::new_v4().to_string();
-        client.execute(&insert, &[&"test_project", &span_id, &"to_delete", &"OK", &"Message", &"INFO", &vec!["Summary"]]).await?;
-
-        let count: i64 =
-            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?.get(0);
-        assert_eq!(count, 1);
+        TestServer::insert_row(&client, &span_id, "to_delete", "OK", "Message", "Summary").await?;
+        assert_eq!(TestServer::count(&client, "project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?, 1);
 
         // Delete the record
         client.execute("DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
-
-        let count: i64 =
-            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?.get(0);
-        assert_eq!(count, 0);
+        assert_eq!(TestServer::count(&client, "project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?, 0);
 
         for i in 0..4 {
             let status = match i % 3 {
@@ -235,18 +216,14 @@ mod integration {
                 1 => "ERROR",
                 _ => "WARNING",
             };
-            client.execute(&insert, &[&"test_project", &format!("delete_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]]).await?;
+            TestServer::insert_row(&client, &format!("delete_test_{i}"), "test", status, "Message", "Summary").await?;
         }
 
         // Delete all ERROR records
         client.execute("DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2", &[&"test_project", &"ERROR"]).await?;
 
-        let error_count: i64 =
-            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2", &[&"test_project", &"ERROR"]).await?.get(0);
-        assert_eq!(error_count, 0);
-
-        let total_count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
-        assert_eq!(total_count, 3);
+        assert_eq!(TestServer::count(&client, "project_id = $1 AND status_code = $2", &[&"test_project", &"ERROR"]).await?, 0);
+        assert_eq!(TestServer::count(&client, "project_id = $1", &[&"test_project"]).await?, 3);
 
         Ok(())
     }
@@ -284,23 +261,20 @@ mod integration {
             )
             .await?;
 
+        async fn attributes(client: &Client, id: &str, tail: &str) -> Result<serde_json::Value> {
+            let sql = format!("SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2 {tail}");
+            Ok(client.query_one(&sql, &[&"test_project", &id]).await?.get(0))
+        }
+
         // Bare projection: hits wrap_root_projection's Projection arm directly.
         // Bare Variant columns surface as jsonb (OID 3802), decoded binary as serde_json::Value
         // (see jsonb_oid_test::bare_variant_column_returns_jsonb_oid for the wire contract).
-        let row = client.query_one("SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
-        let parsed: serde_json::Value = row.get(0);
+        let parsed = attributes(&client, &span_id, "").await?;
         assert_eq!(parsed["http"]["method"], "GET");
         assert_eq!(parsed["user"], "alice");
 
         // Sort/Limit peel path: VariantSelectRewriter must wrap through Sort+Limit.
-        let row = client
-            .query_one(
-                "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2 \
-                 ORDER BY timestamp DESC LIMIT 1",
-                &[&"test_project", &span_id],
-            )
-            .await?;
-        let parsed: serde_json::Value = row.get(0);
+        let parsed = attributes(&client, &span_id, "ORDER BY timestamp DESC LIMIT 1").await?;
         assert_eq!(parsed["http"]["status"], 200, "Sort+Limit path must round-trip variant as jsonb");
 
         Ok(())

@@ -8,7 +8,6 @@ use arrow::{
     array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray},
     datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
 };
-use chrono::Utc;
 use object_store::memory::InMemory;
 use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
 use tempfile::TempDir;
@@ -55,6 +54,13 @@ fn table() -> TableSchema {
             },
         ],
     }
+}
+
+/// A manifest entry with everything not under test left at its derived default
+/// (`schema_version` defaults to `SCHEMA_VERSION`). Override the rest with
+/// struct-update syntax at the call site.
+fn entry(index: Option<&str>, rows: u64, error: Option<&str>) -> ManifestEntry {
+    ManifestEntry { index: index.map(Into::into), rows, error: error.map(Into::into), ..Default::default() }
 }
 
 fn batch() -> RecordBatch {
@@ -193,39 +199,14 @@ async fn manifest_load_default_when_missing() {
 #[tokio::test]
 async fn manifest_upsert_and_remove_roundtrip() {
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let entry = ManifestEntry {
-        element_fields: Default::default(),
-        index: Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst".into()),
-        rows: 100,
-        built_at: Utc::now(),
-        schema_version: SCHEMA_VERSION,
+    let built = ManifestEntry {
         min_timestamp_micros: Some(1_000_000),
         max_timestamp_micros: Some(2_000_000),
-        error: None,
         covered_files: vec!["part-uuid-1.parquet".into()],
-        ordinals_valid: false,
+        ..entry(Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst"), 100, None)
     };
-    upsert_manifest(store_obj.as_ref(), "logs", "proj1", "part-uuid-1.parquet", entry.clone()).await.expect("upsert 1");
-    upsert_manifest(
-        store_obj.as_ref(),
-        "logs",
-        "proj1",
-        "part-uuid-2.parquet",
-        ManifestEntry {
-            element_fields: Default::default(),
-            index: None,
-            rows: 0,
-            built_at: Utc::now(),
-            schema_version: 1,
-            min_timestamp_micros: None,
-            max_timestamp_micros: None,
-            error: Some("boom".into()),
-            covered_files: vec![],
-            ordinals_valid: false,
-        },
-    )
-    .await
-    .expect("upsert 2");
+    upsert_manifest(store_obj.as_ref(), "logs", "proj1", "part-uuid-1.parquet", built).await.expect("upsert 1");
+    upsert_manifest(store_obj.as_ref(), "logs", "proj1", "part-uuid-2.parquet", entry(None, 0, Some("boom"))).await.expect("upsert 2");
 
     let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.unwrap();
     assert_eq!(m.entries.len(), 2);
@@ -244,54 +225,13 @@ async fn concurrent_upserts_last_writer_wins() {
     // is the documented behavior; both writes must produce a valid manifest
     // (no corruption), and the final manifest must contain at least one entry.
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let s1 = store_obj.clone();
-    let s2 = store_obj.clone();
-    let (r1, r2) = tokio::join!(
-        tokio::spawn(async move {
-            upsert_manifest(
-                s1.as_ref(),
-                "logs",
-                "proj1",
-                "part-uuid-A.parquet",
-                ManifestEntry {
-                    element_fields: Default::default(),
-                    index: Some("a".into()),
-                    rows: 1,
-                    built_at: Utc::now(),
-                    schema_version: 1,
-                    min_timestamp_micros: None,
-                    max_timestamp_micros: None,
-                    error: None,
-                    covered_files: vec![],
-                    ordinals_valid: false,
-                },
-            )
-            .await
-        }),
-        tokio::spawn(async move {
-            upsert_manifest(
-                s2.as_ref(),
-                "logs",
-                "proj1",
-                "part-uuid-B.parquet",
-                ManifestEntry {
-                    element_fields: Default::default(),
-                    index: Some("b".into()),
-                    rows: 2,
-                    built_at: Utc::now(),
-                    schema_version: 1,
-                    min_timestamp_micros: None,
-                    max_timestamp_micros: None,
-                    error: None,
-                    covered_files: vec![],
-                    ordinals_valid: false,
-                },
-            )
-            .await
-        }),
-    );
-    r1.unwrap().unwrap();
-    r2.unwrap().unwrap();
+    let writers = [("part-uuid-A.parquet", "a", 1u64), ("part-uuid-B.parquet", "b", 2)].map(|(key, blob, rows)| {
+        let s = store_obj.clone();
+        tokio::spawn(async move { upsert_manifest(s.as_ref(), "logs", "proj1", key, entry(Some(blob), rows, None)).await })
+    });
+    for w in writers {
+        w.await.unwrap().unwrap();
+    }
     let m = load_manifest(store_obj.as_ref(), "logs", "proj1").await.unwrap();
     // At least one of them survived. Race is acceptable; corruption is not.
     assert!(!m.entries.is_empty());

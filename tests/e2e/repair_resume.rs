@@ -49,6 +49,26 @@ async fn footerless_partition(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
     Ok(files)
 }
 
+/// The fixture wiring every test here needs: every flush output lands unsorted
+/// and already "converged", so the repair path is the only thing that would
+/// ever rewrite it. `resume` flips the kill switch under test.
+async fn repair_env(resume: bool) -> anyhow::Result<E2eEnv> {
+    let b = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(60))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_optimize_sort_by()
+        .with_sort_skip_bytes(0)
+        .with_light_optimize_target(1024);
+    let env = if resume { b.with_repair_resume() } else { b }.start().await?;
+    env.db().cancel_maintenance();
+    Ok(env)
+}
+
+async fn row_count(env: &E2eEnv) -> anyhow::Result<i64> {
+    let client = env.pg_client().await?;
+    Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&PROJECT]).await?.get(0))
+}
+
 async fn live_files(env: &E2eEnv) -> anyhow::Result<Vec<String>> {
     let table_ref = env.db().resolve_table(PROJECT, TABLE).await?;
     let t = table_ref.read().await;
@@ -107,24 +127,10 @@ fn live_manifest_entries(env: &E2eEnv) -> usize {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> anyhow::Result<()> {
-    let mut env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(60))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
-        // Every flush output lands unsorted and already "converged", so the
-        // repair path is the only thing that would ever rewrite it.
-        .with_sort_skip_bytes(0)
-        .with_light_optimize_target(1024)
-        .with_repair_resume()
-        .start()
-        .await?;
-    env.db().cancel_maintenance();
+    let mut env = repair_env(true).await?;
 
     let before = footerless_partition(&env).await?;
-    let rows_before: i64 = {
-        let client = env.pg_client().await?;
-        client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&PROJECT]).await?.get(0)
-    };
+    let rows_before = row_count(&env).await?;
 
     // The rewrite that gets killed: staged parquet on S3, an intent line on
     // disk, no commit.
@@ -163,9 +169,7 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
 
     // Row preservation, end to end. This is the whole point: the rewrite was
     // done before the crash, and committing it must change nothing logically.
-    let client = env.pg_client().await?;
-    let rows_after: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&PROJECT]).await?.get(0);
-    assert_eq!(rows_after, rows_before, "a resumed repair is data-preserving — it must not lose or duplicate a row");
+    assert_eq!(row_count(&env).await?, rows_before, "a resumed repair is data-preserving — it must not lose or duplicate a row");
 
     // A resumed file must be an ordinary compaction output, not a special case:
     // let the rest of the partition repair normally on top of it.
@@ -173,8 +177,7 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
     for _ in 0..before.len() {
         env.db().optimize_table_light(&table_ref, TABLE, TailPass::Pack).await?;
     }
-    let rows_end: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&PROJECT]).await?.get(0);
-    assert_eq!(rows_end, rows_before, "the follow-up repairs must not lose or duplicate a row either");
+    assert_eq!(row_count(&env).await?, rows_before, "the follow-up repairs must not lose or duplicate a row either");
     Ok(())
 }
 
@@ -186,16 +189,7 @@ async fn a_repair_pass_commits_the_bin_a_killed_process_had_already_staged() -> 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_staged_bin_whose_inputs_were_rewritten_is_declined_and_reclaimed() -> anyhow::Result<()> {
-    let mut env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(60))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
-        .with_sort_skip_bytes(0)
-        .with_light_optimize_target(1024)
-        .with_repair_resume()
-        .start()
-        .await?;
-    env.db().cancel_maintenance();
+    let mut env = repair_env(true).await?;
 
     let before = footerless_partition(&env).await?;
     let first = abandon_one_bin(&env).await?;
@@ -228,15 +222,7 @@ async fn a_staged_bin_whose_inputs_were_rewritten_is_declined_and_reclaimed() ->
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_is_a_no_op_while_the_kill_switch_is_off() -> anyhow::Result<()> {
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(60))
-        .with_retention(Duration::from_secs(60 * 60))
-        .with_optimize_sort_by()
-        .with_sort_skip_bytes(0)
-        .with_light_optimize_target(1024)
-        .start()
-        .await?;
-    env.db().cancel_maintenance();
+    let env = repair_env(false).await?;
 
     footerless_partition(&env).await?;
     abandon_one_bin(&env).await?;

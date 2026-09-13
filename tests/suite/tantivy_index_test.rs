@@ -15,6 +15,7 @@ use tantivy::{
     query::{BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery},
     schema::IndexRecordOption,
 };
+use test_case::test_case;
 use timefusion::{
     schema::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
     tantivy::{
@@ -92,9 +93,12 @@ fn small_table() -> TableSchema {
     }
 }
 
+/// (timestamp, id, level, message, summary, body_json, attrs_json) — an empty
+/// JSON string means a null variant.
 #[allow(clippy::type_complexity)]
-fn batch(rows: &[(i64, &str, &str, &str, Vec<&str>, &str, &str)]) -> RecordBatch {
-    // (timestamp, id, level, message, summary, body_json, attrs_json)
+type Row<'a> = (i64, &'a str, &'a str, &'a str, Vec<&'a str>, &'a str, &'a str);
+
+fn batch(rows: &[Row<'_>]) -> RecordBatch {
     let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.0).collect::<Vec<_>>()).with_timezone("UTC"));
     let id: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>()));
     let level: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>()));
@@ -178,6 +182,26 @@ fn build_variant(jsons: Vec<&str>) -> ArrayRef {
     Arc::new(StructArray::new(new_fields.into(), new_cols, nulls)) as ArrayRef
 }
 
+/// Row c carries an empty summary list and null variants; its message mentions
+/// "timeout" so a body query for it must NOT match c (text in another field
+/// must not create a body match).
+fn corpus() -> Vec<Row<'static>> {
+    vec![
+        (1_000_000, "a", "INFO", "hello world", vec!["alpha", "beta", "greeting"], r#"{"msg":"timeout occurred"}"#, r#"{"http":{"status":"200"}}"#),
+        (2_000_000, "b", "ERROR", "panic on shutdown", vec!["gamma", "fatal", "shutdown"], r#"{"msg":"db connection lost"}"#, r#"{"http":{"status":"500"}}"#),
+        (3_000_000, "c", "INFO", "goodbye world timeout", vec![], "", ""),
+    ]
+}
+
+/// Three batches instead of one: the first two are *sliced* (non-zero offset
+/// into shared buffers), and the third prepares its own variant columns and is
+/// entirely null in them.
+fn corpus_batches() -> Vec<RecordBatch> {
+    let rows = corpus();
+    let ab = batch(&rows[0..2]);
+    vec![ab.slice(0, 1), ab.slice(1, 1), batch(&rows[2..3])]
+}
+
 #[test]
 fn schema_build_emits_reserved_and_user_fields() {
     let table = small_table();
@@ -189,98 +213,54 @@ fn schema_build_emits_reserved_and_user_fields() {
     }
 }
 
+/// One 3-row batch: stats, a raw-tokenizer term query, and a timestamp range
+/// ANDed with a term.
 #[test]
-fn build_and_query_term_and_phrase() {
+fn build_and_query_term_range_and_boolean() {
     let table = small_table();
-    let b = batch(&[
-        (1_000_000, "a", "INFO", "hello world", vec!["greeting"], r#"{"msg":"timeout occurred"}"#, r#"{"http":{"status":"200"}}"#),
-        (2_000_000, "b", "ERROR", "panic on shutdown", vec!["fatal", "shutdown"], r#"{"msg":"db connection lost"}"#, r#"{"http":{"status":"500"}}"#),
-        (3_000_000, "c", "INFO", "goodbye world", vec!["greeting"], r#"{"msg":"clean exit"}"#, r#"{"http":{"status":"200"}}"#),
-    ]);
+    let b = batch(&corpus());
     let (idx, built, stats) = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
-    assert_eq!(stats.rows, 3);
+    assert_eq!((stats.batches, stats.rows), (1, 3), "single batch, all rows indexed");
     assert_eq!(stats.min_timestamp_micros, Some(1_000_000));
     assert_eq!(stats.max_timestamp_micros, Some(3_000_000));
 
     // Term query on raw-tokenizer field (level = ERROR)
-    let level_field = built.user_fields.get("level").unwrap().field;
-    let q = TermQuery::new(Term::from_field_text(level_field, "ERROR"), IndexRecordOption::Basic);
+    let level = built.user_fields.get("level").unwrap().field;
+    let q = TermQuery::new(Term::from_field_text(level, "ERROR"), IndexRecordOption::Basic);
     let hits = query_index(&idx, &q, None).unwrap();
     assert_eq!(hits, vec![Hit { timestamp_micros: 2_000_000, id: "b".into(), row_ordinal: Some(1) }]);
 
-    // Phrase via QueryParser on default-tokenizer field (message)
-    let msg_field = built.user_fields.get("message").unwrap().field;
-    let qp = QueryParser::for_index(&idx, vec![msg_field]);
-    let q = qp.parse_query("\"panic on shutdown\"").unwrap();
-    let hits = query_index(&idx, &*q, None).unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, "b");
-}
-
-#[test]
-fn query_timestamp_range_and_boolean() {
-    let table = small_table();
-    let b =
-        batch(&[(1_000_000, "a", "INFO", "x", vec![], "", ""), (2_000_000, "b", "ERROR", "y", vec![], "", ""), (3_000_000, "c", "INFO", "z", vec![], "", "")]);
-    let (idx, built, _) = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
-    let ts = built.timestamp;
-    let level = built.user_fields.get("level").unwrap().field;
-
     let range = RangeQuery::new_i64("_timestamp".to_string(), 1_500_000..3_500_000);
-    let _ = ts;
     let info = TermQuery::new(Term::from_field_text(level, "INFO"), IndexRecordOption::Basic);
     let combined = BooleanQuery::new(vec![(Occur::Must, Box::new(range)), (Occur::Must, Box::new(info))]);
     let hits = query_index(&idx, &combined, None).unwrap();
-    let ids: Vec<_> = hits.iter().map(|h| h.id.as_str()).collect();
-    assert_eq!(ids, vec!["c"]);
+    assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["c"]);
 }
 
 #[test]
-fn variant_kv_flatten_indexes_status_value() {
-    let table = small_table();
-    let b = batch(&[
-        (1_000_000, "a", "INFO", "x", vec![], r#"{"msg":"hello"}"#, r#"{"http":{"status":"200"}}"#),
-        (2_000_000, "b", "ERROR", "y", vec![], r#"{"msg":"oops"}"#, r#"{"http":{"status":"500"}}"#),
-    ]);
-    let (idx, built, _) = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
-    let attrs = built.user_fields.get("attributes").unwrap().field;
-    // kv flatten emits "http.status:500" — query for "500" should match the second row.
-    let qp = QueryParser::for_index(&idx, vec![attrs]);
-    let q = qp.parse_query("500").unwrap();
-    let hits = query_index(&idx, &*q, None).unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, "b");
-}
-
-#[test]
-fn variant_json_flatten_full_text() {
-    let table = small_table();
-    let b = batch(&[
-        (1_000_000, "a", "INFO", "x", vec![], r#"{"msg":"timeout occurred"}"#, ""),
-        (2_000_000, "b", "ERROR", "y", vec![], r#"{"msg":"db connection lost"}"#, ""),
-    ]);
-    // Each batch prepares its own variant columns, including an entirely
-    // null batch. Text in another field must not create a body match.
-    let inputs = [b.slice(0, 1), b.slice(1, 1), batch(&[(3_000_000, "c", "INFO", "timeout", vec![], "", "")])];
-    let (idx, built, stats) = build_in_memory(&table, &inputs).unwrap();
+fn multi_batch_indexes_sliced_and_null_variant_batches() {
+    let (_, _, stats) = build_in_memory(&small_table(), &corpus_batches()).unwrap();
     assert_eq!((stats.batches, stats.rows), (3, 3));
-    let body = built.user_fields.get("body").unwrap().field;
-    let qp = QueryParser::for_index(&idx, vec![body]);
-    let q = qp.parse_query("timeout").unwrap();
-    let hits = query_index(&idx, &*q, None).unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, "a");
 }
 
-#[test]
-fn list_utf8_is_joined_and_searchable() {
+// QueryParser over a single user field of the multi-batch corpus; returns the
+// matching ids, sorted and comma-joined.
+// `summary` is List(Utf8) joined into one searchable text field.
+// `attributes` uses kv flatten, which emits "http.status:500" — so "500" matches.
+// `body` uses json flatten (full text over the JSON).
+#[test_case("message", "\"panic on shutdown\"" => "b" ; "phrase on default tokenizer")]
+#[test_case("message", "world" => "a,c" ; "term matching two rows")]
+#[test_case("body", "timeout" => "a" ; "variant json flatten full text")]
+#[test_case("attributes", "500" => "b" ; "variant kv flatten indexes status value")]
+#[test_case("attributes", "200" => "a" ; "variant kv flatten other status")]
+#[test_case("summary", "beta" => "a" ; "list utf8 joined and searchable")]
+#[test_case("summary", "gamma" => "b" ; "list utf8 second row")]
+fn parsed_query_matches(field: &str, query: &str) -> String {
     let table = small_table();
-    let b = batch(&[(1_000_000, "a", "INFO", "x", vec!["alpha", "beta"], "", ""), (2_000_000, "b", "INFO", "y", vec!["gamma"], "", "")]);
-    let (idx, built, _) = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
-    let summary = built.user_fields.get("summary").unwrap().field;
-    let qp = QueryParser::for_index(&idx, vec![summary]);
-    let q = qp.parse_query("beta").unwrap();
-    let hits = query_index(&idx, &*q, None).unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, "a");
+    let (idx, built, _) = build_in_memory(&table, &corpus_batches()).unwrap();
+    let f = built.user_fields.get(field).unwrap().field;
+    let q = QueryParser::for_index(&idx, vec![f]).parse_query(query).unwrap();
+    let mut ids: Vec<String> = query_index(&idx, &*q, None).unwrap().iter().map(|h| h.id.to_string()).collect();
+    ids.sort();
+    ids.join(",")
 }

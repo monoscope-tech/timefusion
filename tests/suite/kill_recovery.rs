@@ -291,27 +291,74 @@ async fn count_after_restart(tf: &Tf, project: &str) -> Result<i64> {
     Err(last)
 }
 
+/// Rows the server ACKED, per project — the only rows carrying a durability
+/// promise. Rows rejected with an error are the producer's DLQ problem.
+type Acked = Vec<(String, usize)>;
+
+/// The crash drill every case below shares: `writer` does the inserts and
+/// reports what was acked; the acked rows must be readable pre-kill, survive a
+/// SIGKILL (no destructors, no flush, no cursor persist — the faithful OOM),
+/// and come back in full after a restart against the same WAL. `kill_delay`
+/// lets a case land the kill inside a specific window (e.g. mid flush-cycle).
+async fn crash_drill(name: &str, opts: TfOpts, kill_delay: Option<Duration>, writer: impl AsyncFnOnce(&Tf) -> Result<Acked>) -> Result<()> {
+    let mut tf = Tf::start(name, opts).await?;
+    let acked = writer(&tf).await?;
+    let total: usize = acked.iter().map(|(_, n)| n).sum();
+    assert!(total > 0, "every insert was rejected; test proves nothing");
+
+    // The readable count must equal exactly what was acked: an ack that
+    // produced no row is silent loss; a row from a rejected insert is a
+    // phantom write.
+    let client = tf.connect().await?;
+    for (p, n) in &acked {
+        let readable = count_rows(&client, p).await?;
+        assert_eq!(readable, *n as i64, "ack/persist mismatch for {p}: acked={n}, readable={readable} — a success tag was returned for rows that never landed");
+    }
+    drop(client);
+
+    if let Some(d) = kill_delay {
+        tokio::time::sleep(d).await;
+    }
+    tf.kill9()?;
+    tf.restart().await?;
+
+    let mut lost = Vec::new();
+    for (p, n) in &acked {
+        let after = count_after_restart(&tf, p).await?;
+        if after != *n as i64 {
+            lost.push(format!("{p}: {after}/{n}"));
+        }
+    }
+    assert!(lost.is_empty(), "ACKED WRITE LOST across SIGKILL (survived/acked): {lost:?} — WAL replay did not restore them");
+    Ok(())
+}
+
+/// `rounds` × `rows` inserts of `PROJECT` from one connection. With `tolerate`,
+/// an Err is explicit backpressure — which the producer DLQs — so it is counted
+/// out instead of failing the test; without it, any error is a failure.
+async fn insert_rounds(tf: &Tf, tag: &str, rounds: usize, rows: usize, tolerate: bool) -> Result<Acked> {
+    let client = tf.connect().await?;
+    let ts = chrono::Utc::now().timestamp_micros();
+    let mut acked = 0usize;
+    for round in 0..rounds {
+        match insert_rows(&client, PROJECT, &format!("{tag}{round}"), rows, ts).await {
+            Ok(()) => acked += rows,
+            Err(e) => {
+                if !tolerate {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Ok(vec![(PROJECT.to_string(), acked)])
+}
+
 /// CASE 1 — the incident in its simplest form. Rows acked into WAL+MemBuffer,
 /// nothing flushed, process SIGKILLed. WAL replay must restore every acked row.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill() -> Result<()> {
-    let mut tf = Tf::start("baseline", TfOpts::default()).await?;
-    let client = tf.connect().await?;
-    let ts = chrono::Utc::now().timestamp_micros();
-
-    const N: usize = 500;
-    insert_rows(&client, PROJECT, "base", N, ts).await?;
-    let before = count_rows(&client, PROJECT).await?;
-    assert_eq!(before, N as i64, "rows not visible even before the kill");
-
-    drop(client);
-    tf.kill9()?;
-    tf.restart().await?;
-
-    let after = count_after_restart(&tf, PROJECT).await?;
-    assert_eq!(after, N as i64, "ACKED WRITE LOST: {N} rows acked, {after} survived SIGKILL — WAL replay did not restore them");
-    Ok(())
+    crash_drill("baseline", TfOpts::default(), None, async |tf| insert_rounds(tf, "base", 1, 500, false).await).await
 }
 
 /// CASE 2 — kill while a background flush is in flight. Reproduces the prod
@@ -321,28 +368,12 @@ async fn acked_rows_survive_sigkill() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill_during_flush() -> Result<()> {
-    // 2s flush interval => a flush is near-certainly mid-commit when we kill.
-    let mut tf = Tf::start("during-flush", TfOpts { flush_interval_secs: 2, ..Default::default() }).await?;
-    let client = tf.connect().await?;
-    let ts = chrono::Utc::now().timestamp_micros();
-
-    let mut total = 0usize;
-    for round in 0..10 {
-        insert_rows(&client, PROJECT, &format!("f{round}"), 200, ts).await?;
-        total += 200;
-    }
-    let before = count_rows(&client, PROJECT).await?;
-    assert_eq!(before, total as i64);
-
-    drop(client);
-    // Kill without warning, mid flush-cycle.
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    tf.kill9()?;
-    tf.restart().await?;
-
-    let after = count_after_restart(&tf, PROJECT).await?;
-    assert_eq!(after, total as i64, "ACKED WRITE LOST across flush+SIGKILL: {total} acked, {after} survived");
-    Ok(())
+    // 2s flush interval + a 900ms pause before the kill => a flush is
+    // near-certainly mid-commit when we kill, without warning.
+    crash_drill("during-flush", TfOpts { flush_interval_secs: 2, ..Default::default() }, Some(Duration::from_millis(900)), async |tf| {
+        insert_rounds(tf, "f", 10, 200, false).await
+    })
+    .await
 }
 
 /// CASE 3 — kill under memory pressure. Prod was thrashing for ~9 minutes
@@ -351,32 +382,12 @@ async fn acked_rows_survive_sigkill_during_flush() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill_under_memory_pressure() -> Result<()> {
-    let mut tf = Tf::start("pressure", TfOpts { flush_interval_secs: 3600, buffer_max_memory_mb: 8, ..Default::default() }).await?;
-    let client = tf.connect().await?;
-    let ts = chrono::Utc::now().timestamp_micros();
-
-    // Push well past the 8MB budget so the pressure path is genuinely engaged.
-    // Rows REJECTED with an error are fine (the producer DLQs those); rows the
-    // server ACKED are the ones that must survive.
-    let mut acked = 0usize;
-    for round in 0..40 {
-        // An Err here is explicit backpressure, which the producer DLQs — only
-        // acked rows carry a durability promise.
-        if insert_rows(&client, PROJECT, &format!("p{round}"), 500, ts).await.is_ok() {
-            acked += 500;
-        }
-    }
-    assert!(acked > 0, "every insert was rejected; test proves nothing");
-    let before = count_rows(&client, PROJECT).await?;
-    assert_eq!(before, acked as i64, "server acked {acked} rows but only {before} are readable pre-kill");
-
-    drop(client);
-    tf.kill9()?;
-    tf.restart().await?;
-
-    let after = count_after_restart(&tf, PROJECT).await?;
-    assert_eq!(after, acked as i64, "ACKED WRITE LOST under pressure: {acked} acked, {after} survived SIGKILL");
-    Ok(())
+    // 40 × 500 rows pushes well past the 8MB budget, so the pressure path is
+    // genuinely engaged and some inserts are rejected outright.
+    crash_drill("pressure", TfOpts { flush_interval_secs: 3600, buffer_max_memory_mb: 8, ..Default::default() }, None, async |tf| {
+        insert_rounds(tf, "p", 40, 500, true).await
+    })
+    .await
 }
 
 /// CASE 4 — multi-tenant. Prod lost data across 10 projects at once; WAL topics
@@ -385,29 +396,19 @@ async fn acked_rows_survive_sigkill_under_memory_pressure() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill_multi_tenant() -> Result<()> {
-    let mut tf = Tf::start("multi-tenant", TfOpts::default()).await?;
-    let client = tf.connect().await?;
-    let ts = chrono::Utc::now().timestamp_micros();
-
-    let projects: Vec<String> = (0..10).map(|i| format!("kill_tenant_{i}")).collect();
-    const PER: usize = 100;
-    for p in &projects {
-        insert_rows(&client, p, "mt", PER, ts).await?;
-    }
-
-    drop(client);
-    tf.kill9()?;
-    tf.restart().await?;
-
-    let mut lost = Vec::new();
-    for p in &projects {
-        let n = count_after_restart(&tf, p).await?;
-        if n != PER as i64 {
-            lost.push(format!("{p}: {n}/{PER}"));
+    crash_drill("multi-tenant", TfOpts::default(), None, async |tf| {
+        let client = tf.connect().await?;
+        let ts = chrono::Utc::now().timestamp_micros();
+        const PER: usize = 100;
+        let mut acked = Acked::new();
+        for i in 0..10 {
+            let p = format!("kill_tenant_{i}");
+            insert_rows(&client, &p, "mt", PER, ts).await?;
+            acked.push((p, PER));
         }
-    }
-    assert!(lost.is_empty(), "ACKED WRITES LOST for tenants across SIGKILL: {lost:?}");
-    Ok(())
+        Ok(acked)
+    })
+    .await
 }
 
 /// CASE 5 — the silent-ack guard. When the server CANNOT durably accept a
@@ -415,11 +416,13 @@ async fn acked_rows_survive_sigkill_multi_tenant() -> Result<()> {
 /// producer's DLQ depends on; prod saw zero DLQ traffic while losing 200k rows,
 /// so a success-on-failure path anywhere here is fatal by itself.
 ///
-/// Armed by driving the WAL hard-backpressure breaker to its floor.
+/// Armed by driving the WAL hard-backpressure breaker to its floor; whatever
+/// the acked/rejected split turns out to be, the drill's pre-kill equality is
+/// what catches a success tag returned for rows that never landed.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn rejected_writes_error_and_are_never_silently_acked() -> Result<()> {
-    let mut tf = Tf::start(
+    crash_drill(
         "no-silent-ack",
         TfOpts {
             flush_interval_secs: 3600,
@@ -427,34 +430,10 @@ async fn rejected_writes_error_and_are_never_silently_acked() -> Result<()> {
             // 0GB hard cap => the breaker is armed as soon as any WAL exists.
             extra_env: vec![("TIMEFUSION_WAL_HARD_LIMIT_GB".into(), "0".into())],
         },
+        None,
+        async |tf| insert_rounds(tf, "sa", 30, 200, true).await,
     )
-    .await?;
-    let client = tf.connect().await?;
-    let ts = chrono::Utc::now().timestamp_micros();
-
-    let mut acked = 0usize;
-    let mut rejected = 0usize;
-    for round in 0..30 {
-        match insert_rows(&client, PROJECT, &format!("sa{round}"), 200, ts).await {
-            Ok(()) => acked += 200,
-            Err(_) => rejected += 200,
-        }
-    }
-    // Whatever the split, the readable count must equal exactly what was acked:
-    // an ack that produced no row is silent loss; a row from a rejected insert
-    // is a phantom write.
-    let readable = count_rows(&client, PROJECT).await?;
-    assert_eq!(
-        readable, acked as i64,
-        "ack/persist mismatch: acked={acked}, rejected={rejected}, readable={readable} — a success tag was returned for rows that never landed"
-    );
-
-    drop(client);
-    tf.kill9()?;
-    tf.restart().await?;
-    let after = count_after_restart(&tf, PROJECT).await?;
-    assert_eq!(after, acked as i64, "ACKED WRITE LOST: acked={acked}, survived={after}");
-    Ok(())
+    .await
 }
 
 /// CASE 6 — concurrent inserts from many connections, then kill. Prod ingest is
@@ -463,36 +442,30 @@ async fn rejected_writes_error_and_are_never_silently_acked() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill_under_concurrent_writers() -> Result<()> {
-    let mut tf = Tf::start("concurrent", TfOpts { flush_interval_secs: 5, ..Default::default() }).await?;
-    let ts = chrono::Utc::now().timestamp_micros();
+    crash_drill("concurrent", TfOpts { flush_interval_secs: 5, ..Default::default() }, None, async |tf| {
+        let ts = chrono::Utc::now().timestamp_micros();
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 25;
+        const BATCH: usize = 20;
 
-    const WRITERS: usize = 8;
-    const PER_WRITER: usize = 25;
-    const BATCH: usize = 20;
-
-    let mut handles = Vec::new();
-    for w in 0..WRITERS {
-        let client = tf.connect().await?;
-        handles.push(tokio::spawn(async move {
-            let mut acked = 0usize;
-            for i in 0..PER_WRITER {
-                if insert_rows(&client, PROJECT, &format!("c{w}-{i}"), BATCH, ts).await.is_ok() {
-                    acked += BATCH;
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let client = tf.connect().await?;
+            handles.push(tokio::spawn(async move {
+                let mut acked = 0usize;
+                for i in 0..PER_WRITER {
+                    if insert_rows(&client, PROJECT, &format!("c{w}-{i}"), BATCH, ts).await.is_ok() {
+                        acked += BATCH;
+                    }
                 }
-            }
-            acked
-        }));
-    }
-    let mut acked = 0usize;
-    for h in handles {
-        acked += h.await?;
-    }
-    assert!(acked > 0);
-
-    tf.kill9()?;
-    tf.restart().await?;
-
-    let after = count_after_restart(&tf, PROJECT).await?;
-    assert_eq!(after, acked as i64, "ACKED WRITE LOST under concurrency: {acked} acked, {after} survived SIGKILL");
-    Ok(())
+                acked
+            }));
+        }
+        let mut acked = 0usize;
+        for h in handles {
+            acked += h.await?;
+        }
+        Ok(vec![(PROJECT.to_string(), acked)])
+    })
+    .await
 }

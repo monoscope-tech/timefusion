@@ -16,6 +16,20 @@ use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
 const PROJECT: &str = "mor_project";
 
+/// Short bucket/retention so a bucket can be sealed and flushed within a test.
+async fn env_and_client() -> anyhow::Result<(E2eEnv, tokio_postgres::Client)> {
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+    let client = env.pg_client().await?;
+    Ok((env, client))
+}
+
+/// Commit MemBuffer to Delta and drop it, so what follows reads from Delta.
+async fn settle(env: &E2eEnv) -> anyhow::Result<()> {
+    env.force_flush().await?;
+    env.force_evict().await?;
+    Ok(())
+}
+
 /// `mor_versioned` has no `insert_at` helper (that one is otel-shaped), so
 /// rows are written with plain SQL at an explicit timestamp.
 async fn insert_row(client: &tokio_postgres::Client, id: &str, name: &str, ts_micros: i64) -> anyhow::Result<()> {
@@ -26,6 +40,14 @@ async fn insert_row(client: &tokio_postgres::Client, id: &str, name: &str, ts_mi
             &[&PROJECT, &ts, &id, &ts.date_naive(), &name],
         )
         .await?;
+    Ok(())
+}
+
+/// `row0..rowN-1`, all in one bucket at `FROZEN_START_MICROS`.
+async fn seed(client: &tokio_postgres::Client, n: i64) -> anyhow::Result<()> {
+    for i in 0..n {
+        insert_row(client, &format!("row{i}"), "base", FROZEN_START_MICROS + i).await?;
+    }
     Ok(())
 }
 
@@ -48,22 +70,18 @@ async fn name_of(client: &tokio_postgres::Client, id: &str) -> anyhow::Result<Op
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
-    let client = env.pg_client().await?;
+    let (env, client) = env_and_client().await?;
 
     // All eight rows share one bucket, so the updated row's window is exactly
     // the window the other seven live in.
-    for i in 0..8 {
-        insert_row(&client, &format!("row{i}"), "base", FROZEN_START_MICROS + i).await?;
-    }
+    seed(&client, 8).await?;
     assert_eq!(count(&client).await?, 8, "baseline");
 
     // Commit to Delta so the update below is resolved against rows that live
     // in Delta, not MemBuffer. The clock must leave the rows' bucket first —
     // only a SEALED bucket is flushable.
     support::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
-    env.force_flush().await?;
-    env.force_evict().await?;
+    settle(&env).await?;
 
     client.execute("UPDATE mor_versioned SET name = 'enriched' WHERE project_id = $1 AND id = 'row3'", &[&PROJECT]).await?;
 
@@ -74,8 +92,7 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
     // ...and the version still resolves after the appended row itself is
     // flushed, which is when merge-on-read (rather than MemBuffer) is what
     // keeps the newer copy visible.
-    env.force_flush().await?;
-    env.force_evict().await?;
+    settle(&env).await?;
     assert_eq!(name_of(&client, "row3").await?.as_deref(), Some("enriched"), "the newer version must survive its own flush");
     assert_eq!(count(&client).await?, 8, "flushing the appended version must not double-count it");
 
@@ -87,14 +104,10 @@ async fn update_appends_a_version_without_hiding_the_windows_other_rows() -> any
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_appends_a_tombstone_that_hides_only_its_own_key() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
-    let client = env.pg_client().await?;
+    let (env, client) = env_and_client().await?;
 
-    for i in 0..4 {
-        insert_row(&client, &format!("row{i}"), "base", FROZEN_START_MICROS + i).await?;
-    }
-    env.force_flush().await?;
-    env.force_evict().await?;
+    seed(&client, 4).await?;
+    settle(&env).await?;
 
     client.execute("DELETE FROM mor_versioned WHERE project_id = $1 AND id = 'row1'", &[&PROJECT]).await?;
 
@@ -105,8 +118,7 @@ async fn delete_appends_a_tombstone_that_hides_only_its_own_key() -> anyhow::Res
     // The tombstone must still suppress the row once it is itself committed —
     // i.e. the suppression is a property of the data, not of the tombstone
     // happening to sit in MemBuffer.
-    env.force_flush().await?;
-    env.force_evict().await?;
+    settle(&env).await?;
     assert_eq!(name_of(&client, "row1").await?, None, "the tombstone must survive its own flush");
     assert_eq!(count(&client).await?, 3, "COUNT(*) after the tombstone is flushed");
 
@@ -119,8 +131,7 @@ async fn delete_appends_a_tombstone_that_hides_only_its_own_key() -> anyhow::Res
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_updates_of_one_key_still_resolve_to_one_row() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
-    let client = env.pg_client().await?;
+    let (env, client) = env_and_client().await?;
 
     insert_row(&client, "hot", "v0", FROZEN_START_MICROS).await?;
     env.force_flush().await?;

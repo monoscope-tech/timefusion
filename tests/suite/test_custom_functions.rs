@@ -2,72 +2,31 @@
 mod tests {
     use anyhow::Result;
     use datafusion::prelude::*;
+    use test_case::test_case;
     use timefusion::{read::functions::register_custom_functions, support::test_helpers::array_get_str as get_str};
 
-    #[tokio::test]
-    async fn test_to_char_function() -> Result<()> {
+    /// Runs `SELECT {expr}` on a fresh session with the custom functions
+    /// registered, asserts exactly one batch of exactly one row, and returns
+    /// that cell as text.
+    async fn eval(expr: &str) -> String {
         let mut ctx = SessionContext::new();
-
-        // Register our custom functions
-        register_custom_functions(&mut ctx)?;
-
-        let timestamp = "2024-01-15 14:30:45";
-
-        let test_cases = vec![
-            ("YYYY-MM-DD", "2024-01-15"),
-            ("YYYY-MM-DD HH24:MI:SS", "2024-01-15 14:30:45"),
-            ("Month DD, YYYY", "January 15, 2024"),
-            ("Mon DD, YYYY", "Jan 15, 2024"),
-        ];
-
-        for (format, expected) in test_cases {
-            let sql = format!("SELECT to_char(TIMESTAMP '{}', '{}') as formatted", timestamp, format);
-
-            let df = ctx.sql(&sql).await?;
-            let results = df.collect().await?;
-
-            assert_eq!(results.len(), 1);
-            let batch = &results[0];
-            assert_eq!(batch.num_rows(), 1);
-
-            let actual = get_str(batch.column(0).as_ref(), 0);
-
-            assert_eq!(actual, expected, "Format '{}' failed", format);
-        }
-
-        Ok(())
+        register_custom_functions(&mut ctx).unwrap();
+        let results = ctx.sql(&format!("SELECT {expr}")).await.unwrap().collect().await.unwrap();
+        assert_eq!(results.len(), 1, "{expr}");
+        assert_eq!(results[0].num_rows(), 1, "{expr}");
+        get_str(results[0].column(0).as_ref(), 0)
     }
 
+    #[test_case("to_char(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM-DD')" => "2024-01-15" ; "to_char date only")]
+    #[test_case("to_char(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM-DD HH24:MI:SS')" => "2024-01-15 14:30:45" ; "to_char date and time")]
+    #[test_case("to_char(TIMESTAMP '2024-01-15 14:30:45', 'Month DD, YYYY')" => "January 15, 2024" ; "to_char full month name")]
+    #[test_case("to_char(TIMESTAMP '2024-01-15 14:30:45', 'Mon DD, YYYY')" => "Jan 15, 2024" ; "to_char abbreviated month name")]
+    // UTC 14:30:45 -> America/New_York (UTC-5 in January) = 09:30:45.
+    #[test_case("to_char(at_time_zone(TIMESTAMP '2024-01-15 14:30:45 UTC', 'America/New_York'), 'YYYY-MM-DD HH24:MI:SS')" => "2024-01-15 09:30:45" ; "at_time_zone converts UTC to New York")]
+    #[test_case("CASE WHEN at_time_zone(TIMESTAMP '2024-01-15 14:30:45 UTC', 'America/New_York') IS NOT NULL THEN 'one non-null row' END" => "one non-null row" ; "bare at_time_zone yields one non-null row")]
     #[tokio::test]
-    async fn test_at_time_zone_function() -> Result<()> {
-        let mut ctx = SessionContext::new();
-
-        // Register our custom functions
-        register_custom_functions(&mut ctx)?;
-
-        let sql = "SELECT at_time_zone(TIMESTAMP '2024-01-15 14:30:45 UTC', 'America/New_York') as ny_time";
-
-        let df = ctx.sql(sql).await?;
-        let results = df.collect().await?;
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 1);
-
-        // The at_time_zone function converts to the target timezone
-        let sql2 = "SELECT to_char(at_time_zone(TIMESTAMP '2024-01-15 14:30:45 UTC', 'America/New_York'), 'YYYY-MM-DD HH24:MI:SS') as formatted";
-
-        let df2 = ctx.sql(sql2).await?;
-        let results2 = df2.collect().await?;
-
-        assert_eq!(results2.len(), 1);
-        let batch2 = &results2[0];
-        let actual = get_str(batch2.column(0).as_ref(), 0);
-
-        // UTC 14:30:45 -> America/New_York (UTC-5 in January) = 09:30:45
-        assert_eq!(actual, "2024-01-15 09:30:45");
-
-        Ok(())
+    async fn to_char_and_at_time_zone(expr: &'static str) -> String {
+        eval(expr).await
     }
 
     /// `SUBSTRING(x FROM 'regex')` is Postgres regex extraction, but sqlparser
@@ -80,6 +39,8 @@ mod tests {
     ///
     /// Built through `create_session_context`, not a bare `SessionContext`:
     /// half the fix is expr-planner ORDER, and only the real session builds it.
+    /// The cases stay a loop rather than a `test_case` table so all five share
+    /// one `Database::new()` instead of standing up five.
     ///
     /// KNOWN GAP, deliberately not asserted here: over pgwire the all-literal
     /// form (`SELECT substring('abc-def' FROM '^[a-z]+')`, no column anywhere)
@@ -152,28 +113,24 @@ mod tests {
     /// TimescaleDB spells the bucket width as an INTERVAL; our own KQL emits a
     /// string. Accepting only the string lost every hand-written Timescale-style
     /// widget to "Failed to coerce arguments … time_bucket(Interval(...),
-    /// Timestamp)" (issue 3812a29a). Both spellings must agree, and a month
-    /// width must be REFUSED rather than silently approximated to 30 days.
+    /// Timestamp)" (issue 3812a29a). Both spellings must agree.
+    #[test_case("INTERVAL '5 minutes'" => "2026-08-31 14:35:00" ; "interval 5 minutes")]
+    #[test_case("'5 minutes'" => "2026-08-31 14:35:00" ; "string 5 minutes lands on the same bucket")]
+    #[test_case("INTERVAL '1 hour'" => "2026-08-31 14:00:00" ; "interval 1 hour")]
+    #[test_case("INTERVAL '1 day'" => "2026-08-31 00:00:00" ; "interval 1 day")]
     #[tokio::test]
-    async fn time_bucket_accepts_an_interval_and_refuses_month_widths() -> Result<()> {
+    async fn time_bucket_accepts_an_interval(width: &'static str) -> String {
+        eval(&format!("to_char(time_bucket({width}, TIMESTAMPTZ '2026-08-31 14:37:45+00'), 'YYYY-MM-DD HH24:MI:SS')")).await
+    }
+
+    /// A month is 28-31 days: refuse it instead of bucketing by a wrong width
+    /// (same issue 3812a29a as `time_bucket_accepts_an_interval`).
+    #[tokio::test]
+    async fn time_bucket_refuses_month_widths() -> Result<()> {
         let mut ctx = SessionContext::new();
         register_custom_functions(&mut ctx)?;
 
-        // The INTERVAL and string spellings must land on the same bucket.
-        for (width, expected) in [
-            ("INTERVAL '5 minutes'", "2026-08-31 14:35:00"),
-            ("'5 minutes'", "2026-08-31 14:35:00"),
-            ("INTERVAL '1 hour'", "2026-08-31 14:00:00"),
-            ("INTERVAL '1 day'", "2026-08-31 00:00:00"),
-        ] {
-            let sql = format!("SELECT to_char(time_bucket({width}, TIMESTAMPTZ '2026-08-31 14:37:45+00'), 'YYYY-MM-DD HH24:MI:SS')");
-            let results = ctx.sql(&sql).await?.collect().await?;
-            assert_eq!(get_str(results[0].column(0).as_ref(), 0), expected, "{width}");
-        }
-
-        // A month is 28-31 days: refuse it instead of bucketing by a wrong width.
-        let err = ctx.sql("SELECT time_bucket(INTERVAL '1 month', TIMESTAMPTZ '2026-08-31 14:37:45+00')").await;
-        let err = match err {
+        let err = match ctx.sql("SELECT time_bucket(INTERVAL '1 month', TIMESTAMPTZ '2026-08-31 14:37:45+00')").await {
             Ok(df) => df.collect().await.err().map(|e| e.to_string()).unwrap_or_default(),
             Err(e) => e.to_string(),
         };

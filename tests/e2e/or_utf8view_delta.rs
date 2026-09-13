@@ -37,12 +37,20 @@ async fn count(client: &tokio_postgres::Client, pid: &str, sql: &str) -> i64 {
     client.query_one(sql, &[&pid]).await.unwrap().get::<_, i64>(0)
 }
 
+const PID: &str = "e2e_project";
+
+/// Short bucket/retention so `force_flush`/`force_evict` can move data into Delta.
+async fn setup() -> anyhow::Result<(E2eEnv, tokio_postgres::Client)> {
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
+    let client = env.pg_client().await?;
+    Ok((env, client))
+}
+
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn or_equality_on_utf8view_delta_matches_in_list() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
-    let client = env.pg_client().await?;
-    let pid = "e2e_project";
+    let (env, client) = setup().await?;
+    let pid = PID;
 
     let kinds: Vec<&str> = (0..40)
         .map(|i| match i % 10 {
@@ -95,9 +103,8 @@ async fn or_equality_on_utf8view_delta_matches_in_list() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn or_like_on_indexed_col_membuffer_matches_union() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(120)).start().await?;
-    let client = env.pg_client().await?;
-    let pid = "e2e_project";
+    let (_env, client) = setup().await?;
+    let pid = PID;
 
     // 3 "alpha", 5 "bravo", 2 "charlie" — distinct substrings on an ngram3 col.
     let msgs: Vec<&str> = std::iter::repeat_n("alpha", 3).chain(std::iter::repeat_n("bravo", 5)).chain(std::iter::repeat_n("charlie", 2)).collect();

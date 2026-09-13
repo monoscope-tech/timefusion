@@ -54,6 +54,25 @@ async fn scalar(db: &Arc<Database>, sql: &str) -> Result<i64> {
     Ok(ctx.sql(sql).await?.collect().await?[0].column(0).as_primitive::<Int64Type>().value(0))
 }
 
+/// The predicate both tests query through: one project, one closed timestamp range.
+fn window(project_id: &str, lo: i64, hi: i64) -> String {
+    let at = |us: i64| chrono::DateTime::from_timestamp_micros(us).unwrap().to_rfc3339();
+    format!("project_id = '{project_id}' AND timestamp >= '{}'::timestamp AND timestamp <= '{}'::timestamp", at(lo), at(hi))
+}
+
+/// Rendered EXPLAIN text for `SELECT count(*)` over `window` — the plan shape is
+/// what both tests assert on.
+async fn explain_count(db: &Arc<Database>, window: &str) -> Result<String> {
+    let mut ctx = Arc::clone(db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let plan = ctx.sql(&format!("EXPLAIN SELECT count(*) FROM otel_logs_and_spans WHERE {window}")).await?.collect().await?;
+    Ok(plan
+        .iter()
+        .flat_map(|b| (0..b.num_rows()).map(|r| timefusion::support::test_helpers::array_get_str(b.column(1).as_ref(), r)).collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// The whole point: a wide window must split, and still count every logical row
 /// exactly once. Asserting the count alone would pass vacuously if the rule
 /// silently declined, so the plan is checked too.
@@ -63,20 +82,8 @@ async fn wide_window_splits_and_still_counts_each_row_once() -> Result<()> {
     let (db, project_id, start, end) = seeded("range_split_counts").await?;
     let expected = DAYS + BRANCHES as i64; // one row per day, plus the boundary rows
 
-    let window = format!(
-        "project_id = '{project_id}' AND timestamp >= '{}'::timestamp AND timestamp <= '{}'::timestamp",
-        chrono::DateTime::from_timestamp_micros(start).unwrap().to_rfc3339(),
-        chrono::DateTime::from_timestamp_micros(end).unwrap().to_rfc3339(),
-    );
-
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-    let plan = ctx.sql(&format!("EXPLAIN SELECT count(*) FROM otel_logs_and_spans WHERE {window}")).await?.collect().await?;
-    let rendered: String = plan
-        .iter()
-        .flat_map(|b| (0..b.num_rows()).map(|r| timefusion::support::test_helpers::array_get_str(b.column(1).as_ref(), r)).collect::<Vec<_>>())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let wide = window(&project_id, start, end);
+    let rendered = explain_count(&db, &wide).await?;
     assert!(rendered.contains("Union"), "a {DAYS}-day aggregate must split into branches:\n{rendered}");
 
     // Branches must prune DIFFERENTLY, or four threads each do the work of one.
@@ -95,7 +102,7 @@ async fn wide_window_splits_and_still_counts_each_row_once() -> Result<()> {
         rendered.lines().filter_map(|line| line.split("predicate=").nth(1)).filter(|predicate| predicate.contains("timestamp")).collect();
     assert!(bounds.len() > 1, "every branch pushed the SAME predicate, so each reads the whole window:\n{rendered}");
 
-    let counted = scalar(&db, &format!("SELECT count(*) FROM otel_logs_and_spans WHERE {window}")).await?;
+    let counted = scalar(&db, &format!("SELECT count(*) FROM otel_logs_and_spans WHERE {wide}")).await?;
     assert_eq!(counted, expected, "split count must equal the logical row count (duplicates collapsed exactly once)");
     Ok(())
 }
@@ -106,19 +113,7 @@ async fn wide_window_splits_and_still_counts_each_row_once() -> Result<()> {
 #[tokio::test]
 async fn narrow_window_is_left_alone() -> Result<()> {
     let (db, project_id, _, end) = seeded("range_split_narrow").await?;
-    let window = format!(
-        "project_id = '{project_id}' AND timestamp >= '{}'::timestamp AND timestamp <= '{}'::timestamp",
-        chrono::DateTime::from_timestamp_micros(end - 2 * DAY_MICROS).unwrap().to_rfc3339(),
-        chrono::DateTime::from_timestamp_micros(end).unwrap().to_rfc3339(),
-    );
-    let mut ctx = Arc::clone(&db).create_session_context();
-    db.setup_session_context(&mut ctx)?;
-    let plan = ctx.sql(&format!("EXPLAIN SELECT count(*) FROM otel_logs_and_spans WHERE {window}")).await?.collect().await?;
-    let rendered: String = plan
-        .iter()
-        .flat_map(|b| (0..b.num_rows()).map(|r| timefusion::support::test_helpers::array_get_str(b.column(1).as_ref(), r)).collect::<Vec<_>>())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let rendered = explain_count(&db, &window(&project_id, end - 2 * DAY_MICROS, end)).await?;
     assert!(!rendered.contains("Union\n"), "a 2-day window must not split:\n{rendered}");
     Ok(())
 }

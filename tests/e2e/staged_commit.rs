@@ -14,11 +14,27 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 
+use timefusion::support::test_helpers::{json_to_batch, test_span};
+
 use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_for};
 
 /// One day in micros — well past the test retention so a single `force_evict`
 /// drains every bucket out of MemBuffer, leaving Delta as the only source.
 const ONE_DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+
+/// Short buckets so one `force_flush` seals them — shared by every test here.
+async fn env60() -> anyhow::Result<E2eEnv> {
+    E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).start().await
+}
+
+/// One standard otel span batch, the shape the staged writer expects.
+fn span_batch(id: &str, project: &str) -> anyhow::Result<RecordBatch> {
+    json_to_batch(vec![test_span(id, "span", project)])
+}
+
+async fn count_for(client: &tokio_postgres::Client, project: &str) -> anyhow::Result<i64> {
+    Ok(client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&project]).await?.get(0))
+}
 
 /// Force-flush, then advance past retention and evict so MemBuffer is empty —
 /// any row still queryable afterwards was persisted to Delta by the staged
@@ -38,7 +54,7 @@ async fn flush_then_drain(env: &E2eEnv) -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn staged_flush_persists_to_delta() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = env60().await?;
     let client = env.pg_client().await?;
 
     let n = 80;
@@ -50,8 +66,7 @@ async fn staged_flush_persists_to_delta() -> anyhow::Result<()> {
 
     // MemBuffer is drained (asserted in flush_then_drain), so this count is
     // served purely from Delta — proof the staged commit persisted every row.
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
-    assert_eq!(count, n, "rows lost on the staged commit path (read purely from Delta)");
+    assert_eq!(count_for(&client, "e2e_project").await?, n, "rows lost on the staged commit path (read purely from Delta)");
     Ok(())
 }
 
@@ -69,7 +84,7 @@ async fn staged_flush_persists_to_delta() -> anyhow::Result<()> {
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_unified_table_staging_loses_nothing() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = env60().await?;
     let projects = ["default_a", "default_b", "default_c", "default_d", "default_e"];
     let per = 20;
     for p in projects {
@@ -81,10 +96,8 @@ async fn concurrent_unified_table_staging_loses_nothing() -> anyhow::Result<()> 
         let db = env.db().clone();
         handles.push(tokio::spawn(async move {
             for i in 0..per {
-                let batch =
-                    timefusion::support::test_helpers::json_to_batch(vec![timefusion::support::test_helpers::test_span(&format!("{p}-{i}"), "span", p)])?;
                 // skip_queue=true → straight to the staged commit path, bypassing MemBuffer.
-                db.insert_records_batch(p, "otel_logs_and_spans", vec![batch], true, None).await?;
+                db.insert_records_batch(p, "otel_logs_and_spans", vec![span_batch(&format!("{p}-{i}"), p)?], true, None).await?;
             }
             anyhow::Ok(())
         }));
@@ -95,8 +108,7 @@ async fn concurrent_unified_table_staging_loses_nothing() -> anyhow::Result<()> 
 
     let client = env.pg_client().await?;
     for p in projects {
-        let c: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&p]).await?.get(0);
-        assert_eq!(c, per as i64, "tenant {p} lost rows under concurrent staged commits to the unified table");
+        assert_eq!(count_for(&client, p).await?, per as i64, "tenant {p} lost rows under concurrent staged commits to the unified table");
     }
     Ok(())
 }
@@ -110,12 +122,12 @@ async fn concurrent_unified_table_staging_loses_nothing() -> anyhow::Result<()> 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_evolving_batch_falls_back_to_merge() -> anyhow::Result<()> {
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let env = env60().await?;
     let db = env.db();
     db.get_or_create_table("evolve_proj", "otel_logs_and_spans").await?;
 
     // Standard otel batch + one column the table schema doesn't have.
-    let base = timefusion::support::test_helpers::json_to_batch(vec![timefusion::support::test_helpers::test_span("evo-1", "span", "evolve_proj")])?;
+    let base = span_batch("evo-1", "evolve_proj")?;
     let n = base.num_rows();
     let mut fields: Vec<Arc<Field>> = base.schema().fields().iter().cloned().collect();
     let mut cols = base.columns().to_vec();
@@ -128,7 +140,6 @@ async fn schema_evolving_batch_falls_back_to_merge() -> anyhow::Result<()> {
     assert!(!added.is_empty(), "merge fallback wrote no files");
 
     let client = env.pg_client().await?;
-    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"evolve_proj"]).await?.get(0);
-    assert_eq!(count, 1, "schema-evolving row not persisted via merge fallback");
+    assert_eq!(count_for(&client, "evolve_proj").await?, 1, "schema-evolving row not persisted via merge fallback");
     Ok(())
 }

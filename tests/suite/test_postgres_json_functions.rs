@@ -1,104 +1,57 @@
 #[cfg(test)]
 mod test_json_functions {
     use anyhow::Result;
+    use datafusion::prelude::SessionContext;
+    use test_case::test_case;
     use timefusion::{database::Database, support::test_helpers::array_get_str as get_str};
 
-    #[tokio::test]
-    async fn test_json_build_array() -> Result<()> {
-        // Initialize database
-        let db = Database::new().await?;
-        let db = std::sync::Arc::new(db);
+    async fn session() -> Result<SessionContext> {
+        let db = std::sync::Arc::new(Database::new().await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
-
-        let df = ctx.sql("SELECT json_build_array('a', 'b', 'c') as result").await?;
-        let results = df.collect().await?;
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        let column = batch.column(0);
-        assert_eq!(get_str(column.as_ref(), 0), r#"["a","b","c"]"#);
-
-        Ok(())
+        Ok(ctx)
     }
 
-    #[tokio::test]
-    async fn test_to_json() -> Result<()> {
-        // Initialize database
-        let db = Database::new().await?;
-        let db = std::sync::Arc::new(db);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let df = ctx.sql(r#"SELECT to_json('{"hello": "world"}') as result"#).await?;
-        let results = df.collect().await?;
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        let column = batch.column(0);
-        assert_eq!(get_str(column.as_ref(), 0), r#"{"hello":"world"}"#);
-
-        let df = ctx.sql("SELECT to_json(123) as result").await?;
-        let results = df.collect().await?;
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        let column = batch.column(0);
-        assert_eq!(get_str(column.as_ref(), 0), "123");
-
-        Ok(())
+    /// Runs each `setup` statement, then `SELECT {expr}`, returning the single string cell.
+    async fn eval_str(setup: &[&str], expr: &str) -> String {
+        let ctx = session().await.expect("session");
+        for stmt in setup {
+            ctx.sql(stmt).await.expect("setup sql").collect().await.expect("setup collect");
+        }
+        let results = ctx.sql(&format!("SELECT {expr}")).await.expect("sql").collect().await.expect("collect");
+        assert_eq!(results.len(), 1, "{expr}");
+        assert_eq!(results[0].num_rows(), 1, "{expr}");
+        get_str(results[0].column(0).as_ref(), 0)
     }
 
+    const MAKE_TEST_TABLE: &[&str] = &[
+        "CREATE TABLE test_table (id VARCHAR, name VARCHAR, duration BIGINT, summary VARCHAR)",
+        r#"INSERT INTO test_table VALUES ('001', 'test_span', 1500, '{"status": "ok"}')"#,
+    ];
+
+    // to_jsonb is registered as an alias of to_json — Postgres syntax used by monoscope queries.
+    #[test_case(&[], "json_build_array('a', 'b', 'c')" => r#"["a","b","c"]"# ; "json_build_array")]
+    #[test_case(&[], r#"to_json('{"hello": "world"}')"# => r#"{"hello":"world"}"# ; "to_json object")]
+    #[test_case(&[], "to_json(123)" => "123" ; "to_json number")]
+    #[test_case(&[], r#"to_jsonb('{"hello": "world"}')"# => r#"{"hello":"world"}"# ; "to_jsonb alias object")]
+    #[test_case(&[], "to_jsonb(123)" => "123" ; "to_jsonb alias number")]
+    #[test_case(&[], "to_char(TIMESTAMP '2025-08-07T10:00:00Z', 'YYYY-MM-DD HH24:MI:SS')" => "2025-08-07 10:00:00" ; "to_char")]
+    #[test_case(MAKE_TEST_TABLE, "json_build_array(id, name, duration, to_json(summary)) FROM test_table" => r#"["001","test_span",1500,{"status":"ok"}]"# ; "nested to_json inside json_build_array over a table")]
     #[tokio::test]
-    async fn test_to_jsonb_alias() -> Result<()> {
-        let db = Database::new().await?;
-        let db = std::sync::Arc::new(db);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        // to_jsonb is registered as an alias of to_json — Postgres syntax used by monoscope queries.
-        let df = ctx.sql(r#"SELECT to_jsonb('{"hello": "world"}') as result"#).await?;
-        let results = df.collect().await?;
-        assert_eq!(get_str(results[0].column(0).as_ref(), 0), r#"{"hello":"world"}"#);
-
-        let df = ctx.sql("SELECT to_jsonb(123) as result").await?;
-        let results = df.collect().await?;
-        assert_eq!(get_str(results[0].column(0).as_ref(), 0), "123");
-
-        Ok(())
+    async fn pg_json_scalar_functions(setup: &'static [&'static str], expr: &'static str) -> String {
+        eval_str(setup, expr).await
     }
 
     #[tokio::test]
     async fn test_extract_epoch() -> Result<()> {
-        // Initialize database
-        let db = Database::new().await?;
-        let db = std::sync::Arc::new(db);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
+        let ctx = session().await?;
 
-        let df = ctx.sql("SELECT extract_epoch(TIMESTAMP '2025-08-07T10:00:00Z') as result").await?;
-        let results = df.collect().await?;
+        let results = ctx.sql("SELECT extract_epoch(TIMESTAMP '2025-08-07T10:00:00Z') as result").await?.collect().await?;
         assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        let column = batch.column(0);
+        let column = results[0].column(0);
         let value = column.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
         // The timestamp is interpreted as UTC
         assert_eq!(value.value(0), 1754560800.0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_to_char() -> Result<()> {
-        // Initialize database
-        let db = Database::new().await?;
-        let db = std::sync::Arc::new(db);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        let df = ctx.sql("SELECT to_char(TIMESTAMP '2025-08-07T10:00:00Z', 'YYYY-MM-DD HH24:MI:SS') as result").await?;
-        let results = df.collect().await?;
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        let column = batch.column(0);
-        assert_eq!(get_str(column.as_ref(), 0), "2025-08-07 10:00:00");
 
         Ok(())
     }
@@ -111,11 +64,9 @@ mod test_json_functions {
     // plus a TypePlanner that resolves the `::jsonpath` cast to Utf8.
     #[tokio::test]
     async fn test_jsonb_path_exists_pg_dialect() -> Result<()> {
-        let db = std::sync::Arc::new(Database::new().await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
+        let ctx = session().await?;
 
-        async fn eval(ctx: &datafusion::prelude::SessionContext, predicate: &str) -> Result<bool> {
+        async fn eval(ctx: &SessionContext, predicate: &str) -> Result<bool> {
             let batch = &ctx.sql(&format!("SELECT {predicate} AS r")).await?.collect().await?[0];
             Ok(batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::BooleanArray>().unwrap().value(0))
         }
@@ -164,11 +115,9 @@ mod test_json_functions {
     // exception-related — log explorer, monitors, dashboards — failed to plan.
     #[tokio::test]
     async fn test_jsonb_path_query_first_returns_the_matched_value() -> Result<()> {
-        let db = std::sync::Arc::new(Database::new().await?);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
+        let ctx = session().await?;
 
-        async fn text(ctx: &datafusion::prelude::SessionContext, expr: &str) -> Result<Option<String>> {
+        async fn text(ctx: &SessionContext, expr: &str) -> Result<Option<String>> {
             let batch = &ctx.sql(&format!("SELECT {expr} AS r")).await?.collect().await?[0];
             let col = batch.column(0);
             Ok((!col.is_null(0)).then(|| get_str(col.as_ref(), 0).to_string()))
@@ -232,27 +181,6 @@ mod test_json_functions {
         ] {
             ctx.sql(sql).await.map_err(|e| anyhow::anyhow!("production widget SQL must plan, got: {e}\n  sql: {sql}"))?;
         }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_complex_query() -> Result<()> {
-        // Initialize database
-        let db = Database::new().await?;
-        let db = std::sync::Arc::new(db);
-        let mut ctx = db.clone().create_session_context();
-        db.setup_session_context(&mut ctx)?;
-
-        ctx.sql("CREATE TABLE test_table (id VARCHAR, name VARCHAR, duration BIGINT, summary VARCHAR)").await?.collect().await?;
-        ctx.sql(r#"INSERT INTO test_table VALUES ('001', 'test_span', 1500, '{"status": "ok"}')"#).await?.collect().await?;
-
-        let df = ctx.sql("SELECT json_build_array(id, name, duration, to_json(summary)) as result FROM test_table").await?;
-        let results = df.collect().await?;
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        let column = batch.column(0);
-        assert_eq!(get_str(column.as_ref(), 0), r#"["001","test_span",1500,{"status":"ok"}]"#);
 
         Ok(())
     }

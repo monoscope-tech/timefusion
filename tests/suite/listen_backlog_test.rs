@@ -23,42 +23,27 @@
 use std::{io, sync::Arc, time::Duration};
 
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::Notify,
     time::timeout,
 };
 
-/// Bind a stock tokio TcpListener (backlog=128 from mio) and DO NOT accept
-/// until `release` is notified. This simulates a wedged accept loop —
-/// equivalent to what monoscope sees when the prod accept loop falls behind
-/// during a thundering-herd retry burst.
-async fn stalled_listener() -> (u16, Arc<Notify>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("local_addr").port();
-    let release = Arc::new(Notify::new());
-    let release_clone = release.clone();
+/// Every scenario bursts the same number of concurrent SYNs, well past the
+/// 128-deep default accept queue.
+const BURST: usize = 300;
 
-    tokio::spawn(async move {
-        // Hold the listener, do nothing. Kernel keeps queueing SYNs into the
-        // 128-deep accept queue until it overflows.
-        release_clone.notified().await;
-        // Drain any queued connections so the test exits cleanly.
-        while let Ok((_, _)) = listener.accept().await {}
-    });
-
-    (port, release)
+struct BurstResult {
+    ok: usize,
+    refused: usize,
+    timed_out: usize,
 }
 
-/// Fire N concurrent TCP connect attempts at the given port, with a per-connect
-/// timeout. Returns (successes, refused_count, timeout_count, other_errors).
-async fn burst_connect(port: u16, n: usize, connect_timeout: Duration) -> (usize, usize, usize, Vec<String>) {
-    let handles: Vec<_> = (0..n).map(|_| tokio::spawn(async move { timeout(connect_timeout, TcpStream::connect(("127.0.0.1", port))).await })).collect();
+/// Fire `BURST` concurrent TCP connect attempts at the given port, with a
+/// per-connect timeout, classifying each outcome.
+async fn burst_connect(port: u16, connect_timeout: Duration) -> BurstResult {
+    let handles: Vec<_> = (0..BURST).map(|_| tokio::spawn(async move { timeout(connect_timeout, TcpStream::connect(("127.0.0.1", port))).await })).collect();
 
-    let mut ok = 0;
-    let mut refused = 0;
-    let mut timed_out = 0;
-    let mut other = Vec::new();
-
+    let (mut ok, mut refused, mut timed_out, mut other) = (0, 0, 0, Vec::new());
     for h in handles {
         match h.await.expect("join") {
             Ok(Ok(_stream)) => ok += 1,
@@ -67,7 +52,93 @@ async fn burst_connect(port: u16, n: usize, connect_timeout: Duration) -> (usize
             Err(_elapsed) => timed_out += 1,
         }
     }
-    (ok, refused, timed_out, other)
+    eprintln!("ok={ok} refused={refused} timed_out={timed_out} other={}", other.len());
+    for e in other.iter().take(5) {
+        eprintln!("  - {e}");
+    }
+    BurstResult { ok, refused, timed_out }
+}
+
+/// One burst scenario against a real listener.
+///
+/// * `backlog` — `None` binds the stock tokio way (mio hardcodes 128);
+///   `Some(n)` binds via `TcpSocket` and requests `n` explicitly (the fix).
+/// * `drain` — `true` runs a tight accept loop (the "correct" spawn-immediately
+///   pattern); `false` wedges the acceptor until the burst is over, so the
+///   kernel keeps queueing SYNs until the accept queue overflows.
+/// * `hogs` — CPU-bound tasks pinned on runtime workers before the burst, to
+///   starve the accept task. Must equal `worker_threads` to saturate.
+async fn run_burst(label: &str, backlog: Option<u32>, drain: bool, connect_timeout: Duration, hogs: usize) -> BurstResult {
+    let listener = match backlog {
+        None => TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+        Some(n) => {
+            let socket = TcpSocket::new_v4().expect("socket");
+            socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+            socket.listen(n).expect("listen")
+        }
+    };
+    let port = listener.local_addr().expect("local_addr").port();
+    let release = Arc::new(Notify::new());
+    let release_c = release.clone();
+
+    let accepter = tokio::spawn(async move {
+        if !drain {
+            // Wedged accept loop — equivalent to what monoscope sees when the
+            // prod accept loop falls behind during a thundering-herd retry
+            // burst. Once released, drain so the test exits cleanly.
+            release_c.notified().await;
+        }
+        loop {
+            tokio::select! {
+                _ = release_c.notified() => break,
+                res = listener.accept() => if res.is_err() { break },
+            }
+        }
+    });
+
+    // Saturate every worker with a CPU-bound spin. This mimics heavy query
+    // execution starving the accept task.
+    //
+    // NOTE: tokio::task::spawn_blocking does NOT starve the runtime — it runs
+    // on a dedicated blocking pool. Use tokio::spawn with a tight CPU-bound
+    // loop (no .await points) so the work actually pins a runtime worker.
+    const HOG_DURATION_MS: u64 = 800;
+    let hogs: Vec<_> = (0..hogs)
+        .map(|i| {
+            tokio::spawn(async move {
+                let deadline = std::time::Instant::now() + Duration::from_millis(HOG_DURATION_MS);
+                let mut x: u64 = i as u64;
+                while std::time::Instant::now() < deadline {
+                    // Cooperative yield budget exhausts after ~128 polls in tokio,
+                    // but a tight loop with no .await points blocks the worker
+                    // entirely. That's the realistic case: a heavy synchronous
+                    // routine inside a handler (e.g. arrow compute) holding the
+                    // worker thread.
+                    for _ in 0..1_000_000 {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    }
+                    std::hint::black_box(x);
+                }
+            })
+        })
+        .collect();
+
+    // Let the listener be polled into the runtime; with hogs a shorter pause,
+    // since they must already be spinning when the burst lands.
+    tokio::time::sleep(Duration::from_millis(if hogs.is_empty() { 50 } else { 20 })).await;
+    eprint!("{label}: burst={BURST} ");
+    let res = burst_connect(port, connect_timeout).await;
+
+    for h in hogs {
+        let _ = h.await;
+    }
+    release.notify_one();
+    // Only the draining acceptor exits on release; the stalled one keeps
+    // draining until the runtime drops, so awaiting it would hang.
+    if drain {
+        let _ = accepter.await;
+    }
+    res
 }
 
 // Skipped on CI: GitHub Actions runners silently queue SYNs beyond the
@@ -79,25 +150,7 @@ async fn burst_connect(port: u16, n: usize, connect_timeout: Duration) -> (usize
 #[ignore = "kernel-level backlog enforcement not reliable on CI runners"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listen_backlog_overflows_at_128_when_accept_stalls() {
-    // Burst well past the kernel accept-queue depth.
-    const BURST: usize = 300;
-    const CONNECT_TIMEOUT_MS: u64 = 500;
-
-    let (port, release) = stalled_listener().await;
-    // Give the listener a moment to be polled into the runtime.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let (ok, refused, timed_out, other) = burst_connect(port, BURST, Duration::from_millis(CONNECT_TIMEOUT_MS)).await;
-
-    release.notify_one();
-
-    eprintln!("burst={BURST} ok={ok} refused={refused} timed_out={timed_out} other={}", other.len());
-    if !other.is_empty() {
-        eprintln!("other errors:");
-        for e in other.iter().take(5) {
-            eprintln!("  - {e}");
-        }
-    }
+    let BurstResult { ok, refused, timed_out } = run_burst("stock-backlog", None, false, Duration::from_millis(500), 0).await;
 
     // The contract we're asserting:
     //
@@ -123,12 +176,13 @@ async fn listen_backlog_overflows_at_128_when_accept_stalls() {
     //    ECONNREFUSED — the same error class monoscope's Hasql logs print.
     //    On macOS and stock Linux, failures appear as connect timeouts.
     //    Both indicate the same root cause: kernel-level backlog overflow.
-    eprintln!("Mechanism reproduced: {} of {BURST} connects failed (refused={refused}, timed_out={timed_out}).", failed);
+    eprintln!("Mechanism reproduced: {failed} of {BURST} connects failed (refused={refused}, timed_out={timed_out}).");
     if cfg!(target_os = "linux") && refused > 0 {
         eprintln!("ECONNREFUSED observed -> host has tcp_abort_on_overflow=1, matches prod.");
     } else if refused == 0 && timed_out > 0 {
         eprintln!("Timeouts (no ECONNREFUSED) -> default kernel behavior; same root cause.");
     }
+    let _ = ok;
 }
 
 /// The fix: bind via `TcpSocket` with an explicit larger backlog (e.g. 4096
@@ -145,29 +199,9 @@ async fn listen_backlog_overflows_at_128_when_accept_stalls() {
 ///      `serve_with_handlers` (would need a small API addition).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn larger_backlog_eliminates_overflow_under_same_burst() {
-    use tokio::net::TcpSocket;
-
-    const BURST: usize = 300;
     const BACKLOG: u32 = 4096;
 
-    let socket = TcpSocket::new_v4().expect("socket");
-    socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-    let addr = socket.local_addr().expect("local_addr");
-    let port = addr.port();
-    let listener = socket.listen(BACKLOG).expect("listen");
-    let release = Arc::new(Notify::new());
-    let release_clone = release.clone();
-
-    tokio::spawn(async move {
-        release_clone.notified().await;
-        while let Ok((_, _)) = listener.accept().await {}
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let (ok, refused, timed_out, other) = burst_connect(port, BURST, Duration::from_millis(500)).await;
-    release.notify_one();
-
-    eprintln!("explicit-backlog={BACKLOG} burst={BURST} ok={ok} refused={refused} timed_out={timed_out} other={}", other.len());
+    let BurstResult { ok, refused, timed_out } = run_burst("explicit-backlog=4096", Some(BACKLOG), false, Duration::from_millis(500), 0).await;
 
     // CRITICAL FINDING: this assertion may fail even after the app-level fix
     // because the OS clamps the requested backlog to `somaxconn`:
@@ -199,6 +233,7 @@ async fn larger_backlog_eliminates_overflow_under_same_burst() {
          but got ok={ok} refused={refused} timed_out={timed_out}. \
          Either somaxconn is set below {BURST} on this host or the fix is incomplete."
     );
+    let _ = (refused, timed_out);
 }
 
 /// Reproduces the **realistic** prod scenario: a fast accept loop that
@@ -213,66 +248,9 @@ async fn larger_backlog_eliminates_overflow_under_same_burst() {
 /// accept loop is being starved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_starvation_causes_backlog_overflow_under_burst() {
-    const BURST: usize = 300;
-    const HOG_DURATION_MS: u64 = 800;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    let stop = Arc::new(Notify::new());
-    let stop_clone = stop.clone();
-
-    let accepter = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = stop_clone.notified() => break,
-                res = listener.accept() => {
-                    match res {
-                        Ok((s, _)) => { drop(s); }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    });
-
-    // Saturate every worker with a CPU-bound spin. This mimics heavy query
-    // execution starving the accept task.
-    //
-    // NOTE: tokio::task::spawn_blocking does NOT starve the runtime — it runs
-    // on a dedicated blocking pool. Use tokio::spawn with a tight CPU-bound
-    // loop (no .await points) so the work actually pins a runtime worker.
-    let hogs: Vec<_> = (0..2)
-        .map(|i| {
-            tokio::spawn(async move {
-                let deadline = std::time::Instant::now() + Duration::from_millis(HOG_DURATION_MS);
-                let mut x: u64 = i as u64;
-                while std::time::Instant::now() < deadline {
-                    // Cooperative yield budget exhausts after ~128 polls in tokio,
-                    // but a tight loop with no .await points blocks the worker
-                    // entirely. That's the realistic case: a heavy synchronous
-                    // routine inside a handler (e.g. arrow compute) holding the
-                    // worker thread.
-                    for _ in 0..1_000_000 {
-                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                    }
-                    std::hint::black_box(x);
-                }
-            })
-        })
-        .collect();
-
-    // Tiny pause so the hogs are actually scheduled and start spinning.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    let (ok, refused, timed_out, other) = burst_connect(port, BURST, Duration::from_millis(400)).await;
-
-    for h in hogs {
-        let _ = h.await;
-    }
-    stop.notify_one();
-    let _ = accepter.await;
-
-    eprintln!("worker-starved burst: ok={ok} refused={refused} timed_out={timed_out} other={}", other.len());
+    // hogs == worker_threads: every runtime worker must be pinned to starve
+    // the accept task.
+    let BurstResult { ok, refused, timed_out } = run_burst("worker-starved", None, true, Duration::from_millis(400), 2).await;
 
     // Under worker starvation, the accept task can't drain 128+ SYNs fast
     // enough during the burst. We expect SOME failures even though the
@@ -288,43 +266,20 @@ async fn worker_starvation_causes_backlog_overflow_under_burst() {
         );
     } else {
         eprintln!(
-            "Reproduced: {} of {BURST} connects failed because the accept task was starved \
+            "Reproduced: {failed} of {BURST} connects failed because the accept task was starved \
              by CPU-bound workers (refused={refused}, timed_out={timed_out}). On a Linux host \
              with tcp_abort_on_overflow=1, the timeouts here would appear as ECONNREFUSED \
-             at the client — matching monoscope's prod logs.",
-            failed
+             at the client — matching monoscope's prod logs."
         );
     }
+    let _ = ok;
 }
 
 /// Sanity check: with a fast acceptor, the same burst should succeed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_overflow_when_acceptor_drains_promptly() {
-    const BURST: usize = 300;
+    let BurstResult { ok, refused, timed_out } = run_burst("fast-acceptor", None, true, Duration::from_millis(2000), 0).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    let stop = Arc::new(Notify::new());
-    let stop_clone = stop.clone();
-
-    let accepter = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = stop_clone.notified() => break,
-                res = listener.accept() => {
-                    if res.is_err() { break; }
-                }
-            }
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let (ok, refused, timed_out, other) = burst_connect(port, BURST, Duration::from_millis(2000)).await;
-
-    stop.notify_one();
-    let _ = accepter.await;
-
-    eprintln!("fast-acceptor burst: ok={ok} refused={refused} timed_out={timed_out} other={}", other.len());
     // With a tight accept loop draining the queue, all 300 should land.
     assert_eq!(ok, BURST, "fast acceptor should drain all {BURST} connects (got ok={ok}, refused={refused}, timed_out={timed_out})");
 }

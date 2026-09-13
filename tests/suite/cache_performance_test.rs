@@ -6,28 +6,58 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
-use object_store::{ObjectStoreExt, PutPayload, path::Path};
+use futures::TryStreamExt;
+use object_store::{GetResultPayload, ObjectStoreExt, PutPayload, path::Path};
 use timefusion::{
     database::Database,
     storage::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
 };
 
+/// A cache over a fresh in-memory inner store, configured by `tweak`.
+async fn cached_store(name: &str, tweak: impl FnOnce(&mut FoyerCacheConfig)) -> Result<(SharedFoyerCache, FoyerObjectStoreCache)> {
+    let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config_with(name, tweak)).await?;
+    let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(object_store::memory::InMemory::new()), &shared);
+    Ok((shared, store))
+}
+
+/// The raw stream chunks of a GET — callers assert on chunk 0, so this must not concat.
+async fn get_chunks(store: &FoyerObjectStoreCache, path: &Path) -> Result<Vec<Bytes>> {
+    match store.get(path).await?.payload {
+        GetResultPayload::Stream(s) => Ok(s.try_collect().await?),
+        _ => panic!("Expected stream"),
+    }
+}
+
+async fn put(store: &FoyerObjectStoreCache, path: &Path, data: Vec<u8>) -> Result<()> {
+    store.put(path, PutPayload::from(Bytes::from(data))).await?;
+    Ok(())
+}
+
+/// Reads only the parquet footer range of every file; returns wall time.
+async fn read_all_footers(cache: &FoyerObjectStoreCache, count: usize, size: usize, footer: usize) -> Result<Duration> {
+    let start = Instant::now();
+    for i in 0..count {
+        let _ = cache.get_range(&Path::from(format!("data/part-{i:04}.parquet")), (size - footer) as u64..size as u64).await?;
+    }
+    Ok(start.elapsed())
+}
+
+async fn finish(shared: &SharedFoyerCache) -> Result<()> {
+    shared.log_stats().await;
+    shared.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(30)).await
+}
+
 #[tokio::test]
 async fn test_cache_performance_and_s3_bypass() -> Result<()> {
-    let inner_store = Arc::new(object_store::memory::InMemory::new());
-
-    // Configure cache with reasonable test sizes
-    let config = FoyerCacheConfig::test_config_with("cache_perf", |c| {
+    // Checkpoint caching is always enabled now with stale-while-revalidate
+    let (shared_cache, cached) = cached_store("cache_perf", |c| {
         c.memory_size_bytes = 50 * 1024 * 1024; // 50MB memory
         c.disk_size_bytes = 100 * 1024 * 1024; // 100MB disk
         c.shards = 4;
-        // Checkpoint caching is always enabled now with stale-while-revalidate
-    });
+    })
+    .await?;
 
-    let shared_cache = SharedFoyerCache::new(config).await?;
-    let cached_store = FoyerObjectStoreCache::new_with_shared_cache(inner_store.clone(), &shared_cache);
-
-    let test_files = vec![
+    let test_files = [
         ("table/2024/01/part-001.parquet", vec![0u8; 1024 * 512]), // 512KB
         ("table/2024/01/part-002.parquet", vec![1u8; 1024 * 768]), // 768KB
         ("table/2024/01/part-003.parquet", vec![2u8; 1024 * 256]), // 256KB
@@ -35,36 +65,25 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
 
     // Write test files (these will be cached immediately after write)
     for (path_str, data) in &test_files {
-        let path = Path::from(*path_str);
-        cached_store.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
+        put(&cached, &Path::from(*path_str), data.clone()).await?;
     }
 
-    // Get baseline stats after writes
     let stats_after_write = shared_cache.get_stats().await;
     assert_eq!(stats_after_write.main.inner_puts, 3, "Should have written to inner store 3 times");
     // Writes warm the cache directly from the put payload (no post-write
     // re-fetch), so no inner GETs are issued during writes.
     assert_eq!(stats_after_write.main.inner_gets, 0, "Writes warm from payload — no inner GET during write");
 
-    let start = Instant::now();
-    for (path_str, _) in &test_files {
-        let path = Path::from(*path_str);
-        let _ = cached_store.get(&path).await?;
-    }
-    let first_read_time = start.elapsed();
-
-    // Second read - should also hit cache
-    let start = Instant::now();
-    for (path_str, _) in &test_files {
-        let path = Path::from(*path_str);
-        let _ = cached_store.get(&path).await?;
-    }
-    let cached_read_time = start.elapsed();
-
-    // Log stats to verify cache behavior
-    shared_cache.log_stats().await;
-
     // Both reads should be fast since they hit cache
+    let mut elapsed = Vec::new();
+    for _ in 0..2 {
+        let start = Instant::now();
+        for (path_str, _) in &test_files {
+            let _ = cached.get(&Path::from(*path_str)).await?;
+        }
+        elapsed.push(start.elapsed());
+    }
+    let (first_read_time, cached_read_time) = (elapsed[0], elapsed[1]);
     assert!(cached_read_time <= first_read_time * 2, "Cached reads should be consistently fast. First: {:?}, Cached: {:?}", first_read_time, cached_read_time);
 
     let stats = shared_cache.get_stats().await;
@@ -73,71 +92,38 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     assert_eq!(stats.main.inner_gets, 0, "Writes warm from payload and reads hit cache — no inner GETs at all");
     assert_eq!(stats.main.inner_puts, 3, "Should have written to inner store 3 times");
 
+    // Overwrite invalidates: the next read must see the new data
     let update_path = Path::from("table/2024/01/part-001.parquet");
-    cached_store.put(&update_path, PutPayload::from(Bytes::from(vec![9u8; 1024]))).await?;
+    put(&cached, &update_path, vec![9u8; 1024]).await?;
+    assert_eq!(get_chunks(&cached, &update_path).await?[0][0], 9u8, "Should get updated data after invalidation");
 
-    // Read should fetch new data
-    let result = cached_store.get(&update_path).await?;
-    use futures::TryStreamExt;
-    let stream = match result.payload {
-        object_store::GetResultPayload::Stream(s) => s,
-        _ => panic!("Expected stream"),
-    };
-    let bytes: Vec<Bytes> = stream.try_collect().await?;
-    assert_eq!(bytes[0][0], 9u8, "Should get updated data after invalidation");
-
-    // Cleanup
-    shared_cache.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(30)).await?;
-
-    Ok(())
+    finish(&shared_cache).await
 }
 
 #[tokio::test]
 async fn test_large_file_disk_caching() -> Result<()> {
-    let inner_store = Arc::new(object_store::memory::InMemory::new());
+    let (shared_cache, cached) = cached_store("disk_cache", |c| c.ttl = Duration::from_secs(60)).await?;
 
-    let config = FoyerCacheConfig::test_config_with("disk_cache", |c| {
-        c.ttl = Duration::from_secs(60);
-        // Checkpoint caching is always enabled now with stale-while-revalidate
-    });
-
-    let shared_cache = SharedFoyerCache::new(config).await?;
-    let cached_store = FoyerObjectStoreCache::new_with_shared_cache(inner_store.clone(), &shared_cache);
-
-    let large_files = vec![
+    let large_files = [
         ("test/file1.parquet", vec![0u8; 512 * 1024]), // 512KB
         ("test/file2.parquet", vec![1u8; 768 * 1024]), // 768KB
     ];
 
-    // Write and read test files
     for (path_str, data) in &large_files {
         let path = Path::from(*path_str);
-        cached_store.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
-
-        let _ = cached_store.get(&path).await?;
+        put(&cached, &path, data.clone()).await?;
+        let _ = cached.get(&path).await?;
     }
 
-    // Second read should hit cache
+    // Second read should hit cache, serving the whole file in one chunk
     for (path_str, data) in &large_files {
-        let path = Path::from(*path_str);
-        let result = cached_store.get(&path).await?;
-
-        use futures::TryStreamExt;
-        let stream = match result.payload {
-            object_store::GetResultPayload::Stream(s) => s,
-            _ => panic!("Expected stream"),
-        };
-        let bytes: Vec<Bytes> = stream.try_collect().await?;
-        assert_eq!(bytes[0].len(), data.len(), "Should retrieve full file from cache");
+        let chunks = get_chunks(&cached, &Path::from(*path_str)).await?;
+        assert_eq!(chunks[0].len(), data.len(), "Should retrieve full file from cache");
     }
 
-    let stats = shared_cache.get_stats().await;
-    assert!(stats.main.hits > 0, "Should have cache hits");
+    assert!(shared_cache.get_stats().await.main.hits > 0, "Should have cache hits");
 
-    shared_cache.log_stats().await;
-    shared_cache.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(30)).await?;
-
-    Ok(())
+    finish(&shared_cache).await
 }
 
 #[tokio::test]
@@ -150,11 +136,10 @@ async fn test_cache_with_database_integration() -> Result<()> {
         env::set_var("TIMEFUSION_FOYER_STATS", "true");
     }
 
-    let db = Database::new().await?;
-
     // 1. Shared Foyer cache initializes correctly
     // 2. All tables use the cached object store
     // 3. Cache configuration is applied from environment
+    let db = Database::new().await?;
 
     // Graceful shutdown
     db.shutdown().await?;
@@ -164,14 +149,15 @@ async fn test_cache_with_database_integration() -> Result<()> {
 
 #[tokio::test]
 async fn test_parquet_metadata_cache_performance() -> Result<()> {
-    // Use in-memory store for testing
-    let inner = Arc::new(object_store::memory::InMemory::new());
+    const FILE_COUNT: usize = 10;
+    const FILE_SIZE: usize = 50 * 1024 * 1024; // 50MB each
+    const METADATA_SIZE: usize = 1024 * 1024; // 1MB metadata
 
-    // Configure cache with metadata optimization
+    let inner = Arc::new(object_store::memory::InMemory::new());
     let config = FoyerCacheConfig {
         memory_size_bytes: 50 * 1024 * 1024, // 50MB
         disk_size_bytes: 100 * 1024 * 1024,  // 100MB
-        ttl: std::time::Duration::from_secs(300),
+        ttl: Duration::from_secs(300),
         cache_dir: std::path::PathBuf::from("/tmp/test_parquet_metadata_perf"),
         shards: 4,
         file_size_bytes: 4 * 1024 * 1024, // 4MB
@@ -182,77 +168,28 @@ async fn test_parquet_metadata_cache_performance() -> Result<()> {
         metadata_shards: 2,
         ..Default::default()
     };
-
     let cache_dir = config.cache_dir.clone();
     let _ = std::fs::remove_dir_all(&cache_dir);
 
     let cache = Arc::new(FoyerObjectStoreCache::new(inner.clone(), config).await?);
 
-    let file_count = 10;
-    let file_size = 50 * 1024 * 1024; // 50MB each
-    let metadata_size = 1024 * 1024; // 1MB metadata
-
-    println!("Creating {} parquet files of {}MB each...", file_count, file_size / 1024 / 1024);
-
-    for i in 0..file_count {
-        let path = Path::from(format!("data/part-{:04}.parquet", i));
-        let data = vec![b'x'; file_size];
-        inner.put(&path, PutPayload::from(Bytes::from(data))).await?;
+    let part = |i: usize| Path::from(format!("data/part-{i:04}.parquet"));
+    for i in 0..FILE_COUNT {
+        inner.put(&part(i), PutPayload::from(Bytes::from(vec![b'x'; FILE_SIZE]))).await?;
     }
 
-    // Get initial stats
     let initial_stats = cache.get_stats().await;
-
-    println!("\nTest 1: Reading metadata with cold cache...");
-    let start = Instant::now();
-
-    for i in 0..file_count {
-        let path = Path::from(format!("data/part-{:04}.parquet", i));
-        let metadata_range = (file_size - metadata_size) as u64..file_size as u64;
-        let _ = cache.get_range(&path, metadata_range).await?;
-    }
-
-    let cold_duration = start.elapsed();
+    let cold_duration = read_all_footers(&cache, FILE_COUNT, FILE_SIZE, METADATA_SIZE).await?;
     let cold_stats = cache.get_stats().await;
-
-    println!("Cold cache duration: {:?}", cold_duration);
-    println!(
-        "Cold cache stats: metadata_hits={}, metadata_misses={}, metadata_inner_gets={}",
-        cold_stats.metadata.hits - initial_stats.metadata.hits,
-        cold_stats.metadata.misses - initial_stats.metadata.misses,
-        cold_stats.metadata.inner_gets - initial_stats.metadata.inner_gets
-    );
-
-    println!("\nTest 2: Reading metadata with warm cache...");
-    let start = Instant::now();
-
-    for i in 0..file_count {
-        let path = Path::from(format!("data/part-{:04}.parquet", i));
-        let metadata_range = (file_size - metadata_size) as u64..file_size as u64;
-        let _ = cache.get_range(&path, metadata_range).await?;
-    }
-
-    let warm_duration = start.elapsed();
+    let warm_duration = read_all_footers(&cache, FILE_COUNT, FILE_SIZE, METADATA_SIZE).await?;
     let final_stats = cache.get_stats().await;
 
-    println!("Warm cache duration: {:?}", warm_duration);
-    println!(
-        "Final stats: metadata_hits={}, metadata_misses={}, metadata_inner_gets={}",
-        final_stats.metadata.hits, final_stats.metadata.misses, final_stats.metadata.inner_gets
-    );
-
-    // Calculate speedup
-    let speedup = cold_duration.as_secs_f64() / warm_duration.as_secs_f64();
-    println!("\nSpeedup: {:.2}x", speedup);
-
-    // Calculate data savings
+    // Only the footer of each file is ever fetched, not the whole 50MB object.
     let cold_inner_gets = cold_stats.metadata.inner_gets - initial_stats.metadata.inner_gets;
-    let data_fetched = cold_inner_gets as usize * metadata_size;
-    let data_saved = file_count * file_size - data_fetched;
-    println!("Data fetched: {}MB (instead of {}MB)", data_fetched / 1024 / 1024, file_count * file_size / 1024 / 1024);
-    println!("Data saved: {}MB ({:.1}% reduction)", data_saved / 1024 / 1024, (data_saved as f64 / (file_count * file_size) as f64) * 100.0);
+    let data_fetched = cold_inner_gets as usize * METADATA_SIZE;
+    println!("cold {cold_duration:?} / warm {warm_duration:?}; fetched {}MB of {}MB", data_fetched / 1024 / 1024, FILE_COUNT * FILE_SIZE / 1024 / 1024);
 
-    assert_eq!(final_stats.metadata.hits - cold_stats.metadata.hits, file_count as u64);
+    assert_eq!(final_stats.metadata.hits - cold_stats.metadata.hits, FILE_COUNT as u64);
     assert_eq!(final_stats.metadata.inner_gets, cold_stats.metadata.inner_gets); // No new fetches
 
     cache.shutdown().await?;
