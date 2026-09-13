@@ -249,8 +249,34 @@ const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
 /// `MAX_DECODED_BYTES` and the dedup lane with its own preflight; the packer was
 /// the one that bounded compressed input against a decoded budget and never
 /// converted between them.
+/// The margin, and why a bin sized to exactly ONE sort budget is still too big.
+///
+/// #271 stopped bins from being 2.4x the budget. It did not make them fast: prod
+/// 2026-09-13 measured the staging cost of every bin against this cap and found
+/// the cliff sits AT 1.0, not past it:
+///
+/// | ratio of cap | staging  |
+/// |--------------|----------|
+/// | 0.15         | 3.9 s    |
+/// | 0.56-0.60    | 15-180 s |
+/// | **1.00**     | **1,710 s** |
+/// | 1.37         | 1,753 s  |
+///
+/// A bin at 100% of the cap took **28.5 minutes** while one at 60% took 15
+/// seconds — and at two light permits, one such bin is a quarter of an hour's
+/// whole lane capacity. `DECODED_BYTES_PER_COMPRESSED` = 12 is an ESTIMATE, and
+/// it is optimistic for this data: a bin priced at exactly one sort budget still
+/// exceeds it once decoded, spills, and grows an unspillable merge.
+///
+/// 3/5 puts the ceiling at the top of the measured fast regime rather than at
+/// the estimate's edge. It costs nothing in practice — the MEDIAN bin is 1.4 MB
+/// against a 111.8 MB cap, so this binds only on the large bins, which are
+/// exactly the ones that stall.
+const COORDINATOR_BIN_CAP_MARGIN: (i64, i64) = (3, 5);
+
 pub fn coordinator_bin_compressed_cap_bytes() -> i64 {
-    (COORDINATOR_PER_SORT_BUDGET_BYTES / crate::database::DECODED_BYTES_PER_COMPRESSED as usize) as i64
+    let one_sort = (COORDINATOR_PER_SORT_BUDGET_BYTES / crate::database::DECODED_BYTES_PER_COMPRESSED as usize) as i64;
+    one_sort * COORDINATOR_BIN_CAP_MARGIN.0 / COORDINATOR_BIN_CAP_MARGIN.1
 }
 /// Concurrent target-sized repair rewrites the repair budget must hold.
 ///
@@ -4242,5 +4268,28 @@ mod bin_decode_budget_tests {
         let ratio = |mb: i64| (mb * 1024 * 1024 * crate::database::DECODED_BYTES_PER_COMPRESSED) as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
         assert!(ratio(255) > 2.0, "the stalled prod bins were well past one sort budget");
         assert!(ratio(cap / (1024 * 1024)) <= 1.0, "a bin at the new cap is not");
+    }
+
+    /// A bin at ONE full sort budget is still too slow — the cliff is AT 1.0.
+    ///
+    /// #271 stopped 2.4x bins. Prod 2026-09-13 then measured staging against the
+    /// resulting cap and found a bin at **1.00x took 28.5 MINUTES** while 0.56x
+    /// took 15 s and 0.15x took 3.9 s. `DECODED_BYTES_PER_COMPRESSED` is an
+    /// estimate; pricing a bin at exactly one budget still spills.
+    ///
+    /// Can-fail: drop `COORDINATOR_BIN_CAP_MARGIN` (make the cap one full sort
+    /// budget) and the fast-regime assertion goes red at 1.00x.
+    #[test]
+    fn the_bin_cap_keeps_a_full_bin_inside_the_measured_fast_regime() {
+        let cap = coordinator_bin_compressed_cap_bytes();
+        let ratio = cap as f64 * crate::database::DECODED_BYTES_PER_COMPRESSED as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
+        // 0.56-0.60 staged in 15-180 s; 1.00 took 1,710 s. Stay at or under the
+        // top of the fast band, with the slow point excluded by a real margin.
+        assert!(ratio <= 0.65, "a full bin is {ratio:.2} of a sort budget; prod measured 1.00x at 28.5 minutes");
+        assert!(ratio >= 0.40, "too much margin wastes the lane: bins shrink while fixed per-unit cost stays");
+        // The 111.3 MB prod bin that staged for 28.5 minutes must now be refused.
+        assert!(cap < 111_340_092, "the bin measured at 28.5 minutes ({}) must not fit the cap ({cap})", 111_340_092_i64);
+        // ...while the 63.1 MB bin that staged in 15 s must still fit.
+        assert!(cap >= 63_094_710, "the 15-second prod bin must still be admissible");
     }
 }
