@@ -225,11 +225,14 @@ pub fn coordinator_bin_compressed_cap_bytes() -> i64 {
 /// BELOW 2x the target file size cannot merge anything, whatever it does for
 /// decode safety. **A bin that cannot hold two files retires nothing, and a
 /// lane that retires nothing is worse than a slow one.**
-pub fn coordinator_packing_cap_bytes(target_file_bytes: i64) -> i64 {
+pub fn coordinator_packing_cap_bytes(smallest_pair_bytes: i64) -> i64 {
     let margin = coordinator_bin_compressed_cap_bytes() * 3 / 5;
-    // Two target-sized files, always — the floor wins over the margin, because a
-    // stalled bin costs one permit while an unpackable cell costs the lane.
-    margin.max(target_file_bytes.saturating_mul(2))
+    // The pair itself, NOT a per-file size doubled. Taking a file size and
+    // multiplying by two loses a byte whenever the pair sums odd, and prod
+    // 2026-09-13 showed exactly that: `target=82703666 smallest_pair_bytes=
+    // 82703667 smallest_pair_fits=false`. One byte short is as unpackable as a
+    // hundred megabytes short, and the cell re-enqueues forever either way.
+    margin.max(smallest_pair_bytes)
 }
 /// Concurrent target-sized repair rewrites the repair budget must hold.
 ///
@@ -3103,13 +3106,17 @@ mod bin_decode_budget_tests {
     fn a_packing_cap_always_admits_two_target_sized_files() {
         // The exact prod shape that wedged.
         let metrics_file = 36 * 1024 * 1024;
-        let cap = coordinator_packing_cap_bytes(metrics_file);
+        let cap = coordinator_packing_cap_bytes(metrics_file * 2);
         assert!(cap >= 72_140_172, "the two smallest prod otel_metrics files ({}) must pair under the cap ({cap})", 72_140_172_i64);
         assert!(cap >= metrics_file * 2, "a cap below 2x the target file size can never merge anything");
         // The margin still governs where it can: a small-file table keeps the
         // measured fast regime rather than being widened to the floor.
         let small = 4 * 1024 * 1024;
-        let margin_cap = coordinator_packing_cap_bytes(small);
+        let margin_cap = coordinator_packing_cap_bytes(small * 2);
+        // An ODD pair must still fit: halving then doubling loses a byte, which
+        // prod hit as `target=82703666` against `smallest_pair_bytes=82703667`.
+        let odd = 82_703_667;
+        assert!(coordinator_packing_cap_bytes(odd) >= odd, "an odd-summed pair must fit the cap it was measured against");
         let ratio = margin_cap as f64 * crate::database::DECODED_BYTES_PER_COMPRESSED as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
         assert!(ratio <= 0.65, "where the floor does not bind, a full bin is {ratio:.2} of a sort budget; 1.00x measured 28.5 minutes");
         assert!(margin_cap < coordinator_bin_compressed_cap_bytes(), "the margin must still bind below the raw decode cap");

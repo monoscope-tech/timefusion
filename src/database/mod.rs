@@ -7231,7 +7231,28 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
             // shape stays excluded. Bytes still bind unconditionally, so such a
             // pair is never bigger than one converged file.
             let pair_exemption = selected.len() == 1 && next_rows <= 2 * MAX_BIN_ROWS;
-            if !selected.is_empty() && (bytes.saturating_add(add.size) > limit || (next_rows > MAX_BIN_ROWS && !pair_exemption)) {
+            // NAME the budget that stopped it. Four consecutive fixes to this
+            // packer (2026-09-13) each corrected a different budget and were
+            // bypassed by the next one down, because the refusal log reported
+            // only that fewer than two files were selected — never WHICH bound
+            // fired. A cell refusing with nine candidates and a pair that fits
+            // is indistinguishable from one refusing on rows, and both read as
+            // "selected fewer than two files".
+            let over_bytes = bytes.saturating_add(add.size) > limit;
+            let over_rows = next_rows > MAX_BIN_ROWS && !pair_exemption;
+            if !selected.is_empty() && (over_bytes || over_rows) {
+                if selected.len() < 2 {
+                    debug!(
+                        selected = selected.len(),
+                        limit,
+                        accumulated = bytes,
+                        candidate = add.size,
+                        rows = next_rows,
+                        max_rows = MAX_BIN_ROWS,
+                        stopped_by = if over_bytes { "bytes" } else { "rows" },
+                        event = "pack_bin_stopped_below_a_pair"
+                    );
+                }
                 break;
             }
             bytes = bytes.saturating_add(add.size);
