@@ -2783,10 +2783,16 @@ impl Database {
         let _watchdog = AbortOnDrop(tokio::spawn({
             let phase = Arc::clone(&phase);
             async move {
-                let mut held_secs = 0u64;
+                // Back off doubling. A bin at 1.0x the sort budget legitimately
+                // stages for ~1,710 s, so a flat 60 s interval would put ~28 lines
+                // per healthy unit into the log of a memory-tight box. Doubling
+                // keeps the first report early, where a wedge is still news, and
+                // costs a logarithmic number of lines for the long legitimate ones.
+                let (mut held_secs, mut wait) = (0u64, 60u64);
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    held_secs += 60;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    held_secs += wait;
+                    wait = (wait * 2).min(900);
                     warn!(
                         phase = PERMIT_PHASES[phase.load(std::sync::atomic::Ordering::Relaxed).min(PERMIT_PHASES.len() - 1)],
                         held_secs,
