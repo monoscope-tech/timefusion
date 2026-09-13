@@ -2748,7 +2748,45 @@ impl Database {
             }
             _ => None,
         };
+        // PHASE CLOCK over the whole window in which a light permit is held but no
+        // sort has begun. Prod 2026-09-13, on a 54-minute-old process carrying every
+        // one of tonight's permit and packer fixes:
+        //
+        //     light_optimize_bins_committed:   150 -> 150       FROZEN
+        //     compaction_permits_acquired:     370 -> 370       FROZEN
+        //     compaction_permits_unavailable:  4,026 -> 11,136  climbing
+        //     light_rewrite_permits_available: 0                both held
+        //     HotPacking + SealedConsolidation claims in 6 min: 0
+        //     wave_bin_staging_started in 20 min:               0
+        //
+        // Both permits were held by units that never released them, and because the
+        // permit is taken BEFORE the claim the hygiene lanes then stop claiming at
+        // all. The lane does not drain slowly — it WEDGES, and prod's constant
+        // redeploys keep clearing and re-forming the wedge, which reads as slowness.
+        //
+        // No staging starts, so the block is somewhere in claim -> admission ->
+        // resolve_table -> compaction_files. Every one of those is plausible: the
+        // journal mutex, the second semaphore, an object-store round trip, and a
+        // walk of a 3-4k-file snapshot. Four consecutive failed passes at the packer
+        // came from picking the plausible candidate instead of measuring, so this
+        // measures. #268's lifetime cap cannot substitute — `tokio::time::timeout`
+        // cannot preempt a future that never reaches an await point.
+        let held_at = std::time::Instant::now();
+        let mut phase = "claim";
+        let note = |next: &'static str, at: &mut &'static str| {
+            let elapsed = held_at.elapsed();
+            if elapsed >= std::time::Duration::from_secs(30) {
+                warn!(
+                    phase = *at,
+                    elapsed_secs = elapsed.as_secs(),
+                    event = "compaction_permit_held_without_staging",
+                    "a light permit was held this long before reaching the next phase"
+                );
+            }
+            *at = next;
+        };
         let Some((task, _quarantine_slot)) = self.claim_coordinator_task(selection) else { return Ok(false) };
+        note("admission", &mut phase);
         let key = task.key.clone();
         self.log_task_started(&task);
         let _lease = TaskLease::new(Arc::clone(&self.maintenance_tasks), key.clone());
@@ -2759,11 +2797,14 @@ impl Database {
         let Some(_permit) = self.maintenance_admission.try_acquire(request) else {
             return self.retried(&key, "admission_busy".to_owned(), admission_backoff(task.attempts));
         };
+        note("resolve_table", &mut phase);
         let table_ref = match self.resolve_table(&key.project_id, &key.source).await {
             Ok(table) => table,
             Err(error) => return retry(format!("resolve_compaction_source: {error:#}"), 30),
         };
+        note("compaction_files", &mut phase);
         let files = self.coordinator_compaction_files(&table_ref, &key).await?;
+        note("staging", &mut phase);
         if files.is_empty() {
             return self.completed(&key);
         }
