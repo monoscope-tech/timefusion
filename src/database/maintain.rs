@@ -198,6 +198,19 @@ mod liveness_clock_tests {
         atomic::{AtomicU64, Ordering::Relaxed},
     };
 
+    /// 100s of work in five 20s steps, against a 30s idle window — `step` is how
+    /// the unit reports each step's rows.
+    async fn five_steps_under_a_30s_window(progress: &Arc<AtomicU64>, step: impl Fn()) -> Option<&'static str> {
+        let work = async {
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                step();
+            }
+            "committed"
+        };
+        super::run_until_idle(std::time::Duration::from_secs(30), Arc::clone(progress), work).await.ok()
+    }
+
     /// The whole point: a unit that is still writing rows outlives its window.
     /// Killing it discards uncommitted work and re-queues the identical slice,
     /// which is the treadmill every one of prod's 432 repair units was on.
@@ -205,15 +218,11 @@ mod liveness_clock_tests {
     async fn work_that_keeps_writing_rows_outlives_its_idle_window() {
         let progress = Arc::new(AtomicU64::new(0));
         let ticker = Arc::clone(&progress);
-        let work = async move {
-            for _ in 0..5 {
-                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                ticker.fetch_add(1, Relaxed);
-            }
-            "committed"
-        };
-        let result = super::run_until_idle(std::time::Duration::from_secs(30), progress, work).await;
-        assert_eq!(result.ok(), Some("committed"), "100s of steady progress must survive a 30s idle window");
+        let result = five_steps_under_a_30s_window(&progress, move || {
+            ticker.fetch_add(1, Relaxed);
+        })
+        .await;
+        assert_eq!(result, Some("committed"), "100s of steady progress must survive a 30s idle window");
     }
 
     /// The reporting side, on the path that has no parameter to thread: a write
@@ -221,16 +230,9 @@ mod liveness_clock_tests {
     #[tokio::test(start_paused = true)]
     async fn a_deep_write_loop_keeps_its_unit_alive() {
         let progress = Arc::new(AtomicU64::new(0));
-        let work = async {
-            for _ in 0..5 {
-                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                // Four calls deep in the real thing; the point is that it needs
-                // no handle.
-                super::note_unit_progress(1_000);
-            }
-            "committed"
-        };
-        assert_eq!(super::run_until_idle(std::time::Duration::from_secs(30), Arc::clone(&progress), work).await.ok(), Some("committed"));
+        // `note_unit_progress` is four calls deep in the real thing; the point
+        // is that it needs no handle.
+        assert_eq!(five_steps_under_a_30s_window(&progress, || super::note_unit_progress(1_000)).await, Some("committed"));
         assert_eq!(progress.load(Relaxed), 5_000, "the task-local reached the counter the clock reads");
     }
 
@@ -288,13 +290,14 @@ mod liveness_clock_tests {
     /// (cron paths, tests) it must read as "none" rather than panicking.
     #[tokio::test]
     async fn a_maintenance_query_reports_the_operation_that_ran_it() {
-        assert_eq!(super::UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"), "none", "outside a unit there is no operation");
+        let reported = || super::UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none");
+        assert_eq!(reported(), "none", "outside a unit there is no operation");
         super::UNIT_OPERATION
             .scope("Dedup", async {
-                assert_eq!(super::UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"), "Dedup");
+                assert_eq!(reported(), "Dedup");
                 // And it must survive an await point, since every real query has one.
                 tokio::task::yield_now().await;
-                assert_eq!(super::UNIT_OPERATION.try_with(|operation| *operation).unwrap_or("none"), "Dedup");
+                assert_eq!(reported(), "Dedup");
             })
             .await;
     }
@@ -402,22 +405,23 @@ mod liveness_clock_tests {
 
 #[cfg(test)]
 mod batch_rows_tests {
-    /// One assertion per regime, because the whole point of the function is that
+    use super::{batch_rows_for, estimated_decoded_bytes};
+    use test_case::test_case;
+
+    /// One case per regime, because the whole point of the function is that
     /// one row count cannot serve rows that differ 60x in width.
-    #[test]
-    fn batch_rows_for_prices_bytes_not_rows() {
-        use super::{batch_rows_for, estimated_decoded_bytes};
-        const TARGET: u64 = 8 << 20;
-        // Ordinary otel rows (~1 KB decoded) get a real batch, not 256 rows.
-        assert_eq!(batch_rows_for(1_000_000_000, 1_000_000, TARGET), 8192, "1 KB rows reach the ceiling");
-        // Prod's worst repair input, priced the way the caller prices it — off
-        // `DECODED_BYTES_PER_COMPRESSED`, which calls this file 13.3 KB/row
-        // against its true 6.8. The overestimate lands on the safe side.
-        assert_eq!(batch_rows_for(estimated_decoded_bytes(1_148_230_580), 1_035_264, TARGET), 630, "a mid-width bin lands between the clamps");
-        // The whale's widest rows stay at the floor, which is where they belong.
-        assert_eq!(batch_rows_for(63_000_000, 1_000, TARGET), 256, "63 KB rows cannot afford more");
-        // No rows measured (missing statistics) is not a licence to guess big.
-        assert_eq!(batch_rows_for(1_000_000_000, 0, TARGET), 256, "an unmeasurable bin keeps the old constant");
+    // Ordinary otel rows (~1 KB decoded) get a real batch, not 256 rows.
+    #[test_case(1_000_000_000, 1_000_000 => 8192 ; "1 KB rows reach the ceiling")]
+    // Prod's worst repair input, priced the way the caller prices it — off
+    // `DECODED_BYTES_PER_COMPRESSED`, which calls this file 13.3 KB/row
+    // against its true 6.8. The overestimate lands on the safe side.
+    #[test_case(estimated_decoded_bytes(1_148_230_580), 1_035_264 => 630 ; "a mid-width bin lands between the clamps")]
+    // The whale's widest rows stay at the floor, which is where they belong.
+    #[test_case(63_000_000, 1_000 => 256 ; "63 KB rows cannot afford more")]
+    // No rows measured (missing statistics) is not a licence to guess big.
+    #[test_case(1_000_000_000, 0 => 256 ; "an unmeasurable bin keeps the old constant")]
+    fn batch_rows_for_prices_bytes_not_rows(decoded_bytes: u64, rows: u64) -> usize {
+        batch_rows_for(decoded_bytes, rows, 8 << 20)
     }
 }
 
@@ -9653,23 +9657,20 @@ mod date_coverage_recovery_tests {
     /// a hole anywhere in the run would claim hours no build aggregated. These
     /// pin that a gap refuses outright rather than being papered over by taking
     /// the maximum end — which a span-based union would silently do.
-    #[test]
-    fn a_gap_refuses_and_only_a_true_run_answers() {
-        let hour = 3_600_000_000i64;
-        // Contiguous from the first row: answers the end of the run.
-        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(hour, 2 * hour), (2 * hour, 5 * hour)]), Some(5 * hour));
-        // Overlapping slices are still a run.
-        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(hour, 3 * hour), (2 * hour, 4 * hour)]), Some(4 * hour));
-        // Out of order input is sorted, not rejected.
-        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(2 * hour, 5 * hour), (hour, 2 * hour)]), Some(5 * hour));
-        // A HOLE between 2h and 3h: refuse, do not answer 5h.
-        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(hour, 2 * hour), (3 * hour, 5 * hour)]), None);
-        // Coverage starts AFTER the partition's first row, so the opening rows
-        // were never aggregated — refuse.
-        assert_eq!(Database::contiguous_coverage_end(hour, &mut [(2 * hour, 5 * hour)]), None);
-        // Starting at or before the first row is fine; the read path clamps.
-        assert_eq!(Database::contiguous_coverage_end(2 * hour, &mut [(hour, 5 * hour)]), Some(5 * hour));
-        assert_eq!(Database::contiguous_coverage_end(hour, &mut []), None);
+    ///
+    /// Cases are written in whole HOURS (input and expectation); the body scales
+    /// to the micros the function takes and back.
+    #[test_case::test_case(1, vec![(1, 2), (2, 5)] => Some(5) ; "contiguous from the first row: answers the end of the run")]
+    #[test_case::test_case(1, vec![(1, 3), (2, 4)] => Some(4) ; "overlapping slices are still a run")]
+    #[test_case::test_case(1, vec![(2, 5), (1, 2)] => Some(5) ; "out of order input is sorted, not rejected")]
+    #[test_case::test_case(1, vec![(1, 2), (3, 5)] => None ; "a HOLE between 2h and 3h: refuse, do not answer 5h")]
+    #[test_case::test_case(1, vec![(2, 5)] => None ; "coverage starts AFTER the partition's first row, so the opening rows were never aggregated")]
+    #[test_case::test_case(2, vec![(1, 5)] => Some(5) ; "starting at or before the first row is fine; the read path clamps")]
+    #[test_case::test_case(1, vec![] => None ; "no coverage at all")]
+    fn a_gap_refuses_and_only_a_true_run_answers(partition_min_hour: i64, hour_spans: Vec<(i64, i64)>) -> Option<i64> {
+        const HOUR: i64 = 3_600_000_000;
+        let mut spans: Vec<(i64, i64)> = hour_spans.into_iter().map(|(s, e)| (s * HOUR, e * HOUR)).collect();
+        Database::contiguous_coverage_end(partition_min_hour * HOUR, &mut spans).map(|end| end / HOUR)
     }
 
     /// A ramping tier must not pin the fleet gauge; a starved one must.
@@ -9678,32 +9679,31 @@ mod date_coverage_recovery_tests {
     /// the fleet gauge to 2 while `dashboard_1m_v3`, `dashboard_1h_v2` and both
     /// otel_metrics tiers sat at 30 — running the whole cluster in
     /// coverage-short mode, which OVERRIDES the journal ceiling, for an
-    /// auxiliary tier nobody queries.
-    #[test]
-    fn a_ramping_tier_abstains_from_the_fleet_gauge_but_a_starved_one_pins_it() {
-        // The prod shape: a real tier seeds 30, the ramping tier abstains, so
-        // the fleet stays 30 instead of collapsing to 2.
-        let seeded = fold_fleet_gauge(0, 30, false, false).expect("a real tier always counts");
-        assert_eq!(seeded, 30);
-        assert_eq!(fold_fleet_gauge(seeded, 2, true, true), None, "a ramping tier must not drag an established fleet value down");
-
-        // ORDER-INDEPENDENT: the ramping tier listed FIRST seeds provisionally,
-        // and the real tier overwrites rather than minimising into it. Without
-        // this, schema order alone decided whether the fleet read 2 or 30.
-        assert_eq!(fold_fleet_gauge(0, 2, false, true), Some(2), "with nothing real yet, even a ramping tier is better than no gauge");
-        assert_eq!(fold_fleet_gauge(2, 30, false, false), Some(30), "the first real tier REPLACES a provisional value");
-
-        // A fresh deployment is all-ramping, and must still publish something —
-        // abstaining everywhere left the gauge at its start value, which is how
-        // `the_backfill_ceiling_defers_enqueueing_without_stopping_the_pass`
-        // caught this.
-        assert_eq!(fold_fleet_gauge(u64::MAX, 3, false, true), Some(3));
-
-        // And the property that must NOT be lost: a genuinely starved tier still
-        // pins the fleet, because that is what arms the ceiling override for the
-        // tier every 7d/30d query reads.
-        assert_eq!(fold_fleet_gauge(seeded, 5, true, false), Some(5));
-        assert_eq!(fold_fleet_gauge(5, 30, true, false), Some(5), "min, not last-writer");
+    /// auxiliary tier nobody queries. The prod shape is the first two cases: a
+    /// real tier seeds 30, the ramping tier abstains, so the fleet stays 30
+    /// instead of collapsing to 2.
+    ///
+    /// The folds must also be ORDER-INDEPENDENT: a ramping tier listed FIRST
+    /// seeds provisionally and the real tier OVERWRITES rather than minimising
+    /// into it. Without that, schema order alone decided whether the fleet read
+    /// 2 or 30. And a fresh deployment is all-ramping, so it must still publish
+    /// something — abstaining everywhere left the gauge at its start value,
+    /// which is how
+    /// `the_backfill_ceiling_defers_enqueueing_without_stopping_the_pass`
+    /// caught this.
+    ///
+    /// The property that must NOT be lost is the last two cases: a genuinely
+    /// starved tier still pins the fleet, because that is what arms the ceiling
+    /// override for the tier every 7d/30d query reads.
+    #[test_case::test_case(0, 30, false, false => Some(30) ; "a real tier always counts and seeds the gauge")]
+    #[test_case::test_case(30, 2, true, true => None ; "a ramping tier must not drag an established fleet value down")]
+    #[test_case::test_case(0, 2, false, true => Some(2) ; "with nothing real yet, even a ramping tier is better than no gauge")]
+    #[test_case::test_case(2, 30, false, false => Some(30) ; "the first real tier REPLACES a provisional value")]
+    #[test_case::test_case(u64::MAX, 3, false, true => Some(3) ; "an all-ramping fresh deployment still publishes something")]
+    #[test_case::test_case(30, 5, true, false => Some(5) ; "a genuinely starved tier still pins the fleet")]
+    #[test_case::test_case(5, 30, true, false => Some(5) ; "min, not last-writer")]
+    fn a_ramping_tier_abstains_from_the_fleet_gauge_but_a_starved_one_pins_it(previous: u64, value: u64, seeded_by_real: bool, ramping: bool) -> Option<u64> {
+        fold_fleet_gauge(previous, value, seeded_by_real, ramping)
     }
 
     /// The probe phase must not queue the only groups that can GRANT behind the
@@ -9780,14 +9780,14 @@ mod certify_on_completion_tests {
     /// - case 1 went red with the masked exemption reverted to plain `dropped != 0`;
     /// - case 2 went red with the `dropped != 0` conjunct dropped entirely;
     /// - case 3 went red with the `|| dv_moved` term removed.
-    #[test_case::test_case(3, true, false, false, false, false; "masked fp-stable complete pass is CLEAN despite drops")]
-    #[test_case::test_case(3, false, false, false, false, true; "CoW pass that dropped rows stays DIRTY")]
-    #[test_case::test_case(3, true, false, false, true, true; "masked pass with a foreign DV in live-post is DIRTY")]
-    #[test_case::test_case(0, false, false, false, false, false; "zero-drop clean pass is unchanged")]
-    #[test_case::test_case(3, true, false, true, false, true; "fp movement still declines a masked pass")]
-    #[test_case::test_case(0, true, true, false, false, true; "an empty partition proves nothing, masked or not")]
-    fn slice_dirty_cases(dropped: u64, masked: bool, post_empty: bool, fp_moved: bool, dv_moved: bool, dirty: bool) {
-        assert_eq!(slice_pass_dirty(dropped, masked, post_empty, fp_moved, dv_moved), dirty);
+    #[test_case::test_case(3, true, false, false, false => false; "masked fp-stable complete pass is CLEAN despite drops")]
+    #[test_case::test_case(3, false, false, false, false => true; "CoW pass that dropped rows stays DIRTY")]
+    #[test_case::test_case(3, true, false, false, true => true; "masked pass with a foreign DV in live-post is DIRTY")]
+    #[test_case::test_case(0, false, false, false, false => false; "zero-drop clean pass is unchanged")]
+    #[test_case::test_case(3, true, false, true, false => true; "fp movement still declines a masked pass")]
+    #[test_case::test_case(0, true, true, false, false => true; "an empty partition proves nothing, masked or not")]
+    fn slice_dirty_cases(dropped: u64, masked: bool, post_empty: bool, fp_moved: bool, dv_moved: bool) -> bool {
+        slice_pass_dirty(dropped, masked, post_empty, fp_moved, dv_moved)
     }
 
     fn e(p: &str, dv: Option<&str>) -> DvEntry {
@@ -9798,39 +9798,67 @@ mod certify_on_completion_tests {
     /// pre-vs-post compare would decline every masked pass with losers and ship
     /// the feature dead. Can-fail proof: stubbing `dv_visibility_moved` to
     /// `false` turned the three dirty assertions red; restored, all pass.
-    #[test]
-    fn dv_guard_expects_own_attachments_and_declines_foreign_ones() {
+    ///
+    /// `pre` is `{(a,-), (b,-)}` and this pass attaches `dv1` to `a`; each case
+    /// is the LIVE post-state. The last case is the stale-Remove double-add
+    /// shape: BOTH (a,dv1) and (a,dvX) live. A path-keyed map would collapse
+    /// that to one entry; the set compare must not.
+    #[test_case::test_case(vec![("a", Some("dv1")), ("b", None)] => false ; "exactly our commit: clean")]
+    #[test_case::test_case(vec![("a", Some("dv1")), ("b", Some("dvX"))] => true ; "a foreign DV on an untouched file: dirty")]
+    #[test_case::test_case(vec![("a", Some("dvX")), ("b", None)] => true ; "a foreign replacement of our own attachment: dirty")]
+    #[test_case::test_case(vec![("a", Some("dv1")), ("a", Some("dvX")), ("b", None)] => true ; "stale-Remove double-add: two live adds for one path")]
+    fn dv_guard_expects_own_attachments_and_declines_foreign_ones(live: Vec<(&str, Option<&str>)>) -> bool {
         let pre: HashSet<DvEntry> = [e("a", None), e("b", None)].into();
-        let atts = vec![e("a", Some("dv1"))];
-        // Exactly our commit: clean.
-        assert!(!dv_visibility_moved(&pre, &atts, &[e("a", Some("dv1")), e("b", None)].into()));
-        // A foreign DV on an untouched file: dirty.
-        assert!(dv_visibility_moved(&pre, &atts, &[e("a", Some("dv1")), e("b", Some("dvX"))].into()));
-        // A foreign replacement of our own attachment: dirty.
-        assert!(dv_visibility_moved(&pre, &atts, &[e("a", Some("dvX")), e("b", None)].into()));
-        // The stale-Remove double-add shape: BOTH (a,dv1) and (a,dvX) live. A
-        // path-keyed map would collapse this to one entry; the set compare must not.
-        assert!(dv_visibility_moved(&pre, &atts, &[e("a", Some("dv1")), e("a", Some("dvX")), e("b", None)].into()));
+        dv_visibility_moved(&pre, &[e("a", Some("dv1"))], &live.into_iter().map(|(p, dv)| e(p, dv)).collect())
     }
 
-    /// Cross-file duplicate on a sealed past day, two Delta commits → two files.
-    async fn seed_dup_day(db: &Database, project_id: &str) -> Result<(Arc<RwLock<DeltaTable>>, chrono::NaiveDate)> {
+    const TABLE: &str = "otel_logs_and_spans";
+
+    struct Pass {
+        db: Database,
+        table_ref: Arc<RwLock<DeltaTable>>,
+        project_id: String,
+        date: chrono::NaiveDate,
+        pre_files: Vec<String>,
+        pre_dv: HashSet<DvEntry>,
+        dropped: u64,
+        masked: Option<Vec<DvEntry>>,
+    }
+
+    /// Seeds a cross-file duplicate on a sealed past day (two Delta commits →
+    /// two files), snapshots the pre-state the certification guard compares
+    /// against, and runs ONE dedup pass. The single dropped duplicate is
+    /// asserted here so each arm below states only what is distinct about it.
+    async fn dedup_pass(cfg: Arc<crate::config::AppConfig>) -> Result<Pass> {
+        let db = Database::with_config(cfg).await?;
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
-        let row = |name: &str| json_to_batch(vec![test_span_ts("dup_id", name, project_id, ts)]);
-        db.insert_records_batch(project_id, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(project_id, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        let row = |name: &str| json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]);
+        db.insert_records_batch(&project_id, TABLE, vec![row("first")?], true, None).await?;
+        db.insert_records_batch(&project_id, TABLE, vec![row("second")?], true, None).await?;
+        let table_ref = db.unified_tables().read().await.get(TABLE).expect("table created").clone();
         let date = chrono::DateTime::from_timestamp_micros(ts).unwrap().date_naive();
-        Ok((table_ref, date))
+        let (pre_files, pre_dv) = {
+            let (table, marker) = (table_ref.read().await, format!("date={date}"));
+            let files = Database::partition_files_by_pid(&table, &marker)?.remove(&project_id).unwrap_or_default();
+            (files, Database::partition_dv_state(&table, &project_id, &marker)?)
+        };
+        let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, TABLE, &project_id, date, None, None).await?;
+        assert_eq!((dropped, complete), (1, true), "expected one duplicate dropped in a complete pass");
+        Ok(Pass { db, table_ref, project_id, date, pre_files, pre_dv, dropped, masked })
     }
 
-    async fn pre_state(table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, date: chrono::NaiveDate) -> Result<(Vec<String>, HashSet<DvEntry>)> {
-        let table = table_ref.read().await;
-        let marker = format!("date={date}");
-        Ok((
-            Database::partition_files_by_pid(&table, &marker)?.remove(project_id).unwrap_or_default(),
-            Database::partition_dv_state(&table, project_id, &marker)?,
-        ))
+    impl Pass {
+        /// `None` is a CoW pass (no masked arm); `Some(a)` is a masked pass declaring `a` as the DV attachments it committed.
+        async fn certify(&self, attachments: Option<&[DvEntry]>) -> Result<Option<u64>> {
+            let masked: Option<MaskedPass<'_>> = attachments.map(|a| (&self.pre_dv, a));
+            self.db.record_clean_slice(&self.table_ref, TABLE, &self.project_id, self.date, (day_slice(self.date), self.dropped, masked), &self.pre_files).await
+        }
+
+        /// Is a LIVE (non-stale) whole-day certification recorded for the day?
+        fn certified(&self) -> bool {
+            self.db.dedup_clean_fp.get(&(self.project_id.clone(), TABLE.to_string(), self.date.to_string())).is_some_and(|c| !c.stale)
+        }
     }
 
     fn day_slice(date: chrono::NaiveDate) -> crate::maintenance_coordinator::TimeSlice {
@@ -9848,28 +9876,18 @@ mod certify_on_completion_tests {
     async fn a_masked_dv_pass_certifies_the_day_in_the_same_pass() -> Result<()> {
         let mut cfg = (*TestConfigBuilder::new("certify_same_pass").build()).clone();
         cfg.maintenance.timefusion_read_dedup_skip_swept = true;
-        let db = Database::with_config(Arc::new(cfg)).await?;
-        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let (table_ref, date) = seed_dup_day(&db, &project_id).await?;
-        let (pre_files, pre_dv) = pre_state(&table_ref, &project_id, date).await?;
+        let pass = dedup_pass(Arc::new(cfg)).await?;
+        let atts = pass.masked.as_deref().expect("a DV-dedup pass must report its masked attachments");
 
-        let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, "otel_logs_and_spans", &project_id, date, None, None).await?;
-        assert_eq!((dropped, complete), (1, true), "expected one duplicate dropped in a complete pass");
-        let atts = masked.expect("a DV-dedup pass must report its masked attachments");
-
-        let grant =
-            db.record_clean_slice(&table_ref, "otel_logs_and_spans", &project_id, date, (day_slice(date), dropped, Some((&pre_dv, &atts))), &pre_files).await?;
-        assert!(grant.is_some(), "a masked, complete, fp-stable pass must certify the day in the SAME pass");
-
-        let key = (project_id.clone(), "otel_logs_and_spans".to_string(), date.to_string());
-        assert!(db.dedup_clean_fp.get(&key).is_some_and(|c| !c.stale), "the grant must be a live whole-day certification");
+        assert!(pass.certify(Some(atts)).await?.is_some(), "a masked, complete, fp-stable pass must certify the day in the SAME pass");
+        assert!(pass.certified(), "the grant must be a live whole-day certification");
 
         // The read-side gate the planner consults must turn Granted for a
         // window inside the certified day.
-        let slice = day_slice(date);
+        let slice = day_slice(pass.date);
         let verdict = {
-            let table = table_ref.read().await;
-            db.dedup_window_clean(&table, &project_id, "otel_logs_and_spans", (slice.start_micros, slice.end_micros - 1))
+            let table = pass.table_ref.read().await;
+            pass.db.dedup_window_clean(&table, &pass.project_id, TABLE, (slice.start_micros, slice.end_micros - 1))
         };
         assert_eq!(verdict, DedupSkipVerdict::Granted, "the same-pass certification must reach the read-side skip");
         Ok(())
@@ -9883,23 +9901,13 @@ mod certify_on_completion_tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_foreign_dv_in_live_post_declines_the_masked_pass() -> Result<()> {
-        let cfg = TestConfigBuilder::new("certify_foreign_dv").build();
-        let db = Database::with_config(cfg).await?;
-        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let (table_ref, date) = seed_dup_day(&db, &project_id).await?;
-        let (pre_files, pre_dv) = pre_state(&table_ref, &project_id, date).await?;
-
-        let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, "otel_logs_and_spans", &project_id, date, None, None).await?;
-        assert_eq!((dropped, complete), (1, true));
-        assert!(masked.is_some(), "precondition: the pass took the DV path");
+        let pass = dedup_pass(TestConfigBuilder::new("certify_foreign_dv").build()).await?;
+        assert!(pass.masked.is_some(), "precondition: the pass took the DV path");
 
         // Withhold the attachments: expected post = pre, so the pass's own
         // committed DV is indistinguishable from a foreign interleaved one.
-        let grant =
-            db.record_clean_slice(&table_ref, "otel_logs_and_spans", &project_id, date, (day_slice(date), dropped, Some((&pre_dv, &[]))), &pre_files).await?;
-        assert!(grant.is_none(), "a DV the pass cannot account for must decline certification");
-        let key = (project_id.clone(), "otel_logs_and_spans".to_string(), date.to_string());
-        assert!(db.dedup_clean_fp.get(&key).is_none_or(|c| c.stale), "no live certification may survive the decline");
+        assert!(pass.certify(Some(&[])).await?.is_none(), "a DV the pass cannot account for must decline certification");
+        assert!(!pass.certified(), "no live certification may survive the decline");
         Ok(())
     }
 
@@ -9916,19 +9924,11 @@ mod certify_on_completion_tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cow_pass_that_dropped_rows_still_declines() -> Result<()> {
-        let cfg = TestConfigBuilder::new("certify_cow_declines").without_deletion_vectors().build();
-        let db = Database::with_config(cfg).await?;
-        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let (table_ref, date) = seed_dup_day(&db, &project_id).await?;
-        let (pre_files, pre_dv) = pre_state(&table_ref, &project_id, date).await?;
-        assert!(pre_dv.iter().all(|(_, dv)| dv.is_none()), "CoW setup must start DV-free");
+        let pass = dedup_pass(TestConfigBuilder::new("certify_cow_declines").without_deletion_vectors().build()).await?;
+        assert!(pass.pre_dv.iter().all(|(_, dv)| dv.is_none()), "CoW setup must start DV-free");
+        assert!(pass.masked.is_none(), "a CoW rewrite must NOT report masked attachments");
 
-        let (dropped, complete, masked) = db.dedup_partition_range_limited(&table_ref, "otel_logs_and_spans", &project_id, date, None, None).await?;
-        assert_eq!((dropped, complete), (1, true));
-        assert!(masked.is_none(), "a CoW rewrite must NOT report masked attachments");
-
-        let grant = db.record_clean_slice(&table_ref, "otel_logs_and_spans", &project_id, date, (day_slice(date), dropped, None), &pre_files).await?;
-        assert!(grant.is_none(), "a row-dropping CoW pass must not certify");
+        assert!(pass.certify(None).await?.is_none(), "a row-dropping CoW pass must not certify");
         Ok(())
     }
 
@@ -10046,6 +10046,24 @@ mod rollup_noop_skip_tests {
         journal.checkpoint()
     }
 
+    /// A rollup-enabled db whose backfill window reaches the `date` both
+    /// scenarios build on, plus the project it writes under.
+    async fn rollup_db(name: &str) -> Result<(Arc<Database>, String, chrono::NaiveDate)> {
+        let mut cfg = (*TestConfigBuilder::new(name).with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 7;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        Ok((db, project_id, chrono::Utc::now().date_naive() - chrono::Duration::days(3)))
+    }
+
+    /// One prod 32-minute cycle: re-mint every published slice, then drain.
+    async fn remint_and_drain(db: &Database) -> Result<()> {
+        remint_published_base_slices(db)?;
+        crate::support::advance_micros(16 * 60 * 1_000_000);
+        db.drain_coordinator_rollups(64).await?;
+        Ok(())
+    }
+
     /// Insert one span on `date` and drive every rollup unit the day produces.
     async fn build_day(db: &Database, project_id: &str, date: chrono::NaiveDate, id: &str) -> Result<usize> {
         let ts = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
@@ -10090,27 +10108,16 @@ mod rollup_noop_skip_tests {
     #[serial]
     #[tokio::test]
     async fn a_rollup_whose_input_has_not_moved_completes_without_rebuilding() -> Result<()> {
-        let mut cfg = (*TestConfigBuilder::new("rollup_noop_skip").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 7;
-        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
-        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let (db, project_id, date) = rollup_db("rollup_noop_skip").await?;
 
         // A drain of zero units would make every assertion below vacuous.
         assert!(build_day(&db, &project_id, date, "seed").await? > 0, "no rollup unit ran, so nothing here says anything about rebuilding");
         let published_at = tier_version(&db).await.expect("the rollup tier must exist once a unit has published into it");
 
-        // The re-mint prod actually performs, verbatim: the derived tier's
-        // `skipped_generation` branch calls `journal.enqueue` on the BASE key it
-        // could not verify, which upserts an already-Complete unit back to
-        // Pending over the SAME slice. Coverage is untouched — unlike the
-        // CONTENT-change path (`invalidate_rollup_hours`), which drops it — so
-        // the rebuild it asks for is provably needless. Re-minting every
-        // published slice is the same fact at 32-minute cadence.
+        // Re-minting every published slice is prod's 32-minute re-pend over an
+        // unmoved input, verbatim — see `remint_published_base_slices`.
         let before = skips();
-        remint_published_base_slices(&db)?;
-        crate::support::advance_micros(16 * 60 * 1_000_000);
-        db.drain_coordinator_rollups(64).await?;
+        remint_and_drain(&db).await?;
         assert!(skips() > before, "a re-pended unit over an unmoved input must be proved redundant, not rebuilt");
         assert_eq!(tier_version(&db).await, Some(published_at), "the skip must not write to the tier at all");
 
@@ -10140,11 +10147,7 @@ mod rollup_noop_skip_tests {
     #[serial]
     #[tokio::test]
     async fn a_deletion_vector_that_masks_rows_in_place_still_forces_a_rebuild() -> Result<()> {
-        let mut cfg = (*TestConfigBuilder::new("rollup_noop_dv").with_buffer_mode(BufferMode::Enabled).with_rollups().build()).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 7;
-        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
-        let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(3);
+        let (db, project_id, date) = rollup_db("rollup_noop_dv").await?;
         let ts = date.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
 
         // The same id twice, in two commits, so the duplicate spans two files and
@@ -10162,9 +10165,7 @@ mod rollup_noop_skip_tests {
         let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
         db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
-        remint_published_base_slices(&db)?;
-        crate::support::advance_micros(16 * 60 * 1_000_000);
-        db.drain_coordinator_rollups(64).await?;
+        remint_and_drain(&db).await?;
         assert!(
             tier_version(&db).await > Some(before_dedup),
             "a deletion vector masked a duplicate this rollup had already counted; a paths-only fingerprint would have called that unchanged"

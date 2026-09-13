@@ -1916,6 +1916,38 @@ mod tests {
         }
     }
 
+    /// A cache over `inner`, plus the guard that removes its dir. `name` keys
+    /// the cache dir, so every test (and every `#[test_case]` row) needs its own.
+    async fn cache_with(
+        name: &str, inner: Arc<dyn ObjectStore>, tweak: impl FnOnce(&mut FoyerCacheConfig),
+    ) -> anyhow::Result<(FoyerObjectStoreCache, CacheDirGuard)> {
+        let config = FoyerCacheConfig::test_config_with(name, tweak);
+        let guard = CacheDirGuard(config.cache_dir.clone());
+        Ok((FoyerObjectStoreCache::new(inner, config).await?, guard))
+    }
+
+    /// Same, but keeps the `SharedFoyerCache` handle so a test can inspect,
+    /// insert into, or evict from the shared L1/L2 directly.
+    async fn shared_with(
+        name: &str, inner: Arc<dyn ObjectStore>, tweak: impl FnOnce(&mut FoyerCacheConfig),
+    ) -> anyhow::Result<(SharedFoyerCache, FoyerObjectStoreCache, CacheDirGuard)> {
+        let config = FoyerCacheConfig::test_config_with(name, tweak);
+        let guard = CacheDirGuard(config.cache_dir.clone());
+        let shared = SharedFoyerCache::new(config).await?;
+        let store = FoyerObjectStoreCache::new_with_shared_cache(inner, &shared);
+        Ok((shared, store, guard))
+    }
+
+    /// A round-trip-counting inner store, with its (heads, gets) counters.
+    fn counting_store(inner: &Arc<InMemory>, delay: Duration) -> (Arc<CountingStore>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        (Arc::new(CountingStore { inner: inner.clone(), heads: heads.clone(), gets: gets.clone(), delay }), heads, gets)
+    }
+
+    fn meta_for(path: &Path, size: u64) -> ObjectMeta {
+        ObjectMeta { location: path.clone(), last_modified: Utc::now(), size, e_tag: None, version: None }
+    }
+
     /// The request-class split is the PRIMARY bound on commit-lock hold time
     /// (prod 2026-07-30), so what counts as commit-log class is load-bearing:
     /// misroute the commit PUT and it silently goes back to the 900s data
@@ -1951,35 +1983,41 @@ mod tests {
         Ok(())
     }
 
-    // Locks in the containment-probe slice math in get_range_cached: a strict
-    // sub-range of the warmed (size-hint..size) footer never equals the warm
-    // key, so only the containment probe can serve it without an inner fetch.
+    // Locks in the containment-probe slice math in get_range_cached. Two
+    // distinct probe branches, neither of which may cost an inner fetch after a
+    // footer warm:
+    //   - file > hint → the warm key is the suffix (size-hint..size), and a
+    //     strict sub-range of it never EQUALS the warm key, so only the
+    //     containment probe can serve it;
+    //   - file <= hint → warm_footer caches the file WHOLE under (0..size), and
+    //     the candidate=0 probe then deliberately serves even data-page reads
+    //     near the file START from the metadata cache.
+    #[test_case::test_case("containment_probe", 4096, 3100..3500 ; "suffix key: a strict sub-range of the warmed footer")]
+    #[test_case::test_case("containment_probe_small", 512, 16..96 ; "candidate 0: small file warmed whole, read nowhere near the footer")]
     #[tokio::test]
-    async fn containment_probe_serves_subrange_of_warmed_footer() -> anyhow::Result<()> {
+    async fn containment_probe_serves_a_warmed_file_without_an_inner_fetch(name: &str, size: u32, r: Range<u64>) -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
         // The probe computes its candidate key from the CONFIG's size hint, so
         // the warm call below must use the same value (as prod does — both
         // read config.cache.timefusion_parquet_metadata_size_hint).
         let hint = 1024u64;
-        let cfg = FoyerCacheConfig::test_config_with("containment_probe", |c| c.parquet_metadata_size_hint = hint as usize);
-        let cache = FoyerObjectStoreCache::new(inner.clone(), cfg).await?;
+        let (cache, _dir) = cache_with(name, inner.clone(), |c| c.parquet_metadata_size_hint = hint as usize).await?;
         let path = Path::from("tbl/date=2026-01-01/part.parquet");
-        let data = Bytes::from((0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let data = Bytes::from((0..size).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
         // Put via the inner store so nothing is cached from a write payload.
         inner.put(&path, PutPayload::from(data.clone())).await?;
 
-        // file (4096B) > hint → warm key is (3072..4096). Warm through &cache
-        // (not &*inner) deliberately: prod warms through the caching layer, so
-        // this also covers the suffix-GET path that populates the range key.
+        // Warm through &cache (not &*inner) deliberately: prod warms through the
+        // caching layer, so this also covers the suffix-GET path that populates
+        // the range key.
         assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
 
         let before = cache.get_stats().await;
-        let r = 3100u64..3500u64;
         let got = cache.get_range(&path, r.clone()).await?;
-        assert_eq!(got, data.slice(r.start as usize..r.end as usize), "containment slice math");
+        assert_eq!(got, data.slice(r.start as usize..r.end as usize), "slice math ({name})");
 
         let after = cache.get_stats().await;
-        assert_eq!(after.metadata.hits, before.metadata.hits + 1, "served by the containment probe");
+        assert_eq!(after.metadata.hits, before.metadata.hits + 1, "served by the containment probe ({name})");
         assert_eq!(after.metadata.inner_gets, before.metadata.inner_gets, "no inner fetch after warm");
 
         cache.shutdown().await?;
@@ -1999,37 +2037,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn containment_probe_serves_data_reads_on_small_fully_warmed_files() -> anyhow::Result<()> {
-        // Files smaller than the size hint are cached WHOLE under (0..size) by
-        // warm_footer — the candidate=0 probe then deliberately serves even
-        // data-page reads near the file START from the metadata cache. This is
-        // the other probe branch (candidate 0), distinct from the suffix-key
-        // case covered above.
-        let inner = Arc::new(InMemory::new());
-        let hint = 1024u64;
-        let cfg = FoyerCacheConfig::test_config_with("containment_probe_small", |c| c.parquet_metadata_size_hint = hint as usize);
-        let cache = FoyerObjectStoreCache::new(inner.clone(), cfg).await?;
-        let path = Path::from("tbl/date=2026-01-01/part-small.parquet");
-        let data = Bytes::from((0..512u32).map(|i| (i % 13) as u8).collect::<Vec<u8>>());
-        inner.put(&path, PutPayload::from(data.clone())).await?;
-
-        // file (512B) <= hint → warm key is the whole file (0..512)
-        assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
-
-        let before = cache.get_stats().await;
-        let r = 16u64..96u64; // nowhere near the footer
-        let got = cache.get_range(&path, r.clone()).await?;
-        assert_eq!(got, data.slice(r.start as usize..r.end as usize), "candidate-0 slice math");
-
-        let after = cache.get_stats().await;
-        assert_eq!(after.metadata.hits, before.metadata.hits + 1, "served by the candidate-0 probe");
-        assert_eq!(after.metadata.inner_gets, before.metadata.inner_gets, "no inner fetch after warm");
-
-        cache.shutdown().await?;
-        Ok(())
-    }
-
     /// Writing through the cache warms it from the payload, so every later read
     /// is a hit and the inner store is never touched — whatever the file count,
     /// the file size, or how small the L1 budget is.
@@ -2038,9 +2045,7 @@ mod tests {
     #[test_case::test_case("disk", 1024, &[10 * 1024] ; "file larger than the memory budget")]
     #[tokio::test]
     async fn writes_warm_the_cache_so_reads_never_reach_the_inner_store(name: &str, memory_bytes: usize, sizes: &[usize]) -> anyhow::Result<()> {
-        let config = FoyerCacheConfig::test_config_with(name, |c| c.memory_size_bytes = memory_bytes);
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-        let cache = FoyerObjectStoreCache::new(Arc::new(InMemory::new()), config).await?;
+        let (cache, _dir) = cache_with(name, Arc::new(InMemory::new()), |c| c.memory_size_bytes = memory_bytes).await?;
         cache.reset_stats().await;
 
         let files: Vec<(Path, Bytes)> =
@@ -2070,7 +2075,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_deleted_object_is_no_longer_served_from_cache() -> anyhow::Result<()> {
-        let cache = FoyerObjectStoreCache::new(Arc::new(InMemory::new()), FoyerCacheConfig::test_config("delete")).await?;
+        let (cache, _dir) = cache_with("delete", Arc::new(InMemory::new()), |_| {}).await?;
         let path = Path::from("test/file.parquet");
         cache.put(&path, PutPayload::from(Bytes::from_static(b"test data"))).await?;
         cache.delete(&path).await?;
@@ -2085,12 +2090,10 @@ mod tests {
     /// zero-copy (a `Bytes::slice` of the entry's buffer).
     #[tokio::test]
     async fn cache_hit_serves_the_requested_range() -> anyhow::Result<()> {
-        let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("hit_range")).await?;
-        let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(InMemory::new()), &cache);
+        let (cache, store, _dir) = shared_with("hit_range", Arc::new(InMemory::new()), |_| {}).await?;
         let path = Path::from("test/zc.parquet");
         let body: Vec<u8> = (0u8..=255).collect();
-        let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: body.len() as u64, e_tag: None, version: None };
-        cache.cache.insert(FoyerObjectStoreCache::make_cache_key(&path), CacheValue::new(body.clone(), meta));
+        cache.cache.insert(FoyerObjectStoreCache::make_cache_key(&path), CacheValue::new(body.clone(), meta_for(&path, body.len() as u64)));
 
         assert_eq!(&store.get_range_cached(&path, 10..40).await?[..], &body[10..40], "served range must be the cached bytes");
         assert_eq!(&store.get_range_cached(&path, 0..1).await?[..], &body[0..1], "leading edge");
@@ -2108,13 +2111,11 @@ mod tests {
     /// slices are held, and the held slices must stay readable afterwards.
     #[tokio::test]
     async fn held_slice_does_not_pin_the_cache_entry() -> anyhow::Result<()> {
-        let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("no_pin")).await?;
-        let store = FoyerObjectStoreCache::new_with_shared_cache(Arc::new(InMemory::new()), &cache);
+        let (cache, store, _dir) = shared_with("no_pin", Arc::new(InMemory::new()), |_| {}).await?;
         let path = Path::from("test/pin.parquet");
         let body: Vec<u8> = (0u8..=255).collect();
-        let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: body.len() as u64, e_tag: None, version: None };
         let key = FoyerObjectStoreCache::make_cache_key(&path);
-        cache.cache.insert(key.clone(), CacheValue::new(body.clone(), meta.clone()));
+        cache.cache.insert(key.clone(), CacheValue::new(body.clone(), meta_for(&path, body.len() as u64)));
 
         let held: Vec<Bytes> = futures::future::try_join_all((0..8).map(|i| store.get_range_cached(&path, i * 8..i * 8 + 8))).await?;
 
@@ -2123,8 +2124,7 @@ mod tests {
             cache.cache.remove(&key);
             for i in 0..64u8 {
                 let p = Path::from(format!("test/churn_{i}.parquet"));
-                let m = ObjectMeta { location: p.clone(), last_modified: Utc::now(), size: 256, e_tag: None, version: None };
-                cache.cache.insert(FoyerObjectStoreCache::make_cache_key(&p), CacheValue::new(body.clone(), m));
+                cache.cache.insert(FoyerObjectStoreCache::make_cache_key(&p), CacheValue::new(body.clone(), meta_for(&p, 256)));
                 cache.cache.get(&FoyerObjectStoreCache::make_cache_key(&p)).await.ok();
             }
         })
@@ -2145,8 +2145,7 @@ mod tests {
         });
         let cache = SharedFoyerCache::new(config.clone()).await?;
         let path = Path::from("test/file.parquet");
-        let meta = ObjectMeta { location: path, last_modified: Utc::now(), size: 6, e_tag: None, version: None };
-        cache.cache.insert("test/file.parquet".into(), CacheValue::new(b"cached".to_vec(), meta));
+        cache.cache.insert(path.to_string(), CacheValue::new(b"cached".to_vec(), meta_for(&path, 6)));
 
         let stats = cache.runtime_stats();
         assert_eq!(stats.memory_size_bytes, config.memory_size_bytes);
@@ -2163,14 +2162,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ttl_expiration() -> anyhow::Result<()> {
-        let config = FoyerCacheConfig::test_config_with("ttl", |c| {
-            c.ttl = Duration::from_millis(100);
-        });
-
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let inner = Arc::new(InMemory::new());
-        let cache = FoyerObjectStoreCache::new(inner, config).await?;
+        let (cache, _dir) = cache_with("ttl", Arc::new(InMemory::new()), |c| c.ttl = Duration::from_millis(100)).await?;
 
         let path = Path::from("test/ttl_file.parquet");
         cache.put(&path, PutPayload::from(Bytes::from_static(b"test data"))).await?;
@@ -2192,14 +2184,11 @@ mod tests {
     #[tokio::test]
     async fn test_parquet_metadata_optimization() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config_with("parquet_metadata", |c| {
+        let (cache, _dir) = cache_with("parquet_metadata", inner.clone(), |c| {
             c.parquet_metadata_size_hint = 1024; // 1KB for testing
             c.ttl = Duration::from_secs(300);
-        });
-
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        })
+        .await?;
 
         // Create a test parquet file (10KB)
         let file_size = 10 * 1024;
@@ -2258,16 +2247,12 @@ mod tests {
     #[tokio::test]
     async fn test_metadata_cache_invalidation() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-
-        let config = FoyerCacheConfig::test_config_with("metadata_invalidation", |c| {
+        let (cache, _dir) = cache_with("metadata_invalidation", inner.clone(), |c| {
             c.parquet_metadata_size_hint = 1024;
             c.metadata_memory_size_bytes = 5 * 1024 * 1024;
             c.metadata_disk_size_bytes = 20 * 1024 * 1024;
-        });
-
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        })
+        .await?;
         cache.reset_stats().await;
 
         // Create a parquet file directly in inner store (to avoid main cache)
@@ -2304,91 +2289,56 @@ mod tests {
         Ok(())
     }
 
+    /// The multipart write-capture tee is bounded two independent ways — the
+    /// inline warm cap and the per-upload write-capture cap — and either bound
+    /// behaves identically: under-cap uploads are captured into the cache on
+    /// `complete()` (so a read needs no re-download), while over-cap uploads
+    /// abandon capture and still upload correct, readable bytes. The per-upload
+    /// cap must bound the tee independently of the (much larger) block size:
+    /// that is the memory fix — before it, a 256MB compaction output sat in heap
+    /// per concurrent upload. Both caps are set below the 4MB block size so the
+    /// captured and skipped paths are both reachable.
+    #[test_case::test_case("mpu_capture", 1024 * 1024, 0, 256 * 1024, 768 * 1024 ; "bounded by the inline warm cap")]
+    #[test_case::test_case("wcap_cap", 0, 512 * 1024, 128 * 1024, 384 * 1024 ; "bounded by the per-upload write-capture cap")]
     #[tokio::test]
-    async fn test_multipart_capture_warms_cache() -> anyhow::Result<()> {
+    async fn an_over_cap_multipart_write_abandons_capture_but_not_the_upload(
+        name: &str, inline_cap: usize, capture_cap: usize, small_len: usize, chunk_len: usize,
+    ) -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        // Tighten the inline cap to 1MB (below the 4MB block size) so we can
-        // exercise both the captured and skipped paths.
-        let config = FoyerCacheConfig::test_config_with("mpu_capture", |c| {
-            c.warm_inline_max_bytes = 1024 * 1024;
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        let (cache, _dir) = cache_with(name, inner.clone(), |c| {
+            c.warm_inline_max_bytes = inline_cap;
+            c.write_capture_max_bytes = capture_cap;
+            c.write_capture_budget_bytes = 0; // isolate the per-upload caps
+        })
+        .await?;
         cache.reset_stats().await;
 
-        // Small multipart write (under the cap) → captured into the cache on
-        // complete, with no re-download.
+        // Under the cap → captured (flush-sized files keep the feature), so the
+        // read is served entirely from cache.
         let small_path = Path::from("table/date=2026-06-05/small.parquet");
-        let small_data = Bytes::from(vec![b'a'; 256 * 1024]);
-        let mut upload = cache.put_multipart(&small_path).await?;
-        upload.put_part(small_data.clone().into()).await?;
-        upload.complete().await?;
-
-        // A read is served entirely from cache — the multipart write warmed it.
-        assert_eq!(cache.get(&small_path).await?.bytes().await?.len(), small_data.len());
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.hits, 1, "small multipart write should warm the cache");
-        assert_eq!(stats.main.misses, 0, "no S3 read needed after multipart capture");
-
-        // Large multipart write (over the cap) → capture abandoned, streams
-        // through, so the first read is a genuine miss.
-        cache.reset_stats().await;
-        let big_path = Path::from("table/date=2026-06-05/big.parquet");
-        let big_chunk = Bytes::from(vec![b'b'; 768 * 1024]);
-        let mut upload = cache.put_multipart(&big_path).await?;
-        upload.put_part(big_chunk.clone().into()).await?; // 768KB
-        upload.put_part(big_chunk.clone().into()).await?; // 1.5MB total > 1MB cap
-        upload.complete().await?;
-
-        let _ = cache.get(&big_path).await?;
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.main.misses, 1, "over-cap multipart write should not be cached inline");
-
-        cache.shutdown().await?;
-        Ok(())
-    }
-
-    /// The per-upload write-capture cap must bound the tee independently of the
-    /// (much larger) block size: over-cap uploads abandon capture but still
-    /// upload correct, readable bytes. This is the memory fix — before it, a
-    /// 256MB compaction output sat in heap per concurrent upload.
-    #[tokio::test]
-    async fn test_write_capture_cap_bounds_tee() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        // Block size stays 4MB; only the write-capture cap is tightened.
-        let config = FoyerCacheConfig::test_config_with("wcap_cap", |c| {
-            c.write_capture_max_bytes = 512 * 1024;
-            c.write_capture_budget_bytes = 0; // isolate the per-upload cap
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
-        cache.reset_stats().await;
-
-        // Under the cap → still captured (flush-sized files keep the feature).
-        let small_path = Path::from("table/date=2026-06-05/small.parquet");
-        let small = Bytes::from(vec![b'a'; 128 * 1024]);
+        let small = Bytes::from(vec![b'a'; small_len]);
         let mut upload = cache.put_multipart(&small_path).await?;
         upload.put_part(small.clone().into()).await?;
         upload.complete().await?;
-        let _ = cache.get(&small_path).await?;
-        assert_eq!(cache.get_stats().await.main.hits, 1, "under-cap write should still warm the cache");
+        assert_eq!(cache.get(&small_path).await?.bytes().await?.len(), small_len);
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 1, "under-cap multipart write should warm the cache ({name})");
+        assert_eq!(stats.main.misses, 0, "no S3 read needed after multipart capture");
 
-        // Over the cap (but well under the 4MB block size) → capture abandoned.
+        // Over the cap → capture abandoned, the upload streams through. The
+        // object is fully and correctly uploaded regardless — only the cache tee
+        // was sacrificed, so the first read is a genuine miss.
         cache.reset_stats().await;
         let big_path = Path::from("table/date=2026-06-05/big.parquet");
-        let chunk = Bytes::from(vec![b'b'; 384 * 1024]);
+        let chunk = Bytes::from(vec![b'b'; chunk_len]);
         let mut upload = cache.put_multipart(&big_path).await?;
         upload.put_part(chunk.clone().into()).await?;
-        upload.put_part(chunk.clone().into()).await?; // 768KB > 512KB cap
+        upload.put_part(chunk.clone().into()).await?;
         upload.complete().await?;
 
-        // The object is fully and correctly uploaded regardless — only the
-        // cache tee was sacrificed, so the read is a genuine miss.
-        let fetched = inner.get(&big_path).await?.bytes().await?;
-        assert_eq!(fetched.len(), 768 * 1024, "upload must be unaffected by capture abandonment");
+        assert_eq!(inner.get(&big_path).await?.bytes().await?.len(), 2 * chunk_len, "upload must be unaffected by capture abandonment");
         let _ = cache.get(&big_path).await?;
-        assert_eq!(cache.get_stats().await.main.misses, 1, "over-cap write must not be captured");
+        assert_eq!(cache.get_stats().await.main.misses, 1, "over-cap multipart write must not be captured ({name})");
 
         cache.shutdown().await?;
         Ok(())
@@ -2400,13 +2350,11 @@ mod tests {
     /// capture silently stops entirely.
     #[tokio::test]
     async fn test_write_capture_cap_is_clamped_to_budget() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config_with("wcap_clamp", |c| {
+        let (cache, _dir) = cache_with("wcap_clamp", Arc::new(InMemory::new()), |c| {
             c.write_capture_max_bytes = 0; // bounded by the (4MB) block size
             c.write_capture_budget_bytes = 512 * 1024; // …which exceeds the budget
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        })
+        .await?;
         cache.reset_stats().await;
 
         let path = Path::from("table/date=2026-06-05/clamped.parquet");
@@ -2427,12 +2375,11 @@ mod tests {
     async fn test_write_capture_budget_skips_without_failing_uploads() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
         // Budget fits exactly one concurrent capture (1x the per-upload cap).
-        let config = FoyerCacheConfig::test_config_with("wcap_budget", |c| {
+        let (cache, _dir) = cache_with("wcap_budget", inner.clone(), |c| {
             c.write_capture_max_bytes = 512 * 1024;
             c.write_capture_budget_bytes = 512 * 1024;
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        })
+        .await?;
         cache.reset_stats().await;
 
         let first_path = Path::from("table/date=2026-06-05/first.parquet");
@@ -2473,35 +2420,29 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_block_size_tracks_optimize_target() {
+    /// The 2GiB hard floor wins over both the configured block size and 2x the
+    /// optimize target: the fleet holds ~1.5GB files, and foyer's max entry is
+    /// the block size — anything above it silently never persists. Above the
+    /// floor the block size tracks 2x the target, so bigger outputs stay
+    /// cacheable without touching the cache config.
+    #[test_case::test_case(None, None => 2 << 30 ; "defaults: the 2GiB hard floor")]
+    #[test_case::test_case(Some(2 * 1024 * 1024 * 1024), None => 4 << 30 ; "block size tracks 2x a target above the floor")]
+    #[test_case::test_case(Some(16 * 1024 * 1024), Some(256) => 2 << 30 ; "a small target and a small block size still floor at 2GiB")]
+    fn block_size_tracks_optimize_target(optimize_target: Option<i64>, block_size_mb: Option<usize>) -> usize {
         use crate::config::AppConfig;
         let mut cfg = AppConfig::default();
-
-        // The 2GiB hard floor wins over both the configured block size and 2x
-        // the optimize target: the fleet holds ~1.5GB files, and foyer's max
-        // entry is the block size — anything above it silently never persists.
-        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 2 << 30);
-
-        // A target big enough that 2x exceeds the hard floor → block tracks it,
-        // so bigger outputs stay cacheable without touching the cache config.
-        cfg.parquet.timefusion_optimize_target_size = 2 * 1024 * 1024 * 1024;
-        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 4 << 30, "block size should track 2x the optimize target");
-
-        // A small target still floors at 2GiB.
-        cfg.parquet.timefusion_optimize_target_size = 16 * 1024 * 1024;
-        cfg.cache.timefusion_foyer_block_size_mb = 256;
-        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 2 << 30, "the 1.5GB-file floor holds");
+        if let Some(t) = optimize_target {
+            cfg.parquet.timefusion_optimize_target_size = t;
+        }
+        if let Some(mb) = block_size_mb {
+            cfg.cache.timefusion_foyer_block_size_mb = mb;
+        }
+        FoyerCacheConfig::from_app_config(&cfg).block_size_bytes
     }
 
     #[tokio::test]
     async fn test_sliding_ttl_refresh_on_query() -> anyhow::Result<()> {
-        let config = FoyerCacheConfig::test_config_with("sliding_ttl", |c| {
-            c.ttl = Duration::from_millis(1000);
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-        let inner = Arc::new(InMemory::new());
-        let cache = FoyerObjectStoreCache::new(inner, config).await?;
+        let (cache, _dir) = cache_with("sliding_ttl", Arc::new(InMemory::new()), |c| c.ttl = Duration::from_millis(1000)).await?;
 
         let path = Path::from("table/part-hot.parquet");
         cache.put(&path, PutPayload::from(Bytes::from(vec![b'h'; 4096]))).await?;
@@ -2525,31 +2466,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_evict_data_entry_removes_cached_file() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("evict_entry")).await?;
-        let cache = FoyerObjectStoreCache::new_with_shared_cache(inner, &shared);
-        cache.reset_stats().await;
-
-        let path = Path::from("table/date=2026-06-05/part.parquet");
-        cache.put(&path, PutPayload::from(Bytes::from(vec![b'a'; 4096]))).await?;
-        let _ = cache.get(&path).await?;
-        assert_eq!(cache.get_stats().await.main.hits, 1, "freshly written file should be cached");
-        assert!(shared.cache.memory().contains(&path.to_string()), "freshly read file should be in the in-memory cache");
-
-        // Proactive eviction (what the compaction path does for tombstoned
-        // files) drops the entry from the in-memory cache immediately. foyer's
-        // HybridCache::remove deletes the on-disk copy asynchronously, so we
-        // assert on the memory layer for a deterministic result; the dead bytes
-        // are reclaimed from disk shortly after rather than waiting for VACUUM.
-        shared.evict_data_entry(path.as_ref());
-        assert!(!shared.cache.memory().contains(&path.to_string()), "evicted entry should be dropped from the in-memory cache");
-
-        cache.shutdown().await?;
-        Ok(())
-    }
-
     #[test]
     fn test_is_within_recent_window() {
         let today = Utc::now().date_naive();
@@ -2567,13 +2483,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_recent_window_skips_old_partition_writes() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config_with("recent_window", |c| {
-            c.cache_recent_days = 8; // enforce the window in this test
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        // cache_recent_days = 8 enforces the window in this test.
+        let (cache, _dir) = cache_with("recent_window", Arc::new(InMemory::new()), |c| c.cache_recent_days = 8).await?;
         cache.reset_stats().await;
 
         let today = Utc::now().date_naive();
@@ -2601,12 +2512,7 @@ mod tests {
     #[tokio::test]
     async fn test_warm_footer_primes_metadata_cache() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config_with("warm_footer", |c| {
-            c.parquet_metadata_size_hint = 1024; // 1KB footer
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        let (cache, _dir) = cache_with("warm_footer", inner.clone(), |c| c.parquet_metadata_size_hint = 1024).await?;
 
         // Write the file straight to the inner store so nothing is cached yet —
         // this simulates a multipart compaction output that bypassed put_cached.
@@ -2636,10 +2542,7 @@ mod tests {
     #[tokio::test]
     async fn test_warm_full_primes_main_cache() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config("warm_full");
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        let (cache, _dir) = cache_with("warm_full", inner.clone(), |_| {}).await?;
 
         let file_size = 8 * 1024;
         let path = Path::from("table/date=2026-06-05/part-1.parquet");
@@ -2673,7 +2576,7 @@ mod tests {
         let path = Path::from("table/date=2026-06-05/meta.parquet");
         let size = 4096usize;
         inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; size]))).await?;
-        let cache = FoyerObjectStoreCache::new(inner, FoyerCacheConfig::test_config_with("header_footer", |c| c.parquet_metadata_size_hint = 1024)).await?;
+        let (cache, _dir) = cache_with("header_footer", inner, |c| c.parquet_metadata_size_hint = 1024).await?;
 
         assert!(warm_parquet_metadata(&cache, &path, 1024).await);
         cache.reset_stats().await;
@@ -2687,38 +2590,43 @@ mod tests {
     }
 
     /// Guards key consistency across the three cache paths that derive a key
-    /// independently: the multipart-write warm (`complete()`), the read path
-    /// (`make_cache_key`), and the compaction eviction path (`evict_data_entry`
-    /// on a relativized object path). If any of them diverged, a multipart-warmed
-    /// entry would either never be read back or never be evicted.
+    /// independently: the write warm (a `put` payload, or multipart
+    /// `complete()`), the read path (`make_cache_key`), and the compaction
+    /// eviction path (`evict_data_entry` on a relativized object path). If any
+    /// of them diverged, a warmed entry would either never be read back or never
+    /// be evicted (tombstoned files would linger).
+    ///
+    /// Proactive eviction is what the compaction path does for tombstoned files.
+    /// foyer's `HybridCache::remove` deletes the on-disk copy asynchronously, so
+    /// the assertions are on the in-memory layer for a deterministic result; the
+    /// dead bytes are reclaimed from disk shortly after rather than waiting for
+    /// VACUUM.
+    #[test_case::test_case("evict_entry", false ; "a single put warms from the write payload")]
+    #[test_case::test_case("mpu_key_consistency", true ; "a multipart complete() warms under the same key")]
     #[tokio::test]
-    async fn test_multipart_warm_read_and_evict_key_consistency() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("mpu_key_consistency")).await?;
-        let cache = FoyerObjectStoreCache::new_with_shared_cache(inner, &shared);
+    async fn a_warmed_entry_is_read_back_and_evicted_under_one_key(name: &str, multipart: bool) -> anyhow::Result<()> {
+        let (shared, cache, _dir) = shared_with(name, Arc::new(InMemory::new()), |_| {}).await?;
         cache.reset_stats().await;
 
-        // Warm via the multipart-write path.
         let path = Path::from("table/date=2026-06-05/part.parquet");
         let data = Bytes::from(vec![b'z'; 64 * 1024]);
-        let mut upload = cache.put_multipart(&path).await?;
-        upload.put_part(data.clone().into()).await?;
-        upload.complete().await?;
+        if multipart {
+            let mut upload = cache.put_multipart(&path).await?;
+            upload.put_part(data.clone().into()).await?;
+            upload.complete().await?;
+        } else {
+            cache.put(&path, PutPayload::from(data.clone())).await?;
+        }
 
-        // Read path: a plain GET must find the entry the multipart write warmed —
-        // i.e. `complete()` inserted under the same key the read derives. A key
-        // mismatch would surface here as a miss + an S3 fetch.
+        // Read path: a plain GET must find the entry the write warmed — i.e. the
+        // write inserted under the same key the read derives. A key mismatch
+        // would surface here as a miss + an S3 fetch.
         let _ = cache.get(&path).await?;
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.hits, 1, "multipart-warmed entry must be found by a plain GET (warm/read key match)");
-        assert_eq!(stats.main.misses, 0, "no S3 read needed after multipart capture");
-
-        // Eviction path: the compaction hook evicts by the relativized object
-        // path. It must target the same key warming/reads use, or tombstoned
-        // files would linger. Assert at the in-memory layer — foyer removes the
-        // on-disk copy asynchronously, so the memory layer is the deterministic
-        // signal (mirrors test_evict_data_entry_removes_cached_file).
+        assert_eq!(stats.main.hits, 1, "warmed entry must be found by a plain GET, warm/read key match ({name})");
+        assert_eq!(stats.main.misses, 0, "no S3 read needed after write capture");
         assert!(shared.cache.memory().contains(&path.to_string()), "warmed entry should be in the in-memory cache");
+
         shared.evict_data_entry(path.as_ref());
         assert!(!shared.cache.memory().contains(&path.to_string()), "evict must drop the same key warming/reads use");
 
@@ -2780,7 +2688,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_get_removes_fetch_lock() -> anyhow::Result<()> {
-        let cache = FoyerObjectStoreCache::new(Arc::new(InMemory::new()), FoyerCacheConfig::test_config("failed_get_cleanup")).await?;
+        let (cache, _dir) = cache_with("failed_get_cleanup", Arc::new(InMemory::new()), |_| {}).await?;
         assert!(cache.get(&Path::from("table/date=2026-01-01/missing.parquet")).await.is_err());
         assert!(cache.main_fetch_locks.is_empty(), "failed fetch must not retain its lock");
         cache.shutdown().await?;
@@ -2792,12 +2700,8 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let path = Path::from(format!("table/date={}/part.parquet", Utc::now().date_naive()));
         inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; 1024]))).await?;
-        let gets = Arc::new(AtomicUsize::new(0));
-        let cache = FoyerObjectStoreCache::new(
-            Arc::new(CountingStore { inner, heads: Arc::new(AtomicUsize::new(0)), gets: gets.clone(), delay: Duration::from_millis(50) }),
-            FoyerCacheConfig::test_config("singleflight"),
-        )
-        .await?;
+        let (counting, _heads, gets) = counting_store(&inner, Duration::from_millis(50));
+        let (cache, _dir) = cache_with("singleflight", counting, |_| {}).await?;
 
         let (first, second) = tokio::join!(cache.get(&path), cache.get(&path));
         first?;
@@ -2820,15 +2724,8 @@ mod tests {
         let path = Path::from("table/date=2026-06-05/part-heads.parquet");
         mem.put(&path, PutPayload::from(Bytes::from(vec![b'x'; file_size]))).await?;
 
-        let heads = Arc::new(AtomicUsize::new(0));
-        let gets = Arc::new(AtomicUsize::new(0));
-        let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
-
-        let config = FoyerCacheConfig::test_config_with("warm_footer_heads", |c| {
-            c.parquet_metadata_size_hint = 1024;
-        });
-        let _dir = CacheDirGuard(config.cache_dir.clone());
-        let cache = FoyerObjectStoreCache::new(counting, config).await?;
+        let (counting, heads, gets) = counting_store(&mem, Duration::ZERO);
+        let (cache, _dir) = cache_with("warm_footer_heads", counting, |c| c.parquet_metadata_size_hint = 1024).await?;
         cache.reset_stats().await;
 
         // Footer warm: a single suffix GET, no HEAD.
@@ -2855,7 +2752,7 @@ mod tests {
     #[tokio::test]
     async fn bypass_scope_suppresses_population_but_not_hits() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let cache = FoyerObjectStoreCache::new(inner.clone(), FoyerCacheConfig::test_config("scan_bypass")).await?;
+        let (cache, _dir) = cache_with("scan_bypass", inner.clone(), |_| {}).await?;
         let hot = Path::from("tbl/date=2026-01-02/hot.parquet");
         let cold = Path::from("tbl/date=2020-01-01/cold.parquet");
         cache.put(&hot, PutPayload::from_static(b"hot-bytes")).await?; // cached from the write payload
@@ -2892,7 +2789,7 @@ mod tests {
     #[tokio::test]
     async fn a_repeated_bypassed_scan_warms_on_the_second_sighting() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let cache = FoyerObjectStoreCache::new(inner.clone(), FoyerCacheConfig::test_config("bypass_repeat")).await?;
+        let (cache, _dir) = cache_with("bypass_repeat", inner.clone(), |_| {}).await?;
         let cold = Path::from("tbl/date=2020-01-01/cold.parquet");
         inner.put(&cold, PutPayload::from_static(b"cold-bytes")).await?;
 
@@ -2918,10 +2815,8 @@ mod tests {
     #[tokio::test]
     async fn tiny_parquet_file_is_cached_whole_not_per_range() -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
-        let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
-        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("tiny_full")).await?;
-        let cache = FoyerObjectStoreCache::new_with_shared_cache(counting, &shared);
+        let (counting, _heads, gets) = counting_store(&mem, Duration::ZERO);
+        let (_shared, cache, _dir) = shared_with("tiny_full", counting, |_| {}).await?;
 
         let path = Path::from("tbl/date=2026-01-02/tiny.parquet");
         let body: Vec<u8> = (0..200u8).collect(); // far below the metadata size hint
@@ -2941,10 +2836,8 @@ mod tests {
     /// amplification and competes with the request it is meant to accelerate.
     #[tokio::test]
     async fn large_file_query_miss_reads_ranges_without_warming_full_file() -> anyhow::Result<()> {
-        let config = FoyerCacheConfig::test_config_with("large_warm", |c| c.l1_max_entry_bytes = 64);
-        let shared = SharedFoyerCache::new(config).await?;
         let mem = Arc::new(InMemory::new());
-        let cache = FoyerObjectStoreCache::new_with_shared_cache(mem.clone(), &shared);
+        let (shared, cache, _dir) = shared_with("large_warm", mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
 
         let path = Path::from("tbl/date=2026-01-02/big.parquet");
         let body: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
@@ -2967,10 +2860,8 @@ mod tests {
 
     #[tokio::test]
     async fn sliding_large_file_ranges_reuse_aligned_cache_entry() -> anyhow::Result<()> {
-        let config = FoyerCacheConfig::test_config_with("aligned_ranges", |c| c.l1_max_entry_bytes = 64);
-        let shared = SharedFoyerCache::new(config).await?;
         let mem = Arc::new(InMemory::new());
-        let cache = FoyerObjectStoreCache::new_with_shared_cache(mem.clone(), &shared);
+        let (_shared, cache, _dir) = shared_with("aligned_ranges", mem.clone(), |c| c.l1_max_entry_bytes = 64).await?;
 
         let path = Path::from("tbl/date=2026-01-02/large.parquet");
         let body: Vec<u8> = (0..3 * PARQUET_RANGE_ALIGNMENT_BYTES as usize).map(|i| (i % 251) as u8).collect();
@@ -2995,8 +2886,7 @@ mod tests {
         let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("contains_probe")).await?;
         let path = Path::from("tbl/date=2026-01-02/part.parquet");
         assert!(!shared.contains_data(path.as_ref()), "probe is false before insert");
-        let meta = ObjectMeta { location: path.clone(), last_modified: Utc::now(), size: 3, e_tag: None, version: None };
-        shared.cache.insert(path.to_string(), CacheValue::new(b"abc".to_vec(), meta));
+        shared.cache.insert(path.to_string(), CacheValue::new(b"abc".to_vec(), meta_for(&path, 3)));
         assert!(shared.contains_data(path.as_ref()));
         assert!(!shared.contains_data("tbl/date=2026-01-02/other.parquet"));
         shared.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(5)).await?;
@@ -3008,10 +2898,8 @@ mod tests {
     #[tokio::test]
     async fn warm_full_if_absent_fetches_only_the_uncaptured_files() -> anyhow::Result<()> {
         let mem = Arc::new(InMemory::new());
-        let (heads, gets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
-        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("confirm_cached")).await?;
-        let cache = FoyerObjectStoreCache::new_with_shared_cache(counting, &shared);
+        let (counting, _heads, gets) = counting_store(&mem, Duration::ZERO);
+        let (shared, cache, _dir) = shared_with("confirm_cached", counting, |_| {}).await?;
 
         let captured = Path::from("tbl/date=2026-01-02/captured.parquet");
         let skipped = Path::from("tbl/date=2026-01-02/skipped.parquet");
@@ -3789,36 +3677,36 @@ mod coverage_ledger_tests {
         ("otel_logs_and_spans".to_owned(), "p".to_owned(), "tier".to_owned(), "2026-08-24".to_owned())
     }
 
-    /// A cell gains an entry per incremental build. Left unmerged the ledger
-    /// grows without bound, which defeats the entire reason it exists — coverage
-    /// as a cheap read instead of a log replay.
-    #[test]
-    fn touching_slices_of_one_generation_merge() {
-        let merged = merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, "g1", Some(4))]);
-        assert_eq!(merged.len(), 1, "adjacent slices of one generation are one range");
-        assert_eq!((merged[0].start_micros, merged[0].end_micros), (0, 20));
-        assert_eq!(merged[0].source_rows, Some(7), "the witness is the sum of what was merged");
-        assert_eq!(merged[0].files.len(), 2, "a merged range is served by every file that served any part of it");
+    /// A fresh on-disk ledger; the `TempDir` is returned so it outlives the test.
+    fn ledger() -> (tempfile::TempDir, JsonCoverageLedger) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger = JsonCoverageLedger::load(dir.path());
+        (dir, ledger)
     }
 
-    /// Different generations were built from different source content. Merging
-    /// them would invent a range no build ever produced, and the ledger is the
-    /// authority — an invented range is served as truth.
-    #[test]
-    fn different_generations_never_merge() {
-        let merged = merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, "g2", Some(4))]);
-        assert_eq!(merged.len(), 2, "a generation boundary is a real boundary");
-    }
-
-    /// The witness is what lets a read trust a slice is not stale, so a merged
-    /// range is only as trustworthy as its weakest contributor. Summing `3 +
-    /// unknown` into `3` would manufacture a witness for rows nobody counted —
-    /// and it would fail in the dangerous direction, claiming freshness.
-    #[test]
-    fn a_witnessless_slice_poisons_the_witness_of_the_range_it_merges_into() {
-        let merged = merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, "g1", None)]);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].source_rows, None, "unverifiable beats a manufactured count");
+    /// Merging `(0,10,"g1",Some(3))` with a second slice, summarised as
+    /// `(start, end, rows, file count)` per surviving range.
+    ///
+    /// - *merge*: a cell gains an entry per incremental build; left unmerged the
+    ///   ledger grows without bound, defeating why it exists (coverage as a cheap
+    ///   read, not a log replay). The merged range keeps every file that served
+    ///   any part of it and a witness that is the sum of what was merged.
+    /// - *never merge*: different generations were built from different source
+    ///   content, so merging invents a range no build produced — and the ledger
+    ///   is the authority, so an invented range is served as truth.
+    /// - *poisons the witness*: the witness is what lets a read trust a slice is
+    ///   not stale, so a merged range is only as trustworthy as its weakest
+    ///   contributor. Summing `3 + unknown` into `3` manufactures a witness for
+    ///   rows nobody counted, failing in the dangerous direction — claiming
+    ///   freshness. Unverifiable beats a manufactured count.
+    #[test_case::test_case("g1", Some(4) => vec![(0, 20, Some(7), 2)] ; "touching slices of one generation merge")]
+    #[test_case::test_case("g2", Some(4) => vec![(0, 10, Some(3), 1), (10, 20, Some(4), 1)] ; "different generations never merge")]
+    #[test_case::test_case("g1", None => vec![(0, 20, None, 2)] ; "a witnessless slice poisons the witness of the range it merges into")]
+    fn merge_coverage_joins_only_what_one_generation_proved(generation: &str, rows: Option<i64>) -> Vec<(i64, i64, Option<i64>, usize)> {
+        merge_coverage(vec![entry(0, 10, "g1", Some(3)), entry(10, 20, generation, rows)])
+            .into_iter()
+            .map(|e| (e.start_micros, e.end_micros, e.source_rows, e.files.len()))
+            .collect()
     }
 
     /// Write-through, not on shutdown. Certifications had to learn this the hard
@@ -3826,8 +3714,7 @@ mod coverage_ledger_tests {
     /// shutdown, so state that only persists then never persists at all.
     #[test]
     fn coverage_survives_a_restart() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let ledger = JsonCoverageLedger::load(dir.path());
+        let (dir, ledger) = ledger();
         ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
 
         let reloaded = JsonCoverageLedger::load(dir.path());
@@ -3840,8 +3727,7 @@ mod coverage_ledger_tests {
     /// whose files are gone, which is the one failure the ledger must never have.
     #[test]
     fn replacing_a_cell_drops_superseded_entries_rather_than_accumulating_them() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let ledger = JsonCoverageLedger::load(dir.path());
+        let (dir, ledger) = ledger();
         ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
         ledger.record(&cell(), entry(20, 30, "g1", Some(5)));
         assert_eq!(ledger.coverage(&cell()).len(), 2, "two disjoint ranges are two entries");
@@ -3857,8 +3743,7 @@ mod coverage_ledger_tests {
     /// not call it per cell. That is O(cells^2) serialization on the boot path.
     #[test]
     fn a_batch_replacement_is_one_durable_write() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let ledger = JsonCoverageLedger::load(dir.path());
+        let (dir, ledger) = ledger();
         let other = ("s".to_owned(), "q".to_owned(), "tier".to_owned(), "2026-08-24".to_owned());
         ledger.record(&cell(), entry(0, 10, "g1", Some(1)));
         ledger.record(&other, entry(0, 10, "g1", Some(1)));
@@ -3904,8 +3789,7 @@ mod coverage_ledger_tests {
     /// as "known to have no coverage" and is a different claim.
     #[test]
     fn replacing_with_nothing_retires_the_cell() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let ledger = JsonCoverageLedger::load(dir.path());
+        let (_dir, ledger) = ledger();
         ledger.record(&cell(), entry(0, 10, "g1", Some(5)));
         ledger.replace(&cell(), Vec::new());
         assert!(ledger.cells().is_empty(), "the cell is gone, not empty");
@@ -3913,8 +3797,7 @@ mod coverage_ledger_tests {
 
     #[test]
     fn retiring_drops_only_dates_before_the_bound() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let ledger = JsonCoverageLedger::load(dir.path());
+        let (dir, ledger) = ledger();
         let old = ("s".to_owned(), "p".to_owned(), "tier".to_owned(), "2026-07-01".to_owned());
         ledger.record(&old, entry(0, 10, "g1", Some(1)));
         ledger.record(&cell(), entry(0, 10, "g1", Some(1)));
@@ -3930,20 +3813,23 @@ mod coverage_ledger_tests {
 mod dedup_proof_version_tests {
     use super::{StoredCertification, StoredSliceCoverage};
 
-    #[test]
-    fn legacy_and_unknown_proofs_require_rebuilding() {
-        for version in [None, Some("physical_row_order_v1"), Some("unknown_future_version")] {
-            let mut proof = serde_json::json!({
-                "project_id": "p", "table_name": "otel", "date": "2026-08-14",
-                "fp": 7, "granted_unix_ms": 1, "files": ["a.parquet"], "stale": false,
-                "intervals": [[0, 10]]
-            });
-            if let Some(version) = version {
-                proof["proof_version"] = version.into();
-            }
-            let valid = version == Some("physical_row_order_v1");
-            assert_eq!(serde_json::from_value::<StoredCertification>(proof.clone()).is_ok(), valid);
-            assert_eq!(serde_json::from_value::<StoredSliceCoverage>(proof).is_ok(), valid);
+    /// Returns whether the proof is still usable — the two stored shapes must
+    /// agree, since a proof accepted by one and rejected by the other is a
+    /// half-trusted proof.
+    #[test_case::test_case(None => false ; "a legacy proof carrying no version must be rebuilt")]
+    #[test_case::test_case(Some("physical_row_order_v1") => true ; "the current proof version is accepted")]
+    #[test_case::test_case(Some("unknown_future_version") => false ; "a version this build does not know must be rebuilt")]
+    fn legacy_and_unknown_proofs_require_rebuilding(version: Option<&str>) -> bool {
+        let mut proof = serde_json::json!({
+            "project_id": "p", "table_name": "otel", "date": "2026-08-14",
+            "fp": 7, "granted_unix_ms": 1, "files": ["a.parquet"], "stale": false,
+            "intervals": [[0, 10]]
+        });
+        if let Some(version) = version {
+            proof["proof_version"] = version.into();
         }
+        let certification = serde_json::from_value::<StoredCertification>(proof.clone()).is_ok();
+        assert_eq!(serde_json::from_value::<StoredSliceCoverage>(proof).is_ok(), certification, "both stored shapes must accept or reject alike");
+        certification
     }
 }

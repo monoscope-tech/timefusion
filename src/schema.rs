@@ -888,6 +888,7 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     const BASE_YAML: &str = "table_name: t\npartitions: []\nsorting_columns: []\nz_order_columns: []\ndedup_keys: [id]\ndedup_tiebreak: updated_at\n";
     const FIELDS_YAML: &str = "fields:\n  - {name: id, data_type: Utf8, nullable: false}\n  - {name: updated_at, data_type: 'Timestamp(Microsecond, None)', nullable: true}\n  - {name: deleted, data_type: Boolean, nullable: true}\n";
@@ -909,27 +910,35 @@ mod tests {
         RollupSpec { grain: "1m".into(), name: Some(name.into()), dimensions: vec!["kind".into()], measures, derive_from: None }
     }
 
-    #[test]
-    fn element_index_configuration_requires_exact_string_lists() {
-        for (data_type, options, valid) in [
-            ("List(Utf8)", "indexed: true, tokenizer: raw, list_mode: elements", true),
-            ("Utf8", "indexed: true, tokenizer: raw, list_mode: elements", false),
-            ("List(Int64)", "indexed: true, tokenizer: raw, list_mode: elements", false),
-            ("List(Utf8)", "indexed: true, list_mode: elements", false),
-            ("List(Utf8)", "indexed: false, tokenizer: raw, list_mode: elements", false),
-            ("List(Utf8)", "indexed: true, tokenizer: raw, list_mode: elements, flatten: json", false),
-            ("List(Utf8)", "indexed: true", true),
-        ] {
-            let fields = format!("{FIELDS_YAML}  - name: hashes\n    data_type: {data_type}\n    tantivy: {{{options}}}\n    nullable: true\n");
-            assert_eq!(parse_schema("", &fields).validate().is_ok(), valid, "{data_type}: {options}");
-        }
+    /// The merge-on-read triple every tombstoned table must declare identically.
+    /// The tiebreak MUST be the TF-owned column, not the client's:
+    /// `insert_coerce::stamp_version` OVERWRITES whatever this names, so
+    /// pointing it back at `observed_timestamp` / `ingested_at` would destroy
+    /// client data on every write.
+    fn assert_tombstone_shape(name: &str) {
+        let schema = get_schema(name).unwrap_or_else(|| panic!("{name} registered"));
+        assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"), "{name} tombstone column");
+        // Nullable, so the migration needed no backfill: NULL reads as live.
+        assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)), "{name}.deleted must be nullable Boolean");
+        assert_eq!(schema.dedup_tiebreak.as_deref(), Some("updated_at"), "{name} must break ties on the TF-owned stamp");
+    }
+
+    #[test_case("List(Utf8)", "indexed: true, tokenizer: raw, list_mode: elements" => true ; "exact string list")]
+    #[test_case("Utf8", "indexed: true, tokenizer: raw, list_mode: elements" => false ; "scalar column")]
+    #[test_case("List(Int64)", "indexed: true, tokenizer: raw, list_mode: elements" => false ; "non-string elements")]
+    #[test_case("List(Utf8)", "indexed: true, list_mode: elements" => false ; "tokenizer must be raw")]
+    #[test_case("List(Utf8)", "indexed: false, tokenizer: raw, list_mode: elements" => false ; "not indexed")]
+    #[test_case("List(Utf8)", "indexed: true, tokenizer: raw, list_mode: elements, flatten: json" => false ; "flatten is incompatible")]
+    #[test_case("List(Utf8)", "indexed: true" => true ; "plain indexed list")]
+    fn element_index_configuration_requires_exact_string_lists(data_type: &str, options: &str) -> bool {
+        let fields = format!("{FIELDS_YAML}  - name: hashes\n    data_type: {data_type}\n    tantivy: {{{options}}}\n    nullable: true\n");
+        parse_schema("", &fields).validate().is_ok()
     }
 
     #[test]
     fn synthesized_rollup_stores_a_generation_and_tdigest() {
         let rollup = spec("digest_test", vec![measure("digest", "tdigest", Some("duration"), None)]).synthesize(source()).expect("valid rollup");
         assert_eq!(rollup.field_def("rollup_generation"), Some((ArrowDataType::Utf8View, false)));
-        assert_eq!(rollup.field_def("digest"), Some((ArrowDataType::Binary, true)));
         // `kind` is tantivy-indexed on the source and must NOT inherit it here:
         // measured 2026-08-24, the prefilter it enables costs 8.2s against a
         // 0.28s control on the same rows. See the comment in `synthesize`.
@@ -963,6 +972,25 @@ mod tests {
         assert_eq!(rollup.field_def("landing_url").map(|(ty, _)| ty), Some(ArrowDataType::Utf8View));
     }
 
+    /// A sketch measure stores Binary regardless of aggregate. An `hll`, unlike
+    /// every other aggregate, must accept a NON-numeric source column — the
+    /// columns anyone wants a distinct count of (trace id, user id, service
+    /// name) are all strings.
+    #[test_case("tdigest", "duration" => Some((ArrowDataType::Binary, true)) ; "tdigest over a numeric column")]
+    #[test_case("hll", "context___trace_id" => Some((ArrowDataType::Binary, true)) ; "hll over a string column")]
+    #[test_case("hll", "duration" => Some((ArrowDataType::Binary, true)) ; "hll over a numeric column")]
+    fn a_sketch_measure_stores_a_binary_sketch(agg: &str, column: &str) -> Option<(ArrowDataType, bool)> {
+        spec("sketch_test", vec![measure("sketch", agg, Some(column), None)]).synthesize(source()).expect("valid rollup").field_def("sketch")
+    }
+
+    #[test]
+    fn unresolvable_rollup_measures_are_refused() {
+        let bad = spec("bad_agg", vec![measure("bad", "median", Some("duration"), None)]);
+        assert!(bad.validate(source()).unwrap_err().to_string().contains("unsupported aggregate"));
+        let unknown = spec("hll_test", vec![measure("traces", "hll", Some("no_such_column"), None)]);
+        assert!(unknown.synthesize(source()).is_err(), "an unknown column must still be rejected");
+    }
+
     #[test]
     fn legacy_rollup_generations_remain_readable_during_migration() {
         for name in [
@@ -975,26 +1003,6 @@ mod tests {
         }
     }
 
-    /// An `hll` measure stores a sketch, exactly as `tdigest` does, and unlike
-    /// every other aggregate it must accept a NON-numeric source column — the
-    /// columns anyone wants a distinct count of (trace id, user id, service
-    /// name) are all strings.
-    #[test]
-    fn an_hll_measure_stores_a_sketch_over_any_column_type() {
-        let sketch = |column: &str| spec("hll_test", vec![measure("traces", "hll", Some(column), None)]);
-        for column in ["context___trace_id", "duration"] {
-            let rollup = sketch(column).synthesize(source()).expect("valid rollup");
-            assert_eq!(rollup.field_def("traces"), Some((ArrowDataType::Binary, true)), "column {column}");
-        }
-        assert!(sketch("no_such_column").synthesize(source()).is_err(), "an unknown column must still be rejected");
-    }
-
-    #[test]
-    fn invalid_rollup_aggregate_fails_validation() {
-        let bad = spec("bad_agg", vec![measure("bad", "median", Some("duration"), None)]);
-        assert!(bad.validate(source()).unwrap_err().to_string().contains("unsupported aggregate"));
-    }
-
     /// The tombstone column must be nullable Boolean (NULL = live, so no
     /// backfill) and named by the schema — nothing hard-codes it. Exercised on
     /// `mor_versioned`, the from-scratch fixture. (It was once the ONLY table
@@ -1002,10 +1010,7 @@ mod tests {
     /// 2026-08-02 migration — see `shipped_mor_tables_declare_the_migrated_columns_last`.)
     #[test]
     fn mor_versioned_tombstone_column_is_nullable_boolean() {
-        let schema = get_schema("mor_versioned").expect("fixture registered");
-        assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"));
-        assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)));
-        assert_eq!(schema.dedup_tiebreak.as_deref(), Some("updated_at"));
+        assert_tombstone_shape("mor_versioned");
     }
 
     /// The SHIPPED merge-on-read tables, post-migration (2026-08-02). This guard
@@ -1030,9 +1035,7 @@ mod tests {
             // multi-version rows written while it was on are still in storage,
             // and DedupExec + the tombstone filter are what keep them correct.
             assert!(schema.version_append, "{name} ships merge-on-read");
-            assert_eq!(schema.tombstone_column.as_deref(), Some("deleted"), "{name} tombstone column");
-            // Nullable, so the migration needed no backfill: NULL reads as live.
-            assert_eq!(schema.field_def("deleted"), Some((ArrowDataType::Boolean, true)), "{name}.deleted must be nullable Boolean");
+            assert_tombstone_shape(name);
             assert!(matches!(schema.field_def("updated_at"), Some((ArrowDataType::Timestamp(..), true))), "{name}.updated_at must be a nullable timestamp");
 
             // ORDER is the load-bearing part: `migrate-columns` APPENDS, so
@@ -1047,13 +1050,6 @@ mod tests {
             };
             let tail: Vec<&str> = schema.fields.iter().rev().take(migrated.len()).map(|f| f.name.as_str()).rev().collect();
             assert_eq!(tail, migrated, "{name}: migrated columns must be the LAST fields, in migration order (7d68f01)");
-        }
-        // The tiebreak MUST be the TF-owned column, not the client's:
-        // `insert_coerce::stamp_version` OVERWRITES whatever this names, so
-        // pointing it back at `observed_timestamp` / `ingested_at` would destroy
-        // client data on every write.
-        for name in ["otel_logs_and_spans", "otel_metrics"] {
-            assert_eq!(get_schema(name).unwrap().dedup_tiebreak.as_deref(), Some("updated_at"), "{name} must break ties on the TF-owned stamp");
         }
     }
 

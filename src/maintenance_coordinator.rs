@@ -3919,14 +3919,9 @@ mod tests {
     #[test_case::test_case(false ; "a fast-fail retry reason carries one")]
     fn a_deterministic_plan_error_parks_instead_of_shredding_the_slice(via_abandon: bool) {
         const ERROR: &str = "Schema error: No field named duration_digest.";
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // Day-wide: splittable, so nothing but the guard stops the bisection.
-        let mut unit = task("p", 0, DAY_MICROS, Operation::BaseRollup);
-        unit.attempts = 2;
-        unit.state = TaskState::Running;
-        let key = unit.key.clone();
-        journal.upsert(unit);
+        let key = running_unit(&mut journal, task("p", 0, DAY_MICROS, Operation::BaseRollup), 2);
 
         let now = 1_000_000_000;
         if via_abandon {
@@ -3948,59 +3943,43 @@ mod tests {
         assert_eq!(after.retry_reason.as_deref(), Some(TaskJournal::SCHEMA_FAILURE_REASON));
     }
 
-    /// A unit that cannot be split — repair is the standing case, since its cost
-    /// is the file it rewrites and time-bisection cannot shrink a file set — must
-    /// not come straight back. Burning a 900s deadline and returning 256s later
-    /// is a ~78% duty cycle on a worker, forever, for a unit that has never
-    /// produced anything.
+    /// Abandoning an UNSPLITTABLE unit waits the greater of its exponential
+    /// backoff and the operation's own deadline — but only once it has failed
+    /// more than once. Three incidents, one formula:
     ///
-    /// Prod 2026-08-18: 7 Repair units timed out at 900s inside a 15-minute
-    /// window — 6,300 of 14,400 available slot-seconds, 44% of all maintenance
-    /// capacity. Rollup coverage could not advance behind that whatever the
-    /// scheduling cycle did.
-    #[test]
-    fn a_unit_that_burned_its_deadline_waits_at_least_that_long_again() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        // A single-slice repair unit: `byte_bounded_units` cannot divide it, so
-        // the split path declines and the backoff is what bounds the waste.
-        let mut unit = task("p", 0, 1, Operation::Repair);
-        unit.attempts = 5;
-        unit.state = TaskState::Running;
-        let key = unit.key.clone();
-        journal.upsert(unit);
+    /// `a_unit_that_burned_its_deadline_waits_at_least_that_long_again`: a unit
+    /// that cannot be split — repair is the standing case, since its cost is the
+    /// file it rewrites and time-bisection cannot shrink a file set — must not
+    /// come straight back. Burning a 900s deadline and returning 256s later is a
+    /// ~78% duty cycle on a worker, forever, for a unit that has never produced
+    /// anything. Prod 2026-08-18: 7 Repair units timed out at 900s inside a
+    /// 15-minute window — 6,300 of 14,400 available slot-seconds, 44% of all
+    /// maintenance capacity. Rollup coverage could not advance behind that
+    /// whatever the scheduling cycle did.
+    ///
+    /// `a_first_abandonment_is_not_floored`: a FIRST abandonment must still come
+    /// back fast. The pool is a FairSpillPool, so a correctly sized unit can be
+    /// squeezed out by someone else's memory spike and succeed untouched next
+    /// pass — making that wait a full deadline would penalise the innocent case.
+    /// Only a repeat says the unit is oversized, which is the same threshold the
+    /// split path already uses.
+    ///
+    /// `the_deadline_floor_does_not_cap_exponential_backoff`: the floor must not
+    /// REPLACE exponential backoff, only raise it. A unit that has failed many
+    /// times should keep backing off past the deadline, or a permanently broken
+    /// unit still returns every 15 minutes forever.
+    #[test_case::test_case(Operation::Repair, 1 => 2 * 1_000_000i64 ; "a_first_abandonment_is_not_floored")]
+    #[test_case::test_case(Operation::Repair, 5 => with |delay: i64| assert!(delay >= floor_micros(Operation::Repair), "a repair unit that burned {}s must wait at least that long again, waited {}s", floor_micros(Operation::Repair) / 1_000_000, delay / 1_000_000) ; "a_unit_that_burned_its_deadline_waits_at_least_that_long_again")]
+    #[test_case::test_case(Operation::Dedup, 8 => (256 * 1_000_000i64).max(floor_micros(Operation::Dedup)) ; "the_deadline_floor_does_not_cap_exponential_backoff")]
+    fn abandoning_an_unsplittable_unit_waits_the_greater_of_backoff_and_deadline(operation: Operation, attempts: u32) -> i64 {
+        let (_dir, mut journal) = new_journal();
+        // A single-slice unit: `byte_bounded_units` cannot divide it, so the
+        // split path declines and the backoff is what bounds the waste.
+        let key = running_unit(&mut journal, task("p", 0, 1, operation), attempts);
 
         let now = 1_000_000_000;
         journal.abandon_running(&key, now, None);
-
-        let deadline_micros = i64::try_from(operation_deadline_secs(Operation::Repair) * 1_000_000).expect("fits");
-        let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
-        assert!(
-            not_before >= now + deadline_micros,
-            "a repair unit that burned {}s must wait at least that long again, waited {}s",
-            deadline_micros / 1_000_000,
-            (not_before - now) / 1_000_000
-        );
-    }
-
-    /// A FIRST abandonment must still come back fast. The pool is a FairSpillPool,
-    /// so a correctly sized unit can be squeezed out by someone else's memory
-    /// spike and succeed untouched next pass — making that wait a full deadline
-    /// would penalise the innocent case. Only a repeat says the unit is oversized,
-    /// which is the same threshold the split above already uses.
-    #[test]
-    fn a_first_abandonment_is_not_floored() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut unit = task("p", 0, 1, Operation::Repair);
-        unit.attempts = 1;
-        unit.state = TaskState::Running;
-        let key = unit.key.clone();
-        journal.upsert(unit);
-
-        journal.abandon_running(&key, 0, None);
-        let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
-        assert_eq!(not_before, 2 * 1_000_000, "one failure retries on plain exponential backoff, not the deadline floor");
+        requeued_deadline(&journal, &key) - now
     }
 
     /// A fast-fail retry (resource admission) repeats identically at the same
@@ -4012,8 +3991,7 @@ mod tests {
     /// admission failure bisects like any other capacity failure.
     #[test]
     fn a_repeated_admission_failure_splits_instead_of_hot_looping() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let day = 86_400_000_000;
         // NOT Repair: its cost is a whole file, so it declines to split by
         // construction (see `a_repair_unit_is_never_bisected_...`). The
@@ -4050,8 +4028,7 @@ mod tests {
     #[test_case::test_case(true ; "timeout")]
     #[test_case::test_case(false ; "capacity failure")]
     fn a_lineage_that_did_not_shed_is_not_split_again(via_timeout: bool) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         const DAY: i64 = 86_400_000_000;
         const MEASURED: u64 = 8 * 1024 * 1024 * 1024;
         let mut unit = task("whale", 0, DAY, Operation::BaseRollup);
@@ -4083,8 +4060,7 @@ mod tests {
     /// attempts every second forever. The delay escalates with the evidence.
     #[test]
     fn a_split_refused_capacity_retry_escalates_its_delay() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // Single MIN_SLICE unit: byte_bounded_units would hash-shard, so the
         // split declines.
         let mut unit = task("p", 0, MIN_SLICE_MICROS, Operation::Repair);
@@ -4096,7 +4072,7 @@ mod tests {
         let now = crate::support::now_micros();
         journal.retry_or_split(&key, "resource_admission".into(), now + 1_000_000, 6);
 
-        let not_before = journal.tasks().find(|t| t.key == key).map(|t| t.deadline_micros).expect("requeued");
+        let not_before = requeued_deadline(&journal, &key);
         assert!(
             not_before >= now + (1 << 6) * 1_000_000,
             "sixth identical capacity failure must wait 2^6s, not the 1s admission delay (waited {}s)",
@@ -4113,13 +4089,8 @@ mod tests {
     /// `scheduling_class`, so across 24h of logs not one child ever started.
     #[test]
     fn a_replanned_day_does_not_resurrect_a_superseded_parent() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut unit = task("p", 0, DAY_MICROS, Operation::SealedConsolidation);
-        unit.attempts = 2;
-        unit.state = TaskState::Running;
-        let key = unit.key.clone();
-        journal.upsert(unit);
+        let (_dir, mut journal) = new_journal();
+        let key = running_unit(&mut journal, task("p", 0, DAY_MICROS, Operation::SealedConsolidation), 2);
 
         journal.abandon_running(&key, 0, None);
         assert_eq!(journal.state(&key), Some(TaskState::Superseded), "two failures split a day-wide unit");
@@ -4149,44 +4120,18 @@ mod tests {
     /// deadline back to `now` and cleared the reason.
     #[test]
     fn a_replanned_debt_does_not_erase_worker_failure_backoff() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // Single-slice: unsplittable, so abandonment falls to the backoff floor.
-        let mut unit = task("p", 0, MIN_SLICE_MICROS, Operation::Repair);
-        unit.attempts = 5;
-        unit.state = TaskState::Running;
-        let key = unit.key.clone();
-        journal.upsert(unit);
+        let key = running_unit(&mut journal, task("p", 0, MIN_SLICE_MICROS, Operation::Repair), 5);
 
         let now = 1_000_000_000;
         journal.abandon_running(&key, now, None);
-        let floored = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
+        let floored = requeued_deadline(&journal, &key);
 
         journal.enqueue(key.clone(), now + 60_000_000, 1_000, 0);
         let after = journal.tasks().find(|candidate| candidate.key == key).expect("still queued");
         assert_eq!(after.deadline_micros, floored, "a re-noticed debt must not cancel the abandonment backoff");
         assert_eq!(after.retry_reason.as_deref(), Some(TaskJournal::WORKER_FAILURE_REASON), "the quarantine tag survives the planner tick");
-    }
-
-    /// The floor must not REPLACE exponential backoff, only raise it. A unit that
-    /// has failed many times should keep backing off past the deadline, or a
-    /// permanently broken unit still returns every 15 minutes forever.
-    #[test]
-    fn the_deadline_floor_does_not_cap_exponential_backoff() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut unit = task("p", 0, 1, Operation::Dedup);
-        unit.attempts = 8;
-        unit.state = TaskState::Running;
-        let key = unit.key.clone();
-        journal.upsert(unit);
-
-        let now = 0;
-        journal.abandon_running(&key, now, None);
-        let not_before = journal.tasks().find(|candidate| candidate.key == key).map(|candidate| candidate.deadline_micros).expect("requeued");
-        let exponential = 256 * 1_000_000i64;
-        let floor = i64::try_from(operation_deadline_secs(Operation::Dedup) * 1_000_000).expect("fits");
-        assert_eq!(not_before, now + exponential.max(floor), "the delay is the greater of the two, never the lesser");
     }
 
     /// Splitting a backfill unit must narrow the WORK, not the priority.
@@ -4217,8 +4162,7 @@ mod tests {
         const DAY: i64 = 24 * 60 * 60 * 1_000_000;
         let now = 60 * DAY;
         let (start, end) = (now - 10 * DAY, now - 9 * DAY);
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
 
         let split = task("split", start, end, Operation::BaseRollup);
         let key = split.key.clone();
@@ -4322,8 +4266,7 @@ mod tests {
     fn a_dedup_slice_extending_a_completed_run_outranks_an_island_seed() {
         const DAY: i64 = 24 * 60 * 60 * 1_000_000;
         const TEN_MIN: i64 = 10 * 60 * 1_000_000;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut journal = TaskJournal::load(dir.path()).expect("fresh journal");
+        let (_dir, mut journal) = new_journal();
         let now = 400 * DAY;
         // Sealed and inside the [3d, 31d] starved band, where the whole band
         // TIES on `starved` and the order used to fall through to oldest-first.
@@ -4351,8 +4294,13 @@ mod tests {
     }
 
     fn task(project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
+        task_in("table", project, start, end, operation)
+    }
+
+    /// `task`, with the physical table named — a few assertions turn on the tier.
+    fn task_in(table: &str, project: &str, start: i64, end: i64, operation: Operation) -> MaintenanceTask {
         let key = TaskKey {
-            physical_table: "table".into(),
+            physical_table: table.into(),
             source: "source".into(),
             project_id: project.into(),
             slice: TimeSlice::new(start, end).expect("valid slice"),
@@ -4360,6 +4308,51 @@ mod tests {
         };
         MaintenanceTask::pending(key, 0, 0, 0)
     }
+
+    /// A fresh journal over a temp dir; the dir is returned because several tests
+    /// reload the journal from it.
+    fn new_journal() -> (tempfile::TempDir, TaskJournal) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let journal = TaskJournal::load(dir.path()).expect("journal");
+        (dir, journal)
+    }
+
+    /// Upserts a unit that has already failed `attempts` times and is Running.
+    fn running_unit(journal: &mut TaskJournal, mut unit: MaintenanceTask, attempts: u32) -> TaskKey {
+        unit.attempts = attempts;
+        unit.state = TaskState::Running;
+        let key = unit.key.clone();
+        journal.upsert(unit);
+        key
+    }
+
+    fn requeued_deadline(journal: &TaskJournal, key: &TaskKey) -> i64 {
+        journal.tasks().find(|candidate| candidate.key == *key).map(|candidate| candidate.deadline_micros).expect("requeued")
+    }
+
+    /// The operation's own deadline, in micros — the floor a burned unit waits.
+    fn floor_micros(operation: Operation) -> i64 {
+        i64::try_from(operation_deadline_secs(operation) * 1_000_000).expect("fits")
+    }
+
+    /// A 12h child of a day-wide parent that measured 100x the budget: the model
+    /// promised half the bytes, the next measurement comes back with 96% of them.
+    fn floored_child(journal: &mut TaskJournal) -> TaskKey {
+        let mut unit = task("whale", 0, DAY_MICROS / 2, Operation::BaseRollup);
+        unit.parent_measured_bytes = Some(100 * MAX_DECODED_BYTES);
+        let key = unit.key.clone();
+        journal.upsert(unit);
+        key
+    }
+
+    /// The reference clock for the ordering cases: ten days in.
+    const ORDER_NOW: i64 = 10 * 24 * 60 * 60 * 1_000_000;
+
+    /// (slice start, slice end, operation, deadline) — all offsets from `ORDER_NOW`.
+    type Ranked = (i64, i64, Operation, Option<i64>);
+
+    /// (project, slice start, slice end, deadline, completed) — offsets from `ORDER_NOW`.
+    type Stream = (&'static str, i64, i64, i64, bool);
 
     /// Only outstanding ROLLUP work may veto a rollup backfill.
     ///
@@ -4441,14 +4434,8 @@ mod tests {
     /// minting a single journal unit.
     #[test]
     fn a_child_no_cheaper_than_its_parent_stops_bisecting() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        // A 12h child of a day-wide parent: the model promised half the bytes,
-        // the measurement came back with 96% of them.
-        let mut unit = task("whale", 0, DAY_MICROS / 2, Operation::BaseRollup);
-        unit.parent_measured_bytes = Some(100 * MAX_DECODED_BYTES);
-        let key = unit.key.clone();
-        journal.upsert(unit);
+        let (_dir, mut journal) = new_journal();
+        let key = floored_child(&mut journal);
 
         assert!(
             !journal.split_time_task(&key, 96 * MAX_DECODED_BYTES, None),
@@ -4468,8 +4455,7 @@ mod tests {
     /// identity rules would silently reintroduce the N-rebuild cost.
     #[test]
     fn escalations_to_one_covering_slice_collapse_into_a_single_unit() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let day = 3 * DAY_MICROS;
         let covering = task("p", day, day + DAY_MICROS, Operation::BaseRollup).key;
 
@@ -4492,12 +4478,8 @@ mod tests {
     /// prod; this pins it at the source instead of waiting to read it there.
     #[test]
     fn a_unit_declined_at_the_floor_is_still_claimable() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut unit = task("whale", 0, DAY_MICROS / 2, Operation::BaseRollup);
-        unit.parent_measured_bytes = Some(100 * MAX_DECODED_BYTES);
-        let key = unit.key.clone();
-        journal.upsert(unit);
+        let (_dir, mut journal) = new_journal();
+        let key = floored_child(&mut journal);
 
         let now = crate::support::now_micros();
         assert!(!journal.split_time_task(&key, 96 * MAX_DECODED_BYTES, None), "the floor declines the split");
@@ -4522,14 +4504,10 @@ mod tests {
         let floor0 = stats.split_declined_at_floor.load(std::sync::atomic::Ordering::Relaxed);
         let width0 = stats.split_declined_no_width.load(std::sync::atomic::Ordering::Relaxed);
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
 
         // Floor: the unit came back costing nearly what its parent cost.
-        let mut at_floor = task("whale", 0, DAY_MICROS / 2, Operation::BaseRollup);
-        at_floor.parent_measured_bytes = Some(100 * MAX_DECODED_BYTES);
-        let floor_key = at_floor.key.clone();
-        journal.upsert(at_floor);
+        let floor_key = floored_child(&mut journal);
         assert!(!journal.split_time_task(&floor_key, 96 * MAX_DECODED_BYTES, None), "floor declines");
 
         // No width: already at the minimum slice, so bisection yields no children.
@@ -4551,8 +4529,7 @@ mod tests {
     /// number is the very thing that cannot be trusted.
     #[test]
     fn a_split_stamps_children_with_what_the_parent_measured() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let unit = task("whale", 0, DAY_MICROS, Operation::BaseRollup);
         let key = unit.key.clone();
         journal.upsert(unit);
@@ -4575,8 +4552,7 @@ mod tests {
     /// the immortal-unit shape this file already carries three incidents of.
     #[test]
     fn a_synthetic_stamp_does_not_freeze_a_lineage() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let unit = task("whale", 0, DAY_MICROS, Operation::BaseRollup);
         let key = unit.key.clone();
         journal.upsert(unit);
@@ -4596,8 +4572,7 @@ mod tests {
 
     #[test]
     fn journal_claims_rotate_projects_instead_of_restarting_at_first() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         for input in
             [task("a", 0, 1, Operation::Dedup), task("a", 1, 2, Operation::Dedup), task("b", 0, 1, Operation::Dedup), task("b", 1, 2, Operation::Dedup)]
         {
@@ -4609,8 +4584,7 @@ mod tests {
 
     #[test]
     fn bootstrap_backlog_migration_keeps_publications_and_runs_once() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (dir, mut journal) = new_journal();
         // Production already carries the v1 marker. It must not suppress the
         // corrective cleanup after commit-range reconciliation ships.
         journal.set_source_cursor("__maintenance_bootstrap_backlog_v1".to_owned(), 1);
@@ -4632,8 +4606,7 @@ mod tests {
 
     #[test]
     fn repeated_pending_invalidation_does_not_rewrite_the_wal() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let key = task("customer", 0, 1, Operation::BaseRollup).key;
         journal.enqueue(key.clone(), 10, 512, 1);
         journal.checkpoint().expect("first checkpoint");
@@ -4648,44 +4621,10 @@ mod tests {
         assert!(fs::metadata(&journal.wal_path).expect("wal").len() > first_size);
     }
 
-    #[test]
-    fn recent_slices_precede_overdue_historical_work() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let old = task("old", 0, MIN_SLICE_MICROS, Operation::Dedup);
-        let recent = task("recent", now - MIN_SLICE_MICROS, now, Operation::BaseRollup);
-        assert!(scheduling_class(&recent, now) < scheduling_class(&old, now), "a recent slice outranks overdue historical work");
-    }
-
-    #[test]
-    fn newest_eligible_frontier_slice_precedes_older_frontier_debt() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let older_start = now - 12 * 60 * 60 * 1_000_000;
-        let older = task("older", older_start, older_start + MIN_SLICE_MICROS, Operation::BaseRollup);
-        let newest = task("newest", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        assert!(scheduling_class(&newest, now) < scheduling_class(&older, now));
-    }
-
-    #[test]
-    fn recently_mutated_historical_hole_does_not_displace_frontier() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let mut correction = task("correction", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
-        correction.deadline_micros = now - 1;
-        let mut frontier = task("frontier", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        frontier.deadline_micros = now - 60 * 1_000_000;
-        assert!(scheduling_class(&frontier, now) < scheduling_class(&correction, now));
-    }
-
-    #[test]
-    fn future_clock_slice_does_not_displace_live_frontier() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let future = task("future", now + 24 * 60 * 60 * 1_000_000, now + 24 * 60 * 60 * 1_000_000 + MIN_SLICE_MICROS, Operation::BaseRollup);
-        let frontier = task("frontier", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        assert!(scheduling_class(&frontier, now) < scheduling_class(&future, now));
-    }
-
-    /// Historical debt runs newest SLICE first, not oldest deadline first.
+    /// `historical_debt_runs_newest_slice_first` (the last case): historical debt
+    /// runs newest SLICE first, not oldest deadline first.
     ///
-    /// This asserted the opposite until 2026-08-17, with no stated reason.
+    /// That asserted the opposite until 2026-08-17, with no stated reason.
     /// Oldest-first is FIFO-fair, but it spends the whole non-frontier budget on
     /// the oldest data in the store — which is the data nobody queries. Prod,
     /// over 84 task starts: 74 went to the live frontier (correct) and every one
@@ -4696,15 +4635,28 @@ mod tests {
     /// Newest-first does not starve old debt: frontier work is rate-limited by
     /// ingest and recent slices are finite, so once the recent window drains the
     /// ordering walks backward on its own. What it guarantees is that the window
-    /// a dashboard actually reads is reached FIRST.
-    /// Sealed work must get a share of claims even while the frontier is busy.
-    ///
-    /// Class is strict priority and ingest never stops, so before the
-    /// reservation class 1 simply never ran: prod 2026-08-17 went 278
-    /// consecutive task starts without a single sealed day, while rollup
-    /// coverage for a live tenant sat at two days and every 7d/14d/30d query
-    /// fell back to a raw scan. A frontier that is healthy on its own metric
-    /// (`eligible_watermark_lag_seconds` 0) tells you nothing about this.
+    /// a dashboard actually reads is reached FIRST. Both slices in that case
+    /// sealed RECENTLY, so neither is overdue — age comes from the slice, and
+    /// overdue work drains oldest-first by design, a different question from
+    /// which slice a dashboard needs.
+    #[test_case::test_case((-MIN_SLICE_MICROS, 0, Operation::BaseRollup, None), (-ORDER_NOW, -ORDER_NOW + MIN_SLICE_MICROS, Operation::Dedup, None) ; "recent_slices_precede_overdue_historical_work")]
+    #[test_case::test_case((-2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, Operation::BaseRollup, None), (-12 * 60 * 60 * 1_000_000, -12 * 60 * 60 * 1_000_000 + MIN_SLICE_MICROS, Operation::BaseRollup, None) ; "newest_eligible_frontier_slice_precedes_older_frontier_debt")]
+    #[test_case::test_case((-2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, Operation::BaseRollup, Some(-60 * 1_000_000)), (-ORDER_NOW, -ORDER_NOW + MIN_SLICE_MICROS, Operation::BaseRollup, Some(-1)) ; "recently_mutated_historical_hole_does_not_displace_frontier")]
+    #[test_case::test_case((-2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, Operation::BaseRollup, None), (24 * 60 * 60 * 1_000_000, 24 * 60 * 60 * 1_000_000 + MIN_SLICE_MICROS, Operation::BaseRollup, None) ; "future_clock_slice_does_not_displace_live_frontier")]
+    #[test_case::test_case((-2 * 24 * 3_600_000_000 + MIN_SLICE_MICROS, -2 * 24 * 3_600_000_000 + 2 * MIN_SLICE_MICROS, Operation::BaseRollup, Some(-60 * 1_000_000)), (-2 * 24 * 3_600_000_000, -2 * 24 * 3_600_000_000 + MIN_SLICE_MICROS, Operation::BaseRollup, Some(-2 * 60 * 1_000_000)) ; "historical_debt_runs_newest_slice_first")]
+    fn scheduling_class_prefers(winner: Ranked, loser: Ranked) {
+        let now = ORDER_NOW;
+        let build = |project: &str, (start, end, operation, deadline): Ranked| {
+            let mut unit = task(project, now + start, now + end, operation);
+            if let Some(offset) = deadline {
+                unit.deadline_micros = now + offset;
+            }
+            unit
+        };
+        let (winner, loser) = (build("winner", winner), build("loser", loser));
+        assert!(scheduling_class(&winner, now) < scheduling_class(&loser, now), "the winning slice is the one the scheduler must reach first");
+    }
+
     /// Pending work must be reportable per operation, and split by whether it
     /// is claimable right now.
     ///
@@ -4720,15 +4672,8 @@ mod tests {
         // expressed against it — an epoch-relative `now` makes every deadline
         // look long past and the eligible/pending distinction vanishes.
         let now = crate::support::now_micros();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let key = |op, start: i64, end: i64| TaskKey {
-            physical_table: "t".into(),
-            source: "t".into(),
-            project_id: "p".into(),
-            slice: TimeSlice::new(start, end).expect("slice"),
-            operation: op,
-        };
+        let (_dir, mut journal) = new_journal();
+        let key = |op, start: i64, end: i64| task("p", start, end, op).key;
         // One eligible sealed rollup, one sealed rollup not yet due, one repair.
         // Sealed slices: well before now, so they are not live-frontier.
         let old_start = now - 30 * 24 * 60 * 60 * 1_000_000;
@@ -4760,15 +4705,8 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         const DAY: i64 = 24 * 60 * 60 * 1_000_000;
         let now = crate::support::now_micros();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let key = |start: i64| TaskKey {
-            physical_table: "t".into(),
-            source: "t".into(),
-            project_id: "p".into(),
-            slice: TimeSlice::new(start, start + DAY).expect("slice"),
-            operation: Operation::SealedConsolidation,
-        };
+        let (_dir, mut journal) = new_journal();
+        let key = |start: i64| task("p", start, start + DAY, Operation::SealedConsolidation).key;
         let stamp = |micros: i64| u64::try_from(micros.div_euclid(1_000)).unwrap_or_default();
         // The prod shape: a hygiene unit aged from a seal time 85 days back...
         journal.enqueue(key(now - 86 * DAY), now, 1, stamp(now - 85 * DAY));
@@ -4793,17 +4731,10 @@ mod tests {
     #[test]
     fn coarse_backfill_migration_only_drops_fine_sealed_backfill() {
         let now = crate::support::now_micros();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let day = 24 * 60 * 60 * 1_000_000i64;
         let sealed_start = now - 10 * day;
-        let key = |op, start: i64, end: i64| TaskKey {
-            physical_table: "t".into(),
-            source: "t".into(),
-            project_id: "p".into(),
-            slice: TimeSlice::new(start, end).expect("slice"),
-            operation: op,
-        };
+        let key = |op, start: i64, end: i64| task("p", start, end, op).key;
         // Dropped: fine-grained sealed rollup/dedup work.
         journal.enqueue(key(Operation::BaseRollup, sealed_start, sealed_start + MIN_SLICE_MICROS), now, 1, 1);
         journal.enqueue(key(Operation::Dedup, sealed_start, sealed_start + MIN_SLICE_MICROS), now, 1, 1);
@@ -4834,16 +4765,9 @@ mod tests {
     /// completions into 276 real violations and 9 legitimately empty hours.
     #[test]
     fn published_rows_are_summed_per_slice_and_per_project() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         const HOUR: i64 = 3_600_000_000;
-        let key = |project: &str, table: &str, hour: i64| TaskKey {
-            physical_table: table.into(),
-            source: "src".into(),
-            project_id: project.into(),
-            slice: TimeSlice::new(hour * HOUR, (hour + 1) * HOUR).expect("slice"),
-            operation: Operation::BaseRollup,
-        };
+        let key = |project: &str, table: &str, hour: i64| task_in(table, project, hour * HOUR, (hour + 1) * HOUR, Operation::BaseRollup).key;
         let publish = |journal: &mut TaskJournal, project: &str, table: &str, hour: i64, rows: u64| {
             let key = key(project, table, hour);
             journal.enqueue(key.clone(), 0, 1, 1);
@@ -4863,21 +4787,22 @@ mod tests {
         assert_eq!(rows(0, 24), 17, "the day never picks up another tenant or another tier");
     }
 
+    /// Sealed work must get a share of claims even while the frontier is busy.
+    ///
+    /// Class is strict priority and ingest never stops, so before the
+    /// reservation class 1 simply never ran: prod 2026-08-17 went 278
+    /// consecutive task starts without a single sealed day, while rollup
+    /// coverage for a live tenant sat at two days and every 7d/14d/30d query
+    /// fell back to a raw scan. A frontier that is healthy on its own metric
+    /// (`eligible_watermark_lag_seconds` 0) tells you nothing about this.
     #[test]
     fn sealed_work_gets_claims_while_the_frontier_is_busy() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = ORDER_NOW;
+        let (_dir, mut journal) = new_journal();
 
         // Plenty of frontier work — the production condition, where ingest
         // keeps class 0 permanently non-empty — plus one sealed day.
-        let key = |start: i64, end: i64| TaskKey {
-            physical_table: "t".into(),
-            source: "t".into(),
-            project_id: "p".into(),
-            slice: TimeSlice::new(start, end).expect("slice"),
-            operation: Operation::BaseRollup,
-        };
+        let key = |start: i64, end: i64| task("p", start, end, Operation::BaseRollup).key;
         for k in 1..20 {
             journal.enqueue(key(now - (k + 1) * MIN_SLICE_MICROS, now - k * MIN_SLICE_MICROS), now - 1, 1, 1);
         }
@@ -4914,56 +4839,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn historical_debt_runs_newest_slice_first() {
-        let now: i64 = 10 * 24 * 60 * 60 * 1_000_000;
-        // Older slice, and the older deadline too — under the previous ordering
-        // this ran first purely because it had been waiting longest.
-        // Both cover days that sealed RECENTLY, so neither is overdue. Age now
-        // comes from the slice, and overdue work drains oldest-first by design
-        // — a different question from which slice a dashboard needs.
-        let base = now - 2 * 24 * 3_600_000_000;
-        let mut older_slice = task("a", base, base + MIN_SLICE_MICROS, Operation::BaseRollup);
-        older_slice.deadline_micros = now - 2 * 60 * 1_000_000;
-        let mut newer_slice = task("b", base + MIN_SLICE_MICROS, base + 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
-        newer_slice.deadline_micros = now - 60 * 1_000_000;
-        assert!(scheduling_class(&newer_slice, now) < scheduling_class(&older_slice, now), "the more recent slice is the one a dashboard query needs");
-    }
-
-    #[test]
-    fn live_frontier_lag_ignores_historical_holes() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let mut historical = task("project", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
-        historical.deadline_micros = now - 4 * 60 * 60 * 1_000_000;
-        assert_eq!(live_frontier_lag_secs([&historical], now), 0);
-    }
-
-    #[test]
-    fn live_frontier_lag_tracks_only_each_streams_newest_slice() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let mut older = task("project", now - 3 * MIN_SLICE_MICROS, now - 2 * MIN_SLICE_MICROS, Operation::BaseRollup);
-        older.deadline_micros = now - 10 * 60 * 1_000_000;
-        let mut newest = task("project", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        newest.deadline_micros = now - 2 * 60 * 1_000_000;
-        assert_eq!(live_frontier_lag_secs([&older, &newest], now), 2 * 60);
-        newest.state = TaskState::Complete;
-        assert_eq!(live_frontier_lag_secs([&older, &newest], now), 0, "an older hole is not the raw tail once newer coverage landed");
-    }
-
-    #[test]
-    fn live_frontier_lag_reports_the_slowest_project() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let mut fast = task("fast", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        fast.deadline_micros = now - 60 * 1_000_000;
-        let mut slow = task("slow", now - 2 * MIN_SLICE_MICROS, now - MIN_SLICE_MICROS, Operation::BaseRollup);
-        slow.deadline_micros = now - 5 * 60 * 1_000_000;
-        assert_eq!(live_frontier_lag_secs([&fast, &slow], now), 5 * 60);
+    /// Frontier lag is the newest slice of each stream, never a historical hole:
+    /// `(project, slice start, slice end, deadline, completed)` offsets from
+    /// `ORDER_NOW` in, lag seconds out.
+    #[test_case::test_case(vec![("project", -ORDER_NOW, -ORDER_NOW + MIN_SLICE_MICROS, -4 * 60 * 60 * 1_000_000, false)] => 0 ; "live_frontier_lag_ignores_historical_holes")]
+    #[test_case::test_case(vec![("project", -3 * MIN_SLICE_MICROS, -2 * MIN_SLICE_MICROS, -10 * 60 * 1_000_000, false), ("project", -2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, -2 * 60 * 1_000_000, false)] => 2 * 60 ; "live_frontier_lag_tracks_only_each_streams_newest_slice")]
+    #[test_case::test_case(vec![("project", -3 * MIN_SLICE_MICROS, -2 * MIN_SLICE_MICROS, -10 * 60 * 1_000_000, false), ("project", -2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, -2 * 60 * 1_000_000, true)] => 0 ; "an older hole is not the raw tail once newer coverage landed")]
+    #[test_case::test_case(vec![("fast", -2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, -60 * 1_000_000, false), ("slow", -2 * MIN_SLICE_MICROS, -MIN_SLICE_MICROS, -5 * 60 * 1_000_000, false)] => 5 * 60 ; "live_frontier_lag_reports_the_slowest_project")]
+    fn live_frontier_lag(streams: Vec<Stream>) -> u64 {
+        let now = ORDER_NOW;
+        let tasks: Vec<MaintenanceTask> = streams
+            .into_iter()
+            .map(|(project, start, end, deadline, complete)| {
+                let mut unit = task(project, now + start, now + end, Operation::BaseRollup);
+                unit.deadline_micros = now + deadline;
+                if complete {
+                    unit.state = TaskState::Complete;
+                }
+                unit
+            })
+            .collect();
+        live_frontier_lag_secs(tasks.iter(), now)
     }
 
     #[test]
     fn derived_invalidations_use_one_aligned_hour() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         journal
             .invalidate(Invalidation {
                 source_table: "source",
@@ -4986,8 +4887,7 @@ mod tests {
 
     #[test]
     fn restart_migrates_unpublished_derived_fragments_to_hours() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (dir, mut journal) = new_journal();
         journal.upsert(task("p", 0, NORMAL_SLICE_MICROS, Operation::DerivedRollup));
         journal.checkpoint().expect("old checkpoint");
 
@@ -5018,8 +4918,7 @@ mod tests {
     /// over a non-empty base, against 14.5% for hour-wide units.
     #[test]
     fn the_hour_migration_leaves_a_slice_wider_than_an_hour_alone() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (dir, mut journal) = new_journal();
         const DAY: i64 = 24 * DERIVED_SLICE_MICROS;
         journal.upsert(task("p", 0, DAY, Operation::DerivedRollup));
         // A genuine legacy fragment alongside it, so the migration is not simply inert.
@@ -5055,16 +4954,9 @@ mod tests {
     ///      4,632-superseded-record incident came from resurrect logic that did.
     #[test]
     fn republishing_a_base_slice_reopens_the_derived_cell_over_it() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         const HOUR: i64 = DERIVED_SLICE_MICROS;
-        let derived = |start: i64, end: i64| TaskKey {
-            physical_table: "derived".into(),
-            source: "src".into(),
-            project_id: "p".into(),
-            slice: TimeSlice::new(start, end).expect("slice"),
-            operation: Operation::DerivedRollup,
-        };
+        let derived = |start: i64, end: i64| task_in("derived", "p", start, end, Operation::DerivedRollup).key;
         let publication = || Publication { source_fingerprint: 7, generation: "g".into(), rows: 5, source_rows: Some(9) };
         for (start, end) in [(0, HOUR), (HOUR, 2 * HOUR), (5 * HOUR, 6 * HOUR)] {
             let key = derived(start, end);
@@ -5095,8 +4987,7 @@ mod tests {
 
     #[test]
     fn journal_round_trips_tasks_and_monotonic_cursors() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("new journal");
+        let (dir, mut journal) = new_journal();
         journal.upsert(task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup));
         journal.set_source_cursor("source".into(), 9);
         journal.set_source_cursor("source".into(), 7);
@@ -5109,8 +5000,7 @@ mod tests {
     #[test]
     fn production_sized_wal_replay_updates_tasks_without_quadratic_scans() {
         const TASKS: i64 = 20_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("new journal");
+        let (dir, mut journal) = new_journal();
         for index in 0..TASKS {
             journal.upsert(task("large-project", index, index + 1, Operation::Dedup));
         }
@@ -5129,8 +5019,7 @@ mod tests {
 
     #[test]
     fn empty_rollup_publication_survives_restart() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("new journal");
+        let (dir, mut journal) = new_journal();
         let input = task("p", 0, MIN_SLICE_MICROS, Operation::BaseRollup);
         let key = input.key.clone();
         journal.upsert(input);
@@ -5145,8 +5034,7 @@ mod tests {
 
     #[test]
     fn dropping_a_running_lease_durably_requeues_the_task() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (dir, mut journal) = new_journal();
         let input = task("p", 0, MIN_SLICE_MICROS, Operation::Dedup);
         let key = input.key.clone();
         journal.upsert(input);
@@ -5176,8 +5064,7 @@ mod tests {
     /// silence it replaces, because it looks like data.
     #[test]
     fn a_completed_lease_reports_complete_and_is_not_requeued() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let input = task("p", 0, MIN_SLICE_MICROS, Operation::SealedConsolidation);
         let key = input.key.clone();
         journal.upsert(input);
@@ -5229,54 +5116,27 @@ mod tests {
 
     #[test]
     fn invalidation_is_idempotent_and_extends_the_quiet_period() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        journal
-            .invalidate(Invalidation {
-                source_table: "source",
-                rollup_table: "rollup",
-                source: "source",
-                project_id: "p",
-                start_micros: 0,
-                end_micros: NORMAL_SLICE_MICROS,
-                observed_at_micros: 10,
-                derived: false,
-                mint_dedup: true,
-                mint_rollup: true,
-            })
-            .expect("invalidate");
+        let (_dir, mut journal) = new_journal();
+        // The same slice, re-invalidated; only `observed_at_micros` moves.
+        let observed_at = |observed_at_micros| Invalidation {
+            source_table: "source",
+            rollup_table: "rollup",
+            source: "source",
+            project_id: "p",
+            start_micros: 0,
+            end_micros: NORMAL_SLICE_MICROS,
+            observed_at_micros,
+            derived: false,
+            mint_dedup: true,
+            mint_rollup: true,
+        };
+        journal.invalidate(observed_at(10)).expect("invalidate");
         journal.checkpoint().expect("first invalidation checkpoint");
         let first_wal_size = fs::metadata(&journal.wal_path).expect("wal").len();
-        journal
-            .invalidate(Invalidation {
-                source_table: "source",
-                rollup_table: "rollup",
-                source: "source",
-                project_id: "p",
-                start_micros: 0,
-                end_micros: NORMAL_SLICE_MICROS,
-                observed_at_micros: 20,
-                derived: false,
-                mint_dedup: true,
-                mint_rollup: true,
-            })
-            .expect("invalidate again");
+        journal.invalidate(observed_at(20)).expect("invalidate again");
         journal.checkpoint().expect("same-bucket checkpoint");
         assert_eq!(fs::metadata(&journal.wal_path).expect("wal").len(), first_wal_size, "same deadline bucket must not rewrite tasks");
-        journal
-            .invalidate(Invalidation {
-                source_table: "source",
-                rollup_table: "rollup",
-                source: "source",
-                project_id: "p",
-                start_micros: 0,
-                end_micros: NORMAL_SLICE_MICROS,
-                observed_at_micros: INVALIDATION_DEADLINE_BUCKET_MICROS + 1,
-                derived: false,
-                mint_dedup: true,
-                mint_rollup: true,
-            })
-            .expect("invalidate in next bucket");
+        journal.invalidate(observed_at(INVALIDATION_DEADLINE_BUCKET_MICROS + 1)).expect("invalidate in next bucket");
         // Two, not three: Dedup and the rollup. HotPacking is planned by DEBT
         // in `plan_compaction_debt` (one day-wide unit per project, only when
         // the partition really has small or unsorted files), never per slice —
@@ -5292,8 +5152,7 @@ mod tests {
 
     #[test]
     fn running_tasks_are_requeued_after_a_restart() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let input = task("p", 0, MIN_SLICE_MICROS, Operation::Dedup);
         let key = input.key.clone();
         journal.upsert(input);
@@ -5306,13 +5165,60 @@ mod tests {
 
     #[test]
     fn claim_is_durable_state_not_an_in_memory_queue_pop() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         journal.upsert(task("p", 0, MIN_SLICE_MICROS, Operation::Dedup));
         let claimed = journal.claim_next(Operation::Dedup, 0, true).expect("claim");
         assert_eq!(claimed.state, TaskState::Running);
         assert_eq!(claimed.attempts, 1);
         assert!(journal.claim_next(Operation::Dedup, 0, true).is_none());
+    }
+
+    /// A derived-rollup key on the 1h tier — the shape `invalidate` mints.
+    fn derived_key(project: &str, start: i64, width: i64) -> TaskKey {
+        task_in("rollup_1h", project, start, start + width, Operation::DerivedRollup).key
+    }
+
+    /// A tier unit as the planner just minted it: named tier, due now, and
+    /// freshly created so `starved` cannot decide the order — these cases are
+    /// about hole/damage rank, and leaving `created_unix_ms` at 0 would make
+    /// every unit maximally starved and settle the order on age instead.
+    fn tier_unit(project: &str, table: &str, start: i64, width: i64, now: i64, operation: Operation) -> MaintenanceTask {
+        let mut unit = task_in(table, project, start, start + width, operation);
+        unit.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
+        unit
+    }
+
+    /// A sealed rollup unit on the 1m tier, priced trivially so only the
+    /// coarsening pass's own rules decide whether it fuses or is subsumed.
+    fn coarsenable_unit(project: &str, start: i64, width: i64) -> MaintenanceTask {
+        let mut unit = task_in("rollup_1m", project, start, start + width, Operation::BaseRollup);
+        unit.estimated_decoded_bytes = 1;
+        unit
+    }
+
+    /// `scheduling_class` of a day-wide SealedConsolidation unit whose day
+    /// ended `hours_ago`. Day-wide and footprint-less, so width and benefit tie
+    /// and only age can order two of these.
+    fn sealed_class(project: &str, hours_ago: i64, now: i64) -> (u8, u8, i64, i64, i64) {
+        let end = now - hours_ago * 3_600_000_000;
+        super::scheduling_class(&task(project, end - DAY_MICROS, end, Operation::SealedConsolidation), now)
+    }
+
+    /// A hygiene cell as `plan_compaction_debt` mints one: day-wide, ending at
+    /// `end`, carrying the file footprint it was selected on.
+    fn hygiene_cell(project: &str, end: i64, files: u32, operation: Operation) -> MaintenanceTask {
+        let mut unit = task(project, end - DAY_MICROS, end, operation);
+        unit.input = Some(InputFootprint::new((0..files).map(|n| format!("{project}/{n}.parquet")), 1));
+        unit
+    }
+
+    /// Seeds a FRESH journal — rank state (`tier_holes`, untagged cells) is
+    /// per-journal, so a control and its counterpart cannot share one — and
+    /// returns the project whose unit wins the first claim.
+    fn claim_winner(now: i64, operation: Operation, seed: impl FnOnce(&mut TaskJournal)) -> String {
+        let (_dir, mut journal) = new_journal();
+        seed(&mut journal);
+        journal.claim_next(operation, now, true).expect("claim").key.project_id
     }
 
     /// Historical derived work must not lose every claim to the frontier.
@@ -5325,8 +5231,7 @@ mod tests {
     /// reservation the historical units never run at all.
     #[test]
     fn a_sealed_derived_unit_is_not_starved_by_the_frontier() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 40 * 24 * 3_600_000_000i64;
         let derived = |project: &str, start: i64, width: i64| {
             let mut task = task(project, start, start + width, Operation::DerivedRollup);
@@ -5359,15 +5264,8 @@ mod tests {
     /// family.
     #[test]
     fn a_derived_unit_runs_when_its_base_tier_exists_without_a_journal_record() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let derived = |project: &str| TaskKey {
-            physical_table: "rollup_1h".to_owned(),
-            source: "source".to_owned(),
-            project_id: project.to_owned(),
-            slice: TimeSlice::new(0, 3_600_000_000).expect("slice"),
-            operation: Operation::DerivedRollup,
-        };
+        let (_dir, mut journal) = new_journal();
+        let derived = |project: &str| derived_key(project, 0, 3_600_000_000);
 
         // The status quo, and correct on its own terms: no completed base task
         // covers this slice, so the unit is refused.
@@ -5390,15 +5288,8 @@ mod tests {
     /// shipped, because all 759 tasks predated it.
     #[test]
     fn an_already_queued_derived_unit_can_still_be_told_its_base_tier_exists() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let key = TaskKey {
-            physical_table: "rollup_1h".to_owned(),
-            source: "source".to_owned(),
-            project_id: "p".to_owned(),
-            slice: TimeSlice::new(0, 3_600_000_000).expect("slice"),
-            operation: Operation::DerivedRollup,
-        };
+        let (_dir, mut journal) = new_journal();
+        let key = derived_key("p", 0, 3_600_000_000);
         journal.enqueue(key.clone(), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_none(), "precondition: blocked by the dependency gate");
 
@@ -5424,19 +5315,20 @@ mod tests {
     ///
     /// These three sizes are p50-ish, p75-ish and a small cell; at 64 all three
     /// collapse to band 0.
-    #[test]
-    fn the_benefit_band_separates_cells_at_the_sizes_that_exist() {
-        let band = |files: u32| files / BENEFIT_BUCKET_FILES;
-        assert_ne!(band(35), band(9), "a p50 cell must outrank a nearly-empty one");
-        assert_ne!(band(107), band(35), "p90 must be separable from p50");
-        // ...while staying COARSE. This is not a nicety: `fair_cursors` rotates
-        // projects only among cells that TIE, so a band fine enough to separate
-        // every count makes one cell win every claim. 200 vs 210 must tie —
-        // pinned independently by `sealed_hygiene_ranks_by_files_removed_not_by_date`.
-        assert_eq!(band(200), band(210), "comparable large cells must tie, or rotation dies");
-        assert_eq!(band(35), band(36), "the band must remain coarse enough to tie neighbours");
-        // Honest limit of a LINEAR band at this width: p50 and p75 still tie.
-        assert_eq!(band(35), band(56), "linear banding cannot separate p50 from p75; a ratio band would");
+    ///
+    /// The ties are as load-bearing as the separations: `fair_cursors` rotates
+    /// projects only among cells that TIE, so a band fine enough to separate
+    /// every count makes one cell win every claim (200 vs 210 is pinned
+    /// independently by `sealed_hygiene_ranks_by_files_removed_not_by_date`).
+    /// The p50/p75 tie is the honest limit of a LINEAR band at this width; a
+    /// ratio band would separate them.
+    #[test_case::test_case(35, 9 => false ; "a p50 cell must outrank a nearly-empty one")]
+    #[test_case::test_case(107, 35 => false ; "p90 must be separable from p50")]
+    #[test_case::test_case(200, 210 => true ; "comparable large cells must tie, or rotation dies")]
+    #[test_case::test_case(35, 36 => true ; "the band must remain coarse enough to tie neighbours")]
+    #[test_case::test_case(35, 56 => true ; "linear banding cannot separate p50 from p75; a ratio band would")]
+    fn the_benefit_band_separates_cells_at_the_sizes_that_exist(files: u32, rival_files: u32) -> bool {
+        files / BENEFIT_BUCKET_FILES == rival_files / BENEFIT_BUCKET_FILES
     }
 
     /// `outranked_by` says the ranker could not separate the WORST cell from a
@@ -5449,8 +5341,7 @@ mod tests {
     fn the_hygiene_spread_reports_how_many_cells_the_ranker_cannot_separate() {
         const DAY: i64 = 86_400_000_000;
         let now = 40 * DAY;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // Three cells under the 64-file bucket and one far above it: the shape
         // that makes `benefit` inert for the small ones while still ranking the
         // large one.
@@ -5473,17 +5364,10 @@ mod tests {
     /// wrong models of the queue before this existed.
     #[test]
     fn the_claimability_census_separates_the_reasons_a_task_is_skipped() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         const HOUR: i64 = 3_600_000_000;
         let now = 40 * 24 * HOUR;
-        let at = |project: &str, start: i64| TaskKey {
-            physical_table: "rollup_1h".to_owned(),
-            source: "source".to_owned(),
-            project_id: project.to_owned(),
-            slice: TimeSlice::new(start, start + HOUR).expect("slice"),
-            operation: Operation::DerivedRollup,
-        };
+        let at = |project: &str, start: i64| derived_key(project, start, HOUR);
 
         // Sealed and dependency-blocked: no completed BaseRollup covers it.
         journal.enqueue(at("blocked", now - 10 * 24 * HOUR), 0, 1, 0);
@@ -5532,12 +5416,7 @@ mod tests {
         const HOUR: i64 = 3_600_000_000;
         const DAY: i64 = 24 * HOUR;
         let now = 400 * DAY;
-        let cell = |project: &str, hours_ago: i64, files: u32, operation| {
-            let end = now - hours_ago * HOUR;
-            let mut unit = task(project, end - DAY, end, operation);
-            unit.input = Some(InputFootprint { fp: 1, whole_file_bytes: 1, files });
-            unit
-        };
+        let cell = |project: &str, hours_ago: i64, files: u32, operation| hygiene_cell(project, now - hours_ago * HOUR, files, operation);
         let class = |unit: &MaintenanceTask| super::scheduling_class(unit, now);
 
         // A big older cell beats a small newer one — the reversal.
@@ -5584,11 +5463,7 @@ mod tests {
         // Late morning, so yesterday's slice ended 11 h ago — inside the 24 h
         // frontier window, which is the window the defect lives in.
         let now = 400 * DAY + 11 * HOUR;
-        let cell = |project: &str, start: i64, files: u32, operation| {
-            let mut unit = task(project, start, start + DAY, operation);
-            unit.input = Some(InputFootprint { fp: 1, whole_file_bytes: 1, files });
-            unit
-        };
+        let cell = |project: &str, start: i64, files: u32, operation| hygiene_cell(project, start + DAY, files, operation);
         let yesterday = cell("small", 399 * DAY, 3, Operation::SealedConsolidation);
         let five_days_old = cell("bigdebt", 395 * DAY, 238, Operation::SealedConsolidation);
 
@@ -5645,17 +5520,15 @@ mod tests {
         };
 
         // One cell per day — how hygiene actually runs. Benefit tracks real debt.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut whole = TaskJournal::load(dir.path()).expect("journal");
-        whole.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
-        whole.enqueue_planned(&unit("logs", 3, 0, 1, 964));
-        let first = whole.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
-        assert_eq!(first.key.project_id.as_str(), "logs", "unsplit, the 964-file cell correctly outranks 261");
+        let first = claim_winner(now, Operation::SealedConsolidation, |whole| {
+            whole.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
+            whole.enqueue_planned(&unit("logs", 3, 0, 1, 964));
+        });
+        assert_eq!(first.as_str(), "logs", "unsplit, the 964-file cell correctly outranks 261");
 
         // The same debt, split four ways, now loses to a cell holding a quarter
         // as much — the debt did not change, only its packaging.
-        let dir2 = tempfile::tempdir().expect("temp dir 2");
-        let mut split = TaskJournal::load(dir2.path()).expect("journal");
+        let (_dir, mut split) = new_journal();
         split.enqueue_planned(&unit("metrics", 6, 0, 1, 261));
         for slice in 0..4 {
             split.enqueue_planned(&unit("logs", 3, slice, 4, 964 / 4));
@@ -5693,19 +5566,12 @@ mod tests {
         const HOUR: i64 = 3_600_000_000;
         const DAY: i64 = 24 * HOUR;
         let now = 400 * DAY;
-        let cell = |project: &str, days_ago: i64, files: u32| {
-            let end = now - days_ago * DAY;
-            let mut t = task(project, end - DAY, end, Operation::SealedConsolidation);
-            t.input = Some(InputFootprint::new((0..files).map(|n| format!("{project}/{n}.parquet")), 1));
-            t
-        };
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        journal.enqueue_planned(&cell("biggest-but-young", 1, 433));
-        journal.enqueue_planned(&cell("smaller-but-aged", 3, 238));
-
-        let first = journal.claim_next(Operation::SealedConsolidation, now, true).expect("a claim");
-        assert_eq!(first.key.project_id.as_str(), "smaller-but-aged", "a 238-file cell wins over a 433-file one solely because the bigger one is 1 day old");
+        let cell = |project: &str, days_ago: i64, files: u32| hygiene_cell(project, now - days_ago * DAY, files, Operation::SealedConsolidation);
+        let first = claim_winner(now, Operation::SealedConsolidation, |journal| {
+            journal.enqueue_planned(&cell("biggest-but-young", 1, 433));
+            journal.enqueue_planned(&cell("smaller-but-aged", 3, 238));
+        });
+        assert_eq!(first, "smaller-but-aged", "a 238-file cell wins over a 433-file one solely because the bigger one is 1 day old");
     }
 
     /// the ORDERING and neither reports the winner.
@@ -5720,12 +5586,7 @@ mod tests {
         // footprint it selected on, then hand it to `enqueue_planned`. The old
         // fixture set `input` on a task it `upsert`ed — the one path production
         // does not take — so it passed while prod read `files=0` on every sample.
-        let cell = |project: &str, hours_ago: i64, files: u32| {
-            let end = now - hours_ago * HOUR;
-            let mut unit = task(project, end - DAY, end, Operation::SealedConsolidation);
-            unit.input = Some(InputFootprint::new((0..files).map(|n| format!("{project}/{n}.parquet")), 1));
-            unit
-        };
+        let cell = |project: &str, hours_ago: i64, files: u32| hygiene_cell(project, now - hours_ago * HOUR, files, Operation::SealedConsolidation);
         // The biggest debt sealed only a day ago, so it is NOT in the starvation
         // band; a much smaller cell has been waiting five days and is. `starved`
         // is compared before `benefit`, so the older one legitimately wins and
@@ -5772,8 +5633,7 @@ mod tests {
     /// claim-time footprint breaks the bisect ladder `record_input` documents.
     #[test]
     fn a_planned_footprint_heals_a_pending_cell_and_never_erases_a_measured_one() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let mut unit = task("p", 0, DAY_MICROS, Operation::SealedConsolidation);
 
         // The backlog heal: a cell queued before the planner carried a footprint
@@ -5804,24 +5664,21 @@ mod tests {
         // Age comes from the SLICE, so a case is described by how long ago its
         // day sealed. Anything sealing within 24 h is the live frontier and is
         // class 0 regardless — these are all older than that.
-        let sealed_hours_ago = |project: &str, hours: i64| {
-            let end = now - hours * HOUR;
-            task(project, end - DAY, end, Operation::SealedConsolidation)
-        };
+        let sealed = |project: &str, hours: i64| sealed_class(project, hours, now);
 
         // Inside the overdue threshold: recent sealed days stay newest-first,
         // which is what a dashboard reads.
-        let recent_new = super::scheduling_class(&sealed_hours_ago("a", 30), now);
-        let recent_old = super::scheduling_class(&sealed_hours_ago("b", 60), now);
+        let recent_new = sealed("a", 30);
+        let recent_old = sealed("b", 60);
         assert!(recent_new < recent_old, "among days not yet overdue the newest still leads");
 
         // Past it, a day is backlog and overtakes those recent days.
-        let overdue = super::scheduling_class(&sealed_hours_ago("c", 10 * 24), now);
+        let overdue = sealed("c", 10 * 24);
         assert!(overdue < recent_new, "a day overdue past the threshold overtakes newer sealed work");
 
         // The backlog drains from its OLD end — the half that was missing, and
         // why 2026-08-13 sat at 167 files while seven younger days passed it.
-        let overdue_older = super::scheduling_class(&sealed_hours_ago("d", 30 * 24), now);
+        let overdue_older = sealed("d", 30 * 24);
         assert!(overdue_older < overdue, "a backlog drains oldest-first: the older overdue day leads");
 
         // A day-wide unit still beats a narrow one covering the SAME day, which
@@ -5837,16 +5694,16 @@ mod tests {
         // buys is the FLAT band beneath it: every day inside the goal window
         // ties on age, so `hole`, `-width` and `benefit` decide there, and only
         // the tail the cut-off had abandoned gains rank over them.
-        let ancient = super::scheduling_class(&sealed_hours_ago("f", 60 * 24), now);
+        let ancient = sealed("f", 60 * 24);
         assert!(ancient < recent_new, "past STARVATION_HORIZON_MICROS a day still escalates, it does not fall off");
 
-        let outside_goal_window = super::scheduling_class(&sealed_hours_ago("h", 40 * 24), now);
-        let inside_goal_window = super::scheduling_class(&sealed_hours_ago("i", 25 * 24), now);
+        let outside_goal_window = sealed("h", 40 * 24);
+        let inside_goal_window = sealed("i", 25 * 24);
         assert!(outside_goal_window < inside_goal_window, "a day outside the window is behind in the drain, not beneath it");
         // ...and inside the window age is FLAT, so the terms the band has learned
         // still order it: 25 days and 10 days tie on `starved`.
         let (_, inside_starved, ..) = inside_goal_window;
-        let (_, ten_days_starved, ..) = super::scheduling_class(&sealed_hours_ago("j", 10 * 24), now);
+        let (_, ten_days_starved, ..) = sealed("j", 10 * 24);
         assert_eq!(inside_starved, ten_days_starved, "the goal window is one band: `hole`/`width`/`benefit` order inside it");
 
         // And starvation never lets sealed work outrank the live frontier.
@@ -5871,10 +5728,7 @@ mod tests {
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 800 * DAY;
         // Day-wide, no footprint: width and benefit tie, so only age can order these.
-        let aged = |project: &str, days: i64| {
-            let end = now - days * DAY;
-            super::scheduling_class(&task(project, end - DAY, end, Operation::SealedConsolidation), now)
-        };
+        let aged = |project: &str, days: i64| sealed_class(project, days * 24, now);
 
         assert!(aged("ancient", 71) < aged("recent", 10), "a 71-day-old unit must not rank behind a 10-day-old one");
         assert!(aged("settling", 2) > aged("recent", 10), "the 3-day floor holds: work still settling does not jump the queue");
@@ -5902,48 +5756,31 @@ mod tests {
     /// contiguous days is a contiguity goal.
     #[test]
     fn a_hole_outranks_a_day_that_already_has_tier_output() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
-        let at = |project: &str, day: i64| {
-            let mut t = task(project, day * DAY, day * DAY + DAY, Operation::DerivedRollup);
-            t.key.physical_table = "rollup_1h".to_owned();
-            t.deadline_micros = 0;
-            // Freshly planned, so neither is starved — this test is about
-            // hole-vs-recency, and leaving `created_unix_ms` at 0 would make
-            // both maximally starved and decide the order on age instead.
-            t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
-            t
-        };
+        let at = |project: &str, day: i64| tier_unit(project, "rollup_1h", day * DAY, DAY, now, Operation::DerivedRollup);
         // Both are SEALED and both are overdue, so backlog order applies and the
         // OLDER day leads on age alone. The hole is deliberately put on the
         // NEWER day, so `fills_a_hole` has to beat that ordering rather than
         // merely agree with it — a control that agreed would prove nothing.
-        journal.upsert(at("recent", 35));
-        journal.upsert(at("oldhole", 20));
-        journal.set_base_tier_ready(HashSet::from([
-            ("source".to_owned(), "recent".to_owned(), "1970-02-05".to_owned()),
-            ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
-        ]));
+        let seed = |journal: &mut TaskJournal| {
+            journal.upsert(at("recent", 35));
+            journal.upsert(at("oldhole", 20));
+            journal.set_base_tier_ready(HashSet::from([
+                ("source".to_owned(), "recent".to_owned(), "1970-02-05".to_owned()),
+                ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
+            ]));
+        };
 
         // With no hole information, the older overdue day leads on age.
-        assert_eq!(journal.claim_next(Operation::DerivedRollup, now, true).expect("claim").key.project_id, "oldhole");
+        assert_eq!(claim_winner(now, Operation::DerivedRollup, seed), "oldhole");
 
         // Told which cell is a hole, the hole goes first instead.
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        journal.upsert(at("recent", 35));
-        journal.upsert(at("oldhole", 20));
-        journal.set_base_tier_ready(HashSet::from([
-            ("source".to_owned(), "recent".to_owned(), "1970-02-05".to_owned()),
-            ("source".to_owned(), "oldhole".to_owned(), "1970-01-21".to_owned()),
-        ]));
-        journal.set_tier_holes(HashSet::from([("source".to_owned(), "recent".to_owned(), "rollup_1h".to_owned(), "1970-02-05".to_owned())]));
-        assert_eq!(
-            journal.claim_next(Operation::DerivedRollup, now, true).expect("claim").key.project_id,
-            "recent",
-            "a missing day must outrank an OLDER day that already has output — holes rank above backlog age"
-        );
+        let winner = claim_winner(now, Operation::DerivedRollup, |journal| {
+            seed(journal);
+            journal.set_tier_holes(HashSet::from([("source".to_owned(), "recent".to_owned(), "rollup_1h".to_owned(), "1970-02-05".to_owned())]));
+        });
+        assert_eq!(winner, "recent", "a missing day must outrank an OLDER day that already has output — holes rank above backlog age");
     }
 
     /// A partition still holding UNTAGGED tier files is a hole, whatever else
@@ -5959,16 +5796,9 @@ mod tests {
     /// missing coverage no matter how much output sits beside them.
     #[test]
     fn a_partition_holding_untagged_files_outranks_a_re_derive() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
-        let at = |project: &str, day: i64| {
-            let mut t = task(project, day * DAY, day * DAY + DAY, Operation::BaseRollup);
-            t.key.physical_table = "rollup_1m".to_owned();
-            t.deadline_micros = 0;
-            t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
-            t
-        };
+        let at = |project: &str, day: i64| tier_unit(project, "rollup_1m", day * DAY, DAY, now, Operation::BaseRollup);
         // The damaged cell is deliberately the one that loses every other tie:
         // it is the NEWER day and its project sorts last, so only the untagged
         // rank can put it first.
@@ -5976,18 +5806,13 @@ mod tests {
             journal.upsert(at("aaa-clean", 20));
             journal.upsert(at("zzz-damaged", 35));
         };
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
-        assert_eq!(journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id, "aaa-clean");
+        assert_eq!(claim_winner(now, Operation::BaseRollup, seed), "aaa-clean");
 
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
-        journal.set_untagged_cells("source", "rollup_1m", [("zzz-damaged".to_owned(), "1970-02-05".to_owned())]);
-        assert_eq!(
-            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
-            "zzz-damaged",
-            "a partition holding unretirable untagged files must outrank a day that is merely being re-derived"
-        );
+        let winner = claim_winner(now, Operation::BaseRollup, |journal| {
+            seed(journal);
+            journal.set_untagged_cells("source", "rollup_1m", [("zzz-damaged".to_owned(), "1970-02-05".to_owned())]);
+        });
+        assert_eq!(winner, "zzz-damaged", "a partition holding unretirable untagged files must outrank a day that is merely being re-derived");
     }
 
     /// Damage repair leads a missing day, which leads a re-derive.
@@ -5998,39 +5823,24 @@ mod tests {
     /// rank with. That is why the damaged cells drained at ~2.4 files/hour.
     #[test]
     fn damage_outranks_a_missing_day_which_outranks_a_re_derive() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
         // The damaged unit is deliberately the NARROWEST and the newest, so it
         // loses every other tiebreak and only the rank can put it first.
         let seed = |journal: &mut TaskJournal| {
-            let mut narrow = task("damaged", 35 * DAY, 35 * DAY + 600_000_000, Operation::BaseRollup);
-            narrow.key.physical_table = "rollup_1m".to_owned();
-            narrow.deadline_micros = 0;
-            narrow.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
-            let mut wide_hole = task("missing", 20 * DAY, 21 * DAY, Operation::BaseRollup);
-            wide_hole.key.physical_table = "rollup_1m".to_owned();
-            wide_hole.deadline_micros = 0;
-            wide_hole.created_unix_ms = narrow.created_unix_ms;
-            journal.upsert(narrow);
-            journal.upsert(wide_hole);
+            journal.upsert(tier_unit("damaged", "rollup_1m", 35 * DAY, 600_000_000, now, Operation::BaseRollup));
+            journal.upsert(tier_unit("missing", "rollup_1m", 20 * DAY, DAY, now, Operation::BaseRollup));
             journal.set_tier_holes(HashSet::from([("source".to_owned(), "missing".to_owned(), "rollup_1m".to_owned(), "1970-01-21".to_owned())]));
         };
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
 
         // Sharing one rank, the day-wide hole wins on width — the old behaviour.
-        assert_eq!(journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id, "missing");
+        assert_eq!(claim_winner(now, Operation::BaseRollup, seed), "missing");
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
-        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-02-05".to_owned())]);
-        assert_eq!(
-            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
-            "damaged",
-            "a ten-minute damage repair must outrank a day-wide backfill hole"
-        );
+        let winner = claim_winner(now, Operation::BaseRollup, |journal| {
+            seed(journal);
+            journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-02-05".to_owned())]);
+        });
+        assert_eq!(winner, "damaged", "a ten-minute damage repair must outrank a day-wide backfill hole");
     }
 
     /// Coarsening must not eat a damage repair.
@@ -6044,30 +5854,21 @@ mod tests {
     /// on either side of the hole. Five such cells sat at 3-11 minutes all day.
     #[test]
     fn coarsening_leaves_damage_repairs_alone() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
-        let unit = |project: &str, start: i64, width: i64| {
-            let mut t = task(project, start, start + width, Operation::BaseRollup);
-            t.key.physical_table = "rollup_1m".to_owned();
-            t.deadline_micros = 0;
-            t.estimated_decoded_bytes = 1;
-            t.created_unix_ms = 0;
-            t
-        };
         // Two narrow sealed units in the same bucket, in different cells: the
         // ordinary one is fair game to fuse, the damaged one is not.
         let seed = |journal: &mut TaskJournal| {
-            journal.upsert(unit("ordinary", 10 * DAY, 300_000_000));
-            journal.upsert(unit("ordinary", 10 * DAY + 600_000_000, 300_000_000));
-            journal.upsert(unit("damaged", 10 * DAY, 300_000_000));
-            journal.upsert(unit("damaged", 10 * DAY + 600_000_000, 300_000_000));
+            for project in ["ordinary", "damaged"] {
+                journal.upsert(coarsenable_unit(project, 10 * DAY, 300_000_000));
+                journal.upsert(coarsenable_unit(project, 10 * DAY + 600_000_000, 300_000_000));
+            }
         };
         let survives = |journal: &TaskJournal, project: &str| {
             journal.tasks().filter(|task| task.key.project_id == project && task.key.slice.width() == 300_000_000).count()
         };
 
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         seed(&mut journal);
         journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-01-11".to_owned())]);
         journal.coarsen_sealed_slices(now);
@@ -6084,22 +5885,14 @@ mod tests {
     /// hole of 18:00-18:11.
     #[test]
     fn subsumption_leaves_damage_repairs_alone() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
-        let unit = |project: &str, start: i64, width: i64| {
-            let mut t = task(project, start, start + width, Operation::BaseRollup);
-            t.key.physical_table = "rollup_1m".to_owned();
-            t.deadline_micros = 0;
-            t.estimated_decoded_bytes = 1;
-            t
-        };
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // A narrow repair inside a much wider pending unit for the same cell —
         // exactly what subsumption exists to delete.
         for project in ["damaged", "ordinary"] {
-            journal.upsert(unit(project, 10 * DAY, DAY));
-            journal.upsert(unit(project, 10 * DAY + 600_000_000, 300_000_000));
+            journal.upsert(coarsenable_unit(project, 10 * DAY, DAY));
+            journal.upsert(coarsenable_unit(project, 10 * DAY + 600_000_000, 300_000_000));
         }
         journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-01-11".to_owned())]);
         journal.coarsen_sealed_slices(now);
@@ -6120,17 +5913,10 @@ mod tests {
     /// rank group so `fair_cursors` rotates across projects.
     #[test]
     fn damage_rotates_across_cells_instead_of_draining_one() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
-        let unit = |project: &str, start: i64, width: i64| {
-            let mut t = task(project, start, start + width, Operation::BaseRollup);
-            t.key.physical_table = "rollup_1m".to_owned();
-            t.deadline_micros = 0;
-            t.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
-            t
-        };
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let unit = |project: &str, start: i64, width: i64| tier_unit(project, "rollup_1m", start, width, now, Operation::BaseRollup);
+        let (_dir, mut journal) = new_journal();
         // A whale ladder of very narrow children, and ONE other cell holding a
         // slightly wider hole — the prod shape exactly.
         for minute in 0..6 {
@@ -6152,20 +5938,11 @@ mod tests {
     /// only worth anything if the restored entries rank identically.
     #[test]
     fn a_restored_untagged_cell_ranks_like_a_discovered_one() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let mut damaged = task("zzz-damaged", 35 * DAY, 35 * DAY + 600_000_000, Operation::BaseRollup);
-        damaged.key.physical_table = "rollup_1m".to_owned();
-        damaged.deadline_micros = 0;
-        damaged.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
-        let mut clean = task("aaa-clean", 20 * DAY, 21 * DAY, Operation::BaseRollup);
-        clean.key.physical_table = "rollup_1m".to_owned();
-        clean.deadline_micros = 0;
-        clean.created_unix_ms = damaged.created_unix_ms;
-        journal.upsert(damaged);
-        journal.upsert(clean);
+        let (_dir, mut journal) = new_journal();
+        journal.upsert(tier_unit("zzz-damaged", "rollup_1m", 35 * DAY, 600_000_000, now, Operation::BaseRollup));
+        journal.upsert(tier_unit("aaa-clean", "rollup_1m", 20 * DAY, DAY, now, Operation::BaseRollup));
         // Restored from the sidecar rather than set by a recovery pass.
         journal.restore_untagged_cells([("source".to_owned(), "zzz-damaged".to_owned(), "rollup_1m".to_owned(), "1970-02-05".to_owned())]);
         assert_eq!(journal.untagged_cells().count(), 1, "the restored cell must be readable back for persisting");
@@ -6192,40 +5969,25 @@ mod tests {
     /// alone and the damage flag proved nothing.
     #[test]
     fn damage_outranks_work_inside_the_starvation_window() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAY: i64 = 24 * 3_600_000_000;
         let now = 40 * DAY;
         let seed = |journal: &mut TaskJournal| {
             // Two days sealed: under the floor, so it loses to anything in the
             // band — and past LIVE_FRONTIER_WINDOW_MICROS, so still class 1.
-            let mut settling = task("damaged", 37 * DAY, 38 * DAY, Operation::BaseRollup);
-            settling.key.physical_table = "rollup_1m".to_owned();
-            settling.deadline_micros = 0;
-            settling.created_unix_ms = u64::try_from(now.div_euclid(1_000)).unwrap_or_default();
-            let mut inside = task("recent", 30 * DAY, 31 * DAY, Operation::BaseRollup);
-            inside.key.physical_table = "rollup_1m".to_owned();
-            inside.deadline_micros = 0;
-            inside.created_unix_ms = settling.created_unix_ms;
-            journal.upsert(settling);
-            journal.upsert(inside);
+            journal.upsert(tier_unit("damaged", "rollup_1m", 37 * DAY, DAY, now, Operation::BaseRollup));
+            journal.upsert(tier_unit("recent", "rollup_1m", 30 * DAY, DAY, now, Operation::BaseRollup));
         };
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
         assert_eq!(
-            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
+            claim_winner(now, Operation::BaseRollup, seed),
             "recent",
             "control: work inside the starvation window leads work still settling under the floor"
         );
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        seed(&mut journal);
-        journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-02-07".to_owned())]);
-        assert_eq!(
-            journal.claim_next(Operation::BaseRollup, now, true).expect("claim").key.project_id,
-            "damaged",
-            "a damaged cell the age ordering ranks last must still lead, or it is unreachable"
-        );
+        let winner = claim_winner(now, Operation::BaseRollup, |journal| {
+            seed(journal);
+            journal.set_untagged_cells("source", "rollup_1m", [("damaged".to_owned(), "1970-02-07".to_owned())]);
+        });
+        assert_eq!(winner, "damaged", "a damaged cell the age ordering ranks last must still lead, or it is unreachable");
     }
 
     /// Each (source, tier) owns its own slice of the untagged set.
@@ -6236,8 +5998,7 @@ mod tests {
     /// (`base_tier_ready=374` then `272`, each wiping the other).
     #[test]
     fn setting_untagged_cells_replaces_only_that_sources_tier() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         journal.set_untagged_cells("logs", "logs_1m", [("p".to_owned(), "2026-08-19".to_owned())]);
         journal.set_untagged_cells("metrics", "metrics_1m", [("p".to_owned(), "2026-08-19".to_owned())]);
         assert_eq!(journal.untagged_cells_len(), 2, "a second source must not wipe the first");
@@ -6255,16 +6016,9 @@ mod tests {
     /// about, so keying on it cannot miss a task.
     #[test]
     fn the_base_tier_ready_set_unblocks_derived_work_of_any_width() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         const HOUR: i64 = 3_600_000_000;
-        let at = |start: i64, width: i64| TaskKey {
-            physical_table: "rollup_1h".to_owned(),
-            source: "source".to_owned(),
-            project_id: "p".to_owned(),
-            slice: TimeSlice::new(start, start + width).expect("slice"),
-            operation: Operation::DerivedRollup,
-        };
+        let at = |start: i64, width: i64| derived_key("p", start, width);
         // An hour-wide task and a day-wide one, both inside 1970-01-01.
         journal.enqueue(at(0, HOUR), 0, 1, 0);
         journal.enqueue(at(5 * HOUR, HOUR), 0, 1, 0);
@@ -6296,17 +6050,10 @@ mod tests {
     /// every one vetoed as already-queued, and the proof had never fired once.
     #[test]
     fn the_proof_reaches_hour_wide_tasks_under_a_completed_day_unit() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         const HOUR: i64 = 3_600_000_000;
         const DAY: i64 = 24 * HOUR;
-        let at = |start: i64, width: i64| TaskKey {
-            physical_table: "rollup_1h".to_owned(),
-            source: "source".to_owned(),
-            project_id: "p".to_owned(),
-            slice: TimeSlice::new(start, start + width).expect("slice"),
-            operation: Operation::DerivedRollup,
-        };
+        let at = |start: i64, width: i64| derived_key("p", start, width);
 
         // The legacy rows=0 publication: a COMPLETE day-wide unit.
         let day_unit = at(0, DAY);
@@ -6330,15 +6077,8 @@ mod tests {
     /// silence is not evidence that coverage stopped existing.
     #[test]
     fn a_proven_base_tier_is_not_forgotten_by_a_later_enqueue() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let key = TaskKey {
-            physical_table: "rollup_1h".to_owned(),
-            source: "source".to_owned(),
-            project_id: "p".to_owned(),
-            slice: TimeSlice::new(0, 3_600_000_000).expect("slice"),
-            operation: Operation::DerivedRollup,
-        };
+        let (_dir, mut journal) = new_journal();
+        let key = derived_key("p", 0, 3_600_000_000);
         journal.enqueue_with_base_tier(key.clone(), 0, 1, 0, true);
         journal.enqueue(key.clone(), 0, 1, 0);
         assert!(journal.claim_next(Operation::DerivedRollup, 0, true).is_some(), "a later uninformed enqueue must not clear the proof");
@@ -6356,25 +6096,15 @@ mod tests {
     /// They had failed while their base-tier dependency was unprovable, which
     /// #197/#202 then fixed — stale evidence about a condition that no longer
     /// existed.
-    #[test]
-    fn only_a_worker_verdict_quarantines_a_unit() {
-        let mut over = task("p", 0, MIN_SLICE_MICROS, Operation::DerivedRollup);
-        over.attempts = TaskJournal::QUARANTINE_ATTEMPTS + 3;
-
-        // Handed back for a reason that says nothing about cost.
-        over.retry_reason = Some("source_not_flushed".to_owned());
-        assert!(!TaskJournal::is_quarantined(&over), "a dependency-shaped failure is not evidence about cost");
-        over.retry_reason = None;
-        assert!(!TaskJournal::is_quarantined(&over), "no recorded reason is not evidence either");
-
-        // The worker's own verdict, which IS about cost.
-        over.retry_reason = Some(TaskJournal::WORKER_FAILURE_REASON.to_owned());
-        assert!(TaskJournal::is_quarantined(&over), "a unit the worker gave back, repeatedly, is quarantined");
-
-        // One such failure is still a blip, not proof.
-        let mut once = over.clone();
-        once.attempts = 1;
-        assert!(!TaskJournal::is_quarantined(&once), "a single worker failure is a blip");
+    #[test_case::test_case(TaskJournal::QUARANTINE_ATTEMPTS + 3, Some("source_not_flushed") => false ; "a dependency-shaped failure is not evidence about cost")]
+    #[test_case::test_case(TaskJournal::QUARANTINE_ATTEMPTS + 3, None => false ; "no recorded reason is not evidence either")]
+    #[test_case::test_case(TaskJournal::QUARANTINE_ATTEMPTS + 3, Some(TaskJournal::WORKER_FAILURE_REASON) => true ; "a unit the worker gave back, repeatedly, is quarantined")]
+    #[test_case::test_case(1, Some(TaskJournal::WORKER_FAILURE_REASON) => false ; "a single worker failure is still a blip, not proof")]
+    fn only_a_worker_verdict_quarantines_a_unit(attempts: u32, retry_reason: Option<&str>) -> bool {
+        let mut unit = task("p", 0, MIN_SLICE_MICROS, Operation::DerivedRollup);
+        unit.attempts = attempts;
+        unit.retry_reason = retry_reason.map(str::to_owned);
+        TaskJournal::is_quarantined(&unit)
     }
 
     /// A unit that has proven it cannot fit its deadline must not be able to
@@ -6393,8 +6123,7 @@ mod tests {
     /// measured the same day) — it doubles the number of units paying it.
     #[test]
     fn a_unit_that_cannot_fit_its_deadline_does_not_crowd_out_one_that_can() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // Two units, identical but for their history. The doomed one sorts
         // FIRST on every tiebreak in `claim_next` (project id, then key), so a
         // scheduler blind to attempts is guaranteed to pick it.
@@ -6445,8 +6174,7 @@ mod tests {
     /// not.
     #[test]
     fn a_footprintless_shred_fuses_once_the_partition_ceiling_is_known() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
@@ -6488,8 +6216,7 @@ mod tests {
     /// and every candidate refused on a number written before the fix existed.
     #[test]
     fn clearing_stale_estimates_runs_once_and_lets_a_split_day_fuse_again() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
@@ -6546,6 +6273,37 @@ mod tests {
         assert_eq!(live, 1, "the collapse must survive the reload; got {live} units back");
     }
 
+    /// Enqueues `count` contiguous `width`-wide units from `start`, each priced
+    /// at `bytes` — the shape the live path mints for a sealed day.
+    fn enqueue_run(journal: &mut TaskJournal, project: &str, start: i64, width: i64, count: i64, bytes: u64, operation: Operation) {
+        for slot in 0..count {
+            let at = start + slot * width;
+            journal.enqueue(task(project, at, at + width, operation).key, 0, bytes, 0);
+        }
+    }
+
+    /// Widths of `project`'s pending units whose slice starts inside `day`.
+    fn pending_widths(journal: &TaskJournal, project: &str, day: i64) -> Vec<i64> {
+        journal
+            .tasks()
+            .filter(|t| {
+                t.state == TaskState::Pending
+                    && t.key.project_id == project
+                    && t.key.slice.start_micros >= day * DAY_MICROS
+                    && t.key.slice.start_micros < (day + 1) * DAY_MICROS
+            })
+            .map(|t| t.key.slice.width())
+            .collect()
+    }
+
+    /// Enqueues a unit and stamps it with the file set it reads, which is what
+    /// lets fusion price a group of children as one scan.
+    fn enqueue_with_input(journal: &mut TaskJournal, key: &TaskKey, bytes: u64, input: InputFootprint) {
+        journal.enqueue(key.clone(), 0, bytes, 0);
+        let index = journal.task_indices[key];
+        journal.snapshot.tasks[index].input = Some(input);
+    }
+
     /// Derived hygiene work is never persisted; durable work always is.
     ///
     /// `plan_compaction_debt` scans the real file list every 60 s and mints
@@ -6559,17 +6317,15 @@ mod tests {
     /// output before committing, and losing one means redoing 12-15 minutes.
     #[test]
     fn derived_hygiene_is_not_persisted_but_durable_work_is() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let (dir, mut journal) = new_journal();
         let day = 3 * DAY_MICROS;
         let of = |operation| task("p", day, day + DAY_MICROS, operation).key;
-        {
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
-            for operation in [Operation::HotPacking, Operation::SealedConsolidation, Operation::Repair, Operation::BaseRollup] {
-                journal.enqueue(of(operation), 0, 16, 0);
-            }
-            assert_eq!(journal.tasks().count(), 4, "all four exist in memory");
-            journal.checkpoint().expect("persist");
+        for operation in [Operation::HotPacking, Operation::SealedConsolidation, Operation::Repair, Operation::BaseRollup] {
+            journal.enqueue(of(operation), 0, 16, 0);
         }
+        assert_eq!(journal.tasks().count(), 4, "all four exist in memory");
+        journal.checkpoint().expect("persist");
+        drop(journal);
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         let survived: Vec<_> = reloaded.tasks().map(|t| t.key.operation).collect();
         assert!(survived.contains(&Operation::Repair), "Repair must survive: it stages output before committing");
@@ -6593,19 +6349,14 @@ mod tests {
     /// pins the cheap path, because the cheap path is the one callers reach for.
     #[test]
     fn a_removal_survives_a_reload_without_compacting() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let (dir, mut journal) = new_journal();
         let day = 3 * DAY_MICROS;
-        {
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
-            for slot in 0..6 {
-                let start = day + slot * NORMAL_SLICE_MICROS;
-                journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
-            }
-            journal.checkpoint().expect("persist the slices");
-            let dropped = journal.retain_tasks(|t| t.key.slice.start_micros != day);
-            assert_eq!(dropped, 1, "exactly one unit should have been dropped");
-            journal.checkpoint().expect("persist the REMOVAL — no compact");
-        }
+        enqueue_run(&mut journal, "p", day, NORMAL_SLICE_MICROS, 6, 16, Operation::BaseRollup);
+        journal.checkpoint().expect("persist the slices");
+        let dropped = journal.retain_tasks(|t| t.key.slice.start_micros != day);
+        assert_eq!(dropped, 1, "exactly one unit should have been dropped");
+        journal.checkpoint().expect("persist the REMOVAL — no compact");
+        drop(journal);
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         assert_eq!(reloaded.tasks().count(), 5, "the removal must survive; a tombstone-less WAL replays all 6");
         assert!(!reloaded.tasks().any(|t| t.key.slice.start_micros == day), "the removed unit specifically must be gone, not merely some unit");
@@ -6619,17 +6370,15 @@ mod tests {
     /// won, the pass would delete the very unit it exists to create.
     #[test]
     fn a_task_recreated_after_removal_survives_the_reload() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let (dir, mut journal) = new_journal();
         let day = 3 * DAY_MICROS;
         let key = task("p", day, day + NORMAL_SLICE_MICROS, Operation::BaseRollup).key;
-        {
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
-            journal.enqueue(key.clone(), 0, 16, 0);
-            journal.checkpoint().expect("persist");
-            journal.retain_tasks(|t| t.key != key);
-            journal.enqueue(key.clone(), 0, 32, 0);
-            journal.checkpoint().expect("persist both the removal and the re-creation");
-        }
+        journal.enqueue(key.clone(), 0, 16, 0);
+        journal.checkpoint().expect("persist");
+        journal.retain_tasks(|t| t.key != key);
+        journal.enqueue(key.clone(), 0, 32, 0);
+        journal.checkpoint().expect("persist both the removal and the re-creation");
+        drop(journal);
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         assert_eq!(reloaded.tasks().count(), 1, "the re-created task must be present exactly once");
         assert_eq!(reloaded.state(&key), Some(TaskState::Pending));
@@ -6649,8 +6398,7 @@ mod tests {
     /// planned day-wide and never fused; the two that fuse were the two starving.
     #[test]
     fn a_fused_unit_inherits_the_age_of_the_work_it_replaces() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
         // Members created five days ago, in milliseconds.
@@ -6684,15 +6432,11 @@ mod tests {
     /// real (project, date) cells, ~339 queued units each.
     #[test]
     fn a_pending_day_unit_subsumes_the_ten_minute_units_inside_it() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
-        for slot in 0..(DAY_MICROS / NORMAL_SLICE_MICROS) {
-            let start = day + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 16, 0);
-        }
+        enqueue_run(&mut journal, "p", day, NORMAL_SLICE_MICROS, DAY_MICROS / NORMAL_SLICE_MICROS, 16, Operation::BaseRollup);
         journal.enqueue(task("p", day, day + DAY_MICROS, Operation::BaseRollup).key, 0, 16, 0);
         assert_eq!(journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup).count(), 145, "144 slices plus the day unit");
 
@@ -6715,8 +6459,7 @@ mod tests {
     /// pass exists to remove.
     #[test]
     fn a_superseded_day_unit_does_not_subsume_the_children_that_replaced_it() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
@@ -6742,8 +6485,7 @@ mod tests {
     /// slice exists — and dropping it would lose that rebuild silently.
     #[test]
     fn a_complete_day_unit_does_not_subsume_a_later_invalidation() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let day = 3 * DAY_MICROS;
 
@@ -6778,17 +6520,13 @@ mod tests {
     /// "scan it 144 times".
     #[test]
     fn a_day_over_the_decode_budget_lands_at_a_narrower_width_not_at_ten_minutes() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
 
         // One sealed day of ten-minute slices whose summed estimate busts the
         // day budget but leaves each six-hour quarter comfortably inside it.
         let per_slice = MAX_DECODED_BYTES / 96;
-        for slot in 0..(DAY_MICROS / NORMAL_SLICE_MICROS) {
-            let start = 3 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, per_slice, 0);
-        }
+        enqueue_run(&mut journal, "p", 3 * DAY_MICROS, NORMAL_SLICE_MICROS, DAY_MICROS / NORMAL_SLICE_MICROS, per_slice, Operation::BaseRollup);
         let minted = journal.tasks().filter(|t| t.key.operation == Operation::BaseRollup).count();
         assert_eq!(minted, 144, "the live path mints one unit per ten-minute slice");
 
@@ -6817,21 +6555,13 @@ mod tests {
     /// would split, coarsen, split, forever.
     #[test]
     fn a_sealed_days_fine_slices_collapse_but_never_undo_a_split() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
 
         // Day 3: ten-minute leftovers, nothing coarse above them.
-        for slot in 0..6 {
-            let start = 3 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 10, 0);
-        }
+        enqueue_run(&mut journal, "p", 3 * DAY_MICROS, NORMAL_SLICE_MICROS, 6, 10, Operation::BaseRollup);
         // Day 5: same, but its day unit was already split into these children.
-        for slot in 0..6 {
-            let start = 5 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 10, 0);
-        }
+        enqueue_run(&mut journal, "p", 5 * DAY_MICROS, NORMAL_SLICE_MICROS, 6, 10, Operation::BaseRollup);
         let parent = task("p", 5 * DAY_MICROS, 6 * DAY_MICROS, Operation::BaseRollup).key;
         journal.enqueue(parent.clone(), 0, 0, 0);
         journal.split_time_task(&parent, MAX_DECODED_BYTES.saturating_add(1), None);
@@ -6840,57 +6570,17 @@ mod tests {
         let collapsed = journal.coarsen_sealed_slices(now);
         assert!(collapsed >= 6, "day 3's leftovers must collapse, got {collapsed}");
 
-        let widths = |day: i64| {
-            journal
-                .tasks()
-                .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= day * DAY_MICROS && t.key.slice.start_micros < (day + 1) * DAY_MICROS)
-                .map(|t| t.key.slice.width())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(widths(3), vec![DAY_MICROS], "day 3 is now exactly one day-sized unit");
-        assert!(
-            widths(5).iter().all(|w| *w < DAY_MICROS),
-            "day 5 already had a day unit that was SPLIT; recreating it would loop forever, got {:?}",
-            widths(5)
-        );
+        let day_five = pending_widths(&journal, "p", 5);
+        assert_eq!(pending_widths(&journal, "p", 3), vec![DAY_MICROS], "day 3 is now exactly one day-sized unit");
+        assert!(day_five.iter().all(|w| *w < DAY_MICROS), "day 5 already had a day unit that was SPLIT; recreating it would loop forever, got {day_five:?}");
     }
 
-    /// Among sealed work, a day-sized unit outranks yesterday's ten-minute
-    /// leftovers even though those are newer.
-    ///
-    /// Day-sized units come from the backfill planner and are the only kind
-    /// that advances the rollup horizon. Ten-minute units are what the live
-    /// path mints, and a day that has just sealed carries ~144 of them per
-    /// project per tier. Ordering sealed work newest-first alone therefore
-    /// grinds all of yesterday before reaching the day before — and midnight
-    /// mints a fresh day's worth, so the horizon can never move.
-    ///
-    /// Prod 2026-08-17, 65 rollup starts in 25 minutes: 46 on today, 18 on
-    /// yesterday, ZERO on any older day, while 7d/14d queries were refused for
-    /// want of exactly those older days.
-    /// The sealed reservation is affordable only while the frontier keeps up.
-    ///
-    /// It exists because strict class-0 priority let the frontier take ~90% of
-    /// claims and froze rollup coverage. But frontier lag is a per-query cost —
-    /// `raw_tail_duration_secs` is `FINALIZATION_DELAY + lag` and every hybrid
-    /// query scans that tail — and prod 2026-08-17 reached 62 minutes of it.
-    /// So the reservation yields while the frontier is behind, and returns on
-    /// its own once it is not.
-    /// Coarsening must not build a day unit that cannot finish. One day unit doing
-    /// one full-day scan beats 144 slices each doing the same scan — but only if
-    /// it completes. A day over the decode budget publishes nothing and times out
-    /// repeatedly, which is strictly worse than the slices it replaced.
-    ///
-    /// Measured after #178: BaseRollup timed out at 900s for the first time (4 in
-    /// a 10-minute window) and rollup output collapsed from ~9,000 rows/min to 10.
-    /// The fix is only reachable if it can claim the units it is for.
     /// `attempts >= 2` quarantines a unit and floors its backoff at the
     /// operation deadline, so prod's 432 `worker_error` repair units would
     /// otherwise have drained through ~2 slots at an hour each.
     #[test]
     fn the_repair_migration_unquarantines_the_queue_it_is_for() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let mut wedged = task("p", 0, DAY_MICROS, Operation::Repair);
         wedged.attempts = 100;
         wedged.state = TaskState::Retry;
@@ -6913,8 +6603,7 @@ mod tests {
 
         // A journal with no repair queue must not spend the cursor, or a boot
         // that precedes the queue consumes the one shot.
-        let empty = tempfile::tempdir().expect("temp dir");
-        let mut fresh = TaskJournal::load(empty.path()).expect("journal");
+        let (_empty, mut fresh) = new_journal();
         assert_eq!(fresh.reset_repair_attempts(), None, "nothing to forgive, nothing spent");
         fresh.upsert(task("p", 0, DAY_MICROS, Operation::Repair));
         assert_eq!(fresh.reset_repair_attempts(), Some(1), "and the cursor is still available when the queue arrives");
@@ -6943,8 +6632,10 @@ mod tests {
         // Three quarters full.
         let ceiling = super::occupancy_scaled_ceiling(CAPACITY / 4, CAPACITY);
         assert!(ceiling < MAX_DECODED_BYTES, "a busy pool must refuse a max-size unit");
-        assert!(ceiling >= MAX_DECODED_BYTES / 16, "and still admit a small one");
-        assert!(MAX_DECODED_BYTES / 16 <= ceiling, "a hygiene-sized unit must fit under the ceiling of a busy pool, or the fleet hot-loops on admission");
+        assert!(
+            ceiling >= MAX_DECODED_BYTES / 16,
+            "and still admit a small one: a hygiene-sized unit must fit under the ceiling of a busy pool, or the fleet hot-loops on admission"
+        );
     }
 
     /// REPRODUCES the 2026-09-02 lockout: a unit priced at exactly
@@ -7003,36 +6694,27 @@ mod tests {
     /// coarsening pass: `candidates=7452 fused=0 over_budget=6967`.
     #[test]
     fn a_partition_priced_group_fuses_even_when_the_partition_is_large() {
-        const DAY: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
         // A day shredded into ten-minute slices, each modelled at a fraction of
         // a partition that is far bigger than MAX_DECODED_BYTES.
-        for slot in 0..24 {
-            let start = DAY + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::Dedup).key, 0, MAX_DECODED_BYTES / 2, 0);
-        }
+        let shredded_day = |operation| {
+            let (dir, mut journal) = new_journal();
+            enqueue_run(&mut journal, "p", DAY_MICROS, NORMAL_SLICE_MICROS, 24, MAX_DECODED_BYTES / 2, operation);
+            (dir, journal)
+        };
+        let (_dir, mut journal) = shredded_day(Operation::Dedup);
         let big_partition = MAX_DECODED_BYTES * 20;
 
         // The exemption is dedup's alone until the rollup runner is shown to
         // honour `hash_shard` — see `the_partition_ceiling_does_not_fuse_a_genuinely_oversized_day`.
-        let mut rollup = TaskJournal::load(tempfile::tempdir().expect("dir").path()).expect("journal");
-        for slot in 0..24 {
-            let start = DAY + slot * NORMAL_SLICE_MICROS;
-            rollup.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, MAX_DECODED_BYTES / 2, 0);
-        }
-        assert_eq!(rollup.coarsen_sealed_slices_capped(10 * DAY, &|_, _, _| Some(big_partition)).fused, 0, "rollup keeps the old rule");
+        let (_rollup_dir, mut rollup) = shredded_day(Operation::BaseRollup);
+        assert_eq!(rollup.coarsen_sealed_slices_capped(10 * DAY_MICROS, &|_, _, _| Some(big_partition)).fused, 0, "rollup keeps the old rule");
 
         // Without storage access the old rule stands — the price is a sum over
         // files that might not overlap.
-        let mut blind = TaskJournal::load(tempfile::tempdir().expect("dir").path()).expect("journal");
-        for slot in 0..24 {
-            let start = DAY + slot * NORMAL_SLICE_MICROS;
-            blind.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::Dedup).key, 0, MAX_DECODED_BYTES / 2, 0);
-        }
-        assert_eq!(blind.coarsen_sealed_slices_capped(10 * DAY, &|_, _, _| None).fused, 0, "a sum over unknown files must still be refused");
+        let (_blind_dir, mut blind) = shredded_day(Operation::Dedup);
+        assert_eq!(blind.coarsen_sealed_slices_capped(10 * DAY_MICROS, &|_, _, _| None).fused, 0, "a sum over unknown files must still be refused");
 
-        let report = journal.coarsen_sealed_slices_capped(10 * DAY, &|_, _, _| Some(big_partition));
+        let report = journal.coarsen_sealed_slices_capped(10 * DAY_MICROS, &|_, _, _| Some(big_partition));
         assert!(report.fused > 0, "a group known to share one partition must fuse: {report:?}");
         assert_eq!(report.over_budget, 0, "and must not be counted against the decode budget it cannot honour");
     }
@@ -7080,9 +6762,7 @@ mod tests {
     /// 0.38h widths across four dates, every one of them `worker_error`.
     #[test]
     fn a_repair_unit_is_never_bisected_because_its_cost_is_a_whole_file() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let repair = task("p", DAY_MICROS, DAY_MICROS + DAY_MICROS, Operation::Repair).key;
         journal.enqueue(repair.clone(), 0, MAX_DECODED_BYTES, 0);
         let before = journal.snapshot.tasks.len();
@@ -7097,14 +6777,12 @@ mod tests {
     #[test_case::test_case(Operation::BaseRollup, "schema_error")]
     #[test_case::test_case(Operation::DerivedRollup, "source_not_flushed")]
     fn coarsening_preserves_retry_state(operation: Operation, reason: &str) {
-        const DAY: i64 = 86_400_000_000;
-        let now = 10 * DAY;
+        let now = 10 * DAY_MICROS;
         for deadline in [now - 1, now + 60_000_000] {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
-            let retry = task("p", DAY, DAY + NORMAL_SLICE_MICROS, operation).key;
-            let neighbour = task("p", DAY + NORMAL_SLICE_MICROS, DAY + 2 * NORMAL_SLICE_MICROS, operation).key;
-            let other = task("q", DAY, DAY + NORMAL_SLICE_MICROS, operation).key;
+            let (dir, mut journal) = new_journal();
+            let retry = task("p", DAY_MICROS, DAY_MICROS + NORMAL_SLICE_MICROS, operation).key;
+            let neighbour = task("p", DAY_MICROS + NORMAL_SLICE_MICROS, DAY_MICROS + 2 * NORMAL_SLICE_MICROS, operation).key;
+            let other = task("q", DAY_MICROS, DAY_MICROS + NORMAL_SLICE_MICROS, operation).key;
             for key in [&retry, &neighbour, &other] {
                 journal.enqueue(key.clone(), 0, 1, 0);
             }
@@ -7127,7 +6805,7 @@ mod tests {
                 "coarsening must not bypass the retry through a covering parent"
             );
             // A wider unit queued independently must not erase the retry either.
-            let parent = task("p", DAY, 2 * DAY, operation).key;
+            let parent = task("p", DAY_MICROS, 2 * DAY_MICROS, operation).key;
             journal.enqueue(parent, 0, 1, 0);
             journal.coarsen_sealed_slices(now);
             let retained = journal.tasks().find(|t| t.key == retry).expect("subsumption must retain the retry");
@@ -7138,43 +6816,30 @@ mod tests {
         }
     }
 
+    /// Coarsening must not build a day unit that cannot finish. One day unit doing
+    /// one full-day scan beats 144 slices each doing the same scan — but only if
+    /// it completes. A day over the decode budget publishes nothing and times out
+    /// repeatedly, which is strictly worse than the slices it replaced.
+    ///
+    /// Measured after #178: BaseRollup timed out at 900s for the first time (4 in
+    /// a 10-minute window) and rollup output collapsed from ~9,000 rows/min to 10.
+    /// The fix is only reachable if it can claim the units it is for.
     #[test]
     fn coarsening_skips_a_day_that_would_not_fit_the_decode_budget() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
 
         // Day 1: six slices whose combined estimate fits comfortably. Must fuse.
-        let small = MAX_DECODED_BYTES / 12;
-        for slot in 0..6 {
-            let start = DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, small, 0);
-        }
+        enqueue_run(&mut journal, "p", DAY_MICROS, NORMAL_SLICE_MICROS, 6, MAX_DECODED_BYTES / 12, Operation::BaseRollup);
         // Day 4: six slices that together blow the budget. Must stay as slices.
-        let big = MAX_DECODED_BYTES / 2;
-        for slot in 0..6 {
-            let start = 4 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("q", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, big, 0);
-        }
+        enqueue_run(&mut journal, "q", 4 * DAY_MICROS, NORMAL_SLICE_MICROS, 6, MAX_DECODED_BYTES / 2, Operation::BaseRollup);
 
         journal.coarsen_sealed_slices(now);
 
-        let widths = |project: &str, day: i64| {
-            journal
-                .tasks()
-                .filter(|t| {
-                    t.state == TaskState::Pending
-                        && t.key.project_id == project
-                        && t.key.slice.start_micros >= day * DAY_MICROS
-                        && t.key.slice.start_micros < (day + 1) * DAY_MICROS
-                })
-                .map(|t| t.key.slice.width())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(widths("p", 1), vec![DAY_MICROS], "a day that fits must fuse into one unit");
-        assert_eq!(widths("q", 4).len(), 6, "a day over budget must keep its slices — they finish, a too-big day unit never does");
-        assert!(widths("q", 4).iter().all(|w| *w < DAY_MICROS));
+        let over_budget = pending_widths(&journal, "q", 4);
+        assert_eq!(pending_widths(&journal, "p", 1), vec![DAY_MICROS], "a day that fits must fuse into one unit");
+        assert_eq!(over_budget.len(), 6, "a day over budget must keep its slices — they finish, a too-big day unit never does");
+        assert!(over_budget.iter().all(|w| *w < DAY_MICROS));
     }
 
     /// The prod shape: a whole day shredded to the one-minute floor, with the
@@ -7208,9 +6873,7 @@ mod tests {
     /// files, so fusion charges that set ONCE instead of once per child.
     #[test]
     fn a_day_shredded_to_the_minute_floor_collapses() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         // The 391 GB prod's 1,440 units claimed between them, against a
         // partition holding 35 files that decode to well under the budget.
@@ -7230,9 +6893,7 @@ mod tests {
         for minute in 0..1_440 {
             let start = DAY_MICROS + minute * MIN_SLICE_MICROS;
             let key = task("p", start, start + MIN_SLICE_MICROS, Operation::BaseRollup).key;
-            journal.enqueue(key.clone(), 0, 282 * 1024 * 1024, 0);
-            let index = journal.task_indices[&key];
-            journal.snapshot.tasks[index].input = Some(footprint);
+            enqueue_with_input(&mut journal, &key, 282 * 1024 * 1024, footprint);
         }
         let shredded = |journal: &TaskJournal| {
             journal
@@ -7253,19 +6914,15 @@ mod tests {
     /// would read both, and under-pricing that is how a split/fuse loop starts.
     #[test]
     fn fusion_charges_a_shared_file_set_once_and_disjoint_sets_twice() {
-        const DAY_MICROS: i64 = 86_400_000_000;
         let now = 10 * DAY_MICROS;
         let half = MAX_DECODED_BYTES / 2 + 1;
         let fuse = |footprints: [InputFootprint; 2]| {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            let (_dir, mut journal) = new_journal();
             for (slot, footprint) in footprints.into_iter().enumerate() {
                 let slot = i64::try_from(slot).unwrap_or(0);
                 let start = DAY_MICROS + slot * NORMAL_SLICE_MICROS;
                 let key = task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key;
-                journal.enqueue(key.clone(), 0, half, 0);
-                let index = journal.task_indices[&key];
-                journal.snapshot.tasks[index].input = Some(footprint);
+                enqueue_with_input(&mut journal, &key, half, footprint);
             }
             journal.coarsen_sealed_slices_reporting(now)
         };
@@ -7291,22 +6948,13 @@ mod tests {
     /// in one pass.
     #[test]
     fn a_shredded_day_collapses_once_the_estimate_is_capped_by_its_partition() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        const MINUTE: i64 = 60_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
         let prod_estimate = 282_280_533u64; // one 60-second slice, whole-file accounting
-        for slot in 0..1440 {
-            let start = DAY_MICROS + slot * MINUTE;
-            journal.enqueue(task("p", start, start + MINUTE, Operation::BaseRollup).key, 0, prod_estimate, 0);
-        }
+        enqueue_run(&mut journal, "p", DAY_MICROS, MIN_SLICE_MICROS, 1_440, prod_estimate, Operation::BaseRollup);
         let partition = 386_547_056u64; // 35 files, 0.36 GB — what the day actually holds
         let report = journal.coarsen_sealed_slices_capped(now, &|_, _, _| Some(partition));
-        let remaining = journal
-            .tasks()
-            .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
-            .count();
+        let remaining = pending_widths(&journal, "p", 1).len();
         assert!(
             remaining < 1440,
             "the shredded day must collapse once its estimate is bounded by the partition; {remaining} remain (fused={} over_budget={})",
@@ -7322,21 +6970,12 @@ mod tests {
     /// double-counting, it never argues a big partition is small.
     #[test]
     fn the_partition_ceiling_does_not_fuse_a_genuinely_oversized_day() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
-        for slot in 0..6 {
-            let start = DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, MAX_DECODED_BYTES / 2, 0);
-        }
+        enqueue_run(&mut journal, "p", DAY_MICROS, NORMAL_SLICE_MICROS, 6, MAX_DECODED_BYTES / 2, Operation::BaseRollup);
         // The partition really is 4 GB; the sum was not double-counting here.
         journal.coarsen_sealed_slices_capped(now, &|_, _, _| Some(4 * 1024 * 1024 * 1024));
-        let widths: Vec<i64> = journal
-            .tasks()
-            .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= DAY_MICROS && t.key.slice.start_micros < 2 * DAY_MICROS)
-            .map(|t| t.key.slice.width())
-            .collect();
+        let widths = pending_widths(&journal, "p", 1);
         assert_eq!(widths.len(), 6, "a genuinely oversized day must keep its slices, got {widths:?}");
         assert!(widths.iter().all(|w| *w < DAY_MICROS));
     }
@@ -7349,11 +6988,9 @@ mod tests {
     /// time. Every `_v2` -> `_v3` rename leaves the same residue.
     #[test]
     fn removing_a_spec_retires_its_queued_work_and_nothing_else() {
-        const DAY: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let tiered = |table: &str, slot: i64, operation| {
-            let mut unit = task("p", slot * DAY, (slot + 1) * DAY, operation);
+            let mut unit = task("p", slot * DAY_MICROS, (slot + 1) * DAY_MICROS, operation);
             unit.key.physical_table = table.to_owned();
             unit.key
         };
@@ -7385,17 +7022,15 @@ mod tests {
     /// re-force every cell on the next boot, and prod restarts every few minutes.
     #[test]
     fn the_orphan_repair_claims_itself_once_and_survives_a_reload() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        {
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
-            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "first call claims it");
-            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "second call in the same process must not");
-            // PER SOURCE: the caller loops over sources, so one global cursor
-            // would let whichever source is processed first consume the repair —
-            // and if that is otel_metrics, the source that actually needs it
-            // never runs. A silent no-op that looks like success.
-            assert_eq!(journal.repair_orphaned_coverage_once("otel_metrics"), Some(0), "a different source claims independently");
-        }
+        let (dir, mut journal) = new_journal();
+        assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "first call claims it");
+        assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "second call in the same process must not");
+        // PER SOURCE: the caller loops over sources, so one global cursor
+        // would let whichever source is processed first consume the repair —
+        // and if that is otel_metrics, the source that actually needs it
+        // never runs. A silent no-op that looks like success.
+        assert_eq!(journal.repair_orphaned_coverage_once("otel_metrics"), Some(0), "a different source claims independently");
+        drop(journal);
         let mut reloaded = TaskJournal::load(dir.path()).expect("reload");
         assert_eq!(reloaded.repair_orphaned_coverage_once("otel_logs_and_spans"), None, "a restart must not re-run the repair");
     }
@@ -7407,19 +7042,17 @@ mod tests {
     /// look exactly like success.
     #[test]
     fn the_damage_repair_cursor_is_a_per_source_prefix_that_survives_a_reload() {
-        let dir = tempfile::tempdir().expect("temp dir");
         const DAMAGE: &str = TaskJournal::DAMAGE_REPAIR_MIGRATION;
-        {
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
-            assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "orphan repair claims");
-            assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 0, "the orphan repair's cursor must not consume the damage list");
-            journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 24).expect("advance");
-            assert_eq!(journal.repair_cursor(DAMAGE, "otel_metrics"), 0, "a different source is consumed independently");
-            // Monotonic: `SourceCursor` replay folds with `max()`, and a pass
-            // that resolved less than an earlier one must never rewind the list.
-            journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 3).expect("advance");
-            assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 24);
-        }
+        let (dir, mut journal) = new_journal();
+        assert_eq!(journal.repair_orphaned_coverage_once("otel_logs_and_spans"), Some(0), "orphan repair claims");
+        assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 0, "the orphan repair's cursor must not consume the damage list");
+        journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 24).expect("advance");
+        assert_eq!(journal.repair_cursor(DAMAGE, "otel_metrics"), 0, "a different source is consumed independently");
+        // Monotonic: `SourceCursor` replay folds with `max()`, and a pass
+        // that resolved less than an earlier one must never rewind the list.
+        journal.advance_repair_cursor(DAMAGE, "otel_logs_and_spans", 3).expect("advance");
+        assert_eq!(journal.repair_cursor(DAMAGE, "otel_logs_and_spans"), 24);
+        drop(journal);
         let reloaded = TaskJournal::load(dir.path()).expect("reload");
         assert_eq!(reloaded.repair_cursor(DAMAGE, "otel_logs_and_spans"), 24, "a restart resumes at the prefix, it does not start over");
     }
@@ -7441,9 +7074,7 @@ mod tests {
     /// pending base rollups.
     #[test]
     fn a_completed_day_unit_does_not_block_coarsening_but_a_superseded_one_does() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let now = 10 * DAY_MICROS;
 
         // Day 2: a day unit that already ran to completion, plus fresh slices
@@ -7452,10 +7083,7 @@ mod tests {
         journal.enqueue(done.clone(), 0, 0, 0);
         journal.complete(&done);
         assert_eq!(journal.state(&done), Some(TaskState::Complete), "precondition");
-        for slot in 0..6 {
-            let start = 2 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            journal.enqueue(task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup).key, 0, 10, 0);
-        }
+        enqueue_run(&mut journal, "p", 2 * DAY_MICROS, NORMAL_SLICE_MICROS, 6, 10, Operation::BaseRollup);
 
         // Day 6: a day unit SPLIT because it was too big. Its children must NOT
         // collapse, or the split is undone and the two fight forever.
@@ -7466,24 +7094,23 @@ mod tests {
 
         journal.coarsen_sealed_slices(now);
 
-        let widths = |day: i64| {
-            journal
-                .tasks()
-                .filter(|t| t.state == TaskState::Pending && t.key.slice.start_micros >= day * DAY_MICROS && t.key.slice.start_micros < (day + 1) * DAY_MICROS)
-                .map(|t| t.key.slice.width())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(widths(2), vec![DAY_MICROS], "a completed day must re-coarsen to one day unit, not stay as slices");
-        assert!(widths(6).iter().all(|w| *w < DAY_MICROS), "a SPLIT day's children must stay split — recoarsening them loops forever");
+        assert_eq!(pending_widths(&journal, "p", 2), vec![DAY_MICROS], "a completed day must re-coarsen to one day unit, not stay as slices");
+        assert!(pending_widths(&journal, "p", 6).iter().all(|w| *w < DAY_MICROS), "a SPLIT day's children must stay split — recoarsening them loops forever");
     }
 
+    /// The sealed reservation is affordable only while the frontier keeps up.
+    ///
+    /// It exists because strict class-0 priority let the frontier take ~90% of
+    /// claims and froze rollup coverage. But frontier lag is a per-query cost —
+    /// `raw_tail_duration_secs` is `FINALIZATION_DELAY + lag` and every hybrid
+    /// query scans that tail — and prod 2026-08-17 reached 62 minutes of it.
+    /// So the reservation yields while the frontier is behind, and returns on
+    /// its own once it is not.
     #[test]
     fn the_sealed_reservation_yields_while_the_frontier_is_behind() {
-        const DAY_MICROS: i64 = 86_400_000_000;
         let now = 10 * DAY_MICROS;
         let claims = |lag: u64| {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let mut journal = TaskJournal::load(dir.path()).expect("journal");
+            let (_dir, mut journal) = new_journal();
             // One frontier slice (ends at `now`) and one sealed day, both eligible.
             let frontier = task("p", now - 600_000_000, now, Operation::BaseRollup).key.clone();
             let sealed = task("p", now - 5 * DAY_MICROS, now - 4 * DAY_MICROS, Operation::BaseRollup).key.clone();
@@ -7530,10 +7157,8 @@ mod tests {
     /// nothing served.
     #[test]
     fn work_inside_the_horizon_keeps_a_share_against_work_past_it() {
-        const DAY_MICROS: i64 = 86_400_000_000;
         let now = 100 * DAY_MICROS;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // Ancient: 60 days sealed, so `starved` has gained ~29 steps.
         let ancient = task("p", now - 61 * DAY_MICROS, now - 60 * DAY_MICROS, Operation::Dedup).key.clone();
         // 20 days sealed: PAST the 14-day query window, so `window_turn` does
@@ -7561,20 +7186,27 @@ mod tests {
         );
     }
 
+    /// Among sealed work, a day-sized unit outranks yesterday's ten-minute
+    /// leftovers even though those are newer.
+    ///
+    /// Day-sized units come from the backfill planner and are the only kind
+    /// that advances the rollup horizon. Ten-minute units are what the live
+    /// path mints, and a day that has just sealed carries ~144 of them per
+    /// project per tier. Ordering sealed work newest-first alone therefore
+    /// grinds all of yesterday before reaching the day before — and midnight
+    /// mints a fresh day's worth, so the horizon can never move.
+    ///
+    /// Prod 2026-08-17, 65 rollup starts in 25 minutes: 46 on today, 18 on
+    /// yesterday, ZERO on any older day, while 7d/14d queries were refused for
+    /// want of exactly those older days.
     #[test]
     fn sealed_backfill_units_outrank_yesterdays_fine_slices() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         // "Now" well past both, so everything is sealed rather than frontier.
         let now = 10 * DAY_MICROS;
 
         // Yesterday's fine-grained leftovers: newer, and far more numerous.
-        for slot in 0..12 {
-            let start = 8 * DAY_MICROS + slot * NORMAL_SLICE_MICROS;
-            let fine = task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup);
-            journal.enqueue(fine.key.clone(), 0, 0, 0);
-        }
+        enqueue_run(&mut journal, "p", 8 * DAY_MICROS, NORMAL_SLICE_MICROS, 12, 0, Operation::BaseRollup);
         // An older day, queued whole by the backfill planner.
         let coarse = task("p", 3 * DAY_MICROS, 4 * DAY_MICROS, Operation::BaseRollup);
         journal.enqueue(coarse.key.clone(), 0, 0, 0);
@@ -7589,17 +7221,6 @@ mod tests {
         );
     }
 
-    /// A unit that cannot finish inside its deadline must get SMALLER, not be
-    /// requeued unchanged.
-    ///
-    /// The lease requeues whatever the worker abandoned, so a slice too big for
-    /// its deadline times out, requeues identical, times out again — forever,
-    /// holding a worker for the full deadline each time and never producing
-    /// anything. Prod 2026-08-17: five Dedup timeouts in twelve minutes at 300s
-    /// apiece, permanently occupying ~2 of 16 coordinator workers, while total
-    /// task starts fell to 2.2/min and the rollup horizon it was starving sat
-    /// days behind. Byte-based splitting cannot catch this — a day-sized slice
-    /// with modest bytes still pays one object-store round trip per file.
     /// Verbatim prod text, 2026-08-17. Classification is string-based because
     /// the DataFusion error arrives type-erased through delta-rs/anyhow, so the
     /// strings are the contract and this test is what pins them.
@@ -7639,22 +7260,43 @@ mod tests {
 
     /// A slice too big for the pool fails identically every pass. Back off once
     /// (a FairSpillPool squeeze is transient), then shrink it.
-    #[test]
-    fn a_unit_that_cannot_fit_bisects_instead_of_retrying_at_the_same_size() {
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let key = task("whale", 0, DAY_MICROS, Operation::Dedup).key.clone();
+    ///
+    /// A unit that cannot finish inside its DEADLINE must get SMALLER the same
+    /// way, not be requeued unchanged. The lease requeues whatever the worker
+    /// abandoned, so a slice too big for its deadline times out, requeues
+    /// identical, times out again — forever, holding a worker for the full
+    /// deadline each time and never producing anything. Prod 2026-08-17: five
+    /// Dedup timeouts in twelve minutes at 300s apiece, permanently occupying
+    /// ~2 of 16 coordinator workers, while total task starts fell to 2.2/min
+    /// and the rollup horizon it was starving sat days behind. Byte-based
+    /// splitting cannot catch this — a day-sized slice with modest bytes still
+    /// pays one object-store round trip per file.
+    #[test_case::test_case(false ; "a_unit_that_cannot_fit_bisects_instead_of_retrying_at_the_same_size")]
+    #[test_case::test_case(true ; "a_unit_that_keeps_timing_out_bisects_instead_of_retrying_forever")]
+    fn a_repeated_capacity_failure_bisects_instead_of_retrying_at_the_same_size(via_timeout: bool) {
+        let (_dir, mut journal) = new_journal();
+        let key = task("whale", 0, DAY_MICROS, Operation::Dedup).key;
         journal.enqueue(key.clone(), 0, 0, 0);
         let oom = "dedup: Not enough memory to continue external sort.".to_owned();
 
-        journal.retry_or_split(&key, oom.clone(), 1, 1);
-        assert_eq!(journal.state(&key), Some(TaskState::Retry), "one squeeze may be someone else's fault; retry it whole");
+        // The first failure is an ordinary blip and must simply retry; the
+        // second says the slice itself does not fit.
+        for attempt in 1..=2u32 {
+            if via_timeout {
+                assert!(journal.mark_running(&key));
+                journal.abandon_running(&key, 0, None);
+            } else {
+                journal.retry_or_split(&key, oom.clone(), i64::from(attempt), attempt);
+            }
+            if attempt == 1 {
+                assert_eq!(journal.state(&key), Some(TaskState::Retry), "one squeeze may be someone else's fault; retry it whole");
+            }
+        }
 
-        journal.retry_or_split(&key, oom, 2, 2);
-        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "a repeat says the slice itself does not fit");
+        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "a repeat says the slice itself does not fit; the parent stays as an audit record");
         let widths: Vec<i64> = journal.tasks().filter(|t| t.state != TaskState::Superseded).map(|t| t.key.slice.width()).collect();
-        assert!(!widths.is_empty() && widths.iter().all(|w| *w < DAY_MICROS), "bisection must leave smaller claimable children; got {widths:?}");
+        assert!(!widths.is_empty(), "bisection must leave claimable children behind");
+        assert!(widths.iter().all(|w| *w < DAY_MICROS), "bisection must leave SMALLER children; got widths {widths:?} still at the full day");
     }
 
     #[test_case::test_case(true, 0, None ; "timeout without a byte estimate")]
@@ -7664,14 +7306,10 @@ mod tests {
     #[test_case::test_case(true, 0, Some(2 * MAX_DECODED_BYTES) ; "timeout retains actual preflight")]
     #[test_case::test_case(false, 0, Some(MAX_DECODED_BYTES / 2) ; "capacity failure below byte budget retains actual preflight")]
     fn failure_driven_splits_do_not_fabricate_byte_measurements(via_timeout: bool, estimate: u64, preflight: Option<u64>) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (dir, mut journal) = new_journal();
         let mut unit = task("p", 0, DAY_MICROS, Operation::Dedup);
         unit.estimated_decoded_bytes = estimate;
-        unit.state = TaskState::Running;
-        unit.attempts = 2;
-        let key = unit.key.clone();
-        journal.upsert(unit);
+        let key = running_unit(&mut journal, unit, 2);
         if let Some(bytes) = preflight {
             journal.record_preflight(&key, None, bytes);
         }
@@ -7700,9 +7338,8 @@ mod tests {
     /// nothing about size, and splitting on it would shred a healthy slice.
     #[test]
     fn an_unrelated_failure_retries_whole_however_often_it_repeats() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let key = task("steady", 0, 86_400_000_000, Operation::Dedup).key.clone();
+        let (_dir, mut journal) = new_journal();
+        let key = task("steady", 0, DAY_MICROS, Operation::Dedup).key;
         journal.enqueue(key.clone(), 0, 0, 0);
         for attempts in 1..6 {
             journal.retry_or_split(&key, "dedup: object not found".to_owned(), i64::from(attempts), attempts);
@@ -7743,33 +7380,9 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_that_keeps_timing_out_bisects_instead_of_retrying_forever() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        const DAY_MICROS: i64 = 86_400_000_000;
-        let input = task("whale", 0, DAY_MICROS, Operation::Dedup);
-        let key = input.key.clone();
-        journal.enqueue(key.clone(), 0, 0, 0);
-
-        // Two abandoned runs: the first is an ordinary blip and must simply
-        // retry, the second says the slice itself does not fit.
-        for _ in 0..2 {
-            assert!(journal.mark_running(&key));
-            journal.abandon_running(&key, 0, None);
-        }
-
-        let widths: Vec<i64> = journal.tasks().filter(|t| t.state != TaskState::Superseded).map(|t| t.key.slice.width()).collect();
-        assert!(!widths.is_empty(), "bisection must leave claimable children behind");
-        assert!(widths.iter().all(|width| *width < DAY_MICROS), "a repeatedly-abandoned day must bisect; got widths {widths:?} still at the full day");
-        assert_eq!(journal.state(&key), Some(TaskState::Superseded), "the parent stays as an audit record");
-    }
-
-    #[test]
     fn replanning_live_debt_reopens_one_idempotent_task() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
-        let input = task("p", 0, MIN_SLICE_MICROS, Operation::SealedConsolidation);
-        let key = input.key.clone();
+        let (_dir, mut journal) = new_journal();
+        let key = task("p", 0, MIN_SLICE_MICROS, Operation::SealedConsolidation).key;
         journal.enqueue(key.clone(), 10, 20, 1);
         journal.complete(&key);
         journal.enqueue(key.clone(), 5, 30, 1);
@@ -7783,8 +7396,7 @@ mod tests {
 
     #[test]
     fn derived_rollup_claim_waits_for_complete_base_hour() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let mut base_keys = Vec::new();
         for start in (0..DERIVED_SLICE_MICROS).step_by(NORMAL_SLICE_MICROS as usize) {
             let base = task("p", start, start + NORMAL_SLICE_MICROS, Operation::BaseRollup);
@@ -7801,8 +7413,7 @@ mod tests {
 
     #[test]
     fn oversized_task_is_replaced_by_durable_time_children() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let input = task("p", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup);
         let key = input.key.clone();
         journal.upsert(input);
@@ -7813,9 +7424,8 @@ mod tests {
 
     #[test]
     fn live_frontier_lag_prefers_pending_split_child_over_superseded_parent() {
-        let now = 10 * 24 * 60 * 60 * 1_000_000;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let now = 10 * DAY_MICROS;
+        let (_dir, mut journal) = new_journal();
         let mut input = task("p", now - NORMAL_SLICE_MICROS, now, Operation::BaseRollup);
         input.deadline_micros = now - 2 * 60 * 1_000_000;
         let key = input.key.clone();
@@ -7826,8 +7436,7 @@ mod tests {
 
     #[test]
     fn completed_children_satisfy_a_larger_derived_dependency() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut journal = TaskJournal::load(dir.path()).expect("journal");
+        let (_dir, mut journal) = new_journal();
         let base = task("p", 0, NORMAL_SLICE_MICROS, Operation::BaseRollup);
         let base_key = base.key.clone();
         journal.upsert(base);

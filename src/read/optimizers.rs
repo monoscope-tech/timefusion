@@ -182,57 +182,51 @@ mod tests {
         timestamp_to_date_filters(&expr, "timestamp").iter().flat_map(extract_date_bounds).collect()
     }
 
-    #[test]
-    fn timestamp_between_derives_two_inclusive_date_bounds() {
-        let expr = Expr::Between(Between::new(
-            Box::new(col("timestamp")),
-            false,
-            Box::new(timestamp(1_704_067_200_000_000)),
-            Box::new(timestamp(1_704_240_000_000_000)),
-        ));
+    /// 2024-01-01T00:00:00Z in micros → day 19_723.
+    const START: i64 = 1_704_067_200_000_000;
+    /// 2024-01-03T00:00:00Z in micros → day 19_725.
+    const END: i64 = 1_704_240_000_000_000;
 
-        assert_eq!(date_filters(expr), vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)]);
+    fn cmp(left: Expr, op: Operator, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
     }
 
-    #[test]
-    fn timestamp_comparisons_support_units_casts_and_reversed_operands() {
-        let timestamp_col = col("timestamp");
-        let cast_timestamp = Expr::Cast(Cast::new(Box::new(timestamp_col.clone()), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
-        let try_cast_timestamp = Expr::TryCast(TryCast::new(Box::new(timestamp_col.clone()), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
-        let start = 1_704_067_200_000_000i64;
-        let cases = [
-            (Expr::BinaryExpr(BinaryExpr::new(Box::new(timestamp_col.clone()), Operator::GtEq, Box::new(timestamp(start)))), Operator::GtEq),
-            (Expr::BinaryExpr(BinaryExpr::new(Box::new(timestamp(start)), Operator::LtEq, Box::new(timestamp_col.clone()))), Operator::GtEq),
-            (
-                Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(cast_timestamp),
-                    Operator::Lt,
-                    Box::new(Expr::Literal(ScalarValue::TimestampNanosecond(Some(start * 1_000), Some("UTC".into())), None)),
-                )),
-                Operator::LtEq,
-            ),
-            (Expr::BinaryExpr(BinaryExpr::new(Box::new(try_cast_timestamp), Operator::Gt, Box::new(timestamp(start)))), Operator::GtEq),
-            (
-                Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(timestamp_col.clone()),
-                    Operator::Eq,
-                    Box::new(Expr::Literal(ScalarValue::TimestampMillisecond(Some(start / 1_000), Some("UTC".into())), None)),
-                )),
-                Operator::Eq,
-            ),
-            (
-                Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(timestamp_col),
-                    Operator::Eq,
-                    Box::new(Expr::Literal(ScalarValue::TimestampSecond(Some(start / 1_000_000), Some("UTC".into())), None)),
-                )),
-                Operator::Eq,
-            ),
-        ];
+    fn ns_type() -> DataType {
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+    }
 
-        for (expr, expected_op) in cases {
-            assert_eq!(date_filters(expr), vec![(expected_op, 19_723)]);
-        }
+    fn cast_ns(expr: Expr) -> Expr {
+        Expr::Cast(Cast::new(Box::new(expr), ns_type()))
+    }
+
+    fn try_cast_ns(expr: Expr) -> Expr {
+        Expr::TryCast(TryCast::new(Box::new(expr), ns_type()))
+    }
+
+    fn scalar(v: ScalarValue) -> Expr {
+        Expr::Literal(v, None)
+    }
+
+    #[test_case::test_case(Expr::Between(Between::new(Box::new(col("timestamp")), false, Box::new(timestamp(START)), Box::new(timestamp(END))))
+        => vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)] ; "between derives two inclusive date bounds")]
+    #[test_case::test_case(cmp(col("timestamp"), Operator::GtEq, timestamp(START)) => vec![(Operator::GtEq, 19_723)] ; "col >= micros literal")]
+    #[test_case::test_case(cmp(timestamp(START), Operator::LtEq, col("timestamp")) => vec![(Operator::GtEq, 19_723)] ; "reversed operands: literal <= col")]
+    #[test_case::test_case(cmp(cast_ns(col("timestamp")), Operator::Lt, scalar(ScalarValue::TimestampNanosecond(Some(START * 1_000), Some("UTC".into()))))
+        => vec![(Operator::LtEq, 19_723)] ; "cast column, nanosecond literal, strict < widens to <=")]
+    #[test_case::test_case(cmp(try_cast_ns(col("timestamp")), Operator::Gt, timestamp(START)) => vec![(Operator::GtEq, 19_723)] ; "try_cast column, strict > widens to >=")]
+    #[test_case::test_case(cmp(col("timestamp"), Operator::Eq, scalar(ScalarValue::TimestampMillisecond(Some(START / 1_000), Some("UTC".into()))))
+        => vec![(Operator::Eq, 19_723)] ; "millisecond literal equality")]
+    #[test_case::test_case(cmp(col("timestamp"), Operator::Eq, scalar(ScalarValue::TimestampSecond(Some(START / 1_000_000), Some("UTC".into()))))
+        => vec![(Operator::Eq, 19_723)] ; "second literal equality")]
+    // Regression for the 2026-07-20 prod finding: ~6% of hash-enrichment merges
+    // full-scanned (207 GB, predicate_filtered=0) because extended-protocol param
+    // binding + TypeCoercion wraps the timestamp bound in a `Cast(Literal)` — the
+    // literal side must be unwrapped or no `date` bound is derived. Shape:
+    // `timestamp >= CAST($1 AS Timestamp(ns))` where the bound param arrived as µs.
+    #[test_case::test_case(cmp(col("timestamp"), Operator::GtEq, cast_ns(timestamp(START)))
+        => vec![(Operator::GtEq, 19_723)] ; "2026-07-20: cast-wrapped timestamp literal still derives date bounds")]
+    fn timestamp_predicates_derive_date_bounds(expr: Expr) -> Vec<(Operator, i32)> {
+        date_filters(expr)
     }
 
     /// Regression for the 2026-07-17 prod OOM: the monoscope hash-enrichment
@@ -241,13 +235,10 @@ mod tests {
     /// of scanning all 2704 partitions.
     #[test]
     fn monoscope_update_predicate_gains_date_partition_bounds() {
-        let start = 1_704_067_200_000_000i64; // 2024-01-01 → day 19_723
-        let end = 1_704_240_000_000_000i64; //   2024-01-03 → day 19_725
-        let ts = || col("timestamp");
         let predicate = col("project_id")
-            .eq(Expr::Literal(ScalarValue::Utf8(Some("p".into())), None))
-            .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::GtEq, Box::new(timestamp(start)))))
-            .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::Lt, Box::new(timestamp(end)))));
+            .eq(scalar(ScalarValue::Utf8(Some("p".into()))))
+            .and(cmp(col("timestamp"), Operator::GtEq, timestamp(START)))
+            .and(cmp(col("timestamp"), Operator::Lt, timestamp(END)));
 
         // Bug: no `date` bounds derived from the raw timestamp predicate.
         assert!(extract_date_bounds(&predicate).is_empty());
@@ -261,22 +252,8 @@ mod tests {
         assert_eq!(bounds, vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)]);
 
         // No time-column bounds → predicate returned untouched.
-        let no_ts = col("project_id").eq(Expr::Literal(ScalarValue::Utf8(Some("p".into())), None));
+        let no_ts = col("project_id").eq(scalar(ScalarValue::Utf8(Some("p".into()))));
         assert!(extract_date_bounds(&with_date_partition_filters(no_ts, "timestamp")).is_empty());
-    }
-
-    /// Regression for the 2026-07-20 prod finding: ~6% of hash-enrichment merges
-    /// full-scanned (207 GB, predicate_filtered=0) because extended-protocol param
-    /// binding + TypeCoercion wraps the timestamp bound in a `Cast(Literal)` — the
-    /// literal side must be unwrapped or no `date` bound is derived.
-    #[test]
-    fn cast_wrapped_timestamp_literal_still_derives_date_bounds() {
-        let start = 1_704_067_200_000_000i64; // 2024-01-01 → day 19_723
-        let ts_col = col("timestamp");
-        // `timestamp >= CAST($1 AS Timestamp(ns))` where the bound param arrived as µs.
-        let cast_lit = Expr::Cast(Cast::new(Box::new(timestamp(start)), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
-        let expr = Expr::BinaryExpr(BinaryExpr::new(Box::new(ts_col), Operator::GtEq, Box::new(cast_lit)));
-        assert_eq!(date_filters(expr), vec![(Operator::GtEq, 19_723)]);
     }
 }
 
@@ -1043,18 +1020,14 @@ mod peel_tests {
 
     use super::*;
 
-    fn variant_field(name: &str) -> Field {
-        Field::new(
-            name,
+    fn variant_projection() -> LogicalPlan {
+        let variant_field = Field::new(
+            "v",
             DataType::Struct(vec![Arc::new(Field::new("metadata", DataType::Binary, false)), Arc::new(Field::new("value", DataType::Binary, false))].into()),
             true,
         )
-        .with_metadata(HashMap::from([(crate::schema::VARIANT_EXT_KEY.to_string(), crate::schema::VARIANT_EXT_VALUE.to_string())]))
-    }
-
-    fn variant_projection() -> LogicalPlan {
-        let schema = Schema::new(vec![variant_field("v")]);
-        let df = Arc::new(DFSchema::try_from(schema).unwrap());
+        .with_metadata(HashMap::from([(crate::schema::VARIANT_EXT_KEY.to_string(), crate::schema::VARIANT_EXT_VALUE.to_string())]));
+        let df = Arc::new(DFSchema::try_from(Schema::new(vec![variant_field])).unwrap());
         let empty = LogicalPlan::EmptyRelation(EmptyRelation { produce_one_row: false, schema: df });
         LogicalPlanBuilder::from(empty).project(vec![col("v")]).unwrap().build().unwrap()
     }
@@ -1082,29 +1055,19 @@ mod peel_tests {
         find(plan).expect("expected a Projection in the plan")
     }
 
-    #[test]
-    fn wraps_bare_projection() {
-        let out = analyze(variant_projection());
-        assert!(is_variant_to_json_call(first_projection_expr(&out)));
-    }
-
-    #[test]
-    fn peels_sort_limit_distinct_alias_filter() {
-        let plan = LogicalPlanBuilder::from(variant_projection())
-            .filter(lit(true))
-            .unwrap()
-            .distinct()
-            .unwrap()
-            .limit(0, Some(10))
-            .unwrap()
-            .sort(vec![col("v").sort(true, false)])
-            .unwrap()
-            .alias("a")
-            .unwrap()
-            .build()
-            .unwrap();
-        let out = analyze(plan);
-        assert!(is_variant_to_json_call(first_projection_expr(&out)));
+    /// Each case stacks nodes on top of the bare variant projection and asks
+    /// whether the root projection still ends up wrapped in `variant_to_json`.
+    #[test_case::test_case(|b| b => true ; "bare projection is wrapped")]
+    #[test_case::test_case(|b| b.filter(lit(true)).unwrap() => true ; "peels Filter")]
+    #[test_case::test_case(|b| b.distinct().unwrap() => true ; "peels Distinct")]
+    #[test_case::test_case(|b| b.limit(0, Some(10)).unwrap() => true ; "peels Limit")]
+    #[test_case::test_case(|b| b.sort(vec![col("v").sort(true, false)]).unwrap() => true ; "peels Sort")]
+    #[test_case::test_case(|b| b.alias("a").unwrap() => true ; "peels SubqueryAlias")]
+    #[test_case::test_case(|b| b.filter(lit(true)).unwrap().distinct().unwrap().limit(0, Some(10)).unwrap().sort(vec![col("v").sort(true, false)]).unwrap().alias("a").unwrap()
+        => true ; "peels sort/limit/distinct/alias/filter stacked together")]
+    fn peels_to_the_root_projection(steps: fn(LogicalPlanBuilder) -> LogicalPlanBuilder) -> bool {
+        let plan = steps(LogicalPlanBuilder::from(variant_projection())).build().unwrap();
+        is_variant_to_json_call(first_projection_expr(&analyze(plan)))
     }
 
     #[test]
@@ -1491,33 +1454,37 @@ fn indexed_columns_for(table: &str) -> Option<&'static IndexedCols> {
 mod tantivy_rewriter_tests {
     use super::*;
     use crate::tantivy::udf::{PredNode, collect_text_match_tree};
+    use test_case::test_case;
 
     /// `(pattern, escape, allow_substring)` → routed query, over every
     /// tokenizer-visible shape. `_` and embedded `%` never accelerate;
     /// leading `%` only on ngram3 (`allow_substring`).
-    #[test]
-    fn like_classifier_cases() {
-        for (pat, esc, substring, want) in [
-            ("foo", None, false, Some("foo")),
-            ("foo%", None, false, Some("foo*")),
-            ("%foo", None, false, None),
-            ("%foo", None, true, Some("foo")),
-            ("%foo%", None, true, Some("foo")),
-            ("%foo%", None, false, None),
-            ("fo%o", None, true, None),
-            ("fo%o", None, false, None),
-            ("fo_", None, true, None),
-            ("foo+bar", None, true, None),
-            ("svc.user-api", None, false, Some("svc.user-api")),
-            ("foo\\%", Some('\\'), false, None), // escaped metachar: bail conservatively
-        ] {
-            assert_eq!(classify_like_pattern(pat, esc, substring), want.map(str::to_string), "{pat:?} escape={esc:?} substring={substring}");
-        }
+    #[test_case("foo", None, false => Some("foo".to_string()) ; "bare literal is a term")]
+    #[test_case("foo%", None, false => Some("foo*".to_string()) ; "trailing % is a prefix query")]
+    #[test_case("%foo", None, false => None ; "leading % without substring support")]
+    #[test_case("%foo", None, true => Some("foo".to_string()) ; "leading % on ngram3")]
+    #[test_case("%foo%", None, true => Some("foo".to_string()) ; "both-sided % on ngram3")]
+    #[test_case("%foo%", None, false => None ; "both-sided % without substring support")]
+    #[test_case("fo%o", None, true => None ; "embedded % never accelerates, ngram3")]
+    #[test_case("fo%o", None, false => None ; "embedded % never accelerates, raw")]
+    #[test_case("fo_", None, true => None ; "_ never accelerates")]
+    #[test_case("foo+bar", None, true => None ; "query-syntax metachar")]
+    #[test_case("svc.user-api", None, false => Some("svc.user-api".to_string()) ; "dots and dashes survive")]
+    #[test_case("foo\\%", Some('\\'), false => None ; "escaped metachar: bail conservatively")]
+    fn like_classifier_cases(pat: &str, esc: Option<char>, substring: bool) -> Option<String> {
+        classify_like_pattern(pat, esc, substring)
     }
 
-    /// Test column map; every entry is text-typed unless a test overrides it.
-    fn cols_of<const N: usize>(items: [(&str, &'static str); N]) -> IndexedCols {
-        items.into_iter().map(|(k, tok)| (k.to_string(), (tok, true))).collect()
+    const UID: &str = "0fee13b9-ac71-5c55-acd1-109542595054";
+
+    /// Shared test column map: `tid`/`sid` raw-tokenized, `name` ngram3, all
+    /// text-typed; `body` is ngram3 but NOT text-typed (a Variant/List column).
+    /// `unindexed` is deliberately absent.
+    fn cols() -> IndexedCols {
+        [("tid", RAW_TOKENIZER, true), ("sid", RAW_TOKENIZER, true), ("name", NGRAM3_TOKENIZER, true), ("body", NGRAM3_TOKENIZER, false)]
+            .into_iter()
+            .map(|(k, tok, text)| (k.to_string(), (tok, text)))
+            .collect()
     }
 
     fn col(name: &str) -> Expr {
@@ -1532,133 +1499,95 @@ mod tantivy_rewriter_tests {
         cmp(c, Operator::Eq, val)
     }
 
-    /// Rewrite `e`, then collect the prefilter tree the scan side would see.
-    fn routed_tree(e: Expr, cols: &IndexedCols, allow_eq: bool) -> Option<PredNode> {
-        collect_text_match_tree(&[e.transform_down(|x| rewrite_expr(x, cols, allow_eq)).unwrap().data])
+    fn ilike(c: &str, pat: &str) -> Expr {
+        Expr::Like(Like { negated: false, expr: Box::new(col(c)), pattern: Box::new(lit(pat)), escape_char: None, case_insensitive: true })
+    }
+
+    /// `col::text <op> 'pat'` when `cast`, else the bare column.
+    fn re(c: &str, op: Operator, pat: &str, cast: bool) -> Expr {
+        let lhs = if cast { Expr::Cast(Cast::new(Box::new(col(c)), DataType::Utf8)) } else { col(c) };
+        Expr::BinaryExpr(BinaryExpr::new(Box::new(lhs), op, Box::new(lit(pat))))
+    }
+
+    fn in_list(c: &str, items: &[&str], negated: bool) -> Expr {
+        Expr::InList(InList { expr: Box::new(col(c)), list: items.iter().map(|s| lit(*s)).collect(), negated })
+    }
+
+    fn ready(c: &str, q: &str) -> Option<(String, Route)> {
+        Some((c.to_string(), Route::Ready(q.to_string())))
     }
 
     /// P0: exact `=` on a raw column is the high-cardinality trace/span lookup
     /// acceleration. Every other shape (ngram3, `!=`, flag off, literals the
     /// QueryParser would mis-handle against a single raw token) falls back to
     /// the plain `=` — correctness over acceleration.
-    #[test]
-    fn match_eq_routes_raw_columns_only_when_enabled() {
-        let cols = cols_of([("tid", RAW_TOKENIZER), ("name", NGRAM3_TOKENIZER)]);
-        let uid = "0fee13b9-ac71-5c55-acd1-109542595054";
-        for (expr, allow_eq, want, why) in [
-            (eq("tid", "d01762b88f4ed54d"), true, Some("d01762b88f4ed54d"), "raw column + flag on routes as a term"),
-            (eq("tid", uid), true, Some(uid), "dashed uuid: the `-` survives (e2e-proven)"),
-            (eq("tid", "abc123"), false, None, "flag off reverts to bloom/stats"),
-            (eq("name", "runServer"), true, None, "ngram3 is lossy for equality"),
-            (cmp("tid", Operator::NotEq, "abc"), true, None, "`!=` has no term form"),
-            (eq("tid", "a:b"), true, None, "colon is query syntax"),
-            (eq("tid", "foo bar"), true, None, "space → AND-split can't match one raw token"),
-            (eq("tid", "a.b"), true, None, "dot conservatively excluded"),
-            (eq("tid", ""), true, None, "empty"),
-        ] {
-            let want = want.map(|q| ("tid".to_string(), Route::Ready(q.to_string())));
-            assert_eq!(match_indexed_predicate(&expr, &cols, allow_eq), want, "{why}");
-        }
+    #[test_case(eq("tid", "d01762b88f4ed54d"), true => ready("tid", "d01762b88f4ed54d") ; "raw column + flag on routes as a term")]
+    #[test_case(eq("tid", UID), true => ready("tid", UID) ; "dashed uuid: the `-` survives (e2e-proven)")]
+    #[test_case(eq("tid", "abc123"), false => None ; "flag off reverts to bloom/stats")]
+    #[test_case(eq("name", "runServer"), true => None ; "ngram3 is lossy for equality")]
+    #[test_case(cmp("tid", Operator::NotEq, "abc"), true => None ; "`!=` has no term form")]
+    #[test_case(eq("tid", "a:b"), true => None ; "colon is query syntax")]
+    #[test_case(eq("tid", "foo bar"), true => None ; "space, AND-split can't match one raw token")]
+    #[test_case(eq("tid", "a.b"), true => None ; "dot conservatively excluded")]
+    #[test_case(eq("tid", ""), true => None ; "empty literal")]
+    // ILIKE on a raw-tokenized (case-sensitive) column would silently miss
+    // case variants; ngram3 lowercases both sides, so substrings route.
+    #[test_case(ilike("tid", "foo"), true => None ; "ILIKE never routes on a raw column")]
+    #[test_case(ilike("name", "%foo%"), true => ready("name", "foo") ; "ILIKE substring routes on ngram3")]
+    // `col::text ~* 'lit'` — the shape monoscope renders every KQL
+    // has/contains into. Before this it never matched, so the ngram3 index
+    // was built on ingest and never read.
+    #[test_case(re("name", Operator::RegexIMatch, "runServer", true), true => ready("name", "runServer") ; "cast-wrapped regex imatch on ngram3 routes")]
+    #[test_case(re("name", Operator::RegexIMatch, "runServer", false), true => ready("name", "runServer") ; "bare column regex imatch routes (DataFusion may fold the no-op cast)")]
+    #[test_case(re("name", Operator::RegexMatch, "runServer", true), true => ready("name", "runServer") ; "cast-wrapped regex match on ngram3 routes")]
+    #[test_case(re("name", Operator::RegexMatch, "runServer", false), true => ready("name", "runServer") ; "bare column regex match routes")]
+    #[test_case(re("name", Operator::RegexIMatch, "svc\\.user-api", true), true => ready("name", "svc.user-api") ; "escapeRegex output: `\\.` decodes to a literal")]
+    // Unescaped metachars / anchors (startswith & endswith) / short patterns /
+    // raw-tokenized columns / non-text columns: never routed.
+    #[test_case(re("name", Operator::RegexIMatch, "run.*", true), true => None ; "unescaped metachar")]
+    #[test_case(re("name", Operator::RegexIMatch, "a|b", true), true => None ; "alternation")]
+    #[test_case(re("name", Operator::RegexIMatch, "^foo", true), true => None ; "startswith anchor")]
+    #[test_case(re("name", Operator::RegexIMatch, "foo$", true), true => None ; "endswith anchor")]
+    #[test_case(re("name", Operator::RegexIMatch, "fo(o)", true), true => None ; "group")]
+    #[test_case(re("name", Operator::RegexIMatch, "\\yword\\y", true), true => None ; "backslash-y is a word boundary, not an escaped literal")]
+    #[test_case(re("name", Operator::RegexIMatch, "ab", true), true => None ; "shorter than NGRAM_MIN_QUERY_LEN")]
+    #[test_case(re("name", Operator::RegexIMatch, "", true), true => None ; "empty pattern")]
+    #[test_case(re("name", Operator::RegexIMatch, "a\\", true), true => None ; "trailing backslash")]
+    #[test_case(re("tid", Operator::RegexIMatch, "abcdef", true), true => None ; "regex never routes on a raw column")]
+    // Variant/List column (not text-typed): the index holds our canonical
+    // rendering, which `::text` need not reproduce — never routed.
+    #[test_case(re("body", Operator::RegexIMatch, "boom", true), true => None ; "non-text column never routes")]
+    fn match_indexed_predicate_cases(expr: Expr, allow_eq: bool) -> Option<(String, Route)> {
+        match_indexed_predicate(&expr, &cols(), allow_eq)
     }
 
-    #[test]
-    fn or_of_routed_eqs_becomes_or_node_but_partial_or_is_opaque() {
-        // End-to-end OR-safety with the tree collector: a disjunction where
-        // BOTH branches are rewritten routes as an Or node (union — new
-        // capability); a disjunction with one unroutable branch must yield NO
-        // prefilter at all (else the 2026-06-16 empty/partial-union bug
-        // returns). A top-level conjunct still routes.
-        let cols = cols_of([("tid", RAW_TOKENIZER), ("sid", RAW_TOKENIZER)]);
-
-        let tree = routed_tree(or(eq("tid", "x"), eq("sid", "y")), &cols, true);
-        assert!(matches!(&tree, Some(PredNode::Or(kids)) if kids.len() == 2), "both routed branches must union, got {tree:?}");
-
-        // One branch on an UN-indexed column → whole OR must be opaque.
-        let cols_partial = cols_of([("tid", RAW_TOKENIZER)]);
-        let partial = routed_tree(or(eq("tid", "x"), eq("unindexed", "y")), &cols_partial, true);
-        assert_eq!(partial, None, "an OR with an unroutable branch must not seed the prefilter");
-
-        let tree = routed_tree(and(eq("tid", "x"), lit(true)), &cols, true);
-        assert!(matches!(&tree, Some(PredNode::Leaf(p)) if p.column == "tid" && p.query == "x"), "expected a tid/x leaf, got {tree:?}");
-    }
-
-    #[test]
-    fn in_list_routes_as_or_of_terms() {
-        let cols = cols_of([("tid", RAW_TOKENIZER), ("name", NGRAM3_TOKENIZER)]);
-        let in_list =
-            |c: &str, items: &[&str], negated: bool| Expr::InList(InList { expr: Box::new(col(c)), list: items.iter().map(|s| lit(*s)).collect(), negated });
-        // Routable IN-list → collector sees an Or of leaves (complete via the
-        // AND with the preserved original).
-        let tree = routed_tree(in_list("tid", &["a", "b"], false), &cols, true);
-        assert!(matches!(&tree, Some(PredNode::Or(kids)) if kids.len() == 2), "expected an Or of 2 leaves, got {tree:?}");
-        // NOT IN, ngram3 column, unsafe literal, flag off → never routed.
-        for (e, allow) in [
-            (in_list("tid", &["a"], true), true),
-            (in_list("name", &["abc"], false), true),
-            (in_list("tid", &["a:b"], false), true),
-            (in_list("tid", &["a"], false), false),
-        ] {
-            assert_eq!(routed_tree(e, &cols, allow), None);
+    /// End-to-end OR-safety with the tree collector: a disjunction where BOTH
+    /// branches are rewritten routes as an Or node (union — new capability); a
+    /// disjunction with one unroutable branch must yield NO prefilter at all
+    /// (else the 2026-06-16 empty/partial-union bug returns). A top-level
+    /// conjunct still routes, and a routable IN-list becomes an Or of leaves.
+    ///
+    /// Rewrites `expr`, then renders the prefilter tree the scan side would
+    /// see (`none` when nothing routes). Leaf column and query are part of the
+    /// rendering, so the cases pin contents, not just the node shape.
+    #[test_case(or(eq("tid", "x"), eq("sid", "y")), true => "or(tid:x,sid:y)" ; "both routed branches must union")]
+    #[test_case(or(eq("tid", "x"), eq("unindexed", "y")), true => "none" ; "an OR with an unroutable branch must not seed the prefilter")]
+    #[test_case(and(eq("tid", "x"), lit(true)), true => "tid:x" ; "a top-level conjunct still routes")]
+    #[test_case(in_list("tid", &["a", "b"], false), true => "or(tid:a,tid:b)" ; "IN-list routes as an Or of terms")]
+    #[test_case(in_list("tid", &["a"], true), true => "none" ; "NOT IN is never routed")]
+    #[test_case(in_list("name", &["abc"], false), true => "none" ; "IN-list on an ngram3 column")]
+    #[test_case(in_list("tid", &["a:b"], false), true => "none" ; "IN-list with a QueryParser-unsafe literal")]
+    #[test_case(in_list("tid", &["a"], false), false => "none" ; "IN-list with the flag off")]
+    fn routed_tree_cases(expr: Expr, allow_eq: bool) -> String {
+        fn go(n: &PredNode) -> String {
+            let kids = |k: &[PredNode]| k.iter().map(go).collect::<Vec<_>>().join(",");
+            match n {
+                PredNode::Leaf(p) => format!("{}:{}", p.column, p.query),
+                PredNode::And(k) => format!("and({})", kids(k)),
+                PredNode::Or(k) => format!("or({})", kids(k)),
+            }
         }
-    }
-
-    #[test]
-    fn match_ilike_routes_on_ngram3_but_never_on_raw() {
-        // ILIKE on a raw-tokenized (case-sensitive) column would silently miss
-        // case variants; ngram3 lowercases both sides, so substrings route.
-        let cols = cols_of([("raw", RAW_TOKENIZER), ("c", NGRAM3_TOKENIZER)]);
-        let ilike = |c: &str, pat: &str| {
-            Expr::Like(Like { negated: false, expr: Box::new(col(c)), pattern: Box::new(lit(pat)), escape_char: None, case_insensitive: true })
-        };
-        assert_eq!(match_indexed_predicate(&ilike("raw", "foo"), &cols, true), None);
-        assert_eq!(match_indexed_predicate(&ilike("c", "%foo%"), &cols, true), Some(("c".into(), Route::Ready("foo".into()))));
-    }
-
-    /// `col::text ~* 'lit'` — the shape monoscope renders every KQL
-    /// has/contains into. Before this it never matched, so the ngram3 index
-    /// was built on ingest and never read.
-    #[test]
-    fn match_regex_imatch_through_cast_routes_on_ngram3() {
-        let cols = cols_of([("name", NGRAM3_TOKENIZER), ("tid", RAW_TOKENIZER)]);
-        let re = |c: &str, op: Operator, pat: &str, cast: bool| {
-            let lhs = if cast { Expr::Cast(Cast::new(Box::new(col(c)), DataType::Utf8)) } else { col(c) };
-            Expr::BinaryExpr(BinaryExpr::new(Box::new(lhs), op, Box::new(lit(pat))))
-        };
-
-        for op in [Operator::RegexIMatch, Operator::RegexMatch] {
-            assert_eq!(
-                match_indexed_predicate(&re("name", op, "runServer", true), &cols, true),
-                Some(("name".into(), Route::Ready("runServer".into()))),
-                "cast-wrapped {op:?} on an ngram3 column must route"
-            );
-            // Bare column (DataFusion may fold the no-op cast) routes too.
-            assert_eq!(match_indexed_predicate(&re("name", op, "runServer", false), &cols, true), Some(("name".into(), Route::Ready("runServer".into()))));
-        }
-        // `escapeRegex` output: `.` arrives as `\.` and decodes to a literal.
-        assert_eq!(
-            match_indexed_predicate(&re("name", Operator::RegexIMatch, "svc\\.user-api", true), &cols, true),
-            Some(("name".into(), Route::Ready("svc.user-api".into())))
-        );
-        // Unescaped metachars / anchors (startswith & endswith) / short
-        // patterns / raw-tokenized columns / non-literal RHS: never routed.
-        for (c, pat) in [
-            ("name", "run.*"),
-            ("name", "a|b"),
-            ("name", "^foo"),
-            ("name", "foo$"),
-            ("name", "fo(o)"),
-            ("name", "\\yword\\y"), // \y is a word boundary, not an escaped literal
-            ("name", "ab"),         // < NGRAM_MIN_QUERY_LEN
-            ("name", ""),
-            ("name", "a\\"), // trailing backslash
-            ("tid", "abcdef"),
-        ] {
-            assert_eq!(match_indexed_predicate(&re(c, Operator::RegexIMatch, pat, true), &cols, true), None, "{c} ~* {pat:?} must not route");
-        }
-        // Variant/List column (not text-typed): the index holds our canonical
-        // rendering, which `::text` need not reproduce — never routed.
-        let variant_cols: IndexedCols = HashMap::from([("body".to_string(), (NGRAM3_TOKENIZER, false))]);
-        assert_eq!(match_indexed_predicate(&re("body", Operator::RegexIMatch, "boom", true), &variant_cols, true), None);
+        collect_text_match_tree(&[expr.transform_down(|x| rewrite_expr(x, &cols(), allow_eq)).unwrap().data]).as_ref().map_or("none".to_string(), go)
     }
 }
 
@@ -1937,60 +1866,35 @@ mod pg_array_literal_rewriter_tests {
         ctx
     }
 
-    async fn one_string(ctx: &SessionContext, sql: &str) -> String {
-        let batches = ctx.sql(sql).await.expect("plan ok").collect().await.expect("exec ok");
-        datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string()
-    }
-
+    // cardinality(empty list) = 0 — asserts the actual coalesced value,
+    // not merely that planning succeeded.
+    #[test_case::test_case("SELECT cardinality(COALESCE(CAST(NULL AS VARCHAR[]), '{}')) AS n FROM (SELECT 1)", "| 0 " ; "coalesce_empty_pg_array_literal")]
+    #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR[]), '{a, b, \"c,d\", NULL}') AS v FROM (SELECT 1)", "[a, b, c,d, ]" ; "coalesce_nonempty_pg_array_literal")]
+    // No list-typed arg → rule must not fire; plain string coalesce still works.
+    #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR), '{}') AS v FROM (SELECT 1)", "{}" ; "non_array_string_untouched")]
     #[tokio::test]
-    async fn coalesce_empty_pg_array_literal() {
-        let ctx = ctx_with_rule();
-        // cardinality(empty list) = 0 — asserts the actual coalesced value,
-        // not merely that planning succeeded.
-        let out = one_string(&ctx, "SELECT cardinality(COALESCE(CAST(NULL AS VARCHAR[]), '{}')) AS n FROM (SELECT 1)").await;
-        assert!(out.contains("| 0 "), "{out}");
-    }
-
-    #[tokio::test]
-    async fn coalesce_nonempty_pg_array_literal() {
-        let ctx = ctx_with_rule();
-        let out = one_string(&ctx, "SELECT COALESCE(CAST(NULL AS VARCHAR[]), '{a, b, \"c,d\", NULL}') AS v FROM (SELECT 1)").await;
-        assert!(out.contains("[a, b, c,d, ]"), "{out}");
-    }
-
-    #[tokio::test]
-    async fn non_array_string_untouched() {
-        let ctx = ctx_with_rule();
-        // No list-typed arg → rule must not fire; plain string coalesce still works.
-        let out = one_string(&ctx, "SELECT COALESCE(CAST(NULL AS VARCHAR), '{}') AS v FROM (SELECT 1)").await;
-        assert!(out.contains("{}"), "{out}");
-    }
-
-    // Analyzer rules run at physical planning, so the error may surface at
-    // sql() or collect() — either way it must never execute successfully.
-    async fn expect_plan_error(ctx: &SessionContext, sql: &str) -> String {
-        match ctx.sql(sql).await {
-            Err(e) => e.to_string(),
-            Ok(df) => df.collect().await.expect_err("query must fail planning").to_string(),
-        }
+    async fn coalesce_evaluates_to(sql: &str, want: &str) {
+        let batches = ctx_with_rule().sql(sql).await.expect("plan ok").collect().await.expect("exec ok");
+        let out = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string();
+        assert!(out.contains(want), "{sql}\n{out}");
     }
 
     // arrow-cast's blanket `(_, List)` rule casts ANY type to a list by
     // wrapping each value in a single-element list, so without an explicit
     // guard these queries would silently return `[varchar_value]` instead of
     // failing like PG ("COALESCE types ... cannot be matched").
+    #[test_case::test_case("SELECT COALESCE(v, l) FROM (SELECT CAST('x' AS VARCHAR) AS v, CAST(NULL AS VARCHAR[]) AS l)" ; "coalesce_string_column_with_list_errors")]
+    #[test_case::test_case("SELECT COALESCE(CAST(NULL AS VARCHAR[]), 'not-an-array') FROM (SELECT 1)" ; "coalesce_unparseable_literal_with_list_errors")]
     #[tokio::test]
-    async fn coalesce_string_column_with_list_errors() {
+    async fn coalesce_with_list_arg_errors(sql: &str) {
+        // Analyzer rules run at physical planning, so the error may surface at
+        // sql() or collect() — either way it must never execute successfully.
         let ctx = ctx_with_rule();
-        let err = expect_plan_error(&ctx, "SELECT COALESCE(v, l) FROM (SELECT CAST('x' AS VARCHAR) AS v, CAST(NULL AS VARCHAR[]) AS l)").await;
-        assert!(err.contains("cannot be matched"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn coalesce_unparseable_literal_with_list_errors() {
-        let ctx = ctx_with_rule();
-        let err = expect_plan_error(&ctx, "SELECT COALESCE(CAST(NULL AS VARCHAR[]), 'not-an-array') FROM (SELECT 1)").await;
-        assert!(err.contains("cannot be matched"), "{err}");
+        let err = match ctx.sql(sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => df.collect().await.expect_err("query must fail planning").to_string(),
+        };
+        assert!(err.contains("cannot be matched"), "{sql}\n{err}");
     }
 
     // Guards the leaf-node path in rewrite_in_plan: a TableScan carrying a
@@ -2018,28 +1922,32 @@ mod pg_array_literal_rewriter_tests {
         assert!(matches!(f.args[1], Expr::Literal(ScalarValue::List(_), _)), "array literal in TableScan filter not rewritten: {:?}", f.args[1]);
     }
 
-    #[test]
-    fn pg_array_parse_shapes() {
-        assert_eq!(parse_pg_string_array("{}"), Some(vec![]));
-        assert_eq!(parse_pg_string_array("{a,b}"), Some(vec![Some("a".into()), Some("b".into())]));
-        assert_eq!(parse_pg_string_array(r#"{"a,b", c }"#), Some(vec![Some("a,b".into()), Some("c".into())]));
-        assert_eq!(parse_pg_string_array("{NULL,\"NULL\"}"), Some(vec![None, Some("NULL".into())]));
-        // Chars between a closing quote and the next comma are dropped — PG
-        // rejects these literals outright; we parse leniently and keep the
-        // quoted value. Pinned so the behavior is intentional, not accidental.
-        assert_eq!(parse_pg_string_array("{\"a\"x,b}"), Some(vec![Some("a".into()), Some("b".into())]));
-        // The mirror case — non-whitespace BEFORE an opening quote — is also
-        // PG-invalid; we leniently concatenate. Pinned for the same reason.
-        assert_eq!(parse_pg_string_array("{a\"b\"}"), Some(vec![Some("ab".into())]));
-        // Lone backslash at end of input (inside quotes, escaping nothing):
-        // chars.next()? propagates None → arg left unrewritten → the
-        // string-arg guard errors (never a panic or a half-parsed list).
-        assert_eq!(parse_pg_string_array("{\"a\\}"), None);
-        // Multi-dimensional literals are rejected, not silently flattened;
-        // braces inside quotes are ordinary element text.
-        assert_eq!(parse_pg_string_array("{{a},{b}}"), None);
-        assert_eq!(parse_pg_string_array(r#"{"{x}",y}"#), Some(vec![Some("{x}".into()), Some("y".into())]));
-        assert_eq!(parse_pg_string_array("plain"), None);
+    fn elems(v: &[Option<&str>]) -> Option<Vec<Option<String>>> {
+        Some(v.iter().map(|e| e.map(str::to_string)).collect())
+    }
+
+    #[test_case::test_case("{}" => elems(&[]) ; "empty literal")]
+    #[test_case::test_case("{a,b}" => elems(&[Some("a"), Some("b")]) ; "bare elements")]
+    #[test_case::test_case(r#"{"a,b", c }"# => elems(&[Some("a,b"), Some("c")]) ; "quoted comma, unquoted element trimmed")]
+    #[test_case::test_case("{NULL,\"NULL\"}" => elems(&[None, Some("NULL")]) ; "unquoted NULL is null, quoted NULL is text")]
+    // Chars between a closing quote and the next comma are dropped — PG
+    // rejects these literals outright; we parse leniently and keep the
+    // quoted value. Pinned so the behavior is intentional, not accidental.
+    #[test_case::test_case("{\"a\"x,b}" => elems(&[Some("a"), Some("b")]) ; "trailing junk after a closing quote is dropped")]
+    // The mirror case — non-whitespace BEFORE an opening quote — is also
+    // PG-invalid; we leniently concatenate. Pinned for the same reason.
+    #[test_case::test_case("{a\"b\"}" => elems(&[Some("ab")]) ; "text before an opening quote is concatenated")]
+    // Lone backslash at end of input (inside quotes, escaping nothing):
+    // chars.next()? propagates None → arg left unrewritten → the
+    // string-arg guard errors (never a panic or a half-parsed list).
+    #[test_case::test_case("{\"a\\}" => None ; "lone trailing backslash")]
+    // Multi-dimensional literals are rejected, not silently flattened;
+    // braces inside quotes are ordinary element text.
+    #[test_case::test_case("{{a},{b}}" => None ; "multi-dimensional literal rejected")]
+    #[test_case::test_case(r#"{"{x}",y}"# => elems(&[Some("{x}"), Some("y")]) ; "braces inside quotes are element text")]
+    #[test_case::test_case("plain" => None ; "not brace-delimited")]
+    fn pg_array_parse_shapes(s: &str) -> Option<Vec<Option<String>>> {
+        parse_pg_string_array(s)
     }
 }
 
@@ -2398,69 +2306,58 @@ mod ordered_union_for_topk_tests {
         (Arc::new(SortExec::new(ord.clone(), union).with_fetch(fetch)), ord)
     }
 
+    /// Runs `ordered_children` over one `MockLeaf` per `ordered` flag (`true` =
+    /// advertises `[ts DESC]`, i.e. a sorted Delta scan) and reports, per leg,
+    /// how many `SortExec`s the rewrite left — `None` when it declined to
+    /// rewrite at all.
+    fn ordered_children_sorts(ordered: &[bool], sortable: &[bool], require_ordered_child: bool) -> Option<Vec<usize>> {
+        let (s, ord) = (schema(), ts_desc());
+        let legs: Vec<Arc<dyn ExecutionPlan>> = ordered.iter().map(|o| MockLeaf::leaf(s.clone(), o.then(|| ord.clone()))).collect();
+        ordered_children(&legs, &ord, None, sortable, require_ordered_child).unwrap().map(|out| out.iter().map(count_sorts).collect())
+    }
+
     // Bug: `ORDER BY timestamp DESC LIMIT n` over a mem∪delta union re-sorts the
     // whole window because the MemBuffer branch advertises no ordering, so the
     // union is unordered and the delta scan can't early-terminate. The rule must
-    // sort the mem branch to match delta's advertised ordering.
-    #[test]
-    fn wraps_unordered_mem_branch_of_fetching_sort() {
-        let (top, ord) = fetching_sort_over_union(true, Some(50));
-
-        let out = OrderedUnionForTopK.optimize(top, &ConfigOptions::new()).unwrap();
-
-        // The union is now order-preserving: it advertises [ts DESC].
-        assert!(
-            out.children()[0].properties().equivalence_properties().ordering_satisfy(ord.iter().cloned()).unwrap(),
-            "union must advertise the sort ordering after the rule runs"
-        );
-        // Top sort + one injected mem sort = 2 SortExecs.
-        assert_eq!(count_sorts(&out), 2, "exactly one SortExec injected over the mem branch");
-    }
-
+    // sort the mem branch to match delta's advertised ordering — top sort + one
+    // injected mem sort = 2 SortExecs.
+    #[test_case::test_case(true, Some(50) => 2 ; "exactly one SortExec injected over the unordered mem branch")]
     // Guard: no fetch (plain ORDER BY, no LIMIT) → rule must not touch the plan,
     // so counts/aggregations and unbounded sorts don't grow a MemBuffer sort.
-    #[test]
-    fn ignores_sort_without_fetch() {
-        let (top, _) = fetching_sort_over_union(true, None);
+    #[test_case::test_case(true, None => 1 ; "no injection when there is no fetch")]
+    // Guard: when no child is ordered (Delta pushdown off during mixed-footer
+    // rollout) the rule is a no-op — the built-in blocking sort stays.
+    #[test_case::test_case(false, Some(50) => 1 ; "no injection when neither branch is ordered")]
+    fn topk_rule_sorts_mem_branch_only_when_it_can_merge(delta_ordered: bool, fetch: Option<usize>) -> usize {
+        let (top, ord) = fetching_sort_over_union(delta_ordered, fetch);
         let out = OrderedUnionForTopK.optimize(top, &ConfigOptions::new()).unwrap();
-        assert_eq!(count_sorts(&out), 1, "no injection when there is no fetch");
+        let sorts = count_sorts(&out);
+        if sorts == 2 {
+            // The union is now order-preserving: it advertises [ts DESC].
+            assert!(
+                out.children()[0].properties().equivalence_properties().ordering_satisfy(ord.iter().cloned()).unwrap(),
+                "union must advertise the sort ordering after the rule runs"
+            );
+        }
+        sorts
     }
 
     // `ordered_children` is also called directly by `ProjectRoutingTable::scan`
     // (merge-on-read), with `sortable` marking the cheap in-memory legs and
-    // `require_ordered_child = false`. Both guards must hold: an unsortable
-    // unordered leg (a whole-window Delta scan) aborts the whole rewrite, and a
-    // MemBuffer-only scan with no ordered leg at all still gets sorted.
-    #[test]
-    fn ordered_children_honours_sortable_and_lone_leg() {
-        let (s, ord) = (schema(), ts_desc());
-        let mem = MockLeaf::leaf(s.clone(), None);
-        let delta_ordered = MockLeaf::leaf(s.clone(), Some(ord.clone()));
-        let delta_unordered = MockLeaf::leaf(s.clone(), None);
-
-        // mem (sortable) ∪ delta (ordered) → mem gets sorted.
-        let out = ordered_children(&[mem.clone(), delta_ordered], &ord, None, &[true, false], false).unwrap().expect("mixed union is rewritten");
-        assert_eq!(count_sorts(&out[0]), 1, "the mem leg is sorted");
-        assert_eq!(count_sorts(&out[1]), 0, "the already-ordered Delta leg is untouched");
-
-        // mem (sortable) ∪ delta (UNORDERED, unsortable) → bail entirely: a
-        // blocking sort over a whole-window parquet scan is the 2026-07-21 OOM.
-        assert!(ordered_children(&[mem.clone(), delta_unordered], &ord, None, &[true, false], false).unwrap().is_none());
-
-        // A lone unordered mem leg: nothing to merge toward, but it is exactly
-        // where a fresh version append lives, so it is still sorted.
-        assert!(ordered_children(std::slice::from_ref(&mem), &ord, None, &[true], false).unwrap().is_some());
-        // ...unless the caller is the top-K rule, which requires an ordered peer.
-        assert!(ordered_children(std::slice::from_ref(&mem), &ord, None, &[true], true).unwrap().is_none());
-    }
-
-    // Guard: when no child is ordered (Delta pushdown off during mixed-footer
-    // rollout) the rule is a no-op — the built-in blocking sort stays.
-    #[test]
-    fn ignores_union_with_no_ordered_child() {
-        let (top, _) = fetching_sort_over_union(false, Some(50));
-        let out = OrderedUnionForTopK.optimize(top, &ConfigOptions::new()).unwrap();
-        assert_eq!(count_sorts(&out), 1, "no injection when neither branch is ordered");
+    // `require_ordered_child = false`.
+    //
+    // mem (sortable) ∪ delta (ordered) → mem gets sorted, delta untouched.
+    #[test_case::test_case(&[false, true], &[true, false], false => Some(vec![1, 0]) ; "mixed union: only the mem leg is sorted")]
+    // mem (sortable) ∪ delta (UNORDERED, unsortable) → bail entirely: a
+    // blocking sort over a whole-window parquet scan is the 2026-07-21 OOM.
+    #[test_case::test_case(&[false, false], &[true, false], false => None ; "an unsortable unordered leg aborts the whole rewrite")]
+    // A lone unordered mem leg: nothing to merge toward, but it is exactly
+    // where a fresh version append lives, so it is still sorted...
+    #[test_case::test_case(&[false], &[true], false => Some(vec![1]) ; "a lone sortable leg is still sorted")]
+    // ...unless the caller is the top-K rule, which requires an ordered peer.
+    #[test_case::test_case(&[false], &[true], true => None ; "require_ordered_child declines a lone leg with no ordered peer")]
+    fn ordered_children_honours_sortable_and_lone_leg(ordered: &[bool], sortable: &[bool], require_ordered_child: bool) -> Option<Vec<usize>> {
+        ordered_children_sorts(ordered, sortable, require_ordered_child)
     }
 }
 
@@ -2630,64 +2527,42 @@ mod row_to_json_record_tests {
 
     use super::*;
 
-    fn rewritten(sql: &str) -> String {
+    /// `Some(rewritten SQL)` when the rule fired, `None` when it declined.
+    fn rewrite_sql(sql: &str) -> Option<String> {
         let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
-        let changed = rewrite(&mut statements[0]);
-        assert!(changed, "expected a rewrite for: {sql}");
-        statements[0].to_string()
+        rewrite(&mut statements[0]).then(|| statements[0].to_string())
     }
 
-    #[test]
-    fn bare_alias_becomes_named_struct_in_declared_order() {
-        let sql = rewritten(r#"SELECT row_to_json(t) FROM (SELECT 1 AS "total", 2 AS "active") t"#);
-        assert!(sql.contains(r#"named_struct('total', t."total", 'active', t."active")"#), "got: {sql}");
-    }
-
-    /// pgAdmin schema-qualifies the call.
-    #[test]
-    fn qualified_pg_catalog_call_is_rewritten() {
-        let sql = rewritten(r#"SELECT pg_catalog.row_to_json(t) FROM (SELECT 1 AS "a") t"#);
-        assert!(sql.contains("named_struct('a', t.\"a\")"), "got: {sql}");
-        // A schema-qualified UDF name does not resolve in DataFusion.
-        assert!(!sql.contains("pg_catalog.row_to_json"), "qualifier must be stripped: {sql}");
-    }
-
-    /// The shape prod actually sends: one branch per chart, UNION ALL. A visitor
-    /// that only matches `query.body == Select` silently skips every branch.
-    #[test]
-    fn every_union_branch_is_rewritten() {
-        let sql = rewritten(
-            r#"SELECT 'a' AS chart_name, pg_catalog.row_to_json(t) AS chart_data FROM (SELECT 1 AS "Total") t
+    #[test_case::test_case(r#"SELECT row_to_json(t) FROM (SELECT 1 AS "total", 2 AS "active") t"#,
+        &[r#"named_struct('total', t."total", 'active', t."active")"#], &[] ; "bare alias becomes named_struct in declared order")]
+    // pgAdmin schema-qualifies the call; a schema-qualified UDF name does not resolve in DataFusion.
+    #[test_case::test_case(r#"SELECT pg_catalog.row_to_json(t) FROM (SELECT 1 AS "a") t"#,
+        &["named_struct('a', t.\"a\")"], &["pg_catalog.row_to_json"] ; "qualified pg_catalog call is rewritten")]
+    // The shape prod actually sends: one branch per chart, UNION ALL. A visitor
+    // that only matches `query.body == Select` silently skips every branch.
+    #[test_case::test_case(r#"SELECT 'a' AS chart_name, pg_catalog.row_to_json(t) AS chart_data FROM (SELECT 1 AS "Total") t
                UNION ALL
                SELECT 'b' AS chart_name, pg_catalog.row_to_json(t) AS chart_data FROM (SELECT 2 AS "Active") t"#,
-        );
-        assert!(sql.contains(r#"named_struct('Total', t."Total")"#), "first branch: {sql}");
-        assert!(sql.contains(r#"named_struct('Active', t."Active")"#), "second branch: {sql}");
-        assert!(!sql.contains("row_to_json(t)"), "no branch may keep the bare alias: {sql}");
+        &[r#"named_struct('Total', t."Total")"#, r#"named_struct('Active', t."Active")"#], &["row_to_json(t)"] ; "every union branch is rewritten")]
+    fn rewrites_record_calls(sql: &str, wants: &[&str], forbids: &[&str]) {
+        let out = rewrite_sql(sql).unwrap_or_else(|| panic!("expected a rewrite for: {sql}"));
+        for want in wants {
+            assert!(out.contains(want), "missing {want}: {out}");
+        }
+        for forbid in forbids {
+            assert!(!out.contains(forbid), "must not contain {forbid}: {out}");
+        }
     }
 
-    fn unchanged(sql: &str) {
-        let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
-        assert!(!rewrite(&mut statements[0]), "should not rewrite: {sql}");
-    }
-
-    /// An unnamed column has no name to key the object by; guessing one would be
-    /// worse than the planning error the user already gets.
-    #[test]
-    fn unaliased_derived_column_is_left_alone() {
-        unchanged("SELECT row_to_json(t) FROM (SELECT count(*), 1 AS b) t");
-    }
-
-    /// `row_to_json(some_column)` is an ordinary call on a value, not a record.
-    #[test]
-    fn non_relation_identifier_is_left_alone() {
-        unchanged("SELECT row_to_json(payload) FROM events");
-    }
-
-    /// A real table alias is not a derived table: its columns are not in the AST.
-    #[test]
-    fn plain_table_alias_is_left_alone() {
-        unchanged("SELECT row_to_json(t) FROM some_table t");
+    // An unnamed column has no name to key the object by; guessing one would be
+    // worse than the planning error the user already gets.
+    #[test_case::test_case("SELECT row_to_json(t) FROM (SELECT count(*), 1 AS b) t" => None ; "unaliased derived column is left alone")]
+    // `row_to_json(some_column)` is an ordinary call on a value, not a record.
+    #[test_case::test_case("SELECT row_to_json(payload) FROM events" => None ; "non-relation identifier is left alone")]
+    // A real table alias is not a derived table: its columns are not in the AST.
+    #[test_case::test_case("SELECT row_to_json(t) FROM some_table t" => None ; "plain table alias is left alone")]
+    fn declines_to_rewrite(sql: &str) -> Option<String> {
+        rewrite_sql(sql)
     }
 }
 
@@ -2807,72 +2682,34 @@ mod exists_in_projection_tests {
         ctx
     }
 
-    /// The failure this rule exists for: physical planning rejects a projection
-    /// EXISTS outright, so the rewrite is what makes the query runnable at all.
+    // The failure this rule exists for: physical planning rejects a projection
+    // EXISTS outright, so the rewrite is what makes the query runnable at all.
+    #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 1) AS present FROM outer_t ORDER BY id"
+        => Ok(vec![true, false]) ; "correlated exists in a projection plans and evaluates: id=1 has a match, id=2 does not")]
+    #[test_case::test_case("SELECT id, NOT EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id) AS absent FROM outer_t ORDER BY id"
+        => Ok(vec![false, true]) ; "negated exists inverts: id=1 matches so absent=false; id=2 absent=true")]
+    // Boundary guard. `LIMIT 1 OFFSET 5` asks whether at least SIX rows exist,
+    // so peeling it would silently change the answer. Such a subquery keeps its
+    // Limit and still fails to plan — the honest outcome. If someone later
+    // makes this case pass, it must be by counting past the offset
+    // (`count > skip`), never by dropping the offset.
+    #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 1 OFFSET 5) AS present FROM outer_t"
+        => matches Err(_) ; "offset is not peeled and is never answered wrongly: an offset EXISTS must error rather than return a wrong answer")]
+    // `LIMIT 0` can never produce a row, so EXISTS folds to a constant.
+    #[test_case::test_case("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 0) AS present FROM outer_t"
+        => Ok(vec![false, false]) ; "limit zero folds to false")]
     #[tokio::test]
-    async fn correlated_exists_in_a_projection_plans_and_evaluates() {
-        let batches = ctx()
-            .await
-            .sql("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 1) AS present FROM outer_t ORDER BY id")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let flags = batches
+    async fn exists_in_a_projection(sql: &str) -> std::result::Result<Vec<bool>, String> {
+        // `sql()` must always succeed: the offset case is expected to plan
+        // logically and fail later, not to fail at parse time.
+        let batches = ctx().await.sql(sql).await.expect("logical planning must succeed").collect().await.map_err(|e| e.to_string())?;
+        Ok(batches
             .iter()
             .flat_map(|batch| {
                 let column = datafusion::arrow::array::AsArray::as_boolean(batch.column(1));
                 (0..batch.num_rows()).map(|row| column.value(row)).collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>();
-        assert_eq!(flags, vec![true, false], "id=1 has a match, id=2 does not");
-    }
-
-    #[tokio::test]
-    async fn negated_exists_inverts() {
-        let batches = ctx()
-            .await
-            .sql("SELECT id, NOT EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id) AS absent FROM outer_t ORDER BY id")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let column = datafusion::arrow::array::AsArray::as_boolean(batches[0].column(1));
-        assert!(!column.value(0) && column.value(1), "id=1 matches so absent=false; id=2 absent=true");
-    }
-
-    /// Boundary guard. `LIMIT 1 OFFSET 5` asks whether at least SIX rows exist,
-    /// so peeling it would silently change the answer. Such a subquery keeps its
-    /// Limit and still fails to plan — the honest outcome. If someone later
-    /// makes this case pass, it must be by counting past the offset
-    /// (`count > skip`), never by dropping the offset.
-    #[tokio::test]
-    async fn offset_is_not_peeled_and_is_never_answered_wrongly() {
-        let result = ctx()
-            .await
-            .sql("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 1 OFFSET 5) AS present FROM outer_t")
-            .await
-            .unwrap()
-            .collect()
-            .await;
-        assert!(result.is_err(), "an offset EXISTS must error rather than return a wrong answer");
-    }
-
-    /// `LIMIT 0` can never produce a row, so EXISTS folds to a constant.
-    #[tokio::test]
-    async fn limit_zero_folds_to_false() {
-        let batches = ctx()
-            .await
-            .sql("SELECT id, EXISTS (SELECT 1 FROM inner_t WHERE fk = outer_t.id LIMIT 0) AS present FROM outer_t")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let column = datafusion::arrow::array::AsArray::as_boolean(batches[0].column(1));
-        assert!((0..batches[0].num_rows()).all(|row| !column.value(row)));
+            .collect())
     }
 }
 
@@ -3000,11 +2837,26 @@ mod wildcard_fn_arg_expander_tests {
         batches[0].column(0).as_any().downcast_ref::<StringViewArray>().expect("StringViewArray").value(0).to_string()
     }
 
-    /// End-to-end: the exact shape monoscope wants — `jsonb_build_array(sub.*)`
-    /// expands to the inner SELECT's column values in declared order.
+    // End-to-end: the exact shape monoscope wants — `jsonb_build_array(sub.*)`
+    // expands to the inner SELECT's column values in declared order.
+    #[test_case::test_case("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a, 'x' AS b, true AS c) sub"
+        => r#"[1,"x",true]"#.to_string() ; "qualified wildcard expands in declared column order")]
+    // Two qualifiers in one call — schema lookup must handle each independently
+    // and concatenate the column lists in argument order.
+    #[test_case::test_case("SELECT jsonb_build_array(a.*, b.*) FROM (SELECT 1 AS x, 2 AS y) a CROSS JOIN (SELECT 'p' AS p, 'q' AS q) b"
+        => r#"[1,2,"p","q"]"#.to_string() ; "multiple qualifiers in one call concatenate in argument order")]
+    // Mixed wildcard and literal args — non-wildcard args must be preserved in
+    // their original position; the expansion only replaces the wildcard slot.
+    #[test_case::test_case("SELECT jsonb_build_array(0, sub.*, 99) FROM (SELECT 1 AS a, 2 AS b) sub"
+        => "[0,1,2,99]".to_string() ; "mixes wildcard with other args, positions preserved")]
+    // `outer(inner(sub.*))` — transform_up visits the inner ScalarFunction first,
+    // so the wildcard expansion has to happen there, and the outer call then sees
+    // the resolved column args.
+    #[test_case::test_case("SELECT jsonb_build_array(jsonb_build_array(sub.*)) FROM (SELECT 1 AS a, 2 AS b) sub"
+        => "[[1,2]]".to_string() ; "nested function calls expand inside out")]
     #[tokio::test]
-    async fn jsonb_build_array_expands_qualified_wildcard() {
-        assert_eq!(first_json("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a, 'x' AS b, true AS c) sub").await, r#"[1,"x",true]"#);
+    async fn expands_wildcard_fn_args(sql: &str) -> String {
+        first_json(sql).await
     }
 
     /// `sub` doesn't exist at this scope — DataFusion's SQL planner catches this
@@ -3017,34 +2869,6 @@ mod wildcard_fn_arg_expander_tests {
         let err = ctx.sql("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a) other").await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Invalid qualifier sub"), "msg: {msg}");
-    }
-
-    /// Two qualifiers in one call — schema lookup must handle each independently
-    /// and concatenate the column lists in argument order.
-    #[tokio::test]
-    async fn multiple_qualifiers_in_one_call() {
-        let json = first_json(
-            "SELECT jsonb_build_array(a.*, b.*) \
-             FROM (SELECT 1 AS x, 2 AS y) a \
-             CROSS JOIN (SELECT 'p' AS p, 'q' AS q) b",
-        )
-        .await;
-        assert_eq!(json, r#"[1,2,"p","q"]"#);
-    }
-
-    /// Mixed wildcard and literal args — non-wildcard args must be preserved in
-    /// their original position; the expansion only replaces the wildcard slot.
-    #[tokio::test]
-    async fn mixes_wildcard_with_other_args() {
-        assert_eq!(first_json("SELECT jsonb_build_array(0, sub.*, 99) FROM (SELECT 1 AS a, 2 AS b) sub").await, r#"[0,1,2,99]"#);
-    }
-
-    /// `outer(inner(sub.*))` — transform_up visits the inner ScalarFunction first,
-    /// so the wildcard expansion has to happen there, and the outer call then sees
-    /// the resolved column args.
-    #[tokio::test]
-    async fn nested_function_calls_expand_inside_out() {
-        assert_eq!(first_json("SELECT jsonb_build_array(jsonb_build_array(sub.*)) FROM (SELECT 1 AS a, 2 AS b) sub").await, r#"[[1,2]]"#);
     }
 }
 
@@ -3175,24 +2999,29 @@ mod defer_expensive_projection_tests {
         (logical, physical)
     }
 
-    async fn optimized_plan(sql: &str, with_rule: bool) -> String {
-        plans(sql, with_rule).await.0
+    const TOPK_SQL: &str = "SELECT concat(id, name) FROM t ORDER BY timestamp DESC LIMIT 5";
+
+    /// True when EVERY `concat` sits above `Sort:` in the optimized logical plan,
+    /// i.e. the expensive expr is evaluated on the TopK output, not the window.
+    #[test_case::test_case(TOPK_SQL, false => false ; "baseline evaluates concat below Sort, for every row in the window")]
+    #[test_case::test_case(TOPK_SQL, true => true ; "defers expensive projection past topk")]
+    // Sort keys that reference an expensive projection output must be inlined
+    // below the sort, and the query still plannable.
+    #[test_case::test_case("SELECT upper(name) AS u, concat(id, name) FROM t ORDER BY u DESC LIMIT 3", true => true ; "inlines expensive sort key")]
+    // No fetch → no rewrite (nothing to win without a TopK).
+    #[test_case::test_case("SELECT concat(id, name) FROM t ORDER BY timestamp DESC", true => false ; "leaves unfetched sort alone")]
+    #[tokio::test]
+    async fn concat_is_deferred_above_the_sort(sql: &str, with_rule: bool) -> bool {
+        let plan = plans(sql, with_rule).await.0;
+        let sort = plan.find("Sort:").expect(&plan);
+        plan.rfind("concat").expect(&plan) < sort
     }
 
     /// Regression guard for the prod OOM: jsonb-style row building must not
-    /// run below the TopK. Without the rule, the expensive expr sits under
-    /// `Sort`, i.e. it is evaluated for every row in the window.
+    /// run below the TopK — and the win must survive physical planning.
     #[tokio::test]
     async fn defers_expensive_projection_past_topk() {
-        let sql = "SELECT concat(id, name) FROM t ORDER BY timestamp DESC LIMIT 5";
-        let before = optimized_plan(sql, false).await;
-        let (b_sort, b_concat) = (before.find("Sort:").unwrap(), before.rfind("concat").unwrap());
-        assert!(b_concat > b_sort, "baseline should evaluate concat below Sort:\n{before}");
-
-        let (after, phys) = plans(sql, true).await;
-        let sort_pos = after.find("Sort:").expect(&after);
-        let concat_pos = after.find("concat").expect(&after);
-        assert!(concat_pos < sort_pos, "expensive expr must be above the TopK sort:\n{after}");
+        let (after, phys) = plans(TOPK_SQL, true).await;
         assert!(after.contains("fetch=5"), "TopK fetch must survive the rewrite:\n{after}");
         // The physical ProjectionPushdown rule must not push the expensive
         // projection back below SortExec (it can only do so when the sort key
@@ -3200,25 +3029,6 @@ mod defer_expensive_projection_tests {
         let p_sort = phys.find("SortExec").expect(&phys);
         assert!(phys.find("concat").expect(&phys) < p_sort, "physical plan must keep concat above SortExec:\n{phys}");
         assert!(phys.contains("TopK"), "SortExec must run as TopK:\n{phys}");
-    }
-
-    /// Sort keys that reference an expensive projection output must be
-    /// inlined below the sort, and the query still plannable.
-    #[tokio::test]
-    async fn inlines_expensive_sort_key() {
-        let sql = "SELECT upper(name) AS u, concat(id, name) FROM t ORDER BY u DESC LIMIT 3";
-        let after = optimized_plan(sql, true).await;
-        let sort_pos = after.find("Sort:").expect(&after);
-        assert!(after.rfind("concat").unwrap() < sort_pos, "concat must be deferred:\n{after}");
-    }
-
-    /// No fetch → no rewrite (nothing to win without a TopK).
-    #[tokio::test]
-    async fn leaves_unfetched_sort_alone() {
-        let sql = "SELECT concat(id, name) FROM t ORDER BY timestamp DESC";
-        let after = optimized_plan(sql, true).await;
-        let sort_pos = after.find("Sort:").expect(&after);
-        assert!(after.rfind("concat").unwrap() > sort_pos, "plain sort should be untouched:\n{after}");
     }
 }
 
@@ -3318,44 +3128,32 @@ mod dedup_needs_ordered_input_tests {
         Arc::new(DedupExec::with_tiebreak(child, vec!["ts".into(), "id".into()], None, None).unwrap().requiring(requiring))
     }
 
+    /// Leading alphanumeric run of the child's Debug — the exec's type name.
     fn child_name(plan: &Arc<dyn ExecutionPlan>) -> String {
-        format!("{:?}", plan.children()[0]).split_whitespace().next().unwrap_or_default().to_string()
+        format!("{:?}", plan.children()[0]).split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_string()
     }
 
-    #[test]
-    fn restores_the_merge_a_constant_sort_column_let_the_planner_discharge() {
-        // The shape a `timestamp = '...'` point lookup reaches execute with: DedupExec needs
-        // run structure, but its input is a coalesce that interleaves partitions, so
-        // `detect_bound` finds no ordering and the operator buffers the whole scan.
-        let coalesced = Arc::new(CoalescePartitionsExec::new(ordered_source())) as Arc<dyn ExecutionPlan>;
-        let plan = dedup_over(coalesced, Some(ts_ordering()));
-        assert!(child_name(&plan).contains("CoalescePartitionsExec"), "precondition");
+    // `coalesced` picks the input exec; `requires_order` is whether the DedupExec declares a
+    // required ordering. The precondition (input is what we asked for) is asserted in the body.
+    //
+    // The shape a `timestamp = '...'` point lookup reaches execute with: DedupExec needs run
+    // structure, but its input is a coalesce that interleaves partitions, so `detect_bound`
+    // finds no ordering and the operator buffers the whole scan.
+    #[test_case::test_case(true, true => "SortPreservingMergeExec" ; "restores the merge a constant sort column let the planner discharge")]
+    // No declared ordering = keep-greatest dormant (no `version_append`). Forcing a merge there
+    // would charge every scan of such a table for a property nothing consumes.
+    #[test_case::test_case(true, false => "CoalescePartitionsExec" ; "leaves an ordering agnostic dedup alone")]
+    #[test_case::test_case(false, true => "SortPreservingMergeExec" ; "leaves an already merged dedup alone")]
+    fn rewrites_dedup_input(coalesced: bool, requires_order: bool) -> String {
+        let child: Arc<dyn ExecutionPlan> = if coalesced {
+            Arc::new(CoalescePartitionsExec::new(ordered_source()))
+        } else {
+            Arc::new(SortPreservingMergeExec::new(ts_ordering(), ordered_source()))
+        };
+        let plan = dedup_over(child, requires_order.then(ts_ordering));
+        assert_eq!(child_name(&plan), if coalesced { "CoalescePartitionsExec" } else { "SortPreservingMergeExec" }, "precondition");
 
-        let fixed = DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap();
-
-        assert!(child_name(&fixed).contains("SortPreservingMergeExec"), "coalesce must become an order-preserving merge, got: {}", child_name(&fixed));
-    }
-
-    #[test]
-    fn leaves_an_ordering_agnostic_dedup_alone() {
-        // No declared ordering = keep-greatest dormant (no `version_append`). Forcing a merge
-        // there would charge every scan of such a table for a property nothing consumes.
-        let coalesced = Arc::new(CoalescePartitionsExec::new(ordered_source())) as Arc<dyn ExecutionPlan>;
-        let plan = dedup_over(coalesced, None);
-
-        let out = DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap();
-
-        assert!(child_name(&out).contains("CoalescePartitionsExec"), "must stay a coalesce, got: {}", child_name(&out));
-    }
-
-    #[test]
-    fn leaves_an_already_merged_dedup_alone() {
-        let merged = Arc::new(SortPreservingMergeExec::new(ts_ordering(), ordered_source())) as Arc<dyn ExecutionPlan>;
-        let plan = dedup_over(merged, Some(ts_ordering()));
-
-        let out = DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap();
-
-        assert!(child_name(&out).contains("SortPreservingMergeExec"));
+        child_name(&DedupNeedsOrderedInput.optimize(plan, &ConfigOptions::default()).unwrap())
     }
 }
 
@@ -3622,23 +3420,19 @@ mod range_parallel_dedup_tests {
     /// The rewrite assumes "rows of sub-range A" == "the window's rows restricted
     /// to A". Every shape here breaks that, or has nothing to gain, so each must
     /// come back byte-identical to the un-ruled plan.
+    /// `{W}` in a case is the wide window; everything else is the shape under test.
+    // count(*) over a LIMIT would become branches x limit rows.
+    #[test_case::test_case("SELECT count(*) FROM (SELECT * FROM t WHERE {W} LIMIT 100)" ; "limit under the aggregate")]
+    // No aggregate: splitting costs the streaming TopK its ordering.
+    #[test_case::test_case("SELECT id FROM t WHERE {W} ORDER BY timestamp DESC LIMIT 5" ; "order by with limit")]
+    // Narrow enough that one thread is comfortably inside the timeout.
+    #[test_case::test_case("SELECT count(*) FROM t WHERE timestamp >= '2026-09-01T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp" ; "span below the threshold")]
+    // An open upper bound has no finite span to divide.
+    #[test_case::test_case("SELECT count(*) FROM t WHERE timestamp >= '2026-08-05T00:00:00Z'::timestamp" ; "half-open window")]
     #[tokio::test]
-    async fn declines_where_a_split_would_change_the_answer() {
-        for (name, sql) in [
-            // count(*) over a LIMIT would become branches x limit rows.
-            ("limit under the aggregate", format!("SELECT count(*) FROM (SELECT * FROM t WHERE {WIDE} LIMIT 100)")),
-            // No aggregate: splitting costs the streaming TopK its ordering.
-            ("order by with limit", format!("SELECT id FROM t WHERE {WIDE} ORDER BY timestamp DESC LIMIT 5")),
-            // Narrow enough that one thread is comfortably inside the timeout.
-            (
-                "span below the threshold",
-                "SELECT count(*) FROM t WHERE timestamp >= '2026-09-01T00:00:00Z'::timestamp AND timestamp <= '2026-09-04T00:00:00Z'::timestamp".into(),
-            ),
-            // An open upper bound has no finite span to divide.
-            ("half-open window", "SELECT count(*) FROM t WHERE timestamp >= '2026-08-05T00:00:00Z'::timestamp".into()),
-        ] {
-            assert_eq!(optimized(&sql, true).await, optimized(&sql, false).await, "{name}: must not rewrite");
-        }
+    async fn declines_where_a_split_would_change_the_answer(sql: &str) {
+        let sql = sql.replace("{W}", WIDE);
+        assert_eq!(optimized(&sql, true).await, optimized(&sql, false).await, "must not rewrite");
     }
 
     /// A UNION emits UNQUALIFIED fields, so the parent's `t.id` stopped
@@ -3771,45 +3565,45 @@ mod aggregate_input_ordering_tests {
         prelude::{SessionConfig, SessionContext},
     };
 
+    /// A repeated bucket arrives after an older one. This is the historical-file
+    /// shape observed by the production probe: each bucket must be emitted once
+    /// with its full count, never closed early on untrusted storage order.
+    #[test_case::test_case(vec![vec![2, 1, 2, 0]] => vec![1_i64, 1, 2] ; "repeat after an older row inside one batch")]
+    #[test_case::test_case(vec![vec![2, 1], vec![2, 0]] => vec![1_i64, 1, 2] ; "repeat arrives in a later batch")]
     #[tokio::test]
-    async fn aggregate_does_not_close_groups_on_untrusted_storage_order() -> Result<()> {
-        // A repeated bucket arrives after an older one, including across batches.
-        // This is the historical-file shape observed by the production probe.
-        for batches in [vec![vec![2, 1, 2, 0]], vec![vec![2, 1], vec![2, 0]]] {
-            let mut ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-            crate::read::functions::register_custom_functions(&mut ctx).unwrap();
-            let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
-            let batches = batches
-                .into_iter()
-                .map(|values| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(TimestampMicrosecondArray::from(values.into_iter().map(|v| v * 1_000_000).collect::<Vec<_>>()).with_timezone("UTC"))],
-                    )
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            ctx.register_table("events", Arc::new(MemTable::try_new(schema, vec![batches])?.with_sort_order(vec![vec![col("ts").sort(false, false)]])))?;
-            let plan = ctx
-                .sql("SELECT time_bucket('1 second', ts) AS bucket, count(*) AS n FROM events GROUP BY 1 ORDER BY 1 DESC")
-                .await?
-                .create_physical_plan()
-                .await?;
-            // Use the real merge-on-read operator. A unique row key is not needed
-            // here: the repeated timestamp is in a later run, just like the scan.
-            let plan = plan
-                .transform_up(|node| {
-                    if downcast::<DataSourceExec>(node.as_ref()).is_some() {
-                        return Ok(Transformed::yes(Arc::new(DedupExec::new(node, vec!["ts".into()], None)?) as Arc<dyn ExecutionPlan>));
-                    }
-                    Ok(Transformed::no(node))
-                })
-                .data()?;
-            let plan = AggregateInputOrdering.optimize(plan, ctx.state().config_options())?;
-            let rows = collect(plan, ctx.task_ctx()).await?;
-            let mut counts = rows.iter().flat_map(|batch| batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect::<Vec<_>>();
-            counts.sort();
-            assert_eq!(counts, vec![1, 1, 2], "a bucket must be emitted once with its full count");
-        }
-        Ok(())
+    async fn aggregate_does_not_close_groups_on_untrusted_storage_order(batches: Vec<Vec<i64>>) -> Vec<i64> {
+        let mut ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        crate::read::functions::register_custom_functions(&mut ctx).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]));
+        let batches = batches
+            .into_iter()
+            .map(|values| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(TimestampMicrosecondArray::from(values.into_iter().map(|v| v * 1_000_000).collect::<Vec<_>>()).with_timezone("UTC"))],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        ctx.register_table("events", Arc::new(MemTable::try_new(schema, vec![batches]).unwrap().with_sort_order(vec![vec![col("ts").sort(false, false)]])))
+            .unwrap();
+        let df = ctx.sql("SELECT time_bucket('1 second', ts) AS bucket, count(*) AS n FROM events GROUP BY 1 ORDER BY 1 DESC").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        // Use the real merge-on-read operator. A unique row key is not needed
+        // here: the repeated timestamp is in a later run, just like the scan.
+        let plan = plan
+            .transform_up(|node| {
+                if downcast::<DataSourceExec>(node.as_ref()).is_some() {
+                    return Ok(Transformed::yes(Arc::new(DedupExec::new(node, vec!["ts".into()], None)?) as Arc<dyn ExecutionPlan>));
+                }
+                Ok(Transformed::no(node))
+            })
+            .data()
+            .unwrap();
+        let plan = AggregateInputOrdering.optimize(plan, ctx.state().config_options()).unwrap();
+        let rows = collect(plan, ctx.task_ctx()).await.unwrap();
+        let mut counts = rows.iter().flat_map(|batch| batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect::<Vec<_>>();
+        counts.sort();
+        counts
     }
 }

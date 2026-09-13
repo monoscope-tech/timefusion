@@ -4184,22 +4184,20 @@ mod tests {
         assert!(ingest_identity_idxs("no_such_table", &dschema).is_none(), "no schema => identity undefined");
     }
 
+    /// The 12GiB unflushed-bytes threshold both WAL brakes are measured against.
+    const BRAKE_MAX: u64 = 12 * 1024 * 1024 * 1024;
+    const BRAKE_NOW: i64 = 1_000_000_000;
+
     /// The compaction brake must read the flush BACKLOG, not the WAL directory
     /// size. Prod 2026-07-29: on-disk WAL sat ~30GB (ingest rate × trim
     /// retention) against a 12GiB threshold, so the old signal was permanently
     /// engaged and compaction committed zero waves while flush was healthy.
-    #[test]
-    fn wal_backlog_brake_ignores_directory_size_and_fires_on_real_backlog() {
-        const MAX: u64 = 12 * 1024 * 1024 * 1024;
-        let now = 1_000_000_000i64;
-        // Healthy: on-disk WAL far over threshold is irrelevant; backlog ~0.
-        assert!(!wal_backlog_over_threshold(64 * 1024 * 1024, MAX, 0, now));
-        // Genuine backlog: unflushed bytes over threshold.
-        assert!(wal_backlog_over_threshold(MAX + 1, MAX, 0, now));
-        // Flush broken with a small backlog still brakes...
-        assert!(wal_backlog_over_threshold(1024, MAX, now - 60_000_000, now));
-        // ...but a stale failure does not.
-        assert!(!wal_backlog_over_threshold(1024, MAX, now - 10 * 60_000_000, now));
+    #[test_case::test_case(64 * 1024 * 1024, 0 => false ; "healthy: on-disk WAL far over threshold is irrelevant, backlog ~0")]
+    #[test_case::test_case(BRAKE_MAX + 1, 0 => true ; "genuine backlog: unflushed bytes over threshold")]
+    #[test_case::test_case(1024, BRAKE_NOW - 60_000_000 => true ; "flush broken with a small backlog still brakes")]
+    #[test_case::test_case(1024, BRAKE_NOW - 10 * 60_000_000 => false ; "but a stale flush failure does not")]
+    fn wal_backlog_brake_ignores_directory_size_and_fires_on_real_backlog(backlog_bytes: u64, last_flush_failure_micros: i64) -> bool {
+        wal_backlog_over_threshold(backlog_bytes, BRAKE_MAX, last_flush_failure_micros, BRAKE_NOW)
     }
 
     /// The EMERGENCY-FLUSH gate must be disk-residue-immune too. Prod
@@ -4207,16 +4205,12 @@ mod tests {
     /// against the 12GiB threshold while unflushed sat ~780MB — the old
     /// disk-bytes signal fired `flush_all_now` every ~60s forever, pounding
     /// the commit locks and freezing the dedup drain.
-    #[test]
-    fn wal_emergency_flush_ignores_disk_residue_and_fires_on_backlog_or_sprawl() {
-        const MAX: u64 = 12 * 1024 * 1024 * 1024;
-        // Flushed residue over threshold with a tiny backlog: no storm.
-        assert!(!wal_emergency_flush_needed(15, 50, 780 * 1024 * 1024, MAX));
-        // Real unflushed backlog fires.
-        assert!(wal_emergency_flush_needed(15, 50, MAX + 1, MAX));
-        // File sprawl fires regardless of bytes; max_files=0 disables that leg.
-        assert!(wal_emergency_flush_needed(51, 50, 0, MAX));
-        assert!(!wal_emergency_flush_needed(51, 0, 0, MAX));
+    #[test_case::test_case(15, 50, 780 * 1024 * 1024 => false ; "flushed residue over threshold with a tiny backlog: no storm")]
+    #[test_case::test_case(15, 50, BRAKE_MAX + 1 => true ; "real unflushed backlog fires")]
+    #[test_case::test_case(51, 50, 0 => true ; "file sprawl fires regardless of bytes")]
+    #[test_case::test_case(51, 0, 0 => false ; "max_files=0 disables the sprawl leg")]
+    fn wal_emergency_flush_ignores_disk_residue_and_fires_on_backlog_or_sprawl(file_count: usize, max_files: usize, unflushed_bytes: u64) -> bool {
+        wal_emergency_flush_needed(file_count, max_files, unflushed_bytes, BRAKE_MAX)
     }
 
     /// A byte threshold alone misses small persistence debt (prod 2026-08-05:
@@ -4274,6 +4268,18 @@ mod tests {
     /// A Delta write callback that always succeeds with no files.
     fn noop_delta() -> DeltaWriteCallback {
         Arc::new(|_p, _t, _b, _w| Box::pin(async { Ok(Vec::new()) }))
+    }
+
+    /// A succeeding Delta write callback that tallies commits and rows.
+    fn counting_delta(commits: Arc<AtomicU64>, rows: Arc<AtomicU64>) -> DeltaWriteCallback {
+        Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _w| {
+            let (commits, rows) = (commits.clone(), rows.clone());
+            Box::pin(async move {
+                commits.fetch_add(1, Ordering::Relaxed);
+                rows.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
+                Ok(vec!["s3://test/part.parquet".to_string()])
+            })
+        })
     }
 
     /// Default config rooted at `data_dir`, with `tweak` applied before freezing.
@@ -4377,16 +4383,8 @@ mod tests {
 
         let commits = Arc::new(AtomicU64::new(0));
         let rows = Arc::new(AtomicU64::new(0));
-        let (c, r) = (commits.clone(), rows.clone());
         let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _w| {
-            let (c, r) = (c.clone(), r.clone());
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::Relaxed);
-                r.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
-                Ok(vec!["s3://test/part.parquet".to_string()])
-            })
-        }));
+        layer.delta_write_callback = Some(counting_delta(commits.clone(), rows.clone()));
 
         // Six sealed bucket-id slices for ONE (project, table): pre-chunking this
         // coalesced into a single commit regardless of backlog depth.
@@ -4423,15 +4421,8 @@ mod tests {
         let (project, table) = (format!("p{test_id}"), format!("t{test_id}"));
 
         let commits = Arc::new(AtomicU64::new(0));
-        let c = commits.clone();
         let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, _b: Vec<RecordBatch>, _w| {
-            let c = c.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::Relaxed);
-                Ok(vec!["s3://test/part.parquet".to_string()])
-            })
-        }));
+        layer.delta_write_callback = Some(counting_delta(commits.clone(), Arc::new(AtomicU64::new(0))));
 
         let bucket = crate::write::mem_buffer::bucket_duration_micros();
         let now = crate::support::now_micros();
@@ -5147,6 +5138,40 @@ mod tests {
         assert_eq!(flushed_rows.load(Ordering::Relaxed) + remaining, ROWS, "rows lost across budget-bounded replay");
     }
 
+    /// Ack `per_bucket` ~1MB rows into each of two event-time buckets 20 min
+    /// apart for every tenant, oldest-first so WAL order ≈ bucket order and the
+    /// first relief drains the older bucket, letting the rewind marker advance
+    /// past it. The layer is dropped without flushing: the rows live only in
+    /// the WAL — the crash shape the resumable-replay guards start from.
+    async fn seed_fat_wal_backlog(cfg: &Arc<AppConfig>, tenants: &[(String, String)], per_bucket: u64) {
+        let base = chrono::Utc::now().timestamp_micros();
+        let gap = 20 * 60 * 1_000_000i64;
+        let fat = "x".repeat(1024 * 1024); // ~1MB/row so the tight budget forces a relief
+        let layer = crate::support::test_helpers::test_layer(Arc::clone(cfg)).unwrap();
+        for (project, table) in tenants {
+            for (b, ts) in [base, base + gap].into_iter().enumerate() {
+                for i in 0..per_bucket {
+                    let mut span = crate::support::test_helpers::test_span_ts(&format!("b{b}r{i}"), "n", project, ts + i as i64);
+                    span["summary"] = serde_json::json!([fat]);
+                    layer.insert(project, table, vec![json_to_batch(vec![span]).unwrap()]).await.unwrap();
+                }
+            }
+        }
+    }
+
+    /// A layer whose Delta callback tallies the rows it was handed.
+    fn counting_row_layer(cfg: &Arc<AppConfig>, flushed: Arc<AtomicU64>) -> BufferedWriteLayer {
+        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _wm: DeltaWatermark| {
+            let flushed = flushed.clone();
+            Box::pin(async move {
+                flushed.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
+                Ok(Vec::new())
+            })
+        }));
+        layer
+    }
+
     /// Regression: resumable WAL replay (2026-07-09 incident). A crash mid-replay
     /// must re-replay only the still-un-drained tail, not the whole backlog. The
     /// pre-fix behavior froze the rewind marker at the pre-recovery cursor P0 for
@@ -5164,42 +5189,16 @@ mod tests {
         let project = format!("rr{}", test_id);
         let table = format!("rr{}", test_id);
 
-        // Two event-time buckets 20 min apart, inserted oldest-first so WAL order
-        // ≈ bucket order and the first relief drains the older bucket, letting
-        // the marker advance past it.
         const PER_BUCKET: u64 = 48;
         const TOTAL: u64 = 2 * PER_BUCKET;
-        let base = chrono::Utc::now().timestamp_micros();
-        let gap = 20 * 60 * 1_000_000i64;
-        let fat = "x".repeat(1024 * 1024); // ~1MB/row so the tight budget forces a relief
-        {
-            let layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg_big)).unwrap();
-            for (b, ts) in [base, base + gap].into_iter().enumerate() {
-                for i in 0..PER_BUCKET {
-                    let mut span = crate::support::test_helpers::test_span_ts(&format!("b{b}r{i}"), "n", &project, ts + i as i64);
-                    span["summary"] = serde_json::json!([fat]);
-                    layer.insert(&project, &table, vec![json_to_batch(vec![span]).unwrap()]).await.unwrap();
-                }
-            }
-            // Crash without flushing: all rows live only in the WAL.
-        }
+        seed_fat_wal_backlog(&cfg_big, &[(project.clone(), table.clone())], PER_BUCKET).await;
 
+        // Second life onwards: tight budget, so replay must relief-drain.
         let cfg_small = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_buffer_max_memory_mb = 64);
-        let counting_layer = |flushed: Arc<AtomicU64>| {
-            let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg_small)).unwrap();
-            layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _wm: DeltaWatermark| {
-                let flushed = flushed.clone();
-                Box::pin(async move {
-                    flushed.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
-                    Ok(Vec::new())
-                })
-            }));
-            layer
-        };
 
         // Life 2: crash right after the first relief drain advances the marker.
         let flushed2 = Arc::new(AtomicU64::new(0));
-        let layer2 = counting_layer(flushed2.clone());
+        let layer2 = counting_row_layer(&cfg_small, flushed2.clone());
         layer2.test_crash_after_reliefs.store(1, Ordering::Relaxed);
         let layer2 = Arc::new(layer2);
         assert!(layer2.recover_from_wal().await.is_err(), "test hook should have crashed replay mid-run");
@@ -5210,7 +5209,7 @@ mod tests {
         // Life 3: resume. The marker (advanced past the drained bucket) must make
         // recovery re-read only the un-drained remainder.
         let flushed3 = Arc::new(AtomicU64::new(0));
-        let layer3 = Arc::new(counting_layer(flushed3.clone()));
+        let layer3 = Arc::new(counting_row_layer(&cfg_small, flushed3.clone()));
         let stats = layer3.recover_from_wal().await.unwrap();
         assert!(
             stats.entries_replayed < TOTAL,
@@ -5252,39 +5251,14 @@ mod tests {
         const PER_BUCKET: u64 = 32;
         const PER_TENANT: u64 = 2 * PER_BUCKET;
         const TOTAL: u64 = 2 * PER_TENANT;
-        let base = chrono::Utc::now().timestamp_micros();
-        let gap = 20 * 60 * 1_000_000i64;
-        let fat = "x".repeat(1024 * 1024);
-        {
-            let layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg_big)).unwrap();
-            for (project, table) in &tenants {
-                for (b, ts) in [base, base + gap].into_iter().enumerate() {
-                    for i in 0..PER_BUCKET {
-                        let mut span = crate::support::test_helpers::test_span_ts(&format!("b{b}r{i}"), "n", project, ts + i as i64);
-                        span["summary"] = serde_json::json!([fat]);
-                        layer.insert(project, table, vec![json_to_batch(vec![span]).unwrap()]).await.unwrap();
-                    }
-                }
-            }
-        }
+        seed_fat_wal_backlog(&cfg_big, &tenants, PER_BUCKET).await;
 
         let cfg_small = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_buffer_max_memory_mb = 64);
-        let counting_layer = |flushed: Arc<AtomicU64>| {
-            let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg_small)).unwrap();
-            layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _wm: DeltaWatermark| {
-                let flushed = flushed.clone();
-                Box::pin(async move {
-                    flushed.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
-                    Ok(Vec::new())
-                })
-            }));
-            layer
-        };
 
         // Life 2: crash after the first relief drain — at that point the second
         // tenant's topic has almost certainly not been reached yet.
         let flushed2 = Arc::new(AtomicU64::new(0));
-        let layer2 = counting_layer(flushed2.clone());
+        let layer2 = counting_row_layer(&cfg_small, flushed2.clone());
         layer2.test_crash_after_reliefs.store(1, Ordering::Relaxed);
         let layer2 = Arc::new(layer2);
         assert!(layer2.recover_from_wal().await.is_err(), "test hook should have crashed replay mid-run");
@@ -5293,7 +5267,7 @@ mod tests {
 
         // Life 3: resume.
         let flushed3 = Arc::new(AtomicU64::new(0));
-        let layer3 = Arc::new(counting_layer(flushed3.clone()));
+        let layer3 = Arc::new(counting_row_layer(&cfg_small, flushed3.clone()));
         let stats = layer3.recover_from_wal().await.unwrap();
         // No loss across both tenants.
         let mut buffered = 0u64;
@@ -5503,9 +5477,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_wal_corruption_threshold = 1);
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("cr{}", test_id);
-        let table = format!("cr{}", test_id);
+        let (project, table) = test_ids("cr");
 
         {
             let layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
@@ -5534,6 +5506,43 @@ mod tests {
         }
     }
 
+    /// A unique (project, table) pair for one test, tagged with `prefix` so a
+    /// failure names which test owns the topic. Kept short on purpose: walrus
+    /// caps a topic's metadata at 62 bytes.
+    fn test_ids(prefix: &str) -> (String, String) {
+        let id = &uuid::Uuid::new_v4().to_string()[..4];
+        (format!("{prefix}{id}"), format!("{prefix}{id}"))
+    }
+
+    /// Build an `Arc`d layer whose Delta commits go through `cb` — the
+    /// `test_layer` + `delta_write_callback` + `Arc::new` triple, once.
+    fn layer_with(cfg: Arc<AppConfig>, cb: DeltaWriteCallback) -> Arc<BufferedWriteLayer> {
+        let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
+        layer.delta_write_callback = Some(cb);
+        Arc::new(layer)
+    }
+
+    /// A succeeding Delta write callback that tallies commits (and, unlike
+    /// `counting_delta`, reports no written files).
+    fn tally_delta(calls: Arc<AtomicUsize>) -> DeltaWriteCallback {
+        Arc::new(move |_p: String, _t: String, _b: Vec<RecordBatch>, _w: DeltaWatermark| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        })
+    }
+
+    /// Shut the layer down, returning how long that took and the snapshot it
+    /// persisted — every shutdown test below asserts on both.
+    async fn shutdown_snap(layer: &Arc<BufferedWriteLayer>) -> (std::time::Duration, crate::write::wal::CursorSnapshot) {
+        let started = std::time::Instant::now();
+        layer.shutdown().await.unwrap();
+        let elapsed = started.elapsed();
+        (elapsed, layer.wal().load_cursor_snapshot().expect("shutdown must persist a cursor snapshot (dirty ones still record conservative cursors)"))
+    }
+
     /// A DML entry's shard must stay pinned while the buckets it mutated are
     /// unflushed: DML entries land on their own round-robin shard, which the
     /// buckets' insert holds don't cover, so without a topic-wide pin any
@@ -5548,9 +5557,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("dm{}", test_id);
-        let table = format!("dm{}", test_id);
+        let (project, table) = test_ids("dm");
 
         let now = crate::support::now_micros();
         let old = now - 2 * crate::write::mem_buffer::bucket_duration_micros();
@@ -5559,9 +5566,7 @@ mod tests {
         let assignments = vec![("name".to_string(), datafusion::logical_expr::lit("renamed"))];
 
         {
-            let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-            layer.delta_write_callback = Some(noop_delta());
-            let layer = Arc::new(layer);
+            let layer = layer_with(Arc::clone(&cfg), noop_delta());
 
             layer.insert(&project, &table, vec![row("live", now)]).await.unwrap(); // shard 0
             layer.insert(&project, &table, vec![row("old", old)]).await.unwrap(); // shard 1
@@ -5575,13 +5580,9 @@ mod tests {
         {
             let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
             layer.recover_from_wal().await.unwrap();
-            let results = layer.query(&project, &table, &[]).unwrap();
-            let combined = arrow::compute::concat_batches(&results[0].schema(), &results).unwrap();
-            let names = arrow::compute::cast(combined.column(combined.schema().index_of("name").unwrap()), &arrow::datatypes::DataType::Utf8).unwrap();
-            let names = names.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
-            for i in 0..combined.num_rows() {
-                assert_eq!(names.value(i), "renamed", "acked UPDATE reverted: its WAL entry was drained by an unrelated flush");
-            }
+            let names = crate::support::test_helpers::query_col_strings(&layer, &project, &table, "name");
+            assert!(!names.is_empty(), "expected rows after WAL recovery");
+            assert!(names.iter().all(|n| n == "renamed"), "acked UPDATE reverted: its WAL entry was drained by an unrelated flush (got {names:?})");
         }
     }
 
@@ -5597,9 +5598,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("tp{}", test_id);
-        let table = format!("tp{}", test_id);
+        let (project, table) = test_ids("tp");
 
         let cutoff = crate::support::now_micros() - 3_600_000_000; // 1h ago — matches all rows
         let pred = datafusion::prelude::col("timestamp")
@@ -5616,14 +5615,12 @@ mod tests {
         {
             let layer = Arc::new(crate::support::test_helpers::test_layer(cfg).unwrap());
             layer.recover_from_wal().await.unwrap();
-            let results = layer.query(&project, &table, &[]).unwrap();
-            assert!(!results.is_empty(), "expected rows after WAL recovery");
-            let combined = arrow::compute::concat_batches(&results[0].schema(), &results).unwrap();
-            let names = arrow::compute::cast(combined.column(combined.schema().index_of("name").unwrap()), &arrow::datatypes::DataType::Utf8).unwrap();
-            let names = names.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
-            for i in 0..combined.num_rows() {
-                assert_eq!(names.value(i), "renamed", "WAL replay dropped the UPDATE — timestamp-literal predicate failed to parse on replay");
-            }
+            let names = crate::support::test_helpers::query_col_strings(&layer, &project, &table, "name");
+            assert!(!names.is_empty(), "expected rows after WAL recovery");
+            assert!(
+                names.iter().all(|n| n == "renamed"),
+                "WAL replay dropped the UPDATE — timestamp-literal predicate failed to parse on replay (got {names:?})"
+            );
         }
     }
 
@@ -5640,19 +5637,18 @@ mod tests {
         let dir = tempdir().unwrap();
         // budget=1s, flush_deadline=0.8s
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 1);
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("s{}", test_id);
-        let table = format!("s{}", test_id);
+        let (project, table) = test_ids("s");
 
         // Delta callback that blocks far longer than the shutdown budget.
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
-            Box::pin(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
+        let layer = layer_with(
+            Arc::clone(&cfg),
+            Arc::new(move |_p, _t, _b, _wm| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok(Vec::new())
+                })
+            }),
+        );
 
         // Insert into a stale (sealed) bucket so shutdown's flush has work to do.
         let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
@@ -5661,11 +5657,8 @@ mod tests {
 
         // Shutdown must return promptly (bounded by the budget), not hang on the
         // 60s flush, and must persist the clean snapshot.
-        let t = std::time::Instant::now();
-        layer.shutdown().await.unwrap();
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "shutdown must be deadline-bounded, took {:?}", t.elapsed());
-
-        let snap = layer.wal().load_cursor_snapshot().expect("clean snapshot must be written on shutdown");
+        let (elapsed, snap) = shutdown_snap(&layer).await;
+        assert!(elapsed < std::time::Duration::from_secs(10), "shutdown must be deadline-bounded, took {elapsed:?}");
         assert!(snap.clean_shutdown, "shutdown must mark clean_shutdown=true even on a partial flush");
         // 2026-07-08 review finding: clean ≠ drained. The 60s-hung flush left
         // the bucket un-flushed (WAL-only), so this snapshot must NOT
@@ -5682,18 +5675,13 @@ mod tests {
     async fn shutdown_claims_drained_when_flush_completes() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("d{}", test_id);
-        let table = format!("d{}", test_id);
+        let (project, table) = test_ids("d");
 
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(noop_delta());
-        let layer = Arc::new(layer);
+        let layer = layer_with(Arc::clone(&cfg), noop_delta());
         let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span("x", "spanX", &project)]).unwrap();
         layer.insert(&project, &table, vec![batch]).await.unwrap();
 
-        layer.shutdown().await.unwrap();
-        let snap = layer.wal().load_cursor_snapshot().expect("snapshot written on shutdown");
+        let (_, snap) = shutdown_snap(&layer).await;
         assert!(snap.clean_shutdown && snap.drained, "a fully-drained shutdown must claim drained=true");
         assert!(layer.is_drained(), "a successful flush must report drained");
     }
@@ -5706,23 +5694,13 @@ mod tests {
     async fn shutdown_flushes_post_predeploy_flush_tail() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
-        let flush_calls = Arc::new(AtomicU64::new(0));
-        let calls = Arc::clone(&flush_calls);
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
-            let calls = Arc::clone(&calls);
-            Box::pin(async move {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
+        let flush_calls = Arc::new(AtomicUsize::new(0));
+        let layer = layer_with(Arc::clone(&cfg), tally_delta(Arc::clone(&flush_calls)));
         let project = format!("planned_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
         let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span("tail", "span", &project)]).unwrap();
         layer.insert(&project, "otel_logs_and_spans", vec![batch]).await.unwrap();
-        layer.shutdown().await.unwrap();
-        assert_eq!(flush_calls.load(Ordering::Relaxed), 1, "shutdown must flush the finite post-FLUSH tail");
-        let snap = layer.wal().load_cursor_snapshot().unwrap();
+        let (_, snap) = shutdown_snap(&layer).await;
+        assert_eq!(flush_calls.load(Ordering::SeqCst), 1, "shutdown must flush the finite post-FLUSH tail");
         assert!(snap.clean_shutdown && snap.drained, "successful final flush must authorize a drained boot");
         assert!(layer.wal().is_fully_consumed().unwrap(), "replacement must not replay the flushed tail");
     }
@@ -5732,9 +5710,7 @@ mod tests {
     async fn deploy_handoff_fences_writes_and_makes_shutdown_constant_time() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 70);
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(noop_delta());
-        let layer = Arc::new(layer);
+        let layer = layer_with(Arc::clone(&cfg), noop_delta());
         let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span("handoff", "span", "p")]).unwrap();
         layer.insert("p", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
 
@@ -5745,11 +5721,9 @@ mod tests {
         let err = layer.insert("p", "otel_logs_and_spans", vec![batch]).await.unwrap_err();
         assert!(err.to_string().contains("draining for deployment"));
 
-        let started = std::time::Instant::now();
-        layer.shutdown().await.unwrap();
+        let (elapsed, snap) = shutdown_snap(&layer).await;
         assert!(!layer.is_deploy_handoff_ready(), "shutdown must invalidate the leased takeover authorization");
-        assert!(started.elapsed() < Duration::from_secs(1), "drained handoff shutdown must stay constant-time");
-        let snap = layer.wal().load_cursor_snapshot().unwrap();
+        assert!(elapsed < Duration::from_secs(1), "drained handoff shutdown must stay constant-time");
         assert!(snap.clean_shutdown && snap.drained);
     }
 
@@ -5778,9 +5752,7 @@ mod tests {
     async fn failed_deploy_handoff_reopens_write_admission() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(|_p, _t, _b, _wm| Box::pin(async { anyhow::bail!("injected Delta failure") })));
-        let layer = Arc::new(layer);
+        let layer = layer_with(Arc::clone(&cfg), Arc::new(|_p, _t, _b, _wm| Box::pin(async { anyhow::bail!("injected Delta failure") })));
         let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span("handoff", "span", "p")]).unwrap();
         layer.insert("p", "otel_logs_and_spans", vec![batch.clone()]).await.unwrap();
 
@@ -5798,12 +5770,9 @@ mod tests {
     async fn wedged_background_task_does_not_starve_shutdown_flush() {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_stop_grace_secs = 1);
-        let project = format!("bg{}", &uuid::Uuid::new_v4().to_string()[..4]);
-        let table = project.clone();
+        let (project, table) = test_ids("bg");
 
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(noop_delta());
-        let layer = Arc::new(layer);
+        let layer = layer_with(Arc::clone(&cfg), noop_delta());
         layer.background_tasks.lock().await.push(tokio::spawn(async {
             // Deliberately ignores the layer's cancellation token.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -5812,8 +5781,7 @@ mod tests {
         let batch = crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span("x", "spanX", &project)]).unwrap();
         layer.insert(&project, &table, vec![batch]).await.unwrap();
 
-        layer.shutdown().await.unwrap();
-        let snap = layer.wal().load_cursor_snapshot().expect("snapshot written on shutdown");
+        let (_, snap) = shutdown_snap(&layer).await;
         assert!(snap.clean_shutdown && snap.drained, "the drainable WAL tail must not be left for startup behind a wedged worker");
         assert!(layer.is_drained());
     }
@@ -5834,8 +5802,7 @@ mod tests {
         let err = layer.insert("p", "otel_logs_and_spans", vec![batch]).await.unwrap_err();
         assert!(err.to_string().contains("draining for deployment"));
 
-        layer.shutdown().await.unwrap();
-        let snap = layer.wal().load_cursor_snapshot().expect("dirty snapshot still records conservative cursors");
+        let (_, snap) = shutdown_snap(&layer).await;
         assert!(!snap.clean_shutdown && !snap.drained, "an active pre-fence writer forbids clean/drained claims");
         drop(active);
     }
@@ -5864,11 +5831,9 @@ mod tests {
         }));
         worker_started.notified().await;
 
-        let started = std::time::Instant::now();
-        layer.shutdown().await.unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1), "an already-drained deploy handoff must not spend 7s on a wedged worker");
+        let (elapsed, snap) = shutdown_snap(&layer).await;
+        assert!(elapsed < std::time::Duration::from_secs(1), "an already-drained deploy handoff must not spend 7s on a wedged worker");
         assert!(worker_dropped.load(Ordering::Acquire), "timed-out worker must be aborted and joined before the WAL lock can pass to the replacement");
-        let snap = layer.wal().load_cursor_snapshot().unwrap();
         assert!(snap.clean_shutdown && snap.drained);
     }
 
@@ -5918,9 +5883,7 @@ mod tests {
         use datafusion::logical_expr::col;
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("u{}", test_id);
-        let table = format!("u{}", test_id);
+        let (project, table) = test_ids("u");
 
         let src_batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("new_name", DataType::Utf8, false)])),
@@ -5962,18 +5925,19 @@ mod tests {
         let slow = format!("w{}", test_id);
         let table = format!("t{}", test_id);
 
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
         let slow_p = slow.clone();
-        layer.delta_write_callback = Some(Arc::new(move |p, _t, _b, _wm| {
-            let hang = p == slow_p;
-            Box::pin(async move {
-                if hang {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                }
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
+        let layer = layer_with(
+            Arc::clone(&cfg),
+            Arc::new(move |p, _t, _b, _wm| {
+                let hang = p == slow_p;
+                Box::pin(async move {
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                    Ok(Vec::new())
+                })
+            }),
+        );
 
         let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
         // The fast table gets more rows so largest-first ordering flushes it
@@ -6001,9 +5965,7 @@ mod tests {
     async fn flush_all_now_exempts_surviving_open_bucket_from_exclusion() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("o{}", test_id);
-        let table = format!("o{}", test_id);
+        let (project, table) = test_ids("o");
 
         // Freeze the clock so the bucket stays open across the flush, then
         // seals deterministically. Unfreeze even on panic — a leaked frozen
@@ -6021,16 +5983,17 @@ mod tests {
         let entered = Arc::new(tokio::sync::Notify::new());
         let gate = Arc::new(tokio::sync::Notify::new());
         let (e2, g2) = (Arc::clone(&entered), Arc::clone(&gate));
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
-            let (e, g) = (Arc::clone(&e2), Arc::clone(&g2));
-            Box::pin(async move {
-                e.notify_one();
-                g.notified().await;
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
+        let layer = layer_with(
+            Arc::clone(&cfg),
+            Arc::new(move |_p, _t, _b, _wm| {
+                let (e, g) = (Arc::clone(&e2), Arc::clone(&g2));
+                Box::pin(async move {
+                    e.notify_one();
+                    g.notified().await;
+                    Ok(Vec::new())
+                })
+            }),
+        );
 
         let span = |id: &str, s: &str, ts: i64| crate::support::test_helpers::test_span_ts(id, s, &project, ts);
         layer.insert(&project, &table, vec![crate::support::test_helpers::json_to_batch(vec![span("a", "s1", t0)]).unwrap()]).await.unwrap();
@@ -6065,9 +6028,7 @@ mod tests {
         };
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("q{}", test_id);
-        let table = format!("q{}", test_id);
+        let (project, table) = test_ids("q");
 
         let ts = crate::support::now_micros();
         let ts_col = || Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC")) as arrow::array::ArrayRef;
@@ -6176,9 +6137,7 @@ mod tests {
     async fn boot_redrives_quarantined_insert_payloads() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("r{}", test_id);
-        let table = format!("r{}", test_id);
+        let (project, table) = test_ids("r");
 
         let batch =
             crate::support::test_helpers::json_to_batch(vec![crate::support::test_helpers::test_span_ts("a", "s1", &project, crate::support::now_micros())])
@@ -6263,9 +6222,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("b{}", test_id);
-        let table = format!("b{}", test_id);
+        let (project, table) = test_ids("b");
 
         let layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
@@ -6314,9 +6271,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("u{}", test_id);
-        let table = format!("u{}", test_id);
+        let (project, table) = test_ids("u");
 
         // First instance: insert + UPDATE FROM, then drop without flushing
         // to Delta so the only durable record is the WAL.
@@ -6386,9 +6341,7 @@ mod tests {
     async fn wal_holds_recorded_on_insert() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("c{}", test_id);
-        let table = format!("c{}", test_id);
+        let (project, table) = test_ids("c");
 
         let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
         // 3 batches → 3 WAL entries on one shard for this insert.
@@ -6418,22 +6371,11 @@ mod tests {
         // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial]
         // protects the global.
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("o{}", test_id);
-        let table = format!("o{}", test_id);
+        let (project, table) = test_ids("o");
 
         // Use a stub delta callback so flush succeeds without S3.
         let delta_calls = Arc::new(AtomicUsize::new(0));
-        let delta_calls_cb = delta_calls.clone();
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _batches, _wm| {
-            let c = delta_calls_cb.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
+        let layer = layer_with(Arc::clone(&cfg), tally_delta(delta_calls.clone()));
 
         // Insert "old" rows into a stale bucket (one bucket-duration in the past).
         let bucket_dur_micros = crate::write::mem_buffer::bucket_duration_micros();
@@ -6471,22 +6413,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("w{}", test_id);
-        let table = format!("w{}", test_id);
+        let (project, table) = test_ids("w");
 
         let captured_wm: Arc<std::sync::Mutex<Option<crate::write::DeltaWatermark>>> = Arc::new(std::sync::Mutex::new(None));
         let captured_wm_cb = captured_wm.clone();
 
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _batches, wm| {
-            let captured = captured_wm_cb.clone();
-            Box::pin(async move {
-                *captured.lock().unwrap() = Some(wm);
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
+        let layer = layer_with(
+            Arc::clone(&cfg),
+            Arc::new(move |_p, _t, _batches, wm| {
+                let captured = captured_wm_cb.clone();
+                Box::pin(async move {
+                    *captured.lock().unwrap() = Some(wm);
+                    Ok(Vec::new())
+                })
+            }),
+        );
 
         // Insert into a sealed (past-cutoff) bucket so flush_completed_buckets picks it up.
         let bucket_dur_micros = crate::write::mem_buffer::bucket_duration_micros();
@@ -6524,45 +6465,11 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn backpressure_flushes_instead_of_rejecting() {
-        use std::sync::atomic::{AtomicUsize, Ordering as O};
-
-        use arrow::{
-            array::{StringArray, TimestampMicrosecondArray},
-            datatypes::{DataType, Field, Schema, TimeUnit},
-        };
-
-        let dir = tempdir().unwrap();
-        // 64MB floor → hard limit ~76.8MB
-        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_buffer_max_memory_mb = 64);
-
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("bp{}", test_id);
-        let table = format!("bp{}", test_id);
+        let (project, table) = test_ids("bp");
 
         let flush_calls = Arc::new(AtomicUsize::new(0));
-        let fc = flush_calls.clone();
-        let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
-            let c = fc.clone();
-            Box::pin(async move {
-                c.fetch_add(1, O::SeqCst);
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
-
         // Old timestamp → all rows land in a completed (flushable) bucket.
-        let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-            Field::new("payload", DataType::Utf8, false),
-        ]));
-        let rows = 30_000usize;
-        let make_batch = || {
-            let ts = TimestampMicrosecondArray::from(vec![old_ts; rows]);
-            let payload = StringArray::from(vec!["x".repeat(400); rows]); // ~12MB
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(ts), Arc::new(payload)]).unwrap()
-        };
+        let (layer, _dir, make_batch) = over_limit_layer(tally_delta(flush_calls.clone()), true, |_| {});
 
         // ~96MB cumulative into a ~76.8MB buffer: at least one insert must cross
         // the hard limit and rely on backpressure. All must succeed.
@@ -6570,7 +6477,7 @@ mod tests {
             layer.insert(&project, &table, vec![make_batch()]).await.unwrap_or_else(|e| panic!("insert {i} must succeed under backpressure, got: {e}"));
         }
 
-        assert!(flush_calls.load(O::SeqCst) >= 1, "backpressure must have forced at least one Delta flush");
+        assert!(flush_calls.load(Ordering::SeqCst) >= 1, "backpressure must have forced at least one Delta flush");
         assert!(layer.snapshot_stats().backpressure_engaged_total >= 1, "backpressure_engaged_total must record the over-limit event");
     }
 
@@ -6584,34 +6491,10 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn pressure_flushes_current_bucket() {
-        use arrow::{
-            array::{StringArray, TimestampMicrosecondArray},
-            datatypes::{DataType, Field, Schema, TimeUnit},
-        };
-
-        let dir = tempdir().unwrap();
-        // 64MB floor → hard limit ~76.8MB
-        let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_buffer_max_memory_mb = 64);
-
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let (project, table) = (format!("cb{test_id}"), format!("cb{test_id}"));
-
-        let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        layer.delta_write_callback = Some(noop_delta());
-        let layer = Arc::new(layer);
+        let (project, table) = test_ids("cb");
 
         // NOW timestamp → every row lands in the current (unsealed) bucket.
-        let now_ts = crate::support::now_micros();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-            Field::new("payload", DataType::Utf8, false),
-        ]));
-        let rows = 30_000usize;
-        let make_batch = || {
-            let ts = TimestampMicrosecondArray::from(vec![now_ts; rows]);
-            let payload = StringArray::from(vec!["x".repeat(400); rows]); // ~12MB
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(ts), Arc::new(payload)]).unwrap()
-        };
+        let (layer, _dir, make_batch) = over_limit_layer(noop_delta(), false, |_| {});
 
         // ~96MB cumulative into a ~76.8MB buffer with zero completed buckets:
         // relief must force-flush the current bucket, never reject.
@@ -6623,14 +6506,16 @@ mod tests {
         }
     }
 
-    /// Build a layer with a no-op (always-succeed) Delta callback and an old-bucket
-    /// batch maker, sharing the over-limit setup of the two decouple tests below.
-    /// `backpressure_secs = 0` makes `reserve_with_backpressure` return immediately
-    /// on the over-limit insert (no relief loop), so the exhaustion path is
-    /// deterministic without depending on flush timing.
+    /// The over-limit ingest rig shared by the backpressure/pressure/decouple
+    /// tests: a 64MB budget (the floor → hard limit ~76.8MB) plus a ~12MB batch
+    /// maker, so 8 inserts push ~96MB through a buffer that cannot hold it.
+    /// `sealed` dates the rows two bucket-durations back (a completed, flushable
+    /// bucket); otherwise they land in the current, never-completed window.
     /// Returns the `TempDir` guard too — the caller must hold it for the test's
     /// lifetime (dropping it deletes the data dir out from under the layer).
-    fn decouple_test_layer(decouple: bool) -> (Arc<BufferedWriteLayer>, TempDir, impl Fn() -> RecordBatch) {
+    fn over_limit_layer(
+        cb: DeltaWriteCallback, sealed: bool, tweak: impl FnOnce(&mut AppConfig),
+    ) -> (Arc<BufferedWriteLayer>, TempDir, impl Fn() -> RecordBatch) {
         use arrow::{
             array::{StringArray, TimestampMicrosecondArray},
             datatypes::{DataType, Field, Schema, TimeUnit},
@@ -6638,23 +6523,32 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = test_config_with(dir.path().to_path_buf(), |c| {
             c.buffer.timefusion_buffer_max_memory_mb = 64; // floor → hard limit ~76.8MB
-            c.buffer.timefusion_write_backpressure_secs = 0; // exhaust immediately
-            c.buffer.timefusion_wal_admit_decouple = decouple;
+            tweak(c);
         });
-        let mut layer = crate::support::test_helpers::test_layer(cfg).unwrap();
-        layer.delta_write_callback = Some(noop_delta());
-        let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
+        let layer = layer_with(cfg, cb);
+        let ts_micros = crate::support::now_micros() - if sealed { 2 * crate::write::mem_buffer::bucket_duration_micros() } else { 0 };
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
             Field::new("payload", DataType::Utf8, false),
         ]));
         let make_batch = move || {
             let rows = 30_000usize;
-            let ts = TimestampMicrosecondArray::from(vec![old_ts; rows]);
+            let ts = TimestampMicrosecondArray::from(vec![ts_micros; rows]);
             let payload = StringArray::from(vec!["x".repeat(400); rows]); // ~12MB
             RecordBatch::try_new(schema.clone(), vec![Arc::new(ts), Arc::new(payload)]).unwrap()
         };
-        (Arc::new(layer), dir, make_batch)
+        (layer, dir, make_batch)
+    }
+
+    /// The decouple tests' flavour of the rig: `backpressure_secs = 0` makes
+    /// `reserve_with_backpressure` return immediately on the over-limit insert
+    /// (no relief loop), so the exhaustion path is deterministic without
+    /// depending on flush timing.
+    fn decouple_test_layer(decouple: bool) -> (Arc<BufferedWriteLayer>, TempDir, impl Fn() -> RecordBatch) {
+        over_limit_layer(noop_delta(), true, move |c| {
+            c.buffer.timefusion_write_backpressure_secs = 0; // exhaust immediately
+            c.buffer.timefusion_wal_admit_decouple = decouple;
+        })
     }
 
     /// Baseline for the decouple flag: with it OFF and backpressure exhausted
@@ -6710,13 +6604,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("fc{}", test_id);
-        let table = format!("fc{}", test_id);
+        let (project, table) = test_ids("fc");
 
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(noop_delta());
-        let layer = Arc::new(layer);
+        let layer = layer_with(Arc::clone(&cfg), noop_delta());
 
         // create_test_batch uses now() timestamps → the current (open) bucket.
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
@@ -6744,22 +6634,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("g{}", test_id);
-        let table = format!("g{}", test_id);
+        let (project, table) = test_ids("g");
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let calls_cb = calls.clone();
         {
-            let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-            layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
-                let c = calls_cb.clone();
-                Box::pin(async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    Ok(Vec::new())
-                })
-            }));
-            let layer = Arc::new(layer);
+            let layer = layer_with(Arc::clone(&cfg), tally_delta(calls.clone()));
 
             // Old (completed, never flushed) bucket + current (open) bucket.
             let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
@@ -6797,15 +6676,16 @@ mod tests {
 
         let flushed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let flushed_cb = flushed.clone();
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |p, _t, _b, _wm| {
-            let f = flushed_cb.clone();
-            Box::pin(async move {
-                f.lock().unwrap().push(p);
-                Ok(Vec::new())
-            })
-        }));
-        let layer = Arc::new(layer);
+        let layer = layer_with(
+            Arc::clone(&cfg),
+            Arc::new(move |p, _t, _b, _wm| {
+                let f = flushed_cb.clone();
+                Box::pin(async move {
+                    f.lock().unwrap().push(p);
+                    Ok(Vec::new())
+                })
+            }),
+        );
 
         // T1: a sealed (completed) bucket left un-flushed → a bucket-before-current.
         let old_ts = crate::support::now_micros() - 2 * crate::write::mem_buffer::bucket_duration_micros();
@@ -6836,14 +6716,10 @@ mod tests {
         // 1s flush-bucket timeout trips the watchdog fast
         let cfg = test_config_with(dir.path().to_path_buf(), |c| c.buffer.timefusion_flush_bucket_timeout_secs = 1);
 
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("w{}", test_id);
-        let table = format!("w{}", test_id);
+        let (project, table) = test_ids("w");
 
-        let mut layer = crate::support::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
         // Callback that never resolves — models a stalled S3/commit-lock wait.
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(std::future::pending())));
-        let layer = Arc::new(layer);
+        let layer = layer_with(Arc::clone(&cfg), Arc::new(move |_p, _t, _b, _wm| Box::pin(std::future::pending())));
 
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
 
@@ -6864,9 +6740,7 @@ mod tests {
         let cfg = create_test_config(dir.path().to_path_buf());
 
         // Use unique but short project/table names (walrus has metadata size limit)
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let project = format!("m{}", test_id);
-        let table = format!("m{}", test_id);
+        let (project, table) = test_ids("m");
 
         let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
 
@@ -6887,8 +6761,7 @@ mod tests {
     async fn insert_rejected_while_wal_hard_backpressure_set() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
-        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
-        let (project, table) = (format!("w{test_id}"), format!("w{test_id}"));
+        let (project, table) = test_ids("w");
         let layer = crate::support::test_helpers::test_layer(cfg).unwrap();
 
         layer.wal_hard_backpressure.store(true, Ordering::Relaxed);
@@ -7098,8 +6971,13 @@ mod batch_queue_tests {
         Ok(BatchQueue::new(Arc::new(Database::new().await?), 100, max_rows))
     }
 
-    /// Queue one span per (id, project), let the flush interval fire, then shut down.
-    async fn run(max_rows: usize, spans: impl IntoIterator<Item = (String, String)>) -> Result<()> {
+    /// Queue one span per (id, project), let the flush interval fire, then shut
+    /// down. A queue/insert error or the 30s timeout fails the case.
+    #[test_case::test_case(10, (0..5).map(|i| (format!("test-{i}"), "test-project-uuid".to_string())).collect::<Vec<_>>() ; "processing: one project, chunk cap 10")]
+    #[test_case::test_case(100, ["project_a", "project_b", "project_c"].map(|p| (format!("id_{p}"), p.to_string())).to_vec() ; "grouping: three projects in one chunk")]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_queue_drains_queued_spans(max_rows: usize, spans: Vec<(String, String)>) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(30), async move {
             let queue = test_queue(max_rows).await?;
             spans.into_iter().try_for_each(|(id, project)| queue.queue(json_to_batch(vec![test_span(&id, &format!("span_{project}"), &project)])?))?;
@@ -7109,18 +6987,6 @@ mod batch_queue_tests {
         })
         .await
         .map_err(|_| anyhow!("Test timed out"))?
-    }
-
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_batch_queue_processing() -> Result<()> {
-        run(10, (0..5).map(|i| (format!("test-{i}"), "test-project-uuid".to_string()))).await
-    }
-
-    #[serial]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_batch_queue_grouping() -> Result<()> {
-        run(100, ["project_a", "project_b", "project_c"].map(|p| (format!("id_{p}"), p.to_string()))).await
     }
 }
 
@@ -7447,65 +7313,53 @@ mod stamp_tests {
         arr.is_valid(0).then(|| arr.value(0))
     }
 
-    /// Two writes inside the SAME microsecond must not tie — "greatest version
-    /// wins" is meaningless if two versions share a stamp. The clock is frozen
-    /// (not slept on) so the microsecond really is identical.
+    /// Every hazard that could tie or regress a version stamp, in one frozen
+    /// timeline: "greatest version wins" is meaningless if two versions share a
+    /// stamp or a later one goes backwards. The clock is frozen (not slept on)
+    /// so the microsecond really is identical. Values are collected first and
+    /// asserted after `unfreeze` so a failure never leaks a frozen clock.
     #[test]
     #[serial]
-    fn stamps_strictly_increase_within_one_microsecond() {
+    fn stamps_are_strictly_monotone_across_clock_hazards() {
         let t = unique_table();
         crate::support::set_micros(4_000_000_000_000_000);
+        // Two writes inside the SAME microsecond must not tie.
         let (a, b, c) = (next_stamp(&t), next_stamp(&t), next_stamp(&t));
-        crate::support::unfreeze();
-        assert!(a < b && b < c, "stamps must be strictly increasing, got {a} {b} {c}");
-    }
-
-    /// An NTP step backwards must not let a NEW version be issued a stamp that
-    /// an OLD version already holds.
-    #[test]
-    #[serial]
-    fn stamps_survive_a_clock_going_backwards() {
-        let t = unique_table();
-        crate::support::set_micros(4_000_000_000_000_000);
-        let before = next_stamp(&t);
+        // An NTP step backwards must not let a NEW version be issued a stamp
+        // that an OLD version already holds.
         crate::support::set_micros(3_000_000_000_000_000); // clock steps back an epoch
         let after = next_stamp(&t);
-        crate::support::unfreeze();
-        assert!(after > before, "stamp regressed across a backwards clock step: {before} -> {after}");
-    }
-
-    /// Boot seeding: whatever WAL replay observed bounds every later stamp,
-    /// even when it is far ahead of the wall clock.
-    #[test]
-    #[serial]
-    fn observed_replay_stamps_bound_the_next_issue() {
-        let t = unique_table();
-        crate::support::set_micros(4_000_000_000_000_000);
+        // Boot seeding: whatever WAL replay observed bounds every later stamp,
+        // even when it is far ahead of the wall clock. The state is reset first
+        // so `observe_stamp` is exercised on a table with NO issued-stamp entry,
+        // which is what a real fresh boot hands it.
+        reset_stamp_state(&t);
         let replayed = 9_000_000_000_000_000_i64; // well past "now"
         observe_stamp(&t, replayed);
         let next = next_stamp(&t);
         crate::support::unfreeze();
+        assert!(a < b && b < c, "stamps must be strictly increasing, got {a} {b} {c}");
+        assert!(after > c, "stamp regressed across a backwards clock step: {c} -> {after}");
         assert!(next > replayed, "post-boot stamp {next} must exceed the replayed max {replayed}");
     }
 
+    /// TF owns the tiebreak of a `version_append` table — filling the column
+    /// when absent and OVERWRITING a client-supplied value — and owns nothing
+    /// else's; every other table is left byte-for-byte alone. Covers both
+    /// reasons for that: no tiebreak at all (`variant_bench`), and a declared
+    /// tiebreak with the write path OFF (`mor_dormant`) — the shape
+    /// `otel_logs_and_spans` and `otel_metrics` had until they flipped
+    /// merge-on-read on 2026-08-02, when their tiebreak also moved off the
+    /// client-supplied `observed_timestamp` / `ingested_at` and onto the
+    /// TF-owned `updated_at` precisely BECAUSE stamping overwrites it.
     #[test]
-    fn stamp_fills_a_missing_column_and_overwrites_a_client_supplied_one() {
+    fn only_version_append_tables_are_stamped() {
         let out = stamp_version("mor_versioned", vec![batch_with(None), batch_with(Some(1_234))]);
         let filled = stamp_of(&out[0]).expect("missing column is appended and populated");
         let overwritten = stamp_of(&out[1]).expect("client value is replaced, not left");
         assert_ne!(overwritten, 1_234, "a client-supplied stamp must be overwritten by TF's");
         assert!(overwritten > filled, "successive batches get increasing stamps");
-    }
 
-    /// Only a `version_append` table has a TF-owned tiebreak; every other table
-    /// is left byte-for-byte alone. Covers both reasons for that: no tiebreak at
-    /// all (`variant_bench`), and a declared tiebreak with the write path OFF
-    /// (`mor_dormant`) — the shape `otel_logs_and_spans` and `otel_metrics` had
-    /// until they flipped merge-on-read on 2026-08-02, when their tiebreak also
-    /// moved off the client-supplied `observed_timestamp` / `ingested_at` and
-    /// onto the TF-owned `updated_at` precisely BECAUSE stamping overwrites it.
-    #[test]
-    fn only_version_append_tables_are_stamped() {
         for t in ["variant_bench", "mor_dormant"] {
             assert!(stamp_column(t).is_none(), "{t} is not a version_append table — TF must not own its tiebreak");
             let before = batch_with(None);

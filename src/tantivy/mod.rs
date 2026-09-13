@@ -413,17 +413,20 @@ mod builder_tests {
         }
     }
 
+    fn arrow_schema(level: DataType) -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("level", level, true),
+        ]))
+    }
+
     /// One row per batch so each `index_to_writer` call is a separate commit
     /// producing its own (tiny, same-sized) segment — the shape the default
     /// `LogMergePolicy` would collapse once ≥8 pile up in one level.
     fn batch(n: i64) -> RecordBatch {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-            Field::new("id", DataType::Utf8, false),
-            Field::new("level", DataType::Utf8, true),
-        ]));
         RecordBatch::try_new(
-            schema,
+            arrow_schema(DataType::Utf8),
             vec![
                 Arc::new(TimestampMicrosecondArray::from(vec![n * 1_000]).with_timezone("UTC")),
                 Arc::new(StringArray::from(vec![format!("id{n}")])),
@@ -461,13 +464,8 @@ mod builder_tests {
                 }
             }
             let values: ArrayRef = Arc::new(lists.finish());
-            let schema = Arc::new(ArrowSchema::new(vec![
-                Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
-                Field::new("id", DataType::Utf8, false),
-                Field::new("level", values.data_type().clone(), true),
-            ]));
             let input = RecordBatch::try_new(
-                schema,
+                arrow_schema(values.data_type().clone()),
                 vec![
                     Arc::new(TimestampMicrosecondArray::from(vec![0; 7]).with_timezone("UTC")),
                     Arc::new(StringArray::from_iter_values((0..7).map(|i| i.to_string()))),

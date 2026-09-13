@@ -51,7 +51,7 @@ fn as_array(v: &ColumnarValue) -> datafusion::error::Result<ArrayRef> {
 }
 
 /// Downcasts an Arrow array to its concrete type, failing with `msg`.
-fn downcast<'a, T: 'static>(array: &'a dyn Array, msg: impl std::fmt::Display) -> datafusion::error::Result<&'a T> {
+fn downcast<T: 'static>(array: &dyn Array, msg: impl std::fmt::Display) -> datafusion::error::Result<&T> {
     array.as_any().downcast_ref::<T>().ok_or_else(|| DataFusionError::Execution(msg.to_string()))
 }
 
@@ -1609,30 +1609,36 @@ pub fn hash_bucket_udf() -> ScalarUDF {
 mod hash_bucket_tests {
     use datafusion::prelude::SessionContext;
 
+    /// Runs `sql` with `hash_bucket` registered, returning the integer cells of each
+    /// rendered data row (borders and the header carry none, so they drop out) plus
+    /// the raw render, which the NULL check needs as a string.
+    async fn int_rows(sql: &str) -> (Vec<Vec<i64>>, String) {
+        let ctx = SessionContext::new();
+        ctx.register_udf(super::hash_bucket_udf());
+        let batches = ctx.sql(sql).await.expect("plan").collect().await.expect("run");
+        let rendered = datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+        let rows = rendered
+            .lines()
+            .map(|line| line.split('|').filter_map(|cell| cell.trim().parse::<i64>().ok()).collect::<Vec<i64>>())
+            .filter(|cells| !cells.is_empty())
+            .collect();
+        (rows, rendered)
+    }
+
     /// Bucketing is only correct if it PARTITIONS: every row lands in exactly one
     /// bucket of `[0, n)`, and equal keys always land together — that is what lets
     /// the dedup rewrite process one shard at a time without splitting a key's
     /// copies across passes.
     #[tokio::test]
     async fn hash_bucket_partitions_and_keeps_equal_keys_together() {
-        let ctx = SessionContext::new();
-        ctx.register_udf(super::hash_bucket_udf());
-        let one = |sql: &str| {
-            let ctx = ctx.clone();
-            let sql = sql.to_string();
-            async move {
-                let batches = ctx.sql(&sql).await.expect("plan").collect().await.expect("run");
-                datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string()
-            }
-        };
         // In range, and the same input always gives the same bucket.
-        let rendered = one("SELECT hash_bucket(arrow_cast(v, 'Utf8View'), 256) AS b FROM (VALUES ('a'), ('a'), ('b')) AS t(v)").await;
-        let buckets: Vec<i64> = rendered.lines().filter_map(|line| line.trim_matches(|c: char| c == '|' || c.is_whitespace()).parse::<i64>().ok()).collect();
+        let (rows, rendered) = int_rows("SELECT hash_bucket(arrow_cast(v, 'Utf8View'), 256) AS b FROM (VALUES ('a'), ('a'), ('b')) AS t(v)").await;
+        let buckets: Vec<i64> = rows.iter().map(|cells| cells[0]).collect();
         assert_eq!(buckets.len(), 3, "three rows: {rendered}");
         assert!(buckets.iter().all(|b| (0..256).contains(b)), "every bucket in range: {buckets:?}");
         assert_eq!(buckets[0], buckets[1], "equal keys must share a bucket");
         // NULL must not vanish: it buckets as the empty string, not as NULL.
-        let rendered = one("SELECT hash_bucket(arrow_cast(NULL, 'Utf8View'), 256) AS b").await;
+        let (_, rendered) = int_rows("SELECT hash_bucket(arrow_cast(NULL, 'Utf8View'), 256) AS b").await;
         assert!(!rendered.contains("NULL"), "NULL must bucket, not propagate: {rendered}");
     }
 
@@ -1642,29 +1648,14 @@ mod hash_bucket_tests {
     /// bucketing makes one shard carry the memory the split existed to avoid.
     #[tokio::test]
     async fn hash_bucket_spreads_evenly_enough_to_shard_on() {
-        let ctx = SessionContext::new();
-        ctx.register_udf(super::hash_bucket_udf());
-        let batches = ctx
-            .sql(
-                "SELECT count(*) AS n, count(DISTINCT hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS distinct_buckets, \
-                 min(hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS lo, max(hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS hi \
-                 FROM (SELECT CAST(i AS VARCHAR) AS v FROM generate_series(1, 5000) AS t(i))",
-            )
-            .await
-            .expect("plan")
-            .collect()
-            .await
-            .expect("run");
-        let rendered = datafusion::arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
-        // The one data row renders as `| n | distinct | lo | hi |`; every other
-        // line is a border or the header.
-        let row = rendered
-            .lines()
-            .find_map(|line| {
-                let cells: Vec<i64> = line.split('|').filter_map(|cell| cell.trim().parse::<i64>().ok()).collect();
-                (cells.len() == 4).then_some(cells)
-            })
-            .unwrap_or_else(|| panic!("one four-column data row: {rendered}"));
+        // The one data row renders as `| n | distinct | lo | hi |`.
+        let (rows, rendered) = int_rows(
+            "SELECT count(*) AS n, count(DISTINCT hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS distinct_buckets, \
+             min(hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS lo, max(hash_bucket(arrow_cast(v, 'Utf8View'), 256)) AS hi \
+             FROM (SELECT CAST(i AS VARCHAR) AS v FROM generate_series(1, 5000) AS t(i))",
+        )
+        .await;
+        let row = rows.iter().find(|cells| cells.len() == 4).unwrap_or_else(|| panic!("one four-column data row: {rendered}"));
         assert_eq!(row[0], 5000, "all rows counted: {rendered}");
         assert_eq!(row[1], 256, "5000 keys must reach every one of 256 buckets: {rendered}");
         assert!((0..256).contains(&row[2]) && (0..256).contains(&row[3]), "bounds inside [0, 256): {rendered}");
@@ -1699,49 +1690,44 @@ mod hll_tests {
 
     /// The rollup property: sketches built per group and folded afterwards must
     /// agree with one built over everything at once. Without this a 30-day tile
-    /// cannot be answered from 1-minute buckets.
+    /// cannot be answered from 1-minute buckets. Folding per-bucket sketches is
+    /// the rewrite a rollup substitutes; it must answer the same number as the
+    /// raw fallback it replaces — in both the `hll_*` and the Timescale-toolkit
+    /// spelling of that fallback.
     #[tokio::test]
-    async fn merging_per_bucket_sketches_equals_one_pass_over_all_rows() {
+    async fn merging_per_bucket_sketches_equals_one_pass_and_the_toolkit_spelling() {
         let rows = "SELECT value % 30000 AS v, value % 7 AS bucket FROM generate_series(1, 300000) t(value)";
         let merged = scalar(&format!("SELECT hll_count(hll_merge(s)) FROM (SELECT hll_agg(v) AS s FROM ({rows}) GROUP BY bucket)")).await;
         let one_pass = scalar(&format!("SELECT hll_count(hll_agg(v)) FROM ({rows})")).await;
+        let toolkit = scalar(&format!("SELECT distinct_count(approx_count_distinct(v)) FROM ({rows})")).await;
         assert_eq!(merged, one_pass, "folding per-bucket states must equal a single pass");
+        assert_eq!(toolkit, one_pass, "the rewrite must not change the answer");
+        let error = (one_pass as f64 - 30_000.0).abs() / 30_000.0;
+        assert!(error < 0.05, "estimated {one_pass}, want ~30000");
     }
 
     /// Distinct counts are asked of every column type, and NULL is not a value.
+    ///
+    /// The `distinct_count(approx_count_distinct(…))` cases are the exact SQL
+    /// monoscope sends to BOTH backends. Verified 2026-08-13 against prod
+    /// Timescale: `distinct_count(approx_count_distinct(v))::float` returns 2
+    /// for (1,2,2,NULL). Toolkit's `approx_count_distinct` builds a SKETCH, not
+    /// a count — `approx_count_distinct(x)::float` is a type error there — so TF
+    /// has to split the same way or the one query text cannot run on both. The
+    /// session query wraps the sketch in `FILTER (WHERE …)`; verified on prod
+    /// Timescale in the same shape, so the one text runs on both.
+    #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES (1),(2),(2),(NULL)) t(v)" => 2 ; "ints, and NULL is not a value")]
+    #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES (1.5),(2.5),(1.5)) t(v)" => 2 ; "floats")]
+    #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES ('a'),('b'),('a')) t(v)" => 2 ; "strings")]
+    #[test_case::test_case("SELECT hll_count(hll_agg(v)) FROM (VALUES (arrow_cast(1, 'Timestamp(Microsecond, None)'))) t(v)" => 1 ; "timestamps")]
+    #[test_case::test_case("SELECT distinct_count(approx_count_distinct(v)) FROM (VALUES (1),(2),(2),(NULL)) t(v)" => 2 ; "the timescale toolkit spelling runs unchanged")]
+    #[test_case::test_case(
+        "SELECT distinct_count(approx_count_distinct(v) FILTER (WHERE v IS NOT NULL))::BIGINT FROM (VALUES (1),(2),(2),(NULL)) t(v)" => 2
+        ; "the filtered form the session query sends runs here too"
+    )]
     #[tokio::test]
-    async fn non_string_columns_work_and_nulls_are_ignored() {
-        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (1),(2),(2),(NULL)) t(v)").await, 2);
-        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (1.5),(2.5),(1.5)) t(v)").await, 2);
-        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES ('a'),('b'),('a')) t(v)").await, 2);
-        assert_eq!(scalar("SELECT hll_count(hll_agg(v)) FROM (VALUES (arrow_cast(1, 'Timestamp(Microsecond, None)'))) t(v)").await, 1);
-    }
-
-    /// The exact SQL monoscope sends to BOTH backends. Verified 2026-08-13
-    /// against prod Timescale: `distinct_count(approx_count_distinct(v))::float`
-    /// returns 2 for (1,2,2,NULL). Toolkit's `approx_count_distinct` builds a
-    /// SKETCH, not a count — `approx_count_distinct(x)::float` is a type error
-    /// there — so TF has to split the same way or the one query text cannot run
-    /// on both.
-    #[tokio::test]
-    async fn the_timescale_toolkit_spelling_runs_unchanged() {
-        assert_eq!(scalar("SELECT distinct_count(approx_count_distinct(v)) FROM (VALUES (1),(2),(2),(NULL)) t(v)").await, 2);
-        let rows = "SELECT value % 30000 AS v, value % 7 AS bucket FROM generate_series(1, 300000) t(value)";
-        let direct = scalar(&format!("SELECT distinct_count(approx_count_distinct(v)) FROM ({rows})")).await;
-        // Folding per-bucket sketches is the rewrite a rollup substitutes; it
-        // must answer the same number as the raw fallback it replaces.
-        let via_rollup = scalar(&format!("SELECT hll_count(hll_merge(s)) FROM (SELECT hll_agg(v) AS s FROM ({rows}) GROUP BY bucket)")).await;
-        assert_eq!(direct, via_rollup, "the rewrite must not change the answer");
-        let error = (direct as f64 - 30_000.0).abs() / 30_000.0;
-        assert!(error < 0.05, "estimated {direct}, want ~30000");
-    }
-
-    /// The session query wraps the sketch in `FILTER (WHERE …)`; verified on
-    /// prod Timescale in the same shape, so the one text runs on both.
-    #[tokio::test]
-    async fn the_filtered_form_the_session_query_sends_runs_here_too() {
-        let sql = "SELECT distinct_count(approx_count_distinct(v) FILTER (WHERE v IS NOT NULL))::BIGINT FROM (VALUES (1),(2),(2),(NULL)) t(v)";
-        assert_eq!(scalar(sql).await, 2);
+    async fn an_exact_distinct_count(sql: &str) -> u64 {
+        scalar(sql).await
     }
 
     /// `hll_count(NULL)` is NULL, not 0: a rollup row that never saw the measure
@@ -2018,6 +2004,9 @@ fn map_utf8_rows<T, A: FromIterator<Option<T>>>(array: &ArrayRef, label: &str, f
 mod tests {
     use super::*;
 
+    /// The timestamp every `to_char` parity case is captured against.
+    const TS: &str = "TIMESTAMP '2026-06-10 08:10:52.422355'";
+
     /// `::` binds tighter than `->>`, so monoscope emits a cast on the PATH.
     /// Both spellings address the same field and must plan to the same
     /// `variant_get`; before the cast was unwrapped the second one did not
@@ -2102,79 +2091,68 @@ mod tests {
         assert!(values.value(0) > 90.0);
     }
 
-    #[test]
-    fn test_parse_pg_format() {
-        // Helper: assert the parse collapses to a single Chrono part with the given spec.
-        let chrono_only = |fmt: &str, expected: &str| {
-            assert_eq!(parse_pg_format(fmt), vec![FmtPart::Chrono(expected.to_string())], "fmt: {fmt}");
-        };
-        chrono_only("YYYY-MM-DD", "%Y-%m-%d");
-        chrono_only("YYYY-MM-DD HH24:MI:SS", "%Y-%m-%d %H:%M:%S");
-        chrono_only("Day, DD Mon YYYY", "%A, %d %b %Y");
-        // Postgres-style "..." literal escapes: ISO-8601 with T separator and Z suffix.
-        chrono_only(r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#, "%Y-%m-%dT%H:%M:%S.%6fZ");
-        // Tokens inside a literal stay literal.
-        chrono_only(r#""YYYY=" YYYY"#, "YYYY= %Y");
-        // "" inside a literal is an escaped quote.
-        chrono_only(r#""a""b""#, "a\"b");
-        // A bare % outside tokens is escaped to chrono's literal-%.
-        chrono_only("100%", "100%%");
-        // Unterminated literal: copy the remainder verbatim, don't panic.
-        chrono_only(r#"YYYY "tail"#, "%Y tail");
+    /// The one UTF-8 string a query returns, through the real registered UDFs.
+    async fn text(sql: &str) -> String {
+        let mut ctx = datafusion::prelude::SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        batches[0].column(0).as_any().downcast_ref::<StringViewArray>().unwrap().value(0).to_string()
+    }
 
-        // D / DY split the buffer (no chrono equivalent).
-        assert_eq!(parse_pg_format("D"), vec![FmtPart::PgD]);
-        assert_eq!(parse_pg_format("DY"), vec![FmtPart::PgDY]);
-        assert_eq!(parse_pg_format("YYYY-D"), vec![FmtPart::Chrono("%Y-".to_string()), FmtPart::PgD]);
-        assert_eq!(parse_pg_format("DY YYYY"), vec![FmtPart::PgDY, FmtPart::Chrono(" %Y".to_string())]);
+    fn chrono_only(spec: &str) -> Vec<FmtPart> {
+        vec![FmtPart::Chrono(spec.to_string())]
+    }
+
+    #[test_case::test_case("YYYY-MM-DD" => chrono_only("%Y-%m-%d") ; "date")]
+    #[test_case::test_case("YYYY-MM-DD HH24:MI:SS" => chrono_only("%Y-%m-%d %H:%M:%S") ; "date and 24h time")]
+    #[test_case::test_case("Day, DD Mon YYYY" => chrono_only("%A, %d %b %Y") ; "names")]
+    // Postgres-style "..." literal escapes: ISO-8601 with T separator and Z suffix.
+    #[test_case::test_case(r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""# => chrono_only("%Y-%m-%dT%H:%M:%S.%6fZ") ; "iso 8601 literal escapes")]
+    #[test_case::test_case(r#""YYYY=" YYYY"# => chrono_only("YYYY= %Y") ; "tokens inside a literal stay literal")]
+    #[test_case::test_case(r#""a""b""# => chrono_only("a\"b") ; "doubled quote inside a literal is an escaped quote")]
+    #[test_case::test_case("100%" => chrono_only("100%%") ; "a bare percent is escaped to chrono literal-percent")]
+    #[test_case::test_case(r#"YYYY "tail"# => chrono_only("%Y tail") ; "unterminated literal copies the remainder verbatim")]
+    // D / DY split the buffer (no chrono equivalent).
+    #[test_case::test_case("D" => vec![FmtPart::PgD] ; "pg D alone")]
+    #[test_case::test_case("DY" => vec![FmtPart::PgDY] ; "pg DY alone")]
+    #[test_case::test_case("YYYY-D" => vec![FmtPart::Chrono("%Y-".to_string()), FmtPart::PgD] ; "pg D splits the chrono buffer")]
+    #[test_case::test_case("DY YYYY" => vec![FmtPart::PgDY, FmtPart::Chrono(" %Y".to_string())] ; "pg DY splits the chrono buffer")]
+    fn test_parse_pg_format(fmt: &str) -> Vec<FmtPart> {
+        parse_pg_format(fmt)
     }
 
     /// End-to-end UDF parity with Postgres/TimescaleDB `to_char`. Expected outputs
     /// captured from real Postgres 16 with `SELECT to_char(TIMESTAMP '2026-06-10 08:10:52.422355', fmt)`.
+    #[test_case::test_case(TS, "YYYY-MM-DD" => "2026-06-10" ; "date")]
+    #[test_case::test_case(TS, "YYYY-MM-DD HH24:MI:SS" => "2026-06-10 08:10:52" ; "date and 24h time")]
+    // Monoscope's ISO-8601 target — the bug this fix addresses.
+    #[test_case::test_case(TS, r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""# => "2026-06-10T08:10:52.422355Z" ; "monoscope iso 8601 micros")]
+    #[test_case::test_case(TS, r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""# => "2026-06-10T08:10:52.422Z" ; "iso 8601 millis")]
+    #[test_case::test_case(TS, "DD/MM/YYYY" => "10/06/2026" ; "day first")]
+    #[test_case::test_case(TS, "Mon DD, YYYY" => "Jun 10, 2026" ; "short month name")]
+    #[test_case::test_case(TS, "Day, Mon DD YYYY" => "Wednesday, Jun 10 2026" ; "long day name")]
+    #[test_case::test_case(TS, "HH12:MI" => "08:10" ; "12h time")]
+    #[test_case::test_case(TS, "YY" => "26" ; "two digit year")]
+    // Literal containing characters that look like tokens.
+    #[test_case::test_case(TS, r#""YYYY=" YYYY"# => "YYYY= 2026" ; "literal that looks like a token")]
+    // Non-ASCII bytes inside a literal must survive intact (UTF-8 boundary walk).
+    #[test_case::test_case(TS, r#""· "YYYY"# => "· 2026" ; "non ascii literal survives the utf8 boundary walk")]
+    // AM/PM, Dy, bare HH round-out token coverage.
+    #[test_case::test_case(TS, "HH12:MI AM" => "08:10 AM" ; "am token")]
+    #[test_case::test_case(TS, "HH:MI:SS" => "08:10:52" ; "bare HH aliases HH12, 12 hour clock with leading zero")]
+    #[test_case::test_case(TS, "HH12:MI am" => "08:10 am" ; "lowercase am token emits lowercase output")]
+    #[test_case::test_case(TS, "Dy" => "Wed" ; "abbreviated day name")]
+    // Postgres-specific tokens with no exact chrono equivalent.
+    // 2026-06-10 is a Wednesday: Postgres D=4 (Sun=1), DY="WED".
+    #[test_case::test_case(TS, "D" => "4" ; "pg D is 1 based from sunday")]
+    #[test_case::test_case(TS, "DY" => "WED" ; "pg DY is upper case")]
+    // Order-of-parsing check: DY must beat bare D.
+    #[test_case::test_case(TS, "DY-D" => "WED-4" ; "DY must beat bare D")]
+    // A PM timestamp, to actually exercise the PM output of %p.
+    #[test_case::test_case("TIMESTAMP '2026-06-10 20:10:52'", "HH12:MI PM" => "08:10 PM" ; "pm token on an afternoon timestamp")]
     #[tokio::test]
-    async fn test_to_char_postgres_parity() {
-        use datafusion::prelude::SessionContext;
-        let mut ctx = SessionContext::new();
-        register_custom_functions(&mut ctx).unwrap();
-        let ts = "TIMESTAMP '2026-06-10 08:10:52.422355'";
-        let cases: &[(&str, &str)] = &[
-            ("YYYY-MM-DD", "2026-06-10"),
-            ("YYYY-MM-DD HH24:MI:SS", "2026-06-10 08:10:52"),
-            // Monoscope's ISO-8601 target — the bug this fix addresses.
-            (r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#, "2026-06-10T08:10:52.422355Z"),
-            (r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""#, "2026-06-10T08:10:52.422Z"),
-            ("DD/MM/YYYY", "10/06/2026"),
-            ("Mon DD, YYYY", "Jun 10, 2026"),
-            ("Day, Mon DD YYYY", "Wednesday, Jun 10 2026"),
-            ("HH12:MI", "08:10"),
-            ("YY", "26"),
-            // Literal containing characters that look like tokens.
-            (r#""YYYY=" YYYY"#, "YYYY= 2026"),
-            // Non-ASCII bytes inside a literal must survive intact (UTF-8 boundary walk).
-            (r#""· "YYYY"#, "· 2026"),
-            // AM/PM, Dy, bare HH round-out token coverage.
-            ("HH12:MI AM", "08:10 AM"),
-            ("HH:MI:SS", "08:10:52"),   // bare HH aliases HH12 (12-hour clock with leading zero).
-            ("HH12:MI am", "08:10 am"), // lowercase am token emits lowercase output.
-            ("Dy", "Wed"),
-            // Postgres-specific tokens with no exact chrono equivalent.
-            // 2026-06-10 is a Wednesday: Postgres D=4 (Sun=1), DY="WED".
-            ("D", "4"),
-            ("DY", "WED"),
-            // Order-of-parsing check: DY must beat bare D.
-            ("DY-D", "WED-4"),
-        ];
-        for (fmt, expected) in cases {
-            let sql = format!("SELECT to_char({ts}, '{fmt}') AS s");
-            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-            let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
-            assert_eq!(col.value(0), *expected, "format `{fmt}`");
-        }
-        // Separate PM-timestamp case to actually exercise the PM output of %p.
-        let pm_sql = "SELECT to_char(TIMESTAMP '2026-06-10 20:10:52', 'HH12:MI PM') AS s";
-        let pm_batches = ctx.sql(pm_sql).await.unwrap().collect().await.unwrap();
-        let pm_col = pm_batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
-        assert_eq!(pm_col.value(0), "08:10 PM");
+    async fn test_to_char_postgres_parity(ts: &str, fmt: &str) -> String {
+        text(&format!("SELECT to_char({ts}, '{fmt}') AS s")).await
     }
 
     /// PG parity: `to_jsonb(text[])` produces an array of JSON *strings*. Elements
@@ -2183,28 +2161,17 @@ mod tests {
     /// log explorer's row renderer ("e.indexOf is not a function").
     #[tokio::test]
     async fn test_to_jsonb_text_array_elements_stay_strings() {
-        use datafusion::prelude::SessionContext;
-        let mut ctx = SessionContext::new();
-        register_custom_functions(&mut ctx).unwrap();
-        let sql = r#"SELECT to_jsonb(make_array('{"a":1}', '[1,2]', 'plain', '123')) AS s"#;
-        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
-        assert_eq!(col.value(0), r#"["{\"a\":1}","[1,2]","plain","123"]"#);
+        let array = text(r#"SELECT to_jsonb(make_array('{"a":1}', '[1,2]', 'plain', '123')) AS s"#).await;
+        assert_eq!(array, r#"["{\"a\":1}","[1,2]","plain","123"]"#);
         // Independent of serialisation format: every element must be a JSON *string*.
-        let parsed: serde_json::Value = serde_json::from_str(col.value(0)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&array).unwrap();
         assert!(parsed.as_array().unwrap().iter().all(serde_json::Value::is_string), "elements must stay strings: {parsed}");
         // Top-level Utf8 scalars keep the JSON sniff: Variant/Utf8 columns holding
         // JSON (attributes, events, links) rely on it to surface as real JSON.
-        let sql = r#"SELECT to_jsonb('{"a":1}') AS s"#;
-        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
-        assert_eq!(col.value(0), r#"{"a":1}"#);
+        assert_eq!(text(r#"SELECT to_jsonb('{"a":1}') AS s"#).await, r#"{"a":1}"#);
         // to_json shares array_to_json_values, so the same rule applies — monoscope's
         // selectChildSpansAndLogs emits to_json(summary).
-        let sql = r#"SELECT to_json(make_array('{"a":1}')) AS s"#;
-        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
-        assert_eq!(col.value(0), r#"["{\"a\":1}"]"#);
+        assert_eq!(text(r#"SELECT to_json(make_array('{"a":1}')) AS s"#).await, r#"["{\"a\":1}"]"#);
     }
 
     /// LargeList and FixedSizeList must keep list structure (they used to fall
@@ -2301,11 +2268,6 @@ mod tests {
             assert!(parse_interval_to_micros(bad).is_err(), "expected error for: {bad}");
         }
     }
-}
-
-#[cfg(test)]
-mod row_to_json_tests {
-    use super::*;
 
     /// `row_to_json` is PG's `to_json` over a record. Struct support also fixes
     /// `to_json`/`to_jsonb` of a struct column, which previously failed with
@@ -2315,16 +2277,11 @@ mod row_to_json_tests {
     /// column order). Both share this code path, and serde_json's Map is a
     /// BTreeMap unless the crate-wide `preserve_order` feature is on — not worth
     /// flipping globally for key order no caller depends on.
+    #[test_case::test_case("SELECT row_to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "row_to_json of a struct")]
+    #[test_case::test_case("SELECT to_json(named_struct('total', 1, 'active', 2)) AS d" => r#"{"active":2,"total":1}"# ; "to_json of a struct column")]
     #[tokio::test]
-    async fn row_to_json_renders_a_struct_as_a_json_object() {
-        use datafusion::prelude::SessionContext;
-        let mut ctx = SessionContext::new();
-        register_custom_functions(&mut ctx).unwrap();
-        for sql in ["SELECT row_to_json(named_struct('total', 1, 'active', 2)) AS d", "SELECT to_json(named_struct('total', 1, 'active', 2)) AS d"] {
-            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-            let column = batches[0].column(0).as_any().downcast_ref::<StringViewArray>().unwrap();
-            assert_eq!(column.value(0), r#"{"active":2,"total":1}"#, "sql: {sql}");
-        }
+    async fn row_to_json_renders_a_struct_as_a_json_object(sql: &str) -> String {
+        text(sql).await
     }
 
     /// Documented limitation. PG lets `row_to_json(t)` name a whole row; DataFusion
@@ -2367,13 +2324,13 @@ mod time_bucket_streaming_tests {
             self.batch.schema_ref()
         }
         fn execute(&self, _: Arc<TaskContext>) -> SendableRecordBatchStream {
-            let batch = self.batch.clone();
-            let release = self.release.clone();
+            let (batch, schema, release) = (self.batch.clone(), self.batch.schema(), self.release.clone());
+            let tail_schema = schema.clone();
             let rows = stream::once(async move { Ok(batch) }).chain(stream::once(async move {
                 release.notified().await;
-                Ok(RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)]))))
+                Ok(RecordBatch::new_empty(tail_schema))
             }));
-            Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), rows))
+            Box::pin(RecordBatchStreamAdapter::new(schema, rows))
         }
     }
 
@@ -2389,7 +2346,7 @@ mod time_bucket_streaming_tests {
         ctx.register_table("ordered_input", Arc::new(StreamingTable::try_new(schema, vec![source])?.with_sort_order(vec![col("ts").sort(true, false)])))?;
         let mut rows = ctx.sql("SELECT time_bucket('1 second', ts), count(*) FROM ordered_input GROUP BY 1 ORDER BY 1").await?.execute_stream().await?;
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), rows.next()).await?.expect("first completed group")?;
-        assert!(first.num_rows() > 0);
+        assert!(first.num_rows() > 0, "a completed group must be emitted before the input finishes");
         assert_eq!(first.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 2);
         release.notify_one();
         let mut count = first.num_rows();
@@ -2407,15 +2364,13 @@ mod time_bucket_streaming_tests {
         let rows = ctx.sql("SELECT time_bucket('1 second', to_timestamp_micros(n)) IS NOT DISTINCT FROM date_bin(INTERVAL '1 second', to_timestamp_micros(n), TIMESTAMP '1970-01-01') FROM (VALUES (-1000001), (-1), (0), (999999), (1000000), (NULL)) t(n)").await?.collect().await?;
         for batch in rows {
             let equal = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
-            assert!(equal.iter().all(|value| value == Some(true)));
+            assert!(equal.iter().all(|value| value == Some(true)), "time_bucket must agree with date_bin on every pinned boundary: {equal:?}");
         }
         for width in ["'0 seconds'", "'-1 second'", "'9223372036854775807 weeks'", "INTERVAL '0 seconds'", "INTERVAL '1 month'"] {
-            let result = ctx.sql(&format!("SELECT time_bucket({width}, TIMESTAMP '2026-01-01')")).await;
-            let failed = match result {
-                Ok(frame) => frame.collect().await.is_err(),
-                Err(_) => true,
-            };
-            assert!(failed, "invalid width {width}");
+            // A planning error and an execution error both count as a rejection.
+            let ran: datafusion::error::Result<_> =
+                async { ctx.sql(&format!("SELECT time_bucket({width}, TIMESTAMP '2026-01-01')")).await?.collect().await }.await;
+            assert!(ran.is_err(), "invalid width {width}");
         }
         Ok(())
     }

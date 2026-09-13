@@ -1697,6 +1697,7 @@ mod tests {
         array::{ArrayRef, Int64Array, StringViewArray},
         datatypes::{DataType, Field, Schema},
     };
+    use test_case::test_case;
 
     use super::*;
 
@@ -1705,13 +1706,55 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(StringViewArray::from(vec!["a", "b", "c"]))]).unwrap()
     }
 
-    #[test]
-    fn test_record_batch_serialization() {
-        let batch = create_test_batch();
-        let serialized = serialize_record_batch(&batch).unwrap();
-        let deserialized = deserialize_record_batch(&serialized).unwrap();
-        assert_eq!(batch.num_rows(), deserialized.num_rows());
-        assert_eq!(batch.num_columns(), deserialized.num_columns());
+    /// Per-test-unique table name. Walrus state lives under a process-global
+    /// `WALRUS_DATA_DIR`, so a fixed topic inherits blocks/cursors appended by
+    /// earlier tests in the same process and exact-position asserts flake.
+    fn uniq(prefix: &str) -> String {
+        format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    /// A WalManager rooted in `dir`. Takes `&TempDir` so the caller keeps the
+    /// guard alive across drop/reopen (process A / process B) sequences.
+    fn wal_in(dir: &tempfile::TempDir, mode: crate::config::WalFsyncMode, shards: usize) -> WalManager {
+        WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), mode, shards).unwrap()
+    }
+
+    /// The common case: 4 shards, fsync on every append.
+    fn sync_wal(dir: &tempfile::TempDir) -> WalManager {
+        wal_in(dir, crate::config::WalFsyncMode::SyncEach, 4)
+    }
+
+    /// Single non-null `body: Utf8` column — the shape the split/replay tests
+    /// use to control payload size by row width.
+    fn str_batch(strs: &[String]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
+            vec![Arc::new(arrow::array::StringArray::from(strs.iter().map(|s| s.as_str()).collect::<Vec<_>>()))],
+        )
+        .unwrap()
+    }
+
+    /// Poll (never sleep-and-hope) until the blocked contender publishes its
+    /// takeover request; `msg` names the invariant if it never does.
+    async fn await_takeover_request(path: &std::path::Path, msg: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !takeover_requested(path) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(msg);
+    }
+
+    /// Decode every split payload, asserting the splitter's size bound on each.
+    fn decode_bounded(payloads: &[Vec<u8>], target: usize) -> Vec<RecordBatch> {
+        payloads
+            .iter()
+            .map(|p| {
+                assert!(p.len() <= target, "payload {} bytes exceeds target {target}", p.len());
+                deserialize_record_batch(p).unwrap()
+            })
+            .collect()
     }
 
     // Prod 2026-06-11 night: WAL replay of 6,546 entries charged 772.5GB
@@ -1746,8 +1789,21 @@ mod tests {
         assert!(charged < 1024 * 1024, "replayed ~150KB-logical batch charged {charged} bytes — IPC message-body slices are leaking into accounting");
     }
 
+    fn payload_roundtrip<T: Encode + Decode<()>>(payload: &T) -> T {
+        decode_payload(&bincode::encode_to_vec(payload, BINCODE_CONFIG).unwrap()).unwrap()
+    }
+
+    /// Every on-disk shape must survive its round-trip: the Arrow IPC batch,
+    /// the framed `WalEntry` (every field), and every DML payload shape —
+    /// including the `None` predicate (a bare `DELETE`/`UPDATE` over the whole
+    /// table).
     #[test]
-    fn test_wal_entry_serialization() {
+    fn wal_serialization_roundtrips() {
+        let batch = create_test_batch();
+        let deserialized = deserialize_record_batch(&serialize_record_batch(&batch).unwrap()).unwrap();
+        assert_eq!(batch.num_rows(), deserialized.num_rows());
+        assert_eq!(batch.num_columns(), deserialized.num_columns());
+
         let entry = WalEntry {
             timestamp_micros: 1234567890,
             project_id: "project-123".to_string(),
@@ -1755,23 +1811,12 @@ mod tests {
             operation: WalOperation::Insert,
             data: vec![1, 2, 3, 4, 5],
         };
-        let serialized = serialize_wal_entry(&entry).unwrap();
-        let deserialized = deserialize_wal_entry(&serialized).unwrap();
-        assert_eq!(entry.timestamp_micros, deserialized.timestamp_micros);
-        assert_eq!(entry.project_id, deserialized.project_id);
-        assert_eq!(entry.table_name, deserialized.table_name);
-        assert_eq!(entry.operation, deserialized.operation);
-        assert_eq!(entry.data, deserialized.data);
-    }
+        let back = deserialize_wal_entry(&serialize_wal_entry(&entry).unwrap()).unwrap();
+        assert_eq!(
+            (back.timestamp_micros, back.project_id, back.table_name, back.operation, back.data),
+            (entry.timestamp_micros, entry.project_id, entry.table_name, entry.operation, entry.data)
+        );
 
-    fn payload_roundtrip<T: Encode + Decode<()>>(payload: &T) -> T {
-        decode_payload(&bincode::encode_to_vec(payload, BINCODE_CONFIG).unwrap()).unwrap()
-    }
-
-    /// Every DML payload shape must survive the bincode round-trip, including
-    /// the `None` predicate (a bare `DELETE`/`UPDATE` over the whole table).
-    #[test]
-    fn dml_payloads_roundtrip_through_bincode() {
         for predicate_sql in [Some("id = 1".to_string()), None] {
             assert_eq!(payload_roundtrip(&DeletePayload { predicate_sql: predicate_sql.clone() }).predicate_sql, predicate_sql);
             let assignments = vec![("name".to_string(), "'updated'".to_string())];
@@ -1788,9 +1833,8 @@ mod tests {
     #[test]
     fn volatile_replay_persists_only_the_final_parked_cursor() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let table = format!("volatile_{}", uuid::Uuid::new_v4().simple());
-        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::None, 1).unwrap();
+        let table = uniq("volatile");
+        let wal = wal_in(&dir, crate::config::WalFsyncMode::None, 1);
         let batch = create_test_batch();
         for _ in 0..8 {
             wal.append_batch("proj", &table, std::slice::from_ref(&batch), |_, _| {}).unwrap();
@@ -1808,7 +1852,7 @@ mod tests {
         wal.set_positions_allow_rewind("proj", &table, &[Some(tail)]).unwrap();
         drop(wal);
 
-        let reopened = WalManager::with_fsync_mode_and_shards(path, crate::config::WalFsyncMode::None, 1).unwrap();
+        let reopened = wal_in(&dir, crate::config::WalFsyncMode::None, 1);
         assert!(reopened.is_fully_consumed().unwrap(), "the one final parked cursor write must survive reopen");
     }
 
@@ -1821,18 +1865,13 @@ mod tests {
     #[test]
     fn oversized_insert_append_survives_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let table = format!("big_{}", uuid::Uuid::new_v4().simple());
-        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 2).unwrap();
+        let table = uniq("big");
+        let wal = wal_in(&dir, crate::config::WalFsyncMode::None, 2);
 
         // ~112MB of string payload (35k rows × 3.2KB) — over WAL_SPLIT_TARGET,
         // mirroring the prod 121MB / 39k-row entry.
         let n_rows = 35_000;
-        let strs: Vec<String> = (0..n_rows).map(|i| format!("{i:0>3200}")).collect();
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
-            vec![Arc::new(arrow::array::StringArray::from(strs.iter().map(|s| s.as_str()).collect::<Vec<_>>()))],
-        )
-        .unwrap();
+        let batch = str_batch(&(0..n_rows).map(|i| format!("{i:0>3200}")).collect::<Vec<_>>());
 
         wal.append_batch("proj", &table, std::slice::from_ref(&batch), |_, _| {}).unwrap();
 
@@ -1851,32 +1890,25 @@ mod tests {
     #[test]
     fn split_to_wal_payloads_bounds_every_entry() {
         use arrow::array::Array;
-        let make = |strs: Vec<String>| {
-            RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
-                vec![Arc::new(arrow::array::StringArray::from(strs.iter().map(|s| s.as_str()).collect::<Vec<_>>()))],
-            )
-            .unwrap()
-        };
         let (target, hard_max) = (8 * 1024, 32 * 1024);
-        let batch = make((0..100).map(|i| format!("{i:0>200}")).collect());
-        let payloads = split_to_wal_payloads(&batch, target, hard_max).unwrap();
+        let expected: Vec<String> = (0..100).map(|i| format!("{i:0>200}")).collect();
+        let payloads = split_to_wal_payloads(&str_batch(&expected), target, hard_max).unwrap();
         assert!(payloads.len() > 1);
-        let mut rows: Vec<String> = Vec::new();
-        for p in &payloads {
-            assert!(p.len() <= target, "payload {} bytes exceeds target {target}", p.len());
-            let b = deserialize_record_batch(p).unwrap();
-            let col = b.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
-            rows.extend((0..col.len()).map(|i| col.value(i).to_string()));
-        }
-        assert_eq!(rows, (0..100).map(|i| format!("{i:0>200}")).collect::<Vec<_>>(), "rows preserved in order");
+        let rows: Vec<String> = decode_bounded(&payloads, target)
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+                (0..col.len()).map(|i| col.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(rows, expected, "rows preserved in order");
 
-        let fat_row = make(vec!["x".repeat(16 * 1024)]);
+        let fat_row = str_batch(&["x".repeat(16 * 1024)]);
         let whole = split_to_wal_payloads(&fat_row, target, hard_max).unwrap();
         assert_eq!(whole.len(), 1, "a single row between target and hard cap must pass through whole");
         assert_eq!(deserialize_record_batch(&whole[0]).unwrap().num_rows(), 1);
 
-        let too_fat_row = make(vec!["x".repeat(64 * 1024)]);
+        let too_fat_row = str_batch(&["x".repeat(64 * 1024)]);
         assert!(
             matches!(split_to_wal_payloads(&too_fat_row, target, hard_max), Err(WalError::BatchTooLarge { .. })),
             "a single row over the hard cap must fail the append explicitly, not ack-then-drop"
@@ -1902,12 +1934,7 @@ mod tests {
         assert!(payloads.len() > 1);
         // Way fewer entries than rows — the pre-fix splitter emitted ~1 per row.
         assert!(payloads.len() < 100, "split degenerated toward per-row entries: {} payloads", payloads.len());
-        let mut rows = 0usize;
-        for p in &payloads {
-            assert!(p.len() <= target, "payload {} bytes exceeds target {target}", p.len());
-            let b = deserialize_record_batch(p).unwrap();
-            rows += b.num_rows();
-        }
+        let rows: usize = decode_bounded(&payloads, target).iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1000, "no rows lost across the dictionary split");
     }
 
@@ -1918,7 +1945,7 @@ mod tests {
     #[test]
     fn append_update_with_source_rejects_oversized_source() {
         let dir = tempfile::tempdir().unwrap();
-        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 2).unwrap();
+        let wal = wal_in(&dir, crate::config::WalFsyncMode::None, 2);
         let source = SerializedSource { join_keys: vec![("id".to_string(), "id".to_string())], batch_ipc: vec![0u8; MAX_BATCH_SIZE + 1] };
         let res = wal.append_update_with_source("proj", "tbl", None, &[], &source, |_, _| {});
         assert!(matches!(res, Err(WalError::BatchTooLarge { .. })));
@@ -1927,17 +1954,14 @@ mod tests {
     /// Stability anchor: `walrus_topic_key` must produce the same bytes across
     /// builds and library versions. A regression here silently strands WAL
     /// entries on upgrade — see WAL_VERSION 131/132 bump rationale.
-    #[test]
-    fn walrus_topic_key_is_stable() {
-        let k = WalManager::walrus_topic_key("project", "table", 0);
-        // 16-hex-char FNV-1a + "-00" suffix. Concrete value is pinned below;
-        // shape check first so a regression reports a useful diff.
-        assert_eq!(k.len(), 19, "key shape changed: {k}");
-        assert!(k.ends_with("-00"));
-        // Pinned values — update both lines together if the encoding changes,
-        // and bump WAL_VERSION + document in the const's Bumps section.
-        assert_eq!(WalManager::walrus_topic_key("project", "table", 0), "d8751a406eed3d9a-00");
-        assert_eq!(WalManager::walrus_topic_key("p1", "otel_logs_and_spans", 3), "ae0768bab343abd1-03");
+    ///
+    /// Shape: 16-hex-char FNV-1a + a "-NN" shard suffix. Pinned values —
+    /// update every case together if the encoding changes, and bump
+    /// WAL_VERSION + document in the const's Bumps section.
+    #[test_case("project", "table", 0 => "d8751a406eed3d9a-00".to_string() ; "shard 0 suffix")]
+    #[test_case("p1", "otel_logs_and_spans", 3 => "ae0768bab343abd1-03".to_string() ; "shard 3 suffix")]
+    fn walrus_topic_key_is_stable(project: &str, table: &str, shard: usize) -> String {
+        WalManager::walrus_topic_key(project, table, shard)
     }
 
     /// Collision guards: distinct (project_id, table_name) tuples must map
@@ -1963,10 +1987,8 @@ mod tests {
     #[test]
     fn ack_fsync_appends_are_synced_and_readable() {
         let dir = tempfile::tempdir().unwrap();
-        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
-        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::Milliseconds(60_000), 2)
-            .unwrap()
-            .with_ack_fsync(true);
+        let table = uniq("tbl");
+        let wal = wal_in(&dir, crate::config::WalFsyncMode::Milliseconds(60_000), 2).with_ack_fsync(true);
 
         wal.append_delete("proj", &table, Some("id = 'x'"), |_, _| {}).unwrap();
         wal.append_batch("proj", &table, &[create_test_batch()], |_, _| {}).unwrap();
@@ -1997,8 +2019,8 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
-        let wal = Arc::new(WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 4).unwrap());
+        let table = uniq("tbl");
+        let wal = Arc::new(wal_in(&dir, crate::config::WalFsyncMode::None, 4));
 
         // Far more concurrent writers than the 4 shards → guaranteed same-shard
         // collisions under round-robin. Without `append_lock` walrus errors.
@@ -2036,9 +2058,8 @@ mod tests {
     #[serial_test::serial]
     fn recovery_rewind_marker_restores_consumed_cursor() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let table = format!("rw_{}", uuid::Uuid::new_v4().simple());
-        let wal = WalManager::with_fsync_mode_and_shards(path, crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        let table = uniq("rw");
+        let wal = sync_wal(&dir);
         wal.append("proj", &table, &create_test_batch()).unwrap();
 
         let p0 = wal.write_recovery_rewind_marker().unwrap();
@@ -2068,8 +2089,8 @@ mod tests {
     #[serial_test::serial]
     fn fully_consumed_requires_every_cursor_at_its_exact_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let table = format!("fc_{}", uuid::Uuid::new_v4().simple());
-        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        let table = uniq("fc");
+        let wal = sync_wal(&dir);
 
         assert!(wal.is_fully_consumed().unwrap(), "an empty WAL has nothing to replay");
         wal.append("proj", &table, &create_test_batch()).unwrap();
@@ -2107,15 +2128,11 @@ mod tests {
     fn cursor_snapshot_roundtrip_restores_persisted_positions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        // Unique topic per run: walrus state lives under the process-global
-        // WALRUS_DATA_DIR (whatever the last test pointed it at), so a fixed
-        // "proj:tbl" topic inherits blocks/cursors appended by earlier tests
-        // in the same process and the exact-position asserts below flake.
-        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
+        let table = uniq("tbl");
 
         // Process A: append, advance cursor, write snapshot with clean flag.
         {
-            let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+            let wal = sync_wal(&dir);
             let batch = create_test_batch();
             wal.append("proj", &table, &batch).unwrap();
             // Advance shard 0 (the only shard written — round-robin picks it
@@ -2132,7 +2149,7 @@ mod tests {
         // Process B: fresh manager, snapshot present, no walrus state mutation
         // beyond what restore does.
         {
-            let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+            let wal = sync_wal(&dir);
             let snap = wal.load_cursor_snapshot().expect("snapshot loadable");
             assert!(snap.clean_shutdown);
             assert_eq!(snap.shards_per_topic, 4);
@@ -2146,45 +2163,37 @@ mod tests {
         }
     }
 
-    /// Snapshot version mismatch (or a corrupted file) must return None so
-    /// boot falls through to the Delta scan rather than misinterpreting the
-    /// payload.
+    /// An unloadable snapshot must return None so boot falls through to the
+    /// Delta scan rather than misinterpreting the payload. Two rejections:
+    /// a version mismatch (or corrupted file), and a shard-count mismatch —
+    /// if an operator changes `TIMEFUSION_WAL_SHARDS_PER_TOPIC` between
+    /// restarts the per-shard layout is incompatible, and restoring it would
+    /// seed shard-misaligned positions.
     #[test]
     #[serial_test::serial]
-    fn cursor_snapshot_rejects_version_mismatch() {
+    fn cursor_snapshot_rejects_version_or_shard_count_mismatch() {
+        // Version mismatch. `.timefusion_meta/` is guaranteed by construction.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-        // `.timefusion_meta/` is guaranteed by WalManager construction.
+        let wal = sync_wal(&dir);
         std::fs::write(
-            path.join(".timefusion_meta/cursor_snapshot.json"),
+            dir.path().join(".timefusion_meta/cursor_snapshot.json"),
             br#"{"version":999,"written_at_micros":0,"shards_per_topic":4,"clean_shutdown":true,"entries":{}}"#,
         )
         .unwrap();
-        assert!(wal.load_cursor_snapshot().is_none());
-    }
+        assert!(wal.load_cursor_snapshot().is_none(), "version mismatch must be rejected");
 
-    /// If an operator changes `TIMEFUSION_WAL_SHARDS_PER_TOPIC` between
-    /// restarts, the snapshot's per-shard layout is incompatible. Reject it
-    /// so the boot falls through to the Delta scan rather than restoring
-    /// shard-misaligned positions.
-    #[test]
-    #[serial_test::serial]
-    fn cursor_snapshot_rejects_shard_count_mismatch() {
+        // Shard-count mismatch: write a 4-shard snapshot, re-open with 8.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        // Unique topic per run — see cursor_snapshot_roundtrip_restores_persisted_positions.
-        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
+        let table = uniq("tbl");
         {
-            let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+            let wal = sync_wal(&dir);
             wal.append("proj", &table, &create_test_batch()).unwrap();
             let tail = wal.current_position("proj", &table).unwrap();
             wal.merge_persisted_positions("proj", &table, &[Some(tail[0]), None, None, None]).unwrap();
             wal.write_cursor_snapshot(true, true).unwrap();
         }
-        // Re-open with a different shard count — load must refuse.
-        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 8).unwrap();
-        assert!(wal.load_cursor_snapshot().is_none());
+        let wal = wal_in(&dir, crate::config::WalFsyncMode::SyncEach, 8);
+        assert!(wal.load_cursor_snapshot().is_none(), "shard-count mismatch must be rejected");
     }
 
     /// Rescue path: walrus has no fsynced state for this topic (simulating a
@@ -2197,13 +2206,8 @@ mod tests {
     #[serial_test::serial]
     fn cursor_snapshot_restore_advances_walrus_past_local_state() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let wal = WalManager::with_fsync_mode_and_shards(path, crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-
-        // Walrus uses a process-global `WALRUS_DATA_DIR` so other tests may
-        // have seeded state for shared collection keys. Use a per-test
-        // unique topic name so the hashed walrus key is guaranteed fresh.
-        let table = format!("rescue_{}", uuid::Uuid::new_v4().simple());
+        let wal = sync_wal(&dir);
+        let table = uniq("rescue");
         let project = "p";
 
         let before = wal.persisted_read_positions(project, &table).unwrap();
@@ -2227,13 +2231,12 @@ mod tests {
     #[serial_test::serial]
     fn cursor_snapshot_tmp_swept_on_init() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
         // First init creates `.timefusion_meta/`.
-        drop(WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap());
-        let tmp = path.join(".timefusion_meta/cursor_snapshot.json.tmp");
+        drop(sync_wal(&dir));
+        let tmp = dir.path().join(".timefusion_meta/cursor_snapshot.json.tmp");
         std::fs::write(&tmp, b"partial").unwrap();
         assert!(tmp.exists());
-        drop(WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap());
+        drop(sync_wal(&dir));
         assert!(!tmp.exists(), "init must sweep leftover tmp file");
     }
 
@@ -2250,10 +2253,9 @@ mod tests {
     fn write_and_delete_both_fail_under_readonly_meta_dir() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        let wal = sync_wal(&dir);
         wal.write_cursor_snapshot(true, true).unwrap();
-        let meta = path.join(".timefusion_meta");
+        let meta = dir.path().join(".timefusion_meta");
         let target = meta.join("cursor_snapshot.json");
 
         // Lock the meta dir: r-x only.
@@ -2274,12 +2276,17 @@ mod tests {
     /// verifier doesn't trust it. Failure is forced by putting a directory
     /// in the spot the atomic-rename tmp would occupy — `fs::write` to a
     /// directory path errors, so the rename never happens.
+    ///
+    /// `delete_cursor_snapshot` is therefore also asserted idempotent here:
+    /// a no-op when absent (both before any write and on a second call), and
+    /// a removal when present.
     #[test]
     #[serial_test::serial]
     fn write_cursor_snapshot_failure_requires_caller_to_delete_stale_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        let wal = sync_wal(&dir);
+        wal.delete_cursor_snapshot().unwrap(); // missing → Ok
         wal.write_cursor_snapshot(true, true).unwrap();
         let target = path.join(".timefusion_meta/cursor_snapshot.json");
         let tmp = path.join(".timefusion_meta/cursor_snapshot.json.tmp");
@@ -2293,25 +2300,7 @@ mod tests {
         // BufferedWriteLayer's recovery: delete the stale file.
         wal.delete_cursor_snapshot().unwrap();
         assert!(!target.exists(), "delete clears the stale snapshot");
-    }
-
-    /// `delete_cursor_snapshot` removes a present file and is a no-op when
-    /// absent. The flush path calls this on write failure to keep boot from
-    /// restoring stale state.
-    #[test]
-    #[serial_test::serial]
-    fn delete_cursor_snapshot_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-        // Missing → Ok.
-        wal.delete_cursor_snapshot().unwrap();
-        wal.write_cursor_snapshot(true, true).unwrap();
-        assert!(path.join(".timefusion_meta/cursor_snapshot.json").exists());
-        wal.delete_cursor_snapshot().unwrap();
-        assert!(!path.join(".timefusion_meta/cursor_snapshot.json").exists());
-        // Second call must still be Ok.
-        wal.delete_cursor_snapshot().unwrap();
+        wal.delete_cursor_snapshot().unwrap(); // second call must still be Ok
     }
 
     /// A snapshot written from the flush path (clean_shutdown=false) loads
@@ -2321,10 +2310,8 @@ mod tests {
     #[serial_test::serial]
     fn cursor_snapshot_dirty_path_loads_but_signals_unclean() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-        // Unique topic per run — see cursor_snapshot_roundtrip_restores_persisted_positions.
-        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
+        let wal = sync_wal(&dir);
+        let table = uniq("tbl");
         wal.append("proj", &table, &create_test_batch()).unwrap();
         let tail = wal.current_position("proj", &table).unwrap();
         wal.merge_persisted_positions("proj", &table, &[Some(tail[0]), None, None, None]).unwrap();
@@ -2364,13 +2351,7 @@ mod tests {
         let contender_path = path.clone();
         let contender = tokio::spawn(async move { WalDirLock::acquire(&contender_path).await });
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !takeover_requested(&path) {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("contender must request a takeover");
+        await_takeover_request(&path, "contender must request a takeover").await;
         let first = std::fs::read_to_string(path.join(".timefusion_meta").join(TAKEOVER_REQUEST_FILE)).unwrap();
 
         // Poll well past the contender's ~10s rewrite interval.
@@ -2393,13 +2374,7 @@ mod tests {
         let contender_path = path.clone();
         let contender = tokio::spawn(async move { WalDirLock::acquire(&contender_path).await.unwrap() });
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !takeover_requested(&path) {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("blocked replacement must publish a takeover request");
+        await_takeover_request(&path, "blocked replacement must publish a takeover request").await;
 
         drop(owner);
         let replacement = tokio::time::timeout(std::time::Duration::from_secs(2), contender).await.unwrap().unwrap();
@@ -2641,31 +2616,13 @@ mod wal_payload_encoding {
         // Arrow IPC-like: uniformly random bytes, so ~50% are >= 128.
         let payload: Vec<u8> = (0..86_408u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
         let s = bincode::encode_to_vec(ViaSerde { data: payload.clone() }, CFG).unwrap();
-        let n = bincode::encode_to_vec(Native { data: payload.clone() }, CFG).unwrap();
-        println!(
-            "\npayload={}B  with_serde={}B ({:.2}x)  native={}B ({:.2}x)",
-            payload.len(),
-            s.len(),
-            s.len() as f64 / payload.len() as f64,
-            n.len(),
-            n.len() as f64 / payload.len() as f64
-        );
-
-        let iters = 200;
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            let _: (ViaSerde, _) = bincode::decode_from_slice(&s, CFG).unwrap();
-        }
-        let serde_us = t.elapsed().as_micros() / iters;
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            let _: (Native, _) = bincode::decode_from_slice(&n, CFG).unwrap();
-        }
-        let native_us = t.elapsed().as_micros() / iters;
-        println!("decode: with_serde={}us  native={}us  speedup={:.1}x", serde_us, native_us, serde_us as f64 / native_us.max(1) as f64);
+        let n = bincode::encode_to_vec(Native { data: payload }, CFG).unwrap();
         // THE question: if the bytes are identical, dropping the attribute is a
         // pure speedup with no on-disk format change and no version bump.
-        println!("bytes identical: {}\n", s == n);
         assert_eq!(s, n, "wire format must be unchanged for this to be a safe swap");
+        // Both encodings must also decode back to the same payload.
+        let (via_serde, _): (ViaSerde, _) = bincode::decode_from_slice(&s, CFG).unwrap();
+        let (native, _): (Native, _) = bincode::decode_from_slice(&n, CFG).unwrap();
+        assert_eq!(via_serde.data, native.data);
     }
 }

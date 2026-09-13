@@ -1168,6 +1168,26 @@ mod tests {
         Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0)
     }
 
+    /// The pure shape path (no client binds): rendered shape key + lifted values.
+    fn shape(sql: &str) -> (String, Vec<ScalarValue>) {
+        let (param, values) = parameterize_statement(&parse(sql), 0, true).expect("has literals");
+        (param.to_string(), values)
+    }
+
+    fn utf8(s: &str) -> ScalarValue {
+        ScalarValue::Utf8(Some(s.into()))
+    }
+
+    proptest::proptest! {
+        /// The premise of the cross-connection cache: the shape key depends on the
+        /// AST's SHAPE only, never on the literal values it carries.
+        #[test]
+        fn shape_key_ignores_literal_values(p in "[a-z]{1,8}", q in "[a-z]{1,8}", n in 0i64..10_000, m in 0i64..10_000) {
+            let sql = |proj: &str, num: i64| format!("SELECT id FROM t WHERE project_id = '{proj}' AND n = {num} LIMIT 10");
+            proptest::prop_assert_eq!(shape(&sql(&p, n)).0, shape(&sql(&q, m)).0);
+        }
+    }
+
     /// The prod-breaking shape: monoscope's service graph, ~5500 planning
     /// failures/hour. `count(*)` must reach the planner as `count(1)` so the
     /// `ORDER BY 6` ordinal resolves against the same expression.
@@ -1177,13 +1197,11 @@ mod tests {
     /// is what kept every dashboard chart out of the plan cache on prod.
     #[test]
     fn one_literal_lifts_to_one_placeholder_so_group_by_still_matches_select() {
-        let stmt = parse(
+        let (text, values) = shape(
             "SELECT EXTRACT(EPOCH FROM time_bucket(60, timestamp)), count(*) FROM t \
              WHERE project_id = 'p' GROUP BY time_bucket(60, timestamp) ORDER BY time_bucket(60, timestamp) DESC",
         );
-        let (param, values) = parameterize_statement(&stmt, 0, true).expect("has literals");
-        let text = param.to_string();
-        assert_eq!(values, vec![ScalarValue::Int64(Some(60)), ScalarValue::Utf8(Some("p".into()))], "the repeated 60 is stored once");
+        assert_eq!(values, vec![ScalarValue::Int64(Some(60)), utf8("p")], "the repeated 60 is stored once");
         assert_eq!(text.matches("time_bucket($1,").count(), 3, "all three time_bucket calls share one placeholder: {text}");
         assert!(!text.contains("$3"), "no placeholder beyond the two distinct literals: {text}");
     }
@@ -1194,80 +1212,80 @@ mod tests {
     /// 'Number 782574.0' to value of Int64" (2026-08-31), because `$N` coerces
     /// to substr's declared Int64 arg 2 before it is bound. Opting the whole
     /// statement out of shape caching is what keeps the literal inline.
-    #[test]
-    fn a_regex_substring_pattern_is_never_lifted_to_a_placeholder() {
-        // Bare scalar (the exact prod shape) and one over a real table.
-        for sql in ["SELECT substring('abc-def' FROM '^[a-z]+')", "SELECT substring(body FROM 'HTTP/[0-9.]+') FROM t WHERE project_id = 'p'"] {
-            assert!(parameterize_statement(&parse(sql), 0, true).is_none(), "regex substring must opt out of shape caching: {sql}");
-        }
-
-        // Offsets carry a number, not a string — they still parameterize, and
-        // the surrounding literals must keep lifting as before.
-        let (param, values) =
-            parameterize_statement(&parse("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'"), 0, true).expect("an offset substring still caches");
-        assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))]);
-        assert!(param.to_string().contains("FROM 3"), "the offset stays inline: {param}");
+    // The first is the exact prod shape (bare scalar), the second the same over a table.
+    #[test_case("SELECT substring('abc-def' FROM '^[a-z]+')" => matches None ; "a regex substring pattern is never lifted to a placeholder")]
+    #[test_case("SELECT substring(body FROM 'HTTP/[0-9.]+') FROM t WHERE project_id = 'p'" => matches None ; "regex substring over a real table opts out too")]
+    // No string/number/time-fn literals to lift → nothing to cache-generalize.
+    #[test_case("SELECT count(*) FROM t" => matches None ; "parameterize none without any literals")]
+    fn parameterize_declines_shape_caching(sql: &str) -> Option<(Statement, Vec<ScalarValue>)> {
+        parameterize_statement(&parse(sql), 0, true)
     }
 
-    #[test]
-    fn count_star_is_normalized_so_an_order_by_ordinal_can_resolve_it() {
-        let stmt = parse("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 2 DESC");
-        let out = normalize_count_star(&stmt).expect("rewritten").to_string();
-        assert!(out.contains("COUNT(1)"), "count(*) becomes count(1): {out}");
-        assert!(!out.contains("COUNT(*)"), "no wildcard call survives: {out}");
+    /// Literals that are NOT ordinal-safe value contexts must survive verbatim in
+    /// the shape key; in each case only the `'p'` project id may be lifted.
+    // Substring OFFSETs carry a number, not a string — the statement still caches
+    // (unlike the regex form above) and the surrounding literals keep lifting.
+    #[test_case("SELECT substring(body FROM 3) FROM t WHERE project_id = 'p'", &["FROM 3"] => vec![utf8("p")] ; "an offset substring still caches, offset inline")]
+    // SAFETY regression: GROUP BY / ORDER BY ordinals and LIMIT/OFFSET are bare
+    // Number nodes; parameterizing them would change ORDER BY 1 into ordering by
+    // a constant (wrong results).
+    #[test_case("SELECT status_code, count(*) FROM t WHERE project_id = 'p' GROUP BY 1 ORDER BY 1 LIMIT 100 OFFSET 20", &["GROUP BY 1", "ORDER BY 1", "LIMIT 100", "OFFSET 20"]
+        => vec![utf8("p")] ; "ordinals and limit stay inline")]
+    // Regression: parameterizing '{}'/'{a,b}' into a $N placeholder hides them
+    // from PgArrayLiteralRewriter (matches Expr::Literal only), so they got
+    // mis-cast to single-element lists (COALESCE(list_col, '{a,b}') → ['{a,b}']
+    // instead of ['a','b']; edge_cases.slt:172). Array literals must stay inline.
+    #[test_case("SELECT ARRAY_LENGTH(COALESCE(parent_id, '{a,b}')) FROM t WHERE project_id = 'p'", &["'{a,b}'"] => vec![utf8("p")] ; "parameterize keeps pg array literals inline")]
+    fn only_the_unsafe_literals_stay_inline(sql: &str, inline: &[&str]) -> Vec<ScalarValue> {
+        let (text, values) = shape(sql);
+        for frag in inline {
+            assert!(text.contains(frag), "{frag} must stay inline: {text}");
+        }
+        values
     }
 
     /// Only statements DataFusion rejects today may be rewritten: a working query
     /// must keep its exact output column names, and declining is also what keeps
     /// a statement on the ordinary cache path. See `normalize_count_star`.
-    #[test_case("SELECT COUNT(*)::int8 FROM t" ; "no order by at all")]
-    #[test_case("SELECT src, COUNT(*) FROM t GROUP BY src ORDER BY 2 DESC" ; "ordinal resolves to a bare count(*)")]
-    #[test_case("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 1 ASC" ; "ordinal points elsewhere")]
-    #[test_case("SELECT src, COUNT(*)::int8 AS c FROM t GROUP BY src ORDER BY c DESC" ; "order by alias resolves")]
-    #[test_case("SELECT COUNT(id)::int8 FROM t ORDER BY 1" ; "counts a column")]
-    #[test_case("SELECT COUNT(DISTINCT level)::int8 FROM t ORDER BY 1" ; "count distinct")]
-    #[test_case("SELECT SUM(d)::int8 FROM t ORDER BY 1" ; "not a count at all")]
-    #[test_case("SELECT COUNT(t.*)::int8 FROM t ORDER BY 1" ; "qualified wildcard is not the idiom")]
-    fn normalize_count_star_declines(sql: &str) {
-        assert!(normalize_count_star(&parse(sql)).is_none(), "must decline: {sql}");
-    }
-
+    ///
     /// The reason this is an AST rewrite and not a text rewrite: monoscope
     /// inserts arbitrary span bodies and log text, and a regex over raw SQL
     /// would corrupt any row whose DATA contains `count(*)`.
-    #[test]
-    fn insert_data_containing_the_text_count_star_is_never_rewritten() {
-        let stmt = parse("INSERT INTO t (body) VALUES ('the query was count(*) over spans')");
-        assert!(normalize_count_star(&stmt).is_none(), "a string literal is data, not a call");
-        // A neighbouring string literal survives a genuine rewrite untouched.
-        let mixed = parse("SELECT a, CAST(COUNT(*) AS int8), 'count(*)' FROM s GROUP BY a ORDER BY 2 DESC");
-        let out = normalize_count_star(&mixed).expect("rewritten").to_string();
-        assert!(out.contains("COUNT(1)") && out.contains("'count(*)'"), "call rewritten, literal preserved: {out}");
+    #[test_case("SELECT COUNT(*)::int8 FROM t" => matches None ; "no order by at all")]
+    #[test_case("SELECT src, COUNT(*) FROM t GROUP BY src ORDER BY 2 DESC" => matches None ; "ordinal resolves to a bare count(*)")]
+    #[test_case("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 1 ASC" => matches None ; "ordinal points elsewhere")]
+    #[test_case("SELECT src, COUNT(*)::int8 AS c FROM t GROUP BY src ORDER BY c DESC" => matches None ; "order by alias resolves")]
+    #[test_case("SELECT COUNT(id)::int8 FROM t ORDER BY 1" => matches None ; "counts a column")]
+    #[test_case("SELECT COUNT(DISTINCT level)::int8 FROM t ORDER BY 1" => matches None ; "count distinct")]
+    #[test_case("SELECT SUM(d)::int8 FROM t ORDER BY 1" => matches None ; "not a count at all")]
+    #[test_case("SELECT COUNT(t.*)::int8 FROM t ORDER BY 1" => matches None ; "qualified wildcard is not the idiom")]
+    #[test_case("INSERT INTO t (body) VALUES ('the query was count(*) over spans')" => matches None ; "insert data containing the text count star is never rewritten")]
+    #[test_case("SELECT src, COUNT(*)::int8 FROM t GROUP BY src ORDER BY 2 DESC" => with |o: Option<String>| {
+        let out = o.expect("rewritten");
+        assert!(out.contains("COUNT(1)"), "count(*) becomes count(1): {out}");
+        assert!(!out.contains("COUNT(*)"), "no wildcard call survives: {out}");
+    } ; "count star is normalized so an order by ordinal can resolve it")]
+    #[test_case("SELECT a, CAST(COUNT(*) AS int8), 'count(*)' FROM s GROUP BY a ORDER BY 2 DESC" => with |o: Option<String>| {
+        let out = o.expect("rewritten");
+        assert!(out.contains("COUNT(1)") && out.contains("'count(*)'"), "call rewritten, neighbouring literal preserved: {out}");
+    } ; "a string literal beside a genuine rewrite survives untouched")]
+    fn normalize_count_star_rewrites_only_the_broken_ordinal_shape(sql: &str) -> Option<String> {
+        normalize_count_star(&parse(sql)).map(|s| s.to_string())
     }
 
     #[test]
     fn parameterize_extracts_strings_and_value_context_numbers_in_walk_order() {
-        let stmt = parse("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100");
-        let (param, values) = parameterize_statement(&stmt, 0, true).expect("has literals");
-        let text = param.to_string();
+        let (text, values) = shape("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100");
         assert!(text.contains("$1") && text.contains("$2") && text.contains("$3"), "strings + the comparison number become placeholders: {text}");
         assert!(text.contains("LIMIT 100"), "LIMIT stays inline (not an ordinal-safe value context): {text}");
         // Walk order: 'p1', '2026-07-01', then the numeric 5 from `n = 5`.
-        assert_eq!(
-            values,
-            vec![ScalarValue::Utf8(Some("p1".into())), ScalarValue::Utf8(Some("2026-07-01".into())), ScalarValue::Int64(Some(5))],
-            "values extracted in walk order"
-        );
+        assert_eq!(values, vec![utf8("p1"), utf8("2026-07-01"), ScalarValue::Int64(Some(5))], "values extracted in walk order");
         // Same shape with different literals (incl. the number) → identical shape key.
-        let stmt2 = parse("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 9 LIMIT 100");
-        let (param2, _) = parameterize_statement(&stmt2, 0, true).unwrap();
-        assert_eq!(text, param2.to_string(), "shape key must be literal-insensitive");
-    }
-
-    #[test]
-    fn parameterize_none_without_any_literals() {
-        // No string/number/time-fn literals to lift → nothing to cache-generalize.
-        assert!(parameterize_statement(&parse("SELECT count(*) FROM t"), 0, true).is_none());
+        assert_eq!(
+            text,
+            shape("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 9 LIMIT 100").0,
+            "shape key must be literal-insensitive"
+        );
     }
 
     #[test]
@@ -1275,58 +1293,34 @@ mod tests {
         // The 2026-07-20 plateau fix: dashboard shapes that differ only by numeric
         // literals (bucket size, percentile, duration thresholds, epoch bounds) must
         // collapse to one cached shape instead of replanning every refresh.
-        let a = "SELECT time_bucket(60, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 500 AND timestamp >= 1721000000000000";
-        let b = "SELECT time_bucket(300, timestamp), approx_percentile(0.99, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000";
-        let (pa, va) = parameterize_statement(&parse(a), 0, true).expect("numbers parameterize");
-        let (pb, _) = parameterize_statement(&parse(b), 0, true).unwrap();
-        let ta = pa.to_string();
+        let (ta, va) = shape(
+            "SELECT time_bucket(60, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 500 AND timestamp >= 1721000000000000",
+        );
+        let tb = shape(
+            "SELECT time_bucket(300, timestamp), approx_percentile(0.99, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000",
+        )
+        .0;
         assert!(!ta.contains("60") && !ta.contains("0.95") && !ta.contains("500"), "numerics replaced: {ta}");
-        assert_eq!(ta, pb.to_string(), "shape identical across differing numeric literals");
+        assert_eq!(ta, tb, "shape identical across differing numeric literals");
         // 4 numbers + the 'p' string all captured.
         assert_eq!(va.len(), 5, "captured {:?}", va);
     }
 
-    #[test]
-    fn ordinals_and_limit_stay_inline() {
-        // SAFETY regression: GROUP BY / ORDER BY ordinals and LIMIT/OFFSET are bare
-        // Number nodes; parameterizing them would change ORDER BY 1 into ordering by
-        // a constant (wrong results). Only the 'p' string may be lifted.
-        let stmt = parse("SELECT status_code, count(*) FROM t WHERE project_id = 'p' GROUP BY 1 ORDER BY 1 LIMIT 100 OFFSET 20");
-        let (param, values) = parameterize_statement(&stmt, 0, true).expect("'p' parameterizes");
-        let text = param.to_string();
-        assert!(text.contains("GROUP BY 1"), "group-by ordinal inline: {text}");
-        assert!(text.contains("ORDER BY 1"), "order-by ordinal inline: {text}");
-        assert!(text.contains("LIMIT 100") && text.contains("OFFSET 20"), "limit/offset inline: {text}");
-        assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))], "only the string lifted, no ordinals");
-    }
-
-    #[test]
-    fn parameterize_keeps_pg_array_literals_inline() {
-        // Regression: parameterizing '{}'/'{a,b}' into a $N placeholder hides them
-        // from PgArrayLiteralRewriter (matches Expr::Literal only), so they got
-        // mis-cast to single-element lists (COALESCE(list_col, '{a,b}') → ['{a,b}']
-        // instead of ['a','b']; edge_cases.slt:172). Array literals must stay inline.
-        let stmt = parse("SELECT ARRAY_LENGTH(COALESCE(parent_id, '{a,b}')) FROM t WHERE project_id = 'p'");
-        let (param, values) = parameterize_statement(&stmt, 0, true).expect("the 'p' literal still parameterizes");
-        let text = param.to_string();
-        assert!(text.contains("'{a,b}'"), "PG array literal stays inline: {text}");
-        assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))], "only the non-array string is extracted");
-    }
-
-    #[test]
-    fn time_functions_disqualify_caching() {
-        // Optimizer const-folds these from the query start time — caching the
-        // optimized plan would freeze the window (2026-07-05 review finding).
-        for sql in [
-            "SELECT id FROM t WHERE project_id = 'p' AND ts > now()",
-            "SELECT id FROM t WHERE project_id = 'p' AND d = current_date",
-            "SELECT id FROM t WHERE project_id = 'p' AND ts > NOW() - INTERVAL '1 hour'",
-        ] {
-            assert!(contains_plan_time_folded_fn(&parse(sql)), "{sql}");
-        }
-        assert!(!contains_plan_time_folded_fn(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'")));
-        // A column merely NAMED now must not disqualify.
-        assert!(!contains_plan_time_folded_fn(&parse("SELECT now FROM t WHERE project_id = 'p'")));
+    /// Optimizer const-folds time fns from the query start time — caching the
+    /// optimized plan would freeze the window (2026-07-05 review finding). The
+    /// Date/Time-returning subset is riskier still (different result type) and
+    /// must additionally stay OFF the shape path.
+    #[test_case("SELECT id FROM t WHERE project_id = 'p' AND ts > now()" => (true, false) ; "now() folds but parameterizes")]
+    #[test_case("SELECT id FROM t WHERE ts > now()" => (true, false) ; "now() folds, bare predicate")]
+    #[test_case("SELECT id FROM t WHERE project_id = 'p' AND ts > NOW() - INTERVAL '1 hour'" => (true, false) ; "now() inside an interval arithmetic")]
+    #[test_case("SELECT id FROM t WHERE project_id = 'p' AND d = current_date" => (true, true) ; "date fns stay unparameterizable")]
+    #[test_case("SELECT id FROM t WHERE d = current_date" => (true, true) ; "current_date, bare predicate")]
+    #[test_case("SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'" => (false, false) ; "a timestamp literal is not a time fn")]
+    // A column merely NAMED now must not disqualify.
+    #[test_case("SELECT now FROM t WHERE project_id = 'p'" => (false, false) ; "a column named now is not a call")]
+    fn time_fn_classification(sql: &str) -> (bool, bool) {
+        let stmt = parse(sql);
+        (contains_plan_time_folded_fn(&stmt), contains_unparameterizable_time_fn(&stmt))
     }
 
     #[test]
@@ -1334,10 +1328,8 @@ mod tests {
         // now()/current_timestamp become $N bound to a fresh instant so the
         // optimized plan is reusable while the window stays current (D2).
         let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-        let stmt = parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'");
-        let (param, values) = parameterize_statement(&stmt, 0, true).expect("now() parameterizes");
+        let (text, values) = shape("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'");
         let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-        let text = param.to_string();
         assert!(!text.to_lowercase().contains("now("), "now() replaced by placeholder: {text}");
         assert!(text.contains("$1") && text.contains("$2"), "project_id + now() both placeholders: {text}");
         // Second value is the timestamp bound to the captured instant.
@@ -1346,14 +1338,13 @@ mod tests {
             ref v => panic!("expected tz-aware nanosecond timestamp, got {v:?}"),
         }
         // Shape is literal-insensitive: two refreshes yield the same placeholder text.
-        let (param2, _) = parameterize_statement(&parse("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'"), 0, true).unwrap();
-        assert_eq!(text, param2.to_string(), "reusable shape key across refreshes");
+        assert_eq!(text, shape("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'").0, "reusable shape key across refreshes");
     }
 
-    #[test]
-    fn max_placeholder_index_finds_highest_client_bind() {
-        assert_eq!(max_placeholder_index(&parse("SELECT id FROM t WHERE project_id = $1 AND n = $3")), 3);
-        assert_eq!(max_placeholder_index(&parse("SELECT id FROM t WHERE project_id = 'p'")), 0);
+    #[test_case("SELECT id FROM t WHERE project_id = $1 AND n = $3" => 3 ; "highest client bind wins")]
+    #[test_case("SELECT id FROM t WHERE project_id = 'p'" => 0 ; "no binds at all")]
+    fn max_placeholder_index_finds_highest_client_bind(sql: &str) -> usize {
+        max_placeholder_index(&parse(sql))
     }
 
     #[test]
@@ -1392,13 +1383,6 @@ mod tests {
         // inject into one, so a dropped AST must not panic or over-count.
         assert!(hook.extra_execute_params(None).is_empty());
         assert_eq!(hook.injected_param_count(None), 0);
-    }
-
-    #[test]
-    fn date_time_fns_stay_unparameterizable() {
-        // Date/Time-returning fns must NOT take the shape path (type risk).
-        assert!(contains_unparameterizable_time_fn(&parse("SELECT id FROM t WHERE d = current_date")));
-        assert!(!contains_unparameterizable_time_fn(&parse("SELECT id FROM t WHERE ts > now()")));
     }
 
     /// SessionContext with one in-memory table, enough to plan the SELECTs the
@@ -1480,12 +1464,12 @@ mod tests {
 
         // Each statement is a bulk INSERT longer than the last: a client that
         // batches by time or by buffer rather than by a fixed row count.
-        for batch in 1..=STATEMENTS {
+        let bulk_insert = |batch: usize| {
             let values = (0..batch * 50).map(|r| format!("(${}, ${})", r * 2 + 1, r * 2 + 2)).collect::<Vec<_>>().join(",");
-            assert!(
-                hook.cached_plan(&parse(&format!("INSERT INTO t (id, project_id) VALUES {values}")), &ctx).await.is_some(),
-                "the INSERT must still plan and be served"
-            );
+            parse(&format!("INSERT INTO t (id, project_id) VALUES {values}"))
+        };
+        for batch in 1..=STATEMENTS {
+            assert!(hook.cached_plan(&bulk_insert(batch), &ctx).await.is_some(), "the INSERT must still plan and be served");
         }
 
         // The budget held, and the accounting matches what is actually retained
@@ -1508,8 +1492,7 @@ mod tests {
         let select = "SELECT id FROM t WHERE project_id = $1";
         assert!(hook.cached_plan(&parse(select), &ctx).await.is_some());
         for batch in 1..=STATEMENTS {
-            let values = (0..batch * 50).map(|r| format!("(${}, ${})", r * 2 + 1, r * 2 + 2)).collect::<Vec<_>>().join(",");
-            let _ = hook.cached_plan(&parse(&format!("INSERT INTO t (id, project_id) VALUES {values}")), &ctx).await;
+            let _ = hook.cached_plan(&bulk_insert(batch), &ctx).await;
         }
         assert!(hook.cache.contains_key(&parse(select).to_string()), "the flood evicted the small hot SELECT instead of the bulk INSERTs paying for the bytes");
     }

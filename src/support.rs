@@ -97,6 +97,8 @@ pub fn without_blocking_the_worker<T>(f: impl FnOnce() -> T) -> T {
 mod tests {
     use std::time::Duration;
 
+    use test_case::test_case;
+
     use super::*;
 
     /// The prod defect in miniature: one worker, a task blocking it, and a
@@ -141,27 +143,27 @@ mod tests {
         assert!(protected < BLOCK / 4, "the neighbour should run while the blocking work happens elsewhere, but waited {protected:?}");
     }
 
-    /// `block_in_place` panics when called off a runtime worker, and a
-    /// `spawn_blocking` thread still reports a runtime handle — so the flavor
-    /// check alone would not save us if tokio rejected that combination. It
-    /// does not, and `write_atomic_with` is reachable from both kinds of
-    /// thread, so this pins the behaviour the helper depends on.
-    #[test]
-    fn safe_to_call_from_a_blocking_thread_which_also_sees_a_runtime_handle() {
+    /// Both call sites tokio could reject — rejection is a panic, not an error.
+    /// Blocking thread: `block_in_place` panics off a runtime worker, and a
+    /// `spawn_blocking` thread still reports a runtime handle, so the flavor
+    /// check alone would not save us if tokio rejected that combination. It does
+    /// not, and `write_atomic_with` is reachable from both kinds of thread.
+    /// Nested: wrapped helpers now nest — `store_sidecar` wraps a serialize whose
+    /// write tail is `write_atomic_with`, itself wrapped — so `block_in_place`
+    /// inside `block_in_place` has to be legal for that to be a fix rather than a
+    /// panic on the maintenance path.
+    #[test_case(false => 42 ; "safe to call from a blocking thread which also sees a runtime handle")]
+    #[test_case(true => 42 ; "nested helper calls are allowed")]
+    fn reachable_without_panicking(nested: bool) -> i32 {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        let out = runtime.block_on(async { tokio::task::spawn_blocking(|| without_blocking_the_worker(|| 42)).await });
-        assert_eq!(out.unwrap(), 42);
-    }
-
-    /// Wrapped helpers now nest — `store_sidecar` wraps a serialize whose
-    /// write tail is `write_atomic_with`, itself wrapped. `block_in_place`
-    /// inside `block_in_place` has to be legal for that to be a fix rather
-    /// than a panic on the maintenance path.
-    #[test]
-    fn nested_helper_calls_are_allowed() {
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        let out = runtime.block_on(async { tokio::spawn(async { without_blocking_the_worker(|| without_blocking_the_worker(|| 42)) }).await });
-        assert_eq!(out.unwrap(), 42);
+        runtime.block_on(async move {
+            let joined = if nested {
+                tokio::spawn(async { without_blocking_the_worker(|| without_blocking_the_worker(|| 42)) }).await
+            } else {
+                tokio::task::spawn_blocking(|| without_blocking_the_worker(|| 42)).await
+            };
+            joined.unwrap()
+        })
     }
 
     #[test]

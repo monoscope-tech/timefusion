@@ -804,6 +804,9 @@ fn has_any_segment(dir: &Path) -> bool {
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
+    use proptest::prelude::*;
+    use test_case::test_case;
+
     use super::{TantivySearchService, collect_index_dirs, entry_overlaps};
 
     /// Fake extracted index of `bytes` bytes at `<root>/tantivy_cache/<rel>`.
@@ -851,21 +854,15 @@ mod tests {
         assert!(!tmp.path().join("tantivy_cache/tbl/p/cold").exists());
     }
 
-    #[test]
-    fn reap_under_budget_is_a_no_op() {
+    /// `seed` plants one 1000-byte index first; without it the cache root never
+    /// exists. Returns (dirs_scanned, dirs_removed, bytes_removed, dir survives).
+    #[test_case(true, u64::MAX => (1, 0, 0, true) ; "reap under budget is a no-op")]
+    #[test_case(false, 0 => (0, 0, 0, false) ; "reap on a missing root reports nothing")]
+    fn reap_reports(seed: bool, budget: u64) -> (usize, usize, u64, bool) {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = service(tmp.path());
-        let dir = fake_index(tmp.path(), "tbl/p/only", 1000);
-        let report = svc.reap_disk_cache(u64::MAX);
-        assert_eq!((report.dirs_removed, report.bytes_removed), (0, 0));
-        assert!(dir.exists());
-    }
-
-    #[test]
-    fn reap_on_a_missing_root_reports_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let report = service(tmp.path()).reap_disk_cache(0);
-        assert_eq!((report.dirs_scanned, report.dirs_removed), (0, 0));
+        let dir = seed.then(|| fake_index(tmp.path(), "tbl/p/only", 1000));
+        let report = service(tmp.path()).reap_disk_cache(budget);
+        (report.dirs_scanned, report.dirs_removed, report.bytes_removed, dir.is_some_and(|d| d.exists()))
     }
 
     #[test]
@@ -879,22 +876,32 @@ mod tests {
         assert!(svc.last_used.get(&dir).is_none());
     }
 
-    #[test]
-    fn time_prune_overlap_logic() {
-        // overlapping span is kept
-        assert!(entry_overlaps(Some(10), Some(20), Some((15, 25))));
-        assert!(entry_overlaps(Some(10), Some(20), Some((5, 12))));
-        // entirely before / after the window is pruned
-        assert!(!entry_overlaps(Some(10), Some(20), Some((21, 30))));
-        assert!(!entry_overlaps(Some(40), Some(50), Some((21, 30))));
-        // an unknown bound is treated permissively (won't wrongly prune), but a
-        // KNOWN bound still prunes correctly even if the other side is unknown.
-        assert!(entry_overlaps(None, None, Some((21, 30)))); // both unknown → keep
-        assert!(entry_overlaps(Some(10), None, Some((100, 200)))); // max unknown, min below hi → keep
-        assert!(!entry_overlaps(None, Some(5), Some((100, 200)))); // known max 5 < lo 100 → safely pruned
-        assert!(!entry_overlaps(Some(300), None, Some((100, 200)))); // known min 300 > hi 200 → safely pruned
-        // no query range matches everything (today's behavior)
-        assert!(entry_overlaps(Some(10), Some(20), None));
+    /// An unknown bound is treated permissively (won't wrongly prune), but a
+    /// KNOWN bound still prunes correctly even if the other side is unknown.
+    #[test_case(Some(10), Some(20), Some((15, 25)) => true  ; "overlapping span is kept")]
+    #[test_case(Some(10), Some(20), Some((5, 12))  => true  ; "window ends inside the span is kept")]
+    #[test_case(Some(10), Some(20), Some((21, 30)) => false ; "entirely before the window is pruned")]
+    #[test_case(Some(40), Some(50), Some((21, 30)) => false ; "entirely after the window is pruned")]
+    #[test_case(None, None, Some((21, 30))         => true  ; "both bounds unknown keeps")]
+    #[test_case(Some(10), None, Some((100, 200))   => true  ; "max unknown min below hi keeps")]
+    #[test_case(None, Some(5), Some((100, 200))    => false ; "known max 5 below lo 100 safely prunes")]
+    #[test_case(Some(300), None, Some((100, 200))  => false ; "known min 300 above hi 200 safely prunes")]
+    #[test_case(Some(10), Some(20), None           => true  ; "no query range matches everything (today's behavior)")]
+    fn time_prune_overlap_logic(min: Option<i64>, max: Option<i64>, range: Option<(i64, i64)>) -> bool {
+        entry_overlaps(min, max, range)
+    }
+
+    proptest! {
+        /// Soundness half of the doc contract: `entry_overlaps` must never return
+        /// false for an entry covering an in-window row `t`, bounds known or not.
+        #[test]
+        fn overlaps_never_prunes_an_entry_covering_an_in_window_row(t in any::<i64>(), d in prop::array::uniform4(0i64..1 << 40)) {
+            let (min, max) = (t.saturating_sub(d[0]), t.saturating_add(d[1]));
+            let range = Some((t.saturating_sub(d[2]), t.saturating_add(d[3])));
+            for (lo, hi) in [(Some(min), Some(max)), (None, Some(max)), (Some(min), None)] {
+                prop_assert!(entry_overlaps(lo, hi, range), "covering entry pruned: {lo:?} {hi:?} {range:?}");
+            }
+        }
     }
 }
 
@@ -1102,7 +1109,10 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
 
 #[cfg(test)]
 mod reader_tests {
+    use std::sync::LazyLock;
+
     use tantivy::doc;
+    use test_case::test_case;
 
     use super::*;
     use crate::{
@@ -1159,57 +1169,38 @@ mod reader_tests {
         index
     }
 
-    fn hit_ids(index: &Index, query: &str) -> Result<Vec<String>> {
-        hit_ids_on(index, "body", query)
-    }
+    static NGRAM_INDEX: LazyLock<Index> = LazyLock::new(ngram_index);
 
-    fn hit_ids_on(index: &Index, column: &str, query: &str) -> Result<Vec<String>> {
+    /// Sorted hit ids, comma-joined (`""` = no hits). `Err` is what callers
+    /// treat as "no prefilter available, scan everything".
+    fn hit_ids_on(column: &str, query: &str) -> std::result::Result<String, String> {
         let node = PredNode::Leaf(TextMatchPred { column: column.into(), query: query.into() });
-        let PredsQuery::Query(q) = build_node_query(index, &node)? else { panic!("field must exist") };
-        let mut ids: Vec<String> = query_index(index, &*q, None)?.into_iter().map(|h| h.id).collect();
+        let PredsQuery::Query(q) = build_node_query(&NGRAM_INDEX, &node).map_err(|e| e.to_string())? else { panic!("field must exist") };
+        let mut ids: Vec<String> = query_index(&NGRAM_INDEX, &*q, None).map_err(|e| e.to_string())?.into_iter().map(|h| h.id).collect();
         ids.sort();
-        Ok(ids)
+        Ok(ids.join(","))
     }
 
-    #[test]
-    fn query_grammar_chars_in_routed_substrings_still_hit() {
-        let index = ngram_index();
-        // `-` adjacent to whitespace used to become a MustNot clause.
-        assert_eq!(hit_ids(&index, "accept -header").unwrap(), vec!["id0"]);
-        assert_eq!(hit_ids(&index, "err -1234").unwrap(), vec!["id1"]);
-        // Bare `NOT` used to be parsed as an operator.
-        assert_eq!(hit_ids(&index, "foo NOT bar").unwrap(), vec!["id2"]);
-        // Single words and the full literal still work.
-        assert_eq!(hit_ids(&index, "header").unwrap(), vec!["id0"]);
-        assert_eq!(hit_ids(&index, "accept -header now").unwrap(), vec!["id0"]);
-        // Case-insensitive (LowerCaser in tf_ngram3).
-        assert_eq!(hit_ids(&index, "ACCEPT").unwrap(), vec!["id0"]);
-        // Prefix marker from `LIKE 'foo%'` routing is dropped (substring ⊇ prefix).
-        assert_eq!(hit_ids(&index, "accept*").unwrap(), vec!["id0"]);
-        // Still selective: a literal present in no doc returns nothing.
-        assert!(hit_ids(&index, "zzzqqq").unwrap().is_empty());
-    }
-
-    #[test]
-    fn short_tokens_broaden_and_all_short_literals_scan() {
-        let index = ngram_index();
-        // A <3-char word yields no trigram → dropped (broadens), never empties.
-        assert_eq!(hit_ids(&index, "header xy").unwrap(), vec!["id0"]);
-        // Nothing left to query → error, which callers treat as "no prefilter".
-        assert!(hit_ids(&index, "xy").is_err());
-    }
-
-    #[test]
-    fn raw_tokenized_terms_match_the_whole_indexed_value() {
-        let index = ngram_index();
-        assert_eq!(hit_ids_on(&index, "level", "ERROR").unwrap(), vec!["id1"]);
-        // A leading `-` used to parse as a lone MustNot clause (∅ hits), and
-        // whitespace used to AND-split a value indexed as ONE raw token.
-        assert_eq!(hit_ids_on(&index, "level", "-alpha").unwrap(), vec!["id0"]);
-        assert_eq!(hit_ids_on(&index, "level", "two words").unwrap(), vec!["id2"]);
-        // Raw stays exact/case-sensitive: no partial or case-folded matches.
-        assert!(hit_ids_on(&index, "level", "error").unwrap().is_empty());
-        assert!(hit_ids_on(&index, "level", "two").unwrap().is_empty());
+    // `body` (ngram3): query-grammar chars in routed substrings must still hit,
+    // short tokens broaden instead of emptying, and an all-short literal scans.
+    #[test_case("body", "accept -header" => Ok("id0".to_string()) ; "`-` adjacent to whitespace used to become a MustNot clause")]
+    #[test_case("body", "err -1234" => Ok("id1".to_string()) ; "`-` before digits")]
+    #[test_case("body", "foo NOT bar" => Ok("id2".to_string()) ; "bare `NOT` used to be parsed as an operator")]
+    #[test_case("body", "header" => Ok("id0".to_string()) ; "single word")]
+    #[test_case("body", "accept -header now" => Ok("id0".to_string()) ; "full literal")]
+    #[test_case("body", "ACCEPT" => Ok("id0".to_string()) ; "case-insensitive (LowerCaser in tf_ngram3)")]
+    #[test_case("body", "accept*" => Ok("id0".to_string()) ; "LIKE 'foo%' prefix marker dropped (substring superset of prefix)")]
+    #[test_case("body", "zzzqqq" => Ok(String::new()) ; "still selective: literal in no doc returns nothing")]
+    #[test_case("body", "header xy" => Ok("id0".to_string()) ; "a <3-char word yields no trigram, is dropped (broadens), never empties")]
+    #[test_case("body", "xy" => matches Err(_) ; "nothing left to query: all-short literal errors so callers scan")]
+    // `level` (raw): the whole indexed value is ONE token.
+    #[test_case("level", "ERROR" => Ok("id1".to_string()) ; "raw term matches the whole indexed value")]
+    #[test_case("level", "-alpha" => Ok("id0".to_string()) ; "a leading `-` used to parse as a lone MustNot clause (no hits)")]
+    #[test_case("level", "two words" => Ok("id2".to_string()) ; "whitespace used to AND-split a value indexed as ONE raw token")]
+    #[test_case("level", "error" => Ok(String::new()) ; "raw stays case-sensitive")]
+    #[test_case("level", "two" => Ok(String::new()) ; "raw stays exact: no partial match")]
+    fn text_match_prefilter_hits(column: &str, query: &str) -> std::result::Result<String, String> {
+        hit_ids_on(column, query)
     }
 }
 

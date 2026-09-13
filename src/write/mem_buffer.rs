@@ -2375,7 +2375,7 @@ impl MemBuffer {
         let physical_predicate =
             predicate.map(|p| create_physical_expr(&rewrite(strip_column_qualifiers(p.clone())?)?, &widened_df_schema, &props)).transpose()?;
 
-        let physical_assignments = Self::compile_assignments(assignments, &target_schema, &widened_df_schema, &props, &rewrite)?;
+        let physical_assignments = Self::compile_assignments(assignments, &target_schema, &widened_df_schema, &props, rewrite)?;
 
         // Hash the source side once via Arrow's RowConverter so target rows can
         // probe the lookup with byte-identical key encoding.
@@ -3004,6 +3004,7 @@ mod tests {
         array::{Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
+    use test_case::test_case;
 
     use super::*;
 
@@ -3090,29 +3091,19 @@ mod tests {
     /// as `nullable=true` made the buffer advertise a schema that disagreed
     /// with the declared NOT NULL one — surfacing downstream as hot-tier read
     /// misses and DataFusion's `physical true vs logical false` aggregate error.
-    #[test]
-    fn membuffer_takes_nullability_from_declared_schema_not_first_batch() {
-        let declared = nullable_test_declared_schema();
-        let stored = canonicalize_declared_batch(nullable_otel_batch(false), Some(&declared)).unwrap();
-
-        for col in ["timestamp", "id"] {
-            assert!(
-                !stored.schema().field_with_name(col).unwrap().is_nullable(),
-                "`{col}` is declared NOT NULL and holds no nulls, so it must not stay nullable"
-            );
-        }
-    }
-
-    /// The alignment must never assert an invariant the data violates: a
+    ///
+    /// The alignment must never assert an invariant the data violates either: a
     /// declared-NOT-NULL column that genuinely contains nulls stays nullable
     /// (surfacing the bad data) rather than being relabelled NOT NULL.
-    #[test]
-    fn declared_not_null_column_holding_nulls_stays_nullable() {
-        let declared = nullable_test_declared_schema();
-        let stored = canonicalize_declared_batch(nullable_otel_batch(true), Some(&declared)).unwrap();
+    ///
+    /// Returns `(timestamp_nullable, id_nullable)` of the canonicalized batch;
+    /// `timestamp` is null-free in both cases and must always be tightened.
+    #[test_case(false => (false, false) ; "prod 2026-07-31: declared NOT NULL beats the first batch's nullable=true")]
+    #[test_case(true => (false, true) ; "a declared-NOT-NULL column that really holds nulls stays nullable")]
+    fn canonicalization_takes_nullability_from_declared_schema_and_the_data(with_null_id: bool) -> (bool, bool) {
+        let stored = canonicalize_declared_batch(nullable_otel_batch(with_null_id), Some(&nullable_test_declared_schema())).unwrap();
         let schema = stored.schema();
-        assert!(schema.field_with_name("id").unwrap().is_nullable(), "`id` actually contains a null; relabelling it NOT NULL would lie about the data");
-        assert!(!schema.field_with_name("timestamp").unwrap().is_nullable(), "`timestamp` is null-free and must still be tightened");
+        (schema.field_with_name("timestamp").unwrap().is_nullable(), schema.field_with_name("id").unwrap().is_nullable())
     }
 
     /// Alignment is name+exact-type only, so it must leave unknown tables and
@@ -3338,13 +3329,28 @@ mod tests {
         assert_eq!(buffer.oldest_wal_append_micros(), None, "released take must drop the floor");
     }
 
-    #[test]
-    fn single_row_utf8view_insert_charged_logical_size_not_block_capacity() {
+    /// One row whose 8 Utf8View columns are SLICES of a large scan block —
+    /// the shape the DML re-insert path produces (capacity == len, so no
+    /// slack to detect; only referenced bytes distinguish it).
+    fn sliced_scan_row(ts: i64) -> RecordBatch {
+        let big: Vec<String> = (0..1000).map(|i| format!("{i:0>100}")).collect();
+        let full = StringViewArray::from(big.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let mut fields: Vec<Field> = vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
+        fields.extend((0..8).map(|i| Field::new(format!("c{i}"), DataType::Utf8View, true)));
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC"))];
+        cols.extend((0..8).map(|_| Arc::new(full.slice(0, 1)) as ArrayRef));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+    }
+
+    /// Bytes MemBuffer charges for `n` batches from `mk`, all inserted at ONE
+    /// timestamp so they land in one bucket and the coalesce/fold path runs.
+    fn charged_bytes(n: usize, mk: fn(i64) -> RecordBatch) -> usize {
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
-        buffer.insert("p1", "t1", wide_view_row(ts), ts).unwrap();
-        let charged = buffer.estimated_memory_bytes();
-        assert!(charged < 64 * 1024, "single ~3KB-logical row charged {charged} bytes — view block capacity is leaking into memory accounting");
+        for _ in 0..n {
+            buffer.insert("p1", "t1", mk(ts), ts).unwrap();
+        }
+        buffer.estimated_memory_bytes()
     }
 
     // Prod 2026-06-11 evening: 54,767 rows / 221 batches charged 29.9GB
@@ -3353,40 +3359,17 @@ mod tests {
     // arrays inherit the reader's full column-chunk data blocks, where
     // capacity == len — invisible to slack-based waste detection. The gate
     // must compare capacity against bytes the views actually reference.
-    #[test]
-    fn sliced_scan_rows_charged_referenced_bytes_not_block_size() {
-        let big: Vec<String> = (0..1000).map(|i| format!("{i:0>100}")).collect();
-        let full = StringViewArray::from(big.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-        let ts = chrono::Utc::now().timestamp_micros();
-        let mut fields: Vec<Field> = vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
-        fields.extend((0..8).map(|i| Field::new(format!("c{i}"), DataType::Utf8View, true)));
-        let schema = Arc::new(Schema::new(fields));
-        let mut cols: Vec<ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC"))];
-        cols.extend((0..8).map(|_| Arc::new(full.slice(0, 1)) as ArrayRef));
-        let batch = RecordBatch::try_new(schema, cols).unwrap();
-
-        let buffer = MemBuffer::new();
-        buffer.insert("p1", "t1", batch, ts).unwrap();
-        let charged = buffer.estimated_memory_bytes();
-        assert!(
-            charged < 32 * 1024,
-            "1 sliced row (8 view cols x 100B referenced) charged {charged} bytes — inherited scan blocks are leaking into accounting"
-        );
-    }
-
-    // Companion guard: tail-fold outputs must also stay near logical size
-    // (folds concat view arrays; inherited buffers may carry slack).
-    #[test]
-    fn fold_outputs_charged_near_logical_size() {
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        for _ in 0..200 {
-            buffer.insert("p1", "t1", wide_view_row(ts), ts).unwrap();
-        }
-        let charged = buffer.estimated_memory_bytes();
-        // 200 rows × ~3KB logical ≈ 600KB; allow generous overhead but stay
-        // orders of magnitude under the ~megabytes-per-fold failure mode.
-        assert!(charged < 16 * 1024 * 1024, "200 ~3KB-logical rows charged {charged} bytes — fold outputs are carrying view block capacity");
+    //
+    // The 200-row case is the companion guard: tail-fold outputs must also stay
+    // near logical size (folds concat view arrays; inherited buffers may carry
+    // slack). 200 rows × ~3KB logical ≈ 600KB, so the generous 16MB bound is
+    // still orders of magnitude under the ~megabytes-per-fold failure mode.
+    #[test_case(1, wide_view_row, 64 * 1024 ; "prod 2026-06-11: single ~3KB-logical wide-Utf8View row")]
+    #[test_case(1, sliced_scan_row, 32 * 1024 ; "prod 2026-06-11 evening: 1 sliced row, 8 view cols x 100B referenced")]
+    #[test_case(200, wide_view_row, 16 * 1024 * 1024 ; "200 rows: fold outputs stay near logical size")]
+    fn view_rows_charged_logical_size_not_block_capacity(n: usize, mk: fn(i64) -> RecordBatch, limit: usize) {
+        let charged = charged_bytes(n, mk);
+        assert!(charged < limit, "{n} ~3KB-logical row(s) charged {charged} bytes (limit {limit}) — view block capacity is leaking into memory accounting");
     }
 
     // Prod 2026-06-11 follow-up to the view-block fix: the coalesce gate
@@ -3441,6 +3424,21 @@ mod tests {
         batches.iter().flat_map(|b| b.column_by_name(name).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect()
     }
 
+    /// `[id, <stamp_col>?, payload]` rows — the shared shape of the dedup tests.
+    /// `stamp_col: None` omits the stamp column entirely, which is the
+    /// pre-`version_append` legacy batch shape.
+    fn key_batch(stamp_col: Option<&str>, rows: &[(i64, Option<i64>, &str)]) -> RecordBatch {
+        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>()))];
+        if let Some(c) = stamp_col {
+            fields.push(Field::new(c, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true));
+            cols.push(Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.1).collect::<Vec<_>>()).with_timezone("UTC")));
+        }
+        fields.push(Field::new("payload", DataType::Utf8View, false));
+        cols.push(Arc::new(StringViewArray::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+    }
+
     #[test]
     fn dedup_batches_keep_last_on_composite_key() {
         let schema = Arc::new(Schema::new(vec![
@@ -3477,30 +3475,11 @@ mod tests {
     /// version, no matter which one the flush happens to see first. (It holds
     /// because `SortField::new` takes `SortOptions::default()` — ascending,
     /// nulls first — so a NULL row encodes below every value.)
-    #[test]
-    fn dedup_batches_null_tiebreak_always_loses() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
-            Field::new("payload", DataType::Utf8View, false),
-        ]));
-        let mk = |stamp: Option<i64>, payload: &str| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(vec![1i64])),
-                    Arc::new(TimestampMicrosecondArray::from(vec![stamp]).with_timezone("UTC")),
-                    Arc::new(StringViewArray::from(vec![payload])),
-                ],
-            )
-            .unwrap()
-        };
-        let keys = vec!["id".to_string()];
-        for (batches, want) in [(vec![mk(None, "legacy"), mk(Some(10), "stamped")], "stamped"), (vec![mk(Some(10), "stamped"), mk(None, "legacy")], "stamped")]
-        {
-            let out = dedup_batches(batches, &keys, Some("updated_at"), None).expect("dedup ok");
-            assert_eq!(col_strings(&out, "payload"), vec![want.to_string()], "NULL tiebreak must lose regardless of arrival order");
-        }
+    #[test_case(&[(None, "legacy"), (Some(10), "stamped")] => vec!["stamped".to_string()] ; "NULL arrives first")]
+    #[test_case(&[(Some(10), "stamped"), (None, "legacy")] => vec!["stamped".to_string()] ; "NULL arrives last")]
+    fn dedup_batches_null_tiebreak_always_loses(rows: &[(Option<i64>, &str)]) -> Vec<String> {
+        let batches = rows.iter().map(|&(stamp, payload)| key_batch(Some("updated_at"), &[(1, stamp, payload)])).collect();
+        col_strings(&dedup_batches(batches, &["id".to_string()], Some("updated_at"), None).expect("dedup ok"), "payload")
     }
 
     #[test]
@@ -3522,10 +3501,7 @@ mod tests {
     /// duplicate keys across N input batches it returns those N batches untouched.
     #[test]
     fn dedup_batches_does_not_concatenate_full_payload() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("payload", DataType::Utf8View, false)]));
-        let mk = |id: i64, p: &str| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![id])), Arc::new(StringViewArray::from(vec![p]))]).unwrap()
-        };
+        let mk = |id: i64, p: &str| key_batch(None, &[(id, None, p)]);
         let batches = vec![mk(1, "a"), mk(2, "b"), mk(3, "c")];
         let out = dedup_batches(batches, &["id".to_string()], None, None).expect("dedup ok");
         assert_eq!(out.len(), 3, "distinct-key batches must be returned un-fused (no 2GB-prone concat)");
@@ -3547,16 +3523,13 @@ mod tests {
     /// below any stamped version on the read side.
     #[test]
     fn dedup_batches_tolerates_a_legacy_batch_with_no_tiebreak_column() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("payload", DataType::Utf8View, false)]));
-        let mk = |ids: Vec<i64>, pl: Vec<&str>| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids)), Arc::new(StringViewArray::from(pl))]).unwrap()
-        };
-        let batches = vec![mk(vec![1], vec!["old"]), mk(vec![1], vec!["new"])];
+        let mk = |id: i64, p: &str| key_batch(None, &[(id, None, p)]);
+        let batches = vec![mk(1, "old"), mk(1, "new")];
         let out = dedup_batches(batches, &["id".to_string()], Some("updated_at"), None).expect("a legacy batch must flush, not fail the whole commit");
         assert_eq!(col_strings(&out, "payload"), vec!["new".to_string()], "with no tiebreak available the last occurrence must win");
 
         // A missing dedup KEY stays fatal — that is a schema fault, not legacy data.
-        assert!(dedup_batches(vec![mk(vec![1], vec!["x"])], &["nope".to_string()], None, None).is_err(), "a missing dedup key must still fail loudly");
+        assert!(dedup_batches(vec![mk(1, "x")], &["nope".to_string()], None, None).is_err(), "a missing dedup key must still fail loudly");
     }
 
     /// Defect 3: with a tiebreak column, the row with the greatest tiebreak value
@@ -3564,23 +3537,11 @@ mod tests {
     /// regardless of input position — and a non-null tiebreak beats a null one.
     #[test]
     fn dedup_batches_tiebreak_keeps_greatest() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("observed", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
-            Field::new("payload", DataType::Utf8View, false),
-        ]));
-        let mk = |ids: Vec<i64>, obs: Vec<Option<i64>>, pl: Vec<&str>| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(ids)), Arc::new(TimestampMicrosecondArray::from(obs).with_timezone("UTC")), Arc::new(StringViewArray::from(pl))],
-            )
-            .unwrap()
-        };
+        let mk = |rows: &[(i64, Option<i64>, &str)]| key_batch(Some("observed"), rows);
         // id=1: base (observed=100) appears AFTER enriched (observed=200) in input —
         //   keep-last would wrongly pick base; tiebreak must pick the observed=200 row.
         // id=2: base has a NULL observed, enriched has 50 — non-null must win.
-        let batches =
-            vec![mk(vec![1, 2], vec![Some(200), None], vec!["1-enriched", "2-base"]), mk(vec![1, 2], vec![Some(100), Some(50)], vec!["1-base", "2-enriched"])];
+        let batches = vec![mk(&[(1, Some(200), "1-enriched"), (2, None, "2-base")]), mk(&[(1, Some(100), "1-base"), (2, Some(50), "2-enriched")])];
         let out = dedup_batches(batches, &["id".to_string()], Some("observed"), None).expect("dedup ok");
         let mut got: Vec<(i64, String)> = col_i64(&out, "id").into_iter().zip(col_strings(&out, "payload")).collect();
         got.sort();
@@ -3592,6 +3553,8 @@ mod tests {
     /// on that survivor retires the key when — and only when — the caller declares
     /// its scope safe (`drop_tombstones = Some("deleted")`).
     mod tombstones {
+        use test_case::test_case;
+
         use super::*;
 
         fn schema() -> SchemaRef {
@@ -3631,54 +3594,55 @@ mod tests {
             got
         }
 
-        /// A tombstone is just another version: it wins on `updated_at`, not on
-        /// being a tombstone. The live row is gone either way — what differs is
-        /// whether the tombstone itself survives to keep it gone.
-        #[test]
-        fn tombstone_beats_older_live_version() {
-            let batches = vec![row(1, Some(10), None, "live"), row(1, Some(20), Some(true), "deleted")];
-            assert_eq!(collapse(batches, None), vec![(1, "deleted".into(), Some(true))]);
+        /// `(id, updated_at, deleted, payload)` rows, one row per batch so input
+        /// order is explicit, collapsed under `drop_tombstones`.
+        ///
+        /// The cases below, in order, pin:
+        /// - a tombstone is just another version — it wins on `updated_at`, not on
+        ///   being a tombstone. The live row is gone either way; what differs is
+        ///   whether the tombstone itself survives to keep it gone;
+        /// - out-of-order flush, the older live version arriving AFTER the
+        ///   tombstone: `updated_at`, not position, decides, so the row is not
+        ///   resurrected — and the drop takes the whole key, not just the
+        ///   tombstone row;
+        /// - the two policies on one input: retained (the sweep's choice — an
+        ///   older version may live in a file/partition/buffer it never saw) vs
+        ///   dropped (only when the caller's scope holds every version of the key);
+        /// - a lone tombstone with no older version is still a row to drop — it
+        ///   must not slip through the no-duplicates fast path;
+        /// - a newer LIVE version un-deletes the key (re-insert after delete), and
+        ///   NULL/false are both live, so the all-NULL steady state of a table that
+        ///   declares `tombstone_column` but was never deleted from is a no-op
+        ///   (identical rows under either policy).
+        #[test_case(&[(1, Some(10), None, "live"), (1, Some(20), Some(true), "deleted")], None
+            => vec![(1, "deleted".to_string(), Some(true))] ; "tombstone beats older live version")]
+        #[test_case(&[(1, Some(20), Some(true), "deleted"), (1, Some(10), None, "live")], None
+            => vec![(1, "deleted".to_string(), Some(true))] ; "late older live version does not resurrect")]
+        #[test_case(&[(1, Some(20), Some(true), "deleted"), (1, Some(10), None, "live")], Some("deleted")
+            => Vec::<(i64, String, Option<bool>)>::new() ; "tombstone drop takes the whole key, not just the tombstone row")]
+        #[test_case(&[(1, Some(10), Some(false), "live"), (1, Some(20), Some(true), "deleted"), (2, Some(5), None, "untouched")], None
+            => vec![(1, "deleted".to_string(), Some(true)), (2, "untouched".to_string(), None)] ; "tombstone retained unless caller declares scope safe")]
+        #[test_case(&[(1, Some(10), Some(false), "live"), (1, Some(20), Some(true), "deleted"), (2, Some(5), None, "untouched")], Some("deleted")
+            => vec![(2, "untouched".to_string(), None)] ; "scope-safe caller drops the tombstoned key only")]
+        #[test_case(&[(1, Some(20), Some(true), "deleted")], Some("deleted")
+            => Vec::<(i64, String, Option<bool>)>::new() ; "lone tombstone drops without a duplicate")]
+        #[test_case(&[(1, Some(20), Some(true), "deleted"), (1, Some(30), Some(false), "reinserted")], Some("deleted")
+            => vec![(1, "reinserted".to_string(), Some(false))] ; "newer live version un-deletes the key")]
+        #[test_case(&[(1, Some(10), None, "a"), (2, Some(20), None, "b")], Some("deleted")
+            => vec![(1, "a".to_string(), None), (2, "b".to_string(), None)] ; "all-NULL deleted column is live under the drop policy")]
+        #[test_case(&[(1, Some(10), None, "a"), (2, Some(20), None, "b")], None
+            => vec![(1, "a".to_string(), None), (2, "b".to_string(), None)] ; "all-NULL deleted column is unchanged without the drop policy")]
+        fn version_collapse(rows: &[(i64, Option<i64>, Option<bool>, &str)], drop_tombstones: Option<&str>) -> Vec<(i64, String, Option<bool>)> {
+            collapse(rows.iter().map(|&(id, updated_at, deleted, payload)| row(id, updated_at, deleted, payload)).collect(), drop_tombstones)
         }
 
-        /// Out-of-order flush: the older live version arrives AFTER the tombstone.
-        /// `updated_at`, not position, decides — so the row is not resurrected.
+        /// With no tombstone present the drop policy must preserve the
+        /// untouched-batches fast path, not re-filter every batch.
         #[test]
-        fn late_older_live_version_does_not_resurrect() {
-            let batches = vec![row(1, Some(20), Some(true), "deleted"), row(1, Some(10), None, "live")];
-            assert_eq!(collapse(batches.clone(), None), vec![(1, "deleted".into(), Some(true))]);
-            assert_eq!(collapse(batches, Some("deleted")), vec![], "tombstone drop must take the whole key, not just the tombstone row");
-        }
-
-        /// The two policies, same input: retained (the sweep's choice — an older
-        /// version may live in a file/partition/buffer it never saw) vs dropped
-        /// (only when the caller's scope holds every version of the key).
-        #[test]
-        fn tombstone_retained_unless_caller_declares_scope_safe() {
-            let batches = vec![row(1, Some(10), Some(false), "live"), row(1, Some(20), Some(true), "deleted"), row(2, Some(5), None, "untouched")];
-            assert_eq!(collapse(batches.clone(), None), vec![(1, "deleted".into(), Some(true)), (2, "untouched".into(), None)]);
-            assert_eq!(collapse(batches, Some("deleted")), vec![(2, "untouched".into(), None)]);
-        }
-
-        /// A tombstone with no older version in the input is still a row to drop —
-        /// it must not slip through the no-duplicates fast path.
-        #[test]
-        fn lone_tombstone_drops_without_a_duplicate() {
-            assert_eq!(collapse(vec![row(1, Some(20), Some(true), "deleted")], Some("deleted")), vec![]);
-        }
-
-        /// A newer LIVE version un-deletes the key (re-insert after delete), and
-        /// NULL/false are both live. The all-NULL steady state of a table that
-        /// declares `tombstone_column` but has never been deleted from is a no-op:
-        /// same rows, and the untouched-batches fast path is preserved.
-        #[test]
-        fn null_and_false_are_live() {
-            let undelete = vec![row(1, Some(20), Some(true), "deleted"), row(1, Some(30), Some(false), "reinserted")];
-            assert_eq!(collapse(undelete, Some("deleted")), vec![(1, "reinserted".into(), Some(false))]);
-
+        fn all_null_tombstone_column_keeps_the_untouched_fast_path() {
             let all_null = vec![row(1, Some(10), None, "a"), row(2, Some(20), None, "b")];
-            let out = dedup_batches(all_null.clone(), &["id".to_string()], Some("updated_at"), Some("deleted")).expect("collapse ok");
+            let out = dedup_batches(all_null, &["id".to_string()], Some("updated_at"), Some("deleted")).expect("collapse ok");
             assert_eq!(out.len(), 2, "no tombstones present → batches returned untouched, not re-filtered");
-            assert_eq!(collapse(all_null.clone(), Some("deleted")), collapse(all_null, None));
         }
 
         /// A table that declares no tombstone column is byte-identical to before:
@@ -3714,22 +3678,27 @@ mod tests {
         assert_eq!(results[0].num_rows(), 1);
     }
 
+    /// A real `otel_logs_and_spans` batch of `(id, service_name)` rows.
+    fn spans(rows: &[(&str, &str)]) -> RecordBatch {
+        use crate::support::test_helpers::{json_to_batch, test_span};
+        json_to_batch(rows.iter().map(|&(id, svc)| test_span(id, svc, "p1")).collect()).expect("json_to_batch")
+    }
+
+    fn name_preds(query: &str) -> Vec<crate::tantivy::udf::TextMatchPred> {
+        vec![crate::tantivy::udf::TextMatchPred { column: "name".into(), query: query.into() }]
+    }
+
     #[test]
     fn search_text_match_returns_matching_ids_from_membuffer() {
         // Build a real otel_logs_and_spans batch and verify the per-bucket
         // tantivy index returns matching IDs before flush. This exercises:
         // (1) lazy build on first query, (2) ngram3 tokenizer integration,
         // (3) the bucket-search → MemBuffer.search_text_match plumbing.
-        use crate::support::test_helpers::{json_to_batch, test_span};
         let buffer = MemBuffer::new();
-        let r1 = test_span("row-1", "auth-svc", "p1");
-        let r2 = test_span("row-2", "billing-svc", "p1");
-        let batch = json_to_batch(vec![r1, r2]).expect("json_to_batch");
         let ts = chrono::Utc::now().timestamp_micros();
-        buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", spans(&[("row-1", "auth-svc"), ("row-2", "billing-svc")]), ts).unwrap();
 
-        let preds = vec![crate::tantivy::udf::TextMatchPred { column: "name".into(), query: "auth".into() }];
-        let got = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).expect("search");
+        let got = buffer.search_text_match("p1", "otel_logs_and_spans", &name_preds("auth")).expect("search");
         let ids = got.expect("indexed table produces Some");
         assert!(ids.contains("row-1"), "expected row-1 (auth-svc) in hit set: {:?}", ids);
         assert!(!ids.contains("row-2"), "expected row-2 (billing-svc) NOT in hit set: {:?}", ids);
@@ -3743,8 +3712,7 @@ mod tests {
         let ts = chrono::Utc::now().timestamp_micros();
         buffer.insert("p1", "table1", create_test_batch(ts), ts).unwrap();
 
-        let preds = vec![crate::tantivy::udf::TextMatchPred { column: "name".into(), query: "test".into() }];
-        let got = buffer.search_text_match("p1", "table1", &preds).expect("search");
+        let got = buffer.search_text_match("p1", "table1", &name_preds("test")).expect("search");
         assert!(got.is_none(), "unindexed table should return None, got {:?}", got);
     }
 
@@ -3752,17 +3720,14 @@ mod tests {
     fn search_text_match_cache_invalidates_on_insert() {
         // Build cache via first query, insert new rows, second query must
         // see them (i.e. cache was invalidated and rebuilt).
-        use crate::support::test_helpers::{json_to_batch, test_span};
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
-        let batch1 = json_to_batch(vec![test_span("a", "alpha-svc", "p1")]).unwrap();
-        buffer.insert("p1", "otel_logs_and_spans", batch1, ts).unwrap();
-        let preds = vec![crate::tantivy::udf::TextMatchPred { column: "name".into(), query: "beta".into() }];
+        buffer.insert("p1", "otel_logs_and_spans", spans(&[("a", "alpha-svc")]), ts).unwrap();
+        let preds = name_preds("beta");
         let initial = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
         assert!(initial.is_empty(), "no 'beta' row inserted yet");
 
-        let batch2 = json_to_batch(vec![test_span("b", "beta-svc", "p1")]).unwrap();
-        buffer.insert("p1", "otel_logs_and_spans", batch2, ts + 1).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", spans(&[("b", "beta-svc")]), ts + 1).unwrap();
         let post = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
         assert!(post.contains("b"), "expected 'b' after insert+rebuild, got {:?}", post);
     }
@@ -3774,15 +3739,12 @@ mod tests {
         // A row that exists in the bucket at query time MUST be either in
         // both (returned) or in neither (filtered) — never in the snapshot
         // but missing from the id set.
-        use crate::support::test_helpers::{json_to_batch, test_span};
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
-        // Build a batch with two rows, one matching the search and one not.
-        let batch = json_to_batch(vec![test_span("hit-1", "alpha-search-svc", "p1"), test_span("miss-1", "completely-unrelated-svc", "p1")]).unwrap();
-        buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
+        // Two rows, one matching the search and one not.
+        buffer.insert("p1", "otel_logs_and_spans", spans(&[("hit-1", "alpha-search-svc"), ("miss-1", "completely-unrelated-svc")]), ts).unwrap();
 
-        let preds = vec![crate::tantivy::udf::TextMatchPred { column: "name".into(), query: "alpha".into() }];
-        let node = crate::tantivy::udf::PredNode::from_preds(&preds);
+        let node = crate::tantivy::udf::PredNode::from_preds(&name_preds("alpha"));
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], node.as_ref()).unwrap();
         let total_rows: usize = parts.partitions.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1, "expected only the matching row, got {} rows in {:?}", total_rows, parts);
@@ -3797,11 +3759,9 @@ mod tests {
     #[test]
     fn query_partitioned_with_text_match_empty_preds_falls_through() {
         // No text_match preds → behave identically to query_partitioned.
-        use crate::support::test_helpers::{json_to_batch, test_span};
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
-        let batch = json_to_batch(vec![test_span("a", "svc", "p1"), test_span("b", "svc", "p1")]).unwrap();
-        buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", spans(&[("a", "svc"), ("b", "svc")]), ts).unwrap();
 
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], None).unwrap();
         let total: usize = parts.partitions.iter().flatten().map(|b| b.num_rows()).sum();
@@ -3814,12 +3774,11 @@ mod tests {
     /// pruning until the next insert. It must replay the rows' real range.
     #[test]
     fn restore_taken_bucket_preserves_timestamp_range() {
-        use crate::support::test_helpers::{json_to_batch, test_span};
         let buffer = MemBuffer::new();
         let dur = bucket_duration_micros();
         let ts = 7 * dur + 12_345; // mid-bucket — distinct from the bucket-start sentinel
         let bucket_id = MemBuffer::compute_bucket_id(ts);
-        buffer.insert("p1", "otel_logs_and_spans", json_to_batch(vec![test_span("a", "svc", "p1")]).unwrap(), ts).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", spans(&[("a", "svc")]), ts).unwrap();
 
         let taken = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("bucket taken");
         assert_eq!((taken.min_timestamp, taken.max_timestamp), (ts, ts), "take must capture the real row range");
@@ -3925,48 +3884,23 @@ mod tests {
         assert_eq!(ranges, vec![(late_ts, late_ts + 1)], "survivor's mask must cover only the late rows so the drained rows' Delta copies stay visible");
     }
 
-    /// The narrowing above CANNOT save a drained row that shares its timestamp with a survivor,
-    /// and that is a live correctness bug, not a corner case.
+    /// A flushed instant must stay visible however the bucket emptied.
     ///
-    /// The mask is a time RANGE; the rows differ only by `id`. So when a flushed row and a
-    /// retained row sit at the same instant, narrowing the survivor's range to `(ts, ts+1)` still
-    /// covers the drained row's freshly committed Delta copy — it is masked out of the Delta leg
-    /// while no longer being in the memory leg, and the row is invisible to queries until the
-    /// survivors themselves flush.
-    ///
+    /// `survivor_at_same_instant`: the narrowing above CANNOT save a drained row that shares its
+    /// timestamp with a survivor, and that is a live correctness bug, not a corner case. The mask
+    /// is a time RANGE; the rows differ only by `id`. So when a flushed row and a retained row sit
+    /// at the same instant, narrowing the survivor's range to `(ts, ts+1)` still covers the drained
+    /// row's freshly committed Delta copy — it is masked out of the Delta leg while no longer being
+    /// in the memory leg, and the row is invisible to queries until the survivors themselves flush.
     /// Reproduced end to end 2026-08-28 by `e2e smoke::count_star_returns_correct_value` under
     /// machine load: seven INSERTs at an identical timestamp, `COUNT(*)` = 6, the missing row is
     /// the FIRST one, MemBuffer holds exactly the other 6, and an immediate re-query still says 6
-    /// (so it is masked, not in flight). Filed as a flake for three days.
+    /// (so it is masked, not in flight). Filed as a flake for three days. Identical timestamps are
+    /// the common case for this workload, not an edge: a batch of OTel spans arrives stamped to the
+    /// same instant. (Its only difference from
+    /// `prefix_drain_narrows_survivor_range_to_late_rows` is the survivor's ts, which uses ts+60s.)
     ///
-    /// Identical timestamps are the common case for this workload, not an edge: a batch of OTel
-    /// spans arrives stamped to the same instant.
-    #[test]
-    fn a_drained_row_sharing_a_timestamp_with_a_survivor_is_not_masked() {
-        let buffer = MemBuffer::new();
-        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
-        let bucket_id = MemBuffer::compute_bucket_id(ts);
-
-        // The row that will be flushed to Delta and drained.
-        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
-        let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
-
-        // A survivor at the SAME instant — the only difference from
-        // `prefix_drain_narrows_survivor_range_to_late_rows`, which uses ts+60s.
-        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
-        assert!(buffer.finish_flushed_snapshot(&snap));
-
-        // The drained row's Delta copy lives at exactly `ts`. Any mask covering
-        // `ts` hides a committed row that memory no longer holds.
-        let ranges = buffer.get_bucket_ranges("project1", "table1");
-        assert!(
-            !ranges.iter().any(|&(start, end)| (start..end).contains(&ts)),
-            "the survivor's mask covers the drained row's committed Delta copy, so that row is \
-             invisible to every query until the survivor flushes: ranges={ranges:?}, drained ts={ts}"
-        );
-    }
-
-    /// The same disappearance, reached three more ways — and all three defeat
+    /// The other three modes reach the same disappearance, and all three defeat
     /// the narrowing above, because the narrowing `store`s into `min_timestamp`
     /// and the INSERT path `fetch_min`s the very same atomic (`2857`). Any later
     /// row at the flushed instant pulls the mask back down over rows that have
@@ -3982,9 +3916,10 @@ mod tests {
     ///
     /// This is why the floor belongs at READ time in `get_bucket_ranges` rather
     /// than in a stored minimum: it has to live outside the value inserts maintain.
-    #[test_case::test_case("take"; "full take, then a row at the same instant")]
-    #[test_case::test_case("drain_to_empty"; "snapshot drained clean, then a row at the same instant")]
-    #[test_case::test_case("narrow_then_insert"; "partial-drain narrowing undone by a later row")]
+    #[test_case("survivor_at_same_instant"; "prod 2026-08-28: a drained row sharing a timestamp with a survivor is masked")]
+    #[test_case("take"; "full take, then a row at the same instant")]
+    #[test_case("drain_to_empty"; "snapshot drained clean, then a row at the same instant")]
+    #[test_case("narrow_then_insert"; "partial-drain narrowing undone by a later row")]
     fn a_flushed_instant_stays_visible_however_the_bucket_emptied(mode: &str) {
         let buffer = MemBuffer::new();
         let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
@@ -3993,6 +3928,12 @@ mod tests {
         // The row that reaches Delta and leaves memory, in every mode.
         buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
         match mode {
+            "survivor_at_same_instant" => {
+                let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
+                // A survivor at the SAME instant, inserted mid-flight.
+                buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+                assert!(buffer.finish_flushed_snapshot(&snap));
+            }
             "take" => {
                 buffer.take_bucket_for_flush("project1", "table1", bucket_id).expect("bucket has rows");
             }
@@ -4009,9 +3950,14 @@ mod tests {
             other => unreachable!("unknown mode {other}"),
         }
         // ...and now one more row at the flushed instant, which is what the
-        // workload actually does: a batch of spans all stamped the same.
-        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        // workload actually does: a batch of spans all stamped the same. (The
+        // survivor mode already has its same-instant row and keeps the exact
+        // 2026-08-28 sequence.)
+        if mode != "survivor_at_same_instant" {
+            buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        }
 
+        // Any mask covering `ts` hides a committed row that memory no longer holds.
         let ranges = buffer.get_bucket_ranges("project1", "table1");
         assert!(
             !ranges.iter().any(|&(start, end)| (start..end).contains(&ts)),
@@ -4071,124 +4017,68 @@ mod tests {
         tin_batch(vec![ts; ids.len()], ids, names.into_iter().map(Into::into).collect())
     }
 
-    #[test]
-    fn test_delete_all_rows() {
+    /// The (id, name) table every DML case below mutates.
+    fn dml_buffer(project: &str, table: &str, ids: Vec<i64>, names: Vec<&str>) -> MemBuffer {
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
-        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
-
-        buffer.insert("project1", "table1", batch, ts).unwrap();
-
-        // Delete all rows (no predicate)
-        let deleted = buffer.delete("project1", "table1", None, None).unwrap();
-        assert_eq!(deleted, 3);
-
-        let results = buffer.query("project1", "table1", &[]).unwrap();
-        assert!(results.is_empty() || results.iter().all(|b| b.num_rows() == 0));
+        buffer.insert(project, table, create_multi_row_batch(ids, names), ts).unwrap();
+        buffer
     }
 
-    #[test]
-    fn test_delete_with_predicate() {
-        use datafusion::logical_expr::{col, lit};
-
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
-
-        buffer.insert("project1", "table1", batch, ts).unwrap();
-
-        // Delete rows where id = 2
-        let predicate = col("id").eq(lit(2i64));
-        let deleted = buffer.delete("project1", "table1", Some(&predicate), None).unwrap();
-        assert_eq!(deleted, 1);
-
-        let results = buffer.query("project1", "table1", &[]).unwrap();
-        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2);
-    }
-
-    #[test]
-    fn test_update_with_predicate() {
-        use datafusion::logical_expr::{col, lit};
-
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
-
-        buffer.insert("project1", "table1", batch, ts).unwrap();
-
-        // Update name to "updated" where id = 2
-        let predicate = col("id").eq(lit(2i64));
-        let assignments = vec![("name".to_string(), lit("updated"))];
-        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments, None).unwrap();
-        assert_eq!(updated, 1);
-
-        // Verify the update
-        let results = buffer.query("project1", "table1", &[]).unwrap();
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 3);
-
-        let name_col = batch.column(2).as_any().downcast_ref::<StringViewArray>().unwrap();
-        assert_eq!(name_col.value(0), "a");
-        assert_eq!(name_col.value(1), "updated");
-        assert_eq!(name_col.value(2), "c");
-    }
-
-    // Regression: predicate/assignment exprs from the SQL planner carry table
-    // qualifiers (e.g. `Column { relation: Some("table1"), name: "id" }`), but
-    // DFSchema is built from the bare table schema. Without qualifier stripping,
-    // create_physical_expr fails with "No field named table1.id".
-    #[test]
-    fn test_delete_with_qualified_predicate() {
+    /// A column reference in the two forms the planner produces. Regression:
+    /// predicate/assignment exprs from the SQL planner carry table qualifiers
+    /// (e.g. `Column { relation: Some("table1"), name: "id" }`), but DFSchema is
+    /// built from the bare table schema. Without qualifier stripping,
+    /// create_physical_expr fails with "No field named table1.id".
+    fn maybe_qualified(name: &str, qualified: bool) -> Expr {
         use datafusion::{
             common::{Column, TableReference},
-            logical_expr::{Expr, lit},
+            logical_expr::col,
         };
-
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
-        buffer.insert("project1", "table1", batch, ts).unwrap();
-
-        let predicate = Expr::Column(Column::new(Some(TableReference::bare("table1")), "id")).eq(lit(2i64));
-        let deleted = buffer.delete("project1", "table1", Some(&predicate), None).unwrap();
-        assert_eq!(deleted, 1);
+        if qualified { Expr::Column(Column::new(Some(TableReference::bare("table1")), name)) } else { col(name) }
     }
 
-    #[test]
-    fn test_update_with_qualified_predicate_and_assignment() {
-        use datafusion::{
-            common::{Column, TableReference},
-            logical_expr::{Expr, lit},
-        };
-
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
-        buffer.insert("project1", "table1", batch, ts).unwrap();
-
-        let predicate = Expr::Column(Column::new(Some(TableReference::bare("table1")), "id")).eq(lit(2i64));
-        // Assignment value also references a qualified column — the planner
-        // produces these when the SET RHS reads from the same table.
-        let value_expr = Expr::Column(Column::new(Some(TableReference::bare("table1")), "name"));
-        let assignments = vec![("name".to_string(), value_expr)];
-        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments, None).unwrap();
-        assert_eq!(updated, 1);
+    fn rows(pairs: &[(i64, &str)]) -> Vec<(i64, String)> {
+        pairs.iter().map(|&(id, name)| (id, name.to_string())).collect()
     }
 
-    /// id -> name from a buffer query, for asserting the full row set.
-    fn collect_id_name(buffer: &MemBuffer) -> std::collections::HashMap<i64, String> {
+    #[test_case(None => (3, vec![]) ; "no predicate deletes every row")]
+    #[test_case(Some(false) => (1, rows(&[(1, "a"), (3, "c")])) ; "bare predicate deletes only id=2")]
+    #[test_case(Some(true) => (1, rows(&[(1, "a"), (3, "c")])) ; "SQL-planner qualified predicate resolves against the bare schema")]
+    fn delete_applies_predicate(qualified: Option<bool>) -> (u64, Vec<(i64, String)>) {
+        use datafusion::logical_expr::lit;
+        let buffer = dml_buffer("project1", "table1", vec![1, 2, 3], vec!["a", "b", "c"]);
+        let predicate = qualified.map(|q| maybe_qualified("id", q).eq(lit(2i64)));
+        let deleted = buffer.delete("project1", "table1", predicate.as_ref(), None).unwrap();
+        (deleted, collect_id_name(&buffer, "project1", "table1"))
+    }
+
+    // The qualified case's SET RHS is `table1.name` — the planner produces these
+    // when the SET RHS reads from the same table — so its rows must come back
+    // unchanged.
+    #[test_case(false, None => (1, 1, rows(&[(1, "a"), (2, "updated"), (3, "c")])) ; "bare predicate, literal assignment")]
+    #[test_case(true, Some("name") => (1, 1, rows(&[(1, "a"), (2, "b"), (3, "c")])) ; "qualified predicate and qualified assignment value")]
+    fn update_applies_predicate(qualified: bool, value_column: Option<&str>) -> (u64, usize, Vec<(i64, String)>) {
+        use datafusion::logical_expr::lit;
+        let buffer = dml_buffer("project1", "table1", vec![1, 2, 3], vec!["a", "b", "c"]);
+        let predicate = maybe_qualified("id", qualified).eq(lit(2i64));
+        let value = value_column.map_or_else(|| lit("updated"), |c| maybe_qualified(c, qualified));
+        let updated = buffer.update("project1", "table1", Some(&predicate), &[("name".to_string(), value)], None).unwrap();
+        let batches = buffer.query("project1", "table1", &[]).unwrap().len();
+        (updated, batches, collect_id_name(&buffer, "project1", "table1"))
+    }
+
+    /// Sorted (id, name) pairs from a buffer query, for asserting the full row set.
+    fn collect_id_name(buffer: &MemBuffer, project: &str, table: &str) -> Vec<(i64, String)> {
         use arrow::array::AsArray;
-        let mut out = std::collections::HashMap::new();
-        for b in buffer.query("p", "t", &[]).unwrap() {
+        let mut out = Vec::new();
+        for b in buffer.query(project, table, &[]).unwrap() {
             let ids = b.column(b.schema().index_of("id").unwrap()).as_primitive::<arrow::datatypes::Int64Type>();
             let names = arrow::compute::cast(b.column(b.schema().index_of("name").unwrap()), &DataType::Utf8).unwrap();
             let names = names.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
-            for i in 0..b.num_rows() {
-                out.insert(ids.value(i), names.value(i).to_string());
-            }
+            out.extend((0..b.num_rows()).map(|i| (ids.value(i), names.value(i).to_string())));
         }
+        out.sort();
         out
     }
 
@@ -4207,45 +4097,18 @@ mod tests {
     /// update_with_source must update exactly the source-matched rows and keep
     /// every other row intact — proving the matched-rows-only split rewrite
     /// (the 89GB-OOM fix) doesn't lose/duplicate rows or corrupt unmatched ones.
-    #[test]
-    fn update_with_source_updates_only_matched_and_preserves_rest() {
-        use datafusion::logical_expr::col;
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        buffer.insert("p", "t", create_multi_row_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]), ts).unwrap();
-
-        let n = buffer.update_with_source("p", "t", None, &[("name".to_string(), col("new_name"))], &id_source(), None).unwrap();
-        assert_eq!(n, 2, "exactly the 2 source-matched rows update");
-
-        let rows = collect_id_name(&buffer);
-        assert_eq!(rows.len(), 5, "no rows lost or duplicated by the split rebuild");
-        assert_eq!(rows.get(&1).map(String::as_str), Some("a"));
-        assert_eq!(rows.get(&2).map(String::as_str), Some("B"), "matched row updated");
-        assert_eq!(rows.get(&3).map(String::as_str), Some("c"));
-        assert_eq!(rows.get(&4).map(String::as_str), Some("D"), "matched row updated");
-        assert_eq!(rows.get(&5).map(String::as_str), Some("e"));
-    }
-
-    /// A source-matched row that FAILS the predicate must be preserved
-    /// UNCHANGED (not updated, not dropped) — the critical path of the split
-    /// rewrite (`updated_full` scatter + not-updated filter).
-    #[test]
-    fn update_with_source_respects_predicate_and_preserves_unmatched_predicate_rows() {
+    /// The source matches ids 2 and 4; a source-matched row that FAILS the
+    /// predicate must be preserved UNCHANGED (not updated, not dropped) — the
+    /// critical path of the split rewrite (`updated_full` scatter + not-updated
+    /// filter). Neither case may lose a row: the returned set is always all 5.
+    #[test_case(false => (2, rows(&[(1, "a"), (2, "B"), (3, "c"), (4, "D"), (5, "e")])) ; "no predicate: exactly the 2 source-matched rows update")]
+    #[test_case(true => (1, rows(&[(1, "a"), (2, "B"), (3, "c"), (4, "d"), (5, "e")])) ; "predicate id=2: matched-but-predicate-false id=4 preserved unchanged")]
+    fn update_with_source_updates_only_matched_and_preserves_rest(with_predicate: bool) -> (u64, Vec<(i64, String)>) {
         use datafusion::logical_expr::{col, lit};
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        buffer.insert("p", "t", create_multi_row_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]), ts).unwrap();
-
-        // Source matches 2 and 4; predicate keeps only id=2.
-        let pred = col("id").eq(lit(2i64));
-        let n = buffer.update_with_source("p", "t", Some(&pred), &[("name".to_string(), col("new_name"))], &id_source(), None).unwrap();
-        assert_eq!(n, 1, "only the source-matched row passing the predicate updates");
-
-        let rows = collect_id_name(&buffer);
-        assert_eq!(rows.len(), 5, "no rows lost");
-        assert_eq!(rows.get(&2).map(String::as_str), Some("B"), "matched + predicate-true → updated");
-        assert_eq!(rows.get(&4).map(String::as_str), Some("d"), "matched but predicate-false → preserved unchanged");
-        assert_eq!(rows.get(&1).map(String::as_str), Some("a"));
+        let buffer = dml_buffer("p", "t", vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]);
+        let pred = with_predicate.then(|| col("id").eq(lit(2i64)));
+        let n = buffer.update_with_source("p", "t", pred.as_ref(), &[("name".to_string(), col("new_name"))], &id_source(), None).unwrap();
+        (n, collect_id_name(&buffer, "p", "t"))
     }
 
     /// WAL-replay regression (2026-07-05 quarantine flood): the DML unparser
@@ -4256,9 +4119,7 @@ mod tests {
     /// normalized bare/`source__` form (what the fixed serializer stores) applies.
     #[test]
     fn update_with_source_by_sql_replay_requires_normalized_columns() {
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        buffer.insert("p", "t", create_multi_row_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]), ts).unwrap();
+        let buffer = dml_buffer("p", "t", vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]);
         let src = id_source(); // id (Int64) join key, new_name (Utf8View); matches 2 & 4
         let assigns = [("name".to_string(), "source__new_name".to_string())];
         let keys = [("id".to_string(), "id".to_string())];
@@ -4270,9 +4131,7 @@ mod tests {
         // Bare predicate (the normalized stored form) parses and applies.
         let n = buffer.update_with_source_by_sql("p", "t", Some("id > 0"), &assigns, &keys, src.batch, None, None).unwrap();
         assert_eq!(n, 2);
-        let rows = collect_id_name(&buffer);
-        assert_eq!(rows.get(&2).map(String::as_str), Some("B"));
-        assert_eq!(rows.get(&4).map(String::as_str), Some("D"));
+        assert_eq!(collect_id_name(&buffer, "p", "t"), rows(&[(1, "a"), (2, "B"), (3, "c"), (4, "D"), (5, "e")]));
     }
 
     /// End-to-end reprocessing of the EXACT prod quarantine shape: a buffer row
@@ -4392,19 +4251,26 @@ mod tests {
     }
 
     fn test_table_df_schema() -> DFSchema {
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        let batch = create_multi_row_batch(vec![1], vec!["a"]);
-        buffer.insert("p", "t", batch, ts).unwrap();
-        buffer.df_schema_for("p", "t").unwrap()
+        dml_buffer("p", "t", vec![1], vec!["a"]).df_schema_for("p", "t").unwrap()
     }
 
-    // Regression: WAL replay used to fail "No functions registered" on any UDF.
-    #[test]
-    fn parse_sql_predicate_without_registry_rejects_udf() {
+    /// Regression: WAL replay used to fail "No functions registered" on any UDF.
+    /// Returns whether the predicate parsed; the no-registry case additionally
+    /// pins the exact error text replay used to quarantine on.
+    #[test_case("coalesce(name, '') = 'x'", false => false ; "without a registry a UDF is rejected with 'No functions registered'")]
+    #[test_case("coalesce(name, '') = 'x'", true => true ; "coalesce resolves with a registry")]
+    #[test_case("to_char(timestamp, 'YYYY') = '2024'", true => true ; "to_char resolves with a registry")]
+    fn parse_sql_predicate_resolves_udfs_only_with_a_registry(sql: &str, with_registry: bool) -> bool {
         let schema = test_table_df_schema();
-        let err = super::parse_sql_predicate("coalesce(name, '') = 'x'", &schema, None).unwrap_err();
-        assert!(err.to_string().contains("No functions registered"), "expected 'No functions registered' error, got: {err}");
+        let owned = crate::read::functions::function_registry().unwrap();
+        let registry = with_registry.then(|| owned.as_ref());
+        match super::parse_sql_predicate(sql, &schema, registry) {
+            Ok(_) => true,
+            Err(err) => {
+                assert!(err.to_string().contains("No functions registered"), "expected 'No functions registered' error, got: {err}");
+                false
+            }
+        }
     }
 
     /// The 4273 prod quarantines are ONE shape: the monoscope `hashes`
@@ -4441,23 +4307,11 @@ mod tests {
             .expect("normalized hashes-update assignment must parse");
     }
 
-    #[test]
-    fn parse_sql_predicate_with_registry_handles_udf() {
-        let schema = test_table_df_schema();
-        let reg = crate::read::functions::function_registry().unwrap();
-        super::parse_sql_predicate("coalesce(name, '') = 'x'", &schema, Some(reg.as_ref())).expect("coalesce should resolve");
-        super::parse_sql_predicate("to_char(timestamp, 'YYYY') = '2024'", &schema, Some(reg.as_ref())).expect("to_char should resolve");
-    }
-
     // upper() — a UDF that survives logical->physical lowering (unlike coalesce
     // which the optimizer rewrites to CASE).
     #[test]
     fn update_by_sql_with_udf_replays_when_registry_present() {
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
-        buffer.insert("project1", "table1", batch, ts).unwrap();
-
+        let buffer = dml_buffer("project1", "table1", vec![1, 2, 3], vec!["a", "b", "c"]);
         let reg = crate::read::functions::function_registry().unwrap();
         let updated = buffer
             .update_by_sql("project1", "table1", Some("upper(name) = 'B'"), &[("name".into(), "'updated'".into())], Some(reg.as_ref()), None)
@@ -4484,14 +4338,25 @@ mod tests {
     }
 
     /// A window is half-open: the last microsecond before a boundary belongs to
-    /// the previous bucket, and the boundary itself opens the next one — so two
-    /// rows one microsecond apart across it must land in two separate buckets.
+    /// the previous bucket, and the boundary itself opens the next one. Negative
+    /// (pre-1970) timestamps ride the same rule even though integer division
+    /// truncates toward zero: -1 / N = 0, -N / N = -1.
+    #[test_case(0 => 0)]
+    #[test_case(BUCKET_DURATION_MICROS - 1 => 0 ; "last microsecond of the first window")]
+    #[test_case(BUCKET_DURATION_MICROS => 1 ; "the boundary instant opens the next window")]
+    #[test_case(BUCKET_DURATION_MICROS * 2 => 2)]
+    #[test_case(-1 => 0 ; "just before epoch -> bucket 0")]
+    #[test_case(-BUCKET_DURATION_MICROS => -1)]
+    #[test_case(-BUCKET_DURATION_MICROS - 1 => -1)]
+    #[test_case(-BUCKET_DURATION_MICROS * 2 => -2 ; "20 minutes before epoch should be bucket -2")]
+    fn compute_bucket_id_is_half_open(ts: i64) -> i64 {
+        MemBuffer::compute_bucket_id(ts)
+    }
+
+    /// Two rows one microsecond apart across a boundary must land in two
+    /// separate buckets.
     #[test]
     fn bucket_boundaries_are_half_open() {
-        for (ts, want) in [(0, 0), (BUCKET_DURATION_MICROS - 1, 0), (BUCKET_DURATION_MICROS, 1), (BUCKET_DURATION_MICROS * 2, 2)] {
-            assert_eq!(MemBuffer::compute_bucket_id(ts), want, "ts {ts}");
-        }
-
         let buffer = MemBuffer::new();
         buffer.insert("project1", "table1", create_test_batch(BUCKET_DURATION_MICROS), BUCKET_DURATION_MICROS).unwrap();
         assert_eq!(buffer.get_stats().total_buckets, 1, "the boundary instant alone opens exactly one bucket");
@@ -4555,52 +4420,11 @@ mod tests {
     }
 
     #[test]
-    fn test_flushable_buckets_carry_all_batches() {
-        // Flush-time pre-compaction is gone (the parquet writer downstream
-        // regroups rows into row groups itself, and pre-compacting forced an
-        // unnecessary deep copy of the entire bucket).
-        //
-        // Insert-time coalesce still applies: when `batches.len()` crosses
-        // `MAX_BATCH_COUNT_PER_BUCKET` we concat under the bucket lock to
-        // amortise per-batch RecordBatch overhead. So after N tiny inserts
-        // the flushable bucket may carry fewer than N RecordBatches —
-        // the invariant the flush path actually cares about is "every row
-        // makes it through", not "one RecordBatch per insert".
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
-
-        let total_rows = 10;
-        for i in 0..total_rows {
-            let batch = create_multi_row_batch(vec![i as i64], vec!["test"]);
-            buffer.insert("project1", "table1", batch, ts).unwrap();
-        }
-
-        let cutoff = MemBuffer::compute_bucket_id(ts) + 1;
-        let flushable: Vec<_> = buffer.bucket_keys(|id| id < cutoff).into_iter().filter_map(|(p, t, id)| buffer.take_bucket_for_flush(&p, &t, id)).collect();
-        assert_eq!(flushable.len(), 1, "all inserts share one time bucket");
-        assert_eq!(flushable[0].row_count, total_rows);
-        let summed: usize = flushable[0].batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(summed, total_rows, "no rows lost to insert-time coalesce");
-        // Coalesce keeps the in-bucket batch count bounded by MAX_BATCH_COUNT_PER_BUCKET + 1
-        // (concat fires when len > MAX_BATCH_COUNT_PER_BUCKET, then the next push reaches
-        // the cap again before the next concat).
-        assert!(
-            flushable[0].batches.len() <= MAX_BATCH_COUNT_PER_BUCKET + 1,
-            "got {} batches, expected ≤ {}",
-            flushable[0].batches.len(),
-            MAX_BATCH_COUNT_PER_BUCKET + 1
-        );
-    }
-
-    #[test]
     fn test_point_lookup_fast_path_filters_inline() {
         use datafusion::logical_expr::{col, lit};
 
-        let buffer = MemBuffer::new();
-        let ts = chrono::Utc::now().timestamp_micros();
         // 10 rows in a single bucket — point lookup should return only the matching one.
-        let batch = create_multi_row_batch(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10], vec!["a"; 10]);
-        buffer.insert("project1", "table1", batch, ts).unwrap();
+        let buffer = dml_buffer("project1", "table1", (1..=10).collect(), vec!["a"; 10]);
 
         // Non-point query: returns the whole bucket (downstream FilterExec narrows it).
         let no_id_filter = buffer.query("project1", "table1", &[]).unwrap();
@@ -4622,22 +4446,13 @@ mod tests {
 
     #[test]
     fn test_negative_bucket_ids_pre_1970() {
-        // Integer division truncates toward zero: -1 / N = 0, -N / N = -1
-        assert_eq!(MemBuffer::compute_bucket_id(-1), 0); // Just before epoch -> bucket 0
-        assert_eq!(MemBuffer::compute_bucket_id(-BUCKET_DURATION_MICROS), -1);
-        assert_eq!(MemBuffer::compute_bucket_id(-BUCKET_DURATION_MICROS - 1), -1);
-        assert_eq!(MemBuffer::compute_bucket_id(-BUCKET_DURATION_MICROS * 2), -2);
-
         let buffer = MemBuffer::new();
         let pre_1970_ts = -BUCKET_DURATION_MICROS * 2; // 20 minutes before epoch
 
         buffer.insert("project1", "table1", create_test_batch(pre_1970_ts), pre_1970_ts).unwrap();
 
         let results = buffer.query("project1", "table1", &[]).unwrap();
-        assert_eq!(results.len(), 1);
-
-        let bucket_id = MemBuffer::compute_bucket_id(pre_1970_ts);
-        assert_eq!(bucket_id, -2, "20 minutes before epoch should be bucket -2");
+        assert_eq!(results.len(), 1, "a pre-epoch bucket is still queryable");
     }
 
     /// Repro for the prod fragmentation incident (docs/membuffer_flush_fix_plan.md):
@@ -4645,13 +4460,27 @@ mod tests {
     /// became one RecordBatch in the bucket → 1000 inserts = 1000 batches,
     /// 30 rows/batch, scan-time bound. With amortized coalesce, the bucket
     /// is bounded at MAX_BATCH_COUNT_PER_BUCKET — when a push crosses
-    /// the threshold the next insert folds the lot into one.
-    #[test]
-    fn insert_coalesces_small_batches_into_bucket_tail() {
+    /// the threshold the next insert folds the lot into one. (Concat fires when
+    /// len > MAX_BATCH_COUNT_PER_BUCKET, then the next push reaches the cap
+    /// again before the next concat, hence the `+ 1`.)
+    ///
+    /// The same bound must survive the flush path. Flush-time pre-compaction is
+    /// gone (the parquet writer downstream regroups rows into row groups itself,
+    /// and pre-compacting forced an unnecessary deep copy of the entire bucket),
+    /// so after N tiny inserts the flushable bucket may carry fewer than N
+    /// RecordBatches — the invariant the flush path actually cares about is
+    /// "every row makes it through", not "one RecordBatch per insert".
+    ///
+    /// The batch-count bound is the load-bearing assertion for coalesce. A
+    /// separate avg-rows-per-batch check is redundant (avg = total_rows /
+    /// n_batches by definition) and would be schema-sensitive — bigger column
+    /// types ⇒ larger per-batch memory for the same row count without changing
+    /// the count.
+    #[test_case(10, 1 ; "ten one-row inserts share a single bucket")]
+    #[test_case(1000, 30 ; "prod fragmentation incident: 1000 OTLP INSERTs of ~30 rows")]
+    fn insert_coalesces_small_batches_into_bucket_tail(inserts: usize, row_count_per_insert: usize) {
         let buffer = MemBuffer::new();
         let ts = 1_000_000_000_000i64;
-        let row_count_per_insert = 30;
-        let inserts = 1000;
         let total_rows = row_count_per_insert * inserts;
 
         for i in 0..inserts {
@@ -4661,23 +4490,27 @@ mod tests {
 
         let bucket_id = MemBuffer::compute_bucket_id(ts);
         let table = buffer.get_table("p1", "t1").unwrap();
-        let bucket = table.buckets.get(&bucket_id).expect("bucket exists");
-
-        let snapshot: Vec<RecordBatch> = bucket.batches.lock().to_vec();
+        let snapshot: Vec<RecordBatch> = table.buckets.get(&bucket_id).expect("bucket exists").batches.lock().to_vec();
         let n_batches = snapshot.len();
-        let total_in_bucket: usize = snapshot.iter().map(|b| b.num_rows()).sum();
 
-        assert_eq!(total_in_bucket, total_rows, "row preservation");
+        assert_eq!(snapshot.iter().map(|b| b.num_rows()).sum::<usize>(), total_rows, "row preservation");
         assert!(
             n_batches <= MAX_BATCH_COUNT_PER_BUCKET + 1,
             "bucket should hold ≤{} batches after amortized coalesce, got {n_batches}",
             MAX_BATCH_COUNT_PER_BUCKET + 1
         );
-        // The bound on n_batches above is the load-bearing assertion for
-        // coalesce. A separate avg-rows-per-batch check is redundant
-        // (avg = total_rows / n_batches by definition) and would be
-        // schema-sensitive — bigger column types ⇒ larger per-batch
-        // memory for the same row count without changing the count.
+
+        let flushable: Vec<_> =
+            buffer.bucket_keys(|id| id < bucket_id + 1).into_iter().filter_map(|(p, t, id)| buffer.take_bucket_for_flush(&p, &t, id)).collect();
+        assert_eq!(flushable.len(), 1, "all inserts share one time bucket");
+        assert_eq!(flushable[0].row_count, total_rows);
+        assert_eq!(flushable[0].batches.iter().map(|b| b.num_rows()).sum::<usize>(), total_rows, "no rows lost to insert-time coalesce");
+        assert!(
+            flushable[0].batches.len() <= MAX_BATCH_COUNT_PER_BUCKET + 1,
+            "got {} batches, expected ≤ {}",
+            flushable[0].batches.len(),
+            MAX_BATCH_COUNT_PER_BUCKET + 1
+        );
     }
 
     fn make_batch_with_rows(start_ts: i64, n: usize) -> RecordBatch {

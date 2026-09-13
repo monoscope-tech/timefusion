@@ -904,10 +904,8 @@ impl Greatest {
                 continue;
             }
             let bi = self.batches.len() as u32;
-            let mut next = 0u32;
-            for (row, _) in mask.iter().enumerate().filter(|(_, k)| **k) {
-                rows[row] = (bi, next);
-                next += 1;
+            for (next, (row, _)) in mask.iter().enumerate().filter(|(_, k)| **k).enumerate() {
+                rows[row] = (bi, next as u32);
             }
             // `compact_batch` after the filter, not just the filter: Arrow's
             // filter over a view array produces new views over the ORIGINAL
@@ -1569,17 +1567,51 @@ mod tests {
         out
     }
 
-    /// The version-append contract: the greatest-tiebreak copy of a key wins,
-    /// even when the newer version arrives in a later batch, and even when the
-    /// key's versions straddle batches within one `ts` run. Counts stay right.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn keep_greatest_picks_highest_tiebreak_across_batches() {
-        let plan = greatest_plan(vec![
-            vbatch(&["a", "b"], &[10, 10], &[Some(1), Some(5)]),
-            vbatch(&["a", "b"], &[10, 10], &[Some(7), Some(2)]), // a upgraded, b's older loses
-            vbatch(&["a"], &[10], &[Some(3)]),
-        ]);
-        assert_eq!(collect_rows(&plan).await, vec![("b".into(), 10, Some(5)), ("a".into(), 10, Some(7))]);
+    /// Run a `DedupExec` over `spec` and return the rows in EMISSION order.
+    /// `ordered` declares the `ts` ordering on the source (bounded runs);
+    /// `tiebreak` supplies the `tb` version stamp.
+    fn dedup_rows(ordered: bool, tiebreak: bool, spec: &[BatchSpec<'_>]) -> Vec<(String, i64, Option<i64>)> {
+        let batches: Vec<RecordBatch> = spec.iter().map(|(ids, ts, tb)| vbatch(ids, ts, tb)).collect();
+        let src = source(&[batches], ordered.then(|| col_asc("ts", 1)));
+        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], tiebreak.then(|| "tb".to_string()), None).unwrap();
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(collect_rows(&plan))
+    }
+
+    /// THE survivor rules of `DedupExec`, one case per arrival shape. Rows are
+    /// asserted in emission order: survivors come out at their own input
+    /// positions, i.e. a subsequence of the input, so any declared ordering —
+    /// not just the bound column — still holds.
+    //
+    // The version-append contract: the greatest-tiebreak copy of a key wins,
+    // even when the newer version arrives in a later batch (`a` upgraded to 7,
+    // `b`'s older copy loses), and even when the key's versions straddle
+    // batches within one `ts` run. Counts stay right.
+    #[test_case::test_case(true, true, &[(&["a", "b"], &[10, 10], &[Some(1), Some(5)]), (&["a", "b"], &[10, 10], &[Some(7), Some(2)]), (&["a"], &[10], &[Some(3)])] => vec![("b".to_string(), 10, Some(5)), ("a".to_string(), 10, Some(7))] ; "keep_greatest picks the highest tiebreak across batches")]
+    // Runs are the unit of emission: keys of a closed run are emitted when the
+    // bound advances, and a key re-seen at a *new* ts is a different row (a@11
+    // wins at row 0 of batch 2, b@11 at row 1).
+    #[test_case::test_case(true, true, &[(&["a", "a", "b"], &[10, 10, 11], &[Some(1), Some(9), Some(1)]), (&["a", "b"], &[11, 11], &[Some(4), Some(8)]), (&["a"], &[12], &[Some(0)])] => vec![("a".to_string(), 10, Some(9)), ("a".to_string(), 11, Some(4)), ("b".to_string(), 11, Some(8)), ("a".to_string(), 12, Some(0))] ; "keep_greatest across a run boundary")]
+    // NULL tiebreak sorts lowest: a pre-existing (unstamped) row always loses
+    // to any stamped version, in either arrival order.
+    #[test_case::test_case(true, true, &[(&["a", "a", "b", "b"], &[1, 1, 2, 2], &[None, Some(1), Some(1), None])] => vec![("a".to_string(), 1, Some(1)), ("b".to_string(), 2, Some(1))] ; "keep_greatest null tiebreak loses in either order")]
+    // All-NULL keeps exactly ONE row (no spurious duplicate). The two inputs are
+    // byte-identical, so naming the surviving row asserts only the row count —
+    // do not generalize this into a which-row-survives claim.
+    #[test_case::test_case(true, true, &[(&["a", "a"], &[1, 1], &[None, None])] => vec![("a".to_string(), 1, None)] ; "keep_greatest all-NULL stamps keep exactly one row")]
+    // No `dedup_tiebreak` ⇒ byte-for-byte the old behaviour: keep-FIRST, even
+    // though a later copy would have won under keep-greatest.
+    #[test_case::test_case(true, false, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(1))] ; "no tiebreak stays keep-first")]
+    // Unordered input has no run boundary, so keep-greatest buffers to
+    // end-of-stream rather than degrading to keep-first. It used to degrade,
+    // which under merge-on-read served the PRE-UPDATE row; the alternative the
+    // planner then took — forcing an ordering — inserted a blocking SortExec
+    // that exhausted the query pool on prod (2026-08-02). Buffering here is
+    // strictly cheaper than that sort, and unlike keep-first it is correct.
+    #[test_case::test_case(false, true, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(9))] ; "unordered input keeps the newest version")]
+    // A table WITHOUT a tiebreak still keeps first: nothing ranks its versions.
+    #[test_case::test_case(false, false, &[(&["a", "a"], &[1, 1], &[Some(1), Some(9)])] => vec![("a".to_string(), 1, Some(1))] ; "unordered input without a tiebreak keeps first")]
+    fn dedup_survivor_rules(ordered: bool, tiebreak: bool, spec: &[BatchSpec<'_>]) -> Vec<(String, i64, Option<i64>)> {
+        dedup_rows(ordered, tiebreak, spec)
     }
 
     /// A production OTel batch contains many distinct timestamps. Bounded
@@ -1600,63 +1632,6 @@ mod tests {
         }
         assert_eq!(batches.len(), 1, "one input batch must not fragment into one output batch per timestamp");
         assert_eq!(batches[0].num_rows(), 4096);
-    }
-
-    /// Runs are the unit of emission: keys of a closed run are emitted when the
-    /// bound advances, and a key re-seen at a *new* ts is a different row.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn keep_greatest_across_run_boundary() {
-        let plan = greatest_plan(vec![
-            vbatch(&["a", "a", "b"], &[10, 10, 11], &[Some(1), Some(9), Some(1)]),
-            vbatch(&["a", "b"], &[11, 11], &[Some(4), Some(8)]),
-            vbatch(&["a"], &[12], &[Some(0)]),
-        ]);
-        // Survivors are emitted at their own input positions (a@11 wins at row 0
-        // of batch 2, b@11 at row 1), i.e. a subsequence of the input — so any
-        // declared ordering, not just the bound column, still holds.
-        assert_eq!(
-            collect_rows(&plan).await,
-            vec![("a".into(), 10, Some(9)), ("a".into(), 11, Some(4)), ("b".into(), 11, Some(8)), ("a".into(), 12, Some(0)),]
-        );
-    }
-
-    /// NULL tiebreak sorts lowest: a pre-existing (unstamped) row always loses
-    /// to any stamped version, in either arrival order.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn keep_greatest_null_tiebreak_loses() {
-        let plan = greatest_plan(vec![vbatch(&["a", "a", "b", "b"], &[1, 1, 2, 2], &[None, Some(1), Some(1), None])]);
-        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1)), ("b".into(), 2, Some(1))]);
-        // All-NULL keeps exactly one row (no spurious duplicate).
-        let plan = greatest_plan(vec![vbatch(&["a", "a"], &[1, 1], &[None, None])]);
-        assert_eq!(collect_rows(&plan).await.len(), 1);
-    }
-
-    /// No `dedup_tiebreak` ⇒ byte-for-byte the old behaviour: keep-FIRST, even
-    /// though a later copy would have won under keep-greatest.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn no_tiebreak_stays_keep_first() {
-        let src = source(&[vec![vbatch(&["a", "a"], &[1, 1], &[Some(1), Some(9)])]], Some(col_asc("ts", 1)));
-        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], None, None).unwrap();
-        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1))]);
-    }
-
-    /// Unordered input has no run boundary, so keep-greatest buffers to
-    /// end-of-stream rather than degrading to keep-first. It used to degrade,
-    /// which under merge-on-read served the PRE-UPDATE row; the alternative the
-    /// planner then took — forcing an ordering — inserted a blocking SortExec
-    /// that exhausted the query pool on prod (2026-08-02). Buffering here is
-    /// strictly cheaper than that sort, and unlike keep-first it is correct.
-    ///
-    /// A table WITHOUT a tiebreak still keeps first: nothing ranks its versions.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn unordered_input_keeps_greatest_and_without_a_tiebreak_keeps_first() {
-        let src = source(&[vec![vbatch(&["a", "a"], &[1, 1], &[Some(1), Some(9)])]], None);
-        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], Some("tb".into()), None).unwrap();
-        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(9))], "the newest version must win even with no ordering");
-
-        let src = source(&[vec![vbatch(&["a", "a"], &[1, 1], &[Some(1), Some(9)])]], None);
-        let plan = DedupExec::with_tiebreak(src, vec!["ts".into(), "id".into()], None, None).unwrap();
-        assert_eq!(collect_rows(&plan).await, vec![("a".into(), 1, Some(1))], "no tiebreak ⇒ keep-first, unchanged");
     }
 
     /// `output_projection` still restores the requested columns.
@@ -1991,31 +1966,30 @@ mod ordering_probe_tests {
         }
     }
 
-    /// The probe must name the leg that lied, and leave the innocent legs at
+    /// The probe must name the leg that lied and leave the innocent legs at
     /// zero — a diagnostic that blames everyone is no better than the global
-    /// counter it is meant to disambiguate.
+    /// counter it is meant to disambiguate — and a leg that honours its claim
+    /// must be silent, or the counter is noise.
+    ///
+    /// Returns the (delta, mem) violation counts this drain added.
+    // Ascending rows behind a DESC claim: every step after the first is a violation.
+    #[test_case::test_case(vec![1, 2, 3, 4], LegKind::Delta => with |(delta, mem): (u64, u64)| {
+        assert!(delta >= 3, "the lying delta leg must be attributed, got {delta}");
+        assert_eq!(mem, 0, "an innocent leg must not be blamed");
+    } ; "the_probe_names_the_leg_whose_declared_order_is_false")]
+    #[test_case::test_case(vec![9, 8, 7, 6], LegKind::Mem => with |(_, mem): (u64, u64)| {
+        assert_eq!(mem, 0, "descending rows honour a DESC claim — nothing to report");
+    } ; "an_honest_leg_reports_nothing")]
     #[tokio::test]
-    async fn the_probe_names_the_leg_whose_declared_order_is_false() {
+    async fn the_probe_attributes_ordering_violations_per_leg(values: Vec<i64>, leg: LegKind) -> (u64, u64) {
         let before = ordering_violations_by_leg();
-        // Ascending rows behind a DESC claim: every step after the first is a violation.
-        drain(Arc::new(OrderingProbeExec::new(lying_desc_leg(vec![1, 2, 3, 4]), LegKind::Delta))).await;
+        drain(Arc::new(OrderingProbeExec::new(lying_desc_leg(values), leg))).await;
         let after = ordering_violations_by_leg();
         let delta = |k: &str| {
             let g = |v: &[(&'static str, u64); 2]| v.iter().find(|(n, _)| *n == k).unwrap().1;
             g(&after) - g(&before)
         };
-        assert!(delta("delta") >= 3, "the lying delta leg must be attributed, got {}", delta("delta"));
-        assert_eq!(delta("mem"), 0, "an innocent leg must not be blamed");
-    }
-
-    /// A leg that honours its claim must be silent, or the counter is noise.
-    #[tokio::test]
-    async fn an_honest_leg_reports_nothing() {
-        let before = ordering_violations_by_leg();
-        drain(Arc::new(OrderingProbeExec::new(lying_desc_leg(vec![9, 8, 7, 6]), LegKind::Mem))).await;
-        let after = ordering_violations_by_leg();
-        let g = |v: &[(&'static str, u64); 2]| v.iter().find(|(n, _)| *n == "mem").unwrap().1;
-        assert_eq!(g(&after) - g(&before), 0, "descending rows honour a DESC claim — nothing to report");
+        (delta("delta"), delta("mem"))
     }
 
     /// `LegKind::sortable()` is what replaced the parallel `leg_sortable` mask.
@@ -2903,7 +2877,7 @@ impl LogicalCountIndex {
             let id_offset = u32::try_from(packed.ids.len()).context("logical-count ID arena exceeds 4GiB")?;
             let id_len = u16::try_from(id.len()).context("logical-count ID exceeds 65535 bytes")?;
             packed.ids.extend_from_slice(id);
-            let flags = u8::from(winner.tiebreak.is_some()) * FLAG_TIEBREAK_PRESENT | u8::from(winner.deleted) * FLAG_DELETED;
+            let flags = (u8::from(winner.tiebreak.is_some()) * FLAG_TIEBREAK_PRESENT) | (u8::from(winner.deleted) * FLAG_DELETED);
             if !winner.deleted {
                 packed.live_timestamps.push(timestamp);
             }
@@ -3215,6 +3189,14 @@ mod logical_count_index_tests {
         paths.iter().map(|path| ((*path).to_owned(), None)).collect()
     }
 
+    fn part(project_id: &str, date: &str) -> CountPartition {
+        CountPartition { project_id: project_id.into(), table_name: "otel".into(), date: date.into() }
+    }
+
+    fn cols() -> LogicalCountColumns<'static> {
+        LogicalCountColumns { timestamp: "timestamp", keys: &["id"], tiebreak: "updated_at", deleted: "deleted" }
+    }
+
     fn versions(rows: &[(i64, &str, Option<i64>, Option<bool>)]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
@@ -3318,7 +3300,7 @@ mod logical_count_index_tests {
 
     #[test]
     fn narrow_batches_build_and_overlay_unflushed_versions_exactly() {
-        let columns = LogicalCountColumns { timestamp: "timestamp", keys: &["id"], tiebreak: "updated_at", deleted: "deleted" };
+        let columns = cols();
         let mut index = LogicalCountIndex::new();
         index.apply_batch(&versions(&[(10, "a", Some(1), Some(false)), (20, "b", Some(1), None), (30, "gone", Some(2), Some(true))]), columns).unwrap();
         assert_eq!(index.count(0, 100), 2);
@@ -3339,7 +3321,7 @@ mod logical_count_index_tests {
 
     #[test]
     fn covered_overlay_replaces_delta_rows_like_the_union_scan() {
-        let columns = LogicalCountColumns { timestamp: "timestamp", keys: &["id"], tiebreak: "updated_at", deleted: "deleted" };
+        let columns = cols();
         let mut index = LogicalCountIndex::new();
         index.apply(10, "old", Some(1), false);
         index.apply(20, "newer-delta", Some(5), false);
@@ -3388,7 +3370,7 @@ mod logical_count_index_tests {
     #[test]
     fn cache_lazily_loads_only_matching_partition_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
-        let key = CountPartition { project_id: "p/unsafe".into(), table_name: "otel".into(), date: "2026-08-04".into() };
+        let key = part("p/unsafe", "2026-08-04");
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), usize::MAX);
         let mut index = LogicalCountIndex::new();
         index.apply(42, "id", Some(1), false);
@@ -3442,7 +3424,7 @@ mod logical_count_index_tests {
         };
         for (before, after) in [(None, dv(1)), (dv(1), dv(2)), (dv(1), None)] {
             let dir = tempfile::tempdir().unwrap();
-            let key = CountPartition { project_id: "p".into(), table_name: "otel".into(), date: "2026-08-14".into() };
+            let key = part("p", "2026-08-14");
             let cache = LogicalCountCache::new(dir.path().to_owned(), usize::MAX);
             let files = [("same.parquet".into(), before)].into_iter().collect();
             cache.install(key.clone(), 1, files, LogicalCountIndex::new()).unwrap();
@@ -3456,15 +3438,13 @@ mod logical_count_index_tests {
     #[test]
     fn cache_paths_cannot_alias_distinct_partition_names() {
         let cache = LogicalCountCache::new(PathBuf::from("unused"), usize::MAX);
-        let slash = CountPartition { project_id: "a/b".into(), table_name: "otel".into(), date: "2026-08-04".into() };
-        let underscore = CountPartition { project_id: "a_b".into(), table_name: "otel".into(), date: "2026-08-04".into() };
-        assert_ne!(cache.path(&slash), cache.path(&underscore));
+        assert_ne!(cache.path(&part("a/b", "2026-08-04")), cache.path(&part("a_b", "2026-08-04")));
     }
 
     #[test]
     fn resident_cache_evicts_the_least_recent_partition_within_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let key = |project: &str| CountPartition { project_id: project.into(), table_name: "otel".into(), date: "2026-08-04".into() };
+        let key = |project: &str| part(project, "2026-08-04");
         let mut first = LogicalCountIndex::new();
         first.apply(1, "a", Some(1), false);
         first.finalize().unwrap();
@@ -3486,7 +3466,7 @@ mod logical_count_index_tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = LogicalCountCache::new(dir.path().to_path_buf(), usize::MAX);
         for day in 1..=DISK_PARTITIONS_PER_PROJECT + 3 {
-            let key = CountPartition { project_id: "p".into(), table_name: "otel".into(), date: format!("2026-08-{day:02}") };
+            let key = part("p", &format!("2026-08-{day:02}"));
             cache.install(key, u64::try_from(day).unwrap(), CountFiles::new(), LogicalCountIndex::new()).unwrap();
         }
         let project_dir = dir.path().join(LogicalCountCache::safe_component("otel")).join(LogicalCountCache::safe_component("p"));
@@ -3803,6 +3783,12 @@ mod hll_tests {
         hll
     }
 
+    fn merged(left: std::ops::Range<u64>, right: std::ops::Range<u64>) -> Hll {
+        let mut sketch = sketch_of(left);
+        sketch.merge(&sketch_of(right));
+        sketch
+    }
+
     /// The sparse mode is not an approximation, which is what makes this safe to
     /// put behind the low-cardinality dashboard tiles (distinct services, distinct
     /// hosts) where a 2% error would be visible as a wrong integer.
@@ -3813,35 +3799,22 @@ mod hll_tests {
         }
     }
 
-    #[test]
-    fn large_cardinalities_land_within_the_error_bound() {
-        // 1.04/sqrt(4096) = 1.6% standard error; allow 3 sigma so the test is not
-        // flaky against a hash-dependent but deterministic outcome.
-        for n in [5_000u64, 50_000, 1_000_000] {
-            let estimate = sketch_of(0..n).estimate() as f64;
-            let error = (estimate - n as f64).abs() / n as f64;
-            assert!(error < 0.05, "n={n}: estimated {estimate}, error {:.3}%", error * 100.0);
-        }
-    }
-
-    /// Union must be order-independent and must not double-count the overlap —
-    /// the property the whole rollup design rests on.
-    #[test]
-    fn merge_is_a_union_not_a_sum() {
-        let (mut left, right) = (sketch_of(0..30_000), sketch_of(20_000..50_000));
-        left.merge(&right);
-        let error = (left.estimate() as f64 - 50_000.0).abs() / 50_000.0;
-        assert!(error < 0.05, "overlapping union estimated {}, want ~50000", left.estimate());
-    }
-
-    #[test]
-    fn merge_crosses_the_sparse_dense_boundary_in_both_directions() {
-        let (small, large) = (sketch_of(0..10), sketch_of(0..20_000));
-        for (mut a, b) in [(small.clone(), large.clone()), (large.clone(), small.clone())] {
-            a.merge(&b);
-            let error = (a.estimate() as f64 - 20_000.0).abs() / 20_000.0;
-            assert!(error < 0.05, "estimated {} from a mixed-mode merge", a.estimate());
-        }
+    /// Dense estimates must land inside the error bound, and `merge` must be an
+    /// order-independent union that does not double-count the overlap — the
+    /// property the whole rollup design rests on.
+    ///
+    /// 1.04/sqrt(4096) = 1.6% standard error; the cases allow 3 sigma so they are
+    /// not flaky against a hash-dependent but deterministic outcome.
+    #[test_case::test_case(sketch_of(0..5_000), 5_000 ; "dense at 5k")]
+    #[test_case::test_case(sketch_of(0..50_000), 50_000 ; "dense at 50k")]
+    #[test_case::test_case(sketch_of(0..1_000_000), 1_000_000 ; "dense at 1M")]
+    #[test_case::test_case(merged(0..30_000, 20_000..50_000), 50_000 ; "union is not a sum: the overlap is not double-counted")]
+    #[test_case::test_case(merged(0..10, 0..20_000), 20_000 ; "sparse merged into dense")]
+    #[test_case::test_case(merged(0..20_000, 0..10), 20_000 ; "dense merged into sparse")]
+    fn estimates_land_within_the_error_bound(sketch: Hll, truth: u64) {
+        let estimate = sketch.estimate();
+        let error = (estimate as f64 - truth as f64).abs() / truth as f64;
+        assert!(error < 0.05, "truth={truth}: estimated {estimate}, error {:.3}%", error * 100.0);
     }
 
     /// Sketches are persisted and merged months later, so a round-trip through
@@ -3856,6 +3829,24 @@ mod hll_tests {
         assert!(Hll::from_bytes(&[TAG_SPARSE, 0, 0, 0]).is_err());
         assert!(Hll::from_bytes(&[9, 9]).is_err());
         assert_eq!(Hll::from_bytes(&[]).unwrap(), Hll::default());
+    }
+
+    proptest::proptest! {
+        /// The pinned sizes above cover the encoding boundaries; this covers the
+        /// payloads they cannot enumerate. 400 hashes a side is enough that a
+        /// union can cross `SPARSE_MAX` and densify inside `merge`.
+        #[test]
+        fn merge_is_commutative_and_bytes_round_trip(
+            left in proptest::collection::vec(proptest::prelude::any::<u64>(), 0..400),
+            right in proptest::collection::vec(proptest::prelude::any::<u64>(), 0..400),
+        ) {
+            let build = |hashes: &[u64]| hashes.iter().fold(Hll::default(), |mut hll, &h| { hll.insert_hash(h); hll });
+            let (mut a, mut b) = (build(&left), build(&right));
+            a.merge(&build(&right));
+            b.merge(&build(&left));
+            proptest::prop_assert_eq!(&a, &b);
+            proptest::prop_assert_eq!(Hll::from_bytes(&a.to_bytes()).unwrap(), a);
+        }
     }
 
     /// A dense sketch is bounded no matter how many rows it sees: that bound is

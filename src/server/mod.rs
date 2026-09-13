@@ -1287,6 +1287,12 @@ mod pgwire_handlers_tests {
     };
     use futures::StreamExt;
     use std::{sync::Arc, time::Duration};
+    use test_case::test_case;
+
+    /// The admin-command tables render the parsed command's fields into one
+    /// `|`-joined literal, so a single expected value pins every field; a
+    /// rejection flattens to `Err(())` (the message text is not contracted).
+    type Parsed = Result<Option<String>, ()>;
 
     #[tokio::test]
     async fn query_stream_observes_the_server_deadline() {
@@ -1357,23 +1363,13 @@ mod pgwire_handlers_tests {
     /// The deadline is enforced by dropping the in-flight future, and the DML
     /// path commits inside it — so a timed-out write is reported as failed while
     /// already partly durable. Reads only.
-    #[test]
-    fn the_statement_timeout_never_applies_to_a_write() {
-        assert!(super::statement_timeout_applies("SELECT count(*) FROM otel_logs_and_spans"));
-        assert!(super::statement_timeout_applies("SHOW server_version"));
-        assert!(!super::statement_timeout_applies("INSERT INTO otel_logs_and_spans VALUES (1)"));
-        assert!(!super::statement_timeout_applies("UPDATE otel_logs_and_spans SET name = 'x' WHERE id = '1'"));
-        assert!(!super::statement_timeout_applies("DELETE FROM otel_logs_and_spans WHERE id = '1'"));
-    }
-
-    #[test]
-    fn optimize_parses_table_and_date() {
-        let cmd = parse_optimize("OPTIMIZE otel_logs_and_spans WHERE date = '2026-06-19'").unwrap().unwrap();
-        assert_eq!(cmd.table, "otel_logs_and_spans");
-        assert_eq!(cmd.date, "2026-06-19".parse().unwrap());
-        // Case / spacing / quote / trailing-semicolon tolerance.
-        assert_eq!(parse_optimize("optimize t where DATE='2026-01-02';").unwrap().unwrap().date, "2026-01-02".parse().unwrap());
-        assert_eq!(parse_optimize("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  ").unwrap().unwrap().table, "t");
+    #[test_case("SELECT count(*) FROM otel_logs_and_spans" => true ; "read")]
+    #[test_case("SHOW server_version" => true ; "show")]
+    #[test_case("INSERT INTO otel_logs_and_spans VALUES (1)" => false ; "insert")]
+    #[test_case("UPDATE otel_logs_and_spans SET name = 'x' WHERE id = '1'" => false ; "update")]
+    #[test_case("DELETE FROM otel_logs_and_spans WHERE id = '1'" => false ; "delete")]
+    fn the_statement_timeout_never_applies_to_a_write(query: &str) -> bool {
+        super::statement_timeout_applies(query)
     }
 
     /// Mode D, pinned as a test: the statement deadline is COOPERATIVE. It is
@@ -1415,113 +1411,84 @@ mod pgwire_handlers_tests {
         assert_eq!(value, 42, "it completed, which is precisely the failure mode");
     }
 
-    #[test]
-    fn optimize_rejects_unbounded_and_malformed() {
-        // Bare OPTIMIZE (no date) is rejected — would compact all history in-process.
-        assert!(parse_optimize("OPTIMIZE otel_logs_and_spans").is_err());
-        assert!(parse_optimize("OPTIMIZE").is_err());
-        // project_id alone (no date bound), bad date, unknown column.
-        assert!(parse_optimize("OPTIMIZE t WHERE project_id = 'x'").is_err());
-        assert!(parse_optimize("OPTIMIZE t WHERE date = 'not-a-date'").is_err());
-        assert!(parse_optimize("OPTIMIZE t WHERE date = '2026-01-02' AND name = 'x'").is_err());
+    // Case / spacing / quote / trailing-semicolon tolerance on the accepted form;
+    // bare OPTIMIZE (no date) is rejected — it would compact all history in-process.
+    #[test_case("OPTIMIZE otel_logs_and_spans WHERE date = '2026-06-19'" => Ok(Some("otel_logs_and_spans|2026-06-19|None".to_string())) ; "table and date")]
+    #[test_case("optimize t where DATE='2026-01-02';" => Ok(Some("t|2026-01-02|None".to_string())) ; "lowercase, unspaced, trailing semicolon")]
+    #[test_case("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  " => Ok(Some("t|2026-01-02|None".to_string())) ; "loose spacing and double quotes")]
+    // Tenant-scoped compaction (2026-07-27: whole-date OPTIMIZE OOM'd twice
+    // in-process; one (project, date) partition is the safe unit).
+    #[test_case("OPTIMIZE t WHERE project_id = 'p-1' AND date = '2026-01-02'" => Ok(Some("t|2026-01-02|Some(\"p-1\")".to_string())) ; "project_id then date")]
+    #[test_case("optimize t where date='2026-01-02' and PROJECT_ID=\"p-1\"" => Ok(Some("t|2026-01-02|Some(\"p-1\")".to_string())) ; "date then project_id, mixed case")]
+    #[test_case("OPTIMIZE t WHERE date = '2026-01-02'" => Ok(Some("t|2026-01-02|None".to_string())) ; "date alone leaves project_id unset")]
+    #[test_case("OPTIMIZE otel_logs_and_spans" => Err(()) ; "bare OPTIMIZE on a table is unbounded")]
+    #[test_case("OPTIMIZE" => Err(()) ; "bare OPTIMIZE")]
+    #[test_case("OPTIMIZE t WHERE project_id = 'x'" => Err(()) ; "project_id alone is not a date bound")]
+    #[test_case("OPTIMIZE t WHERE date = 'not-a-date'" => Err(()) ; "bad date")]
+    #[test_case("OPTIMIZE t WHERE date = '2026-01-02' AND name = 'x'" => Err(()) ; "unknown column")]
+    #[test_case("SELECT 1" => Ok(None) ; "select falls through")]
+    #[test_case("INSERT INTO t VALUES (1)" => Ok(None) ; "insert falls through")]
+    // Don't false-match an identifier that merely starts with "optimize".
+    #[test_case("SELECT optimizer FROM t" => Ok(None) ; "optimizer column is not a match")]
+    #[test_case("optimizer_stats" => Ok(None) ; "optimizer_stats is not a match")]
+    fn optimize_parses_bounded_tenant_scoped_compaction_only(query: &str) -> Parsed {
+        parse_optimize(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{}|{:?}", c.table, c.date, c.project_id)))
     }
 
-    /// Tenant-scoped compaction (2026-07-27: whole-date OPTIMIZE OOM'd twice
-    /// in-process; one (project, date) partition is the safe unit).
-    #[test]
-    fn optimize_accepts_project_and_date_in_either_order() {
-        let cmd = parse_optimize("OPTIMIZE t WHERE project_id = 'p-1' AND date = '2026-01-02'").unwrap().unwrap();
-        assert_eq!(cmd.project_id.as_deref(), Some("p-1"));
-        assert_eq!(cmd.date, "2026-01-02".parse().unwrap());
-        let cmd = parse_optimize("optimize t where date='2026-01-02' and PROJECT_ID=\"p-1\"").unwrap().unwrap();
-        assert_eq!(cmd.project_id.as_deref(), Some("p-1"));
-        assert!(parse_optimize("OPTIMIZE t WHERE date = '2026-01-02'").unwrap().unwrap().project_id.is_none());
+    // RETAIN clause, case / plural / trailing-semicolon tolerance. Unlike
+    // OPTIMIZE, a bare VACUUM (no table) is rejected — name the table.
+    #[test_case("VACUUM otel_logs_and_spans" => Ok(Some("otel_logs_and_spans|None".to_string())) ; "table, default retention")]
+    #[test_case("vacuum t RETAIN 48 HOURS;" => Ok(Some("t|Some(48)".to_string())) ; "plural HOURS with trailing semicolon")]
+    #[test_case("  VACUUM  t  retain  1  hour  " => Ok(Some("t|Some(1)".to_string())) ; "singular hour, loose spacing")]
+    #[test_case("VACUUM" => Err(()) ; "bare VACUUM names no table")]
+    #[test_case("VACUUM t WHERE date = '2026-01-01'" => Err(()) ; "unknown trailing clause")]
+    #[test_case("VACUUM t RETAIN abc HOURS" => Err(()) ; "non-numeric retention")]
+    #[test_case("SELECT 1" => Ok(None) ; "select falls through")]
+    // Don't false-match an identifier that merely starts with "vacuum".
+    #[test_case("SELECT vacuumed FROM t" => Ok(None) ; "vacuumed column is not a match")]
+    #[test_case("vacuum_log" => Ok(None) ; "vacuum_log is not a match")]
+    fn vacuum_parses_table_and_optional_retention(query: &str) -> Parsed {
+        parse_vacuum(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{:?}", c.table, c.retention_hours)))
     }
 
-    #[test]
-    fn non_optimize_queries_fall_through() {
-        assert_eq!(parse_optimize("SELECT 1"), Ok(None));
-        assert_eq!(parse_optimize("INSERT INTO t VALUES (1)"), Ok(None));
-        // Don't false-match an identifier that merely starts with "optimize".
-        assert_eq!(parse_optimize("SELECT optimizer FROM t"), Ok(None));
-        assert_eq!(parse_optimize("optimizer_stats"), Ok(None));
+    // Both are argument-free on purpose: FLUSH drains the whole MemBuffer and
+    // HANDOFF leases the pre-deploy write fence. Anything with arguments, or a
+    // mere prefix match, falls through.
+    #[test_case(parse_flush, "FLUSH" => true ; "bare FLUSH")]
+    #[test_case(parse_flush, "  flush ; " => true ; "flush, padded and semicoloned")]
+    #[test_case(parse_flush, "FLUSH t" => false ; "FLUSH takes no argument")]
+    #[test_case(parse_flush, "SELECT flushed FROM t" => false ; "flushed column is not a match")]
+    #[test_case(parse_flush, "flush_log" => false ; "flush_log is not a match")]
+    #[test_case(parse_handoff, "HANDOFF" => true ; "bare HANDOFF")]
+    #[test_case(parse_handoff, "  handoff ; " => true ; "handoff, padded and semicoloned")]
+    #[test_case(parse_handoff, "HANDOFF now" => false ; "HANDOFF takes no argument")]
+    #[test_case(parse_handoff, "SELECT handoff FROM t" => false ; "handoff column is not a match")]
+    fn admin_verb_parses_bare_only(parse: fn(&str) -> bool, query: &str) -> bool {
+        parse(query)
     }
 
-    #[test]
-    fn vacuum_parses_table_and_optional_retention() {
-        let cmd = parse_vacuum("VACUUM otel_logs_and_spans").unwrap().unwrap();
-        assert_eq!(cmd.table, "otel_logs_and_spans");
-        assert_eq!(cmd.retention_hours, None);
-        // RETAIN clause, case / plural / trailing-semicolon tolerance.
-        assert_eq!(parse_vacuum("vacuum t RETAIN 48 HOURS;").unwrap().unwrap().retention_hours, Some(48));
-        assert_eq!(parse_vacuum("  VACUUM  t  retain  1  hour  ").unwrap().unwrap().retention_hours, Some(1));
+    #[test_case("DELTA HISTORY otel_logs_and_spans LIMIT 250;" => Ok(Some("otel_logs_and_spans|250".to_string())) ; "explicit limit")]
+    #[test_case("delta history t" => Ok(Some("t|100".to_string())) ; "default limit")]
+    #[test_case("DELTA HISTORY t LIMIT 0" => Err(()) ; "limit below the bound")]
+    #[test_case("DELTA HISTORY t LIMIT 10001" => Err(()) ; "limit above the bound")]
+    #[test_case("DELTA RESTORE t" => Err(()) ; "DELTA is read-only: RESTORE is rejected, not run")]
+    #[test_case("SELECT delta FROM t" => Ok(None) ; "delta column is not a match")]
+    fn delta_history_parses_bounded_read_only_command(query: &str) -> Parsed {
+        parse_delta_history(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{}", c.table, c.limit)))
     }
 
-    #[test]
-    fn vacuum_rejects_bare_and_malformed() {
-        // Bare VACUUM (no table) is rejected — must name the table.
-        assert!(parse_vacuum("VACUUM").is_err());
-        // Unknown trailing clause, non-numeric retention.
-        assert!(parse_vacuum("VACUUM t WHERE date = '2026-01-01'").is_err());
-        assert!(parse_vacuum("VACUUM t RETAIN abc HOURS").is_err());
-    }
-
-    #[test]
-    fn non_vacuum_queries_fall_through() {
-        assert_eq!(parse_vacuum("SELECT 1"), Ok(None));
-        // Don't false-match an identifier that merely starts with "vacuum".
-        assert_eq!(parse_vacuum("SELECT vacuumed FROM t"), Ok(None));
-        assert_eq!(parse_vacuum("vacuum_log"), Ok(None));
-    }
-
-    #[test]
-    fn flush_parses_bare_only() {
-        assert!(parse_flush("FLUSH"));
-        assert!(parse_flush("  flush ; "));
-        // Anything with arguments or a mere prefix match falls through.
-        assert!(!parse_flush("FLUSH t"));
-        assert!(!parse_flush("SELECT flushed FROM t"));
-        assert!(!parse_flush("flush_log"));
-    }
-
-    #[test]
-    fn handoff_parses_bare_only() {
-        assert!(parse_handoff("HANDOFF"));
-        assert!(parse_handoff("  handoff ; "));
-        assert!(!parse_handoff("HANDOFF now"));
-        assert!(!parse_handoff("SELECT handoff FROM t"));
-    }
-
-    #[test]
-    fn delta_history_parses_bounded_read_only_command() {
-        let cmd = parse_delta_history("DELTA HISTORY otel_logs_and_spans LIMIT 250;").unwrap().unwrap();
-        assert_eq!(cmd.table, "otel_logs_and_spans");
-        assert_eq!(cmd.limit, 250);
-        assert_eq!(parse_delta_history("delta history t").unwrap().unwrap().limit, 100);
-        assert!(parse_delta_history("DELTA HISTORY t LIMIT 0").is_err());
-        assert!(parse_delta_history("DELTA HISTORY t LIMIT 10001").is_err());
-        assert!(parse_delta_history("DELTA RESTORE t").is_err());
-        assert_eq!(parse_delta_history("SELECT delta FROM t"), Ok(None));
-    }
-
-    #[test]
-    fn delta_actions_requires_one_exact_version() {
-        let cmd = parse_delta_actions("DELTA ACTIONS otel_logs_and_spans VERSION 462919;").unwrap().unwrap();
-        assert_eq!(cmd.table, "otel_logs_and_spans");
-        assert_eq!(cmd.version, 462919);
-        assert!(parse_delta_actions("DELTA ACTIONS t").is_err());
-        assert!(parse_delta_actions("DELTA ACTIONS t VERSION nope").is_err());
-        assert_eq!(parse_delta_actions("SELECT 1"), Ok(None));
-    }
-
-    #[test]
-    fn delta_recovery_audit_is_explicit_and_version_bounded() {
-        let cmd = parse_delta_recovery_audit("DELTA RECOVERY AUDIT otel_logs_and_spans VERSION 462921;").unwrap().unwrap();
-        assert_eq!(cmd.table, "otel_logs_and_spans");
-        assert_eq!(cmd.version, 462921);
-        assert!(parse_delta_recovery_audit("DELTA RECOVERY otel_logs_and_spans VERSION 462921").is_err());
-        assert!(parse_delta_recovery_audit("DELTA RECOVERY AUDIT t VERSION nope").is_err());
-        assert_eq!(parse_delta_recovery_audit("SELECT 1"), Ok(None));
+    // `DELTA ACTIONS` and `DELTA RECOVERY AUDIT` share `<table> VERSION <n>`, so
+    // they share one table; `parse` selects the command under test.
+    #[test_case(parse_delta_actions, "DELTA ACTIONS otel_logs_and_spans VERSION 462919;" => Ok(Some("otel_logs_and_spans|462919".to_string())) ; "actions at one exact version")]
+    #[test_case(parse_delta_actions, "DELTA ACTIONS t" => Err(()) ; "actions without a version")]
+    #[test_case(parse_delta_actions, "DELTA ACTIONS t VERSION nope" => Err(()) ; "actions with a non-numeric version")]
+    #[test_case(parse_delta_actions, "SELECT 1" => Ok(None) ; "actions falls through on select")]
+    #[test_case(parse_delta_recovery_audit, "DELTA RECOVERY AUDIT otel_logs_and_spans VERSION 462921;" => Ok(Some("otel_logs_and_spans|462921".to_string())) ; "audit at one exact version")]
+    #[test_case(parse_delta_recovery_audit, "DELTA RECOVERY otel_logs_and_spans VERSION 462921" => Err(()) ; "DELTA RECOVERY must say AUDIT explicitly")]
+    #[test_case(parse_delta_recovery_audit, "DELTA RECOVERY AUDIT t VERSION nope" => Err(()) ; "audit with a non-numeric version")]
+    #[test_case(parse_delta_recovery_audit, "SELECT 1" => Ok(None) ; "audit falls through on select")]
+    fn delta_version_commands_require_one_exact_version(parse: fn(&str) -> Result<Option<super::DeltaVersionCmd>, String>, query: &str) -> Parsed {
+        parse(query).map_err(|_| ()).map(|cmd| cmd.map(|c| format!("{}|{}", c.table, c.version)))
     }
 
     #[test]
@@ -1544,24 +1511,20 @@ mod pgwire_handlers_tests {
         assert!(!first_template.contains("project-123"));
     }
 
-    #[test]
-    fn abort_rewrites_to_rollback() {
-        assert_eq!(rewrite_pg_synonyms("ABORT"), "ROLLBACK");
-        assert_eq!(rewrite_pg_synonyms("ABORT;"), "ROLLBACK;");
-        assert_eq!(rewrite_pg_synonyms("  abort  "), "ROLLBACK  ");
-        assert_eq!(rewrite_pg_synonyms("Abort Work"), "ROLLBACK Work");
-        assert_eq!(rewrite_pg_synonyms("ABORT TRANSACTION;"), "ROLLBACK TRANSACTION;");
-    }
-
-    #[test]
-    fn non_abort_queries_are_borrowed_unchanged() {
-        // Cow::Borrowed is the fast path; we just check the content is identical.
-        assert_eq!(rewrite_pg_synonyms("SELECT 1"), "SELECT 1");
-        assert_eq!(rewrite_pg_synonyms("BEGIN"), "BEGIN");
-        assert_eq!(rewrite_pg_synonyms("ROLLBACK"), "ROLLBACK");
-        // Don't false-match identifiers/columns that start with ABORT.
-        assert_eq!(rewrite_pg_synonyms("SELECT aborted FROM t"), "SELECT aborted FROM t");
-        assert_eq!(rewrite_pg_synonyms("ABORTED"), "ABORTED");
+    // Non-ABORT queries take the Cow::Borrowed fast path; we just check the
+    // content is identical. Don't false-match identifiers/columns starting with ABORT.
+    #[test_case("ABORT" => "ROLLBACK" ; "bare ABORT")]
+    #[test_case("ABORT;" => "ROLLBACK;" ; "ABORT with semicolon")]
+    #[test_case("  abort  " => "ROLLBACK  " ; "lowercase, padded")]
+    #[test_case("Abort Work" => "ROLLBACK Work" ; "ABORT WORK")]
+    #[test_case("ABORT TRANSACTION;" => "ROLLBACK TRANSACTION;" ; "ABORT TRANSACTION")]
+    #[test_case("SELECT 1" => "SELECT 1" ; "select unchanged")]
+    #[test_case("BEGIN" => "BEGIN" ; "begin unchanged")]
+    #[test_case("ROLLBACK" => "ROLLBACK" ; "rollback unchanged")]
+    #[test_case("SELECT aborted FROM t" => "SELECT aborted FROM t" ; "aborted column is not a match")]
+    #[test_case("ABORTED" => "ABORTED" ; "ABORTED is not a match")]
+    fn abort_rewrites_to_rollback_and_nothing_else_changes(query: &str) -> String {
+        rewrite_pg_synonyms(query).into_owned()
     }
 }
 
@@ -1684,6 +1647,7 @@ fn build_starting_up_response() -> Vec<u8> {
 #[cfg(test)]
 mod pgwire_early_bind_tests {
     use super::*;
+    use test_case::test_case;
 
     const PROTO_3_0: u32 = 0x0003_0000;
 
@@ -1716,10 +1680,8 @@ mod pgwire_early_bind_tests {
         assert_eq!(client.read(&mut tail).await.unwrap(), 0, "{why}");
     }
 
-    async fn assert_57p03(client: &mut TcpStream) {
-        let mut tag = [0u8; 1];
-        client.read_exact(&mut tag).await.unwrap();
-        assert_eq!(tag[0], b'E');
+    /// Reads the error frame body; the leading `E` tag must already be consumed.
+    async fn assert_57p03_body(client: &mut TcpStream) {
         let mut len_buf = [0u8; 4];
         client.read_exact(&mut len_buf).await.unwrap();
         let body_len = u32::from_be_bytes(len_buf) as usize - 4;
@@ -1728,57 +1690,49 @@ mod pgwire_early_bind_tests {
         assert!(body.windows(5).any(|w| w == b"57P03"));
     }
 
+    async fn assert_57p03(client: &mut TcpStream) {
+        let mut tag = [0u8; 1];
+        client.read_exact(&mut tag).await.unwrap();
+        assert_eq!(tag[0], b'E');
+        assert_57p03_body(client).await;
+    }
+
+    /// One startup shape per case: an optional SSL/GSS negotiation round, the
+    /// declared StartupMessage length, and the params body. `true` means the
+    /// canned 57P03 frame arrived (and the server then closed); `false` means
+    /// the connection was dropped unanswered.
+    #[test_case(None, 8, b"" => true ; "plain startup then close")]
+    #[test_case(Some(SSL_REQUEST_CODE), 8, b"" => true ; "ssl request then startup")]
+    #[test_case(Some(GSS_REQUEST_CODE), 8, b"" => true ; "gss request then startup")]
+    // Exercises drain_body with n > 0 (the cases above send len=8, n=0).
+    #[test_case(None, 8 + 23, b"user\0foo\0database\0bar\0\0" => true ; "drains startup params then responds")]
+    // Oversized declared length must trip the MAX_STARTUP_BYTES guard;
+    // the server drops the connection without sending a response.
+    #[test_case(None, MAX_STARTUP_BYTES as u32 + 1024, b"" => false ; "rejects oversized startup")]
     #[tokio::test]
-    async fn responds_to_plain_startup_then_closes() {
+    async fn responds_to_every_startup_shape(negotiation: Option<u32>, declared_len: u32, params: &[u8]) -> bool {
         let (port, shutdown, task) = spawn_acceptor().await;
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        client.write_all(&8u32.to_be_bytes()).await.unwrap();
-        client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
-        assert_57p03(&mut client).await;
-        assert_closed(&mut client, "server must close after error").await;
-        shutdown.cancel();
-        let _ = task.await;
-    }
-
-    async fn negotiation_then_startup(magic: u32) {
-        let (port, shutdown, task) = spawn_acceptor().await;
-        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        client.write_all(&8u32.to_be_bytes()).await.unwrap();
-        client.write_all(&magic.to_be_bytes()).await.unwrap();
-        let mut n_reply = [0u8; 1];
-        client.read_exact(&mut n_reply).await.unwrap();
-        assert_eq!(n_reply[0], b'N');
-        client.write_all(&8u32.to_be_bytes()).await.unwrap();
-        client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
-        assert_57p03(&mut client).await;
-        assert_closed(&mut client, "server must close after error").await;
-        shutdown.cancel();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn responds_to_ssl_request_then_startup() {
-        negotiation_then_startup(SSL_REQUEST_CODE).await;
-    }
-
-    #[tokio::test]
-    async fn responds_to_gss_request_then_startup() {
-        negotiation_then_startup(GSS_REQUEST_CODE).await;
-    }
-
-    /// Exercises drain_body with n > 0 (the no-params test sends len=8, n=0).
-    #[tokio::test]
-    async fn drains_startup_params_then_responds() {
-        let (port, shutdown, task) = spawn_acceptor().await;
-        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let params = b"user\0foo\0database\0bar\0\0";
-        let len = (4 + 4 + params.len()) as u32;
-        client.write_all(&len.to_be_bytes()).await.unwrap();
+        if let Some(magic) = negotiation {
+            client.write_all(&8u32.to_be_bytes()).await.unwrap();
+            client.write_all(&magic.to_be_bytes()).await.unwrap();
+            let mut n_reply = [0u8; 1];
+            client.read_exact(&mut n_reply).await.unwrap();
+            assert_eq!(n_reply[0], b'N', "negotiation must be declined with 'N'");
+        }
+        client.write_all(&declared_len.to_be_bytes()).await.unwrap();
         client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         client.write_all(params).await.unwrap();
-        assert_57p03(&mut client).await;
+        let mut tag = [0u8; 1];
+        let answered = client.read(&mut tag).await.unwrap() == 1;
+        if answered {
+            assert_eq!(tag[0], b'E');
+            assert_57p03_body(&mut client).await;
+            assert_closed(&mut client, "server must close after error").await;
+        }
         shutdown.cancel();
         let _ = task.await;
+        answered
     }
 
     /// A client that connects but never sends a startup message must be
@@ -1819,22 +1773,6 @@ mod pgwire_early_bind_tests {
             tokio::task::yield_now().await;
         }
 
-        shutdown.cancel();
-        let _ = task.await;
-    }
-
-    /// Oversized declared length must trip the MAX_STARTUP_BYTES guard;
-    /// the server drops the connection without sending a response.
-    #[tokio::test]
-    async fn rejects_oversized_startup() {
-        let (port, shutdown, task) = spawn_acceptor().await;
-        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let oversized = (MAX_STARTUP_BYTES as u32) + 1024;
-        client.write_all(&oversized.to_be_bytes()).await.unwrap();
-        client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
-        let mut tag = [0u8; 1];
-        let n = client.read(&mut tag).await.unwrap();
-        assert_eq!(n, 0, "server must drop connection on oversized startup");
         shutdown.cancel();
         let _ = task.await;
     }
@@ -1900,6 +1838,22 @@ mod streaming_tests {
         }
     }
 
+    /// Drains until the stream yields an error, asserting `expect` when the site
+    /// pins a specific SQLSTATE. Panics with `why` if the stream ends cleanly.
+    async fn drain_to_error<T>(
+        rows: &mut (impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + Unpin), expect: Option<tokio_postgres::error::SqlState>, why: &str,
+    ) {
+        while let Some(row) = rows.next().await {
+            if let Err(error) = row {
+                if let Some(code) = &expect {
+                    assert_eq!(error.code(), Some(code));
+                }
+                return;
+            }
+        }
+        panic!("{why}");
+    }
+
     // Uses production authentication, handlers, DataFusion execution, encoding,
     // and TCP. The input cannot finish until a row has reached the client.
     #[tokio::test]
@@ -1916,14 +1870,10 @@ mod streaming_tests {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let release = Arc::new(tokio::sync::Notify::new());
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])?;
-        ctx.register_table(
-            "gated_error",
-            Arc::new(StreamingTable::try_new(schema.clone(), vec![Arc::new(GatedInput { batch: batch.clone(), release: release.clone(), fail_after: true })])?),
-        )?;
-        ctx.register_table(
-            "gated",
-            Arc::new(StreamingTable::try_new(schema, vec![Arc::new(GatedInput { batch, release: release.clone(), fail_after: false })])?),
-        )?;
+        for (name, fail_after) in [("gated_error", true), ("gated", false)] {
+            let input = GatedInput { batch: batch.clone(), release: release.clone(), fail_after };
+            ctx.register_table(name, Arc::new(StreamingTable::try_new(schema.clone(), vec![Arc::new(input)])?))?;
+        }
         let handlers = handler_factory(Arc::new(ctx), AuthConfig { username: "postgres".into(), password: Some("test".into()) }, None, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
@@ -1936,14 +1886,17 @@ mod streaming_tests {
                 connections.spawn(async move { datafusion_postgres::pgwire::tokio::process_socket(socket, None, handlers).await });
             }
         });
-        let (mut client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
-        tasks.spawn(async move {
-            let _ = connection.await;
-        });
-        let (other, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
-        tasks.spawn(async move {
-            let _ = connection.await;
-        });
+        macro_rules! connect {
+            () => {{
+                let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=postgres password=test"), NoTls).await?;
+                tasks.spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+            }};
+        }
+        let mut client = connect!();
+        let other = connect!();
         let explain = "EXPLAIN SELECT n, count(*) FROM gated GROUP BY n";
         client.batch_execute("SET datafusion.execution.target_partitions = 1").await?;
         let plan = |rows: Vec<tokio_postgres::Row>| rows.iter().map(|row| row.get::<_, String>(1)).collect::<Vec<_>>().join("\n");
@@ -1957,15 +1910,7 @@ mod streaming_tests {
             futures::pin_mut!(rows);
             assert_eq!(rows.next().await.unwrap()?.get::<_, i64>(0), 1);
             client.cancel_token().cancel_query(NoTls).await?;
-            let mut canceled = false;
-            while let Some(row) = rows.next().await {
-                if let Err(error) = row {
-                    assert_eq!(error.code(), Some(&tokio_postgres::error::SqlState::QUERY_CANCELED));
-                    canceled = true;
-                    break;
-                }
-            }
-            assert!(canceled);
+            drain_to_error(&mut rows, Some(tokio_postgres::error::SqlState::QUERY_CANCELED), "extended query was never canceled").await;
             assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42);
             let tx = client.transaction().await?;
             let stmt = tx.prepare("SELECT n FROM gated").await?;
@@ -1979,14 +1924,7 @@ mod streaming_tests {
             futures::pin_mut!(failed);
             assert_eq!(failed.next().await.unwrap()?.get::<_, i64>(0), 1);
             release.notify_one();
-            let mut saw_error = false;
-            while let Some(row) = failed.next().await {
-                if row.is_err() {
-                    saw_error = true;
-                    break;
-                }
-            }
-            assert!(saw_error);
+            drain_to_error(&mut failed, None, "late input failure never reached the client").await;
             client.batch_execute("DECLARE exhausted CURSOR FOR SELECT 42::BIGINT AS n").await?;
             assert_eq!(client.query("FETCH ALL FROM exhausted", &[]).await?.len(), 1);
             for _ in 0..2 {
@@ -2005,14 +1943,7 @@ mod streaming_tests {
                 }
             }
             client.cancel_token().cancel_query(NoTls).await?;
-            let mut canceled = false;
-            while let Some(row) = rows.next().await {
-                if row.is_err() {
-                    canceled = true;
-                    break;
-                }
-            }
-            assert!(canceled);
+            drain_to_error(&mut rows, None, "simple query was never canceled").await;
             assert_eq!(client.query_one("SELECT 42::BIGINT", &[]).await?.get::<_, i64>(0), 42);
             anyhow::Ok(())
         })

@@ -1626,49 +1626,53 @@ mod session_tests {
 mod strip_tests {
     use std::collections::HashSet;
 
-    use datafusion::prelude::{col, lit};
+    use datafusion::prelude::{Expr, col, lit};
+    use test_case::test_case;
 
     use super::strip_source_conjuncts;
 
-    #[test]
-    fn strips_source_referencing_conjuncts_keeps_target_only() {
-        // The prod hash-enrichment shape: project_id + timestamp bounds (target-only)
-        // AND-ed with the equi-key equality and the NOT(@> u.tag) cross-filter, both
-        // of which reference source columns.
-        let source_cols: HashSet<String> = ["span_id", "trace_id", "tag"].iter().map(|s| s.to_string()).collect();
-        let pred = col("project_id")
-            .eq(lit("p1"))
-            .and(col("timestamp").gt(lit(1000i64)))
-            .and(col("context___span_id").eq(col("span_id"))) // references source `span_id`
-            .and(col("hashes").is_not_null().or(col("tag").is_not_null())); // references source `tag`
-
-        let stripped = strip_source_conjuncts(&pred, &source_cols).expect("target-only conjuncts remain");
-        let s = format!("{stripped}");
-        assert!(s.contains("project_id"), "kept project_id: {s}");
-        assert!(s.contains("timestamp"), "kept timestamp: {s}");
-        assert!(!s.contains("span_id"), "dropped the source equi-key: {s}");
-        assert!(!s.contains("tag"), "dropped the source cross-filter: {s}");
+    fn cols(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn strips_isnotnull_on_equi_key_target_columns() {
-        // Prod 2026-07-20 drop bug: the optimizer inserts IsNotNull(o.context___span_id)
-        // null-rejection on the join keys. It's TARGET-only (survives a source-only
-        // strip) but the high-cardinality key isn't in the stats schema, so the fork's
-        // file-skipping scan fails to resolve it. strip_cols includes the equi-key
-        // TARGET columns so these conjuncts are dropped from the file-pruning predicate.
-        let strip_cols: HashSet<String> = ["span_id", "trace_id", "tag", "context___span_id", "context___trace_id"].iter().map(|s| s.to_string()).collect();
-        let pred = col("date")
-            .gt_eq(lit("2026-07-20"))
-            .and(col("timestamp").gt(lit(1000i64)))
-            .and(col("context___span_id").is_not_null()) // optimizer null-rejection — must strip
-            .and(col("context___trace_id").is_not_null());
+    /// Catalog of the real predicate shapes, named so a case can say which
+    /// conjuncts go in and exactly which come back out.
+    fn conjunct(name: &str) -> Expr {
+        match name {
+            "project_eq" => col("project_id").eq(lit("p1")),
+            "project_in" => col("project_id").in_list(vec![lit("p1"), lit("p2")], false),
+            "ts_gt" => col("timestamp").gt(lit(1000i64)),
+            "date_ge" => col("date").gt_eq(lit("2026-07-20")),
+            "equi_key" => col("context___span_id").eq(col("span_id")), // references source `span_id`
+            "cross_filter" => col("hashes").is_not_null().or(col("tag").is_not_null()), // references source `tag`
+            "isnotnull_span" => col("context___span_id").is_not_null(), // optimizer null-rejection
+            "isnotnull_trace" => col("context___trace_id").is_not_null(),
+            other => panic!("unknown conjunct {other}"),
+        }
+    }
 
-        let stripped = strip_source_conjuncts(&pred, &strip_cols).expect("date + timestamp remain");
-        let s = format!("{stripped}");
-        assert!(s.contains("date") && s.contains("timestamp"), "kept prunable partition/stat conjuncts: {s}");
-        assert!(!s.contains("context___span_id"), "dropped IsNotNull(context___span_id): {s}");
-        assert!(!s.contains("context___trace_id"), "dropped IsNotNull(context___trace_id): {s}");
+    /// AND the named conjuncts, strip, and report which of them survived —
+    /// `None` when the whole predicate is stripped away.
+    fn survivors(strip_cols: &HashSet<String>, names: &[&'static str]) -> Option<Vec<&'static str>> {
+        let pred = names.iter().map(|n| conjunct(n)).reduce(Expr::and).expect("at least one conjunct");
+        let stripped = format!("{}", strip_source_conjuncts(&pred, strip_cols)?);
+        strip_cols.iter().for_each(|c| assert!(!stripped.contains(c.as_str()), "stripped predicate still mentions `{c}`: {stripped}"));
+        Some(names.iter().copied().filter(|n| stripped.contains(&format!("{}", conjunct(n)))).collect())
+    }
+
+    // Case 1 is the prod hash-enrichment shape: project_id + timestamp bounds
+    // (target-only) AND-ed with the equi-key equality and the NOT(@> u.tag)
+    // cross-filter, both of which reference source columns.
+    #[test_case(&["span_id", "trace_id", "tag"], &["project_eq", "ts_gt", "equi_key", "cross_filter"] => Some(vec!["project_eq", "ts_gt"]) ; "source referencing conjuncts dropped target only kept")]
+    // Prod 2026-07-20 drop bug: the optimizer inserts IsNotNull(o.context___span_id)
+    // null-rejection on the join keys. It's TARGET-only (survives a source-only
+    // strip) but the high-cardinality key isn't in the stats schema, so the fork's
+    // file-skipping scan fails to resolve it. strip_cols includes the equi-key
+    // TARGET columns so these conjuncts are dropped from the file-pruning predicate.
+    #[test_case(&["span_id", "trace_id", "tag", "context___span_id", "context___trace_id"], &["date_ge", "ts_gt", "isnotnull_span", "isnotnull_trace"] => Some(vec!["date_ge", "ts_gt"]) ; "isnotnull on equi key target columns stripped prunable conjuncts kept")]
+    #[test_case(&["span_id"], &["equi_key"] => None ; "all source conjuncts strips to none")]
+    fn strips_source_referencing_conjuncts(strip_cols: &[&'static str], pred: &[&'static str]) -> Option<Vec<&'static str>> {
+        survivors(&cols(strip_cols), pred)
     }
 
     /// The coalescer fold's `project_id IN (...)` conjunct must SURVIVE the
@@ -1677,27 +1681,18 @@ mod strip_tests {
     /// every tenant's files in the window.
     #[test]
     fn partition_column_equi_key_conjuncts_survive_the_strip() {
-        let source_cols: HashSet<String> = ["span_id", "trace_id", "tag", "project_id"].iter().map(|s| s.to_string()).collect();
         let join_keys: Vec<(String, String)> = [("context___span_id", "span_id"), ("context___trace_id", "trace_id"), ("project_id", "project_id")]
             .iter()
             .map(|(t, s)| (t.to_string(), s.to_string()))
             .collect();
-        let partition_cols = ["project_id".to_string(), "date".to_string()];
-        let strip_cols = super::dv_strip_cols(&source_cols, &join_keys, &partition_cols);
+        let strip_cols =
+            super::dv_strip_cols(&cols(&["span_id", "trace_id", "tag", "project_id"]), &join_keys, &["project_id".to_string(), "date".to_string()]);
 
-        let pred =
-            col("date").gt_eq(lit("2026-07-26")).and(col("project_id").in_list(vec![lit("p1"), lit("p2")], false)).and(col("context___span_id").is_not_null());
-        let stripped = strip_source_conjuncts(&pred, &strip_cols).expect("date + IN-list remain");
-        let s = format!("{stripped}");
-        assert!(s.contains("project_id") && s.contains("IN"), "partition IN-list must survive: {s}");
-        assert!(!s.contains("context___span_id"), "IsNotNull(equi data key) still stripped: {s}");
-    }
-
-    #[test]
-    fn all_source_conjuncts_strips_to_none() {
-        let source_cols: HashSet<String> = ["span_id"].iter().map(|s| s.to_string()).collect();
-        let pred = col("context___span_id").eq(col("span_id"));
-        assert!(strip_source_conjuncts(&pred, &source_cols).is_none());
+        assert_eq!(
+            survivors(&strip_cols, &["date_ge", "project_in", "isnotnull_span"]),
+            Some(vec!["date_ge", "project_in"]),
+            "partition IN-list must survive, IsNotNull(equi data key) still stripped"
+        );
     }
 }
 
@@ -2873,6 +2868,7 @@ mod tests {
         },
         prelude::col,
     };
+    use test_case::test_case;
 
     use super::*;
 
@@ -2882,6 +2878,34 @@ mod tests {
 
     fn window(lo: i64, hi: i64) -> Expr {
         col("timestamp").gt_eq(lit(ts(lo))).and(col("timestamp").lt(lit(ts(hi))))
+    }
+
+    /// Micros carried by a time bound.
+    fn m(b: &TimeBound) -> i64 {
+        match &b.value {
+            ScalarValue::TimestampMicrosecond(Some(v), _) => *v,
+            other => panic!("not a timestamp bound: {other:?}"),
+        }
+    }
+
+    /// The `(lo, hi)` time bounds a batch carries alongside it.
+    type BatchBounds = (Option<TimeBound>, Option<TimeBound>);
+
+    /// A `PendingGroup` with the shared defaults; callers override the fields
+    /// their case is actually about.
+    fn pending(schema: SchemaRef, predicate: DecomposedPredicate, batches: Vec<(RecordBatch, BatchBounds)>) -> PendingGroup {
+        PendingGroup {
+            histogram_guards: Vec::new(),
+            join_keys: vec![("id".into(), "id".into())],
+            assignments: vec![("n".into(), lit(9i64))],
+            predicate,
+            time_col: "timestamp",
+            schema,
+            batches,
+            session: Arc::new(datafusion::prelude::SessionContext::new().state()),
+            attempts: MAX_DRAIN_ATTEMPTS,
+            folded_projects: None,
+        }
     }
 
     /// Regression guard for the 2026-07-27 04:42Z loss: the terminal drain
@@ -2895,18 +2919,8 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false), Field::new("n", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a", "b"])), Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
         let key = GroupKey { project_id: "proj/1".into(), table_name: "otel_logs_and_spans".into(), fingerprint: 7 };
-        let group = PendingGroup {
-            histogram_guards: Vec::new(),
-            join_keys: vec![("id".into(), "id".into())],
-            assignments: vec![("n".into(), lit(9i64))],
-            predicate: DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp"),
-            time_col: "timestamp",
-            schema: schema.clone(),
-            batches: vec![(batch.clone(), (None, None))],
-            session: Arc::new(datafusion::prelude::SessionContext::new().state()),
-            attempts: MAX_DRAIN_ATTEMPTS,
-            folded_projects: Some(vec!["proj/1".into(), "proj2".into()]),
-        };
+        let mut group = pending(schema.clone(), DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp"), vec![(batch.clone(), (None, None))]);
+        group.folded_projects = Some(vec!["proj/1".into(), "proj2".into()]);
 
         let before = crate::observability::dml_stats().coalesce_quarantined.load(Ordering::Relaxed);
         assert!(quarantine_group(dir.path(), &key, &group, std::slice::from_ref(&batch), "resources exhausted"));
@@ -2946,18 +2960,9 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
         let key = GroupKey { project_id: "p".into(), table_name: "t".into(), fingerprint: 1 };
-        let mut group = PendingGroup {
-            histogram_guards: Vec::new(),
-            join_keys: vec![("n".into(), "n".into())],
-            assignments: vec![("n".into(), lit(1i64))],
-            predicate: DecomposedPredicate::decompose(None, "timestamp"),
-            time_col: "timestamp",
-            schema: schema.clone(),
-            batches: vec![(batch.clone(), (None, None))],
-            session: Arc::new(datafusion::prelude::SessionContext::new().state()),
-            attempts: MAX_DRAIN_ATTEMPTS,
-            folded_projects: None,
-        };
+        let mut group = pending(schema.clone(), DecomposedPredicate::decompose(None, "timestamp"), vec![(batch.clone(), (None, None))]);
+        group.join_keys = vec![("n".into(), "n".into())];
+        group.assignments = vec![("n".into(), lit(1i64))];
 
         for _ in 0..3 {
             assert!(quarantine_group(dir.path(), &key, &group, std::slice::from_ref(&batch), "x"));
@@ -3030,40 +3035,30 @@ mod tests {
         assert!(a.upper.is_none());
     }
 
-    #[test]
-    fn clamp_skips_fully_unflushed_window() {
-        let pred = window(1_000, 2_000);
-        assert!(matches!(clamp_to_watermark(Some(&pred), "timestamp", 500), WatermarkClamp::SkipDelta));
-        // Exclusive lower exactly at the watermark also skips.
-        let pred = col("timestamp").gt(lit(ts(500)));
-        assert!(matches!(clamp_to_watermark(Some(&pred), "timestamp", 500), WatermarkClamp::SkipDelta));
-        // Inclusive lower at the watermark must keep (row at wm may be flushed).
-        let pred = col("timestamp").gt_eq(lit(ts(500)));
-        assert!(matches!(clamp_to_watermark(Some(&pred), "timestamp", 500), WatermarkClamp::Keep(_)));
-    }
+    /// A clamped bound as the case lines spell it: `(micros, inclusive)`.
+    type ClampedBound = Option<(i64, bool)>;
 
-    #[test]
-    fn clamp_tightens_upper_bound_to_watermark() {
-        let pred = window(100, 2_000);
+    /// Clamping against a watermark of 500, flattened to `(outcome, lower,
+    /// upper)` with each bound as `(micros, inclusive)`. `"unchanged"` is only
+    /// reported when the returned predicate is *identical* to the input, so a
+    /// pass-through can never be confused with a rebuilt one.
+    #[test_case(window(1_000, 2_000) => ("skip", None, None) ; "window entirely above the watermark skips the delta leg")]
+    #[test_case(col("timestamp").gt(lit(ts(500))) => ("skip", None, None) ; "exclusive lower exactly at the watermark also skips")]
+    // Inclusive lower at the watermark must keep — the row at wm may be flushed.
+    #[test_case(col("timestamp").gt_eq(lit(ts(500))) => ("clamped", Some((500i64, true)), Some((500i64, true))) ; "inclusive lower at the watermark keeps")]
+    #[test_case(window(100, 2_000) => ("clamped", Some((100i64, true)), Some((500i64, true))) ; "upper above the watermark tightens to it")]
+    #[test_case(window(100, 300) => ("unchanged", Some((100i64, true)), Some((300i64, false))) ; "window already below the watermark is untouched")]
+    #[test_case(col("project_id").eq(lit("p1")) => ("unchanged", None, None) ; "no time bounds at all leaves nothing to clamp against")]
+    fn clamp_to_watermark_shapes(pred: Expr) -> (&'static str, ClampedBound, ClampedBound) {
+        let flat = |b: Option<TimeBound>| b.map(|b| (m(&b), b.inclusive));
         match clamp_to_watermark(Some(&pred), "timestamp", 500) {
+            WatermarkClamp::SkipDelta => ("skip", None, None),
+            WatermarkClamp::Keep(None) => ("keep-none", None, None),
             WatermarkClamp::Keep(Some(p)) => {
+                let tag = if p == pred { "unchanged" } else { "clamped" };
                 let d = DecomposedPredicate::decompose(Some(&p), "timestamp");
-                assert_eq!(d.upper, Some(TimeBound { value: ts(500), inclusive: true }));
-                assert_eq!(d.lower.unwrap().value, ts(100));
+                (tag, flat(d.lower), flat(d.upper))
             }
-            _ => panic!("expected clamped predicate"),
-        }
-        // Window already below the watermark: untouched.
-        let pred = window(100, 300);
-        match clamp_to_watermark(Some(&pred), "timestamp", 500) {
-            WatermarkClamp::Keep(Some(p)) => assert_eq!(p, pred),
-            _ => panic!("expected unchanged predicate"),
-        }
-        // No time bounds at all: nothing to clamp against.
-        let pred = col("project_id").eq(lit("p1"));
-        match clamp_to_watermark(Some(&pred), "timestamp", 500) {
-            WatermarkClamp::Keep(Some(p)) => assert_eq!(p, pred),
-            _ => panic!("expected unchanged predicate"),
         }
     }
 
@@ -3144,18 +3139,10 @@ mod tests {
             let stripped: Vec<Expr> = d.residual.iter().filter(|e| !is_project_eq(e, project)).cloned().collect();
             assert!(stripped.is_empty());
             let bounds = (d.lower.clone(), d.upper.clone());
-            let group = PendingGroup {
-                histogram_guards: Vec::new(),
-                join_keys: vec![("context___span_id".into(), "span_id".into())],
-                assignments: vec![("hashes".into(), col("source.tag"))],
-                predicate: d,
-                time_col: "timestamp",
-                schema: schema.clone(),
-                batches: vec![(batch(ids), bounds)],
-                session: Arc::new(datafusion::execution::SessionStateBuilder::new().build()),
-                attempts: 0,
-                folded_projects: None,
-            };
+            let mut group = pending(schema.clone(), d, vec![(batch(ids), bounds)]);
+            group.join_keys = vec![("context___span_id".into(), "span_id".into())];
+            group.assignments = vec![("hashes".into(), col("source.tag"))];
+            group.attempts = 0;
             (GroupKey { project_id: project.into(), table_name: "otel_logs_and_spans".into(), fingerprint: 1 }, group, stripped)
         };
         let members = vec![member("p1", 100, 200, &["a", "b"]), member("p2", 50, 150, &["c"])];
@@ -3205,18 +3192,20 @@ mod tests {
             p.widen(d);
             p
         });
-        PendingGroup {
-            histogram_guards: Vec::new(),
-            join_keys: vec![("id".into(), "id".into())],
-            assignments: vec![("n".into(), lit(9i64))],
-            predicate,
-            time_col: "timestamp",
-            schema,
-            batches: decomposed.into_iter().map(|d| (batch.clone(), (d.lower, d.upper))).collect(),
-            session: Arc::new(datafusion::prelude::SessionContext::new().state()),
-            attempts: 2,
-            folded_projects: None,
-        }
+        let mut group = pending(schema, predicate, decomposed.into_iter().map(|d| (batch.clone(), (d.lower, d.upper))).collect());
+        group.attempts = 2;
+        group
+    }
+
+    /// Bucketed units flattened to `(statements, lower_micros, upper_micros)`,
+    /// ordered by window so the table is order-independent.
+    fn bucket_shape(windows: &[(i64, Option<i64>)]) -> Vec<(usize, Option<i64>, Option<i64>)> {
+        let mut shape: Vec<(usize, Option<i64>, Option<i64>)> = bucket_group(group_with_windows(windows))
+            .iter()
+            .map(|u| (u.batches.len(), u.predicate.lower.as_ref().map(m), u.predicate.upper.as_ref().map(m)))
+            .collect();
+        shape.sort_by_key(|s| (s.1, s.2));
+        shape
     }
 
     #[test]
@@ -3310,68 +3299,32 @@ mod tests {
 
     const B: i64 = DML_MERGE_BUCKET_MICROS;
 
-    /// Statements in distinct 5-min buckets become separate merge units whose
-    /// time bounds cover only their own statements — not the group union.
+    /// How a group's statements split into merge units. Each expected row is
+    /// `(statements_in_unit, lower_micros, upper_micros)`; the unit count is the
+    /// row count and the row sum proves no statement is dropped or duplicated.
+    #[test_case(&[(0, Some(60)), (10, Some(90)), (2 * B, Some(2 * B + 60))] => vec![(2usize, Some(0i64), Some(90i64)), (1, Some(2 * B), Some(2 * B + 60))] ;
+        "distinct buckets become separate units bounded by their own statements not the group union")]
+    #[test_case(&[(B - 10, Some(B + 10)), (0, Some(50))] => vec![(1usize, Some(0i64), Some(50i64)), (1, Some(B - 10), Some(B + 10))] ;
+        "statement spanning a bucket boundary keeps its FULL window in its own unit")]
+    #[test_case(&[(0, Some(50)), (60, Some(100))] => vec![(2usize, Some(0i64), Some(100i64))] ;
+        "one shared bucket drains as one unit with the union window")]
+    #[test_case(&[(0, Some(50)), (10, None)] => vec![(1usize, Some(0i64), Some(50i64)), (1, Some(10), None)] ;
+        "unbounded statements share a catch-all unit that stays unbounded while bounded ones bucket narrowly")]
+    #[test_case(&[(0, Some(B)), (10, Some(20))] => vec![(2usize, Some(0i64), Some(B))] ;
+        "exclusive upper exactly on a bucket edge stays in the bucket below the edge")]
+    fn bucket_group_splits(windows: &[(i64, Option<i64>)]) -> Vec<(usize, Option<i64>, Option<i64>)> {
+        bucket_shape(windows)
+    }
+
+    /// Everything but the time window is carried through bucketing unchanged.
     #[test]
-    fn bucket_group_splits_distinct_buckets_with_narrowed_bounds() {
-        let units = bucket_group(group_with_windows(&[(0, Some(60)), (10, Some(90)), (2 * B, Some(2 * B + 60))]));
-        assert_eq!(units.len(), 2);
-        assert_eq!(units[0].batches.len(), 2);
-        assert_eq!(units[0].predicate.lower.as_ref().unwrap().value, ts(0));
-        assert_eq!(units[0].predicate.upper.as_ref().unwrap().value, ts(90));
-        assert_eq!(units[1].batches.len(), 1);
-        assert_eq!(units[1].predicate.lower.as_ref().unwrap().value, ts(2 * B));
-        assert_eq!(units[1].predicate.upper.as_ref().unwrap().value, ts(2 * B + 60));
-        // Everything but the time window is carried through unchanged.
-        for u in &units {
+    fn bucket_group_carries_non_time_fields() {
+        for u in &bucket_group(group_with_windows(&[(0, Some(60)), (10, Some(90)), (2 * B, Some(2 * B + 60))])) {
             assert_eq!(u.predicate.residual.len(), 1);
             assert!(u.predicate.residual[0].to_string().contains("service"));
             assert_eq!(u.attempts, 2);
             assert_eq!(u.join_keys, vec![("id".to_string(), "id".to_string())]);
         }
-    }
-
-    /// A statement spanning a bucket boundary keeps its FULL window (own unit),
-    /// never narrowed to either bucket.
-    #[test]
-    fn bucket_group_never_narrows_spanning_statement() {
-        let units = bucket_group(group_with_windows(&[(B - 10, Some(B + 10)), (0, Some(50))]));
-        assert_eq!(units.len(), 2);
-        let spanning = units.iter().find(|u| u.batches.len() == 1 && u.predicate.upper.as_ref().unwrap().value == ts(B + 10)).expect("spanning unit");
-        assert_eq!(spanning.predicate.lower.as_ref().unwrap().value, ts(B - 10));
-    }
-
-    /// A group whose statements all share one bucket drains exactly as today:
-    /// one merge unit with the union window.
-    #[test]
-    fn bucket_group_single_bucket_is_one_unit() {
-        let units = bucket_group(group_with_windows(&[(0, Some(50)), (60, Some(100))]));
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].batches.len(), 2);
-        assert_eq!(units[0].predicate.lower.as_ref().unwrap().value, ts(0));
-        assert_eq!(units[0].predicate.upper.as_ref().unwrap().value, ts(100));
-    }
-
-    /// Unbounded statements can't be bucketed — they share a catch-all unit
-    /// whose window stays unbounded; bounded statements still bucket narrowly.
-    #[test]
-    fn bucket_group_unbounded_statements_share_catchall() {
-        let units = bucket_group(group_with_windows(&[(0, Some(50)), (10, None)]));
-        assert_eq!(units.len(), 2);
-        let unbounded = units.iter().find(|u| u.predicate.upper.is_none()).expect("catch-all unit");
-        assert_eq!(unbounded.predicate.lower.as_ref().unwrap().value, ts(10));
-        let bounded = units.iter().find(|u| u.predicate.upper.is_some()).unwrap();
-        assert_eq!(bounded.predicate.upper.as_ref().unwrap().value, ts(50));
-        // No statement is dropped or duplicated by bucketing.
-        assert_eq!(units.iter().map(|u| u.batches.len()).sum::<usize>(), 2);
-    }
-
-    /// An exclusive upper exactly on a bucket edge still belongs to the bucket
-    /// below the edge (the window contains no row at the boundary).
-    #[test]
-    fn bucket_group_exclusive_upper_on_edge_stays_below() {
-        let units = bucket_group(group_with_windows(&[(0, Some(B)), (10, Some(20))]));
-        assert_eq!(units.len(), 1);
     }
 
     #[test]

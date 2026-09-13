@@ -1119,27 +1119,15 @@ mod tests {
     }
 
     /// One completed frontier task per project, so stream extraction sees the
-    /// requested number of streams.
+    /// requested number of streams. The derived twin deliberately keeps the
+    /// BASE physical table — only the operation is flipped.
     fn journal_with_streams(projects: usize) -> TaskJournal {
         let mut journal = empty_journal();
         for i in 0..projects {
-            let mut task = MaintenanceTask {
-                key: key(&format!("p{i}"), Operation::BaseRollup, 60 * DAY_MICROS, NORMAL_SLICE_MICROS),
-                state: TaskState::Complete,
-                deadline_micros: 0,
-                estimated_decoded_bytes: 0,
-                hash_shard: 0,
-                hash_shards: 1,
-                attempts: 0,
-                created_unix_ms: 0,
-                retry_reason: None,
-                publication: None,
-                base_tier_present: false,
-                input: None,
-                parent_measured_bytes: None,
-                preflight_decoded_bytes: None,
-                backfill_priority_micros: None,
-            };
+            let base = key(&format!("p{i}"), Operation::BaseRollup, 60 * DAY_MICROS, NORMAL_SLICE_MICROS);
+            journal.enqueue(base.clone(), 0, 0, 0);
+            let mut task = journal.tasks().find(|task| task.key == base).cloned().expect("enqueued frontier task");
+            task.state = TaskState::Complete;
             journal.upsert(task.clone());
             task.key.operation = Operation::DerivedRollup;
             journal.upsert(task);
@@ -1209,13 +1197,13 @@ mod tests {
     /// days; the rows where MIN and MEDIAN disagree are the whole point (the sim
     /// used to gate on the MIN, so a single laggard put it in coverage-short
     /// mode on states the server calls healthy).
-    #[test_case::test_case(&[30, 30, 30], &[30, 30, 30], false; "fleet covered")]
-    #[test_case::test_case(&[2, 3, 4], &[2, 3, 4], true; "fleet short")]
-    #[test_case::test_case(&[0, 20, 25], &[0, 20, 25], false; "one laggard cannot pin the fleet")]
-    #[test_case::test_case(&[13, 15], &[13, 15], false; "even count takes the upper median")]
-    #[test_case::test_case(&[0, 13], &[0, 13], true; "even count upper median still short")]
-    #[test_case::test_case(&[30, 30, 30], &[2, 2, 2], true; "a lagging derived tier is short on its own")]
-    fn sim_and_server_agree_on_coverage_short(base: &[u64], derived: &[u64], expected: bool) {
+    #[test_case::test_case(&[30, 30, 30], &[30, 30, 30] => false; "fleet covered")]
+    #[test_case::test_case(&[2, 3, 4], &[2, 3, 4] => true; "fleet short")]
+    #[test_case::test_case(&[0, 20, 25], &[0, 20, 25] => false; "one laggard cannot pin the fleet")]
+    #[test_case::test_case(&[13, 15], &[13, 15] => false; "even count takes the upper median")]
+    #[test_case::test_case(&[0, 13], &[0, 13] => true; "even count upper median still short")]
+    #[test_case::test_case(&[30, 30, 30], &[2, 2, 2] => true; "a lagging derived tier is short on its own")]
+    fn sim_and_server_agree_on_coverage_short(base: &[u64], derived: &[u64]) -> bool {
         use std::collections::HashSet;
 
         let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
@@ -1246,8 +1234,8 @@ mod tests {
         let active = projects.iter().map(String::as_str).collect::<HashSet<_>>();
         let fleet = covered.iter().map(|covered| crate::database::min_contiguous_days(covered, &source, today, &active).2).min().unwrap();
         let server = coverage_is_short_for(fleet);
-        assert_eq!(server, expected, "server decision at fleet median {fleet}");
         assert_eq!(coverage.coverage_is_short(now), server, "sim must decide as the server does (fleet median {fleet})");
+        server
     }
 
     #[test]
@@ -1395,24 +1383,23 @@ mod tests {
     /// §3c.2 — the control. Bytes strictly proportional to width is the model
     /// `byte_bounded_units` assumes. Without independent execution timeouts,
     /// byte-driven splitting must stop above the floor with either guard.
-    #[test]
-    fn a_floorless_whale_never_reaches_the_floor() {
-        for guard in [SplitGuard::Off, SplitGuard::Shipped] {
-            // `duration_scale: 0.0` — the duration model is independent of
-            // bytes, and its random timeouts can legitimately split even a small
-            // task, so isolate byte physics here; timeout bisection is exercised
-            // by the failure tests.
-            let (report, whale, _) = synth_run_at(false, guard, 100, 0.0);
-            assert_eq!(report.timeouts.values().sum::<u64>(), 0);
-            // 255 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves,
-            // bisection only makes powers of two, and since bisection descends
-            // ONE level per measurement the 127 intermediate parents are
-            // journal rows too (it was 129 when one call minted the whole
-            // subtree). The discriminating property is unchanged and is the
-            // only one asserted below: NOTHING reaches MIN_SLICE_MICROS.
-            assert!(cell_units(&report, &whale) < 300, "{guard:?}: {} units", cell_units(&report, &whale));
-            assert_eq!(report.min_slice_units_per_cell.get(&whale).copied().unwrap_or_default(), 0, "{guard:?}: the floorless whale must not reach the floor");
-        }
+    #[test_case::test_case(SplitGuard::Off; "guard defeated")]
+    #[test_case::test_case(SplitGuard::Shipped; "shipped guard")]
+    fn a_floorless_whale_never_reaches_the_floor(guard: SplitGuard) {
+        // `duration_scale: 0.0` — the duration model is independent of bytes,
+        // and its random timeouts can legitimately split even a small task, so
+        // isolate byte physics here; timeout bisection is exercised by the
+        // failure tests.
+        let (report, whale, _) = synth_run_at(false, guard, 100, 0.0);
+        assert_eq!(report.timeouts.values().sum::<u64>(), 0);
+        // 255 units, not "tens": 100x MAX_DECODED_BYTES needs 128 leaves,
+        // bisection only makes powers of two, and since bisection descends ONE
+        // level per measurement the 127 intermediate parents are journal rows
+        // too (it was 129 when one call minted the whole subtree). The
+        // discriminating property is unchanged and is the only one asserted
+        // below: NOTHING reaches MIN_SLICE_MICROS.
+        assert!(cell_units(&report, &whale) < 300, "{guard:?}: {} units", cell_units(&report, &whale));
+        assert_eq!(report.min_slice_units_per_cell.get(&whale).copied().unwrap_or_default(), 0, "{guard:?}: the floorless whale must not reach the floor");
     }
 
     /// §3c.3/4 — the fix, and the regression guard for the defect it closed.

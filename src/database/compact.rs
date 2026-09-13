@@ -2470,11 +2470,42 @@ impl RunCollapse {
 
 #[cfg(test)]
 mod immutable_audit_tests {
-    use super::*;
+    use datafusion::arrow::{
+        array::{BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray},
+        datatypes::{DataType, Field, Schema, TimeUnit},
+    };
     use test_case::test_case;
+
+    use super::*;
 
     fn logs_schema() -> &'static crate::schema::TableSchema {
         crate::schema::get_schema("otel_logs_and_spans").expect("the real shipped schema")
+    }
+
+    /// The audit query over the real shipped schema — the shape every
+    /// SQL-form assertion below is about.
+    fn audit_sql() -> String {
+        Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns")
+    }
+
+    /// Trim the real schema to `keep`, declare every kept column immutable and
+    /// key it by `id`, then run the audit over `batch`. Returns the count WITH
+    /// the SQL, because a wrong count is only diagnosable next to the query
+    /// that produced it.
+    async fn audit_count(keep: &[&str], batch: RecordBatch) -> (i64, String) {
+        let mut schema = logs_schema().clone();
+        schema.fields.retain(|field| keep.contains(&field.name.as_str()));
+        schema.fields.iter_mut().for_each(|field| field.mutable = false);
+        schema.dedup_keys = vec!["id".to_owned()];
+        schema.dedup_tiebreak = None;
+        schema.tombstone_column = None;
+        assert_eq!(schema.fields.len(), keep.len(), "the trimmed schema has exactly the columns this test reasons about: {keep:?}");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_batch("scan", batch).expect("register");
+        let sql = Database::immutable_audit_sql(&schema, "scan", "true").expect("columns to audit");
+        let count = Database::scalar_i64(&ctx, &sql).await.expect("the audit must PLAN and RUN").expect("one row");
+        (count, sql)
     }
 
     /// `MIN`/`MAX` ignore nulls, so on their own they cannot see the shape
@@ -2485,7 +2516,7 @@ mod immutable_audit_tests {
     /// be counted.
     #[test]
     fn the_audit_catches_a_null_to_value_transition_not_just_differing_values() {
-        let sql = Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns");
+        let sql = audit_sql();
         assert!(sql.contains("MIN(") && sql.contains("MAX("), "differing non-null values are caught");
         assert!(
             sql.contains("> 0 AND COUNT(") && sql.contains("< COUNT(*)"),
@@ -2500,7 +2531,7 @@ mod immutable_audit_tests {
     #[test]
     fn the_audit_skips_columns_that_vary_by_construction() {
         let schema = logs_schema();
-        let sql = Database::immutable_audit_sql(schema, "scan", "true").expect("logs declare immutable columns");
+        let sql = audit_sql();
         let grouped =
             schema.dedup_keys.iter().map(String::as_str).chain(schema.dedup_tiebreak.as_deref()).chain(schema.tombstone_column.as_deref()).collect::<Vec<_>>();
         assert!(!grouped.is_empty(), "the schema has dedup keys, or this test proves nothing");
@@ -2531,21 +2562,9 @@ mod immutable_audit_tests {
     /// real".
     #[tokio::test]
     async fn the_audit_query_actually_counts_disagreeing_keys() {
-        use datafusion::arrow::array::StringArray;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::arrow::record_batch::RecordBatch;
-
-        let mut schema = logs_schema().clone();
-        schema.fields.retain(|field| ["id", "level"].contains(&field.name.as_str()));
-        schema.fields.iter_mut().for_each(|field| field.mutable = false);
-        schema.dedup_keys = vec!["id".to_owned()];
-        schema.dedup_tiebreak = None;
-        schema.tombstone_column = None;
-        assert_eq!(schema.fields.len(), 2, "the trimmed schema has exactly the two columns this test reasons about");
-
         let arrow = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true), Field::new("level", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(
-            arrow.clone(),
+            arrow,
             vec![
                 //                 differing values   null -> value      agrees      all null
                 Arc::new(StringArray::from(vec!["a", "a", "b", "b", "c", "c", "d", "d"])),
@@ -2554,11 +2573,7 @@ mod immutable_audit_tests {
         )
         .expect("batch");
 
-        let ctx = datafusion::prelude::SessionContext::new();
-        ctx.register_batch("scan", batch).expect("register");
-        let sql = Database::immutable_audit_sql(&schema, "scan", "true").expect("two immutable columns");
-        let count = Database::scalar_i64(&ctx, &sql).await.expect("audit runs").expect("one row");
-
+        let (count, sql) = audit_count(&["id", "level"], batch).await;
         assert_eq!(count, 2, "`a` differs outright and `b` goes null -> error; `c` agrees and `d` is null throughout ({sql})");
     }
 
@@ -2574,7 +2589,7 @@ mod immutable_audit_tests {
     /// `MIN`/`MAX` answer the identical question with O(1) state per group.
     #[test]
     fn the_audit_uses_no_distinct_accumulators() {
-        let sql = Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns");
+        let sql = audit_sql();
         assert!(!sql.contains("COUNT(DISTINCT"), "the audit must not build a per-group hash set per column; it audits ~150 of them");
         let audited = sql.matches("MIN(").count();
         assert!(audited > 50, "the real schema audits many columns, or this test proves nothing: {audited}");
@@ -2587,18 +2602,8 @@ mod immutable_audit_tests {
     /// still looking present in the SQL.
     #[tokio::test]
     async fn the_audit_plans_for_non_string_types() {
-        use datafusion::arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray};
-        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-        use datafusion::arrow::record_batch::RecordBatch;
-
-        let mut schema = logs_schema().clone();
-        schema.fields.retain(|field| ["id", "context___is_remote", "message_size_bytes", "observed_timestamp"].contains(&field.name.as_str()));
-        schema.fields.iter_mut().for_each(|field| field.mutable = false);
-        schema.dedup_keys = vec!["id".to_owned()];
-        schema.dedup_tiebreak = None;
-        schema.tombstone_column = None;
-        assert!(schema.fields.len() >= 3, "the trimmed schema must keep a bool, an int and a timestamp: {:?}", schema.fields.len());
-
+        // A bool, an int and a timestamp alongside the key.
+        let kept = ["id", "context___is_remote", "message_size_bytes", "observed_timestamp"];
         let arrow = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, true),
             Field::new("context___is_remote", DataType::Boolean, true),
@@ -2616,10 +2621,7 @@ mod immutable_audit_tests {
         )
         .expect("batch");
 
-        let ctx = datafusion::prelude::SessionContext::new();
-        ctx.register_batch("scan", batch).expect("register");
-        let sql = Database::immutable_audit_sql(&schema, "scan", "true").expect("columns to audit");
-        let count = Database::scalar_i64(&ctx, &sql).await.expect("the audit must PLAN and RUN over bool/int/timestamp").expect("one row");
+        let (count, sql) = audit_count(&kept, batch).await;
         assert_eq!(count, 1, "only `a` disagrees, on the boolean ({sql})");
     }
 
@@ -2643,10 +2645,6 @@ mod immutable_audit_tests {
     /// trailing run exists for.
     #[tokio::test]
     async fn the_streaming_collapse_agrees_with_the_window_it_replaces() {
-        use datafusion::arrow::array::{StringArray, TimestampMicrosecondArray};
-        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-        use datafusion::arrow::record_batch::RecordBatch;
-
         let mut schema = logs_schema().clone();
         let kept = ["timestamp", "resource___service___name", "id", "level", "updated_at"];
         schema.fields.retain(|field| kept.contains(&field.name.as_str()));
@@ -2724,62 +2722,58 @@ mod immutable_audit_tests {
         assert!(windowed.contains("web"), "the fixture must actually exercise two services sharing (timestamp, id)");
     }
 
+    /// Collapse `(timestamp, id, level)` rows keyed by `(timestamp, id)` in
+    /// batches of `per_batch`, auditing `level` only when `audited` — the audit
+    /// is opt-in and an un-armed collapse must stay silent.
+    fn collapse_disagreements(rows: &[(i64, &str, Option<&str>)], audited: bool, per_batch: usize) -> u64 {
+        let arrow = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("id", DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let collapse = RunCollapse::new(&arrow, &["timestamp".to_string(), "id".to_string()], None).expect("collapse");
+        let mut collapse = if audited { collapse.with_immutable_audit(&arrow, &["level".to_string()]).expect("audit") } else { collapse };
+        for chunk in rows.chunks(per_batch.max(1)) {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&arrow),
+                vec![
+                    Arc::new(Int64Array::from(chunk.iter().map(|row| row.0).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(chunk.iter().map(|row| Some(row.1)).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(chunk.iter().map(|row| row.2).collect::<Vec<_>>())),
+                ],
+            )
+            .expect("batch");
+            collapse.push(batch).expect("push");
+        }
+        collapse.finish();
+        collapse.disagreements()
+    }
+
     /// The streaming audit replaces a `GROUP BY` aggregate that could not fit
     /// its slot of the heavy pool on whale shards. It must count a dedup key
     /// ONCE when its versions disagree on an immutable column, across both
     /// disagreement shapes, and with `batch_size 1` every run straddles a batch
     /// boundary — the carry path, which is where a per-run flag can double-count
     /// or reset.
-    #[test_case(&[(10, "a", Some("info")), (10, "a", Some("warn"))], 1 ; "two different non-null values")]
-    #[test_case(&[(10, "a", None), (10, "a", Some("info"))], 1 ; "enrichment: absent then filled")]
-    #[test_case(&[(10, "a", Some("info")), (10, "a", Some("info"))], 0 ; "versions that agree")]
-    #[test_case(&[(10, "a", None), (10, "a", None)], 0 ; "null in every version agrees")]
-    #[test_case(&[(10, "a", Some("info")), (20, "b", Some("warn"))], 0 ; "different keys never disagree")]
-    #[test_case(&[(10, "a", Some("x")), (10, "a", Some("y")), (10, "a", Some("z"))], 1 ; "a three-way disagreement counts once")]
-    #[test_case(&[(10, "a", Some("x")), (10, "a", Some("y")), (20, "b", Some("p")), (20, "b", Some("q"))], 2 ; "two disagreeing keys count separately")]
-    fn the_collapse_audit_counts_disagreeing_keys(rows: &[(i64, &str, Option<&str>)], expected: u64) {
-        use datafusion::arrow::array::{Int64Array, StringArray};
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::arrow::record_batch::RecordBatch;
-
-        let arrow = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, true),
-            Field::new("id", DataType::Utf8, true),
-            Field::new("level", DataType::Utf8, true),
-        ]));
-        let keys = vec!["timestamp".to_string(), "id".to_string()];
-        let mut collapse = RunCollapse::new(&arrow, &keys, None).expect("collapse").with_immutable_audit(&arrow, &["level".to_string()]).expect("audit");
-
-        // One row per batch, so every run is carried across a boundary.
-        for row in rows {
-            let batch = RecordBatch::try_new(
-                Arc::clone(&arrow),
-                vec![Arc::new(Int64Array::from(vec![row.0])), Arc::new(StringArray::from(vec![Some(row.1)])), Arc::new(StringArray::from(vec![row.2]))],
-            )
-            .expect("batch");
-            collapse.push(batch).expect("push");
-        }
-        collapse.finish();
-
-        assert_eq!(collapse.disagreements(), expected, "rows {rows:?}");
-    }
-
-    /// A collapse with no audit configured must not count anything — the audit
-    /// is opt-in, and the non-streaming path still uses the SQL form.
-    #[test]
-    fn a_collapse_without_the_audit_counts_nothing() {
-        use datafusion::arrow::array::{Int64Array, StringArray};
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::arrow::record_batch::RecordBatch;
-
-        let arrow = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, true), Field::new("level", DataType::Utf8, true)]));
-        let mut collapse = RunCollapse::new(&arrow, &["timestamp".to_string()], None).expect("collapse");
-        let batch = RecordBatch::try_new(arrow, vec![Arc::new(Int64Array::from(vec![10, 10])), Arc::new(StringArray::from(vec![Some("info"), Some("warn")]))])
-            .expect("batch");
-        collapse.push(batch).expect("push");
-        collapse.finish();
-
-        assert_eq!(collapse.disagreements(), 0, "an un-audited collapse reports nothing");
+    ///
+    /// The last case is `a_collapse_without_the_audit_counts_nothing`: a collapse
+    /// with no audit configured must not count anything — the audit is opt-in,
+    /// and the non-streaming path still uses the SQL form.
+    #[test_case(&[(10, "a", Some("info")), (10, "a", Some("warn"))], true => 1 ; "two different non-null values")]
+    #[test_case(&[(10, "a", None), (10, "a", Some("info"))], true => 1 ; "enrichment: absent then filled")]
+    #[test_case(&[(10, "a", Some("info")), (10, "a", Some("info"))], true => 0 ; "versions that agree")]
+    #[test_case(&[(10, "a", None), (10, "a", None)], true => 0 ; "null in every version agrees")]
+    #[test_case(&[(10, "a", Some("info")), (20, "b", Some("warn"))], true => 0 ; "different keys never disagree")]
+    #[test_case(&[(10, "a", Some("x")), (10, "a", Some("y")), (10, "a", Some("z"))], true => 1 ; "a three-way disagreement counts once")]
+    #[test_case(&[(10, "a", Some("x")), (10, "a", Some("y")), (20, "b", Some("p")), (20, "b", Some("q"))], true => 2 ; "two disagreeing keys count separately")]
+    #[test_case(&[(10, "a", Some("info")), (10, "a", Some("warn"))], false => 0 ; "a collapse without the audit counts nothing")]
+    fn the_collapse_audit_counts_disagreeing_keys(rows: &[(i64, &str, Option<&str>)], audited: bool) -> u64 {
+        // One row per batch, so every run is carried across a boundary. The
+        // run state lives on the collapse, not on the batch, so the whole-batch
+        // form — the only one that closes a run INSIDE `push` — must agree.
+        let carried = collapse_disagreements(rows, audited, 1);
+        assert_eq!(collapse_disagreements(rows, audited, rows.len()), carried, "the count cannot depend on batch boundaries: {rows:?}");
+        carried
     }
 
     /// The streaming audit arms by resolving column NAMES against the rewrite's
@@ -2788,8 +2782,6 @@ mod immutable_audit_tests {
     /// for the wrong reason. Pin it against the real shipped schema.
     #[test]
     fn the_streaming_audit_arms_against_the_real_rewrite_schema() {
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-
         let schema = logs_schema();
         // The rewrite selects every schema field, so this is the shape
         // `plan.schema()` has at the call site.
@@ -2808,7 +2800,7 @@ mod immutable_audit_tests {
     #[test]
     fn both_audit_forms_read_one_column_list() {
         let columns = Database::immutable_audit_columns(logs_schema());
-        let sql = Database::immutable_audit_sql(logs_schema(), "scan", "true").expect("logs declare immutable columns");
+        let sql = audit_sql();
         assert!(!columns.is_empty(), "the logs schema must have auditable columns");
         for column in &columns {
             assert!(sql.contains(&format!("MIN(\"{column}\")")), "{column} is audited by the streaming form but absent from the SQL form");

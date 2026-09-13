@@ -552,6 +552,15 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
 
+    /// The canonical dedup key of the test fixtures below.
+    fn keys() -> [String; 4] {
+        ["project", "timestamp", "service", "id"].map(str::to_owned)
+    }
+
+    fn ctx() -> Arc<TaskContext> {
+        Arc::new(TaskContext::default())
+    }
+
     #[tokio::test]
     async fn count_proofs_bind_visibility_and_retain_thirty_day_windows() -> Result<()> {
         let root = url::Url::parse("s3://bucket/table")?;
@@ -598,17 +607,15 @@ mod tests {
         Ok(())
     }
 
-    #[test_case::test_case("part/a%20b.parquet", Some("part/a%20b.parquet"))]
-    #[test_case::test_case("s3://bucket/table/part/a%20b.parquet", Some("part/a b.parquet"))]
-    #[test_case::test_case("s3://bucket/table/part/a%2520b.parquet", Some("part/a%20b.parquet"))]
-    #[test_case::test_case("s3://bucket/table-other/part/file", None)]
-    #[test_case::test_case("s3://other/table/part/file", None)]
-    #[test_case::test_case("s3://bucket/table/part/file?version=2", None)]
-    #[test_case::test_case("s3://bucket/elsewhere/file", None)]
-    fn source_paths_keep_store_and_table_identity(source: &str, expected: Option<&str>) -> Result<()> {
-        let root = url::Url::parse("s3://bucket/table")?;
-        assert_eq!(relative_source_path(&root, source)?.as_deref(), expected);
-        Ok(())
+    #[test_case::test_case("part/a%20b.parquet" => Some("part/a%20b.parquet".to_owned()) ; "relative path stays verbatim")]
+    #[test_case::test_case("s3://bucket/table/part/a%20b.parquet" => Some("part/a b.parquet".to_owned()) ; "absolute URI is percent-decoded once")]
+    #[test_case::test_case("s3://bucket/table/part/a%2520b.parquet" => Some("part/a%20b.parquet".to_owned()) ; "double encoding decodes to a literal percent")]
+    #[test_case::test_case("s3://bucket/table-other/part/file" => None ; "sibling table prefix is not a match")]
+    #[test_case::test_case("s3://other/table/part/file" => None ; "other host")]
+    #[test_case::test_case("s3://bucket/table/part/file?version=2" => None ; "query string is not a plain object path")]
+    #[test_case::test_case("s3://bucket/elsewhere/file" => None ; "outside the table root")]
+    fn source_paths_keep_store_and_table_identity(source: &str) -> Option<String> {
+        relative_source_path(&url::Url::parse("s3://bucket/table").unwrap(), source).unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -747,8 +754,8 @@ mod tests {
             covered_ranges: vec![(11, 13), (10, 12)],
         };
         let sources = vec![SourceRows { batches: vec![delta.slice(0, 2), delta.slice(2, 3)], live: BooleanBuffer::from(vec![true, true, true, false, true]) }];
-        let keys = ["project", "timestamp", "service", "id"].map(str::to_owned);
-        let resolved = resolve_with_memory(sources, memory, &keys, Some("version"), Some("deleted"), Arc::new(TaskContext::default())).await?;
+        let keys = keys();
+        let resolved = resolve_with_memory(sources, memory, &keys, Some("version"), Some("deleted"), ctx()).await?;
         assert_eq!(resolved.winners[0].iter().collect::<Vec<_>>(), vec![true, false, false, false, true]);
         assert_eq!(resolved.winners[1].iter().collect::<Vec<_>>(), vec![true], "memory authority suppresses even a higher version from an older flush");
         assert_eq!(resolved.sources[0].batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5, "physical rows must remain available for fallback");
@@ -764,7 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_delta_winners_match_full_resolution_with_memory_overlays() -> Result<()> {
-        let keys = ["project", "timestamp", "service", "id"].map(str::to_owned);
+        let keys = keys();
         let original = vec![SourceRows {
             batches: vec![batch(&[
                 ("p", "s", "a", 10, Some(1), None),
@@ -775,7 +782,7 @@ mod tests {
             live: BooleanBuffer::from(vec![true, true, true, false]),
         }];
         let mut cached = original.clone();
-        let winners = winner_masks(&cached, &keys, Some("version"), None, Arc::new(TaskContext::default())).await?;
+        let winners = winner_masks(&cached, &keys, Some("version"), None, ctx()).await?;
         for (source, live) in cached.iter_mut().zip(winners) {
             source.live = live;
         }
@@ -784,10 +791,8 @@ mod tests {
                 for ranges in [vec![], vec![(10, 11)], vec![(10, 12)]] {
                     let batches = vec![batch(&[("p", "s", "a", 10, version, deleted)])];
                     let memory = || crate::write::mem_buffer::MemSnapshot { batches: batches.clone(), covered_ranges: ranges.clone() };
-                    let expected =
-                        resolve_with_memory(original.clone(), memory(), &keys, Some("version"), Some("deleted"), Arc::new(TaskContext::default())).await?;
-                    let actual =
-                        resolve_with_memory(cached.clone(), memory(), &keys, Some("version"), Some("deleted"), Arc::new(TaskContext::default())).await?;
+                    let expected = resolve_with_memory(original.clone(), memory(), &keys, Some("version"), Some("deleted"), ctx()).await?;
+                    let actual = resolve_with_memory(cached.clone(), memory(), &keys, Some("version"), Some("deleted"), ctx()).await?;
                     assert_eq!(actual.winners, expected.winners, "version={version:?}, deleted={deleted:?}, ranges={ranges:?}");
                 }
             }
@@ -806,7 +811,7 @@ mod tests {
         let sources =
             [SourceRows { batches: vec![old], live: BooleanBuffer::new_set(rows) }, SourceRows { batches: vec![newer], live: BooleanBuffer::new_set(1) }];
         let context = datafusion::prelude::SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_batch_size(rows));
-        let keys = ["project", "timestamp", "service", "id"].map(str::to_owned);
+        let keys = keys();
         let masks = winner_masks(&sources, &keys, Some("version"), Some("deleted"), context.task_ctx()).await?;
         assert_eq!(masks[0].count_set_bits(), rows - 1);
         assert!(!masks[0].value(rows - 1), "the pre-boundary version must lose");
@@ -838,14 +843,14 @@ mod tests {
             SourceRows { batches: vec![newer], live: BooleanBuffer::new_set(5) },
             SourceRows { batches: vec![memory], live: BooleanBuffer::new_set(2) },
         ];
-        let keys = ["project", "timestamp", "service", "id"].map(str::to_owned);
-        let masks = winner_masks(&sources, &keys, Some("version"), Some("deleted"), Arc::new(TaskContext::default())).await?;
+        let keys = keys();
+        let masks = winner_masks(&sources, &keys, Some("version"), Some("deleted"), ctx()).await?;
         assert_eq!(
             masks.iter().map(|mask| mask.iter().collect::<Vec<_>>()).collect::<Vec<_>>(),
             vec![vec![false, true, true, false, true, false, false], vec![false, false, false, true, true], vec![true, true],]
         );
         sources[0].live = BooleanBuffer::new_set(1);
-        assert!(winner_masks(&sources, &keys, Some("version"), Some("deleted"), Arc::new(TaskContext::default())).await.is_err());
+        assert!(winner_masks(&sources, &keys, Some("version"), Some("deleted"), ctx()).await.is_err());
         Ok(())
     }
 }

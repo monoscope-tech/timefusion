@@ -3210,6 +3210,7 @@ mod tests {
         // 120 - (24 query + 24 buffer + 12 foyer + 12 writer reserve + 18 slack).
         // A prior brake-headroom cut freed 6 GiB to the maintenance remainder.
         assert_eq!(b.maintenance_pool_bytes, 30 * GIB, "maintenance takes the remainder AFTER slack");
+        assert_eq!(b.tick_budget(Duration::from_secs(300)), Duration::from_secs(240), "a tick budget is 80% of the cron period");
     }
 
     /// `TIMEFUSION_MEMORY_BUDGET_GB` exists so a shared host can size TF below
@@ -3408,29 +3409,43 @@ mod tests {
         );
     }
 
-    /// Certification must reach back far enough to serve a 30d query.
+    /// Both maintenance lookbacks must reach back far enough to serve a 30d query.
     ///
-    /// `dedup_sweep` is the only caller of `record_certification`, scoped to
-    /// `today - timefusion_dedup_lookback_days ..= today`, which is therefore a hard
-    /// ceiling on the longest window that can ever route to a rollup. At a
-    /// former default of 1, nothing past yesterday could certify (30d queries
-    /// timed out). Dropping below 30 silently reintroduces that.
+    /// Certification: `dedup_sweep` is the only caller of `record_certification`,
+    /// scoped to `today - timefusion_dedup_lookback_days ..= today`, which is
+    /// therefore a hard ceiling on the longest window that can ever route to a
+    /// rollup. At a former default of 1, nothing past yesterday could certify
+    /// (30d queries timed out). Dropping below 30 silently reintroduces that.
+    ///
+    /// Repair: the lookback IS the suspect-set size (admission offers every
+    /// unverified sealed file), so it is bounded on both sides: too small leaves
+    /// a hole where one footer-less file pins every wide query at `full-set`
+    /// dedup forever; too large spends the pass clearing correctly-sorted files
+    /// instead of rewriting.
     #[test]
-    fn certification_window_covers_a_thirty_day_query() {
-        assert!(
-            AppConfig::default().maintenance.timefusion_dedup_lookback_days >= 30,
-            "the dedup sweep is what certifies partitions; below 30d no 30d query can ever route to a rollup"
-        );
+    fn lookback_windows_cover_a_thirty_day_query_without_flooding() {
+        let m = &AppConfig::default().maintenance;
+        assert!(m.timefusion_dedup_lookback_days >= 30, "the dedup sweep is what certifies partitions; below 30d no 30d query can ever route to a rollup");
+        let d = m.timefusion_light_optimize_repair_days;
+        assert!(d >= 30, "must cover the 30-day window users actually query, got {d}");
+        assert!(d <= 45, "must not balloon the suspect set beyond the query window, got {d}");
     }
 
-    /// Maintenance must not be serialized on a box with room to spare.
+    /// Maintenance must not be serialized on a box with room to spare, the
+    /// coordinator pool must scale with the jobs sharing it, and the three
+    /// maintenance shares must still sum to the pool.
     ///
-    /// A hard-coded 1 here once let the maintenance queue grow unbounded with
-    /// zero dedup commits — and thus zero certifications, `DedupExec` in every
-    /// plan, and zero rollup hits. A regression silently turns 30d queries back
-    /// into timeouts, so assert the prod shape explicitly.
+    /// A hard-coded 1 job here once let the maintenance queue grow unbounded
+    /// with zero dedup commits — and thus zero certifications, `DedupExec` in
+    /// every plan, and zero rollup hits. A regression silently turns 30d queries
+    /// back into timeouts, so assert the prod shape explicitly.
+    ///
+    /// The pool once pinned at one `MAX_DECODED_BYTES` while jobs went to 16,
+    /// and FairSpill handed each consumer ~32 MB — right at
+    /// `ExternalSorterMerge`'s allocation floor — so units failed outright
+    /// instead of spilling.
     #[test]
-    fn coordinator_jobs_scale_with_the_box() {
+    fn coordinator_jobs_and_pool_scale_with_the_box() {
         // Only meaningful when the operator has not pinned the override.
         if std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").is_ok() {
             return;
@@ -3440,26 +3455,14 @@ mod tests {
         assert!(prod.coordinator_jobs() > 1, "prod-shaped box must run maintenance in parallel, got {}", prod.coordinator_jobs());
         // Every admitted unit reserves at most MAX_DECODED_BYTES, so concurrent
         // decode reservation must still fit the maintenance pool.
-        assert!(prod.coordinator_jobs() * 512 * 1024 * 1024 <= prod.maintenance_pool_bytes(), "concurrent 512 MiB units must fit the maintenance pool");
+        assert!(prod.coordinator_jobs() * 512 * MIB <= prod.maintenance_pool_bytes(), "concurrent 512 MiB units must fit the maintenance pool");
         // Small boxes stay modest rather than thrashing. Assert the invariant
         // ("doesn't thrash, still fits its pool"), not a specific job count
         // that would need editing every time the divisor moves.
         let small = DerivedBudget::from_limits(16 * GIB, 4);
         assert!(small.coordinator_jobs() <= 2, "a 4-core box must not run maintenance wide, got {}", small.coordinator_jobs());
-        assert!(small.coordinator_jobs() * 512 * 1024 * 1024 <= small.maintenance_pool_bytes(), "concurrent units must fit a small box's pool too");
-    }
+        assert!(small.coordinator_jobs() * 512 * MIB <= small.maintenance_pool_bytes(), "concurrent units must fit a small box's pool too");
 
-    /// The coordinator pool must scale with the jobs sharing it, and the three
-    /// maintenance shares must still sum to the pool.
-    ///
-    /// Once pinned at one `MAX_DECODED_BYTES` while jobs went to 16, FairSpill
-    /// handed each consumer ~32 MB — right at `ExternalSorterMerge`'s
-    /// allocation floor — and units failed outright instead of spilling.
-    #[test]
-    fn coordinator_pool_scales_with_its_jobs_without_overcommitting() {
-        if std::env::var("TIMEFUSION_COORDINATOR_JOB_WORKERS").is_ok() {
-            return;
-        }
         for (limit_gb, cores) in [(80, 48), (16, 4), (8, 4)] {
             let b = DerivedBudget::from_limits(limit_gb * GIB, cores);
             let per_job = b.coordinator_share_bytes() / b.coordinator_jobs();
@@ -3530,12 +3533,6 @@ mod tests {
         assert!(b.memory_brake_limit_bytes() < b.memory_limit_bytes());
     }
 
-    #[test]
-    fn tick_budget_is_80pct_of_cron_period() {
-        let b = DerivedBudget::from_limits(120 * GIB, 48);
-        assert_eq!(b.tick_budget(Duration::from_secs(300)), Duration::from_secs(240));
-    }
-
     /// The brake must stay well clear of the cgroup the OOM killer watches, and
     /// the budgeted limit is NOT that cgroup — prod budgets 82 GiB inside a
     /// 96 GiB container. Pinned because raising the fraction without
@@ -3576,18 +3573,16 @@ mod tests {
         assert_eq!(parse_cgroup_cpu_max(""), None);
     }
 
+    /// The clamps and unit conversions applied on top of a configured value:
+    /// a below-floor buffer request is raised to the floor, and the cache's MB
+    /// knobs convert to bytes.
     #[test]
-    fn test_buffer_min_enforcement() {
+    fn buffer_floor_is_enforced_and_cache_sizes_convert() {
         let mut config = AppConfig::default();
         config.buffer.timefusion_buffer_max_memory_mb = 10;
-        assert_eq!(config.buffer.max_memory_mb(), 64);
-    }
-
-    #[test]
-    fn test_cache_size_calculations() {
-        let mut config = AppConfig::default();
         config.cache.timefusion_foyer_memory_mb = 256;
         config.cache.timefusion_foyer_disk_mb = Some(1024);
+        assert_eq!(config.buffer.max_memory_mb(), 64, "a below-floor buffer request is clamped up to the floor");
         assert_eq!(config.cache.memory_size_bytes(), 256 * MIB);
         assert_eq!(config.cache.disk_size_bytes(), GIB);
     }
@@ -3606,18 +3601,6 @@ mod tests {
         config.buffer.timefusion_wal_max_file_count = 300;
         assert_eq!(config.effective_wal_max_unflushed_bytes(), 12_000 * MIB as u64);
         assert_eq!(config.effective_wal_max_files(), 300);
-    }
-
-    /// The lookback IS the suspect-set size (admission offers every unverified
-    /// sealed file), so it is bounded on both sides: too small leaves a hole
-    /// where one footer-less file pins every wide query at `full-set` dedup
-    /// forever; too large spends the pass clearing correctly-sorted files
-    /// instead of rewriting.
-    #[test]
-    fn repair_lookback_covers_the_query_window_without_flooding() {
-        let d = AppConfig::default().maintenance.timefusion_light_optimize_repair_days;
-        assert!(d >= 30, "must cover the 30-day window users actually query, got {d}");
-        assert!(d <= 45, "must not balloon the suspect set beyond the query window, got {d}");
     }
 }
 
@@ -3914,7 +3897,35 @@ fn available_disk_for(path: &std::path::Path) -> Option<usize> {
 
 #[cfg(test)]
 mod autotune_tests {
+    use test_case::test_case;
+
     use super::*;
+
+    fn cfg_mb(buffer: usize, foyer: usize, foyer_meta: usize) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.buffer.timefusion_buffer_max_memory_mb = buffer;
+        cfg.cache.timefusion_foyer_memory_mb = foyer;
+        cfg.cache.timefusion_foyer_metadata_memory_mb = foyer_meta;
+        cfg
+    }
+
+    /// Audit `cfg` and assert the accounting identities that must hold for ANY
+    /// config. A previous check passed the prod config that OOM-killed
+    /// repeatedly by omitting the maintenance pool, counting MemBuffer at
+    /// nominal instead of its 120% admission ceiling, ignoring
+    /// `memory_fraction`, and omitting the DataFusion metadata cache. So: both
+    /// pools come from the derived budget, and MemBuffer's 120% ceiling is on
+    /// its EFFECTIVE budget (knob − foyer − tantivy peak) — not the raw knob,
+    /// which would count foyer twice since it is summed separately.
+    fn audited(cfg: &AppConfig, ram_mb: usize) -> BudgetAudit {
+        let a = budget_audit(cfg, ram_mb);
+        assert_eq!(a.query_pool_mb, cfg.derived.query_pool_bytes() / MIB);
+        assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / MIB, "was missing entirely");
+        let effective = cfg.buffer.timefusion_buffer_max_memory_mb - a.foyer_mb - a.tantivy_peak_mb;
+        assert_eq!(a.mem_buffer_hard_mb, effective * 6 / 5);
+        assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.tantivy_peak_mb + a.df_metadata_cache_mb);
+        a
+    }
 
     #[test]
     fn apply_is_idempotent_and_respects_overrides() {
@@ -3930,30 +3941,17 @@ mod autotune_tests {
         assert_eq!(cfg.buffer.timefusion_buffer_max_memory_mb, before);
     }
 
-    /// The prod config that OOM-killed repeatedly must audit as oversubscribed.
-    /// A previous check passed it by omitting the maintenance pool, counting
-    /// MemBuffer at nominal instead of its 120% admission ceiling, ignoring
-    /// `memory_fraction`, and omitting the DataFusion metadata cache. Query +
-    /// maintenance pools now come from the derived budget.
-    #[test]
-    fn budget_audit_flags_an_oversubscribed_config() {
-        let mut cfg = AppConfig::default();
-        cfg.buffer.timefusion_buffer_max_memory_mb = 24000;
-        cfg.cache.timefusion_foyer_memory_mb = 4048;
-        cfg.cache.timefusion_foyer_metadata_memory_mb = 512;
-
-        // The container limit, not the 188GB host: this is what the kernel kills on.
-        let a = budget_audit(&cfg, 24 * 1024);
-        assert_eq!(a.query_pool_mb, cfg.derived.query_pool_bytes() / MIB);
-        assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / MIB, "was missing entirely");
-        assert_eq!(a.foyer_mb, 4560);
-        // MemBuffer's ceiling is on its EFFECTIVE budget (knob − foyer −
-        // tantivy peak), then x1.2 — not the raw knob, which would count foyer
-        // twice since it is summed separately.
-        let effective = 24000 - a.foyer_mb - a.tantivy_peak_mb;
-        assert_eq!(a.mem_buffer_hard_mb, effective * 6 / 5);
-        assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.tantivy_peak_mb + a.df_metadata_cache_mb);
-        assert!(a.oversubscribed(), "a 24GB MemBuffer in a 24GiB container must be flagged: {a:?}");
+    /// The prod config that OOM-killed repeatedly must audit as oversubscribed;
+    /// the identities behind that verdict live in `audited`. RAM is the
+    /// container limit, not the 188GB host — that is what the kernel kills on.
+    #[test_case(24000, 4048, 512, 24 * 1024 => (4560, 18432, true) ; "24GB MemBuffer in a 24GiB container is flagged")]
+    #[test_case(4096, 1024, 256, 256 * 1024 => (1280, 196608, false) ; "real slack passes")]
+    // Unknown RAM (0) must not divide-by-zero; warn_at collapses to 0 so a
+    // non-zero commitment is flagged rather than silently passing.
+    #[test_case(4096, 1024, 256, 0 => (1280, 0, true) ; "unknown ram flags rather than passes")]
+    fn budget_audit_flags_oversubscription(buffer: usize, foyer: usize, foyer_meta: usize, ram_mb: usize) -> (usize, usize, bool) {
+        let a = audited(&cfg_mb(buffer, foyer, foyer_meta), ram_mb);
+        (a.foyer_mb, a.warn_at_mb, a.oversubscribed())
     }
 
     /// An oversubscribed budget must be RECLAIMED, not merely warned about.
@@ -3971,12 +3969,12 @@ mod autotune_tests {
         let mut cfg = AppConfig::default();
         cfg.buffer.timefusion_buffer_max_memory_mb = 24000;
         let ram_mb = 24 * 1024;
-        let before = budget_audit(&cfg, ram_mb);
+        let before = audited(&cfg, ram_mb);
         assert!(before.oversubscribed(), "fixture must start oversubscribed: {before:?}");
 
         let overage = before.committed_mb.saturating_sub(before.warn_at_mb);
         let reclaimed = cfg.derived.reclaim_maintenance_pool(overage * MIB) / MIB;
-        let after = budget_audit(&cfg, ram_mb);
+        let after = audited(&cfg, ram_mb);
 
         assert!(reclaimed > 0, "something must actually be surrendered");
         assert_eq!(after.maintenance_pool_mb, before.maintenance_pool_mb - reclaimed, "the reclaim comes out of maintenance");
@@ -3990,18 +3988,6 @@ mod autotune_tests {
         let floored = cfg.derived.reclaim_maintenance_pool(usize::MAX);
         assert!(cfg.derived.maintenance_pool_bytes() >= 1024 * 1024 * 1024, "must not reclaim below the floor");
         assert!(floored <= after.maintenance_pool_mb * MIB);
-    }
-
-    #[test]
-    fn budget_audit_passes_a_config_with_real_slack() {
-        let mut cfg = AppConfig::default();
-        cfg.buffer.timefusion_buffer_max_memory_mb = 4096;
-        cfg.cache.timefusion_foyer_memory_mb = 1024;
-        cfg.cache.timefusion_foyer_metadata_memory_mb = 256;
-        assert!(!budget_audit(&cfg, 256 * 1024).oversubscribed());
-        // Unknown RAM (0) must not divide-by-zero; warn_at collapses to 0 so a
-        // non-zero commitment is flagged rather than silently passing.
-        assert_eq!(budget_audit(&cfg, 0).warn_at_mb, 0);
     }
 }
 

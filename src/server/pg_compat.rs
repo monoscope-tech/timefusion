@@ -652,6 +652,17 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::AsArray;
 
+    /// Runs `sql` on a session wired the way pgwire wires one, as user `operator`.
+    async fn query(sql: &str) -> RecordBatch {
+        let ctx = SessionContext::new();
+        register_identity_udfs(&ctx, "operator", 60);
+        ctx.sql(sql).await.unwrap().collect().await.unwrap().remove(0)
+    }
+
+    fn text(batch: &RecordBatch, col: usize) -> &str {
+        batch.column(col).as_string::<i32>().value(0)
+    }
+
     /// With the batch ceiling off this is exactly `min(client, server)`.
     ///
     /// With it on, a session raises the cap only by ASKING, and never past the
@@ -675,10 +686,12 @@ mod tests {
         effective_statement_timeout(client_secs.map(Duration::from_secs), max_statement_secs, batch_statement_secs).map(|timeout| timeout.as_secs())
     }
 
-    #[test]
-    fn compatibility_settings_are_case_insensitive() {
-        assert_eq!(compatibility_setting("TimeZone", 60).as_deref(), Some("UTC"));
-        assert_eq!(compatibility_setting("unknown", 60), None);
+    #[test_case::test_case("TimeZone", 60 => Some("UTC".to_string()) ; "a mixed-case name still resolves")]
+    #[test_case::test_case("timezone", 60 => Some("UTC".to_string()) ; "the canonical lowercase spelling resolves")]
+    #[test_case::test_case("statement_timeout", 60 => Some("60000".to_string()) ; "statement_timeout is reported in millis")]
+    #[test_case::test_case("unknown", 60 => None ; "an unlisted name resolves to nothing")]
+    fn compatibility_settings_are_case_insensitive(name: &str, max_statement_secs: u64) -> Option<String> {
+        compatibility_setting(name, max_statement_secs)
     }
 
     #[test]
@@ -693,14 +706,12 @@ mod tests {
     /// found" if this regresses; the upstream pg_catalog only ships the view.
     #[tokio::test]
     async fn pg_show_all_settings_is_callable_as_a_table_function() {
-        let ctx = SessionContext::new();
-        register_identity_udfs(&ctx, "operator", 60);
-        let batches = ctx.sql("SELECT setting FROM pg_show_all_settings() WHERE name = 'server_version'").await.unwrap().collect().await.unwrap();
-        assert_eq!(batches[0].column(0).as_string::<i32>().value(0), PG_COMPAT_VERSION);
+        let one = query("SELECT setting FROM pg_show_all_settings() WHERE name = 'server_version'").await;
+        assert_eq!(text(&one, 0), PG_COMPAT_VERSION);
 
-        let all = ctx.sql("SELECT * FROM pg_show_all_settings()").await.unwrap().collect().await.unwrap();
-        assert_eq!(all[0].num_rows(), COMPATIBILITY_SETTING_NAMES.len());
-        assert_eq!(all[0].num_columns(), 17);
+        let all = query("SELECT * FROM pg_show_all_settings()").await;
+        assert_eq!(all.num_rows(), COMPATIBILITY_SETTING_NAMES.len());
+        assert_eq!(all.num_columns(), 17);
     }
 
     /// pgAdmin's dashboard polls these on a timer; a missing one is a planning
@@ -724,31 +735,20 @@ mod tests {
     /// silently drops it and `current_setting()` still errors on it.
     #[tokio::test]
     async fn pgadmin_connect_probes_all_resolve() {
-        let ctx = SessionContext::new();
-        register_identity_udfs(&ctx, "operator", 60);
         for name in COMPATIBILITY_SETTING_NAMES {
             assert!(compatibility_setting(name, 60).is_some(), "{name} is listed but unresolvable");
         }
-        let batches = ctx.sql("SELECT current_setting('bytea_output'), pg_is_in_recovery()").await.unwrap().collect().await.unwrap();
-        assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "hex");
-        assert!(!batches[0].column(1).as_boolean().value(0));
+        let batch = query("SELECT current_setting('bytea_output'), pg_is_in_recovery()").await;
+        assert_eq!(text(&batch, 0), "hex");
+        assert!(!batch.column(1).as_boolean().value(0));
     }
 
     #[tokio::test]
     async fn identity_and_setting_udfs_match_the_compatibility_contract() {
-        let ctx = SessionContext::new();
-        register_identity_udfs(&ctx, "operator", 60);
-        let batches = ctx
-            .sql("SELECT current_database(), session_user, current_setting('server_version'), current_setting('unknown', true)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let batch = &batches[0];
-        assert_eq!(batch.column(0).as_string::<i32>().value(0), PG_COMPAT_DATABASE);
-        assert_eq!(batch.column(1).as_string::<i32>().value(0), "operator");
-        assert_eq!(batch.column(2).as_string::<i32>().value(0), PG_COMPAT_VERSION);
+        let batch = query("SELECT current_database(), session_user, current_setting('server_version'), current_setting('unknown', true)").await;
+        assert_eq!(text(&batch, 0), PG_COMPAT_DATABASE);
+        assert_eq!(text(&batch, 1), "operator");
+        assert_eq!(text(&batch, 2), PG_COMPAT_VERSION);
         assert!(batch.column(3).is_null(0));
     }
 }
@@ -1412,8 +1412,13 @@ mod stats_table_tests {
         assert!(rows.iter().any(|(c, k, _)| c == component && k == key), "missing {component}.{key}");
     }
 
-    #[test]
-    fn exposes_foyer_runtime_configuration_and_occupancy() {
+    /// Every optional wiring attached at once. Each `with_*` feeds its own
+    /// independent `map_or_else` branch, so one snapshot proves them all.
+    ///
+    /// `with_scan_metrics` is REQUIRED, not incidental: the whole `memory`
+    /// component is emitted inside the scan-metrics branch, so an unwired scan
+    /// hides every pool row too.
+    fn fully_wired_rows() -> Vec<OwnedRow> {
         let snapshot = FoyerRuntimeStats {
             memory_size_bytes: 4 * 1024 * 1024,
             disk_size_bytes: 128 * 1024 * 1024 * 1024,
@@ -1430,105 +1435,112 @@ mod stats_table_tests {
             evictions: 8,
             ..Default::default()
         };
-        let rows = snapshot_rows(&StatsTableProvider::new(None).with_foyer_stats(Arc::new(move || snapshot.clone())));
-
-        for key in [
-            "memory_mb",
-            "disk_gb",
-            "ttl_seconds",
-            "l1_max_entry_mb",
-            "block_size_mb",
-            "cache_recent_days",
-            "cache_dir",
-            "metadata_memory_mb",
-            "metadata_disk_gb",
-            "l1_used_bytes",
-            "l2_used_bytes",
-            "entry_count",
-            "evictions",
-        ] {
-            assert_has(&rows, "foyer", key);
-        }
-        assert!(rows.contains(&("foyer".into(), "cache_dir".into(), "/cache".into())));
+        snapshot_rows(
+            &StatsTableProvider::new(None)
+                .with_scan_metrics(Arc::new(ScanMetrics::default()))
+                .with_foyer_stats(Arc::new(move || snapshot.clone()))
+                .with_maintenance_pools(Arc::new(|| (25, 100)), Arc::new(|| (3, 4)))
+                .with_logical_count(Arc::new(|| (3, 42, 100, 1))),
+        )
     }
 
-    /// The pool rows must EXIST and divide by the size they were given.
+    /// One snapshot, every wired component: the rows a `timefusion_stats` query
+    /// must carry, and the handful whose VALUE is the point.
     ///
-    /// Both halves have bitten: an unwired closure reads `(0, 0)` and is
+    /// The pool rows must EXIST and divide by the size they were given. Both
+    /// halves have bitten: an unwired closure reads `(0, 0)` and is
     /// indistinguishable from an idle pool, and the maintenance row's
     /// denominator was initially the whole maintenance pool while its numerator
     /// is reserved from the heavy share — which would have made a saturated pool
     /// report 30% and argued for widening the very ceiling that was saturating.
     ///
-    /// `with_scan_metrics` is REQUIRED, not incidental: the whole `memory`
-    /// component is emitted inside the scan-metrics branch, so an unwired scan
-    /// hides every pool row too.
-    #[test]
-    fn exposes_maintenance_and_coordinator_pool_usage() {
-        let rows = snapshot_rows(
-            &StatsTableProvider::new(None)
-                .with_scan_metrics(Arc::new(ScanMetrics::default()))
-                .with_maintenance_pools(Arc::new(|| (25, 100)), Arc::new(|| (3, 4))),
-        );
-        for key in ["maintenance_pool_used_bytes", "maintenance_pool_pct", "coordinator_pool_used_bytes", "coordinator_pool_pct"] {
-            assert_has(&rows, "memory", key);
-        }
-        assert!(rows.contains(&("memory".into(), "maintenance_pool_pct".into(), "25".into())), "pct must divide used by the size it was handed");
-        assert!(rows.contains(&("memory".into(), "coordinator_pool_pct".into(), "75".into())));
-    }
-
-    /// An unwired pool must not divide by zero — it reports 0, like the query pool.
-    #[test]
-    fn unwired_pool_rows_are_zero_rather_than_a_panic() {
-        let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
-        assert!(rows.contains(&("memory".into(), "maintenance_pool_pct".into(), "0".into())));
-    }
-
-    #[test]
-    fn exposes_logical_count_residency_and_build_activity() {
-        let rows = snapshot_rows(&StatsTableProvider::new(None).with_logical_count(Arc::new(|| (3, 42, 100, 1))));
-        for key in ["resident_partitions", "resident_bytes_estimated", "resident_mb_estimated", "resident_limit_bytes", "resident_limit_mb", "active_builds"] {
-            assert_has(&rows, "logical_count", key);
-        }
-        assert!(rows.contains(&("logical_count".into(), "active_builds".into(), "1".into())));
-    }
-
     /// Process age and worker starvation must be readable in the same query as
     /// the counters they qualify — a counter quoted without uptime is not a
     /// measurement (2026-08-23, twice).
+    ///
+    /// `parquet` rows come from deltalake's global snapshot struct, not from a
+    /// declaration this crate owns — the only counters here still exposed by hand.
     #[test]
-    fn exposes_process_uptime_scheduling_lag_and_blocking_sections() {
+    fn exposes_every_wired_component_foyer_pools_logical_count_runtime_scan_and_parquet() {
+        use crate::database::scan_metric_names::{SCAN_DERIVED_ROWS, SCAN_ROWS};
         crate::observability::mark_process_start();
         drop(crate::observability::BlockWatch::new("test_section"));
         drop(crate::observability::TimedSection::new("test_section"));
 
-        let rows = snapshot_rows(&StatsTableProvider::new(None));
-        for key in ["uptime_seconds", "scheduling_lag_ms", "scheduling_lag_max_ms", "worker_threads"] {
-            assert_has(&rows, "runtime", key);
-        }
+        let rows = fully_wired_rows();
+        let expect = |component: &str, keys: &[&str]| {
+            for key in keys {
+                assert_has(&rows, component, key);
+            }
+        };
+
+        expect(
+            "foyer",
+            &[
+                "memory_mb",
+                "disk_gb",
+                "ttl_seconds",
+                "l1_max_entry_mb",
+                "block_size_mb",
+                "cache_recent_days",
+                "cache_dir",
+                "metadata_memory_mb",
+                "metadata_disk_gb",
+                "l1_used_bytes",
+                "l2_used_bytes",
+                "entry_count",
+                "evictions",
+            ],
+        );
+        expect("memory", &["maintenance_pool_used_bytes", "maintenance_pool_pct", "coordinator_pool_used_bytes", "coordinator_pool_pct"]);
+        expect(
+            "logical_count",
+            &["resident_partitions", "resident_bytes_estimated", "resident_mb_estimated", "resident_limit_bytes", "resident_limit_mb", "active_builds"],
+        );
+        expect("runtime", &["uptime_seconds", "scheduling_lag_ms", "scheduling_lag_max_ms", "worker_threads"]);
         // Same section name under both kinds must stay two distinct rows: one
         // claims worker occupancy, the other only wall time.
         for component in ["block", "section"] {
-            for key in ["test_section.count", "test_section.total_ms", "test_section.max_ms", "test_section.avg_us"] {
-                assert_has(&rows, component, key);
-            }
+            expect(component, &["test_section.count", "test_section.total_ms", "test_section.max_ms", "test_section.avg_us"]);
+        }
+        expect("parquet", &["metadata_cache_hits", "bytes_read"]);
+        for (component, key) in SCAN_ROWS.iter().map(|(c, k, _)| (*c, *k)).chain(SCAN_DERIVED_ROWS.iter().copied()) {
+            assert_has(&rows, component, key);
+        }
+
+        // The rows whose VALUE, not mere presence, is the assertion: a pct must
+        // divide used by the size it was handed, and a passthrough must not
+        // mangle what it was given.
+        for (component, key, value) in [
+            ("foyer", "cache_dir", "/cache"),
+            ("memory", "maintenance_pool_pct", "25"),
+            ("memory", "coordinator_pool_pct", "75"),
+            ("logical_count", "active_builds", "1"),
+        ] {
+            assert!(rows.contains(&(component.into(), key.into(), value.into())), "{component}.{key} must read {value}");
         }
     }
 
-    /// Every counter `scan_metrics!` declares must reach `timefusion_stats`.
+    /// Scan metrics wired and NOTHING else — the two claims that need exactly
+    /// that shape.
     ///
-    /// `rows`/`reasons` entries are rendered FROM the declaration, so for those
-    /// this only re-proves what the macro already makes structural. What it
-    /// actually pins is `derived`: counters that reach stats through a row
-    /// pg_compat computes by hand (an average, a percentile), the one remaining
-    /// way a declared counter can go unexposed.
+    /// 1. An unwired pool must not divide by zero — it reports 0, like the query
+    ///    pool.
+    /// 2. Every counter `scan_metrics!` declares must reach `timefusion_stats`.
+    ///    `rows`/`reasons` entries are rendered FROM the declaration, so for
+    ///    those this only re-proves what the macro already makes structural. What
+    ///    it actually pins is `derived`: counters that reach stats through a row
+    ///    pg_compat computes by hand (an average, a percentile), the one
+    ///    remaining way a declared counter can go unexposed.
     ///
-    /// The bug it retires: the 2026-08-23 prefilter split renamed four reasons
-    /// and the readout kept asking for the retired string, so `map_or(0, …)`
-    /// rendered a confident 0 — 53% of prod skips unattributable on 2026-08-24.
+    ///    The bug it retires: the 2026-08-23 prefilter split renamed four reasons
+    ///    and the readout kept asking for the retired string, so `map_or(0, …)`
+    ///    rendered a confident 0 — 53% of prod skips unattributable on 2026-08-24.
     #[test]
-    fn every_declared_scan_metric_has_a_row() {
+    fn unwired_pools_read_zero_and_every_declared_scan_metric_has_a_row() {
         let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
+        assert!(rows.contains(&("memory".into(), "maintenance_pool_pct".into(), "0".into())), "an unwired pool reports 0, not a panic");
+
         let exposed = rows.iter().filter(|(component, key, _)| component == "scan" && key.starts_with("prefilter_skipped_")).count();
         assert_eq!(
             exposed,
@@ -1562,25 +1574,5 @@ mod stats_table_tests {
             .map(|(_, key, _)| key.clone())
             .collect();
         assert_eq!(exposed, expected, "the exposed rows and the bucket lists must be the same set — an unexposed bucket cannot be attributed");
-    }
-
-    #[test]
-    fn exposes_dml_retry_outcomes() {
-        use crate::database::scan_metric_names::{SCAN_DERIVED_ROWS, SCAN_ROWS};
-        let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
-
-        for (component, key) in SCAN_ROWS.iter().map(|(c, k, _)| (*c, *k)).chain(SCAN_DERIVED_ROWS.iter().copied()) {
-            assert_has(&rows, component, key);
-        }
-    }
-
-    /// `parquet` rows come from deltalake's global snapshot struct, not from a
-    /// declaration this crate owns — the only counters here still exposed by hand.
-    #[test]
-    fn exposes_parquet_io_counters() {
-        let rows = snapshot_rows(&StatsTableProvider::new(None).with_scan_metrics(Arc::new(ScanMetrics::default())));
-        for key in ["metadata_cache_hits", "bytes_read"] {
-            assert_has(&rows, "parquet", key);
-        }
     }
 }

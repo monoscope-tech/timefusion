@@ -168,13 +168,17 @@ fn match_source<'a>(matched: &'a LogicalPlan, input: &LogicalPlan, width: i64) -
             if column(&binary.left, "timestamp") {
                 let Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), _), _) = unalias(&binary.right) else { return None };
                 // lo is exclusive-shifted for `>`, hi for `<=`; both narrow toward the tighter bound.
-                let (bound, shift, tighter): (&mut Option<i64>, i64, fn(i64, i64) -> i64) = match binary.op {
-                    Operator::GtEq | Operator::Gt => (&mut lo, i64::from(binary.op == Operator::Gt), i64::max),
-                    Operator::Lt | Operator::LtEq => (&mut hi, i64::from(binary.op == Operator::LtEq), i64::min),
+                match binary.op {
+                    Operator::GtEq | Operator::Gt => {
+                        let value = value.checked_add(i64::from(binary.op == Operator::Gt))?;
+                        lo = Some(lo.map_or(value, |old| old.max(value)));
+                    }
+                    Operator::Lt | Operator::LtEq => {
+                        let value = value.checked_add(i64::from(binary.op == Operator::LtEq))?;
+                        hi = Some(hi.map_or(value, |old| old.min(value)));
+                    }
                     _ => return None,
-                };
-                let value = value.checked_add(shift)?;
-                *bound = Some(bound.map_or(value, |old| tighter(old, value)));
+                }
                 continue;
             }
         }

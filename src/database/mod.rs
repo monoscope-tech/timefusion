@@ -1696,7 +1696,7 @@ fn merge_max_watermark_maps(into: &mut serde_json::Map<String, serde_json::Value
     };
     // Non-numeric keys are the "topic" key — already present and identical.
     for (shard, value) in from.into_iter().filter(|(shard, _)| shard.parse::<usize>().is_ok()) {
-        if !into.get(&shard).is_some_and(|existing| pos(existing) >= pos(&value)) {
+        if into.get(&shard).is_none_or(|existing| pos(existing) < pos(&value)) {
             into.insert(shard, value);
         }
     }
@@ -4905,24 +4905,24 @@ impl Database {
                         // small, authoritative set of invalidations persisted in
                         // rollup_journal so they still converge instead of
                         // remaining on the correctness-safe raw fallback forever.
-                        let requeued_dirty_partitions = (discarded_bootstrap_tasks != 0)
-                            .then(|| {
-                                db.rollup_dirty
-                                    .iter()
-                                    // fold, not filter().count(): the enqueue is the POINT of the
-                                    // traversal, so it must not sit in a predicate a later
-                                    // short-circuiting adapter could stop driving.
-                                    .fold(0usize, |requeued, entry| {
-                                        let ((project, source, date), hours) = (entry.key(), *entry.value());
-                                        let enqueued = hours != 0
-                                            && db
-                                                .enqueue_maintenance_hours(project, source, date, hours, true)
-                                                .inspect_err(|error| warn!(%error, project, source, date, event = "maintenance_dirty_partition_requeue_failed"))
-                                                .is_ok();
-                                        requeued + usize::from(enqueued)
-                                    })
-                            })
-                            .unwrap_or_default();
+                        let requeued_dirty_partitions = if discarded_bootstrap_tasks == 0 {
+                            0
+                        } else {
+                            db.rollup_dirty
+                                .iter()
+                                // fold, not filter().count(): the enqueue is the POINT of the
+                                // traversal, so it must not sit in a predicate a later
+                                // short-circuiting adapter could stop driving.
+                                .fold(0usize, |requeued, entry| {
+                                    let ((project, source, date), hours) = (entry.key(), *entry.value());
+                                    let enqueued = hours != 0
+                                        && db
+                                            .enqueue_maintenance_hours(project, source, date, hours, true)
+                                            .inspect_err(|error| warn!(%error, project, source, date, event = "maintenance_dirty_partition_requeue_failed"))
+                                            .is_ok();
+                                    requeued + usize::from(enqueued)
+                                })
+                        };
                         info!(
                             discarded_bootstrap_tasks,
                             requeued_dirty_partitions,
@@ -8528,27 +8528,34 @@ pub(crate) fn select_tail_bin(
 
 #[cfg(test)]
 mod decode_tests {
+    use test_case::test_case;
+
+    /// Asserts a sort-parallelism ladder's shape: it starts at the fast setting and descends
+    /// strictly to 1, the only setting with no (unspillable) `SortPreservingMergeExec` at all.
+    fn assert_ladder(ladder: &[usize], top: usize) {
+        assert_eq!(*ladder.last().unwrap(), 1, "the floor must have no merge exec");
+        assert_eq!(ladder[0], top, "the ladder starts at the fast setting");
+        assert!(ladder.windows(2).all(|w| w[0] > w[1]), "strictly descending: {ladder:?}");
+    }
+
     /// The gate bounds decode heap; it used to bound polls, which reserved the worst case for every
     /// batch. Dashboard batches are much smaller than the worst case, so most of the budget went
     /// unused while polls queued. Charging for produced heap must not move the ceiling.
+    // THE INVARIANT: a worst-case batch still claims a whole slot, so N concurrent worst-case
+    // decodes are still capped at N readers. Unknown size (a stream's first poll) is charged
+    // conservatively — the pre-split behaviour — so nothing regresses before we have evidence.
+    #[test_case(crate::database::NOMINAL_DECODE_BATCH_BYTES => crate::database::DECODE_UNITS_PER_READER ; "a full-size batch must still cost a full slot")]
+    #[test_case(crate::database::NOMINAL_DECODE_BATCH_BYTES * 4 => crate::database::DECODE_UNITS_PER_READER ; "an oversized batch is clamped, never exceeding one slot")]
+    #[test_case(0 => crate::database::DECODE_UNITS_PER_READER ; "unknown batch size claims a whole slot")]
+    // The actual prod-measured batch size: 1 unit of 16, i.e. 16x the concurrency at the same ceiling.
+    #[test_case(210 * 1024 => 1 ; "a 0.21 MB prod batch costs one unit, not a whole slot")]
+    fn a_decode_claim_is_proportional_to_heap_and_never_exceeds_one_reader_slot(bytes: u64) -> u32 {
+        super::decode_units(bytes)
+    }
+
     #[test]
-    fn a_decode_claim_is_proportional_to_heap_and_never_exceeds_one_reader_slot() {
+    fn a_decode_claim_is_monotonic_and_never_zero() {
         let k = super::DECODE_UNITS_PER_READER;
-        let nominal = super::NOMINAL_DECODE_BATCH_BYTES;
-
-        // THE INVARIANT: a worst-case batch still claims a whole slot, so N
-        // concurrent worst-case decodes are still capped at N readers.
-        assert_eq!(super::decode_units(nominal), k, "a full-size batch must still cost a full slot");
-        assert_eq!(super::decode_units(nominal * 4), k, "an oversized batch is clamped, never exceeding one slot");
-
-        // Unknown size (a stream's first poll) is charged conservatively — the
-        // pre-split behaviour — so nothing regresses before we have evidence.
-        assert_eq!(super::decode_units(0), k, "unknown batch size claims a whole slot");
-
-        // The actual prod-measured batch size: 1 unit of 16, i.e. 16x the
-        // concurrency at the same ceiling.
-        assert_eq!(super::decode_units(210 * 1024), 1, "a 0.21 MB prod batch costs one unit, not a whole slot");
-
         // Monotonic, and never zero (zero would break progress guarantees).
         let mut prev = 0;
         for mb in [0.2_f64, 1.0, 10.0, 50.0, 100.0, 145.0] {
@@ -8681,19 +8688,14 @@ mod decode_tests {
         for attempts in 2..9u32 {
             assert_eq!(super::dedup_sort_partitions(attempts), 1, "attempt {attempts} must narrow: the merge exec cannot spill");
         }
-        let ladder = super::DEDUP_SORT_PARTITION_LADDER;
-        assert_eq!(*ladder.last().unwrap(), 1, "the floor must have no merge exec");
-        assert!(ladder.windows(2).all(|w| w[0] > w[1]), "strictly descending: {ladder:?}");
+        assert_ladder(&super::DEDUP_SORT_PARTITION_LADDER, super::MAINTENANCE_MAX_PARTITIONS);
     }
 
     /// The ladder must end at 1: a single-partition sort is the only setting
     /// with no `SortPreservingMergeExec` at all, and that exec cannot spill.
     #[test]
     fn the_parallelism_ladder_descends_to_a_single_partition() {
-        let ladder = super::REPAIR_SORT_PARTITION_LADDER;
-        assert_eq!(*ladder.last().unwrap(), 1, "the floor must have no merge exec");
-        assert_eq!(ladder[0], super::REPAIR_SORT_PARTITIONS, "the ladder starts at the fast setting");
-        assert!(ladder.windows(2).all(|w| w[0] > w[1]), "strictly descending: {ladder:?}");
+        assert_ladder(&super::REPAIR_SORT_PARTITION_LADDER, super::REPAIR_SORT_PARTITIONS);
     }
 
     #[test]
@@ -10833,20 +10835,40 @@ fn decide_prefilter(
 #[cfg(test)]
 mod decide_prefilter_tests {
     use super::*;
+    use test_case::test_case;
 
-    fn decide(ids: &[&str], indexed_rows: u64, is_mutable: bool) -> PrefilterDecision {
-        decide_prefilter(
+    /// One `decide_prefilter` call with realistic NON-EMPTY narrowing inputs, rendered
+    /// as a stable string so a case line pins the exact decision *and* the exact
+    /// exclude/row-selection payload (`PrefilterDecision` is neither `Debug` nor `Eq`).
+    fn decide(ids: &[&str], indexed_rows: u64, min_selectivity_pct: u64, field_gap: bool, is_mutable: bool, file_pruning: bool, row_selection: bool) -> String {
+        let decision = decide_prefilter(
             ids.iter().map(|s| s.to_string()).collect(),
             indexed_rows,
-            50, // min_selectivity_pct
-            false,
+            min_selectivity_pct,
+            field_gap,
             HashSet::from(["covered.parquet".to_string()]),
             HashSet::from(["zero_hit.parquet".to_string()]),
             HashMap::from([("row_sel.parquet".to_string(), vec![1, 2])]),
             is_mutable,
-            true,
-            true,
-        )
+            file_pruning,
+            row_selection,
+        );
+        let sorted = |s: HashSet<String>| {
+            let mut v: Vec<_> = s.into_iter().collect();
+            v.sort();
+            v.join(",")
+        };
+        match decision {
+            PrefilterDecision::Skipped(reason) => format!("skipped:{reason}"),
+            PrefilterDecision::Used { ids, covered_files, exclude_files, row_selections } => {
+                let rows = row_selections.map_or("none".to_string(), |m| {
+                    let mut v: Vec<_> = m.into_iter().map(|(f, r)| format!("{f}:{r:?}")).collect();
+                    v.sort();
+                    v.join(",")
+                });
+                format!("used ids={} covered={} exclude={} rows={rows}", sorted(ids), sorted(covered_files), exclude_files.map_or("none".to_string(), sorted))
+            }
+        }
     }
 
     /// The narrowing itself: which predicates count as touching a mutable
@@ -10888,89 +10910,35 @@ mod decide_prefilter_tests {
         assert!(!mutable.is_empty(), "otel declares mutable columns; an empty set would make this test prove nothing");
     }
 
-    /// Indexed-only candidate discovery cannot drop competing mutable versions.
-    #[test]
-    fn only_a_mutable_predicate_blocks_file_pruning() {
-        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 100, false) else {
-            panic!("immutable predicate must use the prefilter");
-        };
-        assert!(exclude_files.is_some(), "an immutable-only predicate must prune zero-hit files");
-        assert!(row_selections.is_some(), "...and push row selections");
-
-        assert!(matches!(decide(&["a"], 100, true), PrefilterDecision::Skipped("mutable_visibility")));
-    }
-
-    /// Each skip reason fires independently and in the documented priority order —
-    /// pins the exact branch order `scan()`'s prefilter block depends on.
-    #[test]
-    fn skip_reasons_fire_in_priority_order() {
-        assert!(matches!(decide(&["a"], 0, false), PrefilterDecision::Skipped("empty_index")));
-        assert!(matches!(decide(&["a", "b"], 2, false), PrefilterDecision::Skipped("low_selectivity")), "2 of 2 indexed rows hit == 100% >= 50%");
-        let field_gap = decide_prefilter(
-            HashSet::from(["a".to_string()]),
-            10,
-            50,
-            true, // field_gap
-            HashSet::new(),
-            HashSet::new(),
-            HashMap::new(),
-            false,
-            true,
-            true,
-        );
-        assert!(matches!(field_gap, PrefilterDecision::Skipped("field_coverage_gap")));
-    }
-
-    /// A 0% selectivity floor is the whole prefilter's off switch, and the e2e
-    /// harness (`with_tantivy_prefilter(false)`) relies on it to keep a Delta
-    /// leg's file list independent of a detached index build. It must skip for
-    /// EVERY hit set — the empty one included, which would otherwise push an
-    /// `id IN ()` that statically prunes every file.
-    #[test]
-    fn zero_selectivity_floor_skips_every_hit_set() {
-        for ids in [&[][..], &["a"][..]] {
-            let d = decide_prefilter(
-                ids.iter().map(|s| s.to_string()).collect(),
-                100,
-                0, // min_selectivity_pct
-                false,
-                HashSet::new(),
-                HashSet::from(["zero_hit.parquet".to_string()]),
-                HashMap::new(),
-                false,
-                true,
-                true,
-            );
-            assert!(matches!(d, PrefilterDecision::Skipped("low_selectivity")), "0% floor must skip for {} hits", ids.len());
-        }
-    }
-
-    /// A non-mutable (non-merge-on-read) table gets file exclusion + row selection.
-    #[test]
-    fn non_mutable_table_gets_file_exclusion_and_row_selection() {
-        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decide(&["a"], 10, false) else { panic!("expected Used") };
-        assert_eq!(exclude_files, Some(HashSet::from(["zero_hit.parquet".to_string()])));
-        assert_eq!(row_selections, Some(HashMap::from([("row_sel.parquet".to_string(), vec![1, 2])])));
-    }
-
-    /// Disabled config knobs suppress narrowing even when the data would otherwise justify it.
-    #[test]
-    fn narrowing_respects_its_own_config_toggle() {
-        let decision = decide_prefilter(
-            HashSet::from(["a".to_string()]),
-            10,
-            50,
-            false,
-            HashSet::new(),
-            HashSet::from(["zero_hit.parquet".to_string()]),
-            HashMap::from([("row_sel.parquet".to_string(), vec![1])]),
-            false,
-            false, // file_pruning_enabled = false
-            false, // row_selection_enabled = false
-        );
-        let PrefilterDecision::Used { exclude_files, row_selections, .. } = decision else { panic!("expected Used") };
-        assert!(exclude_files.is_none(), "file pruning disabled must suppress exclude_files even though zero_hit_files is non-empty");
-        assert!(row_selections.is_none(), "row selection disabled must suppress row_selections even though the map is non-empty");
+    // Indexed-only candidate discovery cannot drop competing mutable versions: an
+    // immutable-only predicate prunes zero-hit files and pushes row selections, a
+    // mutable one blocks file pruning entirely.
+    #[test_case(&["a"], 100, 50, false, false, true, true => "used ids=a covered=covered.parquet exclude=zero_hit.parquet rows=row_sel.parquet:[1, 2]".to_string() ; "only a mutable predicate blocks file pruning")]
+    #[test_case(&["a"], 100, 50, false, true, true, true => "skipped:mutable_visibility".to_string() ; "a mutable predicate is refused")]
+    // Each skip reason fires independently and in the documented priority order —
+    // pins the exact branch order `scan()`'s prefilter block depends on. The
+    // empty-index case ALSO satisfies the low-selectivity condition (1*100 >= 0*50),
+    // so it is what proves `empty_index` is tested first.
+    #[test_case(&["a"], 0, 50, false, false, true, true => "skipped:empty_index".to_string() ; "empty index wins over low selectivity")]
+    #[test_case(&["a", "b"], 2, 50, false, false, true, true => "skipped:low_selectivity".to_string() ; "2 of 2 indexed rows hit == 100% >= 50%")]
+    #[test_case(&["a"], 10, 50, true, false, true, true => "skipped:field_coverage_gap".to_string() ; "an in-window index missing a queried field")]
+    // A 0% selectivity floor is the whole prefilter's off switch, and the e2e
+    // harness (`with_tantivy_prefilter(false)`) relies on it to keep a Delta
+    // leg's file list independent of a detached index build. It must skip for
+    // EVERY hit set — the empty one included, which would otherwise push an
+    // `id IN ()` that statically prunes every file.
+    #[test_case(&[] as &[&str], 100, 0, false, false, true, true => "skipped:low_selectivity".to_string() ; "zero selectivity floor skips the empty hit set")]
+    #[test_case(&["a"], 100, 0, false, false, true, true => "skipped:low_selectivity".to_string() ; "zero selectivity floor skips a non-empty hit set")]
+    // A non-mutable (non-merge-on-read) table gets file exclusion + row selection,
+    // with exactly the zero-hit files and row selections it was handed.
+    #[test_case(&["a"], 10, 50, false, false, true, true => "used ids=a covered=covered.parquet exclude=zero_hit.parquet rows=row_sel.parquet:[1, 2]".to_string() ; "non mutable table gets file exclusion and row selection")]
+    // Disabled config knobs suppress narrowing even though zero_hit_files and the
+    // row-selection map are both non-empty.
+    #[test_case(&["a"], 10, 50, false, false, false, false => "used ids=a covered=covered.parquet exclude=none rows=none".to_string() ; "narrowing respects its own config toggle")]
+    fn prefilter_decision(
+        ids: &[&str], indexed_rows: u64, min_selectivity_pct: u64, field_gap: bool, is_mutable: bool, file_pruning: bool, row_selection: bool,
+    ) -> String {
+        decide(ids, indexed_rows, min_selectivity_pct, field_gap, is_mutable, file_pruning, row_selection)
     }
 }
 
@@ -11643,9 +11611,11 @@ impl TableProvider for ProjectRoutingTable {
 #[cfg(test)]
 mod writer_properties_tests {
     use deltalake::datafusion::parquet::{
-        basic::{Compression, ZstdLevel},
+        basic::{Compression, Encoding, ZstdLevel},
+        file::properties::EnabledStatistics,
         schema::types::ColumnPath,
     };
+    use test_case::test_case;
 
     use super::*;
     use crate::schema::{FieldDef, SortingColumnDef, TableSchema};
@@ -11677,6 +11647,20 @@ mod writer_properties_tests {
     /// Drain the streaming sort into batches, failing loudly on a merge error.
     fn drain(f: FlushBatches) -> Vec<RecordBatch> {
         f.collect::<Result<Vec<_>, _>>().expect("merge must not fail on well-formed input")
+    }
+
+    /// A batch of one non-null Int64 `timestamp` column — the minimal input for the sort paths.
+    fn ts_batch(vals: Vec<i64>) -> RecordBatch {
+        use arrow::array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        let s = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
+        RecordBatch::try_new(s, vec![Arc::new(Int64Array::from(vals))]).unwrap()
+    }
+
+    /// The `timestamp` values of a `ts_batch` list, concatenated in emit order.
+    fn ts_values(batches: &[RecordBatch]) -> Vec<i64> {
+        use arrow::array::Int64Array;
+        batches.iter().flat_map(|b| b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect()
     }
 
     /// Row-wise rendering of a batch list, independent of how rows are chunked
@@ -11822,19 +11806,15 @@ mod writer_properties_tests {
     /// that bound is the entire point of the change, so pin it.
     #[test]
     fn streaming_merge_emits_bounded_chunks() {
-        use arrow::array::Int64Array;
-        use arrow_schema::{DataType, Field, Schema};
-        let s = Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
         // Two interleaved runs, 200k rows total — past the row cap, so the
         // merge must hand the writer several chunks instead of one big batch.
-        let mk =
-            |off: i64| RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from((0..100_000).map(|i| i * 2 + off).rev().collect::<Vec<_>>()))]).unwrap();
+        let mk = |off: i64| ts_batch((0..100_000).map(|i| i * 2 + off).rev().collect());
         let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![mk(0), mk(1)], DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         let chunks = drain(out);
         assert!(chunks.len() > 1, "output must be chunked, not one 200k-row batch");
         assert!(chunks.iter().all(|c| c.num_rows() <= MERGE_CHUNK_ROWS_MAX), "no chunk may exceed the row cap");
-        let all: Vec<i64> = chunks.iter().flat_map(|c| c.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect();
+        let all = ts_values(&chunks);
         assert_eq!(all.len(), 200_000);
         assert!(all.windows(2).all(|w| w[0] <= w[1]), "merge of sorted runs is globally sorted");
     }
@@ -11904,12 +11884,13 @@ mod writer_properties_tests {
         assert!(uri_date_in_window("s3://b/no-partition/f.parquet", day(2026, 6, 16), day(2026, 6, 20)));
     }
 
-    #[test]
-    fn compression_level_drives_zstd() {
-        for level in [3, 9, 15, 19] {
-            let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level, true, None);
-            assert_eq!(p.compression(&ColumnPath::from("anything")), Compression::ZSTD(ZstdLevel::try_new(level).unwrap()));
-        }
+    #[test_case(3 => Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))]
+    #[test_case(9 => Compression::ZSTD(ZstdLevel::try_new(9).unwrap()))]
+    #[test_case(15 => Compression::ZSTD(ZstdLevel::try_new(15).unwrap()))]
+    #[test_case(19 => Compression::ZSTD(ZstdLevel::try_new(19).unwrap()))]
+    #[test_case(999 => Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()) ; "invalid zstd level falls back")]
+    fn compression_level_drives_zstd(level: i32) -> Compression {
+        build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level, true, None).compression(&ColumnPath::from("anything"))
     }
 
     #[test]
@@ -11937,12 +11918,6 @@ mod writer_properties_tests {
         assert!(!super::parquet_tail_ok(b"\x00\x00\x00\x00PAR1", 1024));
         // Wrong length input.
         assert!(!super::parquet_tail_ok(b"PAR1", 8));
-    }
-
-    #[test]
-    fn invalid_zstd_level_falls_back() {
-        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 999, true, None);
-        assert_eq!(p.compression(&ColumnPath::from("x")), Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()));
     }
 
     #[test]
@@ -11985,64 +11960,41 @@ mod writer_properties_tests {
         assert!(paths[0].0.as_ref().contains("date=2099-01-01"));
     }
 
-    #[test]
-    fn bloom_opt_in_only_for_flagged_columns() {
-        let mut f1 = field("id", "Utf8");
-        f1.bloom_filter = true;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![f1, field("body", "Utf8")], vec![]), 3, true, None);
-        assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_some(), "flagged column has bloom");
-        assert!(p.bloom_filter_properties(&ColumnPath::from("body")).is_none(), "unflagged column has no bloom");
-    }
-
-    #[test]
-    fn global_bloom_kill_switch_overrides_opt_in() {
-        let mut f = field("id", "Utf8");
-        f.bloom_filter = true;
+    /// Bloom filters are opt-in per column, and the global kill switch wins over the opt-in.
+    #[test_case("id", false => true ; "flagged column has bloom")]
+    #[test_case("body", false => false ; "unflagged column has no bloom")]
+    #[test_case("id", true => false ; "global kill switch overrides opt-in")]
+    fn bloom_opt_in_only_for_flagged_columns(col: &str, globally_disabled: bool) -> bool {
+        let mut flagged = field("id", "Utf8");
+        flagged.bloom_filter = true;
         let mut c = cfg();
-        c.timefusion_bloom_filter_disabled = true;
-        let p = build_writer_properties(&c, &schema_with(vec![f], vec![]), 3, true, None);
-        assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_none());
+        c.timefusion_bloom_filter_disabled = globally_disabled;
+        build_writer_properties(&c, &schema_with(vec![flagged, field("body", "Utf8")], vec![]), 3, true, None)
+            .bloom_filter_properties(&ColumnPath::from(col))
+            .is_some()
     }
 
-    #[test]
-    fn dictionary_opt_out_disables_dict() {
-        let mut f = field("stacktrace", "Utf8");
-        f.dictionary = Some(false);
-        let p = build_writer_properties(&cfg(), &schema_with(vec![f], vec![]), 3, true, None);
-        assert!(!p.dictionary_enabled(&ColumnPath::from("stacktrace")));
-    }
-
-    #[test]
-    fn sort_key_utf8_uses_delta_byte_array_and_no_dict() {
-        use deltalake::datafusion::parquet::basic::Encoding;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![field("id", "Utf8")], vec!["id"]), 3, true, None);
-        assert_eq!(p.encoding(&ColumnPath::from("id")), Some(Encoding::DELTA_BYTE_ARRAY));
-        assert!(!p.dictionary_enabled(&ColumnPath::from("id")));
-    }
-
-    #[test]
-    fn timestamp_and_int_use_delta_binary_packed() {
-        use deltalake::datafusion::parquet::basic::Encoding;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![field("ts", "Timestamp(Nanosecond, None)"), field("n", "Int64")], vec![]), 3, true, None);
-        assert_eq!(p.encoding(&ColumnPath::from("ts")), Some(Encoding::DELTA_BINARY_PACKED));
-        assert!(!p.dictionary_enabled(&ColumnPath::from("ts")));
-        assert_eq!(p.encoding(&ColumnPath::from("n")), Some(Encoding::DELTA_BINARY_PACKED));
+    /// Per-column encoding and dictionary selection: `(encoding, dictionary_enabled)`.
+    /// `id` is the declared sort key; `stacktrace` opts out of dictionary encoding.
+    #[test_case("id" => (Some(Encoding::DELTA_BYTE_ARRAY), false) ; "sort key utf8 uses delta byte array and no dict")]
+    #[test_case("ts" => (Some(Encoding::DELTA_BINARY_PACKED), false) ; "timestamp uses delta binary packed and no dict")]
+    #[test_case("n" => matches (Some(Encoding::DELTA_BINARY_PACKED), _) ; "int uses delta binary packed")]
+    #[test_case("stacktrace" => matches (_, false) ; "dictionary opt-out disables dict")]
+    fn column_encoding_and_dictionary(col: &str) -> (Option<Encoding>, bool) {
+        let mut no_dict = field("stacktrace", "Utf8");
+        no_dict.dictionary = Some(false);
+        let sch = schema_with(vec![field("id", "Utf8"), field("ts", "Timestamp(Nanosecond, None)"), field("n", "Int64"), no_dict], vec!["id"]);
+        let p = build_writer_properties(&cfg(), &sch, 3, true, None);
+        (p.encoding(&ColumnPath::from(col)), p.dictionary_enabled(&ColumnPath::from(col)))
     }
 
     // Fix #3: page-level stats only on declared sort keys; wide columns get
     // chunk-level stats to keep the ColumnIndex (decoded-metadata) small.
-    #[test]
-    fn page_stats_only_for_sort_keys() {
-        use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
-        let p = build_writer_properties(
-            &cfg(),
-            &schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("body", "Utf8")], vec!["timestamp"]),
-            3,
-            true,
-            None,
-        );
-        assert_eq!(p.statistics_enabled(&ColumnPath::from("timestamp")), EnabledStatistics::Page);
-        assert_eq!(p.statistics_enabled(&ColumnPath::from("body")), EnabledStatistics::Chunk);
+    #[test_case("timestamp" => EnabledStatistics::Page ; "declared sort key gets page stats")]
+    #[test_case("body" => EnabledStatistics::Chunk ; "wide column gets chunk stats")]
+    fn page_stats_only_for_sort_keys(col: &str) -> EnabledStatistics {
+        let sch = schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("body", "Utf8")], vec!["timestamp"]);
+        build_writer_properties(&cfg(), &sch, 3, true, None).statistics_enabled(&ColumnPath::from(col))
     }
 
     /// An exhausted maintenance pool must name its holders, not just its victim.
@@ -12070,13 +12022,11 @@ mod writer_properties_tests {
     // Option A: only declare the parquet SortingColumn footer when the writer
     // actually sorted the rows. Optimize/compact paths (declare_sorted=false)
     // must NOT claim an order they don't write, or order-trusting readers break.
-    #[test]
-    fn sorting_columns_declared_only_when_sorted() {
+    #[test_case(true => true ; "flush/dedup path declares the sort order")]
+    #[test_case(false => false ; "optimize/compact path declares no order")]
+    fn sorting_columns_declared_only_when_sorted(declare_sorted: bool) -> bool {
         let s = schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("id", "Utf8")], vec!["timestamp", "id"]);
-        let sorted = build_writer_properties(&cfg(), &s, 3, true, None);
-        let unsorted = build_writer_properties(&cfg(), &s, 3, false, None);
-        assert!(sorted.sorting_columns().is_some(), "flush/dedup path declares the sort order");
-        assert!(unsorted.sorting_columns().is_none(), "optimize/compact path declares no order");
+        build_writer_properties(&cfg(), &s, 3, declare_sorted, None).sorting_columns().is_some()
     }
 
     // Fix #1: the decoded-metadata cache limit must reach the RuntimeEnv (a
@@ -12109,18 +12059,15 @@ mod writer_properties_tests {
 
     // Slice-coverage merge: disjoint stays disjoint, touching/overlapping fuse,
     // and out-of-order inserts still converge to one day-spanning interval.
-    #[test]
-    fn clean_interval_merge() {
-        let merged = |pairs: &[(i64, i64)]| {
-            let mut v = Vec::new();
-            pairs.iter().for_each(|&p| merge_clean_interval(&mut v, p));
-            v
-        };
-        assert_eq!(merged(&[(0, 10), (20, 30)]), vec![(0, 10), (20, 30)], "a gap must survive");
-        assert_eq!(merged(&[(0, 10), (10, 20)]), vec![(0, 20)], "half-open adjacency fuses");
-        assert_eq!(merged(&[(0, 15), (10, 20)]), vec![(0, 20)], "overlap fuses");
-        assert_eq!(merged(&[(12, 24), (0, 6), (6, 12)]), vec![(0, 24)], "order of arrival must not matter");
-        assert_eq!(merged(&[(0, 24), (5, 10)]), vec![(0, 24)], "a contained slice changes nothing");
+    #[test_case(&[(0, 10), (20, 30)] => vec![(0, 10), (20, 30)] ; "a gap must survive")]
+    #[test_case(&[(0, 10), (10, 20)] => vec![(0, 20)] ; "half-open adjacency fuses")]
+    #[test_case(&[(0, 15), (10, 20)] => vec![(0, 20)] ; "overlap fuses")]
+    #[test_case(&[(12, 24), (0, 6), (6, 12)] => vec![(0, 24)] ; "order of arrival must not matter")]
+    #[test_case(&[(0, 24), (5, 10)] => vec![(0, 24)] ; "a contained slice changes nothing")]
+    fn clean_interval_merge(pairs: &[(i64, i64)]) -> Vec<(i64, i64)> {
+        let mut v = Vec::new();
+        pairs.iter().for_each(|&p| merge_clean_interval(&mut v, p));
+        v
     }
 
     #[test]
@@ -12139,17 +12086,12 @@ mod writer_properties_tests {
     // Fix #4: batches are globally sorted by the declared lead key before write.
     #[test]
     fn sort_batches_orders_by_declared_keys() {
-        use arrow::array::{Array, Int64Array};
-        use arrow_schema::{DataType, Field, Schema};
-        let s = std::sync::Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
-        let b1 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![3, 1]))]).unwrap();
-        let b2 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![2, 0]))]).unwrap();
-        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2], DEFAULT_SORT_SKIP_BYTES);
+        let batches = vec![ts_batch(vec![3, 1]), ts_batch(vec![2, 0])];
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), batches, DEFAULT_SORT_SKIP_BYTES);
         assert!(sorted);
         let out = drain(out);
         assert_eq!(out.len(), 1);
-        let col = out[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(col.values(), &[0, 1, 2, 3]);
+        assert_eq!(ts_values(&out), vec![0, 1, 2, 3]);
         // No declared sort columns → input returned untouched, sorted=false.
         let (passthrough, sorted) = sort_batches_by_schema(&schema_with(vec![], vec![]), vec![out[0].clone(), out[0].clone()], DEFAULT_SORT_SKIP_BYTES);
         assert!(!sorted);
@@ -12294,6 +12236,80 @@ mod tests {
         );
     }
 
+    /// A Database on a fresh test config with `edit` applied.
+    async fn db_where(name: &str, edit: impl FnOnce(&mut AppConfig)) -> Result<Database> {
+        let mut cfg = (*create_test_config(name)).clone();
+        edit(&mut cfg);
+        Database::with_config(Arc::new(cfg)).await
+    }
+
+    /// The 35-day rollup backfill horizon the planning tests share: the sealed
+    /// days they write to sit outside the shipped default.
+    fn wide_backfill(cfg: &mut AppConfig) {
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+    }
+
+    /// Complete every queued task and hand back the keys, so a planner pass
+    /// re-derives a day instead of vetoing it as already-queued.
+    fn complete_all(journal: &mut crate::maintenance_coordinator::TaskJournal) -> Vec<crate::maintenance_coordinator::TaskKey> {
+        let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+        for key in &keys {
+            journal.complete(key);
+        }
+        keys
+    }
+
+    /// Stuff the journal past the backfill pending ceiling with debt unrelated to rollup.
+    fn stuff_past_the_ceiling(journal: &mut crate::maintenance_coordinator::TaskJournal) -> Result<()> {
+        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
+        for i in 0..25_100i64 {
+            journal.enqueue(
+                TaskKey {
+                    physical_table: "debt".to_owned(),
+                    source: "debt".to_owned(),
+                    project_id: format!("dummy{i}"),
+                    slice: TimeSlice::new(i * 60_000_000, (i + 1) * 60_000_000)?,
+                    operation: Operation::Repair,
+                },
+                0,
+                0,
+                0,
+            );
+        }
+        Ok(())
+    }
+
+    /// One fresh tenant on a sealed day three days back: the parts of its
+    /// certification key, the instant itself, and the midnight / half-day marks
+    /// the dedup slice units are cut on.
+    struct CertDay {
+        project: String,
+        date: chrono::NaiveDate,
+        /// Midnight UTC of the day, in micros.
+        start: i64,
+        /// Midday: the boundary every "two clean halves" test cuts on.
+        half: i64,
+        /// The exact instant three days back, inside the day.
+        at: i64,
+        key: (String, String, String),
+    }
+
+    fn cert_day() -> CertDay {
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        let day = Utc::now() - chrono::Duration::days(3);
+        let date = day.date_naive();
+        let start = midnight_micros(date);
+        CertDay {
+            key: (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string()),
+            project,
+            date,
+            start,
+            half: start + DAY_MICROS / 2,
+            at: day.timestamp_micros(),
+        }
+    }
+
     /// A unit whose slice has not finished yet must back off past the slice, not spin.
     ///
     /// A flat retry interval left a day-wide unit permanently eligible until midnight, monopolising
@@ -12327,9 +12343,7 @@ mod tests {
     #[tokio::test]
     async fn a_queued_unit_for_one_tier_does_not_veto_planning_another() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
-        let mut cfg = (*create_test_config("per-tier-veto")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = db_where("per-tier-veto", wide_backfill).await?;
         let project = format!("veto_{}", uuid::Uuid::new_v4().simple());
         let day = Utc::now() - chrono::Duration::days(3);
         insert_a_span(&db, &project, "a", day.timestamp_micros()).await?;
@@ -12338,10 +12352,7 @@ mod tests {
         // ONE tier, and nothing at all for the others.
         let blocking_table = {
             let mut journal = db.maintenance_tasks.lock().unwrap();
-            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
-            for key in &keys {
-                journal.complete(key);
-            }
+            let keys = complete_all(&mut journal);
             let blocking = keys.iter().find(|key| key.operation == Operation::BaseRollup).cloned().expect("the write path queues a base rollup for the day");
             let start = midnight_micros(day.date_naive());
             journal.enqueue(TaskKey { slice: TimeSlice::new(start, start + 600_000_000)?, ..blocking.clone() }, 0, 0, 0);
@@ -12369,13 +12380,14 @@ mod tests {
     /// A rollup unit that aggregated nothing still commits a file. A zero-row partition made the
     /// day look covered, so it was never rebuilt and stayed empty. Empty partitions must read as
     /// uncovered so the coordinator re-queues them.
-    #[test]
-    fn an_empty_partition_file_is_not_coverage() {
-        assert!(super::partition_file_is_empty(Some(0)), "an explicit zero-row file proves nothing was built");
-        assert!(!super::partition_file_is_empty(Some(1)), "a file with rows is coverage");
-        // Unknown must read as covered: the other direction re-plans finished
-        // work forever for every partition written before stats existed.
-        assert!(!super::partition_file_is_empty(None), "missing stats are unknown, never empty");
+    ///
+    /// Unknown must read as covered: the other direction re-plans finished work
+    /// forever for every partition written before stats existed.
+    #[test_case(Some(0) => true ; "an explicit zero-row file proves nothing was built")]
+    #[test_case(Some(1) => false ; "a file with rows is coverage")]
+    #[test_case(None => false ; "missing stats are unknown, never empty")]
+    fn an_empty_partition_file_is_not_coverage(num_records: Option<i64>) -> bool {
+        super::partition_file_is_empty(num_records)
     }
 
     /// While coverage is short, the goal outranks the ceiling.
@@ -12386,11 +12398,8 @@ mod tests {
     /// `COVERAGE_SHORT_DAYS` restores the ceiling.
     #[tokio::test]
     async fn coverage_short_backfill_outranks_the_pending_ceiling() -> Result<()> {
-        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
-        let mut cfg = (*create_test_config("backfill-ceiling-bypass")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = db_where("backfill-ceiling-bypass", wide_backfill).await?;
         let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
         insert_a_span(&db, &project, "a", ts).await?;
@@ -12398,25 +12407,8 @@ mod tests {
             let mut journal = db.maintenance_tasks.lock().unwrap();
             // The write path already queued this day; complete it so the planner
             // re-derives the day from the (missing) tier coverage.
-            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
-            for key in keys {
-                journal.complete(&key);
-            }
-            // Stuff the journal past the ceiling with unrelated debt.
-            for i in 0..25_100i64 {
-                journal.enqueue(
-                    TaskKey {
-                        physical_table: "debt".to_owned(),
-                        source: "debt".to_owned(),
-                        project_id: format!("dummy{i}"),
-                        slice: TimeSlice::new(i * 60_000_000, (i + 1) * 60_000_000)?,
-                        operation: Operation::Repair,
-                    },
-                    0,
-                    0,
-                    0,
-                );
-            }
+            complete_all(&mut journal);
+            stuff_past_the_ceiling(&mut journal)?;
         }
         let gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
         let restore = gauge.load(Relaxed);
@@ -12439,33 +12431,14 @@ mod tests {
     /// per-project coverage contiguity log, and the base-tier proof for already-queued derived units.
     #[tokio::test]
     async fn the_backfill_ceiling_defers_enqueueing_without_stopping_the_pass() -> Result<()> {
-        use crate::maintenance_coordinator::{Operation, TaskKey, TimeSlice};
         use std::sync::atomic::Ordering::Relaxed;
-        let mut cfg = (*create_test_config("backfill-ceiling-pass")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = db_where("backfill-ceiling-pass", wide_backfill).await?;
         let project = format!("ceil_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
         insert_a_span(&db, &project, "a", ts).await?;
 
         // Stuff the journal past the ceiling with work unrelated to rollup.
-        {
-            let mut journal = db.maintenance_tasks.lock().unwrap();
-            for i in 0..25_100i64 {
-                journal.enqueue(
-                    TaskKey {
-                        physical_table: "debt".to_owned(),
-                        source: "debt".to_owned(),
-                        project_id: format!("dummy{i}"),
-                        slice: TimeSlice::new(i * 60_000_000, (i + 1) * 60_000_000)?,
-                        operation: Operation::Repair,
-                    },
-                    0,
-                    0,
-                    0,
-                );
-            }
-        }
+        stuff_past_the_ceiling(&mut db.maintenance_tasks.lock().unwrap())?;
         let gauge = &crate::observability::maintenance_stats().rollup_median_contiguous_days;
         let restore = gauge.load(Relaxed);
         // A value the pass cannot legitimately produce for this fixture, so only
@@ -12541,16 +12514,17 @@ mod tests {
     async fn a_backfill_pass_persists_how_far_the_damage_repair_reached() -> Result<()> {
         use crate::maintenance_coordinator::TaskJournal;
         let project = format!("dmg_{}", uuid::Uuid::new_v4().simple());
-        let mut cfg = (*create_test_config("damage-repair-cursor")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
         // The list is a PARAMETER here, not the shipped const — that const is
         // empty between repairs, and a guard that silently passes because there
         // is nothing to consume is exactly the v1 bug's blind spot.
         // Longer than `BACKFILL_PARTITIONS_PER_PASS`, or one pass consumes the
         // whole list and the truncation the v1 bug lost cells to never happens.
         let listed: Vec<String> = (0..30).map(|i| format!("{project}:{}", (Utc::now() - chrono::Duration::days(3 + i)).format("%Y-%m-%d"))).collect();
-        cfg.maintenance.timefusion_damage_repair_cells = listed.clone();
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = db_where("damage-repair-cursor", |cfg| {
+            wide_backfill(cfg);
+            cfg.maintenance.timefusion_damage_repair_cells = listed.clone();
+        })
+        .await?;
         for i in 0..3 {
             insert_a_span(&db, &project, "a", (Utc::now() - chrono::Duration::days(3 + i)).timestamp_micros()).await?;
         }
@@ -12558,11 +12532,7 @@ mod tests {
         // the day must be free of queued rollup work before each pass or the
         // already-queued veto empties `want` and the pass returns early.
         let clear_queue = |db: &Database| {
-            let mut journal = db.maintenance_tasks.lock().unwrap();
-            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
-            for key in &keys {
-                journal.complete(key);
-            }
+            complete_all(&mut db.maintenance_tasks.lock().unwrap());
         };
         let cursor = |db: &Database| db.maintenance_tasks.lock().unwrap().repair_cursor(TaskJournal::DAMAGE_REPAIR_MIGRATION, "otel_logs_and_spans");
         assert_eq!(cursor(&db), 0, "a fresh journal has consumed nothing");
@@ -12613,9 +12583,7 @@ mod tests {
     /// sources before they are written.
     #[tokio::test]
     async fn coverage_published_for_one_source_survives_planning_the_next() -> Result<()> {
-        let mut cfg = (*create_test_config("multi-source-coverage")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = db_where("multi-source-coverage", wide_backfill).await?;
         let project = format!("multi_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::days(3)).timestamp_micros();
         // `all_tables` yields several unified tables, so the planner loop runs
@@ -12726,41 +12694,20 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn a_clean_day_wide_coordinator_dedup_certifies_the_partition(persist: bool) -> Result<()> {
-        use crate::maintenance_coordinator::{DAY_MICROS, Operation, TaskKey, TimeSlice};
-        let mut config = create_test_config("coord-dedup-certify");
-        Arc::make_mut(&mut config).maintenance.timefusion_dedup_certification_persist = persist;
-        let db = Database::with_config(config).await?;
-        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
+        use crate::maintenance_coordinator::DAY_MICROS;
+        let db = db_where("coord-dedup-certify", |cfg| cfg.maintenance.timefusion_dedup_certification_persist = persist).await?;
+        let cert = cert_day();
         // A sealed day with NO duplicates: the pass must drop nothing and leave
         // the file set where it found it, which is exactly what certification
         // requires.
-        let day = Utc::now() - chrono::Duration::days(3);
-        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
+        insert_a_span(&db, &cert.project, "only", cert.at).await?;
 
-        let date = day.date_naive();
-        let day_start = midnight_micros(date);
-        let slice = TimeSlice::new(day_start, day_start + DAY_MICROS)?;
-        {
-            let mut journal = db.maintenance_tasks.lock().unwrap();
-            journal.enqueue(
-                TaskKey {
-                    physical_table: "otel_logs_and_spans".to_owned(),
-                    source: "otel_logs_and_spans".to_owned(),
-                    project_id: project.clone(),
-                    slice,
-                    operation: Operation::Dedup,
-                },
-                0,
-                1024,
-                0,
-            );
-        }
-        assert!(db.run_coordinator_dedup_once().await?, "the day-wide dedup unit must be claimed and run");
+        assert!(run_dedup_slice(&db, &cert.project, cert.start, cert.start + DAY_MICROS).await?, "the day-wide dedup unit must be claimed and run");
 
-        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
-        assert!(db.dedup_clean_fp.contains_key(&key), "a clean day-wide unit must certify the partition; without it DedupExec survives in every 30d plan");
+        assert!(db.dedup_clean_fp.contains_key(&cert.key), "a clean day-wide unit must certify the partition; without it DedupExec survives in every 30d plan");
         let stored = crate::storage::load_sidecar::<crate::storage::StoredCertification>(&db.config.core.timefusion_data_dir, crate::storage::CERTIFICATIONS);
-        let persisted = stored.iter().any(|entry| entry.project_id == project && entry.table_name == "otel_logs_and_spans" && entry.date == date.to_string());
+        let persisted =
+            stored.iter().any(|entry| entry.project_id == cert.project && entry.table_name == "otel_logs_and_spans" && entry.date == cert.date.to_string());
         assert_eq!(
             persisted, persist,
             "a coordinator-owned table never reaches the legacy sweep's persistence site, so its grant must honor the persistence flag here"
@@ -12809,16 +12756,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn the_per_file_skip_never_over_counts_a_duplicated_partition() -> Result<()> {
-        use crate::maintenance_coordinator::DAY_MICROS;
         let db = Database::with_config(create_test_config("perfile-nocount")).await?;
         assert!(db.config.maintenance.timefusion_read_dedup_skip_per_file, "this pins the SHIPPED default, not a test-only override");
-        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
-        let day = Utc::now() - chrono::Duration::days(3);
-        let date = day.date_naive();
-        let day_start = midnight_micros(date);
+        let cert = cert_day();
+        let project = cert.project.clone();
         // Clean rows early in the day, then a duplicate pair later.
-        insert_a_span(&db, &project, "clean", day_start + 3_600_000_000).await?;
-        let dup_ts = day_start + DAY_MICROS / 2 + 3_600_000_000;
+        insert_a_span(&db, &project, "clean", cert.start + 3_600_000_000).await?;
+        let dup_ts = cert.half + 3_600_000_000;
         insert_a_span(&db, &project, "dup", dup_ts).await?;
         insert_a_span(&db, &project, "dup", dup_ts).await?;
 
@@ -12834,7 +12778,7 @@ mod tests {
         };
         let before = count(&db).await?;
         // Prove the early half clean, which certifies the files inside it.
-        assert!(run_dedup_slice(&db, &project, day_start, day_start + DAY_MICROS / 2).await?, "the clean half-day unit must run");
+        assert!(run_dedup_slice(&db, &project, cert.start, cert.half).await?, "the clean half-day unit must run");
         assert_eq!(count(&db).await?, before, "certifying clean files must not change the answer for the duplicated ones");
         Ok(())
     }
@@ -12847,20 +12791,14 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_clean_slice_certifies_only_the_files_it_wholly_covered() -> Result<()> {
-        use crate::maintenance_coordinator::DAY_MICROS;
         let db = Database::with_config(create_test_config("slice-containment")).await?;
-        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
-        let day = Utc::now() - chrono::Duration::days(3);
-        let date = day.date_naive();
-        let day_start = midnight_micros(date);
-        let half = day_start + DAY_MICROS / 2;
+        let day = cert_day();
         // One file inside the first half, one outside it.
-        insert_a_span(&db, &project, "inside", day_start + 3_600_000_000).await?;
-        insert_a_span(&db, &project, "outside", half + 3_600_000_000).await?;
-        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+        insert_a_span(&db, &day.project, "inside", day.start + 3_600_000_000).await?;
+        insert_a_span(&db, &day.project, "outside", day.half + 3_600_000_000).await?;
 
-        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "the first-half unit must run");
-        let cert = db.dedup_clean_fp.get(&key).map(|entry| entry.value().clone());
+        assert!(run_dedup_slice(&db, &day.project, day.start, day.half).await?, "the first-half unit must run");
+        let cert = db.dedup_clean_fp.get(&day.key).map(|entry| entry.value().clone());
         let files = cert.as_ref().map_or(0, |cert| cert.files.len());
         assert!(files <= 1, "a slice must not certify the file lying outside it; certified {files} files");
         assert!(cert.is_none_or(|cert| cert.stale), "slice-derived evidence must never grant the whole-partition skip");
@@ -12875,24 +12813,20 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn slice_evidence_stays_stale_across_a_restart() -> Result<()> {
-        use crate::maintenance_coordinator::DAY_MICROS;
+        // One config, built once: the restart must reopen the SAME storage.
         let cfg = create_test_config("slice-stale-restart");
         let db = Database::with_config(cfg.clone()).await?;
-        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
-        let day = Utc::now() - chrono::Duration::days(3);
-        let date = day.date_naive();
-        let day_start = midnight_micros(date);
-        insert_a_span(&db, &project, "only", day_start + 3_600_000_000).await?;
-        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+        let day = cert_day();
+        insert_a_span(&db, &day.project, "only", day.start + 3_600_000_000).await?;
 
-        assert!(run_dedup_slice(&db, &project, day_start, day_start + DAY_MICROS / 2).await?, "the half-day unit must run");
-        let banked = db.dedup_clean_fp.get(&key).is_some();
+        assert!(run_dedup_slice(&db, &day.project, day.start, day.half).await?, "the half-day unit must run");
+        let banked = db.dedup_clean_fp.get(&day.key).is_some();
         drop(db);
 
         let db = Database::with_config(cfg).await?;
-        assert!(!grants_whole_partition(&db, &key), "a restored slice certification must still be stale");
+        assert!(!grants_whole_partition(&db, &day.key), "a restored slice certification must still be stale");
         if banked {
-            assert!(db.dedup_clean_fp.contains_key(&key), "and its file evidence must survive the restart");
+            assert!(db.dedup_clean_fp.contains_key(&day.key), "and its file evidence must survive the restart");
         }
         Ok(())
     }
@@ -12902,18 +12836,13 @@ mod tests {
     async fn clean_slice_units_accumulate_to_certify_the_partition() -> Result<()> {
         use crate::maintenance_coordinator::DAY_MICROS;
         let db = Database::with_config(create_test_config("slice-cov-certify")).await?;
-        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
-        let day = Utc::now() - chrono::Duration::days(3);
-        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
-        let date = day.date_naive();
-        let day_start = midnight_micros(date);
-        let half = day_start + DAY_MICROS / 2;
-        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+        let day = cert_day();
+        insert_a_span(&db, &day.project, "only", day.at).await?;
 
-        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
-        assert!(!grants_whole_partition(&db, &key), "half a day proves nothing about the DAY on its own");
-        assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run");
-        assert!(db.dedup_clean_fp.contains_key(&key), "two clean halves cover the day and must certify the partition");
+        assert!(run_dedup_slice(&db, &day.project, day.start, day.half).await?, "first half-day unit must run");
+        assert!(!grants_whole_partition(&db, &day.key), "half a day proves nothing about the DAY on its own");
+        assert!(run_dedup_slice(&db, &day.project, day.half, day.start + DAY_MICROS).await?, "second half-day unit must run");
+        assert!(db.dedup_clean_fp.contains_key(&day.key), "two clean halves cover the day and must certify the partition");
         Ok(())
     }
 
@@ -12927,24 +12856,20 @@ mod tests {
     #[serial]
     async fn slice_coverage_survives_a_restart() -> Result<()> {
         use crate::maintenance_coordinator::DAY_MICROS;
+        // One config, built once: the restart must reopen the SAME storage.
         let cfg = create_test_config("slice-cov-restart");
         let db = Database::with_config(cfg.clone()).await?;
-        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
-        let day = Utc::now() - chrono::Duration::days(3);
-        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
-        let date = day.date_naive();
-        let day_start = midnight_micros(date);
-        let half = day_start + DAY_MICROS / 2;
-        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+        let day = cert_day();
+        insert_a_span(&db, &day.project, "only", day.at).await?;
 
-        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
-        assert!(!grants_whole_partition(&db, &key));
+        assert!(run_dedup_slice(&db, &day.project, day.start, day.half).await?, "first half-day unit must run");
+        assert!(!grants_whole_partition(&db, &day.key));
         drop(db); // the restart: coverage evidence must not die with the process
 
         let db = Database::with_config(cfg).await?;
-        assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run post-restart");
+        assert!(run_dedup_slice(&db, &day.project, day.half, day.start + DAY_MICROS).await?, "second half-day unit must run post-restart");
         assert!(
-            db.dedup_clean_fp.contains_key(&key),
+            db.dedup_clean_fp.contains_key(&day.key),
             "coverage accumulated before the restart plus the post-restart half must certify; \
              losing it on restart is why prod (restarting every 1-2h) never granted"
         );
@@ -12961,19 +12886,14 @@ mod tests {
     async fn a_write_between_clean_slices_voids_accumulated_coverage() -> Result<()> {
         use crate::maintenance_coordinator::DAY_MICROS;
         let db = Database::with_config(create_test_config("slice-cov-voided")).await?;
-        let project = format!("cert_{}", uuid::Uuid::new_v4().simple());
-        let day = Utc::now() - chrono::Duration::days(3);
-        insert_a_span(&db, &project, "only", day.timestamp_micros()).await?;
-        let date = day.date_naive();
-        let day_start = midnight_micros(date);
-        let half = day_start + DAY_MICROS / 2;
-        let key = (project.clone(), "otel_logs_and_spans".to_owned(), date.to_string());
+        let day = cert_day();
+        insert_a_span(&db, &day.project, "only", day.at).await?;
 
-        assert!(run_dedup_slice(&db, &project, day_start, half).await?, "first half-day unit must run");
+        assert!(run_dedup_slice(&db, &day.project, day.start, day.half).await?, "first half-day unit must run");
         // A new file lands in the partition: the fp the first slice was proved under is dead.
-        insert_a_span(&db, &project, "late", day.timestamp_micros() + 1).await?;
-        assert!(run_dedup_slice(&db, &project, half, day_start + DAY_MICROS).await?, "second half-day unit must run");
-        assert!(!grants_whole_partition(&db, &key), "a moved file set voids the first slice's evidence — no whole-partition certification");
+        insert_a_span(&db, &day.project, "late", day.at + 1).await?;
+        assert!(run_dedup_slice(&db, &day.project, day.half, day.start + DAY_MICROS).await?, "second half-day unit must run");
+        assert!(!grants_whole_partition(&db, &day.key), "a moved file set voids the first slice's evidence — no whole-partition certification");
         Ok(())
     }
 
@@ -13117,8 +13037,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_debt_skips_rollup_tier_tables() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
-        let cfg = (*create_test_config("debt-skips-tiers")).clone();
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = Database::with_config(create_test_config("debt-skips-tiers")).await?;
         let project = format!("tier_{}", uuid::Uuid::new_v4().simple());
         let day = Utc::now() - chrono::Duration::days(4);
         for id in ["a", "b"] {
@@ -13151,9 +13070,7 @@ mod tests {
     #[tokio::test]
     async fn run_unit_runs_the_requested_project_and_not_another() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
-        let mut cfg = (*create_test_config("run-unit-targeting")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = db_where("run-unit-targeting", wide_backfill).await?;
         // The background coordinator would roll up BOTH projects on its own,
         // which is exactly what this test must not mistake for the CLI's doing.
         db.cancel_maintenance();
@@ -13217,14 +13134,12 @@ mod tests {
     #[serial]
     async fn a_built_rollup_routes_and_stops_routing_once_its_source_grows() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
-        let mut cfg = (*create_test_config("slice-rows-guard")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = db_where("slice-rows-guard", wide_backfill).await?;
         db.cancel_maintenance();
         let project = format!("guard_{}", uuid::Uuid::new_v4().simple());
         let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
         let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        insert_a_span(&db, &project, "a", at).await?;
         db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
 
         let covered = |db: &Database| {
@@ -13256,7 +13171,7 @@ mod tests {
 
         // Rows arrive after the build. The witness is now stale, and the guard
         // must refuse rather than serve an aggregate short of the partition.
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("b", "op", &project, at + 1)])?], true, None).await?;
+        insert_a_span(&db, &project, "b", at + 1).await?;
         let grown = {
             let table = source.read().await;
             Database::partition_stats_bounded(&table, tiebreak_of("otel_logs_and_spans"), &|_, _| i64::MAX)?
@@ -13453,22 +13368,67 @@ mod tests {
         Ok(())
     }
 
+    /// The base (`derived = false`) or derived tier table name for the source
+    /// every rollup fixture below builds over.
+    fn rollup_tier(derived: bool) -> String {
+        get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some() == derived).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a rollup tier")
+    }
+
+    /// `create_test_config` with the rollup backfill window widened past the
+    /// three-day-old days these fixtures build.
+    fn rollup_backfill_config(label: &str, days: u16) -> Arc<AppConfig> {
+        let mut cfg = (*create_test_config(label)).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = days;
+        Arc::new(cfg)
+    }
+
+    /// One project with a single noon row on a three-day-old day, already rolled
+    /// up into the base tier — the starting state of every recovery/resume
+    /// fixture below.
+    async fn one_rolled_up_day(db: &Database, prefix: &str) -> Result<(String, chrono::NaiveDate)> {
+        let project = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+        Ok((project, day))
+    }
+
+    /// One Delta commit against a live table handle, swapping in the resulting
+    /// snapshot. Every fixture here rewinds or re-tags a log this way.
+    async fn commit_to(table_ref: &Arc<RwLock<DeltaTable>>, actions: Vec<deltalake::kernel::Action>, op: deltalake::protocol::DeltaOperation) -> Result<()> {
+        let mut table = table_ref.read().await.clone();
+        let finalized = deltalake::kernel::transaction::CommitBuilder::default()
+            .with_actions(actions)
+            .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
+            .await?;
+        table.state = Some(finalized.snapshot());
+        *table_ref.write().await = table;
+        Ok(())
+    }
+
+    /// The metadata-only `Append` every re-tagging fixture commits.
+    fn append_op(partitioned: bool) -> deltalake::protocol::DeltaOperation {
+        deltalake::protocol::DeltaOperation::Write {
+            mode: deltalake::protocol::SaveMode::Append,
+            partition_by: partitioned.then(|| get_schema("otel_logs_and_spans").expect("source schema").partitions.clone()),
+            predicate: None,
+        }
+    }
+
     // Keep persisted generation and measure evidence consistent when modeling
     // a materialization that predates a measure. Recover through the real tag path.
     async fn strip_rollup_measure(db: &Database, project: &str, day: chrono::NaiveDate, measure: &str) -> Result<()> {
         use crate::maintenance_coordinator::{TAG_GENERATION, TAG_MEASURES, TAG_PROJECT, TAG_SLICE_START};
-        use deltalake::kernel::{
-            Action,
-            transaction::{CommitBuilder, TableReference},
-        };
+        use deltalake::kernel::Action;
         use object_store::ObjectStoreExt as _;
         let source = "otel_logs_and_spans";
         for spec in &get_schema(source).expect("source schema").rollups {
             let tier = db.get_or_create_table(project, &spec.table_name(source)).await?;
-            let mut table = tier.read().await.clone();
-            let store = table.log_store().object_store(None);
-            #[allow(deprecated)]
-            let adds: Vec<_> = table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect();
+            let store = { tier.read().await.log_store().object_store(None) };
+            let adds = live_adds(&tier).await;
             let file_count = adds.len();
             let mut actions = Vec::new();
             for mut add in adds {
@@ -13494,11 +13454,8 @@ mod tests {
             if actions.is_empty() {
                 continue;
             }
-            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
-            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
-            table.state = Some(finalized.snapshot());
-            assert_eq!(table.snapshot()?.log_data().iter().count(), file_count, "retagging preserves every fixture file");
-            *tier.write().await = table;
+            commit_to(&tier, actions, append_op(false)).await?;
+            assert_eq!(live_adds(&tier).await.len(), file_count, "retagging preserves every fixture file");
         }
         db.recover_rollup_coverage(source).await?;
         Ok(())
@@ -13519,10 +13476,8 @@ mod tests {
     async fn a_date_that_cannot_prove_its_digest_falls_to_the_raw_fringe() -> Result<()> {
         use crate::maintenance_coordinator::Operation;
         const DIGEST: &str = "duration_digest";
-        let mut cfg = (*create_test_config("measure-not-stored")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
         // An `Arc` because `create_session_context` consumes one.
-        let db = std::sync::Arc::new(Database::with_config(std::sync::Arc::new(cfg)).await?);
+        let db = std::sync::Arc::new(Database::with_config(rollup_backfill_config("measure-not-stored", 35)).await?);
         db.cancel_maintenance();
         let project = format!("meas_{}", uuid::Uuid::new_v4().simple());
         let days: Vec<chrono::NaiveDate> = (3..=4).rev().map(|back| (Utc::now() - chrono::Duration::days(back)).date_naive()).collect();
@@ -13651,20 +13606,11 @@ mod tests {
     /// ~80% of every stale decline on the whale.
     #[tokio::test]
     async fn recovery_queues_a_republish_for_a_slice_with_no_row_witness() -> Result<()> {
-        use crate::maintenance_coordinator::{Operation, TaskState};
-        let mut cfg = (*create_test_config("witnessless-republish")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        use crate::maintenance_coordinator::TaskState;
+        let db = Database::with_config(rollup_backfill_config("witnessless-republish", 35)).await?;
         db.cancel_maintenance();
-        let project = format!("wit_{}", uuid::Uuid::new_v4().simple());
-        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
-        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
-
-        let tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a base tier");
+        let (project, day) = one_rolled_up_day(&db, "wit").await?;
+        let tier = rollup_tier(false);
 
         // Blank the witness on the journal publication. `Publication::source_rows`
         // is `#[serde(default)]`, so this is exactly what a journal written before
@@ -13760,9 +13706,7 @@ mod tests {
         let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
         let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
         let project = format!("reopen_{}", uuid::Uuid::new_v4().simple());
-        let derived_tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a derived tier");
+        let derived_tier = rollup_tier(true);
 
         for hour in [20, 21] {
             let at = day_start + hour * 3_600_000_000;
@@ -13808,9 +13752,7 @@ mod tests {
         db.cancel_maintenance();
         let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
         let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
-        let derived_tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a derived tier");
+        let derived_tier = rollup_tier(true);
 
         // `base_hours` is what the BASE tier is built for, out of 20:00-24:00;
         // the derived unit always asks for `derived` hours from `derived_from`.
@@ -13875,12 +13817,7 @@ mod tests {
         let project = format!("evid_{}", uuid::Uuid::new_v4().simple());
         let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
         let day_start = day.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_micros();
-        let tier_of = |derived: bool| {
-            get_schema("otel_logs_and_spans")
-                .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_some() == derived).map(|spec| spec.table_name("otel_logs_and_spans")))
-                .expect("a tier")
-        };
-        let (base_tier, derived_tier) = (tier_of(false), tier_of(true));
+        let (base_tier, derived_tier) = (rollup_tier(false), rollup_tier(true));
         for hour in [20, 21, 22, 23] {
             let at = day_start + hour * 3_600_000_000;
             db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
@@ -13924,14 +13861,9 @@ mod tests {
     #[tokio::test]
     async fn recovery_queues_an_interior_gap_between_live_tagged_slices() -> Result<()> {
         use crate::maintenance_coordinator::{Operation, TaskState};
-        use deltalake::kernel::{
-            Action,
-            transaction::{CommitBuilder, TableReference},
-        };
+        use deltalake::kernel::Action;
         use object_store::ObjectStoreExt as _;
-        let mut cfg = (*create_test_config("untagged-interior-gap")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = Database::with_config(rollup_backfill_config("untagged-interior-gap", 35)).await?;
         db.cancel_maintenance();
         let project = format!("gap_{}", uuid::Uuid::new_v4().simple());
         let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
@@ -13943,25 +13875,14 @@ mod tests {
         }
         db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
 
-        let tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a base tier");
+        let tier = rollup_tier(false);
         let tier_ref = db.get_or_create_table(&project, &tier).await?;
         // Replace the day-wide tagged file with: an UNTAGGED copy spanning the
         // day, plus two tagged slices that leave 12:00-12:11 uncovered.
         const HOLE: (i64, i64) = (12 * 3_600_000_000, 12 * 3_600_000_000 + 11 * 60_000_000);
         {
-            let mut table = tier_ref.read().await.clone();
-            let live: Vec<_> = table
-                .snapshot()?
-                .log_data()
-                .iter()
-                .map(|file| {
-                    #[allow(deprecated)]
-                    file.add_action()
-                })
-                .collect();
-            let store = table.log_store().object_store(None);
+            let live = live_adds(&tier_ref).await;
+            let store = { tier_ref.read().await.log_store().object_store(None) };
             let mut actions = Vec::new();
             let tag = |start: i64, end: i64| {
                 std::collections::HashMap::from([
@@ -13983,10 +13904,7 @@ mod tests {
                 }
                 actions.push(Action::Remove(remove_for_add(&add, true)));
             }
-            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
-            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
-            table.state = Some(finalized.snapshot());
-            *tier_ref.write().await = table;
+            commit_to(&tier_ref, actions, append_op(false)).await?;
         }
 
         {
@@ -14025,16 +13943,10 @@ mod tests {
     /// `coverage_ledger_disagreements` reads zero at production scale.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_routes_from_the_ledger_before_the_tag_replay_runs() -> Result<()> {
-        use crate::maintenance_coordinator::Operation;
-        let cfg = (*create_test_config("ledger-seed")).clone();
-        let cfg = std::sync::Arc::new(cfg);
+        let cfg = create_test_config("ledger-seed");
         let db = Database::with_config(cfg.clone()).await?;
         db.cancel_maintenance();
-        let project = format!("seed_{}", uuid::Uuid::new_v4().simple());
-        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
-        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
+        let (project, _day) = one_rolled_up_day(&db, "seed").await?;
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
         let after_replay = db.rollup_slice_coverage.iter().filter(|entry| entry.key().0 == project).count();
         assert!(after_replay > 0, "the replay published routing coverage, or this test proves nothing");
@@ -14078,19 +13990,10 @@ mod tests {
     }
 
     async fn staged_but_uncommitted_rollup(label: &str) -> Result<KilledUnit> {
-        use crate::maintenance_coordinator::Operation;
-        let cfg = (*create_test_config(label)).clone();
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = Database::with_config(create_test_config(label)).await?;
         db.cancel_maintenance();
-        let project = format!("resume_{}", uuid::Uuid::new_v4().simple());
-        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
-        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
-
-        let tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a base tier");
+        let (project, day) = one_rolled_up_day(&db, "resume").await?;
+        let tier = rollup_tier(false);
         let (key, publication) = db
             .journal()
             .published_rollups("otel_logs_and_spans", &tier)
@@ -14100,31 +14003,20 @@ mod tests {
 
         // The committed output — soon to be the "staged" files.
         let table_ref = db.get_or_create_table(&project, &tier).await?;
-        let staged: Vec<deltalake::kernel::Add> = {
-            let table = table_ref.read().await;
-            #[allow(deprecated)]
-            table.snapshot()?.log_data().iter().map(|file| file.add_action()).collect()
-        };
+        let staged = live_adds(&table_ref).await;
         assert!(!staged.is_empty(), "the build produced files");
 
         // Un-commit them. The parquet stays in object storage.
-        {
-            let mut table = table_ref.read().await.clone();
-            let actions: Vec<deltalake::kernel::Action> =
-                staged.iter().map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, true))).collect();
-            let schema = get_schema(&tier).expect("tier schema");
-            let op = deltalake::protocol::DeltaOperation::Write {
+        commit_to(
+            &table_ref,
+            staged.iter().map(|add| deltalake::kernel::Action::Remove(super::remove_for_add(add, true))).collect(),
+            deltalake::protocol::DeltaOperation::Write {
                 mode: deltalake::protocol::SaveMode::Overwrite,
-                partition_by: Some(schema.partitions.clone()),
+                partition_by: Some(get_schema(&tier).expect("tier schema").partitions.clone()),
                 predicate: None,
-            };
-            let finalized = deltalake::kernel::transaction::CommitBuilder::default()
-                .with_actions(actions)
-                .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
-                .await?;
-            table.state = Some(finalized.snapshot());
-            *table_ref.write().await = table;
-        }
+            },
+        )
+        .await?;
 
         // The intent the killed process would have left, aged past the
         // rolling-deploy window so it is unambiguously a crash leftover.
@@ -14274,20 +14166,7 @@ mod tests {
     /// One metadata-only Delta commit. The fixture below rewinds and re-tags the
     /// log three times; none of it touches object storage.
     async fn commit_actions(table_ref: &Arc<RwLock<DeltaTable>>, actions: Vec<deltalake::kernel::Action>) -> Result<()> {
-        let mut table = table_ref.read().await.clone();
-        let schema = get_schema("otel_logs_and_spans").expect("source schema");
-        let op = deltalake::protocol::DeltaOperation::Write {
-            mode: deltalake::protocol::SaveMode::Append,
-            partition_by: Some(schema.partitions.clone()),
-            predicate: None,
-        };
-        let finalized = deltalake::kernel::transaction::CommitBuilder::default()
-            .with_actions(actions)
-            .build(Some(table.snapshot()? as &dyn deltalake::kernel::transaction::TableReference), table.log_store(), op)
-            .await?;
-        table.state = Some(finalized.snapshot());
-        *table_ref.write().await = table;
-        Ok(())
+        commit_to(table_ref, actions, append_op(true)).await
     }
 
     async fn staged_but_uncommitted_bin(label: &str) -> Result<KilledBin> {
@@ -14455,20 +14334,11 @@ mod tests {
     /// otherwise be indistinguishable from one that merely begins there.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_tag_replay_records_what_it_reads_into_the_coverage_ledger() -> Result<()> {
-        use crate::maintenance_coordinator::Operation;
         use crate::storage::CoverageLedger as _;
-        let cfg = (*create_test_config("ledger-populate")).clone();
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        let db = Database::with_config(create_test_config("ledger-populate")).await?;
         db.cancel_maintenance();
-        let project = format!("ledger_{}", uuid::Uuid::new_v4().simple());
-        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
-        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
-
-        let tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a base tier");
+        let (project, day) = one_rolled_up_day(&db, "ledger").await?;
+        let tier = rollup_tier(false);
         assert!(
             db.coverage_ledger.coverage(&("otel_logs_and_spans".to_owned(), project.clone(), tier.clone(), day.to_string())).is_empty(),
             "the ledger is populated BY the replay, so it is empty until one runs"
@@ -14577,6 +14447,86 @@ mod tests {
         Ok(())
     }
 
+    fn base_tier() -> String {
+        get_schema("otel_logs_and_spans")
+            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
+            .expect("a base tier")
+    }
+
+    /// A published base-tier day with maintenance off: one span at noon three
+    /// days ago, one BaseRollup unit run over it. Returns `(db, project, day, tier)`.
+    async fn published_base_day(label: &str, prefix: &str) -> Result<(Database, String, chrono::NaiveDate, String)> {
+        let mut cfg = (*create_test_config(label)).clone();
+        cfg.maintenance.timefusion_rollup_backfill_days = 35;
+        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
+        db.cancel_maintenance();
+        let project = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
+        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
+        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
+        let report = db.run_unit_once("otel_logs_and_spans", &project, day, crate::maintenance_coordinator::Operation::BaseRollup, 24, 0).await?;
+        assert_eq!(report.date, day);
+        Ok((db, project, day, base_tier()))
+    }
+
+    /// Seed the damage exactly as OPTIMIZE produced it: copy every live file to
+    /// a sibling carrying the same bytes and NO identity tags (a delta-rs
+    /// OPTIMIZE keeps only its own `sort_by` tag).
+    ///
+    /// `replace` also REMOVES the tagged original, so the partition's only file
+    /// is untagged. Leaving the original live is the OTHER shape — an untagged
+    /// file contained in a live tagged slice — covered by
+    /// `a_covered_untagged_file_queues_the_covering_slice`.
+    async fn strip_slice_tags(table_ref: &Arc<RwLock<DeltaTable>>, suffix: &str, replace: bool) -> Result<()> {
+        use deltalake::kernel::Action;
+        use object_store::ObjectStoreExt as _;
+        let live = live_adds(table_ref).await;
+        assert!(!live.is_empty(), "the publish must have written a file to strip");
+        let store = table_ref.read().await.log_store().object_store(None);
+        let mut actions = Vec::new();
+        for add in live {
+            let path = format!("{}-{suffix}.parquet", add.path.trim_end_matches(".parquet"));
+            store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
+            if replace {
+                actions.push(Action::Remove(remove_for_add(&add, true)));
+            }
+            actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
+        }
+        commit_to(table_ref, actions, append_op(false)).await
+    }
+
+    /// Retire every queued task so only work the next pass creates is visible,
+    /// returning the keys it completed.
+    fn retire_all_tasks(db: &Database) -> Vec<crate::maintenance_coordinator::TaskKey> {
+        let mut journal = db.maintenance_tasks.lock().unwrap();
+        let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
+        for key in &keys {
+            journal.complete(key);
+        }
+        keys
+    }
+
+    /// `(live files, of which untagged)` for one project's tier. Re-resolved on
+    /// every call — a rebuild republishes the handle.
+    async fn live_tier_files(db: &Database, project: &str, tier: &str) -> Result<(usize, usize)> {
+        let adds = live_adds(&db.get_or_create_table(project, tier).await?).await;
+        let untagged =
+            adds.iter().filter(|add| add.tags.as_ref().is_none_or(|tags| !tags.contains_key(crate::maintenance_coordinator::TAG_SLICE_START))).count();
+        Ok((adds.len(), untagged))
+    }
+
+    /// The slices still Pending for one project's tier.
+    fn pending_tier_slices(db: &Database, project: &str, tier: &str) -> Vec<crate::maintenance_coordinator::TimeSlice> {
+        let journal = db.maintenance_tasks.lock().unwrap();
+        journal
+            .tasks()
+            .filter(|task| {
+                task.key.project_id == project && task.state == crate::maintenance_coordinator::TaskState::Pending && task.key.physical_table == tier
+            })
+            .map(|task| task.key.slice)
+            .collect()
+    }
+
     /// A partition still holding an untagged tier file must be QUEUED for rebuild.
     ///
     /// `slice_retires` can retire such a file, but only when something publishes that partition,
@@ -14585,75 +14535,19 @@ mod tests {
     /// skipped them silently, which is how 352 of them accumulated across 26 days unnoticed.
     #[tokio::test]
     async fn recovery_queues_a_rebuild_for_a_partition_holding_untagged_tier_files() -> Result<()> {
-        use crate::maintenance_coordinator::{Operation, TaskState};
-        use deltalake::kernel::{
-            Action,
-            transaction::{CommitBuilder, TableReference},
-        };
-        use object_store::ObjectStoreExt as _;
-        let mut cfg = (*create_test_config("untagged-selfheal")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
-        db.cancel_maintenance();
-        let project = format!("heal_{}", uuid::Uuid::new_v4().simple());
-        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
-        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
-        let key = db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await.map(|report| report.date)?;
-        assert_eq!(key, day);
+        use crate::maintenance_coordinator::Operation;
+        let (db, project, day, tier) = published_base_day("untagged-selfheal", "heal").await?;
 
-        // Strip the identity from the published file, exactly as an OPTIMIZE does.
-        let tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a base tier");
+        // Strip the identity from the published file, exactly as an OPTIMIZE
+        // does, REPLACING the tagged original.
         let tier_ref = db.get_or_create_table(&project, &tier).await?;
-        {
-            let mut table = tier_ref.read().await.clone();
-            let live: Vec<_> = table
-                .snapshot()?
-                .log_data()
-                .iter()
-                .map(|file| {
-                    #[allow(deprecated)]
-                    file.add_action()
-                })
-                .collect();
-            let store = table.log_store().object_store(None);
-            let mut actions = Vec::new();
-            for add in live {
-                let path = format!("{}-stripped.parquet", add.path.trim_end_matches(".parquet"));
-                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
-                // REPLACES the tagged original, as a delta-rs OPTIMIZE does.
-                // Leaving it live made the partition's only untagged file
-                // contained in a live tagged slice, which is the OTHER shape —
-                // covered by `a_covered_untagged_file_queues_the_covering_slice`.
-                actions.push(Action::Remove(remove_for_add(&add, true)));
-                actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
-            }
-            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
-            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
-            table.state = Some(finalized.snapshot());
-            *tier_ref.write().await = table;
-        }
+        strip_slice_tags(&tier_ref, "stripped", true).await?;
 
         // Retire everything so only work THIS recovery creates is visible.
-        {
-            let mut journal = db.maintenance_tasks.lock().unwrap();
-            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
-            for key in &keys {
-                journal.complete(key);
-            }
-        }
+        retire_all_tasks(&db);
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
 
-        let queued: Vec<_> = {
-            let journal = db.maintenance_tasks.lock().unwrap();
-            journal
-                .tasks()
-                .filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier)
-                .map(|task| task.key.slice)
-                .collect()
-        };
+        let queued = pending_tier_slices(&db, &project, &tier);
         assert!(!queued.is_empty(), "a partition holding an untagged tier file must be queued for rebuild");
         // Bounded by the FILE, not the day. A day-wide unit is over
         // `MAX_DECODED_BYTES` for any real tenant, so the preflight shreds it
@@ -14687,28 +14581,13 @@ mod tests {
         // false, or `slice_occ_stale`), which there is no cheap way to induce
         // from here. What it does guard is double-counting and counting files
         // the replace-set selected but the commit did not remove.
-        let untagged_live = |db: &Database| {
-            let tier_ref = futures::executor::block_on(db.get_or_create_table(&project, &tier)).expect("tier");
-            let table = futures::executor::block_on(tier_ref.read());
-            table
-                .snapshot()
-                .expect("snapshot")
-                .log_data()
-                .iter()
-                .filter(|file| {
-                    #[allow(deprecated)]
-                    let add = file.add_action();
-                    add.tags.as_ref().is_none_or(|tags| !tags.contains_key(crate::maintenance_coordinator::TAG_SLICE_START))
-                })
-                .count()
-        };
-        let before = untagged_live(&db);
+        let before = live_tier_files(&db, &project, &tier).await?.1;
         assert!(before > 0, "the stripped copies must be live for this to prove anything");
         let counter = || crate::observability::maintenance_stats().rollup_tier_untagged_retired.load(std::sync::atomic::Ordering::Relaxed);
         let counted_before = counter();
         db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
         assert_eq!(
-            u64::try_from(before - untagged_live(&db)).unwrap_or_default(),
+            u64::try_from(before - live_tier_files(&db, &project, &tier).await?.1).unwrap_or_default(),
             counter() - counted_before,
             "the retired counter must equal the untagged files the commit actually removed"
         );
@@ -14725,84 +14604,26 @@ mod tests {
     /// remaining shape, so the wasted hop was most of the work left.
     #[tokio::test]
     async fn a_covered_untagged_file_queues_the_covering_slice() -> Result<()> {
-        use crate::maintenance_coordinator::{Operation, TaskState};
-        use deltalake::kernel::{
-            Action,
-            transaction::{CommitBuilder, TableReference},
-        };
-        use object_store::ObjectStoreExt as _;
-        let mut cfg = (*create_test_config("untagged-covered")).clone();
-        cfg.maintenance.timefusion_rollup_backfill_days = 35;
-        let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
-        db.cancel_maintenance();
-        let project = format!("cover_{}", uuid::Uuid::new_v4().simple());
-        let day = (Utc::now() - chrono::Duration::days(3)).date_naive();
-        let at = day.and_hms_opt(12, 0, 0).expect("noon").and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "op", &project, at)])?], true, None).await?;
-        db.run_unit_once("otel_logs_and_spans", &project, day, Operation::BaseRollup, 24, 0).await?;
-
-        let tier = get_schema("otel_logs_and_spans")
-            .and_then(|schema| schema.rollups.iter().find(|spec| spec.derive_from.is_none()).map(|spec| spec.table_name("otel_logs_and_spans")))
-            .expect("a base tier");
+        let (db, project, _day, tier) = published_base_day("untagged-covered", "cover").await?;
         let tier_ref = db.get_or_create_table(&project, &tier).await?;
         // The stripped copy sits BESIDE its tagged original, so the partition
         // holds an untagged file whose span a live tagged slice contains.
-        {
-            let mut table = tier_ref.read().await.clone();
-            let live: Vec<_> = table
-                .snapshot()?
-                .log_data()
-                .iter()
-                .map(|file| {
-                    #[allow(deprecated)]
-                    file.add_action()
-                })
-                .collect();
-            let store = table.log_store().object_store(None);
-            let mut actions = Vec::new();
-            for add in live {
-                let path = format!("{}-stripped.parquet", add.path.trim_end_matches(".parquet"));
-                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
-                actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
-            }
-            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
-            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
-            table.state = Some(finalized.snapshot());
-            *tier_ref.write().await = table;
-        }
-        let covering: Vec<(i64, i64)> = {
-            let table = tier_ref.read().await;
-            table
-                .snapshot()?
-                .log_data()
-                .iter()
-                .filter_map(|file| {
-                    #[allow(deprecated)]
-                    let tags = file.add_action().tags?;
-                    let tag = |name: &str| tags.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
-                    Some((tag(crate::maintenance_coordinator::TAG_SLICE_START)?, tag(crate::maintenance_coordinator::TAG_SLICE_END)?))
-                })
-                .collect()
-        };
+        strip_slice_tags(&tier_ref, "stripped", false).await?;
+        let covering: Vec<(i64, i64)> = live_adds(&tier_ref)
+            .await
+            .into_iter()
+            .filter_map(|add| {
+                let tags = add.tags?;
+                let tag = |name: &str| tags.get(name).and_then(Option::as_deref)?.parse::<i64>().ok();
+                Some((tag(crate::maintenance_coordinator::TAG_SLICE_START)?, tag(crate::maintenance_coordinator::TAG_SLICE_END)?))
+            })
+            .collect();
         assert!(!covering.is_empty(), "the tagged original must stay live, or this tests the other shape");
 
-        {
-            let mut journal = db.maintenance_tasks.lock().unwrap();
-            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
-            for key in &keys {
-                journal.complete(key);
-            }
-        }
+        retire_all_tasks(&db);
         db.recover_rollup_coverage("otel_logs_and_spans").await?;
 
-        let queued: Vec<(i64, i64)> = {
-            let journal = db.maintenance_tasks.lock().unwrap();
-            journal
-                .tasks()
-                .filter(|task| task.key.project_id == project && task.state == TaskState::Pending && task.key.physical_table == tier)
-                .map(|task| (task.key.slice.start_micros, task.key.slice.end_micros))
-                .collect()
-        };
+        let queued: Vec<(i64, i64)> = pending_tier_slices(&db, &project, &tier).into_iter().map(|slice| (slice.start_micros, slice.end_micros)).collect();
         assert!(!queued.is_empty(), "a covered untagged file must still be queued");
         assert!(
             queued.iter().all(|slice| covering.contains(slice)),
@@ -14941,11 +14762,6 @@ mod tests {
     #[tokio::test]
     async fn a_day_wide_publish_retires_an_untagged_tier_file() -> Result<()> {
         use crate::maintenance_coordinator::{DAY_MICROS, MAX_DECODED_BYTES, Operation, TaskKey, TimeSlice};
-        use deltalake::kernel::{
-            Action,
-            transaction::{CommitBuilder, TableReference},
-        };
-        use object_store::ObjectStoreExt as _;
         let mut cfg = (*create_test_config("untagged-immortal")).clone();
         cfg.maintenance.timefusion_rollup_backfill_days = 35;
         let db = Database::with_config(std::sync::Arc::new(cfg)).await?;
@@ -14960,14 +14776,10 @@ mod tests {
         // Publish the day at DAY width — the width this fix is scoped to, and
         // what `coarsen_sealed_slices` produces for a sealed day in prod.
         let day_unit = |db: &Database| -> Result<TaskKey> {
-            let mut journal = db.maintenance_tasks.lock().unwrap();
-            let keys: Vec<_> = journal.tasks().map(|task| task.key.clone()).collect();
-            for key in &keys {
-                journal.complete(key);
-            }
-            let base = keys.into_iter().find(|key| key.operation == Operation::BaseRollup).expect("the write path queues a base rollup for the day");
+            let base =
+                retire_all_tasks(db).into_iter().find(|key| key.operation == Operation::BaseRollup).expect("the write path queues a base rollup for the day");
             let key = TaskKey { slice: TimeSlice::new(day_start, day_start + DAY_MICROS)?, ..base };
-            journal.enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
+            db.maintenance_tasks.lock().unwrap().enqueue(key.clone(), 0, MAX_DECODED_BYTES, 0);
             Ok(key)
         };
         let key = day_unit(&db)?;
@@ -14988,39 +14800,12 @@ mod tests {
         // Seed the damage exactly as OPTIMIZE produced it: the same bytes, live
         // in the same partition, carrying no identity tags.
         let tier_ref = db.get_or_create_table(&project, &key.physical_table).await?;
-        {
-            let mut table = tier_ref.read().await.clone();
-            let live: Vec<_> = table
-                .snapshot()?
-                .log_data()
-                .iter()
-                .map(|file| {
-                    #[allow(deprecated)]
-                    file.add_action()
-                })
-                .collect();
-            assert!(!live.is_empty(), "the publish must have written a file to strip");
-            let store = table.log_store().object_store(None);
-            let mut actions = Vec::new();
-            for add in live {
-                let path = format!("{}-untagged.parquet", add.path.trim_end_matches(".parquet"));
-                store.copy(&deltalake::Path::from(add.path.clone()), &deltalake::Path::from(path.clone())).await?;
-                actions.push(Action::Add(deltalake::kernel::Add { path, tags: None, ..add }));
-            }
-            let op = deltalake::protocol::DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by: None, predicate: None };
-            let finalized = CommitBuilder::default().with_actions(actions).build(Some(table.snapshot()? as &dyn TableReference), table.log_store(), op).await?;
-            table.state = Some(finalized.snapshot());
-            *tier_ref.write().await = table;
-        }
+        strip_slice_tags(&tier_ref, "untagged", false).await?;
         // Count FILES, not summed measures. Reads collapse versions now that a
         // tier declares its identity, so a read-side sum would report the right
         // answer over a partition that is still carrying the damage — which is
         // exactly the confusion this whole area produced in the first place.
-        let live_files = async |db: &Database| -> Result<usize> {
-            let table = db.get_or_create_table(&project, &key.physical_table).await?;
-            let table = table.read().await.clone();
-            Ok(table.snapshot()?.log_data().iter().count())
-        };
+        let live_files = async |db: &Database| -> Result<usize> { Ok(live_tier_files(db, &project, &key.physical_table).await?.0) };
         assert_eq!(live_files(&db).await?, 2, "precondition: the untagged copy is live alongside the tagged one");
         assert_eq!(tier_total(&db).await?, 3, "read-time dedup must already hide the duplicate from queries");
 
@@ -15122,23 +14907,22 @@ mod tests {
     /// Coverage is intersected across projects, so a dormant tenant that wrote nothing in the window
     /// refuses the query for everyone. A single project with a tiny partition can dominate the miss
     /// profile once `missing_project` is fixed.
-    #[test]
-    fn a_partition_outside_the_window_does_not_join_the_coverage_requirement() {
-        let stats = |min_ts, max_ts| PartitionStats { fingerprint: 0, min_ts, max_ts, rows: 0, bytes: 0 };
-        // Wholly before, wholly after: not in the window.
-        assert!(!stats(0, 50).overlaps(100, 200));
-        assert!(!stats(300, 400).overlaps(100, 200));
-        // Half-open: a row exactly at `hi` is outside, one exactly at `lo` is in.
-        assert!(!stats(200, 250).overlaps(100, 200));
-        assert!(stats(100, 100).overlaps(100, 200));
-        // Straddling either edge, and strictly containing, all overlap.
-        assert!(stats(50, 150).overlaps(100, 200));
-        assert!(stats(150, 250).overlaps(100, 200));
-        assert!(stats(0, 1000).overlaps(100, 200));
-        // No timestamp statistics: the sentinel range must be treated as
-        // OVERLAPPING. Dropping a project on the strength of a statistic that is
-        // not there is the direction that undercounts.
-        assert!(stats(i64::MAX, i64::MIN).overlaps(100, 200));
+    ///
+    /// The window is `[100, 200)` — half-open, so a row exactly at `hi` is out
+    /// and one exactly at `lo` is in. The sentinel case is the load-bearing one:
+    /// a partition with NO timestamp statistics must be treated as OVERLAPPING,
+    /// because dropping a project on the strength of a statistic that is not
+    /// there is the direction that undercounts.
+    #[test_case::test_case(0, 50 => false ; "wholly before the window")]
+    #[test_case::test_case(300, 400 => false ; "wholly after the window")]
+    #[test_case::test_case(200, 250 => false ; "half-open: a row exactly at hi is outside")]
+    #[test_case::test_case(100, 100 => true ; "half-open: a row exactly at lo is in")]
+    #[test_case::test_case(50, 150 => true ; "straddling the low edge")]
+    #[test_case::test_case(150, 250 => true ; "straddling the high edge")]
+    #[test_case::test_case(0, 1000 => true ; "strictly containing the window")]
+    #[test_case::test_case(i64::MAX, i64::MIN => true ; "the no-statistics sentinel range must overlap")]
+    fn a_partition_outside_the_window_does_not_join_the_coverage_requirement(min_ts: i64, max_ts: i64) -> bool {
+        PartitionStats { fingerprint: 0, min_ts, max_ts, rows: 0, bytes: 0 }.overlaps(100, 200)
     }
 
     /// The intersection is the whole safety argument for cross-project routing:
@@ -15228,12 +15012,15 @@ mod tests {
         assert_eq!(split.iter().collect::<HashSet<_>>().len(), split.len(), "a file must not be scheduled twice in one pass: {split:?}");
     }
 
+    fn backfill_queue(items: &[&str]) -> VecDeque<(String, String)> {
+        items.iter().map(|item| (format!("rel/{item}"), format!("uri/{item}"))).collect()
+    }
+
     #[test]
     fn tantivy_backfill_rotates_projects_before_their_history() {
-        let queue = |items: &[&str]| items.iter().map(|item| (format!("rel/{item}"), format!("uri/{item}"))).collect::<VecDeque<_>>();
         let work = super::fair_tantivy_backfill_work(vec![
-            ("whale".to_string(), queue(&["whale-new", "whale-mid", "whale-old"])),
-            ("small".to_string(), queue(&["small-new"])),
+            ("whale".to_string(), backfill_queue(&["whale-new", "whale-mid", "whale-old"])),
+            ("small".to_string(), backfill_queue(&["small-new"])),
         ]);
         let scheduled: Vec<_> = work.iter().map(|(project, _, uri)| (project.as_str(), uri.as_str())).collect();
 
@@ -15245,10 +15032,9 @@ mod tests {
     /// without a big tenant's history starving everyone else's recent files.
     #[test]
     fn a_bounded_backfill_pass_truncates_the_oldest_round_not_one_project() {
-        let queue = |items: &[&str]| items.iter().map(|item| (format!("rel/{item}"), format!("uri/{item}"))).collect::<VecDeque<_>>();
         let mut work = super::fair_tantivy_backfill_work(vec![
-            ("whale".to_string(), queue(&["whale-new", "whale-mid", "whale-old"])),
-            ("small".to_string(), queue(&["small-new", "small-old"])),
+            ("whale".to_string(), backfill_queue(&["whale-new", "whale-mid", "whale-old"])),
+            ("small".to_string(), backfill_queue(&["small-new", "small-old"])),
         ]);
         let deferred = work.len().saturating_sub(3);
         work.truncate(3);
@@ -15518,6 +15304,18 @@ mod tests {
         Ok(())
     }
 
+    /// `(base tiers, derived tiers)` DECLARED for `otel_logs_and_spans`.
+    ///
+    /// The task-count expectations below derive from the declared specs rather
+    /// than a literal: the point of those tests is per-hour sparseness, and
+    /// pinning a literal made them fail whenever a tier was added — which reads
+    /// as a regression and is not one.
+    fn declared_rollup_tiers() -> (usize, usize) {
+        let rollups = &crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups;
+        let derived = rollups.iter().filter(|spec| spec.derive_from.is_some()).count();
+        (rollups.len() - derived, derived)
+    }
+
     /// Reconciling a missed commit must invalidate only the hours the commit's
     /// files actually span, never the whole partition-day. The old form
     /// enqueued `ALL_HOURS` per changed partition, and unified-table flush
@@ -15547,19 +15345,13 @@ mod tests {
 
         let journal = db.maintenance_tasks.lock().unwrap();
         let tasks = journal.tasks().filter(|task| task.key.project_id == project).collect::<Vec<_>>();
-        // Derived from the DECLARED specs for the same reason as
-        // `first_rollup_invalidation_enqueues_only_the_touched_hour`: this pins
-        // per-hour sparseness, and a literal would fail whenever a tier is
-        // added — which reads as a regression and is not one.
-        let rollups = crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups.clone();
-        let (derived, base): (Vec<_>, Vec<_>) = rollups.iter().partition(|spec| spec.derive_from.is_some());
-        let expected = 6 + 6 * base.len() + derived.len();
-        assert_eq!(tasks.len(), expected, "one touched hour: 6 dedup + 6 per base tier + 1 per derived tier, not 312 for the whole day");
+        let (base, derived) = declared_rollup_tiers();
+        assert_eq!(tasks.len(), 6 + 6 * base + derived, "one touched hour: 6 dedup + 6 per base tier + 1 per derived tier, not 312 for the whole day");
         assert!(
             tasks.iter().all(|task| task.key.slice.start_micros >= hour_start && task.key.slice.end_micros <= hour_start + 3_600_000_000),
             "every reconciled task must lie inside the touched hour; day {day} starts {day_start}"
         );
-        assert_eq!(queued, rollups.len(), "one dirty hour x one enqueue per declared rollup spec");
+        assert_eq!(queued, base + derived, "one dirty hour x one enqueue per declared rollup spec");
         Ok(())
     }
 
@@ -15667,47 +15459,27 @@ mod tests {
             *counts.entry(task.key.operation).or_default() += 1;
             counts
         });
-        // Derived from the DECLARED specs, not hardcoded: the point of the test
-        // is per-hour sparseness, and pinning a literal made it fail whenever a
-        // tier was added — which reads as a regression and is not one.
-        let rollups = crate::schema::get_schema("otel_logs_and_spans").expect("schema").rollups.clone();
-        let (derived, base): (Vec<_>, Vec<_>) = rollups.iter().partition(|spec| spec.derive_from.is_some());
+        let (base, derived) = declared_rollup_tiers();
         assert_eq!(counts.get(&Operation::Dedup), Some(&6));
-        assert_eq!(counts.get(&Operation::BaseRollup), Some(&(6 * base.len())));
-        assert_eq!(counts.get(&Operation::DerivedRollup), Some(&derived.len()));
+        assert_eq!(counts.get(&Operation::BaseRollup), Some(&(6 * base)));
+        assert_eq!(counts.get(&Operation::DerivedRollup), Some(&derived));
         assert_eq!(counts.get(&Operation::HotPacking), None, "ingest must not mint file-hygiene work; the debt planner owns it");
-        assert_eq!(journal.tasks().count(), 6 + 6 * base.len() + derived.len(), "one touched hour, not 456 full-day tasks");
+        assert_eq!(journal.tasks().count(), 6 + 6 * base + derived, "one touched hour, not 456 full-day tasks");
         Ok(())
     }
 
-    #[test]
-    fn maintenance_reconciliation_extracts_only_the_changed_partition() {
-        let values = HashMap::from([("project_id".to_owned(), Some("customer-a".to_owned())), ("date".to_owned(), Some("2026-08-16".to_owned()))]);
-        assert_eq!(
-            Database::maintenance_partition_from_action("ignored.parquet", Some(&values), "default"),
-            Some(("customer-a".to_owned(), "2026-08-16".to_owned()))
-        );
-
-        // Older writers may omit partitionValues on Remove. The file path is
-        // still sufficient, so a delete cannot advance the cursor without
-        // invalidating the affected slice.
-        assert_eq!(
-            Database::maintenance_partition_from_action("project_id=customer-b/date=2026-08-15/part-000.parquet", None, "default"),
-            Some(("customer-b".to_owned(), "2026-08-15".to_owned()))
-        );
-
-        assert_eq!(
-            Database::maintenance_partition_from_action("date=2026-08-14/part-000.parquet", None, "default"),
-            Some(("default".to_owned(), "2026-08-14".to_owned()))
-        );
-        assert_eq!(Database::maintenance_partition_from_action("part-000.parquet", None, "default"), None);
-
-        // `default_project` is the fallback for a custom-project table's storage
-        // project, not always the literal string "default".
-        assert_eq!(
-            Database::maintenance_partition_from_action("date=2026-08-14/part-000.parquet", None, "customer-c"),
-            Some(("customer-c".to_owned(), "2026-08-14".to_owned()))
-        );
+    /// An empty `values` slice models an action carrying no `partitionValues` at
+    /// all — older writers omit them on Remove, and the file path must still be
+    /// sufficient, so a delete cannot advance the cursor without invalidating
+    /// the affected slice.
+    #[test_case::test_case(&[("project_id", "customer-a"), ("date", "2026-08-16")], "ignored.parquet", "default" => Some(("customer-a".to_owned(), "2026-08-16".to_owned())) ; "partition values are authoritative over the path")]
+    #[test_case::test_case(&[], "project_id=customer-b/date=2026-08-15/part-000.parquet", "default" => Some(("customer-b".to_owned(), "2026-08-15".to_owned())) ; "a Remove without partitionValues falls back to the path")]
+    #[test_case::test_case(&[], "date=2026-08-14/part-000.parquet", "default" => Some(("default".to_owned(), "2026-08-14".to_owned())) ; "a path with no project takes the default project")]
+    #[test_case::test_case(&[], "part-000.parquet", "default" => None ; "an unpartitioned path yields no partition")]
+    #[test_case::test_case(&[], "date=2026-08-14/part-000.parquet", "customer-c" => Some(("customer-c".to_owned(), "2026-08-14".to_owned())) ; "default_project is a custom table's storage project, not the literal default")]
+    fn maintenance_reconciliation_extracts_only_the_changed_partition(values: &[(&str, &str)], path: &str, default_project: &str) -> Option<(String, String)> {
+        let values: HashMap<String, Option<String>> = values.iter().map(|(key, value)| ((*key).to_owned(), Some((*value).to_owned()))).collect();
+        Database::maintenance_partition_from_action(path, (!values.is_empty()).then_some(&values), default_project)
     }
 
     /// Today is swept on every tick; only the sealed tail rotates.
@@ -15935,75 +15707,55 @@ mod tests {
         assert_eq!(missing.len(), 2, "only the days actually missing a tier");
     }
 
-    /// The metric exists because the two we had both read as progress while
-    /// 14d/30d queries were unroutable. It must report the CONTIGUOUS run, and
-    /// must be dragged down by the worst project — but a day the SOURCE never
-    /// held must still count as answered (else the gauge is unreachable by
-    /// construction: the goal is "30 contiguous days a 30d panel can answer
-    /// from the tier", not "30 days every tenant happened to send traffic").
-    #[test]
-    fn contiguous_coverage_ignores_days_stranded_behind_a_hole() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).expect("date");
-        let day = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
-        let covered = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day(*d))).collect::<HashSet<_>>();
-        let active = |names: &[&'static str]| names.iter().copied().collect::<HashSet<&str>>();
-        // Every day in the window held source rows, so an absent day in `covered`
-        // is a genuine hole rather than a day with nothing to roll up.
-        let dense = |names: &[&str]| names.iter().flat_map(|p| (1u32..=31).map(move |d| ((*p).to_owned(), day(d)))).collect::<HashSet<_>>();
-
-        // 08-16, 08-15, 08-14 unbroken back from yesterday.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("a", 14)]), &dense(&["a"]), today, &active(&["a"])).0, 3);
-
-        // Prod's actual shape: plenty of days, but a hole right after yesterday.
-        // Everything behind it is unreachable to a 30d panel, so it must not count.
-        assert_eq!(min_contiguous_days(&covered(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)]), &dense(&["a"]), today, &active(&["a"])).0, 1);
-
-        // Today is the frontier's job — covering it must not extend the run.
-        assert_eq!(
-            min_contiguous_days(&covered(&[("a", 17)]), &dense(&["a"]), today, &active(&["a"])).0,
-            0,
-            "yesterday missing is zero coverage however complete today is"
-        );
-
-        // One starved project drags the fleet number down; averaging would hide it.
-        assert_eq!(
-            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("b", 16)]), &dense(&["a", "b"]), today, &active(&["a", "b"])).0,
-            1,
-            "the worst project is the number that matters"
-        );
-        assert_eq!(min_contiguous_days(&HashSet::new(), &dense(&["a"]), today, &active(&["a"])).0, 0);
-
-        // A project that stopped ingesting can never have yesterday. Counting it
-        // pinned the gauge at 0 forever on prod (`edb04135`, last wrote 08-03)
-        // while every project anyone queries was fully covered.
-        assert_eq!(
-            min_contiguous_days(&covered(&[("a", 16), ("a", 15), ("dormant", 3)]), &dense(&["a", "dormant"]), today, &active(&["a"])).0,
-            2,
-            "a project that no longer ingests must not pin the fleet number at zero"
-        );
-
-        // A day the source never held must count as answered, or the gauge is
-        // unreachable by construction: the goal is "30 contiguous days a 30d
-        // panel can answer from the tier", not "30 days on which every tenant
-        // happened to send traffic".
-        let today2 = chrono::NaiveDate::from_ymd_opt(2026, 8, 18).expect("date");
-        let day2 = |n: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date");
-        let set = |pairs: &[(&str, u32)]| pairs.iter().map(|(p, d)| ((*p).to_owned(), day2(*d))).collect::<HashSet<_>>();
-        // 4f020cf8's real shape: source on 14/16/18 only, tier matching exactly.
-        let source = set(&[("q", 14), ("q", 16), ("q", 18)]);
-        let covered_q = set(&[("q", 14), ("q", 16), ("q", 18)]);
-        assert_eq!(
-            min_contiguous_days(&covered_q, &source, today2, &active(&["q"])).0,
-            CONTIGUITY_HORIZON_DAYS,
-            "17 and 15 had no rows to roll up, and neither did anything older — fully answered"
-        );
-        // A day the source DID hold and the tier does not is still a real hole.
-        let source = set(&[("q", 17), ("q", 16), ("q", 15)]);
-        let covered_q = set(&[("q", 17), ("q", 15)]);
-        assert_eq!(min_contiguous_days(&covered_q, &source, today2, &active(&["q"])).0, 1, "16 has rows and no tier — a genuine gap");
-        // A project that emitted nothing at all in the window is fully answered
-        // rather than scoring zero.
-        assert_eq!(min_contiguous_days(&HashSet::new(), &HashSet::new(), today2, &active(&["silent"])).0, CONTIGUITY_HORIZON_DAYS);
+    // The metric exists because the two we had both read as progress while
+    // 14d/30d queries were unroutable. It must report the CONTIGUOUS run, and
+    // must be dragged down by the worst project — but a day the SOURCE never
+    // held must still count as answered (else the gauge is unreachable by
+    // construction: the goal is "30 contiguous days a 30d panel can answer
+    // from the tier", not "30 days every tenant happened to send traffic").
+    //
+    // 08-16, 08-15, 08-14 unbroken back from yesterday.
+    #[test_case(&[("a", 16), ("a", 15), ("a", 14)], &["a"], None, 17, &["a"] => 3 ; "an unbroken run back from yesterday")]
+    // Prod's actual shape: plenty of days, but a hole right after yesterday.
+    // Everything behind it is unreachable to a 30d panel, so it must not count.
+    #[test_case(&[("a", 16), ("a", 13), ("a", 12), ("a", 11), ("a", 10)], &["a"], None, 17, &["a"] => 1 ; "days stranded behind a hole do not count")]
+    // Today is the frontier's job — covering it must not extend the run.
+    #[test_case(&[("a", 17)], &["a"], None, 17, &["a"] => 0 ; "yesterday missing is zero coverage however complete today is")]
+    // One starved project drags the fleet number down; averaging would hide it.
+    #[test_case(&[("a", 16), ("a", 15), ("b", 16)], &["a", "b"], None, 17, &["a", "b"] => 1 ; "the worst project is the number that matters")]
+    #[test_case(&[], &["a"], None, 17, &["a"] => 0 ; "nothing covered is zero")]
+    // A project that stopped ingesting can never have yesterday. Counting it
+    // pinned the gauge at 0 forever on prod (`edb04135`, last wrote 08-03)
+    // while every project anyone queries was fully covered.
+    #[test_case(&[("a", 16), ("a", 15), ("dormant", 3)], &["a", "dormant"], None, 17, &["a"] => 2 ; "a project that no longer ingests must not pin the fleet number at zero")]
+    // A day the source never held must count as answered, or the gauge is
+    // unreachable by construction: the goal is "30 contiguous days a 30d
+    // panel can answer from the tier", not "30 days on which every tenant
+    // happened to send traffic". 4f020cf8's real shape: source on 14/16/18
+    // only, tier matching exactly.
+    #[test_case(&[("q", 14), ("q", 16), ("q", 18)], &[], Some(&[("q", 14), ("q", 16), ("q", 18)]), 18, &["q"]
+        => CONTIGUITY_HORIZON_DAYS ; "17 and 15 had no rows to roll up, and neither did anything older — fully answered")]
+    // A day the source DID hold and the tier does not is still a real hole.
+    #[test_case(&[("q", 17), ("q", 15)], &[], Some(&[("q", 17), ("q", 16), ("q", 15)]), 18, &["q"] => 1 ; "16 has rows and no tier — a genuine gap")]
+    // A project that emitted nothing at all in the window is fully answered
+    // rather than scoring zero.
+    #[test_case(&[], &[], Some(&[]), 18, &["silent"] => CONTIGUITY_HORIZON_DAYS ; "a project that emitted nothing is fully answered")]
+    // All dates are in 2026-08. `dense_for` names the projects whose SOURCE held rows on EVERY day of
+    // the window, so an absent day in `covered` is a genuine hole rather than a day with nothing to
+    // roll up; `source_days` instead pins the exact days the source held.
+    fn contiguous_coverage_ignores_days_stranded_behind_a_hole(
+        covered: &[(&str, u32)], dense_for: &[&str], source_days: Option<&[(&str, u32)]>, today: u32, active: &[&str],
+    ) -> u64 {
+        fn day(n: u32) -> chrono::NaiveDate {
+            chrono::NaiveDate::from_ymd_opt(2026, 8, n).expect("date")
+        }
+        fn day_set(pairs: &[(&str, u32)]) -> HashSet<(String, chrono::NaiveDate)> {
+            pairs.iter().map(|(p, d)| ((*p).to_owned(), day(*d))).collect()
+        }
+        let dense: HashSet<_> = dense_for.iter().flat_map(|p| (1u32..=31).map(move |d| ((*p).to_owned(), day(d)))).collect();
+        let source = source_days.map_or(dense, day_set);
+        let active: HashSet<&str> = active.iter().copied().collect();
+        min_contiguous_days(&day_set(covered), &source, day(today), &active).0
     }
 
     #[test]
@@ -16222,12 +15974,6 @@ mod tests {
         assert_eq!(completed.load(Relaxed), 1, "slow-but-healthy run must complete, not be aborted");
     }
 
-    /// The shared OCC classifier must treat every retryable delta-rs conflict as
-    /// retryable — including `VersionAlreadyExists` ("already exists", which can
-    /// hit the dedup path under multi-replica races), `MetadataChanged`, and the
-    /// predicate re-evaluation failure ("Transaction failed") — while permanent
-    /// errors (protocol version, auth/IO) fail fast. Guards the dedup/optimize
-    /// loops, which previously omitted some of these substrings.
     // Warm (30-min Z-order) and cold (daily 512MB consolidate) tiers must own
     // disjoint partitions, or they oscillate the same day 256MB↔512MB every cycle.
     // `date_is_cold` is the single boundary both use; assert today is warm and
@@ -16254,25 +16000,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn is_occ_conflict_err_classifies_retryable_vs_permanent() {
-        for retryable in [
-            "Delta transaction failed, version 58420 already exists.",
-            "Commit failed: a concurrent transaction overlapped",
-            "concurrent transaction wrote to the same files",
-            "Metadata changed since last commit.",
-            "Transaction failed: Error evaluating predicate",
-        ] {
-            assert!(is_occ_conflict_err(retryable), "should retry: {retryable}");
-        }
-        for permanent in [
-            "Generic S3 error: Access Denied",
-            "Unsupported reader version: requires 3, have 2",
-            "Unsupported writer version required",
-            "Arrow error: Invalid argument",
-        ] {
-            assert!(!is_occ_conflict_err(permanent), "must fail fast: {permanent}");
-        }
+    // The shared OCC classifier must treat every retryable delta-rs conflict as
+    // retryable — including `VersionAlreadyExists` ("already exists", which can
+    // hit the dedup path under multi-replica races), `MetadataChanged`, and the
+    // predicate re-evaluation failure ("Transaction failed") — while permanent
+    // errors (protocol version, auth/IO) fail fast. Guards the dedup/optimize
+    // loops, which previously omitted some of these substrings.
+    #[test_case("Delta transaction failed, version 58420 already exists." => true ; "VersionAlreadyExists retries")]
+    #[test_case("Commit failed: a concurrent transaction overlapped" => true ; "concurrent transaction overlap retries")]
+    #[test_case("concurrent transaction wrote to the same files" => true ; "concurrent write to the same files retries")]
+    #[test_case("Metadata changed since last commit." => true ; "MetadataChanged retries")]
+    #[test_case("Transaction failed: Error evaluating predicate" => true ; "predicate re-evaluation retries")]
+    #[test_case("Generic S3 error: Access Denied" => false ; "auth or IO fails fast")]
+    #[test_case("Unsupported reader version: requires 3, have 2" => false ; "reader protocol version fails fast")]
+    #[test_case("Unsupported writer version required" => false ; "writer protocol version fails fast")]
+    #[test_case("Arrow error: Invalid argument" => false ; "arrow error fails fast")]
+    fn is_occ_conflict_err_classifies_retryable_vs_permanent(msg: &str) -> bool {
+        is_occ_conflict_err(msg)
     }
 
     // Regression: a single Arrow batch carrying rows for several projects (as a
@@ -16314,28 +16058,19 @@ mod tests {
         assert_eq!((parts[0].0.as_str(), parts[0].1.num_rows()), ("A", 3));
     }
 
-    #[test]
-    fn test_within_recency() {
-        let cutoff = chrono::NaiveDate::from_ymd_opt(2026, 6, 4);
-
-        // Files on/after the cutoff date are warmed.
-        assert!(within_recency("s3://b/t/date=2026-06-06/part-0.parquet", cutoff));
-        assert!(within_recency("s3://b/t/date=2026-06-04/part-0.parquet", cutoff), "cutoff is inclusive");
-        // Older partitions are skipped.
-        assert!(!within_recency("s3://b/t/date=2026-06-01/part-0.parquet", cutoff));
-
-        // No `date=` segment → warm (don't silently skip an unclassifiable file).
-        assert!(within_recency("s3://b/t/part-0.parquet", cutoff));
-        // Unparseable date → warm.
-        assert!(within_recency("s3://b/t/date=not-a-date/part-0.parquet", cutoff));
-        // Truncated date (segment shorter than YYYY-MM-DD) → warm.
-        assert!(within_recency("s3://b/t/date=2026-06", cutoff));
-
-        // None cutoff → no recency limit, always warm even very old partitions.
-        assert!(within_recency("s3://b/t/date=2000-01-01/part-0.parquet", None));
-
-        // Nested partitioning (project_id then date) still locates `date=`.
-        assert!(!within_recency("s3://b/t/project_id=default/date=2026-05-01/part.parquet", cutoff));
+    const RECENCY_CUTOFF: Option<(i32, u32, u32)> = Some((2026, 6, 4));
+    // Only the `date=` partition decides recency, and anything unclassifiable is
+    // warmed rather than silently skipped.
+    #[test_case("s3://b/t/date=2026-06-06/part-0.parquet", RECENCY_CUTOFF => true ; "after the cutoff is warm")]
+    #[test_case("s3://b/t/date=2026-06-04/part-0.parquet", RECENCY_CUTOFF => true ; "cutoff is inclusive")]
+    #[test_case("s3://b/t/date=2026-06-01/part-0.parquet", RECENCY_CUTOFF => false ; "older partitions are skipped")]
+    #[test_case("s3://b/t/part-0.parquet", RECENCY_CUTOFF => true ; "no date= segment is warm")]
+    #[test_case("s3://b/t/date=not-a-date/part-0.parquet", RECENCY_CUTOFF => true ; "unparseable date is warm")]
+    #[test_case("s3://b/t/date=2026-06", RECENCY_CUTOFF => true ; "truncated date shorter than YYYY-MM-DD is warm")]
+    #[test_case("s3://b/t/date=2000-01-01/part-0.parquet", None => true ; "no cutoff means no recency limit")]
+    #[test_case("s3://b/t/project_id=default/date=2026-05-01/part.parquet", RECENCY_CUTOFF => false ; "nested project_id partitioning still locates date=")]
+    fn test_within_recency(path: &str, cutoff: Option<(i32, u32, u32)>) -> bool {
+        within_recency(path, cutoff.and_then(|(y, m, d)| chrono::NaiveDate::from_ymd_opt(y, m, d)))
     }
 
     /// Roundtrip the watermark through serialize → JSON → parse. Pins the
@@ -16602,6 +16337,22 @@ mod tests {
         assert!(sets[&d2].is_empty());
     }
 
+    /// One candidate file for the tail-packer tests.
+    fn tail_file(path: &str, size: i64, is_sorted_run: bool, event_range: Option<(i64, i64)>, has_dv: bool, rows: Option<u64>) -> super::TailAdd {
+        super::TailAdd { path: path.into(), size, is_sorted_run, event_range, rows, has_dv }
+    }
+
+    // The shared packing target/seal the policy tests are written against.
+    const BIN_TARGET: i64 = 1000;
+    const BIN_SEAL: i64 = 10_000;
+
+    /// One packing pass over `(path, size, is_sorted_run, min_event, max_event, has_dv)`
+    /// tuples, returning the selected bin as a comma-joined path list ("" = nothing selected).
+    fn pack_tail(files: &[(&str, i64, bool, i64, i64, bool)], min_files: usize) -> String {
+        let adds: Vec<_> = files.iter().map(|&(p, size, sorted, lo, hi, dv)| tail_file(p, size, sorted, Some((lo, hi)), dv, None)).collect();
+        super::select_tail_bin(&adds, BIN_TARGET, min_files, BIN_TARGET / 4, BIN_SEAL, TailPass::Pack, 0, 0).join(",")
+    }
+
     /// Every clause of `select_tail_bin` is an incident scar (see its doc), so
     /// they're pinned individually here rather than through a Delta table.
     /// Does FAN-IN scale with the bin target? The 10x path assumes it does.
@@ -16618,16 +16369,8 @@ mod tests {
     #[test]
     fn fan_in_scales_with_the_bin_target() {
         const SEAL: i64 = i64::MAX / 4;
-        let f = |i: usize, size: i64| super::TailAdd {
-            path: format!("f{i}"),
-            size,
-            is_sorted_run: false,
-            event_range: Some((i as i64, i as i64)),
-            rows: Some(10_000),
-            has_dv: false,
-        };
         // 40 candidate files of 16 MiB, contiguous in event time.
-        let adds: Vec<_> = (0..40).map(|i| f(i, 16 * 1024 * 1024)).collect();
+        let adds: Vec<_> = (0..40).map(|i| tail_file(&format!("f{i}"), 16 * 1024 * 1024, false, Some((i, i)), false, Some(10_000))).collect();
 
         let fan_in = |target: i64| super::select_tail_bin(&adds, target, 5, target / 4, SEAL, TailPass::Pack, 0, 0).len();
         let (at256, at512, at768) = (fan_in(256 * 1024 * 1024), fan_in(512 * 1024 * 1024), fan_in(768 * 1024 * 1024));
@@ -16673,17 +16416,10 @@ mod tests {
             for _ in 0..ROUNDS {
                 live.push(ARRIVAL);
                 ingested += ARRIVAL;
-                let adds: Vec<super::TailAdd> = live
+                let adds: Vec<_> = live
                     .iter()
                     .enumerate()
-                    .map(|(i, size)| super::TailAdd {
-                        path: format!("f{i}"),
-                        size: *size,
-                        is_sorted_run: false,
-                        event_range: Some((i as i64, i as i64)),
-                        rows: Some((*size as u64) * 12 / 104),
-                        has_dv: false,
-                    })
+                    .map(|(i, size)| tail_file(&format!("f{i}"), *size, false, Some((i as i64, i as i64)), false, Some((*size as u64) * 12 / 104)))
                     .collect();
                 let picked = super::select_tail_bin(&adds, TARGET, 5, TARGET / 4, SEAL, TailPass::Pack, ratio, floor);
                 if picked.len() < 2 {
@@ -16784,18 +16520,8 @@ mod tests {
     /// directly, exactly as the span-budget test does.
     #[test]
     fn a_bin_is_priced_by_files_removed_not_bytes_written() {
-        const TARGET: i64 = 1000;
-        const SEAL: i64 = 10_000;
-        // NOT sorted runs: `sorted_run_cap` (TARGET/4) excludes already-sorted
+        // NOT sorted runs: `sorted_run_cap` (BIN_TARGET/4) excludes already-sorted
         // files above it, which would keep the pair out for an unrelated reason.
-        let f = |path: &str, size: i64, min: i64, max: i64| super::TailAdd {
-            path: path.into(),
-            size,
-            is_sorted_run: false,
-            event_range: Some((min, max)),
-            rows: None,
-            has_dv: false,
-        };
         // Priced in ROWS per file eliminated, which is what the guard compares.
         let value = |files: &[(&str, i64)]| {
             let rows: i64 = files.iter().map(|(_, s)| *s).sum();
@@ -16804,17 +16530,16 @@ mod tests {
 
         // THE EXPENSIVE SHAPE: two nearly-converged files fill the target and
         // remove ONE file between them.
-        let pair = vec![f("p0", 430, 1, 2), f("p1", 430, 3, 4)];
         assert_eq!(
-            super::select_tail_bin(&pair, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
-            vec!["p0", "p1"],
+            pack_tail(&[("p0", 430, false, 1, 2, false), ("p1", 430, false, 3, 4, false)], 2),
+            "p0,p1",
             "unguarded, the packer takes the pair: it only asks whether the bytes fit"
         );
         assert_eq!(value(&[("p0", 430), ("p1", 430)]), 860, "860 bytes rewritten per file eliminated");
 
         // THE CHEAP SHAPE: ten small files, same partition, remove NINE.
-        let many: Vec<_> = (0..10).map(|i| f(&format!("s{i}"), 20, i * 2 + 1, i * 2 + 2)).collect();
-        let picked = super::select_tail_bin(&many, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0);
+        let many: Vec<_> = (0..10).map(|i| tail_file(&format!("s{i}"), 20, false, Some((i * 2 + 1, i * 2 + 2)), false, None)).collect();
+        let picked = super::select_tail_bin(&many, BIN_TARGET, 2, BIN_TARGET / 4, BIN_SEAL, TailPass::Pack, 0, 0);
         assert_eq!(picked.len(), 10, "all ten fit under the target");
         assert_eq!(value(&[("s", 20); 10]), 22, "22 bytes per file eliminated — 39x better value");
 
@@ -16826,99 +16551,54 @@ mod tests {
         }
     }
 
+    // Seal lag: a file whose newest event is past the seal is still filling
+    // (prod 2026-07-20: compacting it lost every OCC race).
+    #[test_case(&[("a", 10, false, 1, 1, false), ("b", 10, false, 2, BIN_SEAL + 1, false)], 2 => "" ; "unsealed files leave < min_files")]
+    // Converged (>= 7/8 target) files are never re-selected: rewriting one
+    // alone is a 1→1 rewrite forever.
+    #[test_case(&[("big", 900, false, 1, 2, false), ("a", 10, false, 3, 4, false), ("b", 10, false, 5, 6, false)], 2 => "a,b" ; "a converged file is never re-selected")]
+    // REPAIR: an oversized file that is NOT a sorted run declares no
+    // `sorting_columns`, and one of those disables the reader's
+    // all-or-nothing footer ordering for every scan touching the partition.
+    // Nothing else rewrites it — hot-tail used to skip it as converged, and
+    // the daily crons rarely survive this process's restart cadence. So it
+    // is repaired, but only in the GAPS: while a project still has a
+    // packable slice, that slice wins.
+    #[test_case(&[("big_unsorted", 900, false, 1, 2, false), ("a", 10, false, 3, 4, false), ("b", 10, false, 5, 6, false)], 2 => "a,b" ; "normal packing must not be starved by a pending repair")]
+    // With no packable slice left, the tick repairs one oversized unsorted file —
+    // alone, and below min_files (the gap rule: today's poisoned file still gets
+    // repaired even though `TailPass::Repair` excludes today).
+    #[test_case(&[("big_unsorted", 900, false, 1, 2, false)], 2 => "big_unsorted" ; "the gap rule repairs an oversized unsorted file alone")]
+    // A converged file that IS a sorted run stays done — repairing it would
+    // be a 1->1 rewrite forever.
+    #[test_case(&[("big_sorted", 900, true, 1, 2, false)], 2 => "" ; "a converged sorted run is never re-selected")]
+    // ...but the SAME converged sorted run carrying a deletion vector IS
+    // re-selected: a DV disables per-file parquet pushdown, so it must be
+    // rewritten DV-free (via the repair lane — a solo consolidation).
+    #[test_case(&[("big_dv", 900, true, 1, 2, true)], 2 => "big_dv" ; "a DV-bearing converged file is consolidated to restore pushdown")]
+    // Sorted runs fold only while under the cap; an over-cap run is excluded.
+    #[test_case(&[("run_small", 100, true, 1, 2, false), ("run_big", 300, true, 3, 4, false), ("a", 10, false, 5, 6, false)], 2 => "run_small,a" ; "only the sub-cap sorted run folds")]
+    // Earliest contiguous slice up to cap, ordered by EVENT time (input
+    // order is deliberately scrambled) — this is what makes runs disjoint.
+    #[test_case(&[("third", 600, false, 30, 31, false), ("first", 600, false, 10, 11, false), ("second", 300, false, 20, 21, false)], 2 => "first,second" ; "packs earliest slice, stops at cap")]
+    #[test_case(&[("a", 10, false, 1, 2, false), ("b", 10, false, 3, 4, false)], 3 => "" ; "min_files gate")]
+    // A lone over-cap-adjacent file must not wedge the pass: selection skips
+    // past it to the next slice rather than returning a 1-file bin.
+    #[test_case(&[("lone", 800, false, 1, 2, false), ("a", 300, false, 10, 11, false), ("b", 300, false, 12, 13, false)], 2 => "a,b" ; "a lone over-cap-adjacent file does not wedge the pass")]
+    // ...and exactly one repair per bin, so a backlog drains across ticks instead
+    // of rewriting several hundred-megabyte files in a single pass.
+    #[test_case(&[("p1", 900, false, 1, 2, false), ("p2", 950, false, 3, 4, false), ("p3", 800, false, 5, 6, false)], 2
+        => with |bin: String| assert!(!bin.is_empty() && !bin.contains(','), "one repair per bin, got {bin:?}") ; "one repair per bin")]
+    fn select_tail_bin_policy(files: &[(&str, i64, bool, i64, i64, bool)], min_files: usize) -> String {
+        pack_tail(files, min_files)
+    }
+
+    /// Files with no event-time stats can't be binned disjointly (the
+    /// 2026-07-20 silent no-op read them as None and selected NOTHING).
     #[test]
-    fn select_tail_bin_policy() {
-        const TARGET: i64 = 1000;
-        const SEAL: i64 = 10_000;
-        let f = |path: &str, size: i64, sorted: bool, min: i64, max: i64| super::TailAdd {
-            path: path.into(),
-            size,
-            is_sorted_run: sorted,
-            event_range: Some((min, max)),
-            rows: None,
-            has_dv: false,
-        };
-        // Seal lag: a file whose newest event is past the seal is still filling
-        // (prod 2026-07-20: compacting it lost every OCC race).
-        let unsealed = vec![f("a", 10, false, 1, 1), f("b", 10, false, 2, SEAL + 1)];
-        assert_eq!(
-            super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
-            Vec::<String>::new(),
-            "unsealed files leave < min_files"
-        );
-
-        // Converged (>= 7/8 target) files are never re-selected: rewriting one
-        // alone is a 1→1 rewrite forever.
-        let converged = vec![f("big", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["a", "b"]);
-
-        // REPAIR: an oversized file that is NOT a sorted run declares no
-        // `sorting_columns`, and one of those disables the reader's
-        // all-or-nothing footer ordering for every scan touching the partition.
-        // Nothing else rewrites it — hot-tail used to skip it as converged, and
-        // the daily crons rarely survive this process's restart cadence. So it
-        // is repaired, but only in the GAPS: while a project still has a
-        // packable slice, that slice wins.
-        let poisoned = vec![f("big_unsorted", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
-        assert_eq!(
-            super::select_tail_bin(&poisoned, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
-            vec!["a", "b"],
-            "normal packing must not be starved by a pending repair"
-        );
-        let only_poison = vec![f("big_unsorted", 900, false, 1, 2)];
-        assert_eq!(
-            super::select_tail_bin(&only_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
-            vec!["big_unsorted"],
-            "with no packable slice left, the tick repairs one oversized unsorted file — alone, and below min_files (the gap rule: today's poisoned file still gets repaired even though `TailPass::Repair` excludes today)"
-        );
-        // ...and exactly one per bin, so a backlog drains across ticks instead
-        // of rewriting several hundred-megabyte files in a single pass.
-        let many_poison = vec![f("p1", 900, false, 1, 2), f("p2", 950, false, 3, 4), f("p3", 800, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&many_poison, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0).len(), 1, "one repair per bin");
-        // A converged file that IS a sorted run stays done — repairing it would
-        // be a 1->1 rewrite forever.
-        let healthy = vec![f("big_sorted", 900, true, 1, 2)];
-        assert!(super::select_tail_bin(&healthy, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0).is_empty(), "a converged sorted run is never re-selected");
-
-        // ...but the SAME converged sorted run carrying a deletion vector IS
-        // re-selected: a DV disables per-file parquet pushdown, so it must be
-        // rewritten DV-free (via the repair lane — a solo consolidation).
-        let dv_sorted = vec![super::TailAdd { path: "big_dv".into(), size: 900, is_sorted_run: true, event_range: Some((1, 2)), rows: None, has_dv: true }];
-        assert_eq!(
-            super::select_tail_bin(&dv_sorted, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
-            vec!["big_dv"],
-            "a DV-bearing converged file must be consolidated (rewritten DV-free) to restore pushdown"
-        );
-
-        // Sorted runs fold only while under the cap; an over-cap run is excluded.
-        let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
-        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["run_small", "a"], "only the sub-cap run folds");
-
-        // Earliest contiguous slice up to cap, ordered by EVENT time (input
-        // order is deliberately scrambled) — this is what makes runs disjoint.
-        let pack = vec![f("third", 600, false, 30, 31), f("first", 600, false, 10, 11), f("second", 300, false, 20, 21)];
-        assert_eq!(
-            super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
-            vec!["first", "second"],
-            "packs earliest slice, stops at cap"
-        );
-
-        // min_files gate.
-        assert_eq!(
-            super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL, TailPass::Pack, 0, 0),
-            Vec::<String>::new()
-        );
-
-        // A lone over-cap-adjacent file must not wedge the pass: selection skips
-        // past it to the next slice rather than returning a 1-file bin.
-        let lone = vec![f("lone", 800, false, 1, 2), f("a", 300, false, 10, 11), f("b", 300, false, 12, 13)];
-        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), vec!["a", "b"]);
-
-        // Files with no event-time stats can't be binned disjointly (the
-        // 2026-07-20 silent no-op read them as None and selected NOTHING).
-        let no_stats =
-            vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None, rows: None, has_dv: false }, f("a", 10, false, 1, 2)];
-        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL, TailPass::Pack, 0, 0), Vec::<String>::new());
+    fn files_without_event_stats_are_never_binned() {
+        let no_stats = vec![tail_file("x", 10, false, None, false, None), tail_file("a", 10, false, Some((1, 2)), false, None)];
+        assert_eq!(super::select_tail_bin(&no_stats, BIN_TARGET, 2, BIN_TARGET / 4, BIN_SEAL, TailPass::Pack, 0, 0), Vec::<String>::new());
     }
 
     /// The similar-size rule (`bin_breaks_size_ratio`) inside the tail packer:
@@ -16932,14 +16612,7 @@ mod tests {
     fn a_dissimilar_file_ends_the_bin_instead_of_joining_it() {
         const TARGET: i64 = 1000;
         const SEAL: i64 = 10_000;
-        let f = |path: &str, size: i64, min: i64, max: i64| super::TailAdd {
-            path: path.into(),
-            size,
-            is_sorted_run: false,
-            event_range: Some((min, max)),
-            rows: None,
-            has_dv: false,
-        };
+        let f = |path: &str, size: i64, min: i64, max: i64| tail_file(path, size, false, Some((min, max)), false, None);
         // Smalls first, whale later in time: ratio off admits all three (the
         // measured 82.5%-write-volume shape); ratio 4 keeps the small pair and
         // leaves the whale for its own generation.
@@ -16960,14 +16633,7 @@ mod tests {
     #[test]
     fn coordinator_compaction_sorts_small_l0_units_before_merging_sorted_runs() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd {
-            path: path.into(),
-            size: size_mb * MB,
-            is_sorted_run: sorted,
-            event_range: None,
-            rows: None,
-            has_dv: false,
-        };
+        let f = |path: &str, size_mb: i64, sorted: bool| tail_file(path, size_mb * MB, sorted, None, false, None);
 
         // Sorted runs are still excluded while any L0 file is present, but the two
         // L0 files now share one unit instead of taking a unit each.
@@ -16992,6 +16658,23 @@ mod tests {
         assert_eq!(super::coordinator_slice_target(TailPass::Pack, 2, 40 * MB), None);
     }
 
+    /// The wide narrow-row `otel_metrics` shape both staging measurements below
+    /// are written against: 4 base columns plus `extra_cols` attributes (prod
+    /// carries 69 in total). Per-batch cost is paid PER COLUMN, so a 4-column
+    /// model understates it ~17x — the first run of the experiment made exactly
+    /// that mistake and wrongly exonerated batch size.
+    fn wide_metrics_schema(extra_cols: usize) -> Arc<arrow_schema::Schema> {
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        let mut fields = vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("series_id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ];
+        fields.extend((0..extra_cols).map(|i| Field::new(format!("attr_{i}"), if i % 3 == 0 { DataType::Utf8 } else { DataType::Int64 }, true)));
+        Arc::new(Schema::new(fields))
+    }
+
     /// Does `batch_override = Some("256")` explain the metrics staging grind?
     ///
     /// Prod 2026-08-28: a 23-file / 260.8 MB `otel_metrics` bin reads from OVH in
@@ -17009,7 +16692,6 @@ mod tests {
     #[ignore = "measurement, not an assertion — run explicitly with --ignored --no-capture"]
     async fn batch_size_dominates_narrow_row_staging() {
         use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
-        use arrow_schema::{DataType, Field, Schema, TimeUnit};
         use datafusion::{
             datasource::MemTable,
             prelude::{SessionConfig, SessionContext},
@@ -17018,19 +16700,8 @@ mod tests {
 
         const PARTS: usize = 23; // the prod bin's file count
         const ROWS_PER_PART: usize = 40_000;
-        // otel_metrics carries 69 columns. Per-batch cost is paid PER COLUMN, so a
-        // 4-column model understates it ~17x — the first run of this experiment
-        // made exactly that mistake and wrongly exonerated batch size.
         let build = |extra_cols: usize| {
-            let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-            let mut fields = vec![
-                Field::new("timestamp", ts, false),
-                Field::new("metric_name", DataType::Utf8, false),
-                Field::new("series_id", DataType::Utf8, false),
-                Field::new("value", DataType::Int64, false),
-            ];
-            fields.extend((0..extra_cols).map(|i| Field::new(format!("attr_{i}"), if i % 3 == 0 { DataType::Utf8 } else { DataType::Int64 }, true)));
-            let schema = Arc::new(Schema::new(fields));
+            let schema = wide_metrics_schema(extra_cols);
             let partitions: Vec<Vec<_>> = (0..PARTS)
                 .map(|p| {
                     let base = (p * ROWS_PER_PART) as i64;
@@ -17098,41 +16769,16 @@ mod tests {
     #[ignore = "measurement, not an assertion — run explicitly with --run-ignored all --no-capture"]
     async fn staging_write_throughput_by_batch_size() {
         use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
-        use arrow_schema::{DataType, Field, Schema, TimeUnit};
         use datafusion::parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 
         const ROWS: usize = 200_000;
         const COLS: usize = 65;
-        let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-        let mut fields = vec![
-            Field::new("timestamp", ts, false),
-            Field::new("metric_name", DataType::Utf8, false),
-            Field::new("series_id", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ];
-        fields.extend((0..COLS).map(|i| Field::new(format!("attr_{i}"), if i % 3 == 0 { DataType::Utf8 } else { DataType::Int64 }, true)));
-        let schema = Arc::new(Schema::new(fields));
+        let schema = wide_metrics_schema(COLS);
 
         // Batches are built OUTSIDE the timer. Building them inside timed 4.4M
         // string allocations rather than the writer — the first run of this made
         // exactly that mistake and reported the writer 3x slower than it is.
-        let make_batch = |offset: usize, n: usize| {
-            let mut cols: Vec<arrow::array::ArrayRef> = vec![
-                Arc::new(TimestampMicrosecondArray::from((0..n as i64).map(|i| offset as i64 + i).collect::<Vec<_>>()).with_timezone("UTC")),
-                Arc::new(StringArray::from((0..n).map(|i| format!("metric_{}", i % 64)).collect::<Vec<_>>())),
-                Arc::new(StringArray::from((0..n).map(|i| format!("series_{}", i % 512)).collect::<Vec<_>>())),
-                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
-            ];
-            cols.extend((0..COLS).map(|i| -> arrow::array::ArrayRef {
-                if i % 3 == 0 {
-                    Arc::new(StringArray::from((0..n).map(|r| format!("v{}", r % 97)).collect::<Vec<_>>()))
-                } else {
-                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()))
-                }
-            }));
-            arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), cols).expect("batch")
-        };
-
+        //
         // CARDINALITY is the variable the first version of this test missed. The
         // synthetic `i % 97` strings dictionary-encode almost for free, while real
         // otel columns (series_id, ids, attribute values) are near-unique — so the
@@ -17178,7 +16824,6 @@ mod tests {
                 );
             }
         }
-        let _ = &make_batch; // the low-cardinality builder above supersedes it
     }
 
     /// The span budget rejects a merge whose OUTPUT would span too many dedup
@@ -17194,14 +16839,7 @@ mod tests {
     fn the_span_budget_rejects_wide_unions_and_is_off_by_default() {
         const MB: i64 = 1024 * 1024;
         let bin = crate::database::compact::bin_micros();
-        let f = |path: &str, at_bin: i64| super::TailAdd {
-            path: path.into(),
-            size: 10 * MB,
-            is_sorted_run: true,
-            event_range: Some((at_bin * bin, at_bin * bin + bin / 2)),
-            rows: Some(1_000),
-            has_dv: false,
-        };
+        let f = |path: &str, at_bin: i64| tail_file(path, 10 * MB, true, Some((at_bin * bin, at_bin * bin + bin / 2)), false, Some(1_000));
         // Two files 100 bins apart: a merge of them spans ~101 bins.
         let far = vec![f("a", 0), f("b", 100)];
 
@@ -17236,14 +16874,7 @@ mod tests {
     #[test]
     fn a_bin_is_capped_by_rows_not_only_bytes() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64, rows: u64| super::TailAdd {
-            path: path.into(),
-            size: size_mb * MB,
-            is_sorted_run: true,
-            event_range: None,
-            rows: Some(rows),
-            has_dv: false,
-        };
+        let f = |path: &str, size_mb: i64, rows: u64| tail_file(path, size_mb * MB, true, None, false, Some(rows));
 
         // Metrics shape: 47 B/row, so 256 MB of these is ~5.5 M rows. The byte
         // budget alone would take them all; the row cap stops first.
@@ -17260,9 +16891,7 @@ mod tests {
         assert_eq!(sparse_picked.len(), 23, "a sparse bin is still bounded by BYTES, not clipped by the row cap");
 
         // Absent stats must never make the cap stricter than bytes alone.
-        let unknown: Vec<_> = (0..23)
-            .map(|i| super::TailAdd { path: format!("u{i:02}"), size: 11 * MB, is_sorted_run: true, event_range: None, rows: None, has_dv: false })
-            .collect();
+        let unknown: Vec<_> = (0..23).map(|i| tail_file(&format!("u{i:02}"), 11 * MB, true, None, false, None)).collect();
         assert_eq!(
             super::select_coordinator_compaction_candidates(unknown, super::COORDINATOR_SEALED_TARGET_BYTES).len(),
             23,
@@ -17286,14 +16915,7 @@ mod tests {
     #[test]
     fn a_pair_that_fits_the_byte_budget_is_never_blocked_by_the_row_cap() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd {
-            path: path.into(),
-            size: bytes,
-            is_sorted_run: true,
-            event_range: None,
-            rows: Some(rows),
-            has_dv: false,
-        };
+        let f = |path: &str, bytes: i64, rows: u64| tail_file(path, bytes, true, None, false, Some(rows));
 
         // The exact prod cell, sizes and row counts as measured.
         let cell = vec![
@@ -17328,14 +16950,7 @@ mod tests {
     #[test]
     fn the_planner_admits_exactly_what_the_packer_can_bin() {
         let target = super::COORDINATOR_SEALED_TARGET_BYTES;
-        let f = |path: &str, bytes: i64, rows: u64| super::TailAdd {
-            path: path.into(),
-            size: bytes,
-            is_sorted_run: true,
-            event_range: None,
-            rows: Some(rows),
-            has_dv: false,
-        };
+        let f = |path: &str, bytes: i64, rows: u64| tail_file(path, bytes, true, None, false, Some(rows));
 
         // Both cells read off prod 2026-09-03. Bytes fit in BOTH — 82% and 81% of
         // the budget — so a bytes-only planner queues both; the packer bins only
@@ -17367,14 +16982,7 @@ mod tests {
     #[test]
     fn an_unsorted_bin_is_budgeted_in_decoded_bytes() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64| super::TailAdd {
-            path: path.into(),
-            size: size_mb * MB,
-            is_sorted_run: false,
-            event_range: None,
-            rows: None,
-            has_dv: false,
-        };
+        let f = |path: &str, size_mb: i64| tail_file(path, size_mb * MB, false, None, false, None);
         let budget = super::unsorted_bin_budget_bytes();
 
         // The invariant the value is chosen from, stated as a test so a future
@@ -17460,14 +17068,7 @@ mod tests {
     #[test]
     fn coordinator_packing_never_rewrites_a_converged_file() {
         const MB: i64 = 1024 * 1024;
-        let f = |path: &str, size_mb: i64, sorted: bool| super::TailAdd {
-            path: path.into(),
-            size: size_mb * MB,
-            is_sorted_run: sorted,
-            event_range: None,
-            rows: None,
-            has_dv: false,
-        };
+        let f = |path: &str, size_mb: i64, sorted: bool| tail_file(path, size_mb * MB, sorted, None, false, None);
 
         // The whale/07-30 shape: converged files carrying no sorted-run tag, beside real small debt.
         let whale = vec![f("converged-a", 520, false), f("converged-b", 512, false), f("small-a", 6, false), f("small-b", 6, false)];
@@ -17501,14 +17102,7 @@ mod tests {
     #[test]
     fn packing_takes_the_small_files_even_when_a_large_one_sorts_first() {
         const MB: i64 = 1024 * 1024;
-        let run = |path: &str, size_mb: i64| super::TailAdd {
-            path: path.into(),
-            size: size_mb * MB,
-            is_sorted_run: true,
-            event_range: None,
-            rows: None,
-            has_dv: false,
-        };
+        let run = |path: &str, size_mb: i64| tail_file(path, size_mb * MB, true, None, false, None);
 
         // Event-time order puts the 252 MB file first; the rest are tiny.
         let cell = vec![run("big-252", 252), run("t-a", 14), run("t-b", 14), run("t-c", 14)];
@@ -17555,8 +17149,7 @@ mod tests {
             super::COORDINATOR_FILE_REWRITE_TIMEOUT
         );
 
-        let run =
-            |name: &str, mib: i64| super::TailAdd { path: name.into(), size: mib * MIB, is_sorted_run: true, event_range: None, rows: None, has_dv: false };
+        let run = |name: &str, mib: i64| tail_file(name, mib * MIB, true, None, false, None);
         assert_eq!(
             super::select_coordinator_compaction_candidates(vec![run("a", 128), run("b", 128), run("c", 128)], super::COORDINATOR_SEALED_TARGET_BYTES),
             vec!["a", "b"],
@@ -17574,14 +17167,7 @@ mod tests {
     fn repair_pass_takes_the_newest_poisoned_file_then_the_smallest() {
         const TARGET: i64 = 1000;
         const SEAL: i64 = 10_000;
-        let f = |path: &str, size: i64, min: i64| super::TailAdd {
-            path: path.into(),
-            size,
-            is_sorted_run: false,
-            event_range: Some((min, min + 1)),
-            rows: None,
-            has_dv: false,
-        };
+        let f = |path: &str, size: i64, min: i64| tail_file(path, size, false, Some((min, min + 1)), false, None);
         let backlog = vec![f("may", 900, 10), f("july", 900, 500), f("june", 950, 100)];
         assert_eq!(super::select_tail_bin(&backlog, TARGET, 2, TARGET / 4, SEAL, TailPass::Repair, 0, 0), vec!["july"], "newest poisoned file first");
 
@@ -18201,6 +17787,74 @@ mod tests {
         );
     }
 
+    /// Scheduling knobs for `run_bins`. The default is a far deadline, three rounds,
+    /// serial admission and one commit per wave, so each test names only the dimension
+    /// it is about.
+    struct Sched {
+        rounds: usize,
+        concurrency: usize,
+        deadline: std::time::Instant,
+        commit_each_bin: bool,
+        /// Notified after every commit, so a bin can block until a sibling committed.
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl Default for Sched {
+        fn default() -> Self {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            Self { rounds: 3, concurrency: 1, deadline, commit_each_bin: false, release: None }
+        }
+    }
+
+    /// Everything one `round_robin_bins` run observes: the `(project, round)` bins it
+    /// admitted in order, every `on_truncate(round, remaining)`, every commit's bin list,
+    /// and the failure count.
+    struct BinRun {
+        calls: Vec<(String, usize)>,
+        truncated: Vec<(usize, Vec<String>)>,
+        committed: Vec<Vec<String>>,
+        failed: usize,
+    }
+
+    async fn run_bins<F, Fut>(projects: &[&str], sched: Sched, brake: impl Fn() -> Option<super::Brake>, op: F) -> BinRun
+    where
+        F: Fn(String, usize) -> Fut,
+        Fut: std::future::Future<Output = Result<super::BinOutcome<String>>>,
+    {
+        let (calls, truncated, committed) = (std::sync::Mutex::new(Vec::new()), std::sync::Mutex::new(Vec::new()), std::sync::Mutex::new(Vec::new()));
+        let failed = super::round_robin_bins(
+            projects.iter().map(|p| (*p).to_string()).collect(),
+            sched.rounds,
+            sched.concurrency,
+            sched.deadline,
+            |round, remaining: &[String]| truncated.lock().unwrap().push((round, remaining.to_vec())),
+            brake,
+            sched.commit_each_bin,
+            |project_id, round| {
+                calls.lock().unwrap().push((project_id.clone(), round));
+                let outcome = op(project_id.clone(), round);
+                async move { (project_id, outcome.await) }
+            },
+            |bins: Vec<String>, _round| {
+                let (committed, release) = (&committed, sched.release.clone());
+                async move {
+                    committed.lock().unwrap().push(bins);
+                    if let Some(release) = release {
+                        release.notify_one();
+                    }
+                    0
+                }
+            },
+        )
+        .await;
+        let (calls, truncated, committed) = (calls.into_inner().unwrap(), truncated.into_inner().unwrap(), committed.into_inner().unwrap());
+        BinRun { calls, truncated, committed, failed }
+    }
+
+    fn bin_staged(project_id: String) -> Result<super::BinOutcome<String>> {
+        Ok(super::BinOutcome::Staged(project_id))
+    }
+
     /// Round-robin fairness: every project must get its Nth bin before any project gets its
     /// (N+1)th.
     ///
@@ -18208,42 +17862,13 @@ mod tests {
     /// its first, so on a short cron most projects were never compacted.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_gives_every_project_a_bin_before_anyone_gets_a_second() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
-        let seen = calls.clone();
         // Every project has unbounded work, so only the round cap stops it.
-        let failed = super::round_robin_bins(
-            vec!["a".into(), "b".into(), "c".into()],
-            3,
-            1,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            |_, _| panic!("must not truncate: deadline is far away"),
-            || None,
-            false,
-            |project_id, round| {
-                let seen = seen.clone();
-                async move {
-                    seen.lock().unwrap().push((project_id.clone(), round));
-                    (project_id, Ok(super::BinOutcome::Staged(())))
-                }
-            },
-            |_bins, _round| async { 0 },
-        )
-        .await;
-        assert_eq!(failed, 0);
-        let calls = calls.lock().unwrap().clone();
+        let run = run_bins(&["a", "b", "c"], Sched::default(), || None, |project_id, _| async move { bin_staged(project_id) }).await;
+        assert_eq!(run.failed, 0);
+        assert!(run.truncated.is_empty(), "must not truncate: deadline is far away");
         assert_eq!(
-            calls,
-            vec![
-                ("a".to_string(), 0),
-                ("b".to_string(), 0),
-                ("c".to_string(), 0),
-                ("a".to_string(), 1),
-                ("b".to_string(), 1),
-                ("c".to_string(), 1),
-                ("a".to_string(), 2),
-                ("b".to_string(), 2),
-                ("c".to_string(), 2),
-            ],
+            run.calls,
+            (0..3).flat_map(|round| ["a", "b", "c"].map(|p| (p.to_string(), round))).collect::<Vec<_>>(),
             "expected round-robin, got a per-project drain"
         );
     }
@@ -18407,160 +18032,95 @@ mod tests {
     /// implementation cannot finish this test at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_finished_repair_bin_commits_without_waiting_for_its_slow_sibling() {
-        let (committed, gate) = (std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new())), std::sync::Arc::new(tokio::sync::Notify::new()));
-        let (seen, release) = (committed.clone(), gate.clone());
-        let run = super::round_robin_bins(
-            vec!["fast".into(), "slow".into()],
-            1,
-            2,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            |_, _| {},
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let sched = Sched { rounds: 1, concurrency: 2, commit_each_bin: true, release: Some(gate.clone()), ..Sched::default() };
+        let run = run_bins(
+            &["fast", "slow"],
+            sched,
             || None,
-            true,
-            |project_id, _round| {
+            move |project_id, _| {
                 let gate = gate.clone();
                 async move {
                     if project_id == "slow" {
                         gate.notified().await;
                     }
-                    (project_id.clone(), Ok(super::BinOutcome::Staged(project_id)))
-                }
-            },
-            |bins: Vec<String>, _round| {
-                let (seen, release) = (seen.clone(), release.clone());
-                async move {
-                    seen.lock().unwrap().push(bins);
-                    release.notify_one();
-                    0
+                    bin_staged(project_id)
                 }
             },
         );
-        let failed =
-            tokio::time::timeout(std::time::Duration::from_secs(10), run).await.expect("a finished bin must commit while its sibling is still staging");
-        assert_eq!(failed, 0);
-        assert_eq!(*committed.lock().unwrap(), vec![vec!["fast".to_string()], vec!["slow".to_string()]], "one commit per bin, in completion order");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), run).await.expect("a finished bin must commit while its sibling is still staging");
+        assert_eq!(run.failed, 0);
+        assert_eq!(run.committed, vec![vec!["fast".to_string()], vec!["slow".to_string()]], "one commit per bin, in completion order");
     }
 
     /// Packing bins are many and quick, and one commit per bin used to drive long OCC ladders.
     /// Packing must still land the whole wave in a single call.
     #[tokio::test(flavor = "multi_thread")]
     async fn packing_still_commits_the_whole_wave_in_one_call() {
-        let committed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
-        let seen = committed.clone();
-        let failed = super::round_robin_bins(
-            vec!["a".into(), "b".into(), "c".into()],
-            1,
-            3,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            |_, _| {},
-            || None,
-            false,
-            |project_id, _round| async move { (project_id.clone(), Ok(super::BinOutcome::Staged(project_id))) },
-            |bins: Vec<String>, _round| {
-                let seen = seen.clone();
-                async move {
-                    seen.lock().unwrap().push(bins);
-                    0
-                }
-            },
-        )
-        .await;
-        assert_eq!(failed, 0);
-        let committed = committed.lock().unwrap();
-        assert_eq!(committed.len(), 1, "packing commits ONCE per wave, got {} calls", committed.len());
-        assert_eq!(committed[0].len(), 3, "all three bins in the one commit");
+        let sched = Sched { rounds: 1, concurrency: 3, ..Sched::default() };
+        let run = run_bins(&["a", "b", "c"], sched, || None, |project_id, _| async move { bin_staged(project_id) }).await;
+        assert_eq!(run.failed, 0);
+        assert_eq!(run.committed.len(), 1, "packing commits ONCE per wave, got {} calls", run.committed.len());
+        assert_eq!(run.committed[0].len(), 3, "all three bins in the one commit");
     }
 
     /// A dedup-raced bin (`Retry`) must not silence the project for the tick; it stays in rotation and
     /// gets a fresh bin next round.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_keeps_a_vanished_bin_project_in_rotation() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
-        let seen = calls.clone();
-        let failed = super::round_robin_bins(
-            vec!["raced".into()],
-            3,
-            1,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            |_, _| panic!("must not truncate"),
+        let run = run_bins(
+            &["raced"],
+            Sched::default(),
             || None,
-            false,
-            |project_id, round| {
-                let seen = seen.clone();
-                async move {
-                    seen.lock().unwrap().push((project_id.clone(), round));
-                    // Round 0: selection went stale under a concurrent rewrite.
-                    let outcome = if round == 0 { super::BinOutcome::Retry } else { super::BinOutcome::Staged(()) };
-                    (project_id, Ok(outcome))
+            |project_id, round| async move {
+                // Round 0: selection went stale under a concurrent rewrite.
+                match round {
+                    0 => Ok(super::BinOutcome::Retry),
+                    _ => bin_staged(project_id),
                 }
-            },
-            |bins: Vec<()>, _| async move {
-                assert!(!bins.is_empty());
-                0
             },
         )
         .await;
-        assert_eq!(failed, 0);
-        let calls = calls.lock().unwrap().clone();
-        assert_eq!(calls.iter().filter(|(p, _)| p == "raced").count(), 3, "raced project must be retried every round, not dropped");
+        assert_eq!(run.failed, 0);
+        assert!(run.truncated.is_empty(), "must not truncate");
+        assert!(run.committed.iter().all(|bins| !bins.is_empty()), "a wave commit must never be called with an empty bin list");
+        assert_eq!(run.calls.iter().filter(|(p, _)| p == "raced").count(), 3, "raced project must be retried every round, not dropped");
     }
 
     /// A project whose tail is converged (`Ok(false)`) must stop consuming
     /// rounds, so the remaining budget goes to projects that still have work.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_drops_converged_and_failed_projects() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
-        let seen = calls.clone();
-        let failed = super::round_robin_bins(
-            vec!["converged".into(), "busy".into(), "broken".into()],
-            3,
-            1,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            |_, _| panic!("must not truncate"),
+        let run = run_bins(
+            &["converged", "busy", "broken"],
+            Sched::default(),
             || None,
-            false,
-            |project_id, round| {
-                let seen = seen.clone();
-                async move {
-                    seen.lock().unwrap().push((project_id.clone(), round));
-                    let outcome = match project_id.as_str() {
-                        "converged" => Ok(super::BinOutcome::Converged),
-                        "broken" => Err(anyhow::anyhow!("boom")),
-                        _ => Ok(super::BinOutcome::Staged(())),
-                    };
-                    (project_id, outcome)
+            |project_id, _| async move {
+                match project_id.as_str() {
+                    "converged" => Ok(super::BinOutcome::Converged),
+                    "broken" => Err(anyhow::anyhow!("boom")),
+                    _ => bin_staged(project_id),
                 }
             },
-            |_bins, _round| async { 0 },
         )
         .await;
-        assert_eq!(failed, 1, "the erroring project counts once, then drops out");
-        let calls = calls.lock().unwrap().clone();
-        assert_eq!(calls.iter().filter(|(p, _)| p == "converged").count(), 1, "converged project must not be retried");
-        assert_eq!(calls.iter().filter(|(p, _)| p == "broken").count(), 1, "failed project must not be retried");
-        assert_eq!(calls.iter().filter(|(p, _)| p == "busy").count(), 3, "busy project keeps its rounds");
+        assert_eq!(run.failed, 1, "the erroring project counts once, then drops out");
+        assert!(run.truncated.is_empty(), "must not truncate");
+        let served = |project: &str| run.calls.iter().filter(|(p, _)| p == project).count();
+        assert_eq!(served("converged"), 1, "converged project must not be retried");
+        assert_eq!(served("broken"), 1, "failed project must not be retried");
+        assert_eq!(served("busy"), 3, "busy project keeps its rounds");
     }
 
     /// The tick must stop starting rounds past its wall-clock budget rather than overrunning its
     /// own cron period.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_stops_at_the_tick_deadline() {
-        let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
-        let sink = truncated.clone();
-        let failed = super::round_robin_bins(
-            vec!["a".into(), "b".into()],
-            12,
-            1,
-            std::time::Instant::now(), // already expired
-            move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.len())),
-            || None,
-            false,
-            |project_id, _| async move { (project_id, Ok(super::BinOutcome::Staged(()))) },
-            |_bins, _round| async { 0 },
-        )
-        .await;
-        assert_eq!(failed, 0);
-        assert_eq!(*truncated.lock().unwrap(), vec![(0, 2)], "must truncate on round 0 with both projects still pending");
+        let sched = Sched { rounds: 12, deadline: std::time::Instant::now(), ..Sched::default() }; // already expired
+        let run = run_bins(&["a", "b"], sched, || None, |project_id, _| async move { bin_staged(project_id) }).await;
+        assert_eq!(run.failed, 0);
+        assert!(run.calls.is_empty(), "an expired deadline must start no bin at all");
+        assert_eq!(run.truncated, vec![(0, vec!["a".to_string(), "b".to_string()])], "must truncate on round 0 with both projects still pending");
     }
 
     /// A brake sampled only at round boundaries cannot bound memory allocated inside a round, so it
@@ -18571,35 +18131,32 @@ mod tests {
     /// truncate — not run the whole round anyway.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_stops_admitting_bins_when_the_brake_engages_mid_round() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new()));
         // Healthy at the round boundary; trips as soon as the first bin is
         // admitted — the shape of a wave whose own staging exhausts memory.
-        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (seen, sink, gate) = (calls.clone(), truncated.clone(), admitted.clone());
-        super::round_robin_bins(
-            vec!["a".into(), "b".into(), "c".into()],
-            3,
-            1, // serial admission, so the trip point is deterministic
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.to_vec())),
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = admitted.clone();
+        // Serial admission (the default concurrency), so the trip point is deterministic.
+        let run = run_bins(
+            &["a", "b", "c"],
+            Sched::default(),
             move || (gate.load(std::sync::atomic::Ordering::SeqCst) > 0).then_some(super::Brake::Stop("mem")),
-            false,
-            |project_id, _round| {
-                let (seen, admitted) = (seen.clone(), admitted.clone());
+            |project_id, _| {
+                let admitted = admitted.clone();
                 async move {
                     admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    seen.lock().unwrap().push(project_id.clone());
-                    (project_id, Ok(super::BinOutcome::Staged(())))
+                    bin_staged(project_id)
                 }
             },
-            |_bins, _round| async { 0 },
         )
         .await;
 
-        assert_eq!(*calls.lock().unwrap(), vec!["a".to_string()], "only the bin admitted before the brake tripped may run");
         assert_eq!(
-            *truncated.lock().unwrap(),
+            run.calls.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            vec!["a".to_string()],
+            "only the bin admitted before the brake tripped may run"
+        );
+        assert_eq!(
+            run.truncated,
             vec![(1, vec!["a".to_string(), "b".to_string(), "c".to_string()])],
             "the deferred bins stay pending and the NEXT round's boundary check truncates the tick"
         );
@@ -18611,43 +18168,23 @@ mod tests {
     /// by serving the head project serially; `Stop` keeps the old full-truncation behaviour.
     #[tokio::test(flavor = "multi_thread")]
     async fn round_robin_bins_degrade_serves_all_projects_serially() {
-        let run = |brake: Option<super::Brake>| async move {
-            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
-            let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new()));
-            let (seen, sink) = (calls.clone(), truncated.clone());
-            super::round_robin_bins(
-                vec!["head".into(), "b".into(), "c".into()],
-                3,
-                3,
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-                move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.to_vec())),
-                move || brake,
-                false,
-                |project_id, round| {
-                    let seen = seen.clone();
-                    async move {
-                        seen.lock().unwrap().push((project_id.clone(), round));
-                        (project_id, Ok(super::BinOutcome::Staged(())))
-                    }
-                },
-                |_bins, _round| async { 0 },
-            )
-            .await;
-            (calls.lock().unwrap().clone(), truncated.lock().unwrap().clone())
+        let projects: &[&str] = &["head", "b", "c"];
+        let run = move |brake: super::Brake| {
+            run_bins(projects, Sched { concurrency: 3, ..Sched::default() }, move || Some(brake), |project_id, _| async move { bin_staged(project_id) })
         };
 
-        let (calls, truncated) = run(Some(super::Brake::Degrade("wal"))).await;
+        let degraded = run(super::Brake::Degrade("wal")).await;
         let serial_round = |r: usize| [("head".to_string(), r), ("b".to_string(), r), ("c".to_string(), r)];
         assert_eq!(
-            calls,
+            degraded.calls,
             [serial_round(0), serial_round(1), serial_round(2)].concat(),
             "degrade serves every project serially — the deadline, not a cut, bounds the tick"
         );
-        assert!(truncated.is_empty(), "degrade alone cuts nothing; only the deadline truncates");
+        assert!(degraded.truncated.is_empty(), "degrade alone cuts nothing; only the deadline truncates");
 
-        let (calls, truncated) = run(Some(super::Brake::Stop("mem"))).await;
-        assert!(calls.is_empty(), "stop must start no work at all");
-        assert_eq!(truncated, vec![(0, vec!["head".to_string(), "b".to_string(), "c".to_string()])]);
+        let stopped = run(super::Brake::Stop("mem")).await;
+        assert!(stopped.calls.is_empty(), "stop must start no work at all");
+        assert_eq!(stopped.truncated, vec![(0, vec!["head".to_string(), "b".to_string(), "c".to_string()])]);
     }
 
     /// Cache keys are bucket-relative (inserts happen below the PrefixStore), so evict/contains must
@@ -19483,27 +19020,74 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn dv_scan_preserves_physical_positions_under_file_repartitioning() -> Result<()> {
+    /// A builder over an existing Delta root: every builder made from the same
+    /// `(store, url)` sees the same bytes, which is what lets a test rebuild a
+    /// second handle — throttled, or pinned to an older version — over a table
+    /// it just wrote.
+    fn mem_backend(store: Arc<dyn object_store::ObjectStore>, url: &Url) -> DeltaTableBuilder {
+        DeltaTableBuilder::from_url(url.clone()).expect("a memory:/// root parses").with_storage_backend(store, url.clone())
+    }
+
+    /// A one-column Int32 Delta table with deletion vectors enabled, holding
+    /// `1..=4` in a single Add — the fixture both deletion-vector tests below
+    /// need before they can write a DV against a live file.
+    async fn dv_int_table(name: &str) -> Result<DeltaTable> {
         use datafusion::arrow::{
             array::Int32Array,
             datatypes::{DataType as ArrowType, Field, Schema},
         };
-        use deltalake::delta_datafusion::TableProviderBuilder;
-        use deltalake::kernel::{DataType, PrimitiveType, StructField, transaction::CommitBuilder};
-        use deltalake::operations::deletion_vectors::{FileDeletion, write_deletion_vectors};
+        use deltalake::kernel::{DataType, PrimitiveType, StructField};
 
         let store = Arc::new(object_store::memory::InMemory::new());
-        let url = Url::parse("memory:///dv_physical_positions")?;
-        let mut table = DeltaTableBuilder::from_url(url.clone())?
-            .with_storage_backend(store, url)
+        let url = Url::parse(&format!("memory:///{name}"))?;
+        let table = mem_backend(store, &url)
             .build()?
             .create()
             .with_columns(vec![StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true)])
             .with_configuration(HashMap::from([("delta.enableDeletionVectors".to_string(), Some("true".to_string()))]))
             .await?;
         let schema = Arc::new(Schema::new(vec![Field::new("id", ArrowType::Int32, true)]));
-        table = table.write(vec![RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as _])?]).await?;
+        Ok(table.write(vec![RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as _])?]).await?)
+    }
+
+    /// One `test_span` row for `project`. `skip_queue` writes straight to Delta;
+    /// `false` routes through the buffered layer (WAL → MemBuffer) so a flush
+    /// tick owns the row.
+    async fn insert_span(db: &Database, project: &str, table: &str, id: &str, skip_queue: bool) -> Result<()> {
+        db.insert_records_batch(project, table, vec![json_to_batch(vec![test_span(id, "span", project)])?], skip_queue, None).await?;
+        Ok(())
+    }
+
+    /// The unified table's current Delta version.
+    async fn unified_version(db: &Database, table: &str) -> u64 {
+        get_unified_delta_table(db.unified_tables(), table).await.expect("table created").read().await.version().unwrap_or(0)
+    }
+
+    /// The single Int64 value a `COUNT(*)`-shaped query returns.
+    async fn count_of(ctx: &SessionContext, sql: &str) -> Result<i64> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("an Int64 aggregate").value(0))
+    }
+
+    /// One `CoalescedWriteUnit` carrying `batch` plus its own watermark, so a
+    /// shared commit can be checked for per-project attribution.
+    fn coalesced_unit(project: &str, table: &str, batch: RecordBatch, block_id: u64, offset: u64) -> CoalescedWriteUnit {
+        use walrus_rust::WalPosition;
+        CoalescedWriteUnit {
+            project_id: project.to_owned(),
+            table_name: table.to_owned(),
+            batches: vec![batch],
+            watermark: vec![Some(WalPosition { block_id, offset })],
+        }
+    }
+
+    #[tokio::test]
+    async fn dv_scan_preserves_physical_positions_under_file_repartitioning() -> Result<()> {
+        use deltalake::delta_datafusion::TableProviderBuilder;
+        use deltalake::kernel::transaction::CommitBuilder;
+        use deltalake::operations::deletion_vectors::{FileDeletion, write_deletion_vectors};
+
+        let mut table = dv_int_table("dv_physical_positions").await?;
         let table_ref = Arc::new(RwLock::new(table.clone()));
         let targets = live_adds(&table_ref).await;
         assert_eq!(targets.len(), 1);
@@ -19552,35 +19136,18 @@ mod tests {
             let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
             assert_eq!(datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string(), expected);
         }
-        let count = ctx.sql("SELECT COUNT(*) FROM dv WHERE id >= 2").await?.collect().await?;
-        let count = count[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().expect("count is int64");
-        assert_eq!(count.value(0), 2, "filtered count must exclude the deleted row");
+        assert_eq!(count_of(&ctx, "SELECT COUNT(*) FROM dv WHERE id >= 2").await?, 2, "filtered count must exclude the deleted row");
         Ok(())
     }
 
     #[tokio::test]
     async fn wave_rejects_a_superseded_deletion_vector() -> Result<()> {
-        use datafusion::arrow::{
-            array::Int32Array,
-            datatypes::{DataType as ArrowType, Field, Schema},
-        };
-        use deltalake::kernel::{Action, DataType, PrimitiveType, StructField, transaction::CommitBuilder};
+        use deltalake::kernel::{Action, transaction::CommitBuilder};
         use deltalake::operations::deletion_vectors::{FileDeletion, dv_object_store_relative_path, write_deletion_vectors};
         use object_store::ObjectStoreExt;
 
         let db = Database::with_config(create_test_config("wave-dv-liveness")).await?;
-        let store = Arc::new(object_store::memory::InMemory::new());
-        let url = Url::parse("memory:///wave_dv_liveness")?;
-        let mut table = DeltaTableBuilder::from_url(url.clone())?
-            .with_storage_backend(store.clone(), url)
-            .build()?
-            .create()
-            .with_columns(vec![StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true)])
-            .with_configuration(HashMap::from([("delta.enableDeletionVectors".to_string(), Some("true".to_string()))]))
-            .await?;
-        let schema = Arc::new(Schema::new(vec![Field::new("id", ArrowType::Int32, true)]));
-        table = table.write(vec![RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as _])?]).await?;
-        let table_ref = Arc::new(RwLock::new(table));
+        let table_ref = Arc::new(RwLock::new(dv_int_table("wave_dv_liveness").await?));
         let target = live_adds(&table_ref).await.into_iter().next().expect("one written file");
         let mut table = table_ref.read().await.clone();
         let log_store = table.log_store();
@@ -19674,12 +19241,8 @@ mod tests {
         let db = Database::with_config(create_test_config("wave-flush-priority")).await?;
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///wave_flush_priority")?;
-        let table = DeltaTableBuilder::from_url(url.clone())?
-            .with_storage_backend(mem, url)
-            .build()?
-            .create()
-            .with_columns(vec![StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true)])
-            .await?;
+        let table =
+            mem_backend(mem, &url).build()?.create().with_columns(vec![StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true)]).await?;
         let arrow = Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Int32, true)]));
         let table = table.write(vec![RecordBatch::try_new(arrow, vec![Arc::new(Int32Array::from(vec![1, 2])) as _])?]).with_save_mode(SaveMode::Append).await?;
         let target = table.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).next().expect("the written file is live");
@@ -19735,8 +19298,7 @@ mod tests {
 
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///convoy_tbl")?;
-        let fast = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
-        let table = fast.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        let table = mem_backend(mem.clone(), &url).build()?.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
         assert_eq!(table.version(), Some(0));
 
         // Same store, but every list/get pays a delay — makes update_state
@@ -19746,7 +19308,7 @@ mod tests {
             mem,
             ThrottleConfig { wait_get_per_call: wait, wait_list_per_call: wait, wait_list_with_delimiter_per_call: wait, ..Default::default() },
         );
-        let slow = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(Arc::new(throttled), url).build()?;
+        let slow = mem_backend(Arc::new(throttled), &url).build()?;
         let shared = Arc::new(RwLock::new(slow));
 
         let refresher = {
@@ -19796,7 +19358,7 @@ mod tests {
 
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///tierc_removes")?;
-        let backend = || DeltaTableBuilder::from_url(url.clone()).unwrap().with_storage_backend(mem.clone(), url.clone());
+        let backend = || mem_backend(mem.clone(), &url);
 
         // v0: partitioned table.
         let cols = vec![
@@ -19851,8 +19413,7 @@ mod tests {
         let props = |hours: u64| HashMap::from([(KEY.to_string(), format!("interval {hours} hours")), (CP_KEY.to_string(), "1".to_string())]);
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///retention_tbl")?;
-        let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem, url).build()?;
-        let table = t.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        let table = mem_backend(mem, &url).build()?.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
         assert!(!table.snapshot()?.metadata().configuration().contains_key(KEY), "fresh table has no retention property");
 
         let table = ensure_table_properties(table, props(24)).await;
@@ -19885,13 +19446,12 @@ mod tests {
 
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///probe_tbl")?;
-        let fast = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
-        let table = fast.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        let table = mem_backend(mem.clone(), &url).build()?.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
 
         let list_wait = std::time::Duration::from_secs(2);
         let throttled =
             ThrottledStore::new(mem, ThrottleConfig { wait_list_per_call: list_wait, wait_list_with_delimiter_per_call: list_wait, ..Default::default() });
-        let mut slow = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(Arc::new(throttled), url).build()?;
+        let mut slow = mem_backend(Arc::new(throttled), &url).build()?;
         slow.update_state().await?; // initial load pays the LIST
         let shared = Arc::new(RwLock::new(slow));
 
@@ -19918,8 +19478,7 @@ mod tests {
         let (db, _ctx, prefix) = setup_test_database().await?;
         let (p1, p2) = (format!("sfu_a_{prefix}"), format!("sfu_b_{prefix}"));
         for pid in [&p1, &p2] {
-            let batch = json_to_batch(vec![test_span("sfu1", "span", pid)])?;
-            db.insert_records_batch(pid, "otel_logs_and_spans", vec![batch], true, None).await?;
+            insert_span(&db, pid, "otel_logs_and_spans", "sfu1", true).await?;
         }
         let table_ref = get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans").await.expect("table created");
         let table = table_ref.read().await;
@@ -19951,8 +19510,7 @@ mod tests {
             let today = chrono::Utc::now().date_naive();
             for (pid, ids) in [(&target, ["t1", "t2"]), (&other, ["o1", "o2"])] {
                 for id in ids {
-                    let batch = json_to_batch(vec![test_span(id, "span", pid)])?;
-                    db.insert_records_batch(pid, "otel_logs_and_spans", vec![batch], true, None).await?;
+                    insert_span(&db, pid, "otel_logs_and_spans", id, true).await?;
                 }
             }
             let table_ref = get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans").await.expect("table created");
@@ -20118,22 +19676,16 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn write_time_marks_use_the_same_path_strings_admission_reads() -> Result<()> {
-        use walrus_rust::WalPosition;
         let (db, _ctx, prefix) = setup_test_database().await?;
         let t = "otel_logs_and_spans";
         let solo = format!("mark-solo-{prefix}");
         let group: Vec<String> = (0..2).map(|i| format!("mark-grp{i}-{prefix}")).collect();
 
-        db.insert_records_batch(&solo, t, vec![json_to_batch(vec![test_span("s", "span", &solo)])?], true, None).await?;
+        insert_span(&db, &solo, t, "s", true).await?;
         let units: Vec<CoalescedWriteUnit> = group
             .iter()
             .enumerate()
-            .map(|(i, p)| CoalescedWriteUnit {
-                project_id: p.clone(),
-                table_name: t.to_string(),
-                batches: vec![json_to_batch(vec![test_span(&format!("g{i}"), "span", p)]).unwrap()],
-                watermark: vec![Some(WalPosition { block_id: 700 + i as u64, offset: i as u64 })],
-            })
+            .map(|(i, p)| coalesced_unit(p, t, json_to_batch(vec![test_span(&format!("g{i}"), "span", p)]).unwrap(), 700 + i as u64, i as u64))
             .collect();
         for result in db.insert_records_batches_coalesced(units).await {
             result.expect("coalesced commit failed");
@@ -20163,7 +19715,7 @@ mod tests {
         let (db, _ctx, prefix) = setup_test_database().await?;
         let t = "otel_logs_and_spans";
         let project = format!("seed-{prefix}");
-        db.insert_records_batch(&project, t, vec![json_to_batch(vec![test_span("s", "span", &project)])?], true, None).await?;
+        insert_span(&db, &project, t, "s", true).await?;
 
         // Forget everything, as a process that predates the marking would have.
         let written: HashSet<String> = db.repair_verified_sorted.iter().map(|entry| entry.key().clone()).collect();
@@ -20201,12 +19753,7 @@ mod tests {
         let units: Vec<CoalescedWriteUnit> = projects
             .iter()
             .enumerate()
-            .map(|(i, p)| CoalescedWriteUnit {
-                project_id: p.clone(),
-                table_name: t.to_string(),
-                batches: vec![json_to_batch(vec![test_span(&format!("c{i}"), "span", p)]).unwrap()],
-                watermark: vec![Some(WalPosition { block_id: 100 + i as u64, offset: i as u64 })],
-            })
+            .map(|(i, p)| coalesced_unit(p, t, json_to_batch(vec![test_span(&format!("c{i}"), "span", p)]).unwrap(), 100 + i as u64, i as u64))
             .collect();
         let results = db.insert_records_batches_coalesced(units).await;
 
@@ -20256,14 +19803,12 @@ mod tests {
             array::{Array, StringArray},
             datatypes::{DataType, Field, Schema},
         };
-        use walrus_rust::WalPosition;
         let (db, _ctx, prefix) = setup_test_database().await?;
         let t = "otel_logs_and_spans";
         let (p1, p2, evolving) = (format!("se1-{prefix}"), format!("se2-{prefix}"), format!("se3-{prefix}"));
 
         db.insert_records_batch(&p1, t, vec![json_to_batch(vec![test_span("warm", "warm", &p1)])?], true, None).await?;
-        let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
-        let before = table_ref.read().await.version().unwrap_or(0);
+        let before = unified_version(&db, t).await;
 
         // A batch carrying a column the table schema lacks — delta-rs' Default-mode
         // RecordBatchWriter can't evolve schema on a partitioned table, so this
@@ -20276,24 +19821,9 @@ mod tests {
         let evolved_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
 
         let units = vec![
-            CoalescedWriteUnit {
-                project_id: p1.clone(),
-                table_name: t.to_string(),
-                batches: vec![json_to_batch(vec![test_span("s1", "span", &p1)])?],
-                watermark: vec![Some(WalPosition { block_id: 1, offset: 0 })],
-            },
-            CoalescedWriteUnit {
-                project_id: evolving.clone(),
-                table_name: t.to_string(),
-                batches: vec![evolved_batch],
-                watermark: vec![Some(WalPosition { block_id: 2, offset: 0 })],
-            },
-            CoalescedWriteUnit {
-                project_id: p2.clone(),
-                table_name: t.to_string(),
-                batches: vec![json_to_batch(vec![test_span("s2", "span", &p2)])?],
-                watermark: vec![Some(WalPosition { block_id: 3, offset: 0 })],
-            },
+            coalesced_unit(&p1, t, json_to_batch(vec![test_span("s1", "span", &p1)])?, 1, 0),
+            coalesced_unit(&evolving, t, evolved_batch, 2, 0),
+            coalesced_unit(&p2, t, json_to_batch(vec![test_span("s2", "span", &p2)])?, 3, 0),
         ];
         let results = db.insert_records_batches_coalesced(units).await;
         for (i, r) in results.iter().enumerate() {
@@ -20307,7 +19837,7 @@ mod tests {
         // Two commits: the shared one for p1+p2, plus the evolving project's solo
         // merge commit. Three would mean no coalescing; one would mean the merge
         // path swallowed the co-tenants.
-        let after = get_unified_delta_table(db.unified_tables(), t).await.expect("table").read().await.version().unwrap_or(0);
+        let after = unified_version(&db, t).await;
         assert_eq!(after, before + 2, "expected 1 coalesced + 1 solo schema-evolution commit");
 
         // The evolution actually applied.
@@ -20354,14 +19884,10 @@ mod tests {
         // First commit + query.
         let batch1 = json_to_batch(vec![test_span("v1", "span1", &project_id)])?;
         db.insert_records_batch(&project_id, t, vec![batch1], true, None).await?;
-        let v1 = {
-            let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
-            table_ref.read().await.version().unwrap_or(0)
-        };
+        let v1 = unified_version(&db, t).await;
         assert!(v1 > 0, "first commit must bump version above zero");
-        let count1 = ctx.sql(&format!("SELECT count(*) AS c FROM {} WHERE project_id = '{}'", t, project_id)).await?.collect().await?;
-        let c1 = count1[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("count column").value(0);
-        assert_eq!(c1, 1, "first query sees the v=1 row");
+        let count_sql = format!("SELECT count(*) AS c FROM {} WHERE project_id = '{}'", t, project_id);
+        assert_eq!(count_of(&ctx, &count_sql).await?, 1, "first query sees the v=1 row");
         assert_eq!(db.delta_provider_cache.len(), 1, "provider cache must retain the resolved provider for the warm query");
         let stats = ctx.sql("SELECT value FROM timefusion_stats WHERE component = 'scan' AND key = 'provider_cache_entries'").await?.collect().await?;
         let entries = stats[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().expect("stats value").value(0);
@@ -20370,17 +19896,13 @@ mod tests {
         // Second commit advances the snapshot version.
         let batch2 = json_to_batch(vec![test_span("v2", "span2", &project_id)])?;
         db.insert_records_batch(&project_id, t, vec![batch2], true, None).await?;
-        let v2 = {
-            let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
-            table_ref.read().await.version().unwrap_or(0)
-        };
+        let v2 = unified_version(&db, t).await;
         assert!(v2 > v1, "second commit must advance version");
 
         // Second query: if the provider cache served the stale v=v1 cell,
         // the count would be 1 (just the first row). With invalidation, it
         // sees both rows.
-        let count2 = ctx.sql(&format!("SELECT count(*) AS c FROM {} WHERE project_id = '{}'", t, project_id)).await?.collect().await?;
-        let c2 = count2[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("count column").value(0);
+        let c2 = count_of(&ctx, &count_sql).await?;
         assert_eq!(
             c2, 2,
             "STALE CACHE REGRESSION: second query must see the row added at v=v{v2}. \
@@ -20448,26 +19970,21 @@ mod tests {
             // Create the Delta table first so the version delta measures only
             // the coalesced flush commit.
             b.db.insert_records_batch(&projects[0], t, vec![json_to_batch(vec![test_span("warm", "warm", &projects[0])])?], true, None).await?;
-            let table_ref = get_unified_delta_table(b.db.unified_tables(), t).await.expect("table created");
-            let before = table_ref.read().await.version().unwrap_or(0);
+            let before = unified_version(&b.db, t).await;
 
             // skip_queue=false → WAL + MemBuffer, so the flush tick owns these rows.
             for (i, project) in projects.iter().enumerate() {
-                let batch = json_to_batch(vec![test_span(&format!("row{i}"), "span", project)])?;
-                b.db.insert_records_batch(project, t, vec![batch], false, None).await?;
+                insert_span(&b.db, project, t, &format!("row{i}"), false).await?;
             }
             let stats = b.buffered_layer.flush_all_now().await?;
             assert_eq!(stats.buckets_failed, 0, "coalesced e2e flush failed");
             assert_eq!(stats.buckets_flushed, projects.len() as u64);
 
-            let after = get_unified_delta_table(b.db.unified_tables(), t).await.expect("table").read().await.version().unwrap_or(0);
+            let after = unified_version(&b.db, t).await;
             assert_eq!(after, before + 1, "three projects flushed in one tick must produce ONE Delta commit");
 
-            use datafusion::arrow::array::AsArray;
             for project in &projects {
-                let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project}'");
-                let r = b.session_ctx.sql(&sql).await?.collect().await?;
-                let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+                let n = count_of(&b.session_ctx, &format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project}'")).await?;
                 let expected = if project == &projects[0] { 2 } else { 1 }; // p0 also has its warm-up row
                 assert_eq!(n, expected, "{project} rows are not queryable after the coalesced commit");
             }
@@ -20503,30 +20020,90 @@ mod tests {
             // skip_queue=false so the write flows through the buffered layer
             // (WAL → MemBuffer), not straight to Delta.
             for i in 0..3 {
-                let batch = json_to_batch(vec![test_span(&format!("flushed_{i}"), "span", &project_id)])?;
-                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+                insert_span(&b.db, &project_id, "otel_logs_and_spans", &format!("flushed_{i}"), false).await?;
             }
             b.buffered_layer.force_flush_current_buckets().await?;
 
             // 2 more rows repopulate the same current bucket_id in MemBuffer.
             for i in 0..2 {
-                let batch = json_to_batch(vec![test_span(&format!("buffered_{i}"), "span", &project_id)])?;
-                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+                insert_span(&b.db, &project_id, "otel_logs_and_spans", &format!("buffered_{i}"), false).await?;
             }
 
             // All 5 must be visible: 3 from Delta (force-flushed), 2 from MemBuffer.
             // Pre-fix this returned 2 (the current range was excluded from Delta).
-            use datafusion::arrow::array::AsArray;
             let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
-            let r = b.session_ctx.sql(&sql).await?.collect().await?;
-            let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-            assert_eq!(n, 5, "force-flushed rows must remain queryable alongside repopulated MemBuffer rows");
+            assert_eq!(count_of(&b.session_ctx, &sql).await?, 5, "force-flushed rows must remain queryable alongside repopulated MemBuffer rows");
 
             b.shutdown.cancel();
             Ok(())
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
+    }
+
+    /// The unified `otel_logs_and_spans` Delta table handle.
+    async fn otel_unified_table(db: &Database) -> Arc<RwLock<DeltaTable>> {
+        db.unified_tables().read().await.get("otel_logs_and_spans").expect("the unified otel table").clone()
+    }
+
+    /// One `test_span_ts` row into `otel_logs_and_spans`. `skip_queue` writes
+    /// straight to Delta; `false` routes through the buffered layer.
+    async fn insert_otel_ts(db: &Database, project: &str, id: &str, name: &str, ts: i64, skip_queue: bool) -> Result<()> {
+        db.insert_records_batch(project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts(id, name, project, ts)])?], skip_queue, None).await?;
+        Ok(())
+    }
+
+    /// A `Database` on its own storage prefix plus a unique project id — the
+    /// isolation every dirty-bin test needs.
+    async fn dirty_bin_db(tag: &str) -> Result<(Database, String)> {
+        let db = Database::with_config(create_test_config(&format!("{tag}-{}", uuid::Uuid::new_v4().simple()))).await?;
+        Ok((db, format!("dirty_{}", uuid::Uuid::new_v4().simple())))
+    }
+
+    /// A `Database` holding ONE sealed duplicate pair — `id` observed twice at
+    /// the same 26h-old timestamp, so exactly one dirty bin is queued — plus the
+    /// unified table handle. 26h is well beyond the seal lag and keeps the test
+    /// deterministic around midnight.
+    async fn sealed_dup_pair(tag: &str, id: &str) -> Result<(Database, Arc<RwLock<DeltaTable>>)> {
+        let (db, project) = dirty_bin_db(tag).await?;
+        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
+        for observed in ["first", "second"] {
+            insert_otel_ts(&db, &project, id, observed, old, true).await?;
+        }
+        assert_eq!(db.dedup_dirty_bins.len(), 1);
+        let table = otel_unified_table(&db).await;
+        Ok((db, table))
+    }
+
+    /// A dedup drain with the whole budget: healthy flush, no per-bin or pass deadline.
+    async fn drain_dirty_bins_ok(db: &Database, table: &Arc<RwLock<DeltaTable>>) -> Result<()> {
+        db.dedup_dirty_bins_for_table(table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await
+    }
+
+    /// The strings in one column of a query's result, in row order.
+    async fn strings_of(ctx: &SessionContext, sql: &str, column: usize) -> Result<Vec<String>> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches.iter().flat_map(|b| (0..b.num_rows()).map(|row| array_get_str(b.column(column).as_ref(), row)).collect::<Vec<_>>()).collect())
+    }
+
+    /// `writers` concurrent single-row inserts through one `Database`, each into
+    /// `project_of(i)`; every task must land its row.
+    async fn concurrent_inserts_all_land(tag: &str, writers: usize, project_of: impl Fn(usize) -> String) -> Result<()> {
+        let db = Arc::new(Database::with_config(create_test_config(tag)).await?);
+        let tasks = (0..writers).map(|i| {
+            let (db, project) = (Arc::clone(&db), project_of(i));
+            tokio::spawn(async move {
+                let batch_id = format!("batch_{i}");
+                let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{batch_id}"), &project)])?;
+                db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| batch_id)
+            })
+        });
+        let results: Vec<Result<String, _>> =
+            futures::future::join_all(tasks).await.into_iter().map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?).collect();
+        let landed: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
+        assert_eq!(landed.len(), writers, "all {writers} concurrent writes should succeed");
+        db.shutdown().await?;
+        Ok(())
     }
 
     /// Regression: rows force-flushed to Delta from an open bucket must stay visible after the bucket
@@ -20550,23 +20127,19 @@ mod tests {
             let t0 = crate::support::set_micros((crate::support::now_micros() / dur) * dur + dur / 2);
 
             for i in 0..3 {
-                let batch = json_to_batch(vec![test_span_ts(&format!("flushed_{i}"), "span", &project_id, t0)])?;
-                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+                insert_otel_ts(&b.db, &project_id, &format!("flushed_{i}"), "span", t0, false).await?;
             }
             b.buffered_layer.force_flush_current_buckets().await?;
             for i in 0..2 {
-                let batch = json_to_batch(vec![test_span_ts(&format!("buffered_{i}"), "span", &project_id, t0 + 1_000_000)])?;
-                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+                insert_otel_ts(&b.db, &project_id, &format!("buffered_{i}"), "span", t0 + 1_000_000, false).await?;
             }
             // Roll past the bucket boundary: the bucket is now sealed but
             // unflushed (the periodic flush hasn't run) — exactly the
             // backed-up state from the incident.
             crate::support::advance_micros(dur);
 
-            use datafusion::arrow::array::AsArray;
             let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
-            let r = b.session_ctx.sql(&sql).await?.collect().await?;
-            let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            let n = count_of(&b.session_ctx, &sql).await?;
             anyhow::ensure!(n == 5, "force-flushed rows must stay visible after their bucket seals; got {n} of 5");
             b.shutdown.cancel();
             Ok(())
@@ -20595,18 +20168,14 @@ mod tests {
             let t0 = crate::support::set_micros((crate::support::now_micros() / dur) * dur + dur / 2);
 
             // Newer row first → force-flushed, lives only in Delta.
-            let batch = json_to_batch(vec![test_span_ts("newer", "span", &project_id, t0 + 2_000_000)])?;
-            b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            insert_otel_ts(&b.db, &project_id, "newer", "span", t0 + 2_000_000, false).await?;
             b.buffered_layer.force_flush_current_buckets().await?;
             // Late arrival with an older timestamp lands in MemBuffer.
-            let batch = json_to_batch(vec![test_span_ts("older", "span", &project_id, t0 + 1_000_000)])?;
-            b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            insert_otel_ts(&b.db, &project_id, "older", "span", t0 + 1_000_000, false).await?;
 
-            use datafusion::arrow::array::AsArray;
             let bound = chrono::DateTime::from_timestamp_micros(t0 + 1_000_000).unwrap().to_rfc3339();
             let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}' AND timestamp >= TIMESTAMP '{}'", project_id, bound);
-            let r = b.session_ctx.sql(&sql).await?.collect().await?;
-            let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            let n = count_of(&b.session_ctx, &sql).await?;
             anyhow::ensure!(n == 2, "Delta-only rows inside the bound must not be skipped; got {n} of 2");
             b.shutdown.cancel();
             Ok(())
@@ -20630,7 +20199,6 @@ mod tests {
     // to reproduce.)
     async fn test_fast_insert_mixed_custom_storage_routing() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            use datafusion::arrow::array::AsArray;
             let (db, ctx, prefix) = setup_test_database().await?;
             let (pa, pb, table) = (format!("csA_{prefix}"), format!("csB_{prefix}"), "otel_logs_and_spans".to_string());
 
@@ -20648,15 +20216,9 @@ mod tests {
             let rt = any.downcast_ref::<ProjectRoutingTable>().ok_or_else(|| anyhow::anyhow!("otel_logs_and_spans is not a ProjectRoutingTable"))?;
             assert_eq!(rt.fast_insert_batch(batch).await?, 3);
 
-            let count = |p: String| {
-                let ctx = ctx.clone();
-                async move {
-                    let sql = format!("SELECT COUNT(*) c FROM otel_logs_and_spans WHERE project_id = '{p}'");
-                    Result::<i64>::Ok(ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
-                }
-            };
-            assert_eq!(count(pb.clone()).await?, 1, "pb's row must reach pb's BYO bucket, not leak into pa's unified table");
-            assert_eq!(count(pa.clone()).await?, 2, "pa keeps exactly its 2 rows");
+            let count = async |p: &str| count_of(&ctx, &format!("SELECT COUNT(*) c FROM otel_logs_and_spans WHERE project_id = '{p}'")).await;
+            assert_eq!(count(&pb).await?, 1, "pb's row must reach pb's BYO bucket, not leak into pa's unified table");
+            assert_eq!(count(&pa).await?, 2, "pa keeps exactly its 2 rows");
 
             db.shutdown().await?;
             Ok(())
@@ -20673,18 +20235,16 @@ mod tests {
     async fn sql_surface_smoke() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let (db, ctx, prefix) = setup_test_database().await?;
-            use datafusion::arrow::array::AsArray;
+            let pcount = async |p: &str| count_of(&ctx, &format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{p}'")).await;
 
             // Basic insert, count and field selection on a single project.
             let solo = format!("project_{}", prefix);
             let batch = json_to_batch(vec![test_span("test1", "span1", &solo)])?;
             db.insert_records_batch(&solo, "otel_logs_and_spans", vec![batch], true, None).await?;
-            let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", solo)).await?.collect().await?;
-            assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 1);
-            let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", solo)).await?.collect().await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "test1");
-            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "span1");
+            assert_eq!(pcount(&solo).await?, 1);
+            let sql = format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{solo}'");
+            assert_eq!(strings_of(&ctx, &sql, 0).await?, ["test1"]);
+            assert_eq!(strings_of(&ctx, &sql, 1).await?, ["span1"]);
 
             // Multiple projects: isolation per project, and a total across them.
             let projects: Vec<String> = (1..=3).map(|i| format!("proj{}_{}", i, prefix)).collect();
@@ -20692,17 +20252,11 @@ mod tests {
                 let batch = json_to_batch(vec![test_span(&format!("id_{}", project), &format!("span_{}", project), project)])?;
                 db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
             }
-            for project in &projects {
-                let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}'", project);
-                let result = ctx.sql(&sql).await?.collect().await?;
-                assert_eq!(result[0].num_rows(), 1);
-                assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), format!("id_{}", project));
-            }
             let mut total_count = 0;
             for project in &projects {
-                let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project);
-                let result = ctx.sql(&sql).await?.collect().await?;
-                total_count += result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+                let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project}'");
+                assert_eq!(strings_of(&ctx, &sql, 0).await?, [format!("id_{project}")]);
+                total_count += pcount(project).await?;
             }
             assert_eq!(total_count, 3, "each project keeps exactly its own row, unseen by the others");
 
@@ -20725,27 +20279,12 @@ mod tests {
             ];
             let batch = json_to_batch(records)?;
             db.insert_records_batch(&filter_project, "otel_logs_and_spans", vec![batch], true, None).await?;
-            let result = ctx
-                .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'", filter_project))
-                .await?
-                .collect()
-                .await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "span2");
-            let result = ctx
-                .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND duration > 150000000", filter_project))
-                .await?
-                .collect()
-                .await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "span2");
-            let result = ctx
-                .sql(&format!("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'", filter_project))
-                .await?
-                .collect()
-                .await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "Error occurred");
+            let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{filter_project}' AND level = 'ERROR'");
+            assert_eq!(strings_of(&ctx, &sql, 0).await?, ["span2"]);
+            let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{filter_project}' AND duration > 150000000");
+            assert_eq!(strings_of(&ctx, &sql, 0).await?, ["span2"]);
+            let sql = format!("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = '{filter_project}' AND level = 'ERROR'");
+            assert_eq!(strings_of(&ctx, &sql, 1).await?, ["Error occurred"]);
 
             // Literal SQL INSERT, single- and multi-row, alongside a prior API insert.
             let sql_proj1 = format!("default_{}", prefix);
@@ -20765,15 +20304,11 @@ mod tests {
             assert_eq!(result[0].num_rows(), 1);
             let mut sql_total = 0;
             for project in [&sql_proj1, &sql_proj2] {
-                let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project);
-                let result = ctx.sql(&sql).await?.collect().await?;
-                sql_total += result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+                sql_total += pcount(project).await?;
             }
             assert_eq!(sql_total, 2);
-            let result =
-                ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'sql_id'", sql_proj2)).await?.collect().await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "sql_name");
+            let sql = format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{sql_proj2}' AND id = 'sql_id'");
+            assert_eq!(strings_of(&ctx, &sql, 1).await?, ["sql_name"]);
             // Multi-row INSERT, in one statement, returns a count of rows inserted
             // and preserves per-row field values and (default) insertion order.
             let multirow_id = format!("multirow_{}", prefix);
@@ -20784,16 +20319,11 @@ mod tests {
                      ('{multirow_id}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', ARRAY['Multi-row insert test 2']),
                      ('{multirow_id}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', ARRAY['Multi-row insert test 3 - ERROR'])");
             let result = ctx.sql(&sql).await?.collect().await?;
+            use datafusion::arrow::array::AsArray;
             assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0), 3);
-            let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{multirow_id}'");
-            let result = ctx.sql(&sql).await?.collect().await?;
-            assert_eq!(result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 3);
-            let result =
-                ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{multirow_id}' ORDER BY id")).await?.collect().await?;
-            assert_eq!(result[0].num_rows(), 3);
-            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "id1");
-            assert_eq!(array_get_str(result[0].column(0).as_ref(), 1), "id2");
-            assert_eq!(array_get_str(result[0].column(0).as_ref(), 2), "id3");
+            assert_eq!(pcount(&multirow_id).await?, 3);
+            let sql = format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{multirow_id}' ORDER BY id");
+            assert_eq!(strings_of(&ctx, &sql, 0).await?, ["id1", "id2", "id3"]);
 
             // Timestamp filtering and `to_char` formatting.
             let ts_project = format!("ts_test_{}", prefix);
@@ -20810,24 +20340,12 @@ mod tests {
             ];
             let batch = json_to_batch(records)?;
             db.insert_records_batch(&ts_project, "otel_logs_and_spans", vec![batch], true, None).await?;
-            let result = ctx
-                .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND timestamp > '2023-01-01T11:00:00Z'", ts_project))
-                .await?
-                .collect()
-                .await?;
-            assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(array_get_str(result[0].column(0).as_ref(), 0), "late");
-            let result = ctx
-                .sql(&format!(
-                    "SELECT id, to_char(timestamp, 'YYYY-MM-DD HH24:MI') as ts FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY timestamp",
-                    ts_project
-                ))
-                .await?
-                .collect()
-                .await?;
-            assert_eq!(result[0].num_rows(), 2);
-            assert_eq!(array_get_str(result[0].column(1).as_ref(), 0), "2023-01-01 10:00");
-            assert_eq!(array_get_str(result[0].column(1).as_ref(), 1), "2023-01-01 12:00");
+            let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{ts_project}' AND timestamp > '2023-01-01T11:00:00Z'");
+            assert_eq!(strings_of(&ctx, &sql, 0).await?, ["late"]);
+            let sql = format!(
+                "SELECT id, to_char(timestamp, 'YYYY-MM-DD HH24:MI') as ts FROM otel_logs_and_spans WHERE project_id = '{ts_project}' ORDER BY timestamp"
+            );
+            assert_eq!(strings_of(&ctx, &sql, 1).await?, ["2023-01-01 10:00", "2023-01-01 12:00"]);
 
             db.shutdown().await?;
             Ok(())
@@ -20847,73 +20365,23 @@ mod tests {
     #[ignore = "wedges under shared-state CI; see comment above. Run with cargo test -- --ignored"]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_writes_same_project() -> Result<()> {
+        // 3 concurrent writers (reduced from 10 to minimize Delta conflicts) into
+        // ONE project: Delta commit contention is the point.
         // Locally <3s; CI's MinIO + fresh Delta-table create-on-write under 3-way
         // concurrent contention regularly exceeds 60s on the GHA runner. Headroom.
-        tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            let db = Database::with_config(create_test_config("concurrent-writes-same-project")).await?;
-            let db = Arc::new(db);
-            let project_id = format!("concurrent_test_{}", uuid::Uuid::new_v4());
-
-            // Create 3 concurrent write tasks (reduced from 10 to minimize Delta conflicts)
-            let tasks = (0..3).map(|i| {
-                let db = Arc::clone(&db);
-                let project = project_id.clone();
-
-                tokio::spawn(async move {
-                    let batch_id = format!("batch_{}", i);
-                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project)])?;
-                    db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| batch_id)
-                })
-            });
-
-            let results: Vec<Result<String, _>> =
-                futures::future::join_all(tasks).await.into_iter().map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?).collect();
-
-            let successful_writes: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
-            assert_eq!(successful_writes.len(), 3, "All 3 concurrent writes should succeed");
-
-            db.shutdown().await?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
+        let project_id = format!("concurrent_test_{}", uuid::Uuid::new_v4());
+        tokio::time::timeout(std::time::Duration::from_secs(180), concurrent_inserts_all_land("concurrent-writes-same-project", 3, move |_| project_id.clone()))
+            .await
+            .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
     }
 
     #[serial]
     #[ignore = "wedges under shared-state CI; see test_concurrent_writes_same_project comment"]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_table_creation() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            let db = Database::with_config(create_test_config("concurrent-table-creation")).await?;
-            let db = Arc::new(db);
-
-            // Create multiple projects concurrently - each will try to create its own table
-            let tasks = (0..5).map(|i| {
-                let db = Arc::clone(&db);
-                let project_id = format!("project_create_test_{}", i);
-
-                tokio::spawn(async move {
-                    let batch_id = format!("init_batch_{}", i);
-                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project_id)])?;
-                    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| project_id)
-                })
-            });
-
-            // Wait for all tasks to complete
-            let results: Vec<Result<String, _>> =
-                futures::future::join_all(tasks).await.into_iter().map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?).collect();
-
-            let created_projects: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
-            assert_eq!(created_projects.len(), 5, "All 5 projects should be created successfully");
-
-            // Shutdown database
-            db.shutdown().await?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
+        // Multiple projects concurrently — each tries to create its own table.
+        let creating = concurrent_inserts_all_land("concurrent-table-creation", 5, |i| format!("project_create_test_{i}"));
+        tokio::time::timeout(std::time::Duration::from_secs(180), creating).await.map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
     }
 
     #[serial]
@@ -20957,44 +20425,37 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_mixed_operations() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            let db = Database::with_config(create_test_config("concurrent-mixed-operations")).await?;
-            let db = Arc::new(db);
+            let db = Arc::new(Database::with_config(create_test_config("concurrent-mixed-operations")).await?);
 
-            // Test concurrent writes to DIFFERENT projects (no conflicts)
-            let mut handles = Vec::new();
-            for i in 0..3 {
-                let db_clone = Arc::clone(&db);
-                let project_id = format!("project_{}", i);
-                handles.push(tokio::spawn(async move {
-                    let batch = json_to_batch(vec![test_span(&format!("id_{}", i), &format!("span_{}", i), &project_id)])?;
-                    db_clone.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
-                    Ok::<_, anyhow::Error>(())
-                }));
-            }
-
-            // Wait for all writes
-            for handle in handles {
+            // Concurrent writes to DIFFERENT projects (no conflicts), then
+            // concurrent reads across all of them.
+            let spawn_each =
+                |body: fn(Arc<Database>, usize) -> tokio::task::JoinHandle<Result<()>>| (0..3).map(|i| body(Arc::clone(&db), i)).collect::<Vec<_>>();
+            let writes = spawn_each(|db, i| {
+                tokio::spawn(async move {
+                    let project_id = format!("project_{i}");
+                    let batch = json_to_batch(vec![test_span(&format!("id_{i}"), &format!("span_{i}"), &project_id)])?;
+                    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+                    Ok(())
+                })
+            });
+            for handle in writes {
                 handle.await??;
             }
 
-            // Now test concurrent reads across all projects
-            let mut read_handles = Vec::new();
-            for i in 0..3 {
-                let db_clone = Arc::clone(&db);
-                let project_id = format!("project_{}", i);
-                read_handles.push(tokio::spawn(async move {
-                    let ctx = db_clone.clone().create_session_context();
-                    let _ = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await;
-                    Ok::<_, anyhow::Error>(())
-                }));
-            }
-
-            for handle in read_handles {
+            // Only once every write has landed: concurrent reads across all projects.
+            let reads = spawn_each(|db, i| {
+                tokio::spawn(async move {
+                    let ctx = db.create_session_context();
+                    let _ = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project_{i}'")).await;
+                    Ok(())
+                })
+            });
+            for handle in reads {
                 handle.await??;
             }
 
             db.shutdown().await?;
-
             Ok(())
         })
         .await
@@ -21008,8 +20469,7 @@ mod tests {
         let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
         let old = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
         let db = Database::with_config(Arc::clone(&cfg)).await?;
-        let batch = json_to_batch(vec![test_span_ts("restart", "first", &project, old)])?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await?;
+        insert_otel_ts(&db, &project, "restart", "first", old, true).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1);
         drop(db);
 
@@ -21021,14 +20481,11 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn dirty_dedup_bins_enqueue_seal_and_requeue() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-bins-{}", uuid::Uuid::new_v4().simple()));
-        assert!(!cfg.maintenance.timefusion_dedup_sweep_fallback, "the broad fallback sweep must default off");
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("dirty-dedup-bins").await?;
+        assert!(!db.config.maintenance.timefusion_dedup_sweep_fallback, "the broad fallback sweep must default off");
         // Well beyond the seal lag. Today's sealed bins now follow this same
         // targeted path; 26h keeps this test deterministic around midnight.
         let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |id: &str, observed: &str, timestamp| json_to_batch(vec![test_span_ts(id, observed, &project, timestamp)]);
 
         // The first duplicate shares a parquet file with a row from an adjacent
         // 10-minute bin. A targeted rewrite must carry that neighbour through;
@@ -21037,9 +20494,9 @@ mod tests {
         let neighbour = old - 60 * 60 * 1_000_000;
         let first_file = json_to_batch(vec![test_span_ts("sealed", "first", &project, old), test_span_ts("neighbour", "keep", &project, neighbour)])?;
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![first_file], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second", old)?], true, None).await?;
+        insert_otel_ts(&db, &project, "sealed", "second", old, true).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 2, "successful commits enqueue both timestamp bins");
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let table = otel_unified_table(&db).await;
         let selected = {
             let table = table.read().await;
             let snapshot = table.snapshot()?.snapshot();
@@ -21047,19 +20504,19 @@ mod tests {
             dedup_partition_paths(snapshot.log_data().iter().map(|f| f.path().to_string()), &project, &old_date)
         };
         assert_eq!(selected.len(), 2, "snapshot selection must retain both duplicate-bearing files: {selected:?}");
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 2, "sealed bin is deduplicated without dropping an adjacent-bin row from the same file");
         assert!(db.dedup_dirty_bins.is_empty(), "completed sealed bin is consumed");
 
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "later", old)?], true, None).await?;
+        insert_otel_ts(&db, &project, "sealed", "later", old, true).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "late retry requeues the previously consumed bin");
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 2, "later observed timestamp survives the requeue rewrite and the neighbour remains");
 
         let fresh = Utc::now().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "a", fresh)?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "b", fresh)?], true, None).await?;
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        insert_otel_ts(&db, &project, "unsealed", "a", fresh, true).await?;
+        insert_otel_ts(&db, &project, "unsealed", "b", fresh, true).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 1, "unsealed bin remains queued without rewrite");
         assert_eq!(delta_physical_row_count(&table).await?, 4, "unsealed copies remain for read-side dedup");
         Ok(())
@@ -21072,15 +20529,7 @@ mod tests {
     /// flush unhealthy waits for recovery instead.
     #[tokio::test]
     async fn dirty_dedup_drain_survives_transient_flush_unhealthy() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-transient-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |id: &str, observed: &str| json_to_batch(vec![test_span_ts(id, observed, &project, old)]);
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let (db, table) = sealed_dup_pair("dirty-dedup-transient", "sealed").await?;
 
         // Healthy at pass start, unhealthy for exactly one mid-pass sample.
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -21098,24 +20547,21 @@ mod tests {
     /// duplicates), and dup-bearing bins still dedup through the per-bin path.
     #[tokio::test]
     async fn dirty_dedup_batch_probe_consumes_clean_bins() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-batchprobe-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("dirty-dedup-batchprobe").await?;
         // Noon of the day 26h ago: ±20 min can never cross a date boundary,
         // and the bins are sealed far beyond the 2h lag.
         let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
         let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
         const TEN_MIN: i64 = 10 * 60 * 1_000_000;
-        let row = |id: &str, observed: &str, ts: i64| json_to_batch(vec![test_span_ts(id, observed, &project, ts)]);
         // Three bins on one date: one duplicate pair, two clean singles.
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("dup", "first", base)?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("dup", "second", base)?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean1", "only", base - TEN_MIN)?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean2", "only", base - 2 * TEN_MIN)?], true, None).await?;
+        insert_otel_ts(&db, &project, "dup", "first", base, true).await?;
+        insert_otel_ts(&db, &project, "dup", "second", base, true).await?;
+        insert_otel_ts(&db, &project, "clean1", "only", base - TEN_MIN, true).await?;
+        insert_otel_ts(&db, &project, "clean2", "only", base - 2 * TEN_MIN, true).await?;
         assert_eq!(db.dedup_dirty_bins.len(), 3);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let table = otel_unified_table(&db).await;
 
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(
             crate::observability::maintenance_stats().dirty_bin_batch_probe_clean.load(Relaxed),
@@ -21137,22 +20583,19 @@ mod tests {
     /// read recent dates — so the verdict was computed and thrown away.
     #[tokio::test]
     async fn a_clean_batch_probe_certifies_the_whole_date() -> Result<()> {
-        let cfg = create_test_config(&format!("batchprobe-certify-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("batchprobe-certify").await?;
         let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
         let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
         const TEN_MIN: i64 = 10 * 60 * 1_000_000;
-        let row = |id: &str, ts: i64| json_to_batch(vec![test_span_ts(id, "only", &project, ts)]);
         // Two bins, no duplicate anywhere on the date.
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean1", base)?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("clean2", base - TEN_MIN)?], true, None).await?;
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        insert_otel_ts(&db, &project, "clean1", "only", base, true).await?;
+        insert_otel_ts(&db, &project, "clean2", "only", base - TEN_MIN, true).await?;
+        let table = otel_unified_table(&db).await;
 
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
         assert!(db.dedup_clean_fp.get(&key).is_none(), "nothing is certified before the probe runs");
 
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
 
         let cert = db.dedup_clean_fp.get(&key).map(|entry| entry.value().clone()).expect("a clean probe certifies the date it proved");
         assert!(!cert.stale, "a whole-date grant is live evidence, not the stale per-file kind a partial slice banks");
@@ -21173,20 +20616,18 @@ mod tests {
     /// were the whole gap between evidence existing and a query getting faster.
     #[tokio::test]
     async fn a_sealed_date_with_no_queued_bins_is_still_certified() -> Result<()> {
-        let cfg = create_test_config(&format!("certify-sealed-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("certify-sealed").await?;
         let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
         let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("solo", "only", &project, base)])?], true, None).await?;
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        insert_otel_ts(&db, &project, "solo", "only", base, true).await?;
+        let table = otel_unified_table(&db).await;
 
         // THE precondition: nothing is queued, so the old code returned early.
         db.dedup_dirty_bins.clear();
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
         assert!(db.dedup_clean_fp.get(&key).is_none(), "and nothing is certified yet");
 
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
 
         assert!(db.dedup_clean_fp.get(&key).is_some_and(|entry| !entry.value().stale), "an empty queue must not stop a sealed date from being proved");
         // Today is excluded on purpose: a live partition gains files under ingest,
@@ -21208,17 +20649,14 @@ mod tests {
     /// — the same invalidation rule certification itself uses.
     #[tokio::test]
     async fn a_date_probed_dirty_is_not_reprobed_until_its_files_change() -> Result<()> {
-        let cfg = create_test_config(&format!("certify-memo-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("certify-memo").await?;
         let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
         let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
         // A genuine duplicate: same dedup key twice, so the probe must decline.
         for observed in ["first", "second"] {
-            let batch = json_to_batch(vec![test_span_ts("dup", observed, &project, base)])?;
-            db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await?;
+            insert_otel_ts(&db, &project, "dup", observed, base, true).await?;
         }
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let table = otel_unified_table(&db).await;
         let key = (project.clone(), "otel_logs_and_spans".to_owned(), day.to_string());
 
         let want = (project.clone(), day.to_string());
@@ -21254,8 +20692,7 @@ mod tests {
     /// convenience; busiest-first optimises the query that hurts.
     #[tokio::test]
     async fn certification_candidates_start_with_the_busiest_project() -> Result<()> {
-        let cfg = create_test_config(&format!("certify-order-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
+        let (db, _) = dirty_bin_db("certify-order").await?;
         let (busy, quiet) = (format!("busy_{}", uuid::Uuid::new_v4().simple()), format!("quiet_{}", uuid::Uuid::new_v4().simple()));
         // `quiet` has ONE date and so is nearest to done — the old ordering would
         // have drained it first. `busy` has three dates and more files on each,
@@ -21266,12 +20703,11 @@ mod tests {
                 // Two separate inserts on the busy project's dates, so it carries
                 // strictly more FILES — the proxy the ordering sorts on.
                 for row in 0..if *project == busy { 2 } else { 1 } {
-                    let batch = json_to_batch(vec![test_span_ts(&format!("r{back}_{row}"), "only", project, ts + row)])?;
-                    db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
+                    insert_otel_ts(&db, project, &format!("r{back}_{row}"), "only", ts + row, true).await?;
                 }
             }
         }
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let table = otel_unified_table(&db).await;
         let got = db.uncertified_window_dates(&*table.read().await, "otel_logs_and_spans");
 
         let ours: Vec<&String> = got.iter().map(|(project, _)| project).filter(|p| **p == busy || **p == quiet).collect();
@@ -21290,17 +20726,14 @@ mod tests {
     /// cannot run would spend the cheap classification path's entry ticket on nothing.
     #[tokio::test]
     async fn dedup_batch_probe_leaves_bins_queued_when_the_phase_budget_is_gone() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-probedeadline-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("dirty-dedup-probedeadline").await?;
         let day = (Utc::now() - chrono::Duration::hours(26)).date_naive();
         let base = day.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
         const TEN_MIN: i64 = 10 * 60 * 1_000_000;
-        let row = |id: &str, ts: i64| json_to_batch(vec![test_span_ts(id, "only", &project, ts)]);
         // Two bins on one date, so the group clears the `bins.len() >= 2` filter.
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("a", base)?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("b", base - TEN_MIN)?], true, None).await?;
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        insert_otel_ts(&db, &project, "a", "only", base, true).await?;
+        insert_otel_ts(&db, &project, "b", "only", base - TEN_MIN, true).await?;
+        let table = otel_unified_table(&db).await;
 
         let ready: Vec<(String, String, i64)> = db.dedup_dirty_bins.iter().map(|e| (e.key().0.clone(), e.key().2.clone(), e.key().3)).collect();
         let queued_before = db.dedup_dirty_bins.len();
@@ -21321,15 +20754,7 @@ mod tests {
     /// Bins that cannot be admitted must stay queued so the next tick can serve them.
     #[tokio::test]
     async fn dedup_drain_out_of_budget_leaves_its_bins_queued() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-passbudget-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("sealed", observed, &project, old)]);
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let (db, table) = sealed_dup_pair("dirty-dedup-passbudget", "sealed").await?;
 
         // An already-elapsed pass deadline with a generous per-bin ceiling: only
         // the pass budget can stop this, and it must.
@@ -21340,7 +20765,7 @@ mod tests {
         assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
 
         // And the bin is still perfectly drainable once a pass has budget.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1, "the deferred bin dedups on a pass that has budget");
         assert!(db.dedup_dirty_bins.is_empty());
         Ok(())
@@ -21352,15 +20777,7 @@ mod tests {
     /// semaphore for 6.5h while the cron logged skips=77).
     #[tokio::test]
     async fn dirty_dedup_bin_staging_deadline_requeues_instead_of_wedging() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-deadline-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("sealed", observed, &project, old)]);
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let (db, table) = sealed_dup_pair("dirty-dedup-deadline", "sealed").await?;
 
         // A 1ms deadline fires before any real staging read can complete —
         // standing in for the hung GET.
@@ -21370,7 +20787,7 @@ mod tests {
         assert_eq!(db.dedup_dirty_bins.len(), 1, "the timed-out bin is requeued, not lost");
         assert_eq!(delta_physical_row_count(&table).await?, 2, "no partial rewrite landed");
 
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1, "the requeued bin dedups under a sane deadline");
         assert!(db.dedup_dirty_bins.is_empty());
         Ok(())
@@ -21451,22 +20868,19 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn dirty_dedup_cold_bins_are_deferred_not_dropped() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-cold-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("dirty-dedup-cold").await?;
         let after_days = db.config.parquet.cold_optimize_after_days();
         let ancient = (Utc::now() - chrono::Duration::days(after_days as i64 + 2)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("cold", observed, &project, ancient)]);
-
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+        for observed in ["first", "second"] {
+            insert_otel_ts(&db, &project, "cold", observed, ancient, true).await?;
+        }
         assert_eq!(db.dedup_dirty_bins.len(), 1);
 
         let deferred_before = crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        let table = otel_unified_table(&db).await;
         // Batch of 1 with a cold-only queue still serves it (lowest priority ≠
         // never), so the drain deduplicates rather than abandoning the rows.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         assert_eq!(
             crate::observability::maintenance_stats().dedup_bins_deferred_cold.load(std::sync::atomic::Ordering::Relaxed),
             deferred_before,
@@ -21486,8 +20900,7 @@ mod tests {
     /// byte-identical while the logs showed a healthy process.
     #[tokio::test]
     async fn a_busy_repair_permit_requeues_instead_of_parking_a_worker() -> Result<()> {
-        let cfg = create_test_config(&format!("repair-park-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
+        let (db, _) = dirty_bin_db("repair-park").await?;
         let schema = crate::schema::get_schema("otel_logs_and_spans").expect("otel schema");
 
         // A REAL committed file, so the bin survives the vanished-selection
@@ -21497,8 +20910,8 @@ mod tests {
         // thought it covered (2026-09-05: 19 spins, zero completions, 10 min).
         let project = format!("repair_busy_{}", uuid::Uuid::new_v4().simple());
         let ts = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("r1", "op", &project, ts)])?], true, None).await?;
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").cloned().expect("table created");
+        insert_otel_ts(&db, &project, "r1", "op", ts, true).await?;
+        let table = otel_unified_table(&db).await;
         let file = {
             let t = table.read().await;
             t.snapshot()?.log_data().iter().map(|f| f.path().to_string()).find(|p| p.contains(&project)).expect("the committed file")
@@ -21509,17 +20922,13 @@ mod tests {
         let budget = db.repair_rewrite_sem.available_permits();
         let held = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(u32::try_from(budget).unwrap()).expect("the budget starts free");
 
+        let stage = async |files: Vec<String>| {
+            let options = HotStageOptions { pass: TailPass::Repair, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None };
+            db.stage_hot_bin(&table, "otel_logs_and_spans", schema, &project, files, options).await
+        };
+
         let started = std::time::Instant::now();
-        let outcome = db
-            .stage_hot_bin(
-                &table,
-                "otel_logs_and_spans",
-                schema,
-                &project,
-                vec![file],
-                HotStageOptions { pass: TailPass::Repair, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None },
-            )
-            .await;
+        let outcome = stage(vec![file]).await;
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "it must return immediately, not wait for the permit");
         // `BudgetBusy`, not `Retry`: the coordinator paces the two differently
         // (+300s on the holder's clock vs +30s), and folding this into `Retry`
@@ -21529,16 +20938,7 @@ mod tests {
 
         // The stale-selection outcome is unchanged: a vanished file still
         // reports `Retry` (re-servable immediately), even with the budget free.
-        let outcome = db
-            .stage_hot_bin(
-                &table,
-                "otel_logs_and_spans",
-                schema,
-                &project,
-                vec!["nonexistent.parquet".to_owned()],
-                HotStageOptions { pass: TailPass::Repair, runtime_env: Some(db.coordinator_runtime_env()), light_permit: None },
-            )
-            .await;
+        let outcome = stage(vec!["nonexistent.parquet".to_owned()]).await;
         assert!(matches!(outcome, Ok(BinOutcome::Retry)), "a vanished selection stays Retry");
         Ok(())
     }
@@ -21550,9 +20950,7 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn undrainable_dirty_bins_are_retired_not_left_to_grow() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-retire-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let (db, project) = dirty_bin_db("dirty-retire").await?;
         let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
 
         // Coordinator-owned (declares rollups) and a table the cron still serves.
@@ -21579,8 +20977,7 @@ mod tests {
     /// value — without one this test would hang the suite instead of failing it.
     #[tokio::test]
     async fn reading_attempts_does_not_hold_the_journal_into_the_retry() -> Result<()> {
-        let cfg = create_test_config(&format!("admission-backoff-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
+        let (db, _) = dirty_bin_db("admission-backoff").await?;
         let key = crate::maintenance_coordinator::TaskKey {
             physical_table: "otel_logs_and_spans".to_owned(),
             source: "otel_logs_and_spans".to_owned(),
@@ -21608,8 +21005,7 @@ mod tests {
     /// external sort`.
     #[tokio::test]
     async fn repair_serialises_on_its_own_permit() -> Result<()> {
-        let cfg = create_test_config(&format!("repair-permit-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
+        let (db, _) = dirty_bin_db("repair-permit").await?;
         let budget = db.config.derived.repair_rewrite_budget_mib();
         assert_eq!(db.repair_rewrite_sem.available_permits(), budget, "repair's budget is decoded MiB, not a count of rewrites");
         assert!(db.light_rewrite_sem.available_permits() >= 1, "and repair must not spend a hygiene permit it would then starve");
@@ -21618,17 +21014,15 @@ mod tests {
         // the whole budget still runs alone, because its request is CLAMPED to
         // the budget and therefore takes all of it. Prod's worst is ~28 GB
         // decoded against a 1.25 GB budget.
+        let take = |mib: u32| Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(mib);
         let huge = u32::try_from(budget).expect("budget fits u32");
-        let held = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(huge).expect("an oversized bin takes the whole budget");
-        assert!(
-            Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(1).is_err(),
-            "nothing may overlap a bin that filled the budget — this is what the count of 1 was for"
-        );
+        let held = take(huge).expect("an oversized bin takes the whole budget");
+        assert!(take(1).is_err(), "nothing may overlap a bin that filled the budget — this is what the count of 1 was for");
         drop(held);
         // And two small bins DO overlap, which is the entire point.
         let small = u32::try_from(budget / 4).expect("quarter fits u32").max(1);
-        let a = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(small).expect("first small bin");
-        assert!(Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(small).is_ok(), "two small repair bins must share the budget");
+        let a = take(small).expect("first small bin");
+        assert!(take(small).is_ok(), "two small repair bins must share the budget");
         drop(a);
 
         // The case that was NEVER small: a repair unit is one whole file, and
@@ -21637,11 +21031,8 @@ mod tests {
         // repair serializes on its ordinary input — the 2026-09-02 starvation,
         // where `want_mib=1280 budget_mib=1280` logged 243 times in three hours.
         let target_sized = u32::try_from(maintain::estimated_decoded_bytes(COORDINATOR_HOT_TARGET_BYTES) / (1024 * 1024)).expect("fits u32");
-        let first = Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(target_sized).expect("a target-sized file must fit the budget at all");
-        assert!(
-            Arc::clone(&db.repair_rewrite_sem).try_acquire_many_owned(target_sized).is_ok(),
-            "two target-sized repair rewrites must share the budget ({target_sized} MiB each of {budget} MiB)"
-        );
+        let first = take(target_sized).expect("a target-sized file must fit the budget at all");
+        assert!(take(target_sized).is_ok(), "two target-sized repair rewrites must share the budget ({target_sized} MiB each of {budget} MiB)");
         drop(first);
         Ok(())
     }
@@ -21649,18 +21040,8 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn dirty_dedup_drain_yields_to_unhealthy_flush() -> Result<()> {
-        let cfg = create_test_config(&format!("dirty-dedup-gate-{}", uuid::Uuid::new_v4().simple()));
-        let db = Database::with_config(cfg).await?;
-        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
-        let row = |observed: &str| json_to_batch(vec![test_span_ts("gated", observed, &project, old)]);
-
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
-        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
-        assert_eq!(db.dedup_dirty_bins.len(), 1);
-
+        let (db, table) = sealed_dup_pair("dirty-dedup-gate", "gated").await?;
         let yields_before = crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed);
-        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
         db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| false, std::time::Duration::MAX, far_future()).await?;
         assert_eq!(
             crate::observability::maintenance_stats().dedup_passes_flush_yields.load(std::sync::atomic::Ordering::Relaxed),
@@ -21671,7 +21052,7 @@ mod tests {
         assert_eq!(delta_physical_row_count(&table).await?, 2, "no rewrite happened; read-side dedup keeps results correct");
 
         // Healthy again ⇒ the same bin drains normally.
-        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans", &|| true, std::time::Duration::MAX, far_future()).await?;
+        drain_dirty_bins_ok(&db, &table).await?;
         assert_eq!(delta_physical_row_count(&table).await?, 1);
         Ok(())
     }
@@ -21680,35 +21061,25 @@ mod tests {
     /// `extract_time_range_from_filters`. Enforce mode used to reject both —
     /// including the rollup builder's own `project_id = … AND date = …`
     /// aggregate, which has no timestamp predicate and no LIMIT.
-    #[test]
-    fn a_date_partition_or_between_predicate_counts_as_bounded() {
-        assert!(ProjectRoutingTable::is_bounding_predicate(&col("date").eq(lit("2026-08-10"))));
-        assert!(ProjectRoutingTable::is_bounding_predicate(&col("timestamp").between(lit(1_i64), lit(2_i64))));
-        assert!(!ProjectRoutingTable::is_bounding_predicate(&col("timestamp").not_between(lit(1_i64), lit(2_i64))));
-        assert!(!ProjectRoutingTable::is_bounding_predicate(&col("name").between(lit(1_i64), lit(2_i64))));
-        assert!(!ProjectRoutingTable::is_bounding_predicate(&col("project_id").eq(lit("project"))));
+    #[test_case(col("date").eq(lit("2026-08-10")) => true ; "a date partition equality bounds the scan")]
+    #[test_case(col("timestamp").between(lit(1_i64), lit(2_i64)) => true ; "BETWEEN on timestamp bounds the scan")]
+    #[test_case(col("timestamp").not_between(lit(1_i64), lit(2_i64)) => false ; "NOT BETWEEN reaches outside the range")]
+    #[test_case(col("name").between(lit(1_i64), lit(2_i64)) => false ; "BETWEEN on a non-time column bounds nothing")]
+    #[test_case(col("project_id").eq(lit("project")) => false ; "the project filter is not itself a bound")]
+    fn a_date_partition_or_between_predicate_counts_as_bounded(predicate: Expr) -> bool {
+        ProjectRoutingTable::is_bounding_predicate(&predicate)
     }
 
-    #[test]
-    fn bounded_otel_scan_requires_a_project_and_bound() {
-        let project = col("project_id").eq(lit("project"));
-        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", &[], None, false), Some("missing exact project_id filter"));
-        assert_eq!(
-            ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", std::slice::from_ref(&project), None, false),
-            Some("missing timestamp lower bound or scan limit")
-        );
-        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", std::slice::from_ref(&project), Some(1), false), None);
-        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("otel_logs_and_spans", std::slice::from_ref(&project), None, true), None);
-        assert_eq!(
-            ProjectRoutingTable::raw_otel_scan_reason(
-                "otel_logs_and_spans",
-                &[col("project_id").eq(lit("one")).or(col("project_id").eq(lit("two")))],
-                None,
-                true,
-            ),
-            Some("missing exact project_id filter")
-        );
-        assert_eq!(ProjectRoutingTable::raw_otel_scan_reason("timefusion_stats", &[], None, false), None);
+    #[test_case("otel_logs_and_spans", vec![], None, false => Some("missing exact project_id filter") ; "no filters at all")]
+    #[test_case("otel_logs_and_spans", vec![col("project_id").eq(lit("project"))], None, false
+        => Some("missing timestamp lower bound or scan limit") ; "a project alone is unbounded")]
+    #[test_case("otel_logs_and_spans", vec![col("project_id").eq(lit("project"))], Some(1), false => None ; "a limit bounds it")]
+    #[test_case("otel_logs_and_spans", vec![col("project_id").eq(lit("project"))], None, true => None ; "a timestamp lower bound bounds it")]
+    #[test_case("otel_logs_and_spans", vec![col("project_id").eq(lit("one")).or(col("project_id").eq(lit("two")))], None, true
+        => Some("missing exact project_id filter") ; "a project disjunction is not an exact filter")]
+    #[test_case("timefusion_stats", vec![], None, false => None ; "only the otel table is gated")]
+    fn bounded_otel_scan_requires_a_project_and_bound(table: &str, filters: Vec<Expr>, limit: Option<usize>, lower_bound: bool) -> Option<&'static str> {
+        ProjectRoutingTable::raw_otel_scan_reason(table, &filters, limit, lower_bound)
     }
 }
 
