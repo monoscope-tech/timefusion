@@ -40,7 +40,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 use tracing::{Instrument, debug, error, field::Empty, info, instrument, warn};
 use url::Url;
 
@@ -3902,9 +3901,7 @@ impl Database {
                     let store = table.read().await.log_store().object_store(None);
                     let rel =
                         crate::tantivy::search::parquet_rel_of_uri(&file.uri).ok_or_else(|| anyhow::anyhow!("invalid deferred parquet URI {}", file.uri))?;
-                    svc.build_index_for_file(&file.table_name, &file.project_id, rel, &file.uri, store)
-                        .instrument(tracing::info_span!("tantivy_build", cause = "deferred"))
-                        .await
+                    svc.build_index_for_file(&file.table_name, &file.project_id, rel, &file.uri, store).await
                 }
                 .await;
                 match result {
@@ -4301,10 +4298,7 @@ impl Database {
             let mut pending_since: HashMap<String, std::time::Instant> = HashMap::new();
             let mut jobs = futures::stream::iter(work.into_iter().map(|(pid, rel, uri)| {
                 let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
-                async move {
-                    let built = svc.build_index_for_file_deferred(&table, &pid, &rel, &uri, store);
-                    (pid.clone(), built.instrument(tracing::info_span!("tantivy_build", cause = "backfill")).await)
-                }
+                async move { (pid.clone(), svc.build_index_for_file_deferred(&table, &pid, &rel, &uri, store).await) }
             }))
             .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1));
             // Flush on a TIMER, not only on build completions. The age bound is
@@ -7988,7 +7982,19 @@ fn select_coordinator_compaction_candidates(mut candidates: Vec<TailAdd>, target
     // DECODED-sized, like every other sort budget here. NOT
     // `COORDINATOR_L0_SORT_TARGET_BYTES` — that constant still gates single
     // oversized L0 files into the slicing path and must keep its own value.
-    let limit = if has_unsorted { unsorted_bin_budget_bytes() } else { target };
+    // The pair floor belongs HERE, on the limit the loop actually applies — not
+    // only on `target`. Prod 2026-09-13 proved the difference: capping `target`
+    // at the caller left `otel_metrics` refusing 32 bins/min with
+    // `target=109424720 smallest_pair_bytes=109424720 smallest_pair_fits=true`,
+    // because `has_unsorted` swapped in the 64 MB unsorted budget and discarded
+    // the floor. Whichever budget wins, a bin that cannot hold two files retires
+    // nothing and its cell re-enqueues forever.
+    let pair_floor = {
+        let mut sizes: Vec<i64> = candidates.iter().map(|add| add.size).collect();
+        sizes.sort_unstable();
+        sizes.iter().take(2).sum::<i64>()
+    };
+    let limit = if has_unsorted { unsorted_bin_budget_bytes() } else { target }.max(pair_floor);
     // SMALLEST FIRST. Candidates arrive in EVENT-TIME order, and the loop below
     // pushes the first one unconditionally, so a single large file fills the
     // budget by itself, the next candidate breaks the loop, and the unit selects
@@ -17049,6 +17055,28 @@ mod tests {
     /// while `HotPacking` never exceeded 16 — and the packer, which measures
     /// only bytes and rows, cannot tell the two apart. (297 units measured:
     /// `HotPacking` p50 13 / max 20, `SealedConsolidation` p50 84 / max 144.)
+    /// UNSORTED candidates must still be able to PAIR.
+    ///
+    /// Prod 2026-09-13, after the pair floor was added at the caller only:
+    /// `otel_metrics` kept refusing ~32 bins/min with
+    /// `target=109424720 smallest_pair_bytes=109424720 smallest_pair_fits=true`
+    /// — the floor was applied to `target`, then `has_unsorted` swapped in the
+    /// 64 MB unsorted budget and discarded it. A bin that cannot hold two files
+    /// retires nothing, so its cell re-enqueues forever.
+    ///
+    /// Can-fail: drop `.max(pair_floor)` from `limit` and this returns < 2.
+    #[test]
+    fn unsorted_candidates_still_pair_when_the_unsorted_budget_is_smaller() {
+        const MB: i64 = 1024 * 1024;
+        // The real shape: ~54 MB otel_metrics files, so a pair is ~109 MB
+        // against a 64 MB unsorted budget.
+        let files: Vec<_> = (0..4).map(|i| tail_file(&format!("f{i}"), 54 * MB, false, None, false, Some(1_000))).collect();
+        let pair = 54 * MB * 2;
+        assert!(pair > super::unsorted_bin_budget_bytes(), "precondition: the pair exceeds the unsorted budget ({})", super::unsorted_bin_budget_bytes());
+        let picked = super::select_coordinator_compaction_candidates(files, super::COORDINATOR_SEALED_TARGET_BYTES);
+        assert!(picked.len() >= 2, "an unsorted cell whose pair exceeds the unsorted budget still has to merge; picked {}", picked.len());
+    }
+
     #[test]
     fn the_span_budget_rejects_wide_unions_and_is_off_by_default() {
         const MB: i64 = 1024 * 1024;
