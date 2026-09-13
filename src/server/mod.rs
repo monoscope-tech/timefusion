@@ -150,7 +150,10 @@ pub fn tantivy_index_callback(db: &Database, indexer: Arc<crate::tantivy::search
             // One streamed build at a time per callback keeps multi-file commits bounded.
             for uri in added_files {
                 let relative = crate::tantivy::search::parquet_rel_of_uri(&uri).context("committed file has no relative Parquet path")?;
-                indexer.build_index_for_file(&table_name, &project_id, relative, &uri, Arc::clone(&store)).await?;
+                indexer
+                    .build_index_for_file(&table_name, &project_id, relative, &uri, Arc::clone(&store))
+                    .instrument(tracing::info_span!("tantivy_build", cause = "flush"))
+                    .await?;
             }
             Ok(())
         })

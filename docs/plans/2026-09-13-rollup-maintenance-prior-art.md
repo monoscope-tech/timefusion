@@ -3,6 +3,17 @@
 2026-09-13. Prompted by the measured 10x verdict: BaseRollup alone would want
 **25-39 of 48 cores** at ten times today's writes. That is not a tuning problem.
 
+> **CORRECTION (same day).** The cost premise below — the 25-39 cores, and the
+> 1,490:1 ratio it rests on — is **not sound**, and neither is the later 2,158:1
+> reading. `progress_rows` is a plan-tree liveness proxy, not a count of rows of
+> work, and `worker_secs` is wall time a worker *held*, including every wait —
+> both stated at `observability.rs:81`. Directly measured, the entire
+> `maintenance-wor` pool is **5.7-7.0 cores for all operations combined**.
+> See `2026-09-13-where-the-28-cores-actually-go.md`. The *direction* of this
+> document is unaffected; the arithmetic that motivates its urgency must be
+> re-derived, and the cardinality measurement it gates the design on is still
+> the right next step.
+
 ## The number that names the defect
 
 `work.BaseRollup.progress_rows / rows_ingested_total` ≈ **1,490:1**. Every

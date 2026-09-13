@@ -234,7 +234,9 @@ impl Database {
                     let table_owned = table_name.to_string();
                     let (built, reindex_errs) = futures::stream::iter(added.into_iter().map(|(pid, rel, uri)| {
                         let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
-                        async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
+                        async move {
+                            svc.build_index_for_file(&table, &pid, &rel, &uri, store).instrument(tracing::info_span!("tantivy_build", cause = "optimize")).await
+                        }
                     }))
                     .buffer_unordered(self.config.tantivy.timefusion_tantivy_build_concurrency.max(1))
                     .fold((0usize, 0usize), |(built, errs), r| async move {
