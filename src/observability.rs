@@ -875,6 +875,12 @@ atomic_stats! {
         /// shrank against 229,361 grew, so a large `grew` with this counter
         /// climbing is the EXPECTED shape, not a failure of the carry.
         rollup_witness_carried as "rollup_witness_carried_total",
+        /// Times the repair lane's reserved light permits were lent to hygiene
+        /// while repair had no pending work, and reclaimed when it did. Read
+        /// together: a lend with no matching return while `pending_repair` is
+        /// non-zero means the reclaim is not firing.
+        repair_holdback_lends as "repair_holdback_lends_total",
+        repair_holdback_returns as "repair_holdback_returns_total",
         /// How many times the maintenance gauges were actually recomputed.
         /// `publish_statistics` is a full linear scan of the journal under the one
         /// global `Mutex<TaskJournal>`, so it is throttled: this should sit near
