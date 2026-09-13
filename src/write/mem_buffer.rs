@@ -3154,7 +3154,9 @@ mod tests {
     /// set. With no text_match preds it falls through to `query_partitioned`,
     /// i.e. every row comes back.
     ///
-    /// Returns the ids actually returned, so both cases pin identity and count.
+    /// Returns the ids actually returned (sorted — `scan_buckets` orders rows by
+    /// the schema's sorting columns, not by insertion), so both cases pin
+    /// identity and count without asserting an ordering the scan never promises.
     #[test_case(Some("alpha") => vec!["hit-1".to_string()] ; "only the matching row survives the snapshot's id set")]
     #[test_case(None => vec!["hit-1".to_string(), "miss-1".to_string()] ; "no text_match preds falls through to query_partitioned")]
     fn query_partitioned_with_text_match_returns_atomic_snapshot(query: Option<&str>) -> Vec<String> {
@@ -3166,7 +3168,7 @@ mod tests {
         let preds = query.map(name_preds);
         let node = preds.as_deref().and_then(crate::tantivy::udf::PredNode::from_preds);
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], node.as_ref()).unwrap();
-        col_strings(&parts.partitions.concat(), "id")
+        col_strings(&parts.partitions.concat(), "id").into_iter().sorted().collect()
     }
 
     /// Regression: `restore_taken_bucket` (the Delta-commit-failure path of the
