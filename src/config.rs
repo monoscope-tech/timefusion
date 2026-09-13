@@ -225,6 +225,29 @@ const PER_SORT_BUDGET_BYTES: usize = 2 * GIB;
 /// At 1.25 GiB `light_optimize_k` yields 5, plus the one repair permit = **6**
 /// — the measured optimum, and one rung below the measured cliff.
 const COORDINATOR_PER_SORT_BUDGET_BYTES: usize = 5 * GIB / 4;
+
+/// The largest COMPRESSED bin one coordinator sort can decode inside its budget.
+///
+/// A packing target is expressed in compressed bytes and a sort budget in
+/// decoded ones, so the two only agree if something divides by the decode ratio
+/// — and nothing did. `COORDINATOR_SEALED_TARGET_BYTES` is 256 MiB, which at
+/// `DECODED_BYTES_PER_COMPRESSED` = 12 is **3 GiB decoded against a 1.25 GiB
+/// budget — 2.4x**, and 2.39x is the rung `repair_pool_holdback_slices` already
+/// records as having FAILED on the bench.
+///
+/// Prod 2026-09-13 was living it. Every sealed bin at ~255-259 MB compressed
+/// (2.39x and 2.43x) started staging and never finished — one held a permit for
+/// 2 h 04 m at an effective 35 KB/s — while every bin at or under 16 MB
+/// (<=0.15x) completed normally. With only two light permits, two such bins are
+/// the whole lane.
+///
+/// This is the byte-budget shape the rollup lane already guards with
+/// `MAX_DECODED_BYTES` and the dedup lane with its own preflight; the packer was
+/// the one that bounded compressed input against a decoded budget and never
+/// converted between them.
+pub fn coordinator_bin_compressed_cap_bytes() -> i64 {
+    (COORDINATOR_PER_SORT_BUDGET_BYTES / crate::database::DECODED_BYTES_PER_COMPRESSED as usize) as i64
+}
 /// Concurrent target-sized repair rewrites the repair budget must hold.
 ///
 /// A repair unit is exactly ONE file (`coordinator_compaction_files` takes 1
@@ -4284,5 +4307,42 @@ mod light_permit_floor_tests {
         let share_slices = budget.coordinator_share_bytes() / COORDINATOR_PER_SORT_BUDGET_BYTES;
         assert!(share_slices < LIGHT_MIN_SLICES, "precondition: this box cannot hold two sorts");
         assert_eq!(budget.max_light_optimize_k(), 1, "and must not be pushed to two");
+    }
+}
+
+#[cfg(test)]
+mod bin_decode_budget_tests {
+    use super::*;
+
+    /// A packing bin must fit ONE SORT once decoded.
+    ///
+    /// Targets are compressed bytes, sort budgets are decoded bytes, and nothing
+    /// converted between them. `COORDINATOR_SEALED_TARGET_BYTES` is 256 MiB,
+    /// which at `DECODED_BYTES_PER_COMPRESSED` = 12 is 3 GiB against a 1.25 GiB
+    /// budget — **2.4x**, and `repair_pool_holdback_slices` already records
+    /// 2.39x as the rung that FAILED on the bench.
+    ///
+    /// Prod 2026-09-13 lived it: every sealed bin at ~255-259 MB compressed
+    /// (2.39x, 2.43x) started staging and never finished — one held a light
+    /// permit for 2 h 04 m at an effective 35 KB/s — while every bin at or under
+    /// 16 MB (<=0.15x) completed. With two permits, two such bins are the lane.
+    ///
+    /// Can-fail proof, run red then restored: dropping the `.min(...)` at the
+    /// call site leaves the effective cap at 256 MiB and this goes red at 2.40x.
+    #[test]
+    fn a_bin_capped_for_packing_still_fits_one_sort_decoded() {
+        let cap = coordinator_bin_compressed_cap_bytes();
+        let decoded = cap as usize * crate::database::DECODED_BYTES_PER_COMPRESSED as usize;
+        assert!(
+            decoded <= COORDINATOR_PER_SORT_BUDGET_BYTES,
+            "a full bin decodes to {decoded} bytes against a {COORDINATOR_PER_SORT_BUDGET_BYTES}-byte sort budget"
+        );
+        // And the cap is what actually binds, i.e. it is below the output target
+        // we would otherwise pack to — otherwise this guard is decorative.
+        assert!(cap < crate::database::COORDINATOR_HOT_TARGET_BYTES, "the decode cap ({cap}) must bind below the packing target, or it changes nothing");
+        // The prod shapes, stated so the boundary is not re-derived by hand.
+        let ratio = |mb: i64| (mb * 1024 * 1024 * crate::database::DECODED_BYTES_PER_COMPRESSED) as f64 / COORDINATOR_PER_SORT_BUDGET_BYTES as f64;
+        assert!(ratio(255) > 2.0, "the stalled prod bins were well past one sort budget");
+        assert!(ratio(cap / (1024 * 1024)) <= 1.0, "a bin at the new cap is not");
     }
 }
